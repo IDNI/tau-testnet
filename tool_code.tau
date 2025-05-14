@@ -1,0 +1,76 @@
+# --- Input Stream Definitions ---
+tau i0 = console.   # For rule proposals (e.g., from JSON key "0")
+sbf i1 = console.   # For coin transfers. Now 22 bits:
+                    # x0-x2: from_address_id (3 bits)
+                    # x3-x5: to_address_id (3 bits)
+                    # x6-x13: amount (8 bits)
+                    # x14-x21: sender_balance_for_tau (8 bits)
+#sbf i2 = console.   # Was considered for balance, but balance now part of i1
+
+# --- Output Stream Definition ---
+sbf o1 = console.   # Master output stream for all responses
+
+# --- SBF Code Definitions ---
+fail_invalid()         := {x0'}:sbf.    # General failure / invalid input state (SBF for 0)
+fail_src_eq_dest()     := {x0001'}:sbf. # Transfer failure: Source equals Destination
+fail_zero_amount()     := {x0002'}:sbf. # Transfer failure: Amount is zero
+fail_insufficient_funds() := {x0003'}:sbf. # Transfer failure: Insufficient funds (Amount > Sender Balance)
+
+ack_rule_processed()   := {x1001}:sbf.  # Acknowledgment for rule processed successfully
+# ack_custom_processed() := {x1002}:sbf. # Not currently used
+
+# --- Main Logic ---
+# The logic processes inputs in a prioritized order: i0, then i1.
+# Assumes only one primary command/data type is sent per time step 't'.
+
+    (!(i0[t] = 0)) # Check if rule proposal data is present
+    ? ( # --- Process Rule Proposal from i0[t] ---
+        
+        # u[t] = i0[t] #assign to pointwise revision
+        # && 
+        o1[t] = ack_rule_processed()
+    )
+    : (i1[t] != 0) # Else, check if coin transfer data is present on i1 (now 22 bits)
+    ? ( # --- Process Coin Transfer from i1[t] ---
+        # i1 bits: from(x0-x2), to(x3-x5), amount(x6-x13), balance_from(x14-x21)
+
+        # Check 0: Insufficient Funds? (Amount > Sender Balance for Tau)
+        # Amount Field (A): A_7=x13 (MSB), A_6=x12, ..., A_0=x6 (LSB)
+        # Balance Field (B): B_7=x21 (MSB), B_6=x20, ..., B_0=x14 (LSB)
+        # Condition for A > B:
+        (
+            i1[t] <= {
+                ( (x13 & x21') ) # |   
+            # (A_7=1 AND B_7=0)
+#                ( ((x13&x21)|(x13'&x21')) & (x12 & x20') ) |
+            # (A_7=B_7 AND A_6=1 AND B_6=0)
+#             ( ((x13&x21)|(x13'&x21')) & ((x12&x20)|(x12'&x20')) & (x11 & x19') ) |
+            # (A7=B7 & A6=B6 & A5=1 & B5=0)
+#                ( ((x13&x21)|(x13'&x21')) & ((x12&x20)|(x12'&x20')) & ((x11&x19)|(x11'&x19')) & (x10 & x18') ) |                                                                                    # (A7=B7 & A6=B6 & A5=B5 & A4=1 & B4=0)
+#                ( ((x13&x21)|(x13'&x21')) & ((x12&x20)|(x12'&x20')) & ((x11&x19)|(x11'&x19')) & ((x10&x18)|(x10'&x18')) & (x9 & x17') ) |                                                             # (A7=B7 & ... & A4=B4 & A3=1 & B3=0)
+#                ( ((x13&x21)|(x13'&x21')) & ((x12&x20)|(x12'&x20')) & ((x11&x19)|(x11'&x19')) & ((x10&x18)|(x10'&x18')) & ((x9&x17)|(x9'&x17')) & (x8 & x16') ) |                                      # (A7=B7 & ... & A3=B3 & A2=1 & B2=0)
+#                ( ((x13&x21)|(x13'&x21')) & ((x12&x20)|(x12'&x20')) & ((x11&x19)|(x11'&x19')) & ((x10&x18)|(x10'&x18')) & ((x9&x17)|(x9'&x17')) & ((x8&x16)|(x8'&x16')) & (x7 & x15') ) |               # (A7=B7 & ... & A2=B2 & A1=1 & B1=0)
+#                ( ((x13&x21)|(x13'&x21')) & ((x12&x20)|(x12'&x20')) & ((x11&x19)|(x11'&x19')) & ((x10&x18)|(x10'&x18')) & ((x9&x17)|(x9'&x17')) & ((x8&x16)|(x8'&x16')) & ((x7&x15)|(x7'&x15')) & (x6 & x14') ) # (A7=B7 & ... & A1=B1 & A0=1 & B0=0)
+            }:sbf
+        )
+        ? o1[t] = fail_insufficient_funds() # Output fail code if Amount > Sender Balance
+        : ( # Else (Amount <= Sender Balance), proceed to other checks
+            # Check 1: Source Address == Destination Address?
+            # Compares (i1.x0,i1.x1,i1.x2) with (i1.x3,i1.x4,i1.x5)
+            !( i1[t] <= {x0&x3 | x0'&x3'}:sbf & {x1&x4 | x1'&x4'} & {x2&x5 | x2'&x5'}:sbf )
+            ? o1[t] = fail_src_eq_dest() # Output fail code if Src == Dest
+            : ( # Else (Src != Dest), check Amount
+                # Check 2: Amount is Zero?
+                # True if all amount bits (x6 through x13 of i1[t]) are 0.
+                (i1[t] <= {x6'&x7'&x8'&x9'&x10'&x11'&x12'&x13'}:sbf)
+                ? o1[t] = fail_zero_amount()   # Output fail code if Amount is Zero
+                : o1[t] = i1[t]                # All Validations Pass for transfer: Echo the original 22-bit SBF from i1[t]
+            )
+        )
+    )
+#    : (i2[t] != 0) # This was the old i2, not used now.
+#    ? ( # --- Process Custom Asset from i2[t] ---
+#        o1[t] = ack_custom_processed()
+#    )
+    : o1[t] = fail_invalid() # Else (no recognized input stream is active or input is 0 for i0 and i1)
+
