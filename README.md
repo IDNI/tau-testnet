@@ -4,47 +4,56 @@ This project is the codebase for the Tau Testnet Alpha Blockchain. It implements
 
 ## Core Components
 
-*   **`server.py`**: The main TCP server application. It handles client connections, parses commands, and dispatches them to appropriate handlers.
-*   **`tau_manager.py`**: Manages the lifecycle of the Tau Docker process, including starting, stopping, monitoring, and facilitating communication (sending SBF input, receiving SBF output).
-*   **`commands/`**: Directory containing modules for handling specific client commands:
-    *   `sendtx.py`: Handles transaction submission. It parses JSON-formatted transactions, validates individual transfers against Tau logic, updates balances, and adds valid transactions to the mempool.
-    *   `getmempool.py`: Handles requests to retrieve the current content of the mempool. It currently interacts with Tau but primarily fetches from the DB.
-    *   `gettimestamp.py`: Intended for Tau-based timestamp (currently `getcurrenttimestamp` is handled directly by `server.py`).
-*   **`db.py`**: Provides an interface for SQLite database interactions. It manages:
-    *   `tau_strings` table: Maps arbitrary text strings (like public keys) to unique `y<ID>` identifiers for use with Tau.
-    *   `mempool` table: Stores transactions waiting to be processed.
-*   **`chain_state.py`**: Manages the in-memory state of account balances. Includes a genesis account and functions to update balances upon successful transfers.
-*   **`sbf_defs.py`**: Contains definitions for Symbolic Boolean Formula (SBF) constants used in communication with the Tau program (e.g., failure codes, success acknowledgments).
-*   **`utils.py`**: A collection of utility functions, primarily for converting between bit strings, SBF atom strings, and decimal values.
-*   **`config.py`**: Centralized configuration for server settings (host, port), Tau program details (file path, Docker image), timeouts, and database paths.
-*   **`test_sendtx.py`**: Unit tests for the `sendtx` command functionality, including mocking Tau interactions.
-*   **`tool_code.tau`**: The initial Tau logic file
+*   **`server.py`**: The main TCP server application.
+*   **`tau_manager.py`**: Manages the Tau Docker process lifecycle and communication.
+*   **`commands/`**: Modules for handling client commands:
+    *   `sendtx.py`: Handles submission and validation of complex transactions (including signature checks, sequence numbers, and Tau logic for operations).
+    *   `getmempool.py`: Retrieves mempool content.
+    *   `gettimestamp.py`: Handles timestamp requests.
+*   **`db.py`**: SQLite database interface (string-to-ID mapping, mempool).
+*   **`chain_state.py`**: Manages in-memory state (account balances, sequence numbers).
+*   **`sbf_defs.py`**: Symbolic Boolean Formula (SBF) constants for Tau communication.
+*   **`utils.py`**: Utilities for SBF, data conversions, and transaction message canonicalization.
+*   **`config.py`**: Centralized configuration.
+*   **`tool_code.tau`**: The Tau logic program for validating operations.
+*   **`tests/`**: Directory containing unit tests:
+    *   `test_sendtx.py`: Tests for the `sendtx` command, including new transaction structure and cryptographic signature verification.
+    *   `test_tau_logic.py`: Tests direct SBF interaction with `tool_code.tau`.
+    *   `test_chain_state.py`: Tests balance and sequence number management.
 
 ## Features
 
-*   **TCP Server**: Listens for client connections and handles commands concurrently.
-*   **Tau Integration**: Interacts with a `tool_code.tau` program (run in Docker) for validating business logic, particularly for `sendtx` operations.
-*   **Command Handling**:
-    *   `sendtx '{ "1": [["<from_pubkey_hex>", "<to_pubkey_hex>", "<amount_str>"], ...] }'`: Submits a transaction.
-        *   Each transfer within the transaction is individually validated with Tau.
-        *   `<pubkey_hex>` must be a 96-character hexadecimal BLS12-381 public key.
-        *   `<amount_str>` is a decimal string representing the amount (0-255 for Tau validation).
-    *   `getmempool`: Retrieves all transactions currently in the mempool.
-    *   `getcurrenttimestamp`: Returns the server's current UTC timestamp (handled directly by the server, not via Tau currently).
-*   **String-to-ID Mapping**: Dynamically assigns unique `y<ID>` identifiers to strings (e.g., public keys) for compact representation in Tau SBF.
-*   **In-Memory Balances**: Tracks account balances for a native coin (AGRS), with an initial Genesis balance.
-*   **SQLite Mempool**: Persists the mempool in an SQLite database.
-*   **BLS12-381 Public Key Validation**:
-    *   Performs format checks (96-char hex).
-    *   Optionally performs cryptographic validation if the `py_ecc.bls` library is installed.
-*   **Unit Testing**: Includes tests for `sendtx` command.
+*   **TCP Server**: Handles client connections and commands.
+*   **Authenticated Transactions via BLS Signatures**:
+    *   Transactions are cryptographically signed using BLS12-381 signatures.
+    *   The server verifies the signature against the `sender_pubkey` and a canonical representation of the transaction data.
+    *   Requires `py_ecc.bls` for signature verification.
+*   **Replay Protection with Sequence Numbers**:
+    *   Each account (`sender_pubkey`) has a sequence number managed by `chain_state.py`.
+    *   Transactions must include the correct sequence number, which is incremented upon successful validation.
+*   **Transaction Expiration**:
+    *   Transactions include an `expiration_time` (Unix timestamp) after which they are considered invalid.
+*   **New JSON Transaction Structure**:
+    *   The `sendtx` command now expects a JSON object with the following top-level fields:
+        *   `sender_pubkey` (string): BLS12-381 public key of the transaction authorizer.
+        *   `sequence_number` (integer): Nonce for replay protection.
+        *   `expiration_time` (integer): Unix timestamp for transaction validity.
+        *   `operations` (object): Contains the actual operations to perform (e.g., `"0": <rules_data>`, `"1": <transfers_list>`).
+            *   For transfers in `operations["1"]`, the `from_pubkey` of each transfer must match the top-level `sender_pubkey`.
+        *   `fee_limit` (string/integer): Placeholder for future fee models.
+        *   `signature` (string): Hex-encoded BLS signature over a canonical form of the other fields.
+*   **Tau Integration for Operation Validation**: The `tool_code.tau` program validates the logic of operations within a transaction (e.g., coin transfers via SBF).
+*   **String-to-ID Mapping**: Dynamically assigns `y<ID>` identifiers for Tau SBF.
+*   **In-Memory Balances & Sequence Numbers**: Tracks account balances and sequence numbers.
+*   **SQLite Mempool**: Persists transactions awaiting processing.
+*   **BLS12-381 Public Key Validation**: Format and optional cryptographic checks for public keys.
 
 ## Prerequisites
 
 *   Python 3.8+
 *   Docker
-*   A Tau Docker image (default: `tau`, configurable in `config.py`). This image should be capable of running `.tau` files.
-*   `py_ecc` (specifically `py_ecc.bls`): for full BLS public key cryptographic validation.
+*   A Tau Docker image (default: `tau`, configurable in `config.py`).
+*   `py_ecc` (specifically `py_ecc.bls`): **Required** for BLS public key validation and transaction signature verification.
 
 ## Setup and Running
 
@@ -53,58 +62,72 @@ This project is the codebase for the Tau Testnet Alpha Blockchain. It implements
     git clone <repository_url>
     cd <repository_directory>
     ```
-2.  **Ensure `tool_code.tau` is Present:**
-    Place your `tool_code.tau` file in the location specified by `config.TAU_PROGRAM_FILE` (defaults to the project root) or update the path in `config.py`.
-
-3.  **Ensure Tau Docker Image:**
-    Make sure the Docker image specified in `config.TAU_DOCKER_IMAGE` (default: `tau`) is available locally (e.g., `docker pull tau` or `docker build -t tau .` if you have a Dockerfile for it).
-
-4.  **Install Dependencies:**
+2.  **Set up Python Environment (Recommended):**
     ```bash
+    python3 -m venv venv
+    source venv/bin/activate 
     pip install py_ecc
     ```
+3.  **Ensure `tool_code.tau` is Present:**
+    Place your `tool_code.tau` file in the location specified by `config.TAU_PROGRAM_FILE` (defaults to the project root).
+
+4.  **Ensure Tau Docker Image:**
+    Make sure the Docker image specified in `config.TAU_DOCKER_IMAGE` (default: `tau`) is available.
 
 5.  **Run the Server:**
     ```bash
-    python server.py
+    python server.py 
     ```
-    The server will start, initialize the database (default: `strings.db` or `test_tau_string_db.sqlite` for tests, path configurable via `TAU_DB_PATH` environment variable), and attempt to start and manage the Tau Docker process.
+    The server will initialize the database and manage the Tau Docker process.
 
 ## Connecting to the Server
 
-You can connect to the server using any TCP client, such as `netcat` or `telnet`:
-
+Use any TCP client, e.g., `netcat`:
 ```bash
 netcat 127.0.0.1 65432
 ```
 
-Once connected, you can issue commands as described in the "Features" section.
-
 ## Available Commands
 
-*   **Send Transaction:**
+*   **Send Transaction (New Structure):**
     ```
-    sendtx '{"1": [["a63b...ea73", "000a...000a", "10"], ["a63b...ea73", "000b...000b", "20"]]}'
+    sendtx '{
+      "sender_pubkey": "a63b...ea73", 
+      "sequence_number": 0, 
+      "expiration_time": 1700000000, 
+      "operations": {
+        "1": [["a63b...ea73", "000a...000a", "10"]]
+      },
+      "fee_limit": "0",
+      "signature": "HEX_SIGNATURE_OVER_OTHER_FIELDS"
+    }'
     ```
-    (Replace pubkeys with actual 96-char hex keys and amounts with 0-255 values.)
+    *   Replace placeholders with actual values.
+    *   The client is responsible for creating the canonical message, hashing it, signing the hash, and providing the hex-encoded signature.
 
 *   **Get Mempool:**
     ```
     getmempool
     ```
+*   **GetCurrentTimestamp:**
+    ```
+    getcurrenttimestamp
+    ```
 
 ## Testing
 
-Unit tests are provided (e.g., `test_sendtx.py`). To run tests:
-
+Unit tests are located in the `tests/` directory. To run all tests:
 ```bash
-python -m unittest discover
-# or specifically
-# python test_sendtx.py
+python -m unittest discover tests
 ```
-The tests will use a separate database file (`test_tau_string_db.sqlite`) which is cleaned up before each test run.
+Or run a specific test file:
+```bash
+python tests/test_sendtx.py
+```
+Tests for `sendtx` now cover the new transaction structure, including cryptographic signature generation (within the test environment) and verification.
 
 ## Known Issues / Notes
+*   The fee model (`fee_limit`) is a placeholder and not yet enforced.
 
 ## Project Status
 
@@ -112,7 +135,8 @@ The tests will use a separate database file (`test_tau_string_db.sqlite`) which 
 
 ## Future Work
 
-*   Persistent chain state (blocks, not just balances).
+*   Implement a fee model.
+*   Persistent chain state (blocks, not just balances and sequence numbers).
 *   More robust error handling and reporting.
 *   Expansion of Tau-validated logic and commands.
 *   Implementation of a simple P2P networking layer.
