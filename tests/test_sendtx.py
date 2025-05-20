@@ -2,6 +2,12 @@ import unittest
 from unittest.mock import patch, MagicMock
 import json
 import os
+import sys
+
+# Add the project root to sys.path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 TEST_DB_PATH = "test_tau_string_db.sqlite"
 os.environ["TAU_DB_PATH"] = TEST_DB_PATH
@@ -33,6 +39,24 @@ ADDR_B = "0000000000000000000000000000000000000000000000000000000000000000000000
 ADDR_C = "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c"
 INVALID_ADDR_SHORT = "short"
 INVALID_ADDR_NON_HEX = "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000g"
+
+import hashlib
+
+# Dummy BLS interface for signature tests (signature is simply the message hash)
+class DummyBLS:
+    @staticmethod
+    def Verify(pubkey_bytes, message_hash, signature_bytes):
+        return signature_bytes == message_hash
+
+def canonical_bytes(tx_dict):
+    signing_dict = {
+        "sender_pubkey": tx_dict["sender_pubkey"],
+        "sequence_number": tx_dict["sequence_number"],
+        "expiration_time": tx_dict["expiration_time"],
+        "operations": tx_dict["operations"],
+        "fee_limit": tx_dict["fee_limit"],
+    }
+    return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 
 
 def sbf_to_int_array(sbf_atom, num_bits_per_field):
@@ -178,7 +202,7 @@ class TestSendTx(unittest.TestCase):
         self._cleanup_db()
         print(f"[TEARDOWN] Test {self.id()} finished.")
 
-    def _create_tx_json(self, operations_or_transfers, expiration_time=None, sequence_number=None):
+    def _create_tx_json(self, operations_or_transfers, expiration_time=None, sequence_number=None, signature="SIG", sender_pubkey=None):
         # Build operations dict from list or dict
         if isinstance(operations_or_transfers, list):
             ops = {"1": operations_or_transfers}
@@ -187,12 +211,12 @@ class TestSendTx(unittest.TestCase):
         exp_time = expiration_time if expiration_time is not None else int(time.time()) + 1000
         seq = sequence_number if sequence_number is not None else chain_state.get_sequence_number(GENESIS_ADDR)
         tx = {
-            "sender_pubkey": GENESIS_ADDR,
+            "sender_pubkey": sender_pubkey or GENESIS_ADDR,
             "sequence_number": seq,
             "expiration_time": exp_time,
             "operations": ops,
             "fee_limit": "0",
-            "signature": "SIG"
+            "signature": signature
         }
         return json.dumps(tx)
 
@@ -413,6 +437,43 @@ class TestSendTx(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             sendtx.queue_transaction(tx_json)
         self.assertIn("Missing 'signature'", str(cm.exception))
+
+    def test_signature_verification_and_sequence_enforcement(self):
+        print("[TEST_CASE] Signature verification and strict sequence enforcement")
+        self.mock_tau_manager_instance.mode = "auto"
+        # Build a valid transaction dict
+        ops = {"1": [[GENESIS_ADDR, ADDR_A, "3"]]}
+        tx_dict = {
+            "sender_pubkey": GENESIS_ADDR,
+            "sequence_number": chain_state.get_sequence_number(GENESIS_ADDR),
+            "expiration_time": int(time.time()) + 1000,
+            "operations": ops,
+            "fee_limit": "0",
+        }
+        # Compute dummy signature as hash of canonical bytes
+        msg_hash = hashlib.sha256(canonical_bytes(tx_dict)).digest()
+        sig_hex = msg_hash.hex()
+        tx_json = self._create_tx_json(ops, sequence_number=tx_dict["sequence_number"], signature=sig_hex)
+        # Enable dummy BLS for this test
+        sendtx._PY_ECC_AVAILABLE = True
+        sendtx._PY_ECC_BLS = DummyBLS
+        initial_seq = chain_state.get_sequence_number(GENESIS_ADDR)
+        result = sendtx.queue_transaction(tx_json)
+        self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
+        # Sequence number should be incremented
+        self.assertEqual(chain_state.get_sequence_number(GENESIS_ADDR), initial_seq + 1)
+
+    def test_invalid_signature_rejected(self):
+        print("[TEST_CASE] Invalid signature rejection")
+        self.mock_tau_manager_instance.mode = "auto"
+        ops = {"1": [[GENESIS_ADDR, ADDR_A, "2"]]}
+        # Create tx with bad signature
+        bad_sig = "00" * 32
+        tx_json = self._create_tx_json(ops, signature=bad_sig)
+        sendtx._PY_ECC_AVAILABLE = True
+        sendtx._PY_ECC_BLS = DummyBLS
+        result = sendtx.queue_transaction(tx_json)
+        self.assertTrue(result.startswith("FAILURE: Invalid signature"), f"Unexpected result: {result}")
 
 if __name__ == '__main__':
     print("Running SendTx Tests...")

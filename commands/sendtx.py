@@ -6,7 +6,7 @@ import json
 import db
 import chain_state
 import time
-import time
+import hashlib
 
 # Attempt to import py_ecc.bls for cryptographic validation of public keys
 _PY_ECC_AVAILABLE = False
@@ -142,6 +142,21 @@ def _decode_single_transfer_output(output_sbf_str, input_sbf_str):
         print(f"  [WARN][sendtx] Unexpected Tau output: '{output_sbf_str}' (Expected echo: '{input_sbf_str}' or known fail code)")
         return False
 
+def _get_signing_message_bytes(payload: dict) -> bytes:
+    """
+    Construct canonical bytes over transaction fields for BLS signing/verifying.
+    Only includes sender_pubkey, sequence_number, expiration_time, operations, and fee_limit.
+    Uses sorted keys and compact JSON.
+    """
+    signing_dict = {
+        "sender_pubkey": payload["sender_pubkey"],
+        "sequence_number": payload["sequence_number"],
+        "expiration_time": payload["expiration_time"],
+        "operations": payload["operations"],
+        "fee_limit": payload["fee_limit"],
+    }
+    return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
+
 def queue_transaction(json_blob: str) -> str:
     blob = json_blob.strip()
     if len(blob) >= 2 and ((blob[0] == '"' and blob[-1] == '"') or (blob[0] == "'" and blob[-1] == "'")):
@@ -162,15 +177,12 @@ def queue_transaction(json_blob: str) -> str:
     if not is_valid_sender:
         return f"FAILURE: Transaction invalid. {err_sender}"
 
-    # sequence_number (placeholder logic; enforcement in later phase)
+    # sequence_number field must be present and integer (strict enforcement after signature)
     if 'sequence_number' not in payload:
         raise ValueError("Missing 'sequence_number' in transaction.")
     sequence_number = payload['sequence_number']
     if not isinstance(sequence_number, int):
         raise ValueError(f"'sequence_number' must be an integer. Got {type(sequence_number).__name__}.")
-    expected_seq = chain_state.get_sequence_number(sender_pubkey)
-    if sequence_number != expected_seq:
-        print(f"[WARN][sendtx] Sequence number mismatch for {sender_pubkey[:10]}...: expected {expected_seq}, got {sequence_number}.")
 
     # expiration_time
     if 'expiration_time' not in payload:
@@ -194,12 +206,37 @@ def queue_transaction(json_blob: str) -> str:
     if not isinstance(fee_limit, (int, str)):
         raise ValueError(f"'fee_limit' must be a string or integer. Got {type(fee_limit).__name__}.")
 
-    # signature (parsed but not verified in this phase)
+    # signature field must be present and a string
     if 'signature' not in payload:
         raise ValueError("Missing 'signature' in transaction.")
     signature = payload['signature']
     if not isinstance(signature, str):
         raise ValueError(f"'signature' must be a string. Got {type(signature).__name__}.")
+
+    # BLS signature verification and strict sequence enforcement (Phase 2)
+    if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
+        msg_bytes = _get_signing_message_bytes(payload)
+        msg_hash = hashlib.sha256(msg_bytes).digest()
+        try:
+            sig_bytes = bytes.fromhex(signature)
+        except Exception:
+            return "FAILURE: Invalid signature format."
+        try:
+            pubkey_bytes = bytes.fromhex(sender_pubkey)
+        except Exception:
+            return "FAILURE: Invalid signature (bad public key format)."
+        try:
+            if not _PY_ECC_BLS.Verify(pubkey_bytes, msg_hash, sig_bytes):
+                return "FAILURE: Invalid signature."
+        except Exception as e:
+            print(f"[ERROR][sendtx] Signature verification error: {e}")
+            return "FAILURE: Invalid signature."
+        expected_seq = chain_state.get_sequence_number(sender_pubkey)
+        if sequence_number != expected_seq:
+            return f"FAILURE: Invalid sequence number: expected {expected_seq}, got {sequence_number}."
+        chain_state.increment_sequence_number(sender_pubkey)
+    else:
+        print("[WARN][sendtx] BLS crypto not available; skipping signature verification and sequence enforcement.")
 
     # If no transfers specified under operations, handle other ops via dynamic Tau input
     if '1' not in operations:
