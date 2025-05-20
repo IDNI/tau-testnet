@@ -11,6 +11,7 @@ import chain_state
 import db
 import sbf_defs
 import utils # For sbf_atom_to_bits, bits_to_sbf_atom, decimal_to_8bit_binary
+import time
 
 #Test Cases:
 # Successful single transfer.
@@ -79,15 +80,15 @@ class MockTauManager:
         self.sbf_input_received = sbf_input_str
         print(f"\n[MOCK_TAU][{self.tau_call_count}] Received SBF Input: {sbf_input_str}")
 
-        # Expected SBF structure: from(3), to(3), amount(8), balance_from_tau(8) -> 22 bits
-        # For example: x0-x2 (from), x3-x5 (to), x6-x13 (amount), x14-x21 (balance)
+        # Expected SBF structure: amount(4), balance_from_tau(4), from(4), to(4) -> 16 bits
+        # For example: x0-x3 (amount), x4-x7 (balance), x8-x11 (from), x12-x15 (to)
         try:
             # We need utils.sbf_atom_to_bits to be robust here
             # If utils cannot be imported or sbf_atom_to_bits is not available, this will fail.
             # This parsing is crucial for the mock to behave like the Tau code.
-            fields = sbf_to_int_array(sbf_input_str, [3, 3, 8, 8])
-            _from_id_val, _to_id_val, amount_val, balance_val = fields
-            print(f"[MOCK_TAU] Parsed SBF: FromID={_from_id_val}, ToID={_to_id_val}, Amount={amount_val}, BalanceForTau={balance_val}")
+            fields = sbf_to_int_array(sbf_input_str, [4, 4, 4, 4]) # New order & size: amount(4), balance(4), from(4), to(4)
+            amount_val, balance_val, _from_id_val, _to_id_val = fields
+            print(f"[MOCK_TAU] Parsed SBF: Amount={amount_val} (4b), BalanceForTau={balance_val} (4b), FromID={_from_id_val} (4b), ToID={_to_id_val} (4b)")
         except Exception as e:
             print(f"[MOCK_TAU] Error parsing SBF input '{sbf_input_str}' for detailed checks: {e}. Defaulting to echo or preset mode.")
             # Fallback if parsing fails, rely on simple mode
@@ -177,16 +178,31 @@ class TestSendTx(unittest.TestCase):
         self._cleanup_db()
         print(f"[TEARDOWN] Test {self.id()} finished.")
 
-    def _create_tx_json(self, transfers_list):
-        return json.dumps({"1": transfers_list})
+    def _create_tx_json(self, operations_or_transfers, expiration_time=None, sequence_number=None):
+        # Build operations dict from list or dict
+        if isinstance(operations_or_transfers, list):
+            ops = {"1": operations_or_transfers}
+        else:
+            ops = operations_or_transfers
+        exp_time = expiration_time if expiration_time is not None else int(time.time()) + 1000
+        seq = sequence_number if sequence_number is not None else chain_state.get_sequence_number(GENESIS_ADDR)
+        tx = {
+            "sender_pubkey": GENESIS_ADDR,
+            "sequence_number": seq,
+            "expiration_time": exp_time,
+            "operations": ops,
+            "fee_limit": "0",
+            "signature": "SIG"
+        }
+        return json.dumps(tx)
 
     def test_successful_single_transfer(self):
-        print("[TEST_CASE] Successful single transfer: Genesis -> ADDR_A, 100 AGRS")
+        print("[TEST_CASE] Successful single transfer: Genesis -> ADDR_A, 10 AGRS")
         self.mock_tau_manager_instance.mode = "auto" # Tau mock will simulate success
         
         initial_genesis_balance = chain_state.get_balance(GENESIS_ADDR)
         initial_addr_a_balance = chain_state.get_balance(ADDR_A)
-        amount = 100
+        amount = 10 # Corrected: Was 100, now 10 for 4-bit compatibility
 
         tx_json = self._create_tx_json([[GENESIS_ADDR, ADDR_A, str(amount)]])
         result = sendtx.queue_transaction(tx_json)
@@ -200,12 +216,12 @@ class TestSendTx(unittest.TestCase):
         self.assertEqual(mempool[0], "json:" + tx_json)
 
     def test_successful_multiple_transfers(self):
-        print("[TEST_CASE] Successful multiple transfers: G->A (100), G->B (50)")
+        print("[TEST_CASE] Successful multiple transfers: G->A (10), G->B (5)")
         self.mock_tau_manager_instance.mode = "auto"
 
         initial_genesis_balance = chain_state.get_balance(GENESIS_ADDR)
-        amount1 = 100
-        amount2 = 50
+        amount1 = 10 # Corrected: Was 100, now 10
+        amount2 = 5  # Corrected: Was 50, now 5
 
         tx_list = [
             [GENESIS_ADDR, ADDR_A, str(amount1)],
@@ -224,20 +240,20 @@ class TestSendTx(unittest.TestCase):
         self.assertEqual(self.mock_tau_manager_instance.tau_call_count, 2) # Tau called for each transfer
 
     def test_fail_insufficient_funds_actual_balance_tau_rejection(self):
-        print("[TEST_CASE] Fail: Insufficient actual funds (Tau Rejection)")
-        # Tau will check its 8-bit amount vs 8-bit capped balance.
-        # Scenario: Genesis has 100. Wants to send 150. Both <= 255.
-        # actual_sender_balance = 100, amount_int = 150.
-        # sender_balance_for_tau = min(100, 255) = 100.
-        # SBF to Tau: amount=150, balance_for_tau=100.
-        # Mock Tau (auto): amount_val (150) > balance_val (100) -> TRUE. Returns FAIL_INSUFFICIENT_FUNDS_SBF.
+        print("[TEST_CASE] Fail: Insufficient actual funds (Tau Rejection - 4bit amount/balance)")
+        # Tau will check its 4-bit amount vs 4-bit capped balance.
+        # Scenario: Genesis has 10. Wants to send 12. Both <= 15.
+        # actual_sender_balance = 10, amount_int = 12.
+        # sender_balance_for_tau = min(10, 15) = 10.
+        # SBF to Tau: amount=12, balance_for_tau=10.
+        # Mock Tau (auto): amount_val (12) > balance_val (10) -> TRUE. Returns FAIL_INSUFFICIENT_FUNDS_SBF.
         
         # Setup: Give Genesis a smaller balance for this test
-        chain_state._balances[GENESIS_ADDR] = 100
-        self.assertEqual(chain_state.get_balance(GENESIS_ADDR), 100)
+        chain_state._balances[GENESIS_ADDR] = 10
+        self.assertEqual(chain_state.get_balance(GENESIS_ADDR), 10)
 
         self.mock_tau_manager_instance.mode = "auto" 
-        amount_to_send = 150 
+        amount_to_send = 12 # Amount is > balance (10) but <= 15
         tx_json = self._create_tx_json([[GENESIS_ADDR, ADDR_A, str(amount_to_send)]])
         result = sendtx.queue_transaction(tx_json)
         
@@ -245,19 +261,19 @@ class TestSendTx(unittest.TestCase):
         self.assertIn("rejected by tau logic", result.lower())
         # Check that sendtx._decode_single_transfer_output logged the specific Tau error
         # (this would require capturing logs or checking stdout if verbose)
-        self.assertEqual(chain_state.get_balance(GENESIS_ADDR), 100)
+        self.assertEqual(chain_state.get_balance(GENESIS_ADDR), 10)
         self.assertEqual(chain_state.get_balance(ADDR_A), 0)
         self.assertEqual(len(db.get_mempool_txs()), 0)
         self.assertEqual(self.mock_tau_manager_instance.tau_call_count, 1)
 
     def test_fail_amount_too_large_for_sbf_python(self):
-        print("[TEST_CASE] Fail: Amount > 255 (Python util validation for SBF encoding)")
+        print("[TEST_CASE] Fail: Amount > 15 (Python util validation for 4-bit SBF encoding)")
         self.mock_tau_manager_instance.mode = "auto"
-        amount_to_send = 256 
+        amount_to_send = 16 # Max for 4-bit is 15. So 16 is invalid.
         tx_json = self._create_tx_json([[GENESIS_ADDR, ADDR_A, str(amount_to_send)]])
         result = sendtx.queue_transaction(tx_json)
         self.assertTrue(result.startswith("ERROR: Could not process transfer #1"), f"Unexpected result: {result}")
-        self.assertIn("Invalid amount '256': Must be a number between 0 and 255", result)
+        self.assertIn("Invalid amount '16': Must be a number between 0 and 15", result)
         self.assertEqual(chain_state.get_balance(GENESIS_ADDR), chain_state.GENESIS_BALANCE)
         self.assertEqual(len(db.get_mempool_txs()), 0)
         self.assertEqual(self.mock_tau_manager_instance.tau_call_count, 0)
@@ -265,7 +281,7 @@ class TestSendTx(unittest.TestCase):
     def test_fail_src_eq_dest_tau_rejection(self):
         print("[TEST_CASE] Fail: Source == Destination (Tau Rejection)")
         self.mock_tau_manager_instance.mode = "auto" 
-        amount = 10
+        amount = 10 # Valid amount within 4-bit range
         tx_json = self._create_tx_json([[GENESIS_ADDR, GENESIS_ADDR, str(amount)]])
         result = sendtx.queue_transaction(tx_json)
         self.assertTrue(result.startswith("FAILURE: Transaction invalid."), f"Unexpected result: {result}")
@@ -290,7 +306,7 @@ class TestSendTx(unittest.TestCase):
         print("[TEST_CASE] Fail: Insufficient Funds (Tau Rejection - FORCED SBF CODE)")
         print("    This test forces FAIL_INSUFFICIENT_FUNDS_SBF from Tau mock to test sendtx.py's decoder.")
         self.mock_tau_manager_instance.mode = "force_insufficient_funds"
-        amount = 50 
+        amount = 10 # Adjusted from 50 to be within 4-bit range
         self.assertTrue(chain_state.get_balance(GENESIS_ADDR) >= amount, "Test setup error: Genesis needs enough for this test variant")
         tx_json = self._create_tx_json([[GENESIS_ADDR, ADDR_A, str(amount)]])
         result = sendtx.queue_transaction(tx_json)
@@ -303,7 +319,15 @@ class TestSendTx(unittest.TestCase):
     def test_fail_invalid_from_address_format_python(self):
         print("[TEST_CASE] Fail: Invalid 'from' address format (Python encoding phase)")
         self.mock_tau_manager_instance.mode = "auto"
-        tx_json = self._create_tx_json([[INVALID_ADDR_SHORT, ADDR_A, "10"]])
+        tx = {
+            "sender_pubkey": INVALID_ADDR_SHORT,
+            "sequence_number": chain_state.get_sequence_number(INVALID_ADDR_SHORT),
+            "expiration_time": int(time.time()) + 1000,
+            "operations": {"1": [[INVALID_ADDR_SHORT, ADDR_A, "10"]]},
+            "fee_limit": "0",
+            "signature": "SIG"
+        }
+        tx_json = json.dumps(tx)
         result = sendtx.queue_transaction(tx_json)
         self.assertTrue(result.startswith("ERROR: Could not process transfer #1"), f"Unexpected result: {result}")
         self.assertIn("Invalid 'from' address: Must be a 96-character hex BLS12-381 public key: short", result)
@@ -321,15 +345,14 @@ class TestSendTx(unittest.TestCase):
     def test_no_transfers_key_success(self):
         print("[TEST_CASE] Success: No '1' key in JSON payload")
         self.mock_tau_manager_instance.mode = "auto"
-        tx_data_no_transfers = {"0": "some_other_op_data"}
-        tx_json = json.dumps(tx_data_no_transfers) # tx_json is already a string here
+        tx_json = self._create_tx_json({"0": "some_other_op_data"})
         result = sendtx.queue_transaction(tx_json)
         self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
         self.assertIn("no transfers to validate", result)
         mempool = db.get_mempool_txs()
         self.assertEqual(len(mempool), 1)
         self.assertEqual(mempool[0], "json:" + tx_json) # Compare with tx_json string
-        self.assertEqual(self.mock_tau_manager_instance.tau_call_count, 0)
+        self.assertEqual(self.mock_tau_manager_instance.tau_call_count, 1)
 
     def test_empty_transfers_list_success(self):
         print("[TEST_CASE] Success: Empty list for transfers payload '1': []")
@@ -342,6 +365,54 @@ class TestSendTx(unittest.TestCase):
         self.assertEqual(len(mempool), 1)
         self.assertEqual(mempool[0], "json:" + tx_json) # Compare with tx_json string
         self.assertEqual(self.mock_tau_manager_instance.tau_call_count, 0)
+
+    def test_expired_transaction(self):
+        print("[TEST_CASE] Fail: Transaction expired")
+        expired_time = int(time.time()) - 10
+        tx_json = self._create_tx_json([[GENESIS_ADDR, ADDR_A, "1"]], expiration_time=expired_time)
+        result = sendtx.queue_transaction(tx_json)
+        self.assertTrue(result.startswith("FAILURE: Transaction expired at"))
+        self.assertEqual(len(db.get_mempool_txs()), 0)
+        self.assertEqual(self.mock_tau_manager_instance.tau_call_count, 0)
+
+    def test_from_address_mismatch(self):
+        print("[TEST_CASE] Fail: Transfer from address not matching sender_pubkey")
+        self.mock_tau_manager_instance.mode = "auto"
+        invalid_transfer = [ADDR_B, ADDR_A, "1"]
+        tx_json = self._create_tx_json([invalid_transfer])
+        result = sendtx.queue_transaction(tx_json)
+        self.assertTrue(result.startswith("FAILURE: Transaction invalid."))
+        self.assertIn("does not match sender_pubkey", result)
+        self.assertEqual(len(db.get_mempool_txs()), 0)
+        self.assertEqual(self.mock_tau_manager_instance.tau_call_count, 0)
+
+    def test_missing_sequence_number(self):
+        print("[TEST_CASE] Fail: Missing sequence_number field")
+        tx = {
+            "sender_pubkey": GENESIS_ADDR,
+            "expiration_time": int(time.time()) + 1000,
+            "operations": {"1": [[GENESIS_ADDR, ADDR_A, "1"]]},
+            "fee_limit": "0",
+            "signature": "SIG"
+        }
+        tx_json = json.dumps(tx)
+        with self.assertRaises(ValueError) as cm:
+            sendtx.queue_transaction(tx_json)
+        self.assertIn("Missing 'sequence_number'", str(cm.exception))
+
+    def test_missing_signature(self):
+        print("[TEST_CASE] Fail: Missing signature field")
+        tx = {
+            "sender_pubkey": GENESIS_ADDR,
+            "sequence_number": chain_state.get_sequence_number(GENESIS_ADDR),
+            "expiration_time": int(time.time()) + 1000,
+            "operations": {"1": [[GENESIS_ADDR, ADDR_A, "1"]]},
+            "fee_limit": "0"
+        }
+        tx_json = json.dumps(tx)
+        with self.assertRaises(ValueError) as cm:
+            sendtx.queue_transaction(tx_json)
+        self.assertIn("Missing 'signature'", str(cm.exception))
 
 if __name__ == '__main__':
     print("Running SendTx Tests...")

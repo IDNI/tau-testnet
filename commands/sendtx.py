@@ -5,6 +5,8 @@ from db import add_mempool_tx
 import json
 import db
 import chain_state
+import time
+import time
 
 # Attempt to import py_ecc.bls for cryptographic validation of public keys
 _PY_ECC_AVAILABLE = False
@@ -62,23 +64,23 @@ def _validate_bls12_381_pubkey(key_hex: str, key_name: str) -> tuple[bool, str |
 def _encode_single_transfer_sbf(transfer_entry, sender_balance_for_tau: int):
     """
     Encodes a single [from_pubkey, to_pubkey, amount] transfer and sender's (capped) balance
-    into a 22-bit SBF atom.
+    into a 16-bit SBF atom.
     from_pubkey and to_pubkey are BLS12-381 public key hex strings.
-    amount is decimal string, sender_balance_for_tau is an int (0-255).
-    The SBF pattern is: from(3) + to(3) + amount(8) + sender_balance(8).
+    amount is decimal string (0-15), sender_balance_for_tau is an int (0-15).
+    The SBF pattern is: amount(4) + sender_balance(4) + from(4) + to(4).
     """
     if not (isinstance(transfer_entry, (list, tuple)) and len(transfer_entry) == 3):
         raise ValueError(f"Invalid transfer entry format: {transfer_entry}")
     from_addr_key, to_addr_key, amount_decimal_str = map(str, transfer_entry)
 
-    # Helper to validate BLS key, get yID, and convert its numeric part to 3 bits
+    # Helper to validate BLS key, get yID, and convert its numeric part to 4 bits
     def get_address_bits(addr_key_hex, addr_name):
         if not (isinstance(addr_key_hex, str) and len(addr_key_hex) == 96 and all(c in '0123456789abcdef' for c in addr_key_hex.lower())):
             raise ValueError(f"Invalid '{addr_name}' address: Must be a 96-character hex BLS12-381 public key: {addr_key_hex}")
         yid = db.get_string_id(addr_key_hex)
         try:
             id_num = int(yid[1:])
-            bits = format((id_num - 1) % 8, '03b') 
+            bits = format((id_num - 1) % 16, '04b') 
             # print(f"  [INFO][sendtx] Mapped '{addr_name}' BLS key {addr_key_hex[:10]}... to yID {yid}, bits {bits}") # Less verbose
         except ValueError:
             raise ValueError(f"Could not parse numeric ID from yID '{yid}' for '{addr_name}' address ({addr_key_hex[:10]}...)")
@@ -88,25 +90,25 @@ def _encode_single_transfer_sbf(transfer_entry, sender_balance_for_tau: int):
     to_bits = get_address_bits(to_addr_key, "to")
 
     try:
-        amount_binary = utils.decimal_to_8bit_binary(amount_decimal_str)
+        amount_binary = utils.decimal_to_4bit_binary(amount_decimal_str)
     except ValueError as e:
         raise e 
 
     try:
-        # Ensure sender_balance_for_tau is within 0-255 for 8-bit representation
-        if not (0 <= sender_balance_for_tau <= 255):
+        # Ensure sender_balance_for_tau is within 0-15 for 4-bit representation
+        if not (0 <= sender_balance_for_tau <= 15):
             # This should ideally be caught before calling, but as a safeguard:
-            raise ValueError(f"sender_balance_for_tau must be between 0 and 255, got {sender_balance_for_tau}")
-        balance_binary = format(sender_balance_for_tau, '08b')
+            raise ValueError(f"sender_balance_for_tau must be between 0 and 15, got {sender_balance_for_tau}")
+        balance_binary = format(sender_balance_for_tau, '04b')
     except ValueError as e: # Should not happen if input is int, but good practice
-        raise ValueError(f"Could not convert sender_balance_for_tau '{sender_balance_for_tau}' to 8-bit binary: {e}")
+        raise ValueError(f"Could not convert sender_balance_for_tau '{sender_balance_for_tau}' to 4-bit binary: {e}")
 
-    # Construct the 22-bit pattern: from(3) + to(3) + amount(8) + balance(8)
-    full_bit_pattern = from_bits + to_bits + amount_binary + balance_binary
-    if len(full_bit_pattern) != 22: 
-        raise AssertionError(f"Internal error: Generated bit pattern length is {len(full_bit_pattern)}, expected 22.")
+    # Construct the 16-bit pattern: amount(4) + balance(4) + from(4) + to(4)
+    full_bit_pattern = amount_binary + balance_binary + from_bits + to_bits
+    if len(full_bit_pattern) != 16: # Check for 16 bits
+        raise AssertionError(f"Internal error: Generated bit pattern length is {len(full_bit_pattern)}, expected 16.")
 
-    sbf_atom = utils.bits_to_sbf_atom(full_bit_pattern, length=22)
+    sbf_atom = utils.bits_to_sbf_atom(full_bit_pattern, length=16)
     print(f"  [DEBUG][sendtx] Encoded transfer+balance {[from_addr_key[:10]+'...', to_addr_key[:10]+'...', amount_decimal_str, sender_balance_for_tau]} to SBF: '{sbf_atom}' (Pattern: {full_bit_pattern})")
     return sbf_atom
 
@@ -151,18 +153,71 @@ def queue_transaction(json_blob: str) -> str:
     if not isinstance(payload, dict):
         raise ValueError("Transaction must be a JSON object.")
 
-    if '1' not in payload:
-        # If no transfers, consider it valid for queuing (other ops might be present)
-        # Or, require '1' if it's purely a transfer-focused transaction type.
-        # For now, allowing it to pass if '1' is missing.
-        print("  [INFO][sendtx] No transfers (key '1') in payload. Queuing as is.")
-        db.add_mempool_tx(blob)
-        return f"SUCCESS: Transaction queued (no transfers to validate via Tau)."
+    # Parse and validate new top-level transaction fields (structural update phase)
+    # sender_pubkey
+    if 'sender_pubkey' not in payload:
+        raise ValueError("Missing 'sender_pubkey' in transaction.")
+    sender_pubkey = payload['sender_pubkey']
+    is_valid_sender, err_sender = _validate_bls12_381_pubkey(sender_pubkey, "sender_pubkey")
+    if not is_valid_sender:
+        return f"FAILURE: Transaction invalid. {err_sender}"
 
-    transfers = payload['1']
+    # sequence_number (placeholder logic; enforcement in later phase)
+    if 'sequence_number' not in payload:
+        raise ValueError("Missing 'sequence_number' in transaction.")
+    sequence_number = payload['sequence_number']
+    if not isinstance(sequence_number, int):
+        raise ValueError(f"'sequence_number' must be an integer. Got {type(sequence_number).__name__}.")
+    expected_seq = chain_state.get_sequence_number(sender_pubkey)
+    if sequence_number != expected_seq:
+        print(f"[WARN][sendtx] Sequence number mismatch for {sender_pubkey[:10]}...: expected {expected_seq}, got {sequence_number}.")
+
+    # expiration_time
+    if 'expiration_time' not in payload:
+        raise ValueError("Missing 'expiration_time' in transaction.")
+    expiration_time = payload['expiration_time']
+    if not isinstance(expiration_time, int):
+        raise ValueError(f"'expiration_time' must be an integer. Got {type(expiration_time).__name__}.")
+    current_time = int(time.time())
+    if current_time > expiration_time:
+        return f"FAILURE: Transaction expired at {expiration_time}. Current time is {current_time}."
+
+    # operations
+    if 'operations' not in payload or not isinstance(payload['operations'], dict):
+        raise ValueError("Missing or invalid 'operations' in transaction.")
+    operations = payload['operations']
+
+    # fee_limit (placeholder, not used yet)
+    if 'fee_limit' not in payload:
+        raise ValueError("Missing 'fee_limit' in transaction.")
+    fee_limit = payload['fee_limit']
+    if not isinstance(fee_limit, (int, str)):
+        raise ValueError(f"'fee_limit' must be a string or integer. Got {type(fee_limit).__name__}.")
+
+    # signature (parsed but not verified in this phase)
+    if 'signature' not in payload:
+        raise ValueError("Missing 'signature' in transaction.")
+    signature = payload['signature']
+    if not isinstance(signature, str):
+        raise ValueError(f"'signature' must be a string. Got {type(signature).__name__}.")
+
+    # If no transfers specified under operations, handle other ops via dynamic Tau input
+    if '1' not in operations:
+        # Build SBF input for other operation fields
+        try:
+            dynamic_sbf_input = utils.build_tau_input(operations)
+            tau_manager.communicate_with_tau(dynamic_sbf_input)
+        except Exception as e:
+            print(f"  [WARN][sendtx] Dynamic Tau input failed: {e}")
+
+        print("  [INFO][sendtx] No transfers (operations['1']) in payload. Queuing as is.")
+        db.add_mempool_tx(blob)
+        return "SUCCESS: Transaction queued (no transfers to validate via Tau)."
+    
+    transfers = operations['1']
     if not isinstance(transfers, list):
         raise ValueError("Transfers (key '1') must be a list.")
-    if not transfers: # Empty list of transfers
+    if not transfers:
         print("  [INFO][sendtx] Empty list of transfers in payload. Queuing as is.")
         db.add_mempool_tx(blob)
         return f"SUCCESS: Transaction queued (empty transfer list)."
@@ -174,8 +229,13 @@ def queue_transaction(json_blob: str) -> str:
         print(f"    Validating transfer #{i+1}: {transfer_entry}")
         if not (isinstance(transfer_entry, (list, tuple)) and len(transfer_entry) == 3):
             return f"FAILURE: Transaction invalid. Transfer #{i+1} has invalid format: {transfer_entry}"
-        
+            
         from_addr_key, to_addr_key, amount_decimal_str = map(str, transfer_entry)
+
+        # Crucial: from_addr_key must match sender_pubkey
+        if from_addr_key != sender_pubkey:
+            return (f"FAILURE: Transaction invalid. Transfer #{i+1} 'from' address "
+                    f"{from_addr_key} does not match sender_pubkey {sender_pubkey}")
 
         # Validate address formats first (non-cryptographic part)
         is_valid_from, err_from = _validate_bls12_381_pubkey(from_addr_key, f"transfer #{i+1} 'from' address")
@@ -183,23 +243,23 @@ def queue_transaction(json_blob: str) -> str:
             return f"FAILURE: Transaction invalid. {err_from}"
         is_valid_to, err_to = _validate_bls12_381_pubkey(to_addr_key, f"transfer #{i+1} 'to' address")
         if not is_valid_to:
-             return f"FAILURE: Transaction invalid. {err_to}"
+            return f"FAILURE: Transaction invalid. {err_to}"
 
         try:
             amount_int = int(amount_decimal_str)
         except ValueError:
-            # If amount_decimal_str is not even an integer, _encode_single_transfer_sbf will fail at decimal_to_8bit_binary.
+            # If amount_decimal_str is not even an integer, _encode_single_transfer_sbf will fail at decimal_to_4bit_binary.
             print(f"  [ERROR][sendtx] Transfer #{i+1} has non-integer amount '{amount_decimal_str}'. Encoding will likely fail.")
-            # Let it proceed to encoding, which will raise an error if invalid format for 8-bit conversion.
+            # Let it proceed to encoding, which will raise an error if invalid format for 4-bit conversion.
             pass # Allow to proceed to encoding attempt
 
         actual_sender_balance = chain_state.get_balance(from_addr_key)
 
-        # Prepare balance for Tau (capped 0-255)
-        sender_balance_for_tau = min(actual_sender_balance, 255) 
+        # Prepare balance for Tau (capped 0-15 for 4 bits)
+        sender_balance_for_tau = min(actual_sender_balance, 15) 
 
         try:
-            # Encoding will fail here if amount_decimal_str is not valid for decimal_to_8bit_binary (e.g. >255, non-numeric)
+            # Encoding will fail here if amount_decimal_str is not valid for decimal_to_4bit_binary (e.g. >15, non-numeric)
             sbf_input = _encode_single_transfer_sbf(transfer_entry, sender_balance_for_tau)
             sbf_output = tau_manager.communicate_with_tau(sbf_input)
             is_valid_in_tau = _decode_single_transfer_output(sbf_output, sbf_input)

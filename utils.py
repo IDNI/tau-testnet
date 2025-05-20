@@ -82,6 +82,17 @@ def sbf_atom_to_bits(sbf_atom_str: str) -> str | None:
     # print(f"[DEBUG][sbf_atom_to_bits] Converted SBF '{sbf_atom_str}' to bits '{final_bits}'")
     return final_bits
 
+def decimal_to_4bit_binary(decimal_str: str) -> str:
+    """Converts a decimal string (0-15) to a 4-bit binary string."""
+    try:
+        amount_int = int(decimal_str)
+        if not (0 <= amount_int <= 15):
+            raise ValueError(f"Amount '{amount_int}' out of range (must be 0-15 for 4 bits)")
+        binary_str = format(amount_int, '04b')
+        return binary_str
+    except ValueError as e:
+        raise ValueError(f"Invalid amount '{decimal_str}': Must be a number between 0 and 15.")
+
 def decimal_to_8bit_binary(decimal_str: str) -> str:
     """Converts a decimal string (0-255) to an 8-bit binary string."""
     try:
@@ -142,7 +153,13 @@ def normalize_sbf_atoms(s: str) -> str:
     - Extract tokens x<id>'?
     - Sort by numeric id (0-indexed)
     - Join with ' & ' separator
+    If the string is an SBF constant literal (e.g., {x0'}:sbf), it's returned as is.
     """
+    s = s.strip()
+    # Check if it's an SBF constant literal like {x0'}:sbf or {x123}:sbf
+    if re.fullmatch(r"\{[^}]+\}:sbf", s): # Matches {content}:sbf
+        return s # Return as-is if it's a defined SBF constant form
+
     atoms = re.findall(r"x(\d+)('?)", s)
     if atoms:
         try:
@@ -155,3 +172,41 @@ def normalize_sbf_atoms(s: str) -> str:
             return s # Return original on error
         return ' & '.join(sorted_atom_strings)
     return s
+
+# --- Helper utilities for dynamic Tau inputs (added 2025-05-15) --------------
+
+def build_sbf_atom_for_value(value: int) -> str:
+    """
+    Encode an integer 0-15 as a 4-bit SBF atom (e.g., 1 → "x0' & x1' & x2' & x3").
+    """
+    if not (0 <= value <= 15):
+        raise ValueError(f"Value {value} out of 4-bit range 0-15.")
+    bits = decimal_to_4bit_binary(str(value))
+    return bits_to_sbf_atom(bits, 4)
+
+def build_tau_input(
+    payload: dict,
+    expected_fields: tuple[int, ...] = (0, 1, 2),
+) -> str:
+    """
+    Build a multiline SBF string assigning each iN[0].
+
+    • Missing fields → `F`  
+    • Integer 0-15   → encoded 4-bit atom  
+    • Anything else  → treated as `F`
+    """
+    lines: list[str] = []
+    for idx in expected_fields:
+        key = str(idx)
+        if key not in payload:
+            lines.append(f"i{idx}[0] := F")
+            continue
+
+        value = payload[key]
+        if isinstance(value, int) and 0 <= value <= 15:
+            atom = build_sbf_atom_for_value(value)
+            lines.append(f"i{idx}[0] := {atom}")
+        else:
+            lines.append(f"i{idx}[0] := F")
+
+    return "\n".join(lines)

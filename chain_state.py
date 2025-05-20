@@ -7,6 +7,12 @@ _balance_lock = threading.Lock()
 # Maps full BLS public key hex strings to integer amounts
 _balances = {}
 
+# Lock for thread-safe access to sequence numbers
+_sequence_lock = threading.Lock()
+
+# In-memory sequence numbers table: maps address to sequence number
+_sequence_numbers = {}
+
 GENESIS_ADDRESS = "a63b560d042dafc25ea563177c1700b988dfc8c19273763884e38803961e0282c84ebb659d0df0d52e377b3da6afea73"
 GENESIS_BALANCE = 1000000
 
@@ -46,3 +52,13 @@ def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, a
         
         print(f"[INFO][chain_state] Balances updated: {from_address_hex[:10]}... now {_balances[from_address_hex]}, {to_address_hex[:10]}... now {_balances[to_address_hex]}")
         return True
+
+def get_sequence_number(address_hex: str) -> int:
+    """Returns the current sequence number for the given address (defaults to 0)."""
+    with _sequence_lock:
+        return _sequence_numbers.get(address_hex, 0)
+
+def increment_sequence_number(address_hex: str):
+    """Increments the sequence number for the given address."""
+    with _sequence_lock:
+        _sequence_numbers[address_hex] = _sequence_numbers.get(address_hex, 0) + 1

@@ -4,6 +4,7 @@ import time
 import os
 import sys
 import queue
+import re # Added for regex matching
 
 # Import shared state and config
 import config
@@ -250,13 +251,13 @@ def communicate_with_tau(input_sbf):
              raise Exception(f"Failed to write to Tau process stdin: {e}") from e
 
         # Read stdout line by line
-        sbf_output_line = sbf_defs.SBF_ZERO # Default using definition
+        sbf_output_line = sbf_defs.SBF_LOGICAL_ZERO # Default if no specific o1 output found
         output_lines_read = []
         start_comm_time = time.monotonic()
+        found_o1_output = False
         try:
              while time.monotonic() - start_comm_time < config.COMM_TIMEOUT:
                  # Check if process died while we are waiting for output
-                 # Check poll() without lock here is okay for quick check, main check is locked
                  if tau_process.poll() is not None:
                      print("[ERROR] communicate_with_tau: Tau process exited while waiting for output.")
                      tau_ready.clear()
@@ -272,20 +273,40 @@ def communicate_with_tau(input_sbf):
                  output_lines_read.append(line_strip)
                  print(f"  [TAU_STDOUT_COMM] {line_strip}")
 
-                 # Use the utility function for the heuristic check
-                 if utils.sbf_output_heuristic_check(line_strip, input_sbf, sbf_defs):
-                     sbf_output_line = line_strip
-                     print(f"  [DEBUG] communicate_with_tau: Parsed SBF output line: '{sbf_output_line}'")
-                     break # Found plausible output
-             else:
-                 # Loop finished due to timeout
+                 # New logic: Specifically look for o1 assignment
+                 # Regex to match "o1[<any_digits_or_t>] = <sbf_part>" or "o1 = <sbf_part>"
+                 # Tau source uses '=', not ':=' for o1 assignment. Example: o1[t] = fail_code_value
+                 match = re.match(rf"^{re.escape(sbf_defs.TAU_OUTPUT_STREAM_MAIN)}(?:\s*\[\w+\])?\s*=\s*(.*)", line_strip)
+                 if match:
+                     sbf_candidate = match.group(1).strip()
+                     # This sbf_candidate is the direct value assigned to o1 by Tau.
+                     sbf_output_line = sbf_candidate
+                     found_o1_output = True
+                     print(f"  [DEBUG] communicate_with_tau: Extracted SBF output for o1: '{sbf_output_line}' from line '{line_strip}'")
+                     break # Found definitive o1 output, stop reading further lines for this communication
+
+             if not found_o1_output:
+                 # Loop finished due to timeout without finding a clear o1 assignment
                  all_output = "\n".join(output_lines_read)
-                 print(f"[ERROR] communicate_with_tau: Timeout ({config.COMM_TIMEOUT}s) waiting for SBF response from Tau. Output read:\n{all_output}")
+                 print(f"[ERROR] communicate_with_tau: Timeout ({config.COMM_TIMEOUT}s) or no 'o1 = <value>' line found. Output read:\n{all_output}")
                  # Check if process died right at the end
                  if tau_process and tau_process.poll() is not None:
                      tau_ready.clear()
-                     raise Exception("Tau process exited just before communication timeout.")
-                 raise TimeoutError(f"Timeout waiting for Tau response after {config.COMM_TIMEOUT} seconds.")
+                     raise Exception("Tau process exited just before communication timeout or without o1 output.")
+                 # Fallback to old heuristic if no o1 assignment found, this might catch echoes or other formats
+                 # but is less reliable. Consider if this fallback is desirable or should raise error.
+                 # For now, let's try to use the last plausible line if any was identified by the old heuristic
+                 # This part is a bit speculative and might need removal if it causes issues.
+                 print(f"[WARN] communicate_with_tau: No explicit 'o1 = <value>' line found. Applying old heuristic to all read lines.")
+                 temp_sbf_output = sbf_defs.SBF_LOGICAL_ZERO
+                 for read_line in reversed(output_lines_read):
+                     if utils.sbf_output_heuristic_check(read_line, input_sbf, sbf_defs):
+                         temp_sbf_output = read_line
+                         print(f"  [DEBUG] communicate_with_tau: Fallback heuristic chose line: '{temp_sbf_output}'")
+                         break
+                 sbf_output_line = temp_sbf_output
+                 if not found_o1_output and sbf_output_line == sbf_defs.SBF_LOGICAL_ZERO: # if still default after fallback
+                    raise TimeoutError(f"Timeout or no valid SBF output from Tau after {config.COMM_TIMEOUT} seconds. Check Tau logs for errors. Read output: {all_output}")
 
         except (OSError, ValueError) as e:
             print(f"[ERROR] communicate_with_tau: Error reading Tau stdout: {e}")
