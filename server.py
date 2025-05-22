@@ -8,6 +8,7 @@ import os
 import config
 import tau_manager
 import re
+import json
 import db
 from commands import sendtx, getmempool, gettimestamp  # Import command handlers
 import chain_state # Added import
@@ -91,6 +92,39 @@ def handle_client(conn, addr):
                     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     resp = f"Current Timestamp (UTC): {now}\r\n"
                     print(f"[INFO][Server] Sending timestamp to {addr}: '{resp}'")
+                    conn.sendall(resp.encode('utf-8'))
+                    continue
+
+                if raw.lower().startswith("getbalance "):
+                    parts = raw.split()
+                    if len(parts) != 2:
+                        resp = "ERROR: Usage: getbalance <address>\r\n"
+                    else:
+                        bal = chain_state.get_balance(parts[1])
+                        resp = f"BALANCE: {bal}\r\n"
+                    conn.sendall(resp.encode('utf-8'))
+                    continue
+
+                if raw.lower().startswith("history "):
+                    parts = raw.split()
+                    if len(parts) != 2:
+                        resp = "ERROR: Usage: history <address>\r\n"
+                    else:
+                        addr = parts[1]
+                        items = []
+                        for entry in db.get_mempool_txs():
+                            if entry.startswith("json:"):
+                                try:
+                                    payload = json.loads(entry[5:])
+                                except Exception:
+                                    continue
+                                ops = payload.get("operations", {}).get("1", [])
+                                if payload.get("sender_pubkey") == addr or any(isinstance(op, (list, tuple)) and addr in op for op in ops):
+                                    items.append(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+                        if items:
+                            resp = "HISTORY:\n" + "\n".join(items) + "\r\n"
+                        else:
+                            resp = "HISTORY: empty\r\n"
                     conn.sendall(resp.encode('utf-8'))
                     continue
 

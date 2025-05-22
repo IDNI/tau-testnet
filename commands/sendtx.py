@@ -8,7 +8,19 @@ import chain_state
 import time
 import hashlib
 
-# Attempt to import py_ecc.bls for cryptographic validation of public keys
+# {
+#   "sender_pubkey": "BLS_PUBLIC_KEY_HEX",
+#   "sequence_number": 123, // Integer nonce
+#   "expiration_time": 1678886400, // Unix timestamp
+#   "operations": {
+#     "0": "RULE_DATA_IF_ANY",
+#     "1": [["FROM_KEY", "TO_KEY", "AMOUNT"], ...], // Transfers
+#     // Other operation types can be added here.
+#   },
+#   "fee_limit": "10", // Placeholder for future fee model
+#   "signature": "HEX_ENCODED_BLS_SIGNATURE"
+# }
+
 _PY_ECC_AVAILABLE = False
 _PY_ECC_BLS = None
 try:

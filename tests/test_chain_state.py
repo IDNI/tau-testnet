@@ -1,3 +1,29 @@
+# Summary of Tests
+#
+# 1. test_initial_genesis_balance
+#    - Verifies genesis address starts with GENESIS_BALANCE and unknown addresses start at 0.
+#
+# 2. test_get_and_set_balance
+#    - Tests manual balance setting and retrieval via direct access to _balances.
+#
+# 3. test_update_balances_after_transfer
+#    - Validates balances update correctly after a successful transfer.
+#
+# 4. test_update_balances_insufficient_funds_internal_check
+#    - Ensures transfer fails and balances remain unchanged when funds are insufficient.
+#
+# 5. test_update_balances_zero_or_negative_amount
+#    - Ensures transfer fails for zero or negative transfer amounts.
+#
+# 6. test_initial_sequence_number
+#    - Checks that new addresses and GENESIS start with sequence number 0.
+#
+# 7. test_get_and_increment_sequence_number
+#    - Verifies that increment_sequence_number increases the sequence correctly.
+#
+# 8. test_sequence_number_isolation
+#    - Ensures sequence numbers are tracked independently per address.
+
 import unittest
 import os
 import sys

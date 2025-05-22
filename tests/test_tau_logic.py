@@ -1,10 +1,28 @@
-# Test cases for Tau logic
-
-# Insufficient funds (Amount > Balance).
-# Source address ID equals destination address ID.
-# Zero transfer amount.
-# Valid transfers (which should result in Tau echoing the input SBF).
-# Edge cases like Amount == Balance.
+# Summary of Tau Logic Tests
+#
+# 1. test_01_valid_transfer_echo
+#    - Confirms Tau echoes the input SBF for a valid transfer (amount <= balance, distinct addresses).
+#
+# 2. test_02_insufficient_funds
+#    - Verifies Tau returns FAIL_INSUFFICIENT_FUNDS_SBF when amount > balance.
+#
+# 3. test_03_source_equals_destination
+#    - Checks Tau returns FAIL_SRC_EQ_DEST_SBF when source and destination IDs are equal.
+#
+# 4. test_04_zero_amount
+#    - Ensures Tau returns FAIL_ZERO_AMOUNT_SBF for a transfer amount of zero.
+#
+# 5. test_05_amount_equals_balance_valid
+#    - Validates Tau echoes the input SBF when amount equals balance (edge case).
+#
+# 6. test_06_max_values_valid
+#    - Tests Tau echoes the input SBF for maximum field values (15-bit indices and amounts).
+#
+# 7. test_07_insufficient_funds_at_zero_balance
+#    - Confirms FAIL_INSUFFICIENT_FUNDS_SBF when balance is zero and amount > 0.
+#
+# 8. test_08_invalid_sbf_structure_length
+#    - Verifies Tau returns FAIL_INVALID_SBF for improperly structured SBF inputs.
 
 import unittest
 import os
