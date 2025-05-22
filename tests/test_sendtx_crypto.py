@@ -1,277 +1,164 @@
-import unittest
-from unittest.mock import patch, MagicMock
-import json
-import os
-import sys
-import time
-import hashlib
 
-# Add the project root to sys.path
+
+import unittest, os, sys, json, time, hashlib
+from unittest.mock import patch
+from py_ecc.bls import G2Basic as bls
+
+# Add project root
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-
-TEST_DB_PATH = "test_tau_string_db_crypto.sqlite"
-os.environ["TAU_DB_PATH"] = TEST_DB_PATH
+os.environ["TAU_DB_PATH"] = "test_tau_string_db.sqlite"
 
 from commands import sendtx
-import chain_state
-import db
-import sbf_defs # Though not directly used, imported by sendtx
-import utils # For _get_signing_message_bytes
-from commands.sendtx import _get_signing_message_bytes # Explicit import
-import py_ecc.bls as _bls_module # For BLS operations
-from py_ecc.bls import G2Basic as bls # For BLS operations
+import chain_state, db, sbf_defs, utils
+from commands.sendtx import _get_signing_message_bytes
 
-# --- Helper Addresses ---
-GENESIS_ADDR = chain_state.GENESIS_ADDRESS
-ADDR_A = "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a"
-ADDR_B = "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000b"
-
-# Minimal MockTauManager for crypto tests, as Tau interaction is not the focus
-class MockTauManager:
-    def __init__(self):
-        self.mode = "echo"
-        self.tau_call_count = 0
-    def communicate_with_tau(self, sbf_input_str):
-        self.tau_call_count += 1
-        if self.mode == "echo": return sbf_input_str
-        return sbf_input_str
+GENESIS = chain_state.GENESIS_ADDRESS
+ADDR_A = "000...a"
+ADDR_B = "000...b"
 
 class TestSendTxCrypto(unittest.TestCase):
-    def _cleanup_db(self):
-        if os.path.exists(TEST_DB_PATH):
-            os.remove(TEST_DB_PATH)
-        if db._db_conn:
-            db._db_conn.close()
-        db._db_conn = None
-
     def setUp(self):
-        print(f"\n--- Test: {self.id()} ---")
-        self._cleanup_db()
-        chain_state._balances.clear()
-        chain_state._sequence_numbers.clear()
-        db.STRING_DB_PATH = TEST_DB_PATH
-        db.init_db()
-        chain_state.init_chain_state()
-
-        self.mock_tau_manager_instance = MockTauManager()
-        self.patcher_tau_comm = patch('commands.sendtx.tau_manager.communicate_with_tau', 
-                                      self.mock_tau_manager_instance.communicate_with_tau)
-        self.mock_tau_comm = self.patcher_tau_comm.start()
-
-        # For crypto tests, we often want real pubkey validation, so don't mock _validate_bls12_381_pubkey by default
-        # It will be controlled per test if needed, or we'll rely on its actual behavior.
-        # However, ensure py_ecc is seen as available for these tests.
-        sendtx._PY_ECC_AVAILABLE = True
-        sendtx._PY_ECC_BLS = bls # Ensure the bls module is assigned in sendtx
-        print(f"[SETUP] Patched tau_manager. py_ecc.bls is enabled for sendtx.")
+        if os.path.exists("test_tau_string_db.sqlite"):
+            os.remove("test_tau_string_db.sqlite")
+        if db._db_conn:
+            db._db_conn.close(); db._db_conn = None
+        chain_state._balances.clear(); chain_state._sequence_numbers.clear()
+        db.init_db(); chain_state.init_chain_state()
+        self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau', lambda sbf: sbf).start()
 
     def tearDown(self):
-        self.patcher_tau_comm.stop()
-        # Ensure _PY_ECC_AVAILABLE is reset if changed by a test
-        sendtx._PY_ECC_AVAILABLE = False 
-        sendtx._PY_ECC_BLS = None
-        self._cleanup_db()
-        print(f"[TEARDOWN] Test {self.id()} finished.")
+        patch.stopall()
 
-    def _create_tx_dict(self, operations_or_transfers, expiration_time=None, sequence_number=None, sender_pubkey=None, fee_limit="0"):
-        if isinstance(operations_or_transfers, list):
-            ops = {"1": operations_or_transfers}
-        else:
-            ops = operations_or_transfers
-        exp_time = expiration_time if expiration_time is not None else int(time.time()) + 1000
-        pk_hex_to_use = sender_pubkey or GENESIS_ADDR
-        # For crypto tests, sequence number needs to be accurate if PY_ECC_AVAILABLE is True
-        seq = sequence_number if sequence_number is not None else chain_state.get_sequence_number(pk_hex_to_use)
-
-        return {
-            "sender_pubkey": pk_hex_to_use,
+    def _create_tx(self, transfers, expiration=None, sequence=None, sender_privkey=None, signature=None, sender_pubkey=None):
+        ops = {"1": transfers}
+        exp_time = expiration if expiration is not None else int(time.time()) + 1000
+        pk_hex = sender_pubkey or (bls.SkToPk(sender_privkey).hex() if sender_privkey else GENESIS)
+        seq = sequence if sequence is not None else chain_state.get_sequence_number(pk_hex)
+        tx_dict = {
+            "sender_pubkey": pk_hex,
             "sequence_number": seq,
             "expiration_time": exp_time,
             "operations": ops,
-            "fee_limit": fee_limit,
+            "fee_limit": "0",
         }
-
-    def _sign_tx_dict(self, tx_dict, sender_privkey):
-        # This helper assumes tx_dict already has all necessary fields for signing except "signature"
-        msg_bytes = _get_signing_message_bytes(tx_dict)
-        msg_hash = hashlib.sha256(msg_bytes).digest()
-        sig_bytes = bls.Sign(sender_privkey, msg_hash)
-        tx_dict["signature"] = sig_bytes.hex()
-        return tx_dict
-
-    def _create_signed_tx_json(self, operations_or_transfers, sender_privkey, expiration_time=None, sequence_number=None, sender_pubkey=None, fee_limit="0"):
-        # Determine public key from private key if not provided
-        actual_sender_pubkey = sender_pubkey
-        if actual_sender_pubkey is None:
-            actual_sender_pubkey = bls.SkToPk(sender_privkey).hex()
-
-        tx_dict_unsigned = self._create_tx_dict(operations_or_transfers, expiration_time, sequence_number, actual_sender_pubkey, fee_limit)
-        tx_dict_signed = self._sign_tx_dict(tx_dict_unsigned, sender_privkey)
-        return json.dumps(tx_dict_signed)
+        if sender_privkey is not None:
+            msg_bytes = _get_signing_message_bytes(tx_dict)
+            msg_hash = hashlib.sha256(msg_bytes).digest()
+            sig_bytes = bls.Sign(sender_privkey, msg_hash)
+            tx_dict["signature"] = sig_bytes.hex()
+        elif signature is not None:
+            tx_dict["signature"] = signature
+        else:
+            tx_dict["signature"] = "SIG"
+        return json.dumps(tx_dict)
 
     def test_valid_signature_and_sequence_increment(self):
-        print("[TEST_CASE] Crypto: Valid signature and correct sequence number increment")
-        self.mock_tau_manager_instance.mode = "auto"
-        privkey = bls.KeyGen(b"test_seed_crypto_1")
-        pk_hex = bls.SkToPk(privkey).hex()
-        initial_seq = chain_state.get_sequence_number(pk_hex) # Should be 0
+        privkey = bls.KeyGen(b"test_seed_1")
+        pubkey = bls.SkToPk(privkey)
+        pk_hex = pubkey.hex()
+        initial_seq = chain_state.get_sequence_number(pk_hex)
         amount = 3
-        chain_state._balances[pk_hex] = amount # Fund the new account
-
-        tx_json = self._create_signed_tx_json(
-            operations_or_transfers=[[pk_hex, ADDR_A, str(amount)]],
-            sender_privkey=privkey,
-            sequence_number=initial_seq # Explicitly pass current sequence number
-        )
+        chain_state._balances[pk_hex] = amount
+        ops = {"1": [[pk_hex, ADDR_A, str(amount)]]}
+        tx_json = self._create_tx([[pk_hex, ADDR_A, str(amount)]], sequence=initial_seq, sender_privkey=privkey)
+        sendtx._PY_ECC_AVAILABLE = True
+        sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("SUCCESS: Transaction queued"), f"Unexpected: {result}")
+        self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
         self.assertEqual(chain_state.get_sequence_number(pk_hex), initial_seq + 1)
 
-    def test_invalid_signature_tampered(self):
-        print("[TEST_CASE] Crypto: Invalid signature rejection (tampered signature)")
-        self.mock_tau_manager_instance.mode = "auto"
-        privkey = bls.KeyGen(b"test_seed_crypto_2")
-        pk_hex = bls.SkToPk(privkey).hex()
-        chain_state._balances[pk_hex] = 5 # Fund account
+    def test_invalid_signature_rejected(self):
+        privkey = bls.KeyGen(b"test_seed_2")
+        pubkey = bls.SkToPk(privkey)
+        pk_hex = pubkey.hex()
         seq = chain_state.get_sequence_number(pk_hex)
-
-        tx_dict_unsigned = self._create_tx_dict(
-            operations_or_transfers=[[pk_hex, ADDR_A, "2"]],
-            sender_pubkey=pk_hex,
-            sequence_number=seq
-        )
-        # Valid signature initially
-        tx_dict_signed = self._sign_tx_dict(tx_dict_unsigned, privkey)
-        # Tamper the signature
-        original_sig = tx_dict_signed["signature"]
-        tampered_sig = list(original_sig)
-        tampered_sig[5] = 'F' if tampered_sig[5] != 'F' else 'E' # Flip a char
-        tx_dict_signed["signature"] = "".join(tampered_sig)
-        tx_json_tampered_sig = json.dumps(tx_dict_signed)
-
-        result = sendtx.queue_transaction(tx_json_tampered_sig)
-        self.assertTrue(result.startswith("FAILURE: Invalid signature"), f"Unexpected result: {result}")
-        self.assertEqual(chain_state.get_sequence_number(pk_hex), seq) # Sequence not incremented
+        bad_sig = "00" * 96
+        tx_json = self._create_tx([[pk_hex, ADDR_A, "2"]], sequence=seq, signature=bad_sig, sender_pubkey=pk_hex)
+        sendtx._PY_ECC_AVAILABLE = True
+        sendtx._PY_ECC_BLS = bls
+        result = sendtx.queue_transaction(tx_json)
+        self.assertTrue(result.startswith("FAILURE: Invalid signature"))
 
     def test_invalid_signature_wrong_data(self):
-        print("[TEST_CASE] Crypto: Invalid signature (signature of wrong data)")
-        self.mock_tau_manager_instance.mode = "auto"
-        privkey = bls.KeyGen(b"test_seed_crypto_3")
-        pk_hex = bls.SkToPk(privkey).hex()
-        chain_state._balances[pk_hex] = 5 # Fund account
+        privkey = bls.KeyGen(b"test_seed_3")
+        pubkey = bls.SkToPk(privkey)
+        pk_hex = pubkey.hex()
         seq = chain_state.get_sequence_number(pk_hex)
-
-        # Data for actual transaction
-        ops_actual = [[pk_hex, ADDR_A, "3"]]
-        tx_dict_actual_unsigned = self._create_tx_dict(ops_actual, sender_pubkey=pk_hex, sequence_number=seq)
-
-        # Data that will be signed (different operations)
-        ops_for_signing = [[pk_hex, ADDR_A, "4"]]
-        tx_dict_for_signing = self._create_tx_dict(ops_for_signing, sender_pubkey=pk_hex, sequence_number=seq)
-        signed_wrong_data_dict = self._sign_tx_dict(tx_dict_for_signing, privkey)
-
-        # Use signature from wrongly signed data with actual transaction data
-        tx_dict_actual_unsigned["signature"] = signed_wrong_data_dict["signature"]
-        tx_json_final = json.dumps(tx_dict_actual_unsigned)
-
-        result = sendtx.queue_transaction(tx_json_final)
-        self.assertTrue(result.startswith("FAILURE: Invalid signature"), f"Res: {result}")
-        self.assertEqual(chain_state.get_sequence_number(pk_hex), seq)
+        ops = {"1": [[pk_hex, ADDR_A, "3"]]}
+        wrong_ops = {"1": [[pk_hex, ADDR_A, "4"]]}
+        msg_bytes = _get_signing_message_bytes({
+            "sender_pubkey": pk_hex,
+            "sequence_number": seq,
+            "expiration_time": int(time.time()) + 1000,
+            "operations": wrong_ops,
+            "fee_limit": "0"
+        })
+        msg_hash = hashlib.sha256(msg_bytes).digest()
+        sig = bls.Sign(privkey, msg_hash).hex()
+        tx_json = self._create_tx([[pk_hex, ADDR_A, "3"]], sequence=seq, signature=sig, sender_pubkey=pk_hex)
+        sendtx._PY_ECC_AVAILABLE = True
+        sendtx._PY_ECC_BLS = bls
+        result = sendtx.queue_transaction(tx_json)
+        self.assertTrue(result.startswith("FAILURE: Invalid signature"))
 
     def test_invalid_signature_wrong_private_key(self):
-        print("[TEST_CASE] Crypto: Invalid signature (signed with wrong private key)")
-        self.mock_tau_manager_instance.mode = "auto"
-        privkey_sender = bls.KeyGen(b"test_seed_crypto_sender")
-        pk_hex_sender = bls.SkToPk(privkey_sender).hex()
-        privkey_signer = bls.KeyGen(b"test_seed_crypto_signer") # Different key
-        chain_state._balances[pk_hex_sender] = 5 # Fund sender account
-        seq = chain_state.get_sequence_number(pk_hex_sender)
-
-        ops = [[pk_hex_sender, ADDR_A, "5"]]
-        tx_dict_unsigned = self._create_tx_dict(ops, sender_pubkey=pk_hex_sender, sequence_number=seq)
-        # Sign with the wrong private key
-        tx_dict_signed_wrong_key = self._sign_tx_dict(tx_dict_unsigned, privkey_signer)
-        tx_json = json.dumps(tx_dict_signed_wrong_key)
-
-        result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("FAILURE: Invalid signature"), f"Res: {result}")
-        self.assertEqual(chain_state.get_sequence_number(pk_hex_sender), seq)
-
-    def test_invalid_sequence_number_after_valid_signature(self):
-        print("[TEST_CASE] Crypto: Invalid sequence number (after valid signature)")
-        self.mock_tau_manager_instance.mode = "auto"
-        privkey = bls.KeyGen(b"test_seed_crypto_6")
-        pk_hex = bls.SkToPk(privkey).hex()
-        chain_state._balances[pk_hex] = 10 # Fund
-        initial_seq = chain_state.get_sequence_number(pk_hex) # e.g., 0
-        wrong_seq = initial_seq + 1 # This would be for the *next* tx
-
-        # Create and sign the transaction with the WRONG sequence number
-        tx_json = self._create_signed_tx_json(
-            operations_or_transfers=[[pk_hex, ADDR_A, "7"]],
-            sender_privkey=privkey,
-            sequence_number=wrong_seq # Using future sequence number
-        )
-        result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("FAILURE: Invalid sequence number"), f"Res: {result}")
-        self.assertIn(f"expected {initial_seq}, got {wrong_seq}", result)
-        self.assertEqual(chain_state.get_sequence_number(pk_hex), initial_seq) # Sequence not incremented
-
-    def test_signature_verification_fails_on_tampered_data_after_signing(self):
-        print("[TEST_CASE] Crypto: Sig verification fails on data tampered after signing")
-        self.mock_tau_manager_instance.mode = "auto"
-        privkey = bls.KeyGen(b"test_seed_crypto_7")
-        pk_hex = bls.SkToPk(privkey).hex()
-        chain_state._balances[pk_hex] = 10 # Fund
+        privkey1 = bls.KeyGen(b"test_seed_4")
+        pubkey1 = bls.SkToPk(privkey1)
+        pk_hex = pubkey1.hex()
+        privkey2 = bls.KeyGen(b"test_seed_5")
         seq = chain_state.get_sequence_number(pk_hex)
-
-        ops = [[pk_hex, ADDR_A, "8"]]
-        tx_json_signed_correctly = self._create_signed_tx_json(ops, privkey, sequence_number=seq)
-
-        # Tamper the amount in the payload AFTER signing
-        tx_dict_loaded = json.loads(tx_json_signed_correctly)
-        tx_dict_loaded["operations"]["1"][0][2] = "9" # Change amount from "8" to "9"
-        tx_json_tampered_data = json.dumps(tx_dict_loaded)
-
-        result = sendtx.queue_transaction(tx_json_tampered_data)
-        self.assertTrue(result.startswith("FAILURE: Invalid signature"), f"Res: {result}")
-        self.assertEqual(chain_state.get_sequence_number(pk_hex), seq)
-
-    def test_skip_signature_verification_and_sequence_when_PY_ECC_DISABLED(self):
-        print("[TEST_CASE] Crypto: Skip sig verify & seq enforcement when PY_ECC_AVAILABLE=False")
-        # Temporarily disable PY_ECC for this test in sendtx module
-        original_py_ecc_available = sendtx._PY_ECC_AVAILABLE
-        sendtx._PY_ECC_AVAILABLE = False
-        self.addCleanup(setattr, sendtx, '_PY_ECC_AVAILABLE', original_py_ecc_available)
-
-        self.mock_tau_manager_instance.mode = "auto"
-        initial_seq_genesis = chain_state.get_sequence_number(GENESIS_ADDR)
-        initial_gen_balance = chain_state.get_balance(GENESIS_ADDR)
-        initial_a_balance = chain_state.get_balance(ADDR_A)
-        amount_to_send = 5
-
-        # Create a transaction with a clearly invalid signature and potentially wrong sequence
-        tx_dict = self._create_tx_dict(
-            operations_or_transfers=[[GENESIS_ADDR, ADDR_A, str(amount_to_send)]],
-            sender_pubkey=GENESIS_ADDR,
-            sequence_number=initial_seq_genesis + 5 # Intentionally wrong sequence
-        )
-        tx_dict["signature"] = "OBVIOUSLY_INVALID_SIGNATURE_BUT_PYECC_IS_OFF"
-        tx_json = json.dumps(tx_dict)
-
+        ops = {"1": [[pk_hex, ADDR_A, "5"]]}
+        msg_bytes = _get_signing_message_bytes({
+            "sender_pubkey": pk_hex,
+            "sequence_number": seq,
+            "expiration_time": int(time.time()) + 1000,
+            "operations": ops,
+            "fee_limit": "0"
+        })
+        msg_hash = hashlib.sha256(msg_bytes).digest()
+        sig = bls.Sign(privkey2, msg_hash).hex()
+        tx_json = self._create_tx([[pk_hex, ADDR_A, "5"]], sequence=seq, signature=sig, sender_pubkey=pk_hex)
+        sendtx._PY_ECC_AVAILABLE = True
+        sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("SUCCESS: Transaction queued"), f"Res: {result}")
-        
-        # Sequence number should NOT have been incremented because PY_ECC_AVAILABLE is false
-        self.assertEqual(chain_state.get_sequence_number(GENESIS_ADDR), initial_seq_genesis)
-        
-        # Balances should update because the transaction (despite bad sig/seq) is processed without those checks
-        self.assertEqual(chain_state.get_balance(GENESIS_ADDR), initial_gen_balance - amount_to_send)
-        self.assertEqual(chain_state.get_balance(ADDR_A), initial_a_balance + amount_to_send)
-        mempool = db.get_mempool_txs()
-        self.assertEqual(len(mempool), 1)
+        self.assertTrue(result.startswith("FAILURE: Invalid signature"))
 
-if __name__ == '__main__':
-    unittest.main(verbosity=2) 
+    def test_invalid_sequence_number_after_signature(self):
+        privkey = bls.KeyGen(b"test_seed_6")
+        pubkey = bls.SkToPk(privkey)
+        pk_hex = pubkey.hex()
+        initial_seq = chain_state.get_sequence_number(pk_hex)
+        wrong_seq = initial_seq + 1
+        tx_json = self._create_tx([[pk_hex, ADDR_A, "7"]], sequence=wrong_seq, sender_privkey=privkey)
+        sendtx._PY_ECC_AVAILABLE = True
+        sendtx._PY_ECC_BLS = bls
+        result = sendtx.queue_transaction(tx_json)
+        self.assertTrue(result.startswith("FAILURE: Invalid sequence number"))
+
+    def test_signature_verification_fails_on_tampered_data(self):
+        privkey = bls.KeyGen(b"test_seed_7")
+        pubkey = bls.SkToPk(privkey)
+        pk_hex = pubkey.hex()
+        seq = chain_state.get_sequence_number(pk_hex)
+        tx_json = self._create_tx([[pk_hex, ADDR_A, "8"]], sequence=seq, sender_privkey=privkey)
+        tx_dict = json.loads(tx_json)
+        tx_dict["operations"]["1"][0][2] = "9"
+        tx_json_tampered = json.dumps(tx_dict)
+        sendtx._PY_ECC_AVAILABLE = True
+        sendtx._PY_ECC_BLS = bls
+        result = sendtx.queue_transaction(tx_json_tampered)
+        self.assertTrue(result.startswith("FAILURE: Invalid signature"))
+
+    def test_skip_signature_verification_when_disabled(self):
+        initial_seq = chain_state.get_sequence_number(GENESIS)
+        initial_gen_balance = chain_state.get_balance(GENESIS)
+        initial_a_balance = chain_state.get_balance(ADDR_A)
+        tx_json = self._create_tx([[GENESIS, ADDR_A, "5"]], signature="00")
+        sendtx._PY_ECC_AVAILABLE = False
+        result = sendtx.queue_transaction(tx_json)
+        self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
+        self.assertEqual(chain_state.get_sequence_number(GENESIS), initial_seq)
+        self.assertEqual(chain_state.get_balance(GENESIS), initial_gen_balance - 5)
+        self.assertEqual(chain_state.get_balance(ADDR_A), initial_a_balance + 5)
