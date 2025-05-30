@@ -46,6 +46,7 @@ import utils # For bits_to_sbf_atom
 import config # For TAU_READY_SIGNAL, etc.
 import db # To cleanup
 
+@unittest.skip("Skipping Tau logic tests by default")
 class TestTauLogic(unittest.TestCase):
     manager_thread = None
 

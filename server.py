@@ -53,7 +53,7 @@ def handle_client(conn, addr):
                 # Handle JSON-based sendtx: sendtx '{...}'
                 if raw.lower().startswith('sendtx '):
                     json_blob = raw[len('sendtx '):].strip()
-                    print(f"[INFO][Server] Received sendtx command with JSON payload: {json_blob[:100]}...")
+                    print(f"[INFO][Server] Received sendtx command with JSON payload: {json_blob}...")
                     try:
                         # Queue the transaction directly, bypassing Tau for now
                         result_msg = sendtx.queue_transaction(json_blob)

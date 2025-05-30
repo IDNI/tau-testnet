@@ -13,8 +13,15 @@ _sequence_lock = threading.Lock()
 # In-memory sequence numbers table: maps address to sequence number
 _sequence_numbers = {}
 
-GENESIS_ADDRESS = "a63b560d042dafc25ea563177c1700b988dfc8c19273763884e38803961e0282c84ebb659d0df0d52e377b3da6afea73"
-GENESIS_BALANCE = 1000000
+GENESIS_ADDRESS = "91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6"
+GENESIS_BALANCE = 15
+# Private Key (integer): 8054597235389493115102853815869281665959971363731141151742872399797457604361
+# Private Key (hex, 32 bytes): 11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09
+# Public Key (hex, 48 bytes, G1 compressed): 91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6
+
+# Private Key (integer): 3046806499649528081017455507187410877623448292955181009054900221062259370659
+# Private Key (hex, 32 bytes): 06bc6e6e15a4b40df028da6901e471fa1facc5e9fad04408ab864c7ccb036aa3
+# Public Key (hex, 48 bytes, G1 compressed): 893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2
 
 def init_chain_state():
     """Initializes the chain state with genesis balance."""

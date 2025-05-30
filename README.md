@@ -17,9 +17,12 @@ This project is the codebase for the Tau Testnet Alpha Blockchain. It implements
 *   **`config.py`**: Centralized configuration.
 *   **`tool_code.tau`**: The Tau logic program for validating operations.
 *   **`tests/`**: Directory containing unit tests:
-    *   `test_sendtx.py`: Tests for the `sendtx` command, including new transaction structure and cryptographic signature verification.
-    *   `test_tau_logic.py`: Tests direct SBF interaction with `tool_code.tau`.
-    *   `test_chain_state.py`: Tests balance and sequence number management.
+    - `test_sendtx_basic.py`
+    - `test_sendtx_validation.py`
+    - `test_sendtx_tx_meta.py`
+    - `test_sendtx_crypto.py`
+    - `test_tau_logic.py`: Tests direct SBF interaction with `tool_code.tau`.
+    - `test_chain_state.py`: Tests balance and sequence number management.
 
 ## Features
 
@@ -87,6 +90,32 @@ Use any TCP client, e.g., `netcat`:
 netcat 127.0.0.1 65432
 ```
 
+## Console Wallet
+
+A simple command-line wallet `wallet.py` is provided to interact with the Tau node. It supports generating a new keypair, sending signed transactions, querying balances, and listing transaction history.
+
+### Prerequisites
+
+Requires `py_ecc` for BLS operations (install with `pip install py_ecc`).
+
+### Usage
+
+```bash
+# Generate a new keypair
+python wallet.py new
+
+# Query balance (by private key or address)
+python wallet.py balance --privkey <hex_privkey>
+python wallet.py balance --address <pubkey_hex>
+
+# List transaction history
+python wallet.py history --privkey <hex_privkey>
+python wallet.py history --address <pubkey_hex>
+
+# Send a transaction
+python wallet.py send --privkey <hex_privkey> --to <recipient_pubkey_hex> --amount <amount> [--fee <fee_limit>] [--expiry <seconds>]
+```
+
 ## Available Commands
 
 *   **Send Transaction (New Structure):**
@@ -121,8 +150,8 @@ Unit tests are located in the `tests/` directory. To run all tests:
 python -m unittest discover tests
 ```
 Or run a specific test file:
-```bash
-python tests/test_sendtx.py
+```
+*   To run sendtx tests: `python -m unittest tests/test_sendtx_basic.py tests/test_sendtx_validation.py tests/test_sendtx_tx_meta.py tests/test_sendtx_crypto.py`
 ```
 Tests for `sendtx` now cover the new transaction structure, including cryptographic signature generation (within the test environment) and verification.
 

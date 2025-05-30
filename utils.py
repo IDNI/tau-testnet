@@ -186,16 +186,41 @@ def build_sbf_atom_for_value(value: int) -> str:
 
 def build_tau_input(
     payload: dict,
-    expected_fields: tuple[int, ...] = (0, 1, 2),
+    expected_fields: tuple[int, ...] | None = None,
 ) -> str:
     """
     Build a multiline SBF string assigning each iN[0].
 
-    • Missing fields → `F`  
-    • Integer 0-15   → encoded 4-bit atom  
-    • Anything else  → treated as `F`
+    If expected_fields is provided, missing indices in that sequence get `F`.
+    Otherwise, dynamic indices are inferred from payload keys (numeric strings):
+    for each idx in sorted(int keys):
+      - send 'F' for any missing streams before idx,
+      - then encode payload[idx] if int 0-15, else 'F'.
     """
     lines: list[str] = []
+    # Dynamic behavior if no explicit field list
+    if expected_fields is None:
+        # Infer numeric indices from payload keys
+        try:
+            indices = sorted(int(k) for k in payload.keys())
+        except Exception:
+            return ""
+        prev = 0
+        for idx in indices:
+            # fill missing streams with F
+            for j in range(prev, idx):
+                lines.append(f"i{j}[0] := F")
+            # encode this stream
+            value = payload.get(str(idx))
+            if isinstance(value, int) and 0 <= value <= 15:
+                atom = build_sbf_atom_for_value(value)
+                lines.append(f"i{idx}[0] := {atom}")
+            else:
+                lines.append(f"i{idx}[0] := F")
+            prev = idx + 1
+        return "\n".join(lines)
+
+    # Legacy fixed sequence behavior
     for idx in expected_fields:
         key = str(idx)
         if key not in payload:

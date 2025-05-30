@@ -15,8 +15,9 @@ import chain_state, db, sbf_defs, utils
 from commands.sendtx import _get_signing_message_bytes
 
 GENESIS = chain_state.GENESIS_ADDRESS
-ADDR_A = "000...a"
-ADDR_B = "000...b"
+# Use stub BLS keys for test addresses
+ADDR_A = bls.SkToPk(bls.KeyGen(b"crypto_seed_A")).hex()
+ADDR_B = bls.SkToPk(bls.KeyGen(b"crypto_seed_B")).hex()
 
 class TestSendTxCrypto(unittest.TestCase):
     def setUp(self):
@@ -26,7 +27,8 @@ class TestSendTxCrypto(unittest.TestCase):
             db._db_conn.close(); db._db_conn = None
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.init_chain_state()
-        self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau', lambda sbf: sbf).start()
+        self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau',
+                              lambda full: full.split(':=', 1)[1].strip() if ':=' in full else full).start()
 
     def tearDown(self):
         patch.stopall()

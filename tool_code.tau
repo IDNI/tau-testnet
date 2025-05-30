@@ -26,8 +26,8 @@ ack_rule_processed()   := {x1001}:sbf.  # Acknowledgment for rule processed succ
     (!(i0[t] = 0)) # Check if rule proposal data is present
     ? ( # --- Process Rule Proposal from i0[t] ---
         
-        # u[t] = i0[t] #assign to pointwise revision
-        # && 
+        u[t] = i0[t] #assign to pointwise revision
+        &&
         o1[t] = ack_rule_processed()
     )
     : (i1[t] != 0) # Else, check if coin transfer data is present on i1 (16 bits)
