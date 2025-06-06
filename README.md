@@ -1,4 +1,4 @@
-![The TauNet logo](/docs/images/TauNet_Banner.png)
+![The TauNet logo](/docs/images/TauNet_banner.png)
 
 # Tau Testnet Alpha Blockchain
 
