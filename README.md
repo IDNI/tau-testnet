@@ -1,3 +1,5 @@
+![The TauNet logo](/docs/images/TauNet_banner.png)
+
 # Tau Testnet Alpha Blockchain
 
 This project is the codebase for the Tau Testnet Alpha Blockchain. It implements a server that interacts with a Tau logic program (executed via Docker) to manage a simple blockchain with a focus on transaction processing and mempool management.
