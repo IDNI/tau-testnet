@@ -10,7 +10,7 @@ import tau_manager
 import re
 import json
 import db
-from commands import sendtx, getmempool, gettimestamp  # Import command handlers
+from commands import sendtx, getmempool, gettimestamp, createblock  # Import command handlers
 import chain_state # Added import
 
 MEMPOOL = []
@@ -105,6 +105,16 @@ def handle_client(conn, addr):
                     conn.sendall(resp.encode('utf-8'))
                     continue
 
+                if raw.lower().startswith("getsequence "):
+                    parts = raw.split()
+                    if len(parts) != 2:
+                        resp = "ERROR: Usage: getsequence <address>\r\n"
+                    else:
+                        seq = chain_state.get_sequence_number(parts[1])
+                        resp = f"SEQUENCE: {seq}\r\n"
+                    conn.sendall(resp.encode('utf-8'))
+                    continue
+
                 if raw.lower().startswith("history "):
                     parts = raw.split()
                     if len(parts) != 2:
@@ -125,6 +135,30 @@ def handle_client(conn, addr):
                             resp = "HISTORY:\n" + "\n".join(items) + "\r\n"
                         else:
                             resp = "HISTORY: empty\r\n"
+                    conn.sendall(resp.encode('utf-8'))
+                    continue
+
+                if raw.lower().strip() == "createblock":
+                    print(f"[INFO][Server] Received createblock command from {addr}")
+                    try:
+                        block_data = createblock.create_block_from_mempool()
+                        tx_count = len(block_data["transactions"])
+                        block_hash = block_data["block_hash"]
+                        block_number = block_data["header"]["block_number"]
+                        merkle_root = block_data["header"]["merkle_root"]
+                        timestamp = block_data["header"]["timestamp"]
+                        
+                        resp = f"SUCCESS: Block #{block_number} created successfully!\n"
+                        resp += f"  - Transactions: {tx_count}\n"
+                        resp += f"  - Block Hash: {block_hash}\n"
+                        resp += f"  - Merkle Root: {merkle_root}\n"
+                        resp += f"  - Timestamp: {timestamp}\n"
+                        resp += f"  - Mempool cleared\r\n"
+                        
+                        print(f"[INFO][Server] Block creation successful. Sending response to {addr}")
+                    except Exception as e:
+                        print(f"[ERROR][Server] Block creation failed for {addr}: {e}")
+                        resp = f"ERROR: Failed to create block: {e}\r\n"
                     conn.sendall(resp.encode('utf-8'))
                     continue
 
@@ -256,6 +290,7 @@ def main():
             manager_thread.join(timeout=config.SHUTDOWN_TIMEOUT)
             if manager_thread.is_alive():
                 print("[WARN][Server] Tau manager thread did not exit cleanly.")
+                tau_manager.kill_tau_process()
         else:
             print("[INFO][Server] Tau manager thread already finished or not started.")
 

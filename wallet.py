@@ -62,9 +62,10 @@ def cmd_new(args):
 
 def get_address(args):
     if getattr(args, 'privkey', None):
-        raw = _parse_privkey(args.privkey)
-        sk = raw.rjust(48, b'\x00')
-        return G2Basic.SkToPk(sk).hex()
+        raw_bytes = _parse_privkey(args.privkey)
+        # Convert bytes to integer (the actual private key)
+        private_key_int = int.from_bytes(raw_bytes, 'big')
+        return G2Basic.SkToPk(private_key_int).hex()
     return args.address
 
 
@@ -80,12 +81,26 @@ def cmd_history(args):
     print(resp.strip())
 
 
+def cmd_createblock(args):
+    resp = rpc_command("createblock\r\n", args.host, args.port)
+    print(resp.strip())
+
+
 def cmd_send(args):
-    raw = _parse_privkey(args.privkey)
-    sk = raw.rjust(48, b'\x00')
-    sender_pk = G2Basic.SkToPk(sk).hex()
-    hist = rpc_command(f"history {sender_pk}\r\n", args.host, args.port).splitlines()
-    seq = len(hist) - 1 if len(hist) > 1 else 0
+    raw_bytes = _parse_privkey(args.privkey)
+    # Convert bytes to integer (the actual private key)
+    private_key_int = int.from_bytes(raw_bytes, 'big')
+    sender_pk = G2Basic.SkToPk(private_key_int).hex()
+    
+    # Get the current sequence number from the server
+    seq_resp = rpc_command(f"getsequence {sender_pk}\r\n", args.host, args.port).strip()
+    if seq_resp.startswith("SEQUENCE: "):
+        seq = int(seq_resp.split(": ", 1)[1])
+    else:
+        # Fallback to history-based calculation if getsequence fails
+        print(f"Warning: Could not get sequence number from server ({seq_resp}), falling back to history count")
+        hist = rpc_command(f"history {sender_pk}\r\n", args.host, args.port).splitlines()
+        seq = len(hist) - 1 if len(hist) > 1 else 0
     expiration = int(time.time()) + args.expiry
     
     # Build operations dictionary
@@ -160,7 +175,7 @@ def cmd_send(args):
     print(f"Transaction payload: {json.dumps(payload, indent=2)}")
     
     msg_bytes = _get_signing_message_bytes(payload)
-    sig = G2Basic.Sign(sk, hashlib.sha256(msg_bytes).digest())
+    sig = G2Basic.Sign(private_key_int, hashlib.sha256(msg_bytes).digest())
     payload["signature"] = sig.hex()
     blob = json.dumps(payload, separators=(",", ":"))
     cmd = f"sendtx '{blob}'\r\n"
@@ -202,6 +217,11 @@ def main():
     p_send.add_argument("--fee", "-f", default=0, type=int, help="Fee limit")
     p_send.add_argument("--expiry", "-e", default=3600, type=int, help="Expiration seconds from now")
     p_send.set_defaults(func=cmd_send)
+    
+    # Create block command
+    p_createblock = sub.add_parser("createblock", help="Create a new block from mempool")
+    p_createblock.set_defaults(func=cmd_createblock)
+    
     args = parser.parse_args()
     args.func(args)
 

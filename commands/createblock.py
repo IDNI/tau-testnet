@@ -1,0 +1,134 @@
+"""
+createblock.py
+
+Command handler for creating a new block from the current mempool.
+"""
+
+import json
+import time
+from typing import List, Dict
+import db
+import block
+import chain_state
+
+
+def create_block_from_mempool() -> Dict:
+    """
+    Creates a new block from all transactions currently in the mempool.
+    Returns the block data and clears the mempool.
+    """
+    print(f"[INFO][createblock] Starting block creation process...")
+    
+    # Get all transactions from mempool
+    mempool_txs = db.get_mempool_txs()
+    print(f"[INFO][createblock] Found {len(mempool_txs)} entries in mempool")
+    
+    # Parse transactions (filter out invalid JSON)
+    transactions = []
+    skipped_count = 0
+    for i, tx_data in enumerate(mempool_txs):
+        if tx_data.startswith("json:"):
+            try:
+                tx = json.loads(tx_data[5:])  # Remove "json:" prefix
+                transactions.append(tx)
+                sender = tx.get("sender_pubkey", "unknown")[:10] + "..."
+                ops_count = len(tx.get("operations", {}))
+                print(f"[INFO][createblock] TX #{i+1}: From {sender}, {ops_count} operations")
+            except json.JSONDecodeError as e:
+                print(f"[WARN][createblock] Skipping invalid JSON transaction #{i+1}: {e}")
+                skipped_count += 1
+        else:
+            print(f"[WARN][createblock] Skipping non-JSON transaction #{i+1}: {tx_data[:50]}...")
+            skipped_count += 1
+    
+    if skipped_count > 0:
+        print(f"[WARN][createblock] Skipped {skipped_count} invalid transactions")
+    
+    print(f"[INFO][createblock] Successfully parsed {len(transactions)} valid transactions")
+    
+    # For now, use a simple block numbering system and previous hash
+    block_number = 1  # TODO: Track actual block height
+    previous_hash = "0" * 64  # Genesis block hash
+    
+    print(f"[INFO][createblock] Creating block #{block_number} with previous hash: {previous_hash[:16]}...")
+    
+    # Create the block
+    print(f"[INFO][createblock] Computing transaction hashes and Merkle root...")
+    new_block = block.Block.create(
+        block_number=block_number,
+        previous_hash=previous_hash,
+        transactions=transactions
+    )
+    
+    print(f"[INFO][createblock] Block created successfully!")
+    print(f"[INFO][createblock] Block Details:")
+    print(f"[INFO][createblock]   - Block Number: {new_block.header.block_number}")
+    print(f"[INFO][createblock]   - Timestamp: {new_block.header.timestamp}")
+    print(f"[INFO][createblock]   - Transaction Count: {len(transactions)}")
+    print(f"[INFO][createblock]   - Merkle Root: {new_block.header.merkle_root}")
+    print(f"[INFO][createblock]   - Block Hash: {new_block.block_hash}")
+    
+    # Show transaction summary
+    if transactions:
+        print(f"[INFO][createblock] Transaction Summary:")
+        for i, tx in enumerate(transactions):
+            sender = tx.get("sender_pubkey", "unknown")[:10] + "..."
+            seq = tx.get("sequence_number", "?")
+            ops = tx.get("operations", {})
+            transfers = ops.get("1", [])
+            transfer_count = len(transfers) if isinstance(transfers, list) else 0
+            rule = "Yes" if ops.get("0") else "No"
+            print(f"[INFO][createblock]   TX #{i+1}: {sender} (seq:{seq}) - {transfer_count} transfers, rule:{rule}")
+    
+    # Clear the mempool after successful block creation
+    print(f"[INFO][createblock] Clearing mempool...")
+    db.clear_mempool()
+    print(f"[INFO][createblock] Mempool cleared successfully")
+    
+    print(f"[INFO][createblock] Block creation process completed!")
+    
+    return new_block.to_dict()
+
+
+def encode_command(parts: List[str]) -> str:
+    """
+    Encode the createblock command. No parameters needed.
+    """
+    if len(parts) != 1:
+        raise ValueError("createblock command takes no parameters")
+    return "createblock"
+
+
+def decode_output(sbf_output: str, sbf_input: str) -> str:
+    """
+    Decode output - not applicable for createblock as it doesn't use Tau.
+    """
+    return "block_created"
+
+
+def handle_result(decoded: str, sbf_input: str, mempool_state: Dict) -> str:
+    """
+    Handle the result of block creation.
+    """
+    try:
+        block_data = create_block_from_mempool()
+        
+        # Return a detailed summary of the created block
+        tx_count = len(block_data["transactions"])
+        block_hash = block_data["block_hash"]
+        block_number = block_data["header"]["block_number"]
+        merkle_root = block_data["header"]["merkle_root"]
+        timestamp = block_data["header"]["timestamp"]
+        
+        result = f"SUCCESS: Block #{block_number} created successfully!\n"
+        result += f"  - Transactions: {tx_count}\n"
+        result += f"  - Block Hash: {block_hash}\n"
+        result += f"  - Merkle Root: {merkle_root}\n"
+        result += f"  - Timestamp: {timestamp}\n"
+        result += f"  - Mempool cleared"
+        
+        return result
+        
+    except Exception as e:
+        print(f"[ERROR][createblock] Block creation failed: {e}")
+        return f"ERROR: Failed to create block: {e}" 

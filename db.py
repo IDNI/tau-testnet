@@ -82,6 +82,7 @@ def get_text_by_id(yid: str) -> str:
             raise KeyError(f"No text found for Tau ID: {yid}")
 
 def add_mempool_tx(tx_data: str):
+    return
     """Adds data to the mempool. Prefixes with 'json:' if it looks like JSON."""
     if _db_conn is None:
         init_db()
@@ -101,4 +102,14 @@ def get_mempool_txs() -> list:
         cur = _db_conn.cursor()
         cur.execute('SELECT sbf FROM mempool ORDER BY id')
         return [row[0] for row in cur.fetchall()]
+
+def clear_mempool():
+    """Clears all transactions from the mempool."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('DELETE FROM mempool')
+        _db_conn.commit()
+        print(f"[INFO][db] Mempool cleared.")
 

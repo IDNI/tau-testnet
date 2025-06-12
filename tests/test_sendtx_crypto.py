@@ -27,8 +27,18 @@ class TestSendTxCrypto(unittest.TestCase):
             db._db_conn.close(); db._db_conn = None
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.init_chain_state()
-        self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau',
-                              lambda full: full.split(':=', 1)[1].strip() if ':=' in full else full).start()
+        def mock_tau_response(input_sbf, target_output_stream_index=1):
+            # For crypto tests, simulate proper tau behavior
+            if target_output_stream_index == 0:
+                return "OK"  # Non-failure response for rule processing
+            else:
+                # Extract and echo the appropriate stream
+                lines = input_sbf.strip().split('\n')
+                if len(lines) > target_output_stream_index:
+                    return lines[target_output_stream_index]
+                else:
+                    return lines[-1] if lines else "F"
+        self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau', mock_tau_response).start()
 
     def tearDown(self):
         patch.stopall()

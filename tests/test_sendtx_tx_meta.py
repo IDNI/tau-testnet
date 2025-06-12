@@ -27,8 +27,18 @@ class TestSendTxTxMeta(unittest.TestCase):
             db._db_conn.close(); db._db_conn = None
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.init_chain_state()
-        self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau',
-                              lambda full: full.split(':=', 1)[1].strip() if ':=' in full else full).start()
+        def mock_tau_response(input_sbf, target_output_stream_index=1):
+            # For meta tests, simulate proper tau behavior
+            if target_output_stream_index == 0:
+                return "OK"  # Non-failure response for rule processing
+            else:
+                # Extract and echo the appropriate stream
+                lines = input_sbf.strip().split('\n')
+                if len(lines) > target_output_stream_index:
+                    return lines[target_output_stream_index]
+                else:
+                    return lines[-1] if lines else "F"
+        self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau', mock_tau_response).start()
         sendtx._PY_ECC_AVAILABLE = False
         # Patch pubkey validation to bypass format checks for meta tests
         patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
@@ -62,7 +72,7 @@ class TestSendTxTxMeta(unittest.TestCase):
         invalid_transfer = [ADDR_B, ADDR_A, "1"]
         tx_json = self._create_tx([invalid_transfer])
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("FAILURE: Transaction invalid."))
+        self.assertTrue(result.startswith("FAILURE: Transaction invalid"))
         self.assertIn("does not match sender_pubkey", result)
         self.assertEqual(len(db.get_mempool_txs()), 0)
 

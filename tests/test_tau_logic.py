@@ -21,8 +21,26 @@
 # 7. test_07_insufficient_funds_at_zero_balance
 #    - Confirms FAIL_INSUFFICIENT_FUNDS_SBF when balance is zero and amount > 0.
 #
-# 8. test_08_invalid_sbf_structure_length
-#    - Verifies Tau returns FAIL_INVALID_SBF for improperly structured SBF inputs.
+# 8. test_08_invalid_format_incomplete_bits
+#    - Verifies Tau returns FAIL_INVALID_FORMAT_SBF for incomplete SBF inputs (like just "x0").
+#
+# 9. test_09_invalid_format_ambiguous_bits
+#    - Tests FAIL_INVALID_FORMAT_SBF for ambiguous SBF inputs that don't specify all 16 bits.
+#
+# 10. test_10_rule_processing_i0_simple
+#     - Tests rule processing via i0 stream, expecting ACK_RULE_PROCESSED_SBF on o0.
+#
+# 11. test_11_rule_processing_i0_complex
+#     - Tests complex rule processing via i0 stream.
+#
+# 12. test_12_fallback_fail_invalid_both_zero
+#     - Tests the final fallback case when both i0 and i1 are zero/inactive.
+#
+# 13. test_13_fallback_fail_invalid_unrecognized
+#     - Tests fallback for unrecognized input patterns.
+#
+# 14. test_14_pointwise_revision_simple
+#     - Tests pointwise revision functionality with u[t] output.
 
 import unittest
 import os
@@ -121,15 +139,18 @@ class TestTauLogic(unittest.TestCase):
         full_bit_pattern = amount_bits + balance_bits + from_bits + to_bits
         return utils.bits_to_sbf_atom(full_bit_pattern, length=16)
 
-    def _assert_tau_response(self, sbf_input: str, expected_output: str, msg: str):
+    def _assert_tau_response(self, sbf_input: str, expected_output: str, msg: str, output_stream: int = 1):
+        """Helper to assert Tau's response on a specific output stream."""
         self.assertTrue(tau_manager.tau_ready.is_set(), "Assertion failed: Tau is not ready before communication attempt.")
         print(f"    [TEST_TAU_LOGIC] Sending SBF: {sbf_input}")
         try:
-            response = tau_manager.communicate_with_tau(sbf_input)
-            print(f"    [TEST_TAU_LOGIC] Received SBF: {response}")
+            response = tau_manager.communicate_with_tau(sbf_input, target_output_stream_index=output_stream)
+            print(f"    [TEST_TAU_LOGIC] Received SBF from o{output_stream}: {response}")
             self.assertEqual(response.strip(), expected_output.strip(), msg)
         except Exception as e:
             self.fail(f"Error during communicate_with_tau: {e}. SBF Sent: {sbf_input}, Expected: {expected_output}")
+
+    # ===== i1 Transfer Tests (Main Transaction Logic) =====
 
     def test_01_valid_transfer_echo(self):
         print("\n[TAU_LOGIC_CASE] Valid transfer: amount=5, balance=10, from=1, to=2")
@@ -166,24 +187,65 @@ class TestTauLogic(unittest.TestCase):
         sbf_in = self._construct_sbf_input(amount=1, balance=0, from_id_idx=1, to_id_idx=2)
         self._assert_tau_response(sbf_in, sbf_defs.FAIL_INSUFFICIENT_FUNDS_SBF, "Tau should return FAIL_INSUFFICIENT_FUNDS_SBF when balance is 0 and amount > 0.")
 
-    def test_08_invalid_sbf_structure_length(self):
-        print("\n[TAU_LOGIC_CASE] Invalid SBF (e.g., wrong length for i1, not i0 format)")
-        # This should fall through to the final `o1[t] = fail_invalid()` in tool_code.tau
-        invalid_sbf = utils.bits_to_sbf_atom("101010", length=6) # Not 16 bits, nor empty for i0=0
-        # Depending on how Tau interprets this for i0 vs i1 from a single console:
-        # If it considers this non-zero for i0, it will output ack_rule_processed().
-        # If it considers this zero for i0, and then invalid for i1, it will output fail_invalid().
-        # Given the current tool_code.tau, fail_invalid() is the most likely outcome for an unrecognised SBF.
-        self._assert_tau_response(invalid_sbf, sbf_defs.FAIL_INVALID_SBF, "Tau should return FAIL_INVALID_SBF for SBF not matching i1 structure and not triggering i0 rule ack.")
+    # ===== Format Validation Tests =====
 
-    # The test for i0 rule processing is difficult to make stable without clearer
-    # stream distinction from the Python side or in Tau's handling of 'console'.
-    # If `test_08_invalid_sbf_structure_length` passes with FAIL_INVALID_SBF, it implies that
-    # non-i1 structured SBFs that don't evaluate to a simple non-zero for i0 will hit the fallback.
-    # A dedicated test for i0 would ideally involve sending an SBF that IS NOT 0 for i0
-    # and is distinct from i1. Example: `sbf_for_i0 = utils.bits_to_sbf_atom("1", length=1)` -> "x0"
-    # And expecting `sbf_defs.ACK_RULE_PROCESSED_SBF`.
-    # This can be added if the above test (08) is not behaving as expected for FAIL_INVALID_SBF.
+    def test_08_invalid_format_incomplete_bits(self):
+        print("\n[TAU_LOGIC_CASE] Invalid format: incomplete SBF (just x0)")
+        incomplete_sbf = "x0"  # Only specifies x0, not x1-x15
+        self._assert_tau_response(incomplete_sbf, sbf_defs.FAIL_INVALID_FORMAT_SBF, 
+                                "Tau should return FAIL_INVALID_FORMAT_SBF for incomplete SBF.")
+
+    def test_09_invalid_format_ambiguous_bits(self):
+        print("\n[TAU_LOGIC_CASE] Invalid format: ambiguous SBF (x0 & x1)")
+        ambiguous_sbf = "x0 & x1"  # Only specifies x0 and x1, not x2-x15
+        self._assert_tau_response(ambiguous_sbf, sbf_defs.FAIL_INVALID_FORMAT_SBF, 
+                                "Tau should return FAIL_INVALID_FORMAT_SBF for ambiguous SBF.")
+
+    # ===== i0 Rule Processing Tests =====
+
+    def test_10_rule_processing_i0_simple(self):
+        print("\n[TAU_LOGIC_CASE] Rule processing: simple rule on i0")
+        rule_sbf = "o1[t] = 1"  # Simple rule for i0
+        self._assert_tau_response(rule_sbf, sbf_defs.ACK_RULE_PROCESSED_SBF, 
+                                "Tau should return ACK_RULE_PROCESSED_SBF for rule processing.", 
+                                output_stream=0)
+
+    def test_11_rule_processing_i0_complex(self):
+        print("\n[TAU_LOGIC_CASE] Rule processing: complex rule on i0")
+        complex_rule = "always o1[t] = i1[t] && o2[t] = 0"  # More complex rule
+        self._assert_tau_response(complex_rule, sbf_defs.ACK_RULE_PROCESSED_SBF, 
+                                "Tau should return ACK_RULE_PROCESSED_SBF for complex rule.", 
+                                output_stream=0)
+
+    # ===== Fallback Cases =====
+
+    def test_12_fallback_fail_invalid_both_zero(self):
+        print("\n[TAU_LOGIC_CASE] Fallback: both i0 and i1 are zero/inactive")
+        zero_sbf = sbf_defs.SBF_LOGICAL_ZERO  # Should trigger fallback
+        self._assert_tau_response(zero_sbf, sbf_defs.FAIL_INVALID_SBF, 
+                                "Tau should return FAIL_INVALID_SBF when both streams are inactive.")
+
+    def test_13_fallback_fail_invalid_unrecognized(self):
+        print("\n[TAU_LOGIC_CASE] Fallback: unrecognized input pattern")
+        # Create an SBF that's not zero but also not a valid 16-bit format for i1
+        unrecognized_sbf = utils.bits_to_sbf_atom("101010", length=6)  # 6-bit SBF
+        self._assert_tau_response(unrecognized_sbf, sbf_defs.FAIL_INVALID_SBF, 
+                                "Tau should return FAIL_INVALID_SBF for unrecognized patterns.")
+
+    # ===== Pointwise Revision Test =====
+
+    def test_14_pointwise_revision_functionality(self):
+        print("\n[TAU_LOGIC_CASE] Pointwise revision: rule should be assigned to u[t]")
+        # This test is more complex because we need to check if u[t] gets the rule
+        # For now, we'll test that rule processing works correctly
+        # The actual pointwise revision testing would require more sophisticated setup
+        revision_rule = "o1[t] = 42"  # Rule that should go to u[t]
+        # Test that the rule is acknowledged on o0
+        self._assert_tau_response(revision_rule, sbf_defs.ACK_RULE_PROCESSED_SBF, 
+                                "Tau should acknowledge rule processing for pointwise revision.", 
+                                output_stream=0)
+        # Note: Testing the actual u[t] assignment would require monitoring that stream,
+        # which is beyond the current test framework scope
 
 if __name__ == '__main__':
     # This allows running the tests directly from this file

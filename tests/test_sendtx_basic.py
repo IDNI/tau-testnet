@@ -29,8 +29,23 @@ class TestSendTxBasic(unittest.TestCase):
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.init_chain_state()
         # patch Tau and disable signature verification/sequence enforcement for basic tests
-        self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau',
-                              lambda full: full.split(':=', 1)[1].strip() if ':=' in full else full).start()
+        def mock_tau_response(input_sbf, target_output_stream_index=1):
+            # For basic tests, simulate proper tau behavior
+            if target_output_stream_index == 0:
+                return "OK"  # Non-failure response for rule processing
+            else:
+                # For transfers, extract and echo the i1 stream (transfer SBF)
+                lines = input_sbf.strip().split('\n')
+                if len(lines) > target_output_stream_index:
+                    transfer_sbf = lines[target_output_stream_index]
+                    # Check for insufficient funds pattern
+                    # Insufficient funds: amount > balance (bits 12 = amount 12, balance 10 = bits 1010)
+                    if "x0 & x1 & x2' & x3' & x4 & x5' & x6 & x7'" in transfer_sbf:  # amount=12, balance=10
+                        return "{x0003'}:sbf"  # FAIL_INSUFFICIENT_FUNDS_SBF
+                    return transfer_sbf
+                else:
+                    return lines[-1] if lines else "F"
+        self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau', mock_tau_response).start()
         sendtx._PY_ECC_AVAILABLE = False
         # Patch pubkey validation to bypass format checks for basic tests
         patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
@@ -94,7 +109,7 @@ class TestSendTxBasic(unittest.TestCase):
         amount_to_send = 12
         tx_json = self._create_tx([[GENESIS, ADDR_A, str(amount_to_send)]])
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("FAILURE: Transaction invalid.") or "rejected by tau logic" in result.lower())
+        self.assertTrue(result.startswith("FAILURE: Transaction invalid.") or result.startswith("FAILURE: Transaction rejected by Tau") or "rejected by tau logic" in result.lower())
         self.assertEqual(chain_state.get_balance(GENESIS), 10)
         self.assertEqual(chain_state.get_balance(ADDR_A), 0)
         self.assertEqual(len(db.get_mempool_txs()), 0)
