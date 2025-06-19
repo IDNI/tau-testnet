@@ -153,9 +153,15 @@ def handle_client(conn, addr):
                         resp += f"  - Block Hash: {block_hash}\n"
                         resp += f"  - Merkle Root: {merkle_root}\n"
                         resp += f"  - Timestamp: {timestamp}\n"
+                        for idx, tx in enumerate(block_data.get("transactions", []), start=1):
+                            tx_json = json.dumps(tx, sort_keys=True)
+                            resp += f"  - TX#{idx}: {tx_json}\n"
                         resp += f"  - Mempool cleared\r\n"
                         
                         print(f"[INFO][Server] Block creation successful. Sending response to {addr}")
+                        for idx, tx in enumerate(block_data.get("transactions", []), start=1):
+                            tx_json = json.dumps(tx, sort_keys=True)
+                            print(f"[INFO][Server] Included TX#{idx}: {tx_json}")
                     except Exception as e:
                         print(f"[ERROR][Server] Block creation failed for {addr}: {e}")
                         resp = f"ERROR: Failed to create block: {e}\r\n"
