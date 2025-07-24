@@ -234,9 +234,10 @@ def main():
     print(f"[INFO][Server] Initializing database at {config.STRING_DB_PATH}")
     db.init_db()
 
-    # Initialize chain state for balances
-    print(f"[INFO][Server] Initializing chain state...")
-    chain_state.init_chain_state()
+    # Initialize and load the full chain state (balances, sequences, rules)
+    # This will either load from a file and update, or rebuild from scratch.
+    print(f"[INFO][Server] Initializing and loading chain state...")
+    chain_state.initialize_and_load_state()
 
     # Start Tau process manager thread
     print("[INFO][Server] Starting Tau Process Manager Thread...")

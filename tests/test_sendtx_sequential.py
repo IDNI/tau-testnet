@@ -105,7 +105,7 @@ def run_test_sequential_ops():
     print(f"Result1: {result1}")
     assert "SUCCESS" in result1
     assert len(mock_tau_manager.tau_call_history) == 2
-    assert mock_tau_manager.tau_call_history[0] == "o2[t]=i1[t]"
+    assert mock_tau_manager.tau_call_history[0] == "o2[t]=i1[t]."
     # Second call should be F \n <transfer_sbf>
     assert mock_tau_manager.tau_call_history[1].startswith("F\n")
     assert chain_state.get_balance(recipient_pub_key) == 5
@@ -173,7 +173,7 @@ def run_test_sequential_ops():
     print(f"Result4: {result4}")
     assert "SUCCESS" in result4
     assert len(mock_tau_manager.tau_call_history) == 5 # 0, 1, 2, 3, 4
-    assert mock_tau_manager.tau_call_history[0] == "a_rule"
+    assert mock_tau_manager.tau_call_history[0] == "a_rule."
     assert mock_tau_manager.tau_call_history[1] == "F\nF"
     assert mock_tau_manager.tau_call_history[2] == "F\nF\nF" # Custom ops are F for now
     assert mock_tau_manager.tau_call_history[3] == "F\nF\nF\nF"

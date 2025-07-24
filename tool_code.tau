@@ -1,69 +1,16 @@
-# --- Input Stream Definitions ---
-tau i0 = console.   # For rule proposals (e.g., from JSON key "0")
-sbf i1 = console.   # For coin transfers. Now 16 bits:
-                    # x0-x3: amount (4 bits)
-                    # x4-x7: sender_balance_for_tau (4 bits)
-                    # x8-x11: from_address_id (4 bits)
-                    # x12-x15: to_address_id (4 bits)
-#sbf i2 = console.   # Was considered for balance, but balance now part of i1
-
-# --- Output Stream Definition ---
-sbf o1 = console.   # Master output stream for all responses
-
-# --- SBF Code Definitions ---
-fail_invalid()         := {x0'}:sbf.    # General failure / invalid input state (SBF for 0)
-fail_src_eq_dest()     := {x0001'}:sbf. # Transfer failure: Source equals Destination
-fail_zero_amount()     := {x0002'}:sbf. # Transfer failure: Amount is zero
-fail_insufficient_funds() := {x0003'}:sbf. # Transfer failure: Insufficient funds (Amount > Sender Balance)
+tau i0 = console.
+fail_invalid() := {x0'}:sbf.
+fail_src_eq_dest() := {x0001'}:sbf.
+fail_zero_amount() := {x0002'}:sbf.
+fail_insufficient_funds() := {x0003'}:sbf.
 
 ack_rule_processed()   := {x1001}:sbf.  # Acknowledgment for rule processed successfully
-# ack_custom_processed() := {x1002}:sbf. # Not currently used
+fail_invalid()         := {x0'}:sbf.
 
-# --- Main Logic ---
-# The logic processes inputs in a prioritized order: i0, then i1.
-# Assumes only one primary command/data type is sent per time step 't'.
-
-    (!(i0[t] = 0)) # Check if rule proposal data is present
-    ? ( # --- Process Rule Proposal from i0[t] ---
-        
-        u[t] = i0[t] #assign to pointwise revision
-        &&
-        o1[t] = ack_rule_processed()
-    )
-    : (i1[t] != 0) # Else, check if coin transfer data is present on i1 (16 bits)
-    ? ( # --- Process Coin Transfer from i1[t] ---
-        # i1 bits: amount(x0-x3), balance_from(x4-x7), from(x8-x11), to(x12-x15)
-
-        # Check 0: Insufficient Funds? (Amount > Sender Balance for Tau)
-        # Amount Field (A): A_3=x3 (MSB), ..., A_0=x0 (LSB)
-        # Balance Field (B): B_3=x7 (MSB), ..., B_0=x4 (LSB)
-        # Condition for A > B:
-        (
-            i1[t] <= {
-              (x3 & x7')
-              | (((x3 & x7) | (x3' & x7')) & x2 & x6')
-              | (((x3 & x7) | (x3' & x7')) & ((x2 & x6) | (x2' & x6')) & x1 & x5')
-              | (((x3 & x7) | (x3' & x7')) & ((x2 & x6) | (x2' & x6')) & ((x1 & x5) | (x1' & x5')) & x0 & x4')
-            }:sbf
-       )
-        ? o1[t] = fail_insufficient_funds() # Output fail code if Amount > Sender Balance
-        : ( # Else (Amount <= Sender Balance), proceed to other checks
-        # Check 1: Source Address == Destination Address?
-            # Compares (i1.x8,i1.x9,i1.x10,i1.x11) with (i1.x12,i1.x13,i1.x14,i1.x15)
-            ( i1[t] <= {x8&x12 | x8'&x12'}:sbf & {x9&x13 | x9'&x13'}:sbf & {x10&x14 | x10'&x14'}:sbf & {x11&x15 | x11'&x15'}:sbf )
-        ? o1[t] = fail_src_eq_dest() # Output fail code if Src == Dest
-        : ( # Else (Src != Dest), check Amount
-            # Check 2: Amount is Zero?
-                # True if all amount bits (x0 through x3 of i1[t]) are 0.
-                (i1[t] <= {x0'&x1'&x2'&x3'}:sbf)
-        ? o1[t] = fail_zero_amount()   # Output fail code if Amount is Zero
-        : o1[t] = i1[t]                # All Validations Pass for transfer: Echo the original 16-bit SBF from i1[t]
-            )
-        )
-    )
-#    : (i2[t] != 0) # This was the old i2, not used now.
-#    ? ( # --- Process Custom Asset from i2[t] ---
-#        o1[t] = ack_custom_processed()
-#    )
-    : o1[t] = fail_invalid() # Else (no recognized input stream is active or input is 0 for i0 and i1)
-
+(!(i0[t] = 0)) # Check if rule proposal data is present
+? ( # --- Process Rule Proposal from i0[t] ---
+    u[t] = i0[t] #assign to pointwise revision
+    &&
+    o999[t] = this[t] &&
+    o0[t] = ack_rule_processed()
+) : o0[t] = fail_invalid()

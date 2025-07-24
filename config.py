@@ -9,7 +9,7 @@ BUFFER_SIZE = 1024
 TAU_PROGRAM_FILE = 'tool_code.tau'  # Assumes it's in the same directory or adjust path
 TAU_DOCKER_IMAGE = 'tau'
 CONTAINER_WORKDIR = '/data'
-TAU_READY_SIGNAL = "i0[0] :="  # String Tau prints when ready for input
+TAU_READY_SIGNAL = "Execution step: 0"  # String Tau prints when ready for input
 
 # Timeout Configuration
 PROCESS_TIMEOUT = 120 # Timeout for Tau process startup

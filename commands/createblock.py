@@ -14,14 +14,18 @@ import chain_state
 
 def create_block_from_mempool() -> Dict:
     """
-    Creates a new block from all transactions currently in the mempool.
-    Returns the block data and clears the mempool.
+    Creates a new block from all transactions currently in the mempool,
+    saves it to the database, and clears the mempool.
     """
     print(f"[INFO][createblock] Starting block creation process...")
     
     # Get all transactions from mempool
     mempool_txs = db.get_mempool_txs()
     print(f"[INFO][createblock] Found {len(mempool_txs)} entries in mempool")
+
+    if not mempool_txs:
+        print("[INFO][createblock] Mempool is empty. No block created.")
+        return {"message": "Mempool is empty. No block created."}
     
     # Parse transactions (filter out invalid JSON)
     transactions = []
@@ -46,9 +50,17 @@ def create_block_from_mempool() -> Dict:
     
     print(f"[INFO][createblock] Successfully parsed {len(transactions)} valid transactions")
     
-    # For now, use a simple block numbering system and previous hash
-    block_number = 1  # TODO: Track actual block height
-    previous_hash = "0" * 64  # Genesis block hash
+    # Get latest block to determine new block number and previous hash
+    latest_block = db.get_latest_block()
+    if latest_block:
+        block_number = latest_block['header']['block_number'] + 1
+        previous_hash = latest_block['block_hash']
+        print(f"[INFO][createblock] Latest block is #{latest_block['header']['block_number']}. New block will be #{block_number}.")
+    else:
+        # Genesis block
+        block_number = 0
+        previous_hash = "0" * 64
+        print(f"[INFO][createblock] No existing blocks. Creating Genesis Block #{block_number}.")
     
     print(f"[INFO][createblock] Creating block #{block_number} with previous hash: {previous_hash[:16]}...")
     
@@ -79,6 +91,10 @@ def create_block_from_mempool() -> Dict:
             transfer_count = len(transfers) if isinstance(transfers, list) else 0
             rule = "Yes" if ops.get("0") else "No"
             print(f"[INFO][createblock]   TX #{i+1}: {sender} (seq:{seq}) - {transfer_count} transfers, rule:{rule}")
+    
+    # Save the new block to the database
+    print(f"[INFO][createblock] Saving block #{new_block.header.block_number} to the database...")
+    db.add_block(new_block)
     
     # Clear the mempool after successful block creation
     print(f"[INFO][createblock] Clearing mempool...")

@@ -11,24 +11,31 @@ This project is the codebase for the Tau Testnet Alpha Blockchain. It implements
 *   **`commands/`**: Modules for handling client commands:
     *   `sendtx.py`: Handles submission and validation of complex transactions (including signature checks, sequence numbers, and Tau logic for operations).
     *   `getmempool.py`: Retrieves mempool content.
+    *   `createblock.py`: Creates new blocks from mempool transactions.
     *   `gettimestamp.py`: Handles timestamp requests.
-*   **`db.py`**: SQLite database interface (string-to-ID mapping, mempool).
+*   **`db.py`**: SQLite database interface, managing the mempool, string-to-ID mappings, and persistent block storage.
 *   **`chain_state.py`**: Manages in-memory state (account balances, sequence numbers).
 *   **`sbf_defs.py`**: Symbolic Boolean Formula (SBF) constants for Tau communication.
 *   **`utils.py`**: Utilities for SBF, data conversions, and transaction message canonicalization.
 *   **`config.py`**: Centralized configuration.
-*   **`tool_code.tau`**: The Tau logic program for validating operations.
+*   **`block.py`**: Defines block data structures (block header, transactions list) and merkle root computation.
+*   **`tool_code.tau`**: The Tau logic program for validating operations, including structural checks on transaction data and logic for applying new rules via pointwise revision.
 *   **`tests/`**: Directory containing unit tests:
     - `test_sendtx_basic.py`
     - `test_sendtx_validation.py`
     - `test_sendtx_tx_meta.py`
     - `test_sendtx_crypto.py`
-    - `test_tau_logic.py`: Tests direct SBF interaction with `tool_code.tau`.
+    - `test_tau_logic.py`: Tests all logic paths and validation rules directly within `tool_code.tau`.
     - `test_chain_state.py`: Tests balance and sequence number management.
+    - `test_block.py`: Tests the block data structure and the persistent block creation/chaining logic.
 
 ## Features
 
 *   **TCP Server**: Handles client connections and commands.
+*   **Persistent Blockchain**:
+    *   Creates blocks from transactions stored in the mempool.
+    *   Links blocks together in a chain by referencing the previous block's hash.
+    *   Persists the entire chain of blocks to a SQLite database.
 *   **Authenticated Transactions via BLS Signatures**:
     *   Transactions are cryptographically signed using BLS12-381 signatures.
     *   The server verifies the signature against the `sender_pubkey` and a canonical representation of the transaction data.
@@ -47,10 +54,10 @@ This project is the codebase for the Tau Testnet Alpha Blockchain. It implements
             *   For transfers in `operations["1"]`, the `from_pubkey` of each transfer must match the top-level `sender_pubkey`.
         *   `fee_limit` (string/integer): Placeholder for future fee models.
         *   `signature` (string): Hex-encoded BLS signature over a canonical form of the other fields.
-*   **Tau Integration for Operation Validation**: The `tool_code.tau` program validates the logic of operations within a transaction (e.g., coin transfers via SBF).
+*   **Tau Integration for Operation Validation**: The `tool_code.tau` program validates the logic of operations within a transaction (e.g., coin transfers via SBF). This now includes robust structural validation to ensure transfer data is complete and well-formed.
 *   **String-to-ID Mapping**: Dynamically assigns `y<ID>` identifiers for Tau SBF.
-*   **In-Memory Balances & Sequence Numbers**: Tracks account balances and sequence numbers.
-*   **SQLite Mempool**: Persists transactions awaiting processing.
+*   **In-Memory Balances & Sequence Numbers**: Tracks account balances and sequence numbers for rapid validation.
+*   **SQLite Mempool**: Persists transactions awaiting inclusion in a block.
 *   **BLS12-381 Public Key Validation**: Format and optional cryptographic checks for public keys.
 
 ## Prerequisites
@@ -140,10 +147,30 @@ python wallet.py send --privkey <hex_privkey> --to <recipient_pubkey_hex> --amou
     ```
     getmempool
     ```
+*   **Create Block:**
+    ```
+    createblock
+    ```
 *   **GetCurrentTimestamp:**
     ```
     getcurrenttimestamp
     ```
+
+## Block Structure
+
+A block is a fundamental data structure that organizes transactions into an atomic unit for chain progression. Each block consists of:
+
+- A **block header** containing:
+  - `block_number` (integer): Height of the block in the chain.
+  - `previous_hash` (string): Hex-encoded SHA256 hash of the previous block's header.
+  - `timestamp` (integer): Unix timestamp when the block was created.
+  - `merkle_root` (string): Hex-encoded Merkle root of the included transactions.
+- A **block body** containing:
+  - `transactions` (list): Ordered list of transactions (each is the JSON object accepted by `sendtx`).
+
+Blocks do **not** include proof-of-work or signatures at this alpha stage.
+
+The `block.py` module provides the `Block` and `BlockHeader` classes, along with utility functions for computing transaction hashes (`compute_tx_hash`), Merkle roots (`compute_merkle_root`), and block hashes.
 
 ## Testing
 
@@ -154,22 +181,24 @@ python -m unittest discover tests
 Or run a specific test file:
 ```
 *   To run sendtx tests: `python -m unittest tests/test_sendtx_basic.py tests/test_sendtx_validation.py tests/test_sendtx_tx_meta.py tests/test_sendtx_crypto.py`
+*   To run block tests: `python -m unittest tests/test_block.py`
+*   To run state reconstruction tests: `python -m unittest tests/test_state_reconstruction.py`
 ```
 Tests for `sendtx` now cover the new transaction structure, including cryptographic signature generation (within the test environment) and verification.
 
 ## Known Issues / Notes
 *   The fee model (`fee_limit`) is a placeholder and not yet enforced.
+*   The chain state (balances, sequence numbers) is updated in memory *before* a transaction is included in a block. A server crash between transaction validation and block creation could lead to a state inconsistency.
 
 ## Project Status
 
-**Alpha:** This is an early alpha version. It's under active development and is intended for testing and experimentation. Expect changes and potential bugs.
+**Alpha:** This is an early alpha version. It's under active development and is intended for testing and experimentation. The core engine for a functional blockchain is in place, including transaction validation, mempool management, and persistent block creation.
 
 ## Future Work
 
 *   Implement a fee model.
-*   Persistent chain state (blocks, not just balances and sequence numbers).
+*   Reconcile in-memory chain state with the persistent block data to enhance fault tolerance.
 *   More robust error handling and reporting.
 *   Expansion of Tau-validated logic and commands.
-*   Implementation of a simple P2P networking layer.
+*   Implementation of a simple P2P networking layer for node synchronization.
 *   More comprehensive unit and integration tests.
-*   Block creation and processing from mempool.

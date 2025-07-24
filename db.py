@@ -1,8 +1,11 @@
 import sqlite3
 import threading
 import os
+import json
+from typing import Optional, Dict, List
 
 import config
+import block as block_module
 
 # Internal SQLite connection and lock for thread-safety
 _db_conn = None
@@ -34,6 +37,15 @@ def init_db():
             CREATE TABLE IF NOT EXISTS mempool (
                 id   INTEGER PRIMARY KEY AUTOINCREMENT,
                 sbf  TEXT    NOT NULL
+            );
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS blocks (
+                block_number  INTEGER PRIMARY KEY,
+                block_hash    TEXT NOT NULL UNIQUE,
+                previous_hash TEXT NOT NULL,
+                timestamp     INTEGER NOT NULL,
+                block_data    TEXT NOT NULL
             );
         ''')
 
@@ -82,7 +94,6 @@ def get_text_by_id(yid: str) -> str:
             raise KeyError(f"No text found for Tau ID: {yid}")
 
 def add_mempool_tx(tx_data: str):
-    return
     """Adds data to the mempool. Prefixes with 'json:' if it looks like JSON."""
     if _db_conn is None:
         init_db()
@@ -112,4 +123,40 @@ def clear_mempool():
         cur.execute('DELETE FROM mempool')
         _db_conn.commit()
         print(f"[INFO][db] Mempool cleared.")
+
+def add_block(new_block: block_module.Block):
+    """Adds a new block to the database."""
+    if _db_conn is None:
+        init_db()
+    
+    block_dict = new_block.to_dict()
+    block_data_json = json.dumps(block_dict)
+
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'INSERT INTO blocks (block_number, block_hash, previous_hash, timestamp, block_data) VALUES (?, ?, ?, ?, ?)',
+            (
+                new_block.header.block_number,
+                new_block.block_hash,
+                new_block.header.previous_hash,
+                new_block.header.timestamp,
+                block_data_json,
+            )
+        )
+        _db_conn.commit()
+        print(f"[INFO][db] Added block #{new_block.header.block_number} to database.")
+
+def get_latest_block() -> Optional[Dict]:
+    """Retrieves the latest block (highest block_number) from the database."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT block_data FROM blocks ORDER BY block_number DESC LIMIT 1')
+        row = cur.fetchone()
+        if row:
+            return json.loads(row[0])
+        else:
+            return None
 

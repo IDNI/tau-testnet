@@ -228,10 +228,10 @@ def _process_transfers_operation(transfers, sender_pubkey):
         # Validate address formats first (non-cryptographic part)
         is_valid_from, err_from = _validate_bls12_381_pubkey(from_addr_key, f"transfer #{i+1} 'from' address")
         if not is_valid_from:
-            return False, None, err_from
+            return False, None, f"Error processing transfer #{i+1}: {err_from}"
         is_valid_to, err_to = _validate_bls12_381_pubkey(to_addr_key, f"transfer #{i+1} 'to' address")
         if not is_valid_to:
-            return False, None, err_to
+            return False, None, f"Error processing transfer #{i+1}: {err_to}"
 
         try:
             amount_int = int(amount_decimal_str)
@@ -349,180 +349,97 @@ def queue_transaction(json_blob: str) -> str:
     else:
         print("[WARN][sendtx] BLS crypto not available; skipping signature verification and sequence enforcement.")
 
-    # --- NEW SEQUENTIAL OPERATION PROCESSING ---    
     print(f"  [INFO][sendtx] Processing transaction with operations: {list(operations.keys())}")
 
-    # Pre-process all transfers under operations["1"] to validate formats and get SBFs
-    # This is done upfront for Python-side validation, even if Tau sees them one by one or a summary.
     all_validated_transfers = []
     transfer_sbf_encodings = []
     empty_transfer_list = False
-    if "1" in operations:
+    has_transfers = "1" in operations
+    has_rules = "0" in operations
+
+    if has_transfers:
         transfers_op_data = operations["1"]
         if transfers_op_data:
             success, transfer_result_data, transfer_error_msg = _process_transfers_operation(transfers_op_data, sender_pubkey)
             if not success:
-                if transfer_error_msg.startswith("Error processing transfer #"):
-                    return transfer_error_msg.replace(
-                        "Error processing transfer #", "ERROR: Could not process transfer #", 1
-                    )
-                return f"FAILURE: Transaction invalid (transfer pre-processing). {transfer_error_msg}"
+                # Pre-processing failed, so reject before any Tau communication.
+                if "Error processing transfer #" in transfer_error_msg:
+                     return transfer_error_msg.replace("Error processing transfer #", "ERROR: Could not process transfer #")
+                return f"FAILURE: Transaction invalid. {transfer_error_msg}"
             all_validated_transfers = transfer_result_data["transfers"]
             transfer_sbf_encodings = transfer_result_data["sbf_encodings"]
             print(f"  [INFO][sendtx] Pre-processed {len(all_validated_transfers)} transfers from operations['1'].")
         else:
-            print("  [INFO][sendtx] operations['1'] is present but empty. No transfers to pre-process.")
+            print("  [INFO][sendtx] operations['1'] is present but empty. Treating as a success.")
             empty_transfer_list = True
-    else:
-        print("  [INFO][sendtx] No operations['1'] key. No transfers to pre-process.")
 
     try:
-        # Determine the maximum operation key to iterate up to
-        if not operations:
-            # This case should be caught by wallet.py or earlier validation if no ops are provided at all.
-            # If ops is empty dict, it implies no actual work, but still valid structure if signature/meta is fine.
-            print("  [INFO][sendtx] No operations in payload. Queuing as is (likely for non-operational TX or empty ops).")
-            db.add_mempool_tx(blob)
-            if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
-                chain_state.increment_sequence_number(sender_pubkey)
-            return "SUCCESS: Transaction queued (no operations to process with Tau)."
+        # --- Tau Validation Step ---
+        # 1. Validate Rules (Operation "0")
+        if has_rules:
+            rule_text = operations.get("0", "").strip()
+            if rule_text:
+                print(f"  [INFO][sendtx] Validating rule with Tau: '{rule_text[:50]}...'")
+                # For i0 (tau type), data is the rule string itself.
+                tau_output_rules = tau_manager.communicate_with_tau(input_sbf=rule_text, target_output_stream_index=0)
+                if tau_output_rules.strip().lower() != "x1001":
+                    return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
+                print("  [INFO][sendtx] Tau rule validation successful.")
 
-        operation_int_keys = [int(k) for k in operations.keys() if k.isdigit()]
-        if not operation_int_keys: # No numeric keys, implies no Tau interaction needed based on current spec.
-            print("  [INFO][sendtx] No numeric operation keys. Queuing as is.")
-            db.add_mempool_tx(blob)
-            if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
-                chain_state.increment_sequence_number(sender_pubkey)
-            return "SUCCESS: Transaction queued (no numeric operations to process with Tau)."
+        # 2. Validate Transfers (Operation "1")
+        if has_transfers and not empty_transfer_list:
+            print(f"  [INFO][sendtx] Validating {len(all_validated_transfers)} transfers with Tau...")
+            for i, (sbf_encoding, transfer_details) in enumerate(zip(transfer_sbf_encodings, all_validated_transfers)):
+                print(f"    - Validating transfer #{i+1}: {transfer_details} with SBF: {sbf_encoding}")
+                
+                # Each transfer is sent to Tau on stream i1
+                # The Tau program expects i0 (rules) and i1 (transfers) as separate inputs.
+                # When validating transfers, we can send a neutral value for i0.
+                tau_input_for_transfer = f"{sbf_defs.SBF_LOGICAL_ZERO}\n{sbf_encoding}"
+
+                tau_output_transfer = tau_manager.communicate_with_tau(
+                    input_sbf=tau_input_for_transfer,
+                    target_output_stream_index=1
+                )
+
+                if not _decode_single_transfer_output(tau_output_transfer, sbf_encoding):
+                    return (f"FAILURE: Transaction rejected by Tau logic for transfer #{i+1} "
+                            f"({transfer_details}). Output: {tau_output_transfer}")
+            print("  [INFO][sendtx] All Tau transfer validations successful.")
         
-        max_operation_idx = max(operation_int_keys)
+        # --- Post-Tau Processing ---
 
-        # Iterate from operation index 0 up to max_operation_idx
-        for current_op_idx in range(max_operation_idx + 1):
-            op_key_str = str(current_op_idx)
-            tau_input_lines = []
-            current_op_data_for_tau = sbf_defs.SBF_LOGICAL_ZERO # Default to SBF False for this stream
-
-            print(f"  [INFO][sendtx] Preparing Tau step for operation index: {current_op_idx}")
-
-            # Construct the input for Tau for this specific step
-            for i in range(current_op_idx + 1):
-                if i < current_op_idx:
-                    tau_input_lines.append(sbf_defs.SBF_LOGICAL_ZERO) # Previous streams are SBF False
-                else: # This is the current stream ik
-                    # op_key_str here is the current_op_idx, which defines which stream is "active"
-                    # We need to check operations based on str(i) which is the stream index
-                    stream_op_key_str = str(i)
-
-                    if stream_op_key_str == "0": # Rule processing
-                        if stream_op_key_str in operations and isinstance(operations[stream_op_key_str], str) and operations[stream_op_key_str].strip():
-                            # For i0 (tau type), data is the rule string itself.
-                            # It should not be SBF_LOGICAL_ZERO if a rule string is present.
-                            rule_text = operations[stream_op_key_str].strip()
-                            print(f"    [WARN][sendtx] Op {stream_op_key_str} (Rule): Rule processing is experimental. Rule: '{rule_text}'")
-                            print(f"    [WARN][sendtx] Current Tau program may not support arbitrary rule syntax.")
-                            current_op_data_for_stream_i = rule_text
-                            print(f"    [DEBUG][sendtx] Op {stream_op_key_str} (Rule): Using rule string \'{current_op_data_for_stream_i}\' for i{i}")
-                        else:
-                            # If no rule string for op "0", what should i0 be?
-                            # If i0 is tau type, sending SBF_LOGICAL_ZERO might be a type mismatch.
-                            # Tau's `(!(i0[t]=0))` implies i0 can be compared to SBF 0.
-                            # Let's assume sending SBF_LOGICAL_ZERO is acceptable for an empty rule.
-                            current_op_data_for_stream_i = sbf_defs.SBF_LOGICAL_ZERO
-                            print(f"    [DEBUG][sendtx] Op {stream_op_key_str} (Rule): Not present or invalid, using {current_op_data_for_stream_i} for i{i}")
-                    elif stream_op_key_str == "1":  # Transfer processing
-                        if transfer_sbf_encodings:
-                            # Include the transfer SBF directly in the input
-                            current_op_data_for_stream_i = transfer_sbf_encodings[0]
-                            print(f"    [DEBUG][sendtx] Op {stream_op_key_str} (Transfer): "
-                                  f"Using SBF {current_op_data_for_stream_i} for i{i}")
-                        else:
-                            current_op_data_for_stream_i = sbf_defs.SBF_LOGICAL_ZERO
-                            print(f"    [DEBUG][sendtx] Op {stream_op_key_str} (Transfer): "
-                                  f"No transfers, using {current_op_data_for_stream_i} for i{i}")
-                    else: # Custom operations (op_key_str >= "2")
-                        if stream_op_key_str in operations:
-                            try:
-                                current_op_data_for_stream_i = _encode_operation_to_sbf(operations[stream_op_key_str], stream_op_key_str)
-                                print(f"    [DEBUG][sendtx] Op {stream_op_key_str} (Custom): Encoded to {current_op_data_for_stream_i} for i{i}")
-                            except Exception as e:
-                                print(f"    [WARN][sendtx] Op {stream_op_key_str} (Custom): Encoding failed ({e}), using {sbf_defs.SBF_LOGICAL_ZERO} for i{i}")
-                                current_op_data_for_stream_i = sbf_defs.SBF_LOGICAL_ZERO
-                        else:
-                            current_op_data_for_stream_i = sbf_defs.SBF_LOGICAL_ZERO
-                            print(f"    [DEBUG][sendtx] Op {stream_op_key_str} (Custom): Not present, using {current_op_data_for_stream_i} for i{i}")
-                    
-                    # Ensure we use the data specific to this stream for appending
-                    if current_op_data_for_stream_i is not None:
-                        tau_input_lines.append(current_op_data_for_stream_i)
-            
-            tau_input_string_for_step = "\n".join(tau_input_lines)
-            print(f"    [DEBUG][sendtx] Sending to Tau for Op Index {current_op_idx}:\n{tau_input_string_for_step}")
-            
-            # Pass current_op_idx as the target_output_stream_index
-            tau_output = tau_manager.communicate_with_tau(
-                input_sbf=tau_input_string_for_step.strip(),
-                target_output_stream_index=current_op_idx
-            )
-            print(f"    [DEBUG][sendtx] Tau response for Op Index {current_op_idx} (expected from o{current_op_idx}): {tau_output}")
-
-            # Generic failure check using the corrected SBF constants
-            failure_reason = None
-            
-            # Special case: for operation index 1 (transfers), if there are no transfers and we get F back, that's valid
-            if str(current_op_idx) == "1" and not transfer_sbf_encodings and tau_output == sbf_defs.FAIL_INVALID_SBF:
-                # This is expected when there are no transfers to process
-                pass
-            elif tau_output == sbf_defs.FAIL_INVALID_SBF: # This is {x0'}:sbf
-                failure_reason = "Invalid command or generic failure (FAIL_INVALID_SBF)"
-            elif tau_output == sbf_defs.FAIL_SRC_EQ_DEST_SBF:
-                failure_reason = "Source equals Destination (FAIL_SRC_EQ_DEST_SBF)"
-            elif tau_output == sbf_defs.FAIL_ZERO_AMOUNT_SBF:
-                failure_reason = "Zero amount (FAIL_ZERO_AMOUNT_SBF)"
-            elif tau_output == sbf_defs.FAIL_INSUFFICIENT_FUNDS_SBF:
-                failure_reason = "Insufficient funds (FAIL_INSUFFICIENT_FUNDS_SBF)"
-            # Note: SBF_LOGICAL_ZERO is the same as FAIL_INVALID_SBF, so covered by the first case.
-
-            if failure_reason:
-                return f"FAILURE: Transaction rejected by Tau at operation index {current_op_idx}. Reason: {failure_reason}. Output: {tau_output}"
-
-            # Determine what data we actually expect Tau to echo for the *active* stream
-            if str(current_op_idx) == "1" and transfer_sbf_encodings:
-                # For the transfer step we queued the real SBF; Tau should echo that
-                active_stream_data_sent = transfer_sbf_encodings[0]
-            elif current_op_idx < len(tau_input_lines):
-                active_stream_data_sent = tau_input_lines[current_op_idx]
-            else:
-                # Nothing was sent on this stream in the multiline block
-                active_stream_data_sent = sbf_defs.SBF_LOGICAL_ZERO
-
-            if str(current_op_idx) == "1" and active_stream_data_sent != sbf_defs.SBF_LOGICAL_ZERO:
-                is_valid_in_tau = _decode_single_transfer_output(tau_output, active_stream_data_sent)
-                if not is_valid_in_tau:
-                    return f"FAILURE: Transaction invalid. Transfer operation (index {current_op_idx}) rejected by Tau logic. Output: {tau_output}"
-            
-            print(f"  [INFO][sendtx] Tau step for operation index {current_op_idx} successful.")
-
-        # If all Tau steps are successful, then apply Python-side changes for transfers
-        if all_validated_transfers:
-            print(f"  [INFO][sendtx] All Tau steps successful. Applying balance changes for {len(all_validated_transfers)} pre-validated transfers...")
-            for from_addr, to_addr, amt in all_validated_transfers:
-                if not chain_state.update_balances_after_transfer(from_addr, to_addr, amt):
-                    print(f"  [CRITICAL][sendtx] Balance update failed for transfer: {from_addr} to {to_addr} for {amt}. This might indicate a desync or logic error.")
-                    return f"FAILURE: Transaction invalid post-Tau. Could not apply transfer ({from_addr} -> {to_addr}, amount {amt})."
-        
-        # All checks passed, all balances updated, now add to mempool
-        db.add_mempool_tx(blob)
+        # Sequence number must be incremented once the transaction is validated and will be queued.
         if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
             chain_state.increment_sequence_number(sender_pubkey)
+
+        # Apply Python-side changes for transfers ONLY after all are validated by Tau.
+        if all_validated_transfers:
+            print(f"  [INFO][sendtx] Applying balance changes for {len(all_validated_transfers)} validated transfers...")
+            for from_addr, to_addr, amt in all_validated_transfers:
+                if not chain_state.update_balances_after_transfer(from_addr, to_addr, amt):
+                    # This check is critical. If it fails, the state might be inconsistent.
+                    # It implies a bug where Python's pre-check differs from Tau's view.
+                    print(f"  [CRITICAL][sendtx] Balance update failed for transfer: {from_addr} to {to_addr} for {amt}. "
+                          "This indicates a logic error or state desynchronization.")
+                    # Note: At this point, the sequence number was already incremented. This might need a compensating action
+                    # in a more robust system, but for now, we fail loudly.
+                    return f"FAILURE: Transaction invalid post-Tau. Could not apply transfer ({from_addr} -> {to_addr}, amount {amt})."
+
+        # All checks passed, all balances updated, now add to mempool
+        db.add_mempool_tx(blob)
         
-        print(f"  [INFO][sendtx] Transaction successfully queued in mempool")
+        print(f"  [INFO][sendtx] Transaction successfully queued in mempool.")
         if empty_transfer_list:
             return "SUCCESS: Transaction queued (empty transfer list)."
-        return "SUCCESS: Transaction queued."
-        
+        elif has_transfers:
+             return f"SUCCESS: Transaction queued with {len(all_validated_transfers)} transfers."
+        else:
+             return "SUCCESS: Transaction queued."
+
+    except ValueError as e:
+        return f"ERROR: Could not process transaction. {e}"
     except Exception as e:
-        print(f"  [ERROR][sendtx] Error during sequential transaction processing: {e}")
-        # Re-raise for now to get full traceback during development if unexpected
-        # raise
-        return f"ERROR: Could not process transaction: {e}"
+        print(f"  [CRITICAL][sendtx] An unexpected error occurred in queue_transaction: {e}")
+        # Consider logging the full traceback here
+        return f"FAILURE: An unexpected server error occurred."

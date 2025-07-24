@@ -19,23 +19,6 @@ tau_ready = threading.Event()  # Signals when Tau process has printed the ready 
 server_should_stop = threading.Event()  # Signals background threads to stop
 tau_stderr_lines = queue.Queue(maxsize=100)  # Store recent stderr lines
 
-# A queue of inputs that should be sent when Tau prompts on a given iN stream.
-# Key: stream index (int); Value: list[str] of inputs to send in FIFO order.
-pending_inputs: dict[int, list[str]] = {}
-
-
-def enqueue_input_for_stream(stream_idx: int, input_sbf: str):
-    """
-    Add an SBF string to be sent the next time Tau prompts on the given input stream.
-    Ignores empty or whitespace-only strings.
-    """
-    global pending_inputs
-    input_sbf = input_sbf.strip()
-    if not input_sbf:
-        return  # nothing to enqueue
-    pending_inputs.setdefault(stream_idx, []).append(input_sbf)
-
-
 def read_stderr():
     """
     Reads stderr from the Tau process, prints it live, and puts lines into a thread-safe queue.
@@ -252,7 +235,7 @@ def start_and_manage_tau_process():
     print("[INFO][tau_manager] Server shutdown requested or fatal error, Tau manager thread exiting.")
 
 
-def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 1):
+def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 0):
     """
     Sends an SBF string to the persistent Tau process via stdin
     and reads the corresponding SBF output from stdout, focusing on a specific output stream.
@@ -270,6 +253,7 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 1):
         TimeoutError: If Tau does not respond within COMM_TIMEOUT.
     """
     global tau_process, tau_process_lock, tau_ready  # Include tau_ready
+    print(f"communicate_with_tau({input_sbf}, {target_output_stream_index})")
 
     # Quick check if ready before locking
     if not tau_ready.is_set():
@@ -288,38 +272,22 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 1):
             tau_ready.clear()  # Mark as not ready
             raise Exception("Tau process stdin/stdout pipes not available or closed.")
 
-        # Determine if this is a raw Tau rule input for stream i0 (detect by target index and presence of '=')
-        rule_text = input_sbf.strip()
-        is_rule = False
-        if target_output_stream_index == 0:
-            # Treat as rule only if the text looks like a Tau rule (contains '=' or ':=' and is not just logical zero)
-            if rule_text and rule_text not in {sbf_defs.SBF_LOGICAL_ZERO, '0', 'F'} and ('=' in rule_text):
-                is_rule = True
-
-        try:
-            if is_rule:
-                # Rule (i0) is sent immediately
-                rule_line = rule_text if rule_text.endswith('.') or rule_text == sbf_defs.SBF_LOGICAL_ZERO else rule_text + '.'
-                print(f"  [DEBUG] communicate_with_tau: Sending rule immediately for i0: '{rule_line}'")
-                current_stdin.write(rule_line + '\n')
-                current_stdin.flush()
-            else:
-                # Non-rule step: write multi-line input block immediately (i0..ik)
-                if input_sbf.strip():
-                    print(
-                        f"  [DEBUG] communicate_with_tau: Sending multiline input block for step {target_output_stream_index}:\n{input_sbf}")
-                    current_stdin.write(input_sbf + '\n')
-                    current_stdin.flush()
-                else:
-                    print(
-                        f"  [DEBUG] communicate_with_tau: No data for i{target_output_stream_index}; awaiting prompt.")
-
-        except (OSError, BrokenPipeError, ValueError) as e:  # ValueError for closed stream
-            print(f"[ERROR] communicate_with_tau: Error writing to Tau stdin: {e}")
-            tau_ready.clear()  # Mark as not ready
-            # Manager thread will handle restart
-            raise Exception(f"Failed to write to Tau process stdin: {e}") from e
-
+            # Send the input block (including any rule text or SBF atoms) as-is for this step
+            # try:
+            #     if input_sbf.strip():
+            #         print(
+            #             f"  [DEBUG] communicate_with_tau: Sending input block for step {target_output_stream_index}:\n{input_sbf}")
+            #         current_stdin.write(input_sbf + '\n')
+            #         current_stdin.flush()
+            #     else:
+            #         print(
+            #             f"  [DEBUG] communicate_with_tau: No data for i{target_output_stream_index}; awaiting prompt.")
+            #
+            # except (OSError, BrokenPipeError, ValueError) as e:
+            #     print(f"[ERROR] communicate_with_tau: Error writing to Tau stdin: {e}")
+            #     tau_ready.clear()  # Mark as not ready
+            #     raise Exception(f"Failed to write to Tau process stdin: {e}") from e
+            #
         # Read stdout line by line
         sbf_output_line = sbf_defs.SBF_LOGICAL_ZERO  # Default if no specific oN output found
         output_lines_read = []
@@ -333,6 +301,7 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 1):
                 # We may need to wait for Tau to prompt i0[...] := before returning
                 if 'waiting_for_next_i0' not in locals():
                     waiting_for_next_i0 = False
+
                 # Check if process died while we are waiting for output
                 if tau_process.poll() is not None:
                     print("[ERROR] communicate_with_tau: Tau process exited while waiting for output.")
@@ -342,7 +311,7 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 1):
                 # Read either until newline or until prompt ':=' appears, with debug
                 buf = bytearray()
                 fd = current_stdout.fileno()
-                print(f"[DEBUG] prompt-detect: start read loop, fd={fd}")
+                # print(f"[DEBUG] prompt-detect: start read loop, fd={fd}")
                 while True:
                     # print(f"[DEBUG] prompt-detect: select on fd={fd}")
                     rlist, _, _ = select.select([fd], [], [], 0.1)
@@ -363,21 +332,28 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 1):
                         print("[DEBUG] prompt-detect: prompt ':=' detected inside buf")
                         break
                 line = buf.decode('utf-8', errors='replace')
-                print(f"[DEBUG] prompt-detect: final line='{line}'")
+                # print(f"[DEBUG] prompt-detect: final line='{line}'")
 
                 line_strip = line.strip()
+                # --- Early exit on Execution‑step marker ---------------------------------
+                # Tau prints lines like "Execution step: 3" when it rolls over to the next
+                # global iteration.  That means the current interactive exchange is done
+                # and the caller should start a new communicate_with_tau() cycle.
+                if line_strip.startswith("Execution step:"):
+                    # print("  [DEBUG] communicate_with_tau: Detected 'Execution step' marker; returning to caller.")
+                    break
                 if line_strip == "":
-                    print("  [DEBUG] communicate_with_tau: Ignoring blank line from Tau.")
+                    # print("  [DEBUG] communicate_with_tau: Ignoring blank line from Tau.")
                     continue
 
                 # If we've captured our oN value, hold until we see the next i0 prompt
-                if waiting_for_next_i0:
-                    if re.match(r"^i0\[\d+\]\s*(:=|=)\s*$", line_strip):
-                        print("  [DEBUG] communicate_with_tau: Next i0 prompt observed; returning to caller.")
-                        break  # safe to return, caller will handle new step
-                    # Do NOT respond to prompts while waiting
-                    if line_strip.startswith('i'):
-                        continue
+                # if waiting_for_next_i0:
+                #     if re.match(r"^i0\[\d+\]\s*(:=|=)\s*$", line_strip):
+                #         print("  [DEBUG] communicate_with_tau: Next i0 prompt observed; returning to caller.")
+                #         break  # safe to return, caller will handle new step
+                #     # Do NOT respond to prompts while waiting
+                #     if line_strip.startswith('i'):
+                #         continue
 
                 output_lines_read.append(line_strip)
                 print(f"\033[93m  [TAU_STDOUT_COMM] {line_strip}\033[0m")
@@ -401,10 +377,18 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 1):
                     # This line is the value for o{expect_stream_value_for}
                     if expect_stream_value_for == target_output_stream_index:
                         sbf_output_line = line_strip  # keep only our target
-                        print(
-                            f"  [DEBUG] communicate_with_tau: Captured value for o{target_output_stream_index}: '{sbf_output_line}'")
+                        # print(f"  [DEBUG] communicate_with_tau: Captured value for o{target_output_stream_index}: '{sbf_output_line}'")
                         found_target_output = True
                         waiting_for_next_i0 = True  # wait for new i0 prompt
+                    elif expect_stream_value_for == 999:
+                        print(f"  [DEBUG] communicate_with_tau: Captured value for o999: '{line_strip}'")
+                        try:
+                            # Import here to avoid circular imports
+                            import chain_state
+                            chain_state.save_rules_state(line_strip)
+                            print("  [INFO] communicate_with_tau: Successfully saved rules state to chain state")
+                        except Exception as e:
+                            print(f"  [ERROR] communicate_with_tau: Failed to save rules state: {e}")
                     # In every case, stop expecting another line
                     expect_stream_value_for = None
                     continue
@@ -413,8 +397,7 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 1):
                 o_prompt_match = re.match(r"^o(\d+)\[[^\]]+\]\s*(:=|=)\s*$", line_strip)
                 if o_prompt_match:
                     expect_stream_value_for = int(o_prompt_match.group(1))
-                    print(
-                        f"  [DEBUG] communicate_with_tau: Saw o{expect_stream_value_for} prompt; expecting its value next.")
+                    print(f"  [DEBUG] communicate_with_tau: Saw o{expect_stream_value_for} prompt; expecting its value next.")
                     continue
                 # ---------------------------------------------------------------------
 
@@ -423,26 +406,25 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 1):
                 if prompt_match:
                     stream_idx = int(prompt_match.group(1))
                     # If we have queued data for this stream, send the next piece; else send logical zero
-                    if pending_inputs.get(stream_idx):
-                        next_input = pending_inputs[stream_idx].pop(0)
-                        print(f"  [DEBUG] communicate_with_tau: Tau prompting on i{stream_idx}. "
-                              f"Sending queued input: '{next_input}'")
-                        current_stdin.write(next_input + '\n')
-                        current_stdin.flush()
-                    elif is_rule and stream_idx == target_output_stream_index:
-                        # Tau is prompting for the rule on the target input stream
-                        rule_line = rule_text if rule_text.endswith('.') else rule_text + '.'
-                        print(
-                            f"  [DEBUG] communicate_with_tau: Tau prompting on i{stream_idx}. Sending rule: '{rule_line}'")
-                        current_stdin.write(rule_line + '\n')
-                        current_stdin.flush()
+
+                    if stream_idx == target_output_stream_index:
+                            # print(f"  [DEBUG] communicate_with_tau: Tau prompting on i{stream_idx}. "
+                            #       f"Sending queued input: '{input_sbf}'")
+                            current_stdin.write(input_sbf + '\n')
+                            current_stdin.flush()
                     else:
-                        print(f"  [DEBUG] communicate_with_tau: Tau prompting on i{stream_idx}. "
-                              f"No queued input; sending SBF_LOGICAL_ZERO.")
+                        # print(f"  [DEBUG] communicate_with_tau: Tau prompting on i{stream_idx}. "
+                        #         f"No queued input; sending SBF_LOGICAL_ZERO.")
                         current_stdin.write(sbf_defs.SBF_LOGICAL_ZERO + '\n')
                         current_stdin.flush()
                     continue
 
+                # --- Skip completely unrecognised prompt lines ---------------------------
+                # If the line ends with ':=' or '=' but does not match any known iN/oN
+                # prompt patterns, treat it as noise and move on.
+                if re.match(r".*(:=|=)\s*$", line_strip):
+                    # print("  [DEBUG] communicate_with_tau: Unrecognised prompt skipped.")
+                    continue
                 # Specifically look for o<target_output_stream_index> assignment
                 # Regex to match "oN[<any_digits_or_t>] = <sbf_part>" or "oN = <sbf_part>"
                 # Tau source uses '=', not ':=' for oN assignment. Example: o0[t] = fail_code_value
@@ -480,6 +462,7 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 1):
                         temp_sbf_output = read_line
                         print(f"  [DEBUG] communicate_with_tau: Fallback heuristic chose line: '{temp_sbf_output}'")
                         break
+
                 sbf_output_line = temp_sbf_output
                 if not found_target_output and sbf_output_line == sbf_defs.SBF_LOGICAL_ZERO:  # if still default after fallback
                     raise TimeoutError(
@@ -560,7 +543,6 @@ def kill_tau_process():
 
 # Export for external use
 __all__ = [
-    "enqueue_input_for_stream",
     "communicate_with_tau",
     "get_tau_process_status",
     "get_recent_stderr",
