@@ -383,6 +383,7 @@ def queue_transaction(json_blob: str) -> str:
                 # For i0 (tau type), data is the rule string itself.
                 tau_output_rules = tau_manager.communicate_with_tau(input_sbf=rule_text, target_output_stream_index=0)
                 if tau_output_rules.strip().lower() != "x1001":
+                    print(f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}")
                     return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
                 print("  [INFO][sendtx] Tau rule validation successful.")
 

@@ -92,14 +92,43 @@ def create_block_from_mempool() -> Dict:
             rule = "Yes" if ops.get("0") else "No"
             print(f"[INFO][createblock]   TX #{i+1}: {sender} (seq:{seq}) - {transfer_count} transfers, rule:{rule}")
     
-    # Save the new block to the database
-    print(f"[INFO][createblock] Saving block #{new_block.header.block_number} to the database...")
-    db.add_block(new_block)
-    
-    # Clear the mempool after successful block creation
-    print(f"[INFO][createblock] Clearing mempool...")
-    db.clear_mempool()
-    print(f"[INFO][createblock] Mempool cleared successfully")
+    # Atomically save the new block, commit state, and clear mempool
+    print(f"[INFO][createblock] Committing block #{new_block.header.block_number}, state, and clearing mempool in a single transaction...")
+    import chain_state as _cs, db as _db
+    # Inline block insertion and state commit to ensure atomicity
+    with _db._db_lock, _db._db_conn:
+        conn = _db._db_conn
+        # Insert block
+        block_dict = new_block.to_dict()
+        block_data_json = json.dumps(block_dict)
+        conn.execute(
+            'INSERT INTO blocks (block_number, block_hash, previous_hash, timestamp, block_data) VALUES (?, ?, ?, ?, ?)',
+            (
+                new_block.header.block_number,
+                new_block.block_hash,
+                new_block.header.previous_hash,
+                new_block.header.timestamp,
+                block_data_json,
+            )
+        )
+        # Commit in-memory state to database
+        conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('current_rules', _cs.get_rules_state())
+        )
+        conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('last_processed_block_hash', new_block.block_hash)
+        )
+        for addr, bal in _cs._balances.items():
+            seq = _cs._sequence_numbers.get(addr, 0)
+            conn.execute(
+                'INSERT OR REPLACE INTO accounts (address, balance, sequence_number) VALUES (?, ?, ?)',
+                (addr, bal, seq)
+            )
+        # Clear mempool
+        conn.execute('DELETE FROM mempool')
+    print(f"[INFO][createblock] Block, state committed; mempool cleared.")
     
     print(f"[INFO][createblock] Block creation process completed!")
     

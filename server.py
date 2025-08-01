@@ -234,15 +234,34 @@ def main():
     print(f"[INFO][Server] Initializing database at {config.STRING_DB_PATH}")
     db.init_db()
 
-    # Initialize and load the full chain state (balances, sequences, rules)
-    # This will either load from a file and update, or rebuild from scratch.
-    print(f"[INFO][Server] Initializing and loading chain state...")
-    chain_state.initialize_and_load_state()
-
-    # Start Tau process manager thread
+    # Start Tau process manager thread FIRST
     print("[INFO][Server] Starting Tau Process Manager Thread...")
     manager_thread = threading.Thread(target=tau_manager.start_and_manage_tau_process, daemon=True)
     manager_thread.start()
+
+    # Now, wait for Tau to be ready
+    print("[INFO][Server] Waiting for Tau to signal readiness...")
+    if not tau_manager.tau_ready.wait(timeout=config.CLIENT_WAIT_TIMEOUT):
+        print("[ERROR][Server] Tau did not signal readiness in time; aborting startup.")
+        tau_manager.request_shutdown() # Ensure the thread is cleaned up
+        sys.exit(1)
+    
+    print("[INFO][Server] Tau is ready.")
+
+    # Initialize and load the full chain state (balances, sequences, rules)
+    print(f"[INFO][Server] Initializing and loading chain state...")
+    chain_state.initialize_persistent_state()
+
+    # Inject persisted rules state into Tau (i0[0]) if available
+    saved_rules = chain_state.get_rules_state()
+    if saved_rules:
+        print("[INFO][Server] Injecting persisted rules into Tau...")
+        # try:
+        #     out = tau_manager.communicate_with_tau(input_sbf=saved_rules, target_output_stream_index=0)
+        #     if out.strip().lower() != "x1001":
+        #         print(f"[ERROR][Server] Tau rejected persisted rules: {out.strip()}")
+        # except Exception as e:
+        #     print(f"[ERROR][Server] Failed to inject persisted rules into Tau: {e}")
 
     # Start the server socket listening
     server_socket = None

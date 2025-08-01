@@ -48,6 +48,20 @@ def init_db():
                 block_data    TEXT NOT NULL
             );
         ''')
+        # Persistent chain state tables
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS accounts (
+                address         TEXT PRIMARY KEY,
+                balance         INTEGER NOT NULL,
+                sequence_number INTEGER NOT NULL DEFAULT 0
+            );
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS chain_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+        ''')
 
     _db_conn = conn
 
@@ -159,4 +173,3 @@ def get_latest_block() -> Optional[Dict]:
             return json.loads(row[0])
         else:
             return None
-

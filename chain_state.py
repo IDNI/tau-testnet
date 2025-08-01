@@ -20,7 +20,7 @@ _rules_lock = threading.Lock()
 
 # In-memory rules state storage
 _current_rules_state = ""
-_last_processed_block = -1
+_last_processed_block_hash = ""
 
 GENESIS_ADDRESS = "91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6"
 GENESIS_BALANCE = 15
@@ -32,29 +32,6 @@ GENESIS_BALANCE = 15
 # Private Key (hex, 32 bytes): 06bc6e6e15a4b40df028da6901e471fa1facc5e9fad04408ab864c7ccb036aa3
 # Public Key (hex, 48 bytes, G1 compressed): 893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2
 
-def initialize_and_load_state():
-    """
-    Initializes and synchronizes the chain state.
-    - Tries to load state from 'chain_state.json'.
-    - If successful, updates the state from the last known block.
-    - If not, rebuilds the state from scratch and saves it.
-    """
-    if load_chain_state():
-        print("[INFO][chain_state] Successfully loaded chain state from file.")
-        # Check the last block number in the database
-        import db
-        db.init_db()
-        latest_block_num = db.get_latest_block_number()
-        
-        if latest_block_num > _last_processed_block:
-            print(f"[INFO][chain_state] Chain state is behind (state block: {_last_processed_block}, db block: {latest_block_num}). Updating...")
-            rebuild_state_from_blockchain(start_block=_last_processed_block + 1)
-            save_chain_state() # Save the updated state
-    else:
-        print("[INFO][chain_state] No chain state file found or failed to load. Rebuilding from scratch.")
-        rebuild_state_from_blockchain()
-        save_chain_state() # Save the newly built state
-
 def rebuild_state_from_blockchain(start_block=0):
     """
     Rebuilds or updates the chain state by replaying transactions from the database.
@@ -64,7 +41,7 @@ def rebuild_state_from_blockchain(start_block=0):
     import db
     
     print(f"[INFO][chain_state] Starting blockchain state reconstruction from block {start_block}...")
-    global _last_processed_block
+    global _last_processed_block_hash
     
     if start_block == 0:
         # Clear current state for a full rebuild
@@ -72,7 +49,7 @@ def rebuild_state_from_blockchain(start_block=0):
             _balances.clear()
             _sequence_numbers.clear()
             _current_rules_state = ""
-            _last_processed_block = -1
+            _last_processed_block_hash = ''
         print("[INFO][chain_state] Cleared existing in-memory state for full rebuild.")
         # Initialize genesis state
         with _balance_lock:
@@ -216,8 +193,8 @@ def rebuild_state_from_blockchain(start_block=0):
         except Exception as e:
             print(f"[ERROR][chain_state] Unexpected error processing block #{block_idx}: {e}")
         
-        # Update the last processed block number after successfully processing a block
-        _last_processed_block = block_number
+        # Update the last processed block hash after successfully processing a block
+        _last_processed_block_hash = block_data['block_hash']
     
     # Print final state summary
     print(f"[INFO][chain_state] Blockchain state reconstruction completed!")
@@ -293,74 +270,136 @@ def save_rules_state(rules_content: str):
         _current_rules_state = rules_content.strip()
         print(f"[INFO][chain_state] Rules state updated. Length: {len(_current_rules_state)} characters")
         
-        # Also save to a persistent file for recovery
-        try:
-            with open("current_rules_state.tau", "w") as f:
-                f.write(_current_rules_state + "\n")
-            print("[INFO][chain_state] Rules state saved to current_rules_state.tau")
-        except IOError as e:
-            print(f"[ERROR][chain_state] Failed to save rules state to file: {e}")
 
 def get_rules_state() -> str:
     """Returns the current rules state."""
     with _rules_lock:
         return _current_rules_state
 
-def load_rules_state_from_file():
-    """
-    Loads the rules state from the persistent file on startup.
-    This should be called during server initialization.
-    """
-    global _current_rules_state
-    try:
-        with open("current_rules_state.tau", "r") as f:
-            content = f.read().strip()
-            with _rules_lock:
-                _current_rules_state = content
-            print(f"[INFO][chain_state] Loaded rules state from file. Length: {len(content)} characters")
-    except FileNotFoundError:
-        print("[INFO][chain_state] No existing rules state file found. Starting with empty rules state.")
-    except IOError as e:
-        print(f"[WARN][chain_state] Failed to load rules state from file: {e}")
 
-def save_chain_state():
-    """Saves the entire current chain state to a JSON file."""
-    with _balance_lock, _sequence_lock, _rules_lock:
-        state_snapshot = {
-            "balances": _balances,
-            "sequence_numbers": _sequence_numbers,
-            "rules_state": _current_rules_state,
-            "last_processed_block": _last_processed_block
-        }
-    
-    try:
-        with open("chain_state.json", "w") as f:
-            json.dump(state_snapshot, f, indent=4)
-        print(f"[INFO][chain_state] Successfully saved chain state to chain_state.json. Last block: {_last_processed_block}")
-    except IOError as e:
-        print(f"[ERROR][chain_state] Failed to save chain state to file: {e}")
+def load_state_from_db() -> bool:
+    """
+    Loads chain state from the database into the in-memory caches.
+    Returns True if accounts were found in the database, False if no state exists.
+    """
+    import db
+    db.init_db()
+    with db._db_lock:
+        conn = db._db_conn
+        # Load accounts into balances and sequence numbers
+        cursor = conn.execute(
+            'SELECT address, balance, sequence_number FROM accounts'
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return False
+        with _balance_lock, _sequence_lock:
+            _balances.clear()
+            _sequence_numbers.clear()
+            for address, balance, seq in rows:
+                _balances[address] = balance
+                _sequence_numbers[address] = seq
+        # Load rules state and last processed block hash
+        cursor = conn.execute(
+            'SELECT key, value FROM chain_state WHERE key IN (?, ?)',
+            ('current_rules', 'last_processed_block_hash')
+        )
+        entries = dict(cursor.fetchall())
+        with _rules_lock:
+            global _current_rules_state
+            _current_rules_state = entries.get('current_rules', '')
+        global _last_processed_block_hash
+        _last_processed_block_hash = entries.get('last_processed_block_hash', '')
+    return True
 
-def load_chain_state() -> bool:
+def commit_state_to_db(block_hash: str):
     """
-    Loads the chain state from 'chain_state.json'.
-    Returns True on success, False on failure (e.g., file not found).
+    Commits the in-memory state (balances, sequence numbers, rules) to the database atomically,
+    associating it with the provided block_hash.
     """
-    global _balances, _sequence_numbers, _current_rules_state, _last_processed_block
-    try:
-        with open("chain_state.json", "r") as f:
-            state_snapshot = json.load(f)
-        
-        with _balance_lock, _sequence_lock, _rules_lock:
-            _balances = state_snapshot.get("balances", {})
-            _sequence_numbers = state_snapshot.get("sequence_numbers", {})
-            _current_rules_state = state_snapshot.get("rules_state", "")
-            _last_processed_block = state_snapshot.get("last_processed_block", -1)
-        
-        print(f"[INFO][chain_state] Loaded chain state from file. Last processed block: {_last_processed_block}")
-        return True
-    except FileNotFoundError:
-        print("[INFO][chain_state] chain_state.json not found.")
-        return False
-    except (IOError, json.JSONDecodeError) as e:
-        print(f"[ERROR][chain_state] Failed to load or parse chain_state.json: {e}")
-        return False
+    import db
+    db.init_db()
+    with db._db_lock, db._db_conn:
+        conn = db._db_conn
+        conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('current_rules', _current_rules_state)
+        )
+        conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('last_processed_block_hash', block_hash)
+        )
+        for address, balance in _balances.items():
+            seq = _sequence_numbers.get(address, 0)
+            conn.execute(
+                'INSERT OR REPLACE INTO accounts (address, balance, sequence_number) VALUES (?, ?, ?)',
+                (address, balance, seq)
+            )
+
+def initialize_persistent_state():
+    """
+    Initializes persistent chain state from the database and verifies it against the blockchain.
+    On first startup (no state and no blocks), initializes genesis state.
+    On mismatch between stored state and blockchain, rebuilds and commits state.
+    """
+    print("[DEBUG][chain_state] > initialize_persistent_state started")
+    import db
+    db.init_db()
+
+    print("[DEBUG][chain_state] Attempting to load state from database...")
+    loaded = load_state_from_db()
+    if loaded:
+        print(f"[DEBUG][chain_state] State loaded successfully. Last known block hash: '{_last_processed_block_hash[:16]}...'")
+    else:
+        print("[DEBUG][chain_state] No persistent state found in database.")
+
+    print("[DEBUG][chain_state] Fetching latest block from database...")
+    latest = db.get_latest_block()
+    latest_hash = latest['block_hash'] if latest else ''
+    if latest_hash:
+         print(f"[DEBUG][chain_state] Latest block hash from DB: '{latest_hash[:16]}...'")
+    else:
+        print("[DEBUG][chain_state] No blocks found in database.")
+
+    if not latest_hash:
+        # No existing state: full rebuild (or genesis)
+        print("[INFO][chain_state] Triggering full state rebuild because no persistent state was found.")
+        rebuild_state_from_blockchain(start_block=0)
+        print(f"[DEBUG][chain_state] Rebuild complete. Committing state with latest block hash: '{latest_hash[:16]}...'")
+        commit_state_to_db(latest_hash)
+        # Load built-in rules into Tau from rules directory
+        try:
+            import os, tau_manager
+
+            rules_dir = os.path.join(os.path.dirname(__file__), 'rules')
+            if os.path.isdir(rules_dir):
+                print(f"[DEBUG][chain_state] Found rules directory at: {rules_dir}")
+                for fname in sorted(os.listdir(rules_dir)):
+                    path = os.path.join(rules_dir, fname)
+                    if os.path.isfile(path) and fname and fname[0].isdigit():
+                        with open(path, 'r', encoding='utf-8') as f:
+                            # Read all lines, filter out comments (lines starting with #), and join them.
+                            rule_text = " ".join([line.strip() for line in f if not line.strip().startswith('#')]).strip()
+                        
+                        if rule_text:
+                            print(f"[INFO][chain_state] Injecting built-in rule '{fname}' into Tau i0")
+                            print(f"[DEBUG][chain_state] Rule content: {rule_text}")
+                            tau_manager.communicate_with_tau(input_sbf=rule_text,
+                                                             target_output_stream_index=0)
+            else:
+                print(f"[DEBUG][chain_state] Rules directory not found at: {rules_dir}")
+        except Exception as e:
+            print(f"[ERROR][chain_state] Failed to inject built-in rules into Tau: {e}")
+    else:
+        # Verify consistency with blockchain head
+        print("[DEBUG][chain_state] Verifying consistency between loaded state and blockchain head...")
+        if _last_processed_block_hash != latest_hash:
+            print(f"[WARN][chain_state] State-DB mismatch! State hash: '{_last_processed_block_hash[:16]}...', DB hash: '{latest_hash[:16]}...'.")
+            print("[INFO][chain_state] Triggering full state rebuild due to mismatch.")
+            rebuild_state_from_blockchain(start_block=0)
+            print(f"[DEBUG][chain_state] Rebuild complete. Committing state with latest block hash: '{latest_hash[:16]}...'")
+            commit_state_to_db(latest_hash)
+        else:
+            print(f"[INFO][chain_state] Persistent state is consistent and up-to-date with the blockchain.")
+
+    print("[DEBUG][chain_state] > initialize_persistent_state finished")

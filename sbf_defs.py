@@ -24,6 +24,7 @@
 # These are primarily for internal logic or Python-side interpretations if needed.
 # Tau usually outputs specific codes for specific conditions.
 # SBF_LOGICAL_ZERO = "{x0'}:sbf" # Represents logical false or zero generally. Matches Tau's fail_invalid().
+TAU_LOGICAL_ZERO = "F"
 SBF_LOGICAL_ZERO = "0" # Represents logical false or zero generally.
 SBF_LOGICAL_ONE = "{x0}:sbf"    # Represents logical true or one generally.
 

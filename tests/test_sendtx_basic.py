@@ -28,6 +28,7 @@ class TestSendTxBasic(unittest.TestCase):
             db._db_conn.close(); db._db_conn = None
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.init_chain_state()
+        db.clear_mempool()  # Clear mempool for test isolation
         # patch Tau and disable signature verification/sequence enforcement for basic tests
         def mock_tau_response(input_sbf, target_output_stream_index=1):
             # For basic tests, simulate proper tau behavior

@@ -1,4 +1,5 @@
 tau i0 = console.
+sbf i1 = console.
 fail_invalid() := {x0'}:sbf.
 fail_src_eq_dest() := {x0001'}:sbf.
 fail_zero_amount() := {x0002'}:sbf.

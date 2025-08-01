@@ -29,10 +29,11 @@ class TestSendTxValidation(unittest.TestCase):
             db._db_conn.close(); db._db_conn = None
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.init_chain_state()
+        db.clear_mempool()  # Clear mempool for test isolation
         def mock_tau_response(input_sbf, target_output_stream_index=1):
             # For validation tests, simulate proper tau behavior
             if target_output_stream_index == 0:
-                return "OK"  # Non-failure response for rule processing
+                return "x1001"  # Non-failure response for rule processing
             else:
                 # Extract and echo the appropriate stream
                 lines = input_sbf.strip().split('\n')

@@ -98,6 +98,7 @@ def start_and_manage_tau_process():
         current_process = None  # Local variable for the Popen object
         try:
             # Start the process
+            print("[INFO][tau_manager] Starting Tau Docker process...2")
             current_process = subprocess.Popen(
                 docker_command,
                 stdin=subprocess.PIPE,
@@ -108,6 +109,7 @@ def start_and_manage_tau_process():
                 bufsize=1  # Line buffering
             )
             # Set the global process variable *only after* successful start
+            print("[INFO][tau_manager] Starting Tau Docker process...3")
             with tau_process_lock:
                 tau_process = current_process
 
@@ -408,14 +410,19 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 0):
                     # If we have queued data for this stream, send the next piece; else send logical zero
 
                     if stream_idx == target_output_stream_index:
-                            # print(f"  [DEBUG] communicate_with_tau: Tau prompting on i{stream_idx}. "
-                            #       f"Sending queued input: '{input_sbf}'")
+                            print(f"  [DEBUG] communicate_with_tau: Tau prompting on i{stream_idx}. "
+                                  f"Sending queued input: '{input_sbf}'")
                             current_stdin.write(input_sbf + '\n')
                             current_stdin.flush()
                     else:
                         # print(f"  [DEBUG] communicate_with_tau: Tau prompting on i{stream_idx}. "
                         #         f"No queued input; sending SBF_LOGICAL_ZERO.")
-                        current_stdin.write(sbf_defs.SBF_LOGICAL_ZERO + '\n')
+                        if stream_idx == 0:
+                            print(f"  [ERROR] Tau prompting on i{stream_idx} sending {sbf_defs.TAU_LOGICAL_ZERO}")
+                            current_stdin.write(sbf_defs.TAU_LOGICAL_ZERO + '\n')
+                        else:
+                            print(f"  [ERROR] Tau prompting on i{stream_idx}, sending {sbf_defs.SBF_LOGICAL_ZERO}")
+                            current_stdin.write(sbf_defs.SBF_LOGICAL_ZERO + '\n')
                         current_stdin.flush()
                     continue
 
