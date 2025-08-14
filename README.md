@@ -2,32 +2,8 @@
 
 # Tau Testnet Alpha Blockchain
 
-This project is the codebase for the Tau Testnet Alpha Blockchain. It implements a server that interacts with a Tau logic program (executed via Docker) to manage a simple blockchain with a focus on transaction processing and mempool management.
-
-## Core Components
-
-*   **`server.py`**: The main TCP server application.
-*   **`tau_manager.py`**: Manages the Tau Docker process lifecycle and communication.
-*   **`commands/`**: Modules for handling client commands:
-    *   `sendtx.py`: Handles submission and validation of complex transactions (including signature checks, sequence numbers, and Tau logic for operations).
-    *   `getmempool.py`: Retrieves mempool content.
-    *   `createblock.py`: Creates new blocks from mempool transactions.
-    *   `gettimestamp.py`: Handles timestamp requests.
-*   **`db.py`**: SQLite database interface, managing the mempool, string-to-ID mappings, and persistent block storage.
-*   **`chain_state.py`**: Manages in-memory state (account balances, sequence numbers).
-*   **`sbf_defs.py`**: Symbolic Boolean Formula (SBF) constants for Tau communication.
-*   **`utils.py`**: Utilities for SBF, data conversions, and transaction message canonicalization.
-*   **`config.py`**: Centralized configuration.
-*   **`block.py`**: Defines block data structures (block header, transactions list) and merkle root computation.
-*   **`tool_code.tau`**: The Tau logic program for validating operations, including structural checks on transaction data and logic for applying new rules via pointwise revision.
-*   **`tests/`**: Directory containing unit tests:
-    - `test_sendtx_basic.py`
-    - `test_sendtx_validation.py`
-    - `test_sendtx_tx_meta.py`
-    - `test_sendtx_crypto.py`
-    - `test_tau_logic.py`: Tests all logic paths and validation rules directly within `tool_code.tau`.
-    - `test_chain_state.py`: Tests balance and sequence number management.
-    - `test_block.py`: Tests the block data structure and the persistent block creation/chaining logic.
+This project is the codebase for the Tau Testnet Alpha Blockchain. Its primary goal is to provide a live, working demonstration of a blockchain where core state transitions and rules are governed by Tau's formal logic.
+The architecture is designed around the principle of extralogical processing. The core engine, written in Python, handles networking, storage, and any operations not yet implemented in pure Tau logic, such as cryptographic signature verification. This engine prepares transactions and validates them against a separate Tau logic program (executed via Docker), which serves as the ultimate arbiter of the chain's rules. This hybrid model allows us to build a robust and feature-complete testnet today, showcasing the power of Tau's logical core while providing all the necessary functions for a working blockchain.
 
 ## Features
 
@@ -60,14 +36,16 @@ This project is the codebase for the Tau Testnet Alpha Blockchain. It implements
 *   **SQLite Mempool**: Persists transactions awaiting inclusion in a block.
 *   **BLS12-381 Public Key Validation**: Format and optional cryptographic checks for public keys.
 
-## Prerequisites
+## Setup and Running
+
+### Prerequisites
 
 *   Python 3.8+
 *   Docker
 *   A Tau Docker image (default: `tau`, configurable in `config.py`).
 *   `py_ecc` (specifically `py_ecc.bls`): **Required** for BLS public key validation and transaction signature verification.
 
-## Setup and Running
+### Setup Steps
 
 1.  **Clone the Repository:**
     ```bash
@@ -92,16 +70,46 @@ This project is the codebase for the Tau Testnet Alpha Blockchain. It implements
     ```
     The server will initialize the database and manage the Tau Docker process.
 
-## Connecting to the Server
+### Connecting to the Server
 
 Use any TCP client, e.g., `netcat`:
 ```bash
 netcat 127.0.0.1 65432
 ```
 
+## Core Components
+
+*   **`server.py`**: The main TCP server application.
+*   **`tau_manager.py`**: Manages the Tau Docker process lifecycle and communication.
+*   **`commands/`**: Modules for handling client commands:
+    *   `sendtx.py`: Handles submission and validation of complex transactions (including signature checks, sequence numbers, and Tau logic for operations).
+    *   `getmempool.py`: Retrieves mempool content.
+    *   `createblock.py`: Creates new blocks from mempool transactions.
+*   **`db.py`**: SQLite database interface, managing the mempool, string-to-ID mappings, and persistent block storage.
+*   **`chain_state.py`**: Manages in-memory state (account balances, sequence numbers).
+*   **`sbf_defs.py`**: Symbolic Boolean Formula (SBF) constants for Tau communication.
+*   **`utils.py`**: Utilities for SBF, data conversions, and transaction message canonicalization.
+*   **`config.py`**: Centralized configuration.
+*   **`block.py`**: Defines block data structures (block header, transactions list) and merkle root computation.
+*   **`tool_code.tau`**: The Tau logic program for validating operations, including structural checks on transaction data and logic for applying new rules via pointwise revision.
+*   **`wallet.py`**: Command-line wallet interface for interacting with the Tau node (see `WALLET_USAGE.md` for comprehensive usage guide).
+*   **`rules/`**: Directory containing Tau rule files:
+    *   `01_handle_insufficient_funds.tau`: Logic for handling insufficient fund scenarios.
+*   **`tests/`**: Directory containing unit tests:
+    - `test_sendtx_basic.py`: Basic transaction functionality tests.
+    - `test_sendtx_validation.py`: Transaction validation logic tests.
+    - `test_sendtx_tx_meta.py`: Transaction metadata handling tests.
+    - `test_sendtx_crypto.py`: Cryptographic signature verification tests.
+    - `test_sendtx_sequential.py`: Sequential multi-operation transaction tests.
+    - `test_tau_logic.py`: Tests all logic paths and validation rules directly within `tool_code.tau`.
+    - `test_chain_state.py`: Tests balance and sequence number management.
+    - `test_block.py`: Tests the block data structure and the persistent block creation/chaining logic.
+    - `test_persistent_chain_state.py`: Tests for persistent chain state management (currently skipped).
+    - `test_state_reconstruction.py`: Tests for state reconstruction from blockchain data.
+
 ## Console Wallet
 
-A simple command-line wallet `wallet.py` is provided to interact with the Tau node. It supports generating a new keypair, sending signed transactions, querying balances, and listing transaction history.
+A comprehensive command-line wallet `wallet.py` is provided to interact with the Tau node. It supports generating a new keypair, sending complex multi-operation transactions (including rules, transfers, and custom operations), querying balances, and listing transaction history. For detailed usage instructions, see `WALLET_USAGE.md`.
 
 ### Prerequisites
 
@@ -121,11 +129,19 @@ python wallet.py balance --address <pubkey_hex>
 python wallet.py history --privkey <hex_privkey>
 python wallet.py history --address <pubkey_hex>
 
-# Send a transaction
+# Send a simple transaction
 python wallet.py send --privkey <hex_privkey> --to <recipient_pubkey_hex> --amount <amount> [--fee <fee_limit>] [--expiry <seconds>]
+
+# Send a transaction with rules
+python wallet.py send --privkey <hex_privkey> --rule "o2[t]=i1[t]" --transfer "recipient:amount"
+
+# Send multi-operation transaction  
+python wallet.py send --privkey <hex_privkey> --rule "rule_formula" --transfer "addr:amt" --operation "2:custom_data"
 ```
 
-## Available Commands
+## Available Commands and Block Structure
+
+### Available Commands
 
 *   **Send Transaction (New Structure):**
     ```
@@ -151,12 +167,8 @@ python wallet.py send --privkey <hex_privkey> --to <recipient_pubkey_hex> --amou
     ```
     createblock
     ```
-*   **GetCurrentTimestamp:**
-    ```
-    getcurrenttimestamp
-    ```
 
-## Block Structure
+### Block Structure
 
 A block is a fundamental data structure that organizes transactions into an atomic unit for chain progression. Each block consists of:
 
@@ -172,21 +184,8 @@ Blocks do **not** include proof-of-work or signatures at this alpha stage.
 
 The `block.py` module provides the `Block` and `BlockHeader` classes, along with utility functions for computing transaction hashes (`compute_tx_hash`), Merkle roots (`compute_merkle_root`), and block hashes.
 
-## Testing
-
-Unit tests are located in the `tests/` directory. To run all tests:
-```bash
-python -m unittest discover tests
-```
-Or run a specific test file:
-```
-*   To run sendtx tests: `python -m unittest tests/test_sendtx_basic.py tests/test_sendtx_validation.py tests/test_sendtx_tx_meta.py tests/test_sendtx_crypto.py`
-*   To run block tests: `python -m unittest tests/test_block.py`
-*   To run state reconstruction tests: `python -m unittest tests/test_state_reconstruction.py`
-```
-Tests for `sendtx` now cover the new transaction structure, including cryptographic signature generation (within the test environment) and verification.
-
 ## Known Issues / Notes
+
 *   The fee model (`fee_limit`) is a placeholder and not yet enforced.
 *   The chain state (balances, sequence numbers) is updated in memory *before* a transaction is included in a block. A server crash between transaction validation and block creation could lead to a state inconsistency.
 

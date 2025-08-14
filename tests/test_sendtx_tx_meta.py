@@ -29,16 +29,24 @@ class TestSendTxTxMeta(unittest.TestCase):
         db.init_db(); chain_state.init_chain_state()
         db.clear_mempool()  # Clear mempool for test isolation
         def mock_tau_response(input_sbf, target_output_stream_index=1):
-            # For meta tests, simulate proper tau behavior
+            # New bitvector model: return boolean on o1
             if target_output_stream_index == 0:
-                return sbf_defs.ACK_RULE_PROCESSED_SBF
-            else:
-                # Extract and echo the appropriate stream
-                lines = input_sbf.strip().split('\n')
-                if len(lines) > target_output_stream_index:
-                    return lines[target_output_stream_index]
-                else:
-                    return lines[-1] if lines else sbf_defs.FAIL_INVALID_SBF
+                return sbf_defs.ACK_RULE_PROCESSED
+            lines = input_sbf.strip().split('\n')
+            try:
+                amount = int(lines[0]) if len(lines) > 0 else 0
+                balance = int(lines[1]) if len(lines) > 1 else 0
+                from_id = int(lines[2]) if len(lines) > 2 else -1
+                to_id = int(lines[3]) if len(lines) > 3 else -2
+            except ValueError:
+                return sbf_defs.SBF_LOGICAL_ZERO
+            if amount <= 0:
+                return sbf_defs.SBF_LOGICAL_ZERO
+            if from_id == to_id:
+                return sbf_defs.SBF_LOGICAL_ZERO
+            if amount > balance:
+                return sbf_defs.SBF_LOGICAL_ZERO
+            return sbf_defs.SBF_LOGICAL_ONE
         self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau', mock_tau_response).start()
         sendtx._PY_ECC_AVAILABLE = False
         # Patch pubkey validation to bypass format checks for meta tests

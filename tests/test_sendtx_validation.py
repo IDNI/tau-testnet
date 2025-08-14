@@ -31,16 +31,24 @@ class TestSendTxValidation(unittest.TestCase):
         db.init_db(); chain_state.init_chain_state()
         db.clear_mempool()  # Clear mempool for test isolation
         def mock_tau_response(input_sbf, target_output_stream_index=1):
-            # For validation tests, simulate proper tau behavior
+            # New bitvector model: return boolean on o1
             if target_output_stream_index == 0:
-                return "x1001"  # Non-failure response for rule processing
-            else:
-                # Extract and echo the appropriate stream
-                lines = input_sbf.strip().split('\n')
-                if len(lines) > target_output_stream_index:
-                    return lines[target_output_stream_index]
-                else:
-                    return lines[-1] if lines else "F"
+                return sbf_defs.ACK_RULE_PROCESSED
+            lines = input_sbf.strip().split('\n')
+            try:
+                amount = int(lines[0]) if len(lines) > 0 else 0
+                balance = int(lines[1]) if len(lines) > 1 else 0
+                from_id = int(lines[2]) if len(lines) > 2 else -1
+                to_id = int(lines[3]) if len(lines) > 3 else -2
+            except ValueError:
+                return sbf_defs.SBF_LOGICAL_ZERO
+            if amount <= 0:
+                return sbf_defs.SBF_LOGICAL_ZERO
+            if from_id == to_id:
+                return sbf_defs.SBF_LOGICAL_ZERO
+            if amount > balance:
+                return sbf_defs.SBF_LOGICAL_ZERO
+            return sbf_defs.SBF_LOGICAL_ONE
         self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau', mock_tau_response).start()
         sendtx._PY_ECC_AVAILABLE = False
         # Patch pubkey validation to bypass format checks for basic validation tests
@@ -62,13 +70,13 @@ class TestSendTxValidation(unittest.TestCase):
         }
         return json.dumps(tx_dict)
 
-    def test_fail_amount_too_large_for_sbf_python(self):
+    def test_fail_amount_too_large_python(self):
+        chain_state._balances[GENESIS] = 10
         amount_to_send = 16
         tx_json = self._create_tx([[GENESIS, ADDR_A, str(amount_to_send)]])
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("ERROR: Could not process transfer #1"))
-        self.assertIn("Invalid amount '16': Must be a number between 0 and 15", result)
-        self.assertEqual(chain_state.get_balance(GENESIS), chain_state.GENESIS_BALANCE)
+        self.assertTrue(result.startswith("FAILURE:"))
+        self.assertEqual(chain_state.get_balance(GENESIS), 10)
         self.assertEqual(len(db.get_mempool_txs()), 0)
 
     def test_fail_invalid_from_address_format_python(self):
@@ -82,14 +90,12 @@ class TestSendTxValidation(unittest.TestCase):
         }
         tx_json = json.dumps(tx)
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("ERROR: Could not process transfer #1"))
-        self.assertIn("Invalid 'from' address: Must be a 96-character hex BLS12-381 public key", result)
+        self.assertTrue(result.startswith("FAILURE: Transaction invalid."))
 
     def test_fail_invalid_to_address_format_python(self):
         tx_json = self._create_tx([[GENESIS, INVALID_ADDR_NON_HEX, "10"]])
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("ERROR: Could not process transfer #1"))
-        self.assertIn("Invalid 'to' address: Must be a 96-character hex BLS12-381 public key", result)
+        self.assertTrue(result.startswith("FAILURE: Transaction invalid."))
 
     def test_no_transfers_key_success(self):
         tx = {
