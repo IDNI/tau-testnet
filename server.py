@@ -3,6 +3,9 @@ import threading
 import sys
 import time
 import os
+import asyncio
+import multiaddr
+from network import NetworkService, NetworkConfig, BootstrapPeer
 
 # Project modules
 import config
@@ -17,6 +20,11 @@ MEMPOOL = []
 MEMPOOL_LOCK = threading.Lock()
 MEMPOOL_STATE = {'mempool': MEMPOOL, 'lock': MEMPOOL_LOCK}
 
+# --- NetworkService globals ---
+NETWORK_THREAD = None
+NETWORK_STOP_FLAG = threading.Event()
+# --- Command Dispatch Table ---
+
 # --- Command Dispatch Table ---
 # Maps lowercase command names to their respective handler modules
 COMMAND_HANDLERS = {
@@ -24,6 +32,61 @@ COMMAND_HANDLERS = {
     'getmempool': getmempool,
     'getcurrenttimestamp': gettimestamp
 }
+
+
+# --- NetworkService helpers ---
+def _make_network_config_from_settings() -> NetworkConfig:
+    # Pull optional settings from config.py with safe defaults
+    network_id = getattr(config, "NETWORK_ID", "tau-local")
+    genesis_hash = getattr(config, "GENESIS_HASH", "GENESIS")
+    listen_strs = getattr(config, "NETWORK_LISTEN", ["/ip4/127.0.0.1/tcp/0"])
+    bootstrap = getattr(config, "BOOTSTRAP_PEERS", [])
+    listen_addrs = [multiaddr.Multiaddr(s) for s in listen_strs]
+    bootstrap_peers = []
+    for entry in bootstrap:
+        try:
+            pid = entry.get("peer_id")
+            addrs = [multiaddr.Multiaddr(a) for a in entry.get("addrs", [])]
+            if pid:
+                bootstrap_peers.append(BootstrapPeer(peer_id=pid, addrs=addrs))
+        except Exception:
+            continue
+    return NetworkConfig(
+        network_id=network_id,
+        genesis_hash=genesis_hash,
+        listen_addrs=listen_addrs,
+        bootstrap_peers=bootstrap_peers,
+        peerstore_path=None,
+    )
+
+def _start_network_background():
+    """
+    Start NetworkService in a dedicated asyncio thread.
+    """
+    global NETWORK_THREAD
+    cfg = _make_network_config_from_settings()
+
+    def _runner():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        service = NetworkService(cfg)
+        async def main():
+            await service.start()
+            # Periodically check the stop flag
+            try:
+                while not NETWORK_STOP_FLAG.is_set():
+                    await asyncio.sleep(0.25)
+            finally:
+                await service.stop()
+        try:
+            loop.run_until_complete(main())
+        finally:
+            loop.stop()
+            loop.close()
+
+    t = threading.Thread(target=_runner, name="NetworkServiceThread", daemon=True)
+    t.start()
+    NETWORK_THREAD = t
 
 
 def handle_client(conn, addr):
@@ -252,6 +315,10 @@ def main():
     print(f"[INFO][Server] Initializing and loading chain state...")
     chain_state.initialize_persistent_state()
 
+    # Start P2P Network Service in background (P1 skeleton)
+    print("[INFO][Server] Starting NetworkService (P1 skeleton)...")
+    _start_network_background()
+
     # Inject persisted rules state into Tau (i0[0]) if available
     saved_rules = chain_state.get_rules_state()
     if saved_rules:
@@ -308,6 +375,19 @@ def main():
         if server_socket:
             server_socket.close()
             print("[INFO][Server] Server socket closed.")
+
+        # Stop NetworkService thread
+        try:
+            if NETWORK_THREAD is not None:
+                print("[INFO][Server] Stopping NetworkService...")
+                NETWORK_STOP_FLAG.set()
+                NETWORK_THREAD.join(timeout=config.SHUTDOWN_TIMEOUT)
+                if NETWORK_THREAD.is_alive():
+                    print("[WARN][Server] NetworkService thread did not exit cleanly.")
+            else:
+                print("[INFO][Server] NetworkService was not started or already stopped.")
+        except Exception as e:
+            print(f"[WARN][Server] Error during NetworkService shutdown: {e}")
 
         # Wait for Tau manager thread to exit
         print("[INFO][Server] Waiting for Tau manager thread to exit...")

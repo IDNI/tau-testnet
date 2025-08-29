@@ -62,6 +62,19 @@ def init_db():
                 value TEXT NOT NULL
             );
         ''')
+        # Peers table for P2P metadata
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS peers (
+                peer_id      TEXT PRIMARY KEY,
+                addrs_json   TEXT NOT NULL,
+                agent        TEXT,
+                network_id   TEXT,
+                genesis_hash TEXT,
+                head_number  INTEGER,
+                head_hash    TEXT,
+                last_seen    INTEGER
+            );
+        ''')
 
     _db_conn = conn
 
@@ -173,3 +186,66 @@ def get_latest_block() -> Optional[Dict]:
             return json.loads(row[0])
         else:
             return None
+
+
+# --- Peerstore DB-backed functions ---
+from typing import Optional, Dict, List
+
+def upsert_peer_basic(peer_id: str,
+                      addrs: List[str],
+                      agent: Optional[str] = None,
+                      network_id: Optional[str] = None,
+                      genesis_hash: Optional[str] = None,
+                      head_number: Optional[int] = None,
+                      head_hash: Optional[str] = None,
+                      last_seen: Optional[int] = None) -> None:
+    """
+    Insert or update a peer entry with basic metadata. Addresses are stored as JSON array of strings.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    payload = {
+        "agent": agent,
+        "network_id": network_id,
+        "genesis_hash": genesis_hash,
+        "head_number": head_number,
+        "head_hash": head_hash,
+        "last_seen": last_seen,
+    }
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('''
+            INSERT INTO peers (peer_id, addrs_json, agent, network_id, genesis_hash, head_number, head_hash, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(peer_id) DO UPDATE SET
+                addrs_json=excluded.addrs_json,
+                agent=COALESCE(excluded.agent, peers.agent),
+                network_id=COALESCE(excluded.network_id, peers.network_id),
+                genesis_hash=COALESCE(excluded.genesis_hash, peers.genesis_hash),
+                head_number=COALESCE(excluded.head_number, peers.head_number),
+                head_hash=COALESCE(excluded.head_hash, peers.head_hash),
+                last_seen=COALESCE(excluded.last_seen, peers.last_seen)
+        ''', (peer_id, json.dumps(addrs), payload["agent"], payload["network_id"], payload["genesis_hash"],
+              payload["head_number"], payload["head_hash"], payload["last_seen"]))
+        _db_conn.commit()
+
+def load_peers_basic() -> Dict[str, List[str]]:
+    """
+    Returns a mapping peer_id -> list(addrs as strings) from the database.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    out: Dict[str, List[str]] = {}
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT peer_id, addrs_json FROM peers')
+        for pid, addrs_json in cur.fetchall():
+            try:
+                arr = json.loads(addrs_json) if addrs_json else []
+                if isinstance(arr, list):
+                    out[str(pid)] = [str(x) for x in arr]
+            except Exception:
+                continue
+    return out
