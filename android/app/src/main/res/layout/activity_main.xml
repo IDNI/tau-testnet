@@ -139,7 +139,7 @@
             android:id="@+id/etRule"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Rule (operation 0)"
+            android:hint="Tau rule"
             android:importantForAutofill="no"
             android:inputType="textMultiLine"
             android:gravity="top|start"

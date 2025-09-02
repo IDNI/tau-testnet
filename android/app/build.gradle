@@ -15,6 +15,24 @@ android {
         versionName "0.1.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        // Pass BLST_DIR to CMake
+        def props = new Properties()
+        def lp = rootProject.file('local.properties')
+        if (lp.exists()) {
+            lp.withInputStream { props.load(it) }
+        }
+        def blstDir = props.getProperty('blst.dir', System.getenv('BLST_DIR') ?: '/Users/ak/idni/blst')
+        externalNativeBuild {
+            cmake {
+                arguments "-DBLST_DIR=${blstDir}"
+            }
+        }
+
+        // Target common ABIs; adjust as needed
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+        }
     }
 
     buildTypes {
@@ -37,6 +55,14 @@ android {
                 'META-INF/NOTICE*'
         ]
     }
+
+    // Configure CMake build for JNI wrapper
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+        }
+    }
+
 }
 
 dependencies {
@@ -45,4 +71,3 @@ dependencies {
     implementation 'com.google.android.material:material:1.12.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
 }
-
