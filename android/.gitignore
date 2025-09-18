@@ -1,0 +1,25 @@
+# Gradle files
+.gradle/
+build/
+
+# Local configuration
+local.properties
+
+# IDE files
+.idea/
+*.iml
+*.hprof
+
+# Keystore files
+*.jks
+*.keystore
+
+# Generated files
+captures/
+.externalNativeBuild/
+
+# App-specific build output
+app/build/
+
+# Misc
+.DS_Store

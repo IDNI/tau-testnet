@@ -1,82 +1,83 @@
+import json
+import logging
+import os
 import sqlite3
 import threading
-import os
-import json
-from typing import Optional, Dict, List
+from typing import Dict, List, Optional
 
 import config
 import block as block_module
+from errors import DatabaseError
+
+
+logger = logging.getLogger(__name__)
 
 # Internal SQLite connection and lock for thread-safety
 _db_conn = None
 _db_lock = threading.Lock()
 
 def init_db():
-    """
-    Initializes the SQLite database, creating necessary tables.
-    """
+    """Initializes the SQLite database, creating necessary tables."""
     global _db_conn
-    # Ensure data directory exists
     data_dir = os.path.dirname(config.STRING_DB_PATH)
-    if data_dir and not os.path.exists(data_dir):
-        os.makedirs(data_dir, exist_ok=True)
-    # Connect with shared thread access
-    conn = sqlite3.connect(config.STRING_DB_PATH, check_same_thread=False)
-    print(f"  [INFO][db] Initialized with {config.STRING_DB_PATH}.")
-    # Enable foreign keys if needed in future
-    conn.execute('PRAGMA foreign_keys = ON;')
-    # Create tau_strings table for mapping text to IDs
-    with conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS tau_strings (
-                id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                text TEXT    NOT NULL UNIQUE
-            );
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS mempool (
-                id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                sbf  TEXT    NOT NULL
-            );
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS blocks (
-                block_number  INTEGER PRIMARY KEY,
-                block_hash    TEXT NOT NULL UNIQUE,
-                previous_hash TEXT NOT NULL,
-                timestamp     INTEGER NOT NULL,
-                block_data    TEXT NOT NULL
-            );
-        ''')
-        # Persistent chain state tables
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS accounts (
-                address         TEXT PRIMARY KEY,
-                balance         INTEGER NOT NULL,
-                sequence_number INTEGER NOT NULL DEFAULT 0
-            );
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS chain_state (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-        ''')
-        # Peers table for P2P metadata
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS peers (
-                peer_id      TEXT PRIMARY KEY,
-                addrs_json   TEXT NOT NULL,
-                agent        TEXT,
-                network_id   TEXT,
-                genesis_hash TEXT,
-                head_number  INTEGER,
-                head_hash    TEXT,
-                last_seen    INTEGER
-            );
-        ''')
+    try:
+        if data_dir and not os.path.exists(data_dir):
+            os.makedirs(data_dir, exist_ok=True)
+
+        conn = sqlite3.connect(config.STRING_DB_PATH, check_same_thread=False)
+        conn.execute('PRAGMA foreign_keys = ON;')
+        with conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS tau_strings (
+                    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text TEXT    NOT NULL UNIQUE
+                );
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS mempool (
+                    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sbf  TEXT    NOT NULL
+                );
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS blocks (
+                    block_number  INTEGER PRIMARY KEY,
+                    block_hash    TEXT NOT NULL UNIQUE,
+                    previous_hash TEXT NOT NULL,
+                    timestamp     INTEGER NOT NULL,
+                    block_data    TEXT NOT NULL
+                );
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS accounts (
+                    address         TEXT PRIMARY KEY,
+                    balance         INTEGER NOT NULL,
+                    sequence_number INTEGER NOT NULL DEFAULT 0
+                );
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS chain_state (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS peers (
+                    peer_id      TEXT PRIMARY KEY,
+                    addrs_json   TEXT NOT NULL,
+                    agent        TEXT,
+                    network_id   TEXT,
+                    genesis_hash TEXT,
+                    head_number  INTEGER,
+                    head_hash    TEXT,
+                    last_seen    INTEGER
+                );
+            ''')
+    except (sqlite3.Error, OSError) as exc:
+        raise DatabaseError(f"Failed to initialize database at {config.STRING_DB_PATH}: {exc}") from exc
 
     _db_conn = conn
+    logger.info("Database initialized at %s", config.STRING_DB_PATH)
 
 def get_string_id(text: str) -> str:
     """
@@ -149,7 +150,7 @@ def clear_mempool():
         cur = _db_conn.cursor()
         cur.execute('DELETE FROM mempool')
         _db_conn.commit()
-        print(f"[INFO][db] Mempool cleared.")
+        logger.info("Mempool cleared.")
 
 def add_block(new_block: block_module.Block):
     """Adds a new block to the database."""
@@ -172,7 +173,7 @@ def add_block(new_block: block_module.Block):
             )
         )
         _db_conn.commit()
-        print(f"[INFO][db] Added block #{new_block.header.block_number} to database.")
+        logger.info("Added block #%s to database", new_block.header.block_number)
 
 def get_latest_block() -> Optional[Dict]:
     """Retrieves the latest block (highest block_number) from the database."""
@@ -187,6 +188,21 @@ def get_latest_block() -> Optional[Dict]:
         else:
             return None
 
+def get_all_blocks() -> List[Dict]:
+    """Returns all blocks ordered by block_number ascending as parsed dicts."""
+    if _db_conn is None:
+        init_db()
+    out: List[Dict] = []
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT block_data FROM blocks ORDER BY block_number ASC')
+        rows = cur.fetchall()
+        for (block_json,) in rows:
+            try:
+                out.append(json.loads(block_json))
+            except Exception:
+                continue
+    return out
 
 # --- Peerstore DB-backed functions ---
 from typing import Optional, Dict, List

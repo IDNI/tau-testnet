@@ -1,70 +1,37 @@
-import socket
-import threading
-import sys
-import time
-import os
 import asyncio
-import multiaddr
-from network import NetworkService, NetworkConfig, BootstrapPeer
+import logging
+import os
+import socket
+import sys
+import threading
+
+from app.container import ServiceContainer
+from network import NetworkService
 
 # Project modules
 import config
-import tau_manager
 import re
 import json
-import db
-from commands import sendtx, getmempool, gettimestamp, createblock  # Import command handlers
-import chain_state # Added import
+from commands import createblock, sendtx  # Import command handlers
+from errors import ConfigurationError, TauProcessError
+import tau_logging
 
-MEMPOOL = []
-MEMPOOL_LOCK = threading.Lock()
-MEMPOOL_STATE = {'mempool': MEMPOOL, 'lock': MEMPOOL_LOCK}
+
+logger = logging.getLogger(__name__)
 
 # --- NetworkService globals ---
 NETWORK_THREAD = None
 NETWORK_STOP_FLAG = threading.Event()
 # --- Command Dispatch Table ---
 
-# --- Command Dispatch Table ---
-# Maps lowercase command names to their respective handler modules
-COMMAND_HANDLERS = {
-    'sendtx': sendtx,
-    'getmempool': getmempool,
-    'getcurrenttimestamp': gettimestamp
-}
-
 
 # --- NetworkService helpers ---
-def _make_network_config_from_settings() -> NetworkConfig:
-    # Pull optional settings from config.py with safe defaults
-    network_id = getattr(config, "NETWORK_ID", "tau-local")
-    genesis_hash = getattr(config, "GENESIS_HASH", "GENESIS")
-    listen_strs = getattr(config, "NETWORK_LISTEN", ["/ip4/127.0.0.1/tcp/0"])
-    bootstrap = getattr(config, "BOOTSTRAP_PEERS", [])
-    listen_addrs = [multiaddr.Multiaddr(s) for s in listen_strs]
-    bootstrap_peers = []
-    for entry in bootstrap:
-        try:
-            pid = entry.get("peer_id")
-            addrs = [multiaddr.Multiaddr(a) for a in entry.get("addrs", [])]
-            if pid:
-                bootstrap_peers.append(BootstrapPeer(peer_id=pid, addrs=addrs))
-        except Exception:
-            continue
-    return NetworkConfig(
-        network_id=network_id,
-        genesis_hash=genesis_hash,
-        listen_addrs=listen_addrs,
-        bootstrap_peers=bootstrap_peers,
-        peerstore_path=None,
-    )
-
-def _start_network_background():
+def _start_network_background(container: ServiceContainer) -> None:
     """
     Start NetworkService in a dedicated asyncio thread.
     """
     global NETWORK_THREAD
-    cfg = _make_network_config_from_settings()
+    cfg = container.build_network_config()
 
     def _runner():
         loop = asyncio.new_event_loop()
@@ -89,110 +56,117 @@ def _start_network_background():
     NETWORK_THREAD = t
 
 
-def handle_client(conn, addr):
+def handle_client(conn, addr, container: ServiceContainer):
     """Handles a single client connection, supports multiple commands."""
     import datetime
     import socket
-    print(f"[INFO][Server] Connection accepted from {addr}")
+
+    client_label = f"{addr[0]}:{addr[1]}" if isinstance(addr, tuple) else str(addr)
+    logger.info("Connection accepted from %s", client_label)
+
+    db_module = container.db
+    chain_state_module = container.chain_state
+    tau_module = container.tau_manager
+    mempool_state = container.mempool_state
+    command_handlers = container.command_handlers
+
     try:
         with conn:
             while True:
                 try:
                     data = conn.recv(config.BUFFER_SIZE)
-                except socket.error as e:
-                    print(f"[ERROR][Server] Socket error with {addr}: {e}")
-                    break
-                if not data:
-                    print(f"[INFO][Server] Client {addr} disconnected.")
+                except socket.error as exc:
+                    logger.exception("Socket error with %s", client_label)
                     break
 
-                # Decode raw input string (preserve JSON casing for sendtx)
+                if not data:
+                    logger.info("Client %s disconnected", client_label)
+                    break
+
                 try:
                     raw = data.decode('utf-8').strip()
-                except UnicodeDecodeError as e:
-                    print(f"[ERROR][Server] Invalid UTF-8 from {addr}: {e}")
+                except UnicodeDecodeError as exc:
+                    logger.warning("Invalid UTF-8 from %s: %s", client_label, exc)
                     conn.sendall(b"ERROR: Invalid UTF-8 encoding\n")
                     continue
-                # Handle JSON-based sendtx: sendtx '{...}'
+
                 if raw.lower().startswith('sendtx '):
                     json_blob = raw[len('sendtx '):].strip()
-                    print(f"[INFO][Server] Received sendtx command with JSON payload: {json_blob}...")
+                    logger.debug("Received sendtx payload from %s: %s", client_label, json_blob)
                     try:
-                        # Queue the transaction directly, bypassing Tau for now
                         result_msg = sendtx.queue_transaction(json_blob)
-                    except Exception as e:
-                        result_msg = f"ERROR: {e}"
-                    print(f"[INFO][Server] Sending response for sendtx to {addr}: '{result_msg}'")
+                    except Exception as exc:
+                        logger.exception("sendtx queue failed for %s", client_label)
+                        result_msg = f"ERROR: {exc}"
                     conn.sendall((result_msg + "\r\n").encode('utf-8'))
                     continue
-                # For other commands, normalize to lowercase for command name lookup
+
                 command_str = raw.lower()
-                print(f"[INFO][Server] Received command from {addr}: '{command_str}'")
                 if not command_str:
                     conn.sendall(b"ERROR: Received empty command.")
                     continue
 
-                # Map string parameters to Tau IDs
+                logger.debug("Received command from %s: %s", client_label, command_str)
+
                 parts = command_str.split()
                 if len(parts) >= 2:
                     cmd = parts[0]
                     mapped = [cmd]
-                    print(f"[DEBUG][Server] Mapping parameters for command '{cmd}': {parts[1:]} ->", end=' ')
-                    for p in parts[1:]:
-                        if re.fullmatch(r"[01]+", p) or p.isdigit():
-                            mapped.append(p)
-                            print(p, end=' ')
+                    mapped_params = []
+                    for param in parts[1:]:
+                        if re.fullmatch(r"[01]+", param) or param.isdigit():
+                            mapped.append(param)
+                            mapped_params.append(param)
                         else:
-                            yid = db.get_string_id(p)
+                            yid = db_module.get_string_id(param)
                             mapped.append(yid)
-                            print(f"{p}=>{yid}", end=' ')
-                    print()
+                            mapped_params.append(f"{param}->{yid}")
+                    logger.debug("Mapped parameters for %s: %s", cmd, mapped_params)
                     parts = mapped
                 command_name = parts[0]
 
-                # Handle timestamp locally
                 if command_name in ("gettimestamp", "getcurrenttimestamp"):
                     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     resp = f"Current Timestamp (UTC): {now}\r\n"
-                    print(f"[INFO][Server] Sending timestamp to {addr}: '{resp}'")
                     conn.sendall(resp.encode('utf-8'))
                     continue
 
                 if raw.lower().startswith("getbalance "):
-                    parts = raw.split()
-                    if len(parts) != 2:
+                    parts_raw = raw.split()
+                    if len(parts_raw) != 2:
                         resp = "ERROR: Usage: getbalance <address>\r\n"
                     else:
-                        bal = chain_state.get_balance(parts[1])
+                        bal = chain_state_module.get_balance(parts_raw[1])
                         resp = f"BALANCE: {bal}\r\n"
                     conn.sendall(resp.encode('utf-8'))
                     continue
 
                 if raw.lower().startswith("getsequence "):
-                    parts = raw.split()
-                    if len(parts) != 2:
+                    parts_raw = raw.split()
+                    if len(parts_raw) != 2:
                         resp = "ERROR: Usage: getsequence <address>\r\n"
                     else:
-                        seq = chain_state.get_sequence_number(parts[1])
+                        seq = chain_state_module.get_sequence_number(parts_raw[1])
                         resp = f"SEQUENCE: {seq}\r\n"
                     conn.sendall(resp.encode('utf-8'))
                     continue
 
                 if raw.lower().startswith("history "):
-                    parts = raw.split()
-                    if len(parts) != 2:
+                    parts_raw = raw.split()
+                    if len(parts_raw) != 2:
                         resp = "ERROR: Usage: history <address>\r\n"
                     else:
-                        addr = parts[1]
+                        history_addr = parts_raw[1]
                         items = []
-                        for entry in db.get_mempool_txs():
+                        for entry in db_module.get_mempool_txs():
                             if entry.startswith("json:"):
                                 try:
                                     payload = json.loads(entry[5:])
                                 except Exception:
+                                    logger.debug("Skipping invalid mempool json entry for history")
                                     continue
                                 ops = payload.get("operations", {}).get("1", [])
-                                if payload.get("sender_pubkey") == addr or any(isinstance(op, (list, tuple)) and addr in op for op in ops):
+                                if payload.get("sender_pubkey") == history_addr or any(isinstance(op, (list, tuple)) and history_addr in op for op in ops):
                                     items.append(json.dumps(payload, separators=(",", ":"), sort_keys=True))
                         if items:
                             resp = "HISTORY:\n" + "\n".join(items) + "\r\n"
@@ -202,205 +176,225 @@ def handle_client(conn, addr):
                     continue
 
                 if raw.lower().strip() == "createblock":
-                    print(f"[INFO][Server] Received createblock command from {addr}")
+                    logger.info("Create block requested by %s", client_label)
                     try:
                         block_data = createblock.create_block_from_mempool()
-                        tx_count = len(block_data["transactions"])
+                        tx_count = len(block_data.get("transactions", []))
                         block_hash = block_data["block_hash"]
                         block_number = block_data["header"]["block_number"]
                         merkle_root = block_data["header"]["merkle_root"]
                         timestamp = block_data["header"]["timestamp"]
-                        
-                        resp = f"SUCCESS: Block #{block_number} created successfully!\n"
-                        resp += f"  - Transactions: {tx_count}\n"
-                        resp += f"  - Block Hash: {block_hash}\n"
-                        resp += f"  - Merkle Root: {merkle_root}\n"
-                        resp += f"  - Timestamp: {timestamp}\n"
+
+                        resp_lines = [
+                            f"SUCCESS: Block #{block_number} created successfully!",
+                            f"  - Transactions: {tx_count}",
+                            f"  - Block Hash: {block_hash}",
+                            f"  - Merkle Root: {merkle_root}",
+                            f"  - Timestamp: {timestamp}",
+                        ]
                         for idx, tx in enumerate(block_data.get("transactions", []), start=1):
                             tx_json = json.dumps(tx, sort_keys=True)
-                            resp += f"  - TX#{idx}: {tx_json}\n"
-                        resp += f"  - Mempool cleared\r\n"
-                        
-                        print(f"[INFO][Server] Block creation successful. Sending response to {addr}")
-                        for idx, tx in enumerate(block_data.get("transactions", []), start=1):
-                            tx_json = json.dumps(tx, sort_keys=True)
-                            print(f"[INFO][Server] Included TX#{idx}: {tx_json}")
-                    except Exception as e:
-                        print(f"[ERROR][Server] Block creation failed for {addr}: {e}")
-                        resp = f"ERROR: Failed to create block: {e}\r\n"
+                            resp_lines.append(f"  - TX#{idx}: {tx_json}")
+                        resp_lines.append("  - Mempool cleared\r\n")
+                        resp = "\n".join(resp_lines)
+                        logger.info("Block #%s created via client %s", block_number, client_label)
+                    except Exception:
+                        logger.exception("Block creation failed for %s", client_label)
+                        resp = "ERROR: Failed to create block\r\n"
                     conn.sendall(resp.encode('utf-8'))
                     continue
 
-                # Dispatch other commands (excluding the now-handled sendtx)
-                # Ensure sendtx doesn't fall through here
+                if raw.lower().strip() == "getblocks":
+                    logger.debug("getblocks requested by %s", client_label)
+                    try:
+                        blocks = db_module.get_all_blocks()
+                        resp = json.dumps({"blocks": blocks}, separators=(",", ":")) + "\r\n"
+                    except Exception:
+                        logger.exception("getblocks failed for %s", client_label)
+                        resp = "ERROR: Failed to fetch blocks\r\n"
+                    conn.sendall(resp.encode('utf-8'))
+                    continue
+
                 if command_name == 'sendtx':
-                    print("[WARN][Server] sendtx command should have been handled earlier. Ignoring.")
+                    logger.warning("sendtx was not parsed correctly for %s", client_label)
                     conn.sendall(b"ERROR: Invalid sendtx format. Use sendtx '{\"0\":...}'.\r\n")
                     continue
 
-                handler = COMMAND_HANDLERS.get(command_name)
+                handler = command_handlers.get(command_name)
                 if not handler:
                     msg = f"ERROR: Unknown command '{command_name}'\n"
+                    logger.warning("Unknown command from %s: %s", client_label, command_name)
                     conn.sendall(msg.encode('utf-8'))
                     continue
 
-                # Encode
                 try:
                     sbf_input = handler.encode_command(parts)
-                except Exception as e:
-                    conn.sendall(f"ERROR: {e}".encode('utf-8'))
+                except Exception as exc:
+                    logger.exception("Encoding command %s failed for %s", command_name, client_label)
+                    conn.sendall(f"ERROR: {exc}".encode('utf-8'))
                     continue
 
-                # Wait for Tau
-                if not tau_manager.tau_ready.wait(timeout=config.CLIENT_WAIT_TIMEOUT):
+                if not tau_module.tau_ready.wait(timeout=config.CLIENT_WAIT_TIMEOUT):
+                    logger.error("Tau process not ready for command %s from %s", command_name, client_label)
                     conn.sendall(b"ERROR: Tau process not ready.")
                     continue
 
-                # Communicate
                 try:
-                    sbf_output = tau_manager.communicate_with_tau(sbf_input)
+                    sbf_output = tau_module.communicate_with_tau(sbf_input)
                     decoded = handler.decode_output(sbf_output, sbf_input)
-                    result_message = handler.handle_result(decoded, sbf_input, MEMPOOL_STATE)
+                    result_message = handler.handle_result(decoded, sbf_input, mempool_state)
                 except TimeoutError:
+                    logger.error("Timeout communicating with Tau for %s", client_label)
                     result_message = "ERROR: Timeout communicating with Tau process."
                 except Exception:
+                    logger.exception("Internal error processing %s for %s", command_name, client_label)
                     result_message = "ERROR: Internal error processing command."
 
-                # Reverse-map Tau IDs
                 try:
-                    result_message = re.sub(r"y(\\d+)", lambda m: db.get_text_by_id("y" + m.group(1)),
-                                            result_message) + "\r\n"
+                    result_message = re.sub(
+                        r"y(\\d+)",
+                        lambda m: db_module.get_text_by_id("y" + m.group(1)),
+                        result_message,
+                    ) + "\r\n"
                 except Exception:
-                    pass
+                    logger.debug("Failed to reverse-map Tau IDs for %s", client_label)
+                    result_message = result_message + "\r\n"
 
-                print(f"[INFO][Server] Sending response to {addr}: '{result_message}'")
                 conn.sendall(result_message.encode('utf-8'))
-    except Exception as e:
-        print(f"[ERROR][Server] Unexpected error in handle_client for {addr}: {e}")
+    except Exception:
+        logger.exception("Unexpected error in handle_client for %s", client_label)
     finally:
-        print(f"[INFO][Server] Closing connection to {addr}")
+        logger.info("Closing connection to %s", client_label)
 
 
 # --- Main Server Execution ---
-def main():
-    """
-    Starts the Tau process manager thread and then the main server loop.
-    Handles graceful shutdown.
-    """
-    # Ensure Tau program file exists before starting manager
+def _run_server(container: ServiceContainer):
+    """Runs the main server loop. The caller is responsible for exception handling."""
+    logger.info("Bootstrapping server in '%s' environment", container.settings.env)
+
+    tau_module = container.tau_manager
+    db_module = container.db
+    chain_state_module = container.chain_state
+
     if not os.path.exists(config.TAU_PROGRAM_FILE):
-        print(f"[FATAL][Server] Tau program file '{config.TAU_PROGRAM_FILE}' not found!", file=sys.stderr)
-        sys.exit(1)
-    print(f"[INFO][Server] Using Tau program file: {os.path.abspath(config.TAU_PROGRAM_FILE)}")
+        raise ConfigurationError(f"Tau program file '{config.TAU_PROGRAM_FILE}' not found.")
 
-    # Initialize database for string mappings
-    print(f"[INFO][Server] Initializing database at {config.STRING_DB_PATH}")
-    db.init_db()
+    logger.info("Using Tau program file: %s", os.path.abspath(config.TAU_PROGRAM_FILE))
+    logger.info("Initializing database at %s", config.STRING_DB_PATH)
+    db_module.init_db()
 
-    # Start Tau process manager thread FIRST
-    print("[INFO][Server] Starting Tau Process Manager Thread...")
-    manager_thread = threading.Thread(target=tau_manager.start_and_manage_tau_process, daemon=True)
+    logger.info("Starting Tau Process Manager Thread...")
+    manager_thread = threading.Thread(target=tau_module.start_and_manage_tau_process, daemon=True)
     manager_thread.start()
 
-    # Now, wait for Tau to be ready
-    print("[INFO][Server] Waiting for Tau to signal readiness...")
-    if not tau_manager.tau_ready.wait(timeout=config.CLIENT_WAIT_TIMEOUT):
-        print("[ERROR][Server] Tau did not signal readiness in time; aborting startup.")
-        tau_manager.request_shutdown() # Ensure the thread is cleaned up
-        sys.exit(1)
-    
-    print("[INFO][Server] Tau is ready.")
+    logger.info("Waiting for Tau to signal readiness...")
+    if not tau_module.tau_ready.wait(timeout=config.CLIENT_WAIT_TIMEOUT):
+        tau_module.request_shutdown()
+        raise TauProcessError("Tau did not signal readiness within the expected timeout.")
 
-    # Initialize and load the full chain state (balances, sequences, rules)
-    print(f"[INFO][Server] Initializing and loading chain state...")
-    chain_state.initialize_persistent_state()
+    logger.info("Tau is ready.")
+    logger.info("Initializing and loading chain state...")
+    chain_state_module.initialize_persistent_state()
 
-    # Start P2P Network Service in background (P1 skeleton)
-    print("[INFO][Server] Starting NetworkService (P1 skeleton)...")
-    _start_network_background()
+    logger.info("Starting NetworkService background thread...")
+    _start_network_background(container)
 
-    # Inject persisted rules state into Tau (i0[0]) if available
-    saved_rules = chain_state.get_rules_state()
+    saved_rules = chain_state_module.get_rules_state()
     if saved_rules:
-        print("[INFO][Server] Injecting persisted rules into Tau...")
-        # try:
-        #     out = tau_manager.communicate_with_tau(input_sbf=saved_rules, target_output_stream_index=0)
-        #     if out.strip().lower() != "x1001":
-        #         print(f"[ERROR][Server] Tau rejected persisted rules: {out.strip()}")
-        # except Exception as e:
-        #     print(f"[ERROR][Server] Failed to inject persisted rules into Tau: {e}")
+        logger.info("Persisted rules state detected; defer injection until explicit workflow.")
 
-    # Start the server socket listening
     server_socket = None
+    actual_port = config.PORT
+
     try:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((config.HOST, config.PORT))
-        server_socket.listen()
-        print(f"[INFO][Server] Listening on {config.HOST}:{config.PORT}")
-        print(f"[INFO][Server] Press Ctrl+C to stop.")
 
-        # Main accept loop
-        while not tau_manager.server_should_stop.is_set():
+        max_port_attempts = 10
+        for port_offset in range(max_port_attempts):
+            try:
+                test_port = config.PORT + port_offset
+                server_socket.bind((config.HOST, test_port))
+                actual_port = test_port
+                break
+            except OSError:
+                if port_offset == max_port_attempts - 1:
+                    raise
+                logger.warning("Port %s:%s is busy, trying next port...", config.HOST, test_port)
+        else:
+            raise TauProcessError("Failed to bind to any configured port.")
+
+        server_socket.listen()
+        logger.info("Listening on %s:%s", config.HOST, actual_port)
+        logger.info("Press Ctrl+C to stop.")
+
+        while not tau_module.server_should_stop.is_set():
             try:
                 conn, addr = server_socket.accept()
-                client_thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+                client_thread = threading.Thread(target=handle_client, args=(conn, addr, container), daemon=True)
                 client_thread.start()
-            except OSError as e:
-                if tau_manager.server_should_stop.is_set():
-                    print("[INFO][Server] Socket closed during shutdown.")
+            except OSError:
+                if tau_module.server_should_stop.is_set():
+                    logger.info("Socket closed during shutdown.")
                     break
-                else:
-                    print(f"[ERROR][Server] Error accepting connection: {e}")
-            except Exception as e:
-                if not tau_manager.server_should_stop.is_set():
-                    print(f"[ERROR][Server] Unexpected error accepting connection: {e}")
-                else:
-                    break  # Exit loop if server stopping
-
-    # Exception handling for server setup/main loop
-    except OSError as e:
-        print(f"[FATAL][Server] Could not bind to {config.HOST}:{config.PORT} - {e}", file=sys.stderr)
-        tau_manager.request_shutdown()  # Signal shutdown
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\n[INFO][Server] KeyboardInterrupt received, shutting down server...")
-        tau_manager.request_shutdown()  # Signal shutdown
-    except Exception as e:
-        print(f"[FATAL][Server] An unexpected server error occurred in main loop: {e}", file=sys.stderr)
-        tau_manager.request_shutdown()  # Signal shutdown
+                logger.exception("Error accepting connection")
+            except Exception:
+                if tau_module.server_should_stop.is_set():
+                    break
+                logger.exception("Unexpected error accepting connection")
     finally:
-        # --- Graceful Shutdown ---
-        print("[INFO][Server] Main server loop finished. Cleaning up...")
+        logger.info("Main server loop finished. Cleaning up...")
         if server_socket:
-            server_socket.close()
-            print("[INFO][Server] Server socket closed.")
+            try:
+                server_socket.close()
+            finally:
+                logger.info("Server socket closed.")
 
-        # Stop NetworkService thread
         try:
             if NETWORK_THREAD is not None:
-                print("[INFO][Server] Stopping NetworkService...")
+                logger.info("Stopping NetworkService...")
                 NETWORK_STOP_FLAG.set()
                 NETWORK_THREAD.join(timeout=config.SHUTDOWN_TIMEOUT)
                 if NETWORK_THREAD.is_alive():
-                    print("[WARN][Server] NetworkService thread did not exit cleanly.")
+                    logger.warning("NetworkService thread did not exit cleanly.")
             else:
-                print("[INFO][Server] NetworkService was not started or already stopped.")
-        except Exception as e:
-            print(f"[WARN][Server] Error during NetworkService shutdown: {e}")
+                logger.info("NetworkService was not started or already stopped.")
+        except Exception:
+            logger.warning("Error during NetworkService shutdown", exc_info=True)
 
-        # Wait for Tau manager thread to exit
-        print("[INFO][Server] Waiting for Tau manager thread to exit...")
-        # Check if manager_thread exists and is alive before joining
-        if 'manager_thread' in locals() and isinstance(manager_thread, threading.Thread) and manager_thread.is_alive():
+        logger.info("Waiting for Tau manager thread to exit...")
+        if isinstance(manager_thread, threading.Thread) and manager_thread.is_alive():
             manager_thread.join(timeout=config.SHUTDOWN_TIMEOUT)
             if manager_thread.is_alive():
-                print("[WARN][Server] Tau manager thread did not exit cleanly.")
-                tau_manager.kill_tau_process()
+                logger.warning("Tau manager thread did not exit cleanly. Forcing termination.")
+                tau_module.kill_tau_process()
         else:
-            print("[INFO][Server] Tau manager thread already finished or not started.")
+            logger.info("Tau manager thread already finished or not started.")
 
-        print("[INFO][Server] Shutdown complete.")
+        logger.info("Shutdown complete.")
+
+
+def main():
+    tau_logging.configure(getattr(config, "LOGGING", None))
+    container = ServiceContainer.build(overrides={"logger": logger})
+    tau_module = container.tau_manager
+    try:
+        _run_server(container)
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt received, shutting down server...")
+        tau_module.request_shutdown()
+    except ConfigurationError as exc:
+        logger.critical("Configuration error during startup: %s", exc)
+        tau_module.request_shutdown()
+        sys.exit(1)
+    except TauProcessError as exc:
+        logger.critical("Tau process error: %s", exc)
+        tau_module.request_shutdown()
+        sys.exit(1)
+    except Exception:
+        logger.exception("An unexpected server error occurred.")
+        tau_module.request_shutdown()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

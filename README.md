@@ -8,6 +8,16 @@ The architecture is designed around the principle of extralogical processing. Th
 ## Features
 
 *   **TCP Server**: Handles client connections and commands.
+*   **P2P Networking (libp2p shim)**:
+    *   Protocols:
+        - `TAU_PROTOCOL_HANDSHAKE` (`/tau/handshake/1.0.0`): Exchange node info and tip.
+        - `TAU_PROTOCOL_PING` (`/tau/ping/1.0.0`): Latency/keepalive round-trip with a nonce.
+        - `TAU_PROTOCOL_ANNOUNCE` (`/tau/announce/1.0.0`): Peer announces new headers/tip (push).
+        - `TAU_PROTOCOL_SYNC` (`/tau/sync/1.0.0`): Header/tip synchronization with locator/stop/limit (pull).
+        - `TAU_PROTOCOL_BLOCKS` (`/tau/blocks/1.0.0`): Serve block bodies by hash list, or by range using `from`/`from_number` + `limit`.
+        - `TAU_PROTOCOL_TX` (`/tau/tx/1.0.0`): Placeholder for transaction submission.
+    *   Bootstrapping connects to peers, performs handshake + sync, fetches missing blocks, and rebuilds state. New blocks are also announced to peers via `TAU_PROTOCOL_ANNOUNCE` and trigger targeted sync on receivers.
+    *   Verbose debug logging traces requests/responses and bootstrap progress for easier development.
 *   **Persistent Blockchain**:
     *   Creates blocks from transactions stored in the mempool.
     *   Links blocks together in a chain by referencing the previous block's hash.
@@ -30,7 +40,7 @@ The architecture is designed around the principle of extralogical processing. Th
             *   For transfers in `operations["1"]`, the `from_pubkey` of each transfer must match the top-level `sender_pubkey`.
         *   `fee_limit` (string/integer): Placeholder for future fee models.
         *   `signature` (string): Hex-encoded BLS signature over a canonical form of the other fields.
-*   **Tau Integration for Operation Validation**: The `tool_code.tau` program validates the logic of operations within a transaction (e.g., coin transfers via SBF). This now includes robust structural validation to ensure transfer data is complete and well-formed.
+*   **Tau Integration for Operation Validation**: The `genesis.tau` program validates the logic of operations within a transaction (e.g., coin transfers via SBF). This now includes robust structural validation to ensure transfer data is complete and well-formed.
 *   **String-to-ID Mapping**: Dynamically assigns `y<ID>` identifiers for Tau SBF.
 *   **In-Memory Balances & Sequence Numbers**: Tracks account balances and sequence numbers for rapid validation.
 *   **SQLite Mempool**: Persists transactions awaiting inclusion in a block.
@@ -58,8 +68,8 @@ The architecture is designed around the principle of extralogical processing. Th
     source venv/bin/activate 
     pip install py_ecc
     ```
-3.  **Ensure `tool_code.tau` is Present:**
-    Place your `tool_code.tau` file in the location specified by `config.TAU_PROGRAM_FILE` (defaults to the project root).
+3.  **Ensure `genesis.tau` is Present:**
+    Place your `genesis.tau` file in the location specified by `config.TAU_PROGRAM_FILE` (defaults to the project root).
 
 4.  **Ensure Tau Docker Image:**
     Make sure the Docker image specified in `config.TAU_DOCKER_IMAGE` (default: `tau`) is available.
@@ -69,6 +79,18 @@ The architecture is designed around the principle of extralogical processing. Th
     python server.py 
     ```
     The server will initialize the database and manage the Tau Docker process.
+
+6.  **Optional: Configure Bootstrap Peers**
+    Edit `config.py` to point at one or more peers to sync from:
+    ```py
+    BOOTSTRAP_PEERS = [
+        {
+            "peer_id": "<REMOTE_NODE_ID>",
+            "addrs": ["/ip4/127.0.0.1/tcp/12345"]
+        },
+    ]
+    ```
+    On start, the node will connect, handshake, sync headers, request missing block bodies, and rebuild its state.
 
 ### Connecting to the Server
 
@@ -86,12 +108,13 @@ netcat 127.0.0.1 65432
     *   `getmempool.py`: Retrieves mempool content.
     *   `createblock.py`: Creates new blocks from mempool transactions.
 *   **`db.py`**: SQLite database interface, managing the mempool, string-to-ID mappings, and persistent block storage.
+*   **`network/`**: P2P protocols and service implementation (`handshake`, `ping`, `sync`, `blocks`, `tx`).
 *   **`chain_state.py`**: Manages in-memory state (account balances, sequence numbers).
 *   **`sbf_defs.py`**: Symbolic Boolean Formula (SBF) constants for Tau communication.
 *   **`utils.py`**: Utilities for SBF, data conversions, and transaction message canonicalization.
 *   **`config.py`**: Centralized configuration.
 *   **`block.py`**: Defines block data structures (block header, transactions list) and merkle root computation.
-*   **`tool_code.tau`**: The Tau logic program for validating operations, including structural checks on transaction data and logic for applying new rules via pointwise revision.
+*   **`genesis.tau`**: The Tau logic program for validating operations, including structural checks on transaction data and logic for applying new rules via pointwise revision.
 *   **`wallet.py`**: Command-line wallet interface for interacting with the Tau node (see `WALLET_USAGE.md` for comprehensive usage guide).
 *   **`rules/`**: Directory containing Tau rule files:
     *   `01_handle_insufficient_funds.tau`: Logic for handling insufficient fund scenarios.
@@ -101,11 +124,13 @@ netcat 127.0.0.1 65432
     - `test_sendtx_tx_meta.py`: Transaction metadata handling tests.
     - `test_sendtx_crypto.py`: Cryptographic signature verification tests.
     - `test_sendtx_sequential.py`: Sequential multi-operation transaction tests.
-    - `test_tau_logic.py`: Tests all logic paths and validation rules directly within `tool_code.tau`.
+    - `test_tau_logic.py`: Tests all logic paths and validation rules directly within `genesis.tau`.
     - `test_chain_state.py`: Tests balance and sequence number management.
     - `test_block.py`: Tests the block data structure and the persistent block creation/chaining logic.
     - `test_persistent_chain_state.py`: Tests for persistent chain state management (currently skipped).
     - `test_state_reconstruction.py`: Tests for state reconstruction from blockchain data.
+    - `test_p2p.py`: Connectivity and custom protocol round-trip using libp2p shim.
+    - `test_network_protocols.py`: End-to-end tests for Tau protocols (handshake, ping, sync, blocks, tx), including a typical header sync flow.
 
 ## Console Wallet
 
@@ -187,6 +212,7 @@ The `block.py` module provides the `Block` and `BlockHeader` classes, along with
 ## Known Issues / Notes
 
 *   The fee model (`fee_limit`) is a placeholder and not yet enforced.
+*   `TAU_PROTOCOL_TX` is a placeholder; handshake/sync/blocks are implemented.
 
 ## Project Status
 
@@ -197,5 +223,5 @@ The `block.py` module provides the `Block` and `BlockHeader` classes, along with
 *   Implement a fee model.
 *   More robust error handling and reporting.
 *   Expansion of Tau-validated logic and commands.
-*   Implementation of a simple P2P networking layer for node synchronization.
+*   Implementation of a simple P2P networking layer for node synchronization. (Initial version landed: handshake, ping, sync, blocks; tx stub.)
 *   More comprehensive unit and integration tests.

@@ -59,34 +59,44 @@ def _decode_single_transfer_output(output_bv_str: str, expected_amount_int: int)
     """
     output_bv_str = output_bv_str.strip()
     if not output_bv_str:
-        print("  [WARN][sendtx] Received empty output from Tau.")
+        logger.warning("Received empty output from Tau.")
         return False
 
     try:
         output_val = _parse_bitvector_string(output_bv_str)
     except ValueError:
-        print(f"  [WARN][sendtx] Unexpected Tau output format: '{output_bv_str}'")
+        logger.warning("Unexpected Tau output format: '%s'", output_bv_str)
         return False
 
     # The new rules return 0 on any failure, and echo the amount on success.
     if output_val == 0:
-        print("  [DEBUG][sendtx] Tau rejected transfer (output was 0).")
+        logger.debug("Tau rejected transfer (output was 0).")
         return False
     elif output_val == expected_amount_int:
-        print("  [DEBUG][sendtx] Tau accepted: Echoed input amount.")
+        logger.debug("Tau accepted transfer; echoed input amount.")
         return True
     else:
-        print(f"  [WARN][sendtx] Unexpected Tau output value: '{output_bv_str}' (parsed as {output_val}), expected {expected_amount_int}")
+        logger.warning(
+            "Unexpected Tau output value: '%s' (parsed as %s), expected %s",
+            output_bv_str,
+            output_val,
+            expected_amount_int,
+        )
         return False
-import utils
+import hashlib
+import json
+import logging
+import time
+
+import chain_state
+import db
 import sbf_defs
 import tau_manager
+import utils
 from db import add_mempool_tx
-import json
-import db
-import chain_state
-import time
-import hashlib
+
+
+logger = logging.getLogger(__name__)
 
 _PY_ECC_AVAILABLE = False
 _PY_ECC_BLS = None
@@ -95,11 +105,13 @@ try:
     from py_ecc.bls import G2Basic
     _PY_ECC_BLS = _bls_mod
     _PY_ECC_AVAILABLE = True
-    print("[INFO][sendtx] py_ecc.bls module loaded. BLS public key cryptographic validation enabled.")
+    logger.info("py_ecc.bls module loaded. BLS public key validation enabled.")
 except ModuleNotFoundError:
-    print("[WARN][sendtx] py_ecc.bls module not found. BLS public key cryptographic validation will be skipped. Only format checks will be performed.")
+    logger.warning(
+        "py_ecc.bls module not found. BLS public key validation will be skipped; only format checks run."
+    )
 except Exception as e:
-    print(f"[WARN][sendtx] Error importing py_ecc.bls: {e}. BLS public key cryptographic validation will be skipped.")
+    logger.warning("Error importing py_ecc.bls (%s). Skipping BLS public key validation.", e)
 
 
 def _validate_bls12_381_pubkey(key_hex: str, key_name: str) -> tuple[bool, str | None]:
@@ -204,23 +216,27 @@ def _decode_transfer_validation_output(output_bv_str: str) -> bool:
     """
     output_bv_str = output_bv_str.strip()
     if not output_bv_str:
-        print("  [WARN][sendtx] Received empty output from Tau.")
+        logger.warning("Received empty output from Tau.")
         return False
 
     try:
         output_val = _parse_bitvector_string(output_bv_str)
     except ValueError:
-        print(f"  [WARN][sendtx] Unexpected Tau output format: '{output_bv_str}'")
+        logger.warning("Unexpected Tau output format: '%s'", output_bv_str)
         return False
 
     if output_val == 1:
-        print("  [DEBUG][sendtx] Tau accepted transaction (output was 1).")
+        logger.debug("Tau accepted transaction (output was 1).")
         return True
     elif output_val == 0:
-        print("  [DEBUG][sendtx] Tau rejected transaction (output was 0).")
+        logger.debug("Tau rejected transaction (output was 0).")
         return False
     else:
-        print(f"  [WARN][sendtx] Unexpected Tau output value: '{output_bv_str}' (parsed as {output_val}), expected 0 or 1.")
+        logger.warning(
+            "Unexpected Tau output value: '%s' (parsed as %s), expected 0 or 1.",
+            output_bv_str,
+            output_val,
+        )
         return False
 
 
@@ -253,9 +269,9 @@ def _process_transfers_operation(transfers, sender_pubkey):
     validated_transfers = []
     tau_inputs = []
     
-    print(f"  [INFO][sendtx] Processing {len(transfers)} transfers...")
+    logger.info("Processing %s transfers...", len(transfers))
     for i, transfer_entry in enumerate(transfers):
-        print(f"    Processing transfer #{i+1}: {transfer_entry}")
+        logger.debug("Processing transfer #%s: %s", i + 1, transfer_entry)
         if not (isinstance(transfer_entry, (list, tuple)) and len(transfer_entry) == 3):
             return False, None, f"Transfer #{i+1} has invalid format: {transfer_entry}"
             
@@ -340,7 +356,7 @@ def queue_transaction(json_blob: str) -> str:
         if sequence_number != expected_seq:
             return f"FAILURE: Invalid sequence number: expected {expected_seq}, got {sequence_number}."
     else:
-        print("[WARN][sendtx] BLS crypto not available; skipping signature verification and sequence enforcement.")
+        logger.warning("BLS crypto not available; skipping signature verification and sequence enforcement.")
 
     all_validated_transfers = []
     transfer_tau_inputs = []
@@ -364,16 +380,16 @@ def queue_transaction(json_blob: str) -> str:
         if has_rules:
             rule_text = operations.get("0", "").strip()
             if rule_text:
-                print(f"  [INFO][sendtx] Validating rule with Tau: '{rule_text[:50]}...'")
+                logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
                 tau_output_rules = tau_manager.communicate_with_tau(input_sbf=rule_text, target_output_stream_index=0)
                 if "Error" in tau_output_rules:
                     return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
-                print("  [INFO][sendtx] Tau rule validation successful.")
+                logger.info("Tau rule validation successful.")
 
         if has_transfers and all_validated_transfers:
-            print(f"  [INFO][sendtx] Validating {len(all_validated_transfers)} transfers with Tau...")
+            logger.info("Validating %s transfers with Tau...", len(all_validated_transfers))
             for i, (tau_input_dict, transfer_details) in enumerate(zip(transfer_tau_inputs, all_validated_transfers)):
-                print(f"    - Validating transfer #{i+1}: {transfer_details}")
+                logger.debug("Validating transfer #%s: %s", i + 1, transfer_details)
                 
                 # Tau program expects inputs on separate streams for the single-pass validation
                 # i1: amount, i2: balance, i3: from_id, i4: to_id
@@ -393,20 +409,23 @@ def queue_transaction(json_blob: str) -> str:
                 if not _decode_transfer_validation_output(tau_output_transfer):
                     return (f"FAILURE: Transaction rejected by Tau logic for transfer #{i+1} "
                             f"({transfer_details}). Tau output: {tau_output_transfer}")
-            print("  [INFO][sendtx] All Tau transfer validations successful.")
+            logger.info("All Tau transfer validations successful.")
         
         # --- Post-Tau Processing ---
         if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
             chain_state.increment_sequence_number(sender_pubkey)
 
         if all_validated_transfers:
-            print(f"  [INFO][sendtx] Applying balance changes for {len(all_validated_transfers)} validated transfers...")
+            logger.info(
+                "Applying balance changes for %s validated transfers...",
+                len(all_validated_transfers),
+            )
             for from_addr, to_addr, amt in all_validated_transfers:
                 if not chain_state.update_balances_after_transfer(from_addr, to_addr, amt):
                     return f"FAILURE: Transaction invalid post-Tau. Could not apply transfer ({from_addr[:10]}... -> {to_addr[:10]}..., amount {amt})."
 
         db.add_mempool_tx(blob)
-        print(f"  [INFO][sendtx] Transaction successfully queued in mempool.")
+        logger.info("Transaction successfully queued in mempool.")
         if empty_transfer_list:
             return "SUCCESS: Transaction queued (empty transfer list)."
         return "SUCCESS: Transaction queued."
@@ -414,5 +433,5 @@ def queue_transaction(json_blob: str) -> str:
     except ValueError as e:
         return f"ERROR: Could not process transaction. {e}"
     except Exception as e:
-        print(f"  [CRITICAL][sendtx] An unexpected error occurred in queue_transaction: {e}")
+        logger.critical("An unexpected error occurred in queue_transaction: %s", e)
         return f"FAILURE: An unexpected server error occurred."

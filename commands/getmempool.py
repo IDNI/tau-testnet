@@ -6,7 +6,7 @@ from db import get_mempool_txs
 def encode_command(command_parts):
     """Encodes the getMempool command (01) into an SBF atom."""
     print("  [DEBUG][getmempool] Encoding getMempool command.")
-    # Command 10 from tool_code.tau logic
+    # Command 10 from genesis.tau logic
     bit_pattern = "10" + "0" * 9
     sbf_atom = utils.bits_to_sbf_atom(bit_pattern)
     print(f"  [DEBUG][getmempool] Encoded SBF for Tau: '{sbf_atom}'")

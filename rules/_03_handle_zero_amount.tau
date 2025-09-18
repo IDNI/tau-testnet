@@ -1,0 +1,13 @@
+# --- VALIDITY CHECK 3: Amount is Zero ---
+# This rule checks if the transfer amount is zero.
+# It outputs its result as a boolean flag to the dedicated stream o4[t].
+#
+# Streams (Input):
+# i1[t]: Amount to transfer (bitvector).
+# Streams (Output):
+# o4[t]: Validity flag. #b1 (true) if check passes, #b0 (false) if it fails.
+#
+# Logic:
+# If amount == 0, the check fails (output #b0).
+# Otherwise, the check passes (output #b1).
+((i1[t] =_ #b0) ? (o4[t] =_ #b0) : (o4[t] =_ #b1))
