@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import multiaddr
 
@@ -12,13 +12,16 @@ from libp2p.peer.peerinfo import PeerInfo
 
 from .config import NetworkConfig, BootstrapPeer
 import db
+import chain_state
+from commands import sendtx
 from .protocols import (
-	TAU_PROTOCOL_HANDSHAKE,
-	TAU_PROTOCOL_PING,
-	TAU_PROTOCOL_SYNC,
-	TAU_PROTOCOL_ANNOUNCE,
-	TAU_PROTOCOL_BLOCKS,
-	TAU_PROTOCOL_TX,
+    TAU_PROTOCOL_HANDSHAKE,
+    TAU_PROTOCOL_PING,
+    TAU_PROTOCOL_SYNC,
+    TAU_PROTOCOL_ANNOUNCE,
+    TAU_PROTOCOL_BLOCKS,
+    TAU_PROTOCOL_TX,
+    TAU_PROTOCOL_STATE,
 )
 
 
@@ -46,12 +49,20 @@ class PeerstorePersistence:
 
 
 class NetworkService:
-    def __init__(self, config: NetworkConfig) -> None:
+    def __init__(
+        self,
+        config: NetworkConfig,
+        *,
+        tx_submitter: Optional[Callable[[str], str]] = None,
+        state_provider: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+    ) -> None:
         self._config = config
         self._host = None
         self._tasks: List[asyncio.Task] = []
         self._peerstore_persist = PeerstorePersistence(config.peerstore_path)
         self._last_announced_tip: Optional[str] = None
+        self._submit_tx = tx_submitter or sendtx.queue_transaction
+        self._state_provider = state_provider or self._default_state_provider
 
     async def _sync_and_ingest_from_peer(self, peer_id: str, locator: List[str], stop: Optional[str] = None, limit: int = 2000) -> int:
         """Send SYNC to peer, request bodies for unknown headers, ingest, and rebuild state.
@@ -137,6 +148,69 @@ class NetworkService:
             except Exception:
                 pass
         return added
+
+    def _default_state_provider(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        block_hash = request.get("block_hash")
+        block_number = request.get("block_number")
+        block: Optional[Dict[str, Any]] = None
+
+        def _ensure_cursor():
+            with db._db_lock:
+                cur = db._db_conn.cursor() if db._db_conn else None
+            if cur is None:
+                db.init_db()
+                with db._db_lock:
+                    cur = db._db_conn.cursor()
+            return cur
+
+        try:
+            if isinstance(block_hash, str):
+                cur = _ensure_cursor()
+                cur.execute('SELECT block_data FROM blocks WHERE block_hash = ? LIMIT 1', (block_hash,))
+                row = cur.fetchone()
+                if row:
+                    block = json.loads(row[0])
+            elif isinstance(block_number, int):
+                cur = _ensure_cursor()
+                cur.execute('SELECT block_data FROM blocks WHERE block_number = ? LIMIT 1', (block_number,))
+                row = cur.fetchone()
+                if row:
+                    block = json.loads(row[0])
+        except Exception:
+            block = None
+
+        if block is None:
+            try:
+                block = db.get_latest_block()
+            except Exception:
+                block = None
+
+        header = block.get("header", {}) if isinstance(block, dict) else {}
+        result: Dict[str, Any] = {
+            "block_hash": block.get("block_hash") if isinstance(block, dict) else None,
+            "block_number": header.get("block_number"),
+            "state_root": header.get("merkle_root") if header else request.get("state_root"),
+        }
+
+        accounts_resp: Dict[str, Any] = {}
+        accounts_req = request.get("accounts")
+        if isinstance(accounts_req, list):
+            for addr in accounts_req:
+                if isinstance(addr, str):
+                    accounts_resp[addr] = {
+                        "balance": chain_state.get_balance(addr),
+                        "sequence": chain_state.get_sequence_number(addr),
+                    }
+        result["accounts"] = accounts_resp
+
+        receipts_resp: Dict[str, Any] = {}
+        receipts_req = request.get("receipts")
+        if isinstance(receipts_req, list):
+            for entry in receipts_req:
+                receipts_resp[str(entry)] = None
+        result["receipts"] = receipts_resp
+
+        return result
 
     def _build_handshake(self) -> bytes:
         print(f"[DEBUG][network] Building handshake payload")
@@ -361,13 +435,68 @@ class NetworkService:
         await stream.close()
 
     async def _handle_tx(self, stream) -> None:
-        # Accept SubmitTx and respond ok for now
         raw = await stream.read()
-        print(f"[DEBUG][network] <- TX raw='{raw.decode(errors='ignore') if raw else ''}'")
-        response = {"ok": True}
+        decoded = raw.decode(errors='ignore') if raw else ''
+        print(f"[DEBUG][network] <- TX raw='{decoded}'")
+        payload: Optional[str] = None
+        try:
+            req = json.loads(decoded) if decoded else {}
+        except Exception:
+            req = decoded
+
+        if isinstance(req, dict):
+            if 'tx' in req:
+                val = req['tx']
+                payload = val if isinstance(val, str) else json.dumps(val)
+            elif 'transaction' in req:
+                val = req['transaction']
+                payload = val if isinstance(val, str) else json.dumps(val)
+            elif 'payload' in req:
+                val = req['payload']
+                payload = val if isinstance(val, str) else json.dumps(val)
+        elif isinstance(req, str):
+            payload = req
+        elif decoded:
+            payload = decoded
+
+        if not payload:
+            response = {"ok": False, "error": "missing transaction payload"}
+        else:
+            try:
+                result = self._submit_tx(payload)
+                response = {"ok": True, "result": result}
+            except Exception as exc:
+                response = {"ok": False, "error": str(exc)}
+
         out = json.dumps(response).encode()
         await stream.write(out)
         print(f"[DEBUG][network] -> TX response: {json.dumps(response)}")
+        await stream.close()
+
+    async def _handle_state(self, stream) -> None:
+        raw = await stream.read()
+        decoded = raw.decode(errors='ignore') if raw else ''
+        print(f"[DEBUG][network] <- STATE raw='{decoded}'")
+        request: Dict[str, Any] = {}
+        try:
+            if decoded:
+                maybe = json.loads(decoded)
+                if isinstance(maybe, dict):
+                    request = maybe
+        except Exception:
+            request = {}
+
+        try:
+            data = self._state_provider(request)
+            if not isinstance(data, dict):
+                data = {"data": data}
+            response = {"ok": True, **data}
+        except Exception as exc:
+            response = {"ok": False, "error": str(exc)}
+
+        out = json.dumps(response).encode()
+        await stream.write(out)
+        print(f"[DEBUG][network] -> STATE response: {json.dumps(response)[:512]}")
         await stream.close()
 
     async def _handle_announce(self, stream) -> None:
@@ -424,6 +553,7 @@ class NetworkService:
         self._host.set_stream_handler(TAU_PROTOCOL_ANNOUNCE, self._handle_announce)
         self._host.set_stream_handler(TAU_PROTOCOL_BLOCKS, self._handle_blocks)
         self._host.set_stream_handler(TAU_PROTOCOL_TX, self._handle_tx)
+        self._host.set_stream_handler(TAU_PROTOCOL_STATE, self._handle_state)
 
     async def _watch_head_and_announce(self) -> None:
         # Periodically check head and announce new headers to known peers

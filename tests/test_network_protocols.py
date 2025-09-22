@@ -58,14 +58,20 @@ async def two_nodes():
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
 
-    svc1 = NetworkService(cfg1)
-    svc2 = NetworkService(cfg2)
+    submissions = []
+
+    def submit(payload: str) -> str:
+        submissions.append(payload)
+        return "queued"
+
+    svc1 = NetworkService(cfg1, tx_submitter=submit)
+    svc2 = NetworkService(cfg2, tx_submitter=submit)
     await asyncio.gather(svc1.start(), svc2.start())
     # Ensure both have active listeners
     await _wait_for_addrs(svc1.host)
     await _wait_for_addrs(svc2.host)
     try:
-        yield svc1, svc2
+        yield svc1, svc2, submissions
     finally:
         await asyncio.gather(svc1.stop(), svc2.stop())
 
@@ -81,7 +87,7 @@ async def test_each_protocol_communication(two_nodes):
         TAU_PROTOCOL_TX,
     )
 
-    svc1, svc2 = two_nodes
+    svc1, svc2, submissions = two_nodes
 
     # Connect svc1 -> svc2
     addrs2 = await _wait_for_addrs(svc2.host)
@@ -134,6 +140,54 @@ async def test_each_protocol_communication(two_nodes):
     await stream.close()
     tx_resp = json.loads(data.decode())
     assert tx_resp["ok"] is True
+    assert tx_resp["result"] == "queued"
+    assert submissions[-1] == "dummy"
+
+
+@pytest.mark.asyncio
+async def test_state_protocol_accounts(two_nodes):
+    from libp2p.peer.peerinfo import PeerInfo
+    from network.protocols import TAU_PROTOCOL_STATE
+    import chain_state
+    import block as block_module
+    import db as db_module
+
+    svc1, svc2, submissions = two_nodes
+
+    chain_state._balances["0xabc"] = 42
+    chain_state._sequence_numbers["0xabc"] = 7
+
+    test_block = block_module.Block.create(
+        block_number=0,
+        previous_hash="0" * 64,
+        transactions=[],
+    )
+    db_module.add_block(test_block)
+
+    addrs2 = await _wait_for_addrs(svc2.host)
+    peer_info = PeerInfo(svc2.host.get_id(), addrs2)
+    svc1.host.get_peerstore().add_addrs(peer_info.peer_id, peer_info.addrs, 60)
+    await svc1.host.connect(peer_info)
+
+    req = {
+        "block_hash": test_block.block_hash,
+        "state_root": test_block.header.merkle_root,
+        "accounts": ["0xabc", chain_state.GENESIS_ADDRESS],
+        "receipts": ["tx1"],
+    }
+    stream = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_STATE])
+    await stream.write(json.dumps(req).encode())
+    data = await stream.read()
+    await stream.close()
+    resp = json.loads(data.decode())
+    assert resp["ok"] is True
+    assert resp.get("state_root") == test_block.header.merkle_root
+    assert resp.get("block_hash") == test_block.block_hash
+    accounts = resp.get("accounts", {})
+    assert accounts["0xabc"]["balance"] == 42
+    assert accounts["0xabc"]["sequence"] == 7
+    receipts = resp.get("receipts", {})
+    assert receipts.get("tx1") is None
 
 
 @pytest.mark.asyncio
@@ -151,7 +205,7 @@ async def test_sync_protocol_typical_flow(two_nodes):
         TAU_PROTOCOL_BLOCKS,
     )
 
-    svc1, svc2 = two_nodes
+    svc1, svc2, _ = two_nodes
 
     # Connect svc1 -> svc2
     addrs2 = await _wait_for_addrs(svc2.host)
@@ -217,5 +271,3 @@ async def test_sync_protocol_typical_flow(two_nodes):
     await bs.close()
     blocks = json.loads(blocks_raw.decode())
     assert isinstance(blocks.get("blocks"), list)
-
-
