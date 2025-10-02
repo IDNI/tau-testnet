@@ -85,6 +85,8 @@ async def test_each_protocol_communication(two_nodes):
         TAU_PROTOCOL_SYNC,
         TAU_PROTOCOL_BLOCKS,
         TAU_PROTOCOL_TX,
+        TAU_PROTOCOL_GOSSIP,
+        TAU_GOSSIP_TOPIC_TRANSACTIONS,
     )
 
     svc1, svc2, submissions = two_nodes
@@ -142,6 +144,47 @@ async def test_each_protocol_communication(two_nodes):
     assert tx_resp["ok"] is True
     assert tx_resp["result"] == "queued"
     assert submissions[-1] == "dummy"
+
+    received = []
+    gossip_event = asyncio.Event()
+
+    async def gossip_handler(envelope):
+        if envelope.get("topic") == "test.topic":
+            received.append(envelope)
+            gossip_event.set()
+
+    svc2.subscribe_gossip("*", gossip_handler)
+
+    direct_stream = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_GOSSIP])
+    direct_rpc = {
+        "peer_id": svc1.host.get_id(),
+        "rpc": {
+            "messages": [
+                {
+                    "topic": "direct.check",
+                    "message_id": "direct-1",
+                    "data": {"ok": True},
+                }
+            ]
+        },
+    }
+    await direct_stream.write(json.dumps(direct_rpc).encode())
+    direct_raw = await direct_stream.read()
+    await direct_stream.close()
+    direct_resp = json.loads(direct_raw.decode())
+    assert direct_resp["ok"] is True
+    assert direct_resp["messages"][0]["duplicate"] is False
+    assert direct_resp["messages"][0]["message_id"] == "direct-1"
+
+    message_id = await svc1.publish_gossip("test.topic", {"value": 123})
+
+    await asyncio.wait_for(gossip_event.wait(), timeout=5)
+    assert len(received) == 1
+    envelope = received[0]
+    assert envelope["topic"] == "test.topic"
+    assert envelope["payload"] == {"value": 123}
+    assert envelope["origin"] == svc1.host.get_id()
+    assert envelope["message_id"] == message_id
 
 
 @pytest.mark.asyncio
@@ -271,3 +314,82 @@ async def test_sync_protocol_typical_flow(two_nodes):
     await bs.close()
     blocks = json.loads(blocks_raw.decode())
     assert isinstance(blocks.get("blocks"), list)
+
+
+@pytest.mark.asyncio
+async def test_transaction_gossip_triggers_queue(two_nodes, monkeypatch):
+    from libp2p.peer.peerinfo import PeerInfo
+    from commands import sendtx as sendtx_module
+    from network.protocols import TAU_GOSSIP_TOPIC_TRANSACTIONS
+
+    svc1, svc2, submissions = two_nodes
+
+    addrs2 = await _wait_for_addrs(svc2.host)
+    peer_info = PeerInfo(svc2.host.get_id(), addrs2)
+    svc1.host.get_peerstore().add_addrs(peer_info.peer_id, peer_info.addrs, 60)
+    await svc1.host.connect(peer_info)
+
+    loop = asyncio.get_running_loop()
+    event = asyncio.Event()
+    recorded: list[tuple[str, bool]] = []
+
+    def fake_queue(json_blob: str, propagate: bool = True) -> str:
+        recorded.append((json_blob, propagate))
+        loop.call_soon_threadsafe(event.set)
+        return "mocked"
+
+    monkeypatch.setattr(sendtx_module, "queue_transaction", fake_queue)
+
+    tx_payload = json.dumps({"sample": "tx"}, sort_keys=True, separators=(",", ":"))
+    await svc1.publish_gossip(TAU_GOSSIP_TOPIC_TRANSACTIONS, tx_payload, message_id="tx-test-1")
+
+    await asyncio.wait_for(event.wait(), timeout=5)
+    assert recorded
+    payload, propagate_flag = recorded[0]
+    assert payload == tx_payload
+    assert propagate_flag is False
+
+
+@pytest.mark.asyncio
+async def test_block_gossip_triggers_sync(two_nodes, monkeypatch):
+    from libp2p.peer.peerinfo import PeerInfo
+    from network.protocols import TAU_GOSSIP_TOPIC_BLOCKS
+    from network.service import NetworkService
+
+    svc1, svc2, _ = two_nodes
+
+    addrs2 = await _wait_for_addrs(svc2.host)
+    peer_info = PeerInfo(svc2.host.get_id(), addrs2)
+    svc1.host.get_peerstore().add_addrs(peer_info.peer_id, peer_info.addrs, 60)
+    await svc1.host.connect(peer_info)
+
+    loop = asyncio.get_running_loop()
+    event = asyncio.Event()
+    recorded_args = {}
+
+    async def fake_sync(self, peer_id, locator, stop=None, limit=2000):
+        recorded_args["peer_id"] = peer_id
+        recorded_args["locator"] = list(locator)
+        loop.call_soon_threadsafe(event.set)
+        return 0
+
+    monkeypatch.setattr(NetworkService, "_sync_and_ingest_from_peer", fake_sync)
+
+    payload = {
+        "headers": [
+            {
+                "block_number": 1,
+                "previous_hash": "0" * 64,
+                "timestamp": 123,
+                "merkle_root": "f" * 64,
+                "block_hash": "a" * 64,
+            }
+        ],
+        "tip_number": 1,
+        "tip_hash": "a" * 64,
+    }
+    await svc1.publish_gossip(TAU_GOSSIP_TOPIC_BLOCKS, payload, message_id="block-test-1")
+
+    await asyncio.wait_for(event.wait(), timeout=5)
+    assert recorded_args["peer_id"] == svc1.host.get_id()
+    assert recorded_args["locator"]

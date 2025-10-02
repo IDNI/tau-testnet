@@ -31,7 +31,7 @@ class ServerSettings:
 
 @dataclass
 class TauSettings:
-    program_file: str = 'tmp/genesis.tau'
+    program_file: str = 'genesis.tau'
     docker_image: str = 'tau'
     container_workdir: str = '/data'
     ready_signal: str = "Execution step: 0"
@@ -142,11 +142,15 @@ BASE_DEFAULTS: Dict[str, Any] = {
     "network": {
         "network_id": "tau-local",
         "genesis_hash": "GENESIS",
-        "listen": ["/ip4/127.0.0.1/tcp/0"],
+        "listen": ["/ip4/127.0.0.1/tcp/0"], 
         "bootstrap_peers": [
             {
-                "peer_id": "e91ab6c201fad166",
-                "addrs": ["/ip4/127.0.0.1/tcp/26131"],
+                "peer_id": "d03579f7dbd8e8c1",
+                "addrs": ["/ip4/127.0.0.1/tcp/13190"],
+            },
+            {
+                "peer_id": "089cbcf47b4cbf3b",
+                "addrs": ["/ip4/127.0.0.1/tcp/58570"],
             },
         ],
         "peerstore_path": None,

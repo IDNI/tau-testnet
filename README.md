@@ -9,14 +9,18 @@ The architecture is designed around the principle of extralogical processing. Th
 
 *   **TCP Server**: Handles client connections and commands.
 *   **P2P Networking (libp2p shim)**:
-    *   Protocols:
-        - `TAU_PROTOCOL_HANDSHAKE` (`/tau/handshake/1.0.0`): Exchange node info and tip.
+    *   Protocols (all implemented on the libp2p shim):
+        - `TAU_PROTOCOL_HANDSHAKE` (`/tau/handshake/1.0.0`): Exchange node info and current tip.
         - `TAU_PROTOCOL_PING` (`/tau/ping/1.0.0`): Latency/keepalive round-trip with a nonce.
-        - `TAU_PROTOCOL_ANNOUNCE` (`/tau/announce/1.0.0`): Peer announces new headers/tip (push).
-        - `TAU_PROTOCOL_SYNC` (`/tau/sync/1.0.0`): Header/tip synchronization with locator/stop/limit (pull).
-        - `TAU_PROTOCOL_BLOCKS` (`/tau/blocks/1.0.0`): Serve block bodies by hash list, or by range using `from`/`from_number` + `limit`.
-        - `TAU_PROTOCOL_TX` (`/tau/tx/1.0.0`): Placeholder for transaction submission.
-    *   Bootstrapping connects to peers, performs handshake + sync, fetches missing blocks, and rebuilds state. New blocks are also announced to peers via `TAU_PROTOCOL_ANNOUNCE` and trigger targeted sync on receivers.
+        - `TAU_PROTOCOL_SYNC` (`/tau/sync/1.0.0`): Header/tip synchronization with locator/stop/limit semantics.
+        - `TAU_PROTOCOL_BLOCKS` (`/tau/blocks/1.0.0`): Serve block bodies by hash list or by range (`from`/`from_number` + `limit`).
+        - `TAU_PROTOCOL_STATE` (`/tau/state/1.0.0`): Fetch the latest known block metadata alongside requested account/receipt data.
+        - `TAU_PROTOCOL_TX` (`/tau/tx/1.0.0`): Compatibility channel for submitting transactions, which queues locally and re-broadcasts over gossipsub.
+        - `TAU_PROTOCOL_GOSSIP` (`/tau/gossip/1.0.0`): Gossipsub-style transport used for topic-based dissemination.
+    *   Gossip topics:
+        - `tau/blocks/1.0.0`: Propagates new headers/tip summaries prior to full sync.
+        - `tau/transactions/1.0.0`: Propagates canonical, signed transactions across the mesh.
+    *   Bootstrapping connects to peers, performs handshake + sync, fetches missing blocks, rebuilds state, and replays gossip subscriptions so the node immediately participates in block/transaction mesh traffic.
     *   Verbose debug logging traces requests/responses and bootstrap progress for easier development.
 *   **Persistent Blockchain**:
     *   Creates blocks from transactions stored in the mempool.
@@ -130,7 +134,7 @@ netcat 127.0.0.1 65432
     - `test_persistent_chain_state.py`: Tests for persistent chain state management (currently skipped).
     - `test_state_reconstruction.py`: Tests for state reconstruction from blockchain data.
     - `test_p2p.py`: Connectivity and custom protocol round-trip using libp2p shim.
-    - `test_network_protocols.py`: End-to-end tests for Tau protocols (handshake, ping, sync, blocks, tx), including a typical header sync flow.
+    - `test_network_protocols.py`: End-to-end tests for Tau protocols (handshake, ping, sync, blocks, state, tx, gossip) including header sync, transaction gossip, and subscription handling.
 
 ## Console Wallet
 
@@ -212,7 +216,7 @@ The `block.py` module provides the `Block` and `BlockHeader` classes, along with
 ## Known Issues / Notes
 
 *   The fee model (`fee_limit`) is a placeholder and not yet enforced.
-*   `TAU_PROTOCOL_TX` is a placeholder; handshake/sync/blocks are implemented.
+*   Gossipsub topics (`tau/blocks/1.0.0`, `tau/transactions/1.0.0`) must be subscribed to by peers that expect block or transaction updates.
 
 ## Project Status
 

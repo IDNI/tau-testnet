@@ -94,9 +94,20 @@ import sbf_defs
 import tau_manager
 import utils
 from db import add_mempool_tx
+from network import bus as network_bus
 
 
 logger = logging.getLogger(__name__)
+
+
+def _canonicalize_transaction(payload: dict) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _compute_transaction_message_id(payload: dict) -> tuple[str, str]:
+    canonical = _canonicalize_transaction(payload)
+    tx_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return tx_hash, canonical
 
 _PY_ECC_AVAILABLE = False
 _PY_ECC_BLS = None
@@ -296,7 +307,7 @@ def _process_transfers_operation(transfers, sender_pubkey):
     return True, {"transfers": validated_transfers, "tau_inputs": tau_inputs}, None
 
 
-def queue_transaction(json_blob: str) -> str:
+def queue_transaction(json_blob: str, propagate: bool = True) -> str:
     blob = json_blob.strip()
     if len(blob) >= 2 and ((blob[0] == '"' and blob[-1] == '"') or (blob[0] == "'" and blob[-1] == "'")):
         blob = blob[1:-1]
@@ -424,8 +435,13 @@ def queue_transaction(json_blob: str) -> str:
                 if not chain_state.update_balances_after_transfer(from_addr, to_addr, amt):
                     return f"FAILURE: Transaction invalid post-Tau. Could not apply transfer ({from_addr[:10]}... -> {to_addr[:10]}..., amount {amt})."
 
+        tx_message_id, tx_canonical_blob = _compute_transaction_message_id(payload)
         db.add_mempool_tx(blob)
         logger.info("Transaction successfully queued in mempool.")
+        if propagate:
+            svc = network_bus.get()
+            if svc:
+                svc.broadcast_transaction(tx_canonical_blob, tx_message_id)
         if empty_transfer_list:
             return "SUCCESS: Transaction queued (empty transfer list)."
         return "SUCCESS: Transaction queued."

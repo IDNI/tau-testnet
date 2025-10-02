@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
+import logging
 import os
-from typing import Any, Callable, Dict, List, Optional
+import uuid
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 import multiaddr
 
@@ -18,11 +21,17 @@ from .protocols import (
     TAU_PROTOCOL_HANDSHAKE,
     TAU_PROTOCOL_PING,
     TAU_PROTOCOL_SYNC,
-    TAU_PROTOCOL_ANNOUNCE,
     TAU_PROTOCOL_BLOCKS,
     TAU_PROTOCOL_TX,
     TAU_PROTOCOL_STATE,
+    TAU_PROTOCOL_GOSSIP,
+    TAU_GOSSIP_TOPIC_BLOCKS,
+    TAU_GOSSIP_TOPIC_TRANSACTIONS,
 )
+from . import bus
+
+
+logger = logging.getLogger(__name__)
 
 
 class PeerstorePersistence:
@@ -55,6 +64,7 @@ class NetworkService:
         *,
         tx_submitter: Optional[Callable[[str], str]] = None,
         state_provider: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        gossip_handler: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
         self._config = config
         self._host = None
@@ -63,6 +73,225 @@ class NetworkService:
         self._last_announced_tip: Optional[str] = None
         self._submit_tx = tx_submitter or sendtx.queue_transaction
         self._state_provider = state_provider or self._default_state_provider
+        self._gossip_handlers: Dict[str, List[Callable[[Dict[str, Any]], Any]]] = {}
+        if gossip_handler:
+            self.subscribe_gossip("*", gossip_handler)
+        self._gossip_seen: Dict[str, float] = {}
+        self._gossip_seen_ttl = 300.0
+        self._gossip_peer_topics: Dict[str, Set[str]] = {}
+        self._gossip_local_topics: Set[str] = set()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def subscribe_gossip(self, topic: str, handler: Callable[[Dict[str, Any]], Any]) -> None:
+        """Register a handler for gossip envelopes on a topic. Use '*' for catch-all."""
+        if not isinstance(topic, str) or not topic:
+            raise ValueError("topic must be a non-empty string")
+        if not callable(handler):
+            raise ValueError("handler must be callable")
+        self._gossip_handlers.setdefault(topic, []).append(handler)
+
+    async def join_gossip_topic(self, topic: str, handler: Callable[[Dict[str, Any]], Any]) -> None:
+        """Subscribe locally to a topic and announce the subscription to peers."""
+        self.subscribe_gossip(topic, handler)
+        if topic in self._gossip_local_topics:
+            return
+        self._gossip_local_topics.add(topic)
+        await self._broadcast_gossip_subscriptions([
+            {"topic": topic, "subscribe": True}
+        ])
+
+    async def publish_gossip(self, topic: str, payload: Any, *, message_id: Optional[str] = None) -> str:
+        """Broadcast a gossip payload under a topic using gossipsub semantics."""
+        if self._host is None:
+            raise RuntimeError("network service is not started")
+        if not isinstance(topic, str) or not topic:
+            raise ValueError("topic must be a non-empty string")
+        message_id = message_id or uuid.uuid4().hex
+        message = {
+            "from": self._host.get_id(),
+            "topic": topic,
+            "data": payload,
+            "message_id": message_id,
+            "timestamp": asyncio.get_event_loop().time(),
+        }
+        try:
+            json.dumps(message)
+        except TypeError as exc:
+            raise ValueError("gossip payload must be JSON serializable") from exc
+        logger.debug("[network][gossip] Local publish topic=%s message_id=%s payload=%s", topic, message_id, message.get("data"))
+        self._gossip_seen[message_id] = message["timestamp"]
+        # Deliver locally before attempting any rebroadcasts. This ensures handlers
+        # can synchronously subscribe to additional topics in response to the
+        # message before we forward it to peers.
+        await self._deliver_gossip(message, via_peer=None)
+        await self._rebroadcast_gossip_message(message, exclude={self._host.get_id()})
+        return message_id
+
+    def broadcast_transaction(self, payload: str, message_id: str) -> None:
+        if self._loop is None:
+            return
+
+        async def _publish() -> None:
+            logger.debug("[network][gossip] Scheduling transaction publish message_id=%s payload=%s", message_id, payload)
+            await self.publish_gossip(TAU_GOSSIP_TOPIC_TRANSACTIONS, payload, message_id=message_id)
+
+        future = asyncio.run_coroutine_threadsafe(_publish(), self._loop)
+
+        def _log_result(fut: concurrent.futures.Future[Any]) -> None:
+            if fut.cancelled():
+                return
+            exc = fut.exception()
+            if exc:
+                logger.debug("Transaction gossip publish failed: %s", exc)
+
+        future.add_done_callback(_log_result)
+
+    async def _rebroadcast_gossip_message(self, message: Dict[str, Any], exclude: Optional[Set[str]] = None) -> None:
+        if self._host is None:
+            return
+        topic = message.get("topic")
+        if not isinstance(topic, str):
+            return
+        if exclude is None:
+            exclude_ids: Set[str] = set()
+        else:
+            exclude_ids = set(exclude)
+        exclude_ids.add(self._host.get_id())
+        peers = list(self._host.get_peerstore().peers())
+        if not peers:
+            return
+        envelope = json.dumps({
+            "peer_id": self._host.get_id(),
+            "rpc": {"messages": [message]},
+        }).encode()
+        for peer_id in peers:
+            if peer_id in exclude_ids:
+                continue
+            if not self._should_send_topic_to_peer(peer_id, topic):
+                continue
+            logger.debug("[network][gossip] Rebroadcasting topic=%s id=%s to peer=%s", topic, message.get("message_id"), peer_id)
+            await self._send_gossip_rpc(peer_id, envelope)
+
+    def _should_send_topic_to_peer(self, peer_id: str, topic: str) -> bool:
+        topics = self._gossip_peer_topics.get(peer_id)
+        return topics is None or topic in topics
+
+    async def _send_gossip_rpc(self, peer_id: str, payload: bytes) -> None:
+        if self._host is None:
+            return
+        try:
+            stream = await self._host.new_stream(peer_id, [TAU_PROTOCOL_GOSSIP])
+            logger.debug("[network][gossip] Opened gossip stream to %s", peer_id)
+            await stream.write(payload)
+            try:
+                await stream.read()
+            except Exception:
+                pass
+            await stream.close()
+            logger.debug("[network][gossip] Closed gossip stream to %s", peer_id)
+        except Exception:
+            logger.debug("[network][gossip] Failed to send gossip RPC to %s", peer_id, exc_info=True)
+            return
+
+    async def _broadcast_gossip_subscriptions(self, subscriptions: Iterable[Dict[str, Any]]) -> None:
+        if self._host is None:
+            return
+        subs = [sub for sub in subscriptions if isinstance(sub.get("topic"), str)]
+        if not subs:
+            return
+        peers = list(self._host.get_peerstore().peers())
+        if not peers:
+            return
+        payload = json.dumps({
+            "peer_id": self._host.get_id(),
+            "rpc": {"subscriptions": subs},
+        }).encode()
+        for peer_id in peers:
+            logger.debug("[network][gossip] Broadcasting subscriptions to %s topics=%s", peer_id, subs)
+            await self._send_gossip_rpc(peer_id, payload)
+
+    async def _send_local_subscriptions_to_peer(self, peer_id: str) -> None:
+        if self._host is None or not self._gossip_local_topics:
+            return
+        payload = json.dumps({
+            "peer_id": self._host.get_id(),
+            "rpc": {
+                "subscriptions": [
+                    {"topic": topic, "subscribe": True}
+                    for topic in sorted(self._gossip_local_topics)
+                ]
+            },
+        }).encode()
+        logger.debug("[network][gossip] Sending local subscriptions to peer %s topics=%s", peer_id, list(self._gossip_local_topics))
+        await self._send_gossip_rpc(peer_id, payload)
+
+    async def _deliver_gossip(self, message: Dict[str, Any], via_peer: Optional[str]) -> None:
+        topic = message.get("topic")
+        if not isinstance(topic, str) or not topic:
+            return
+        envelope = {
+            "topic": topic,
+            "payload": message.get("data"),
+            "origin": message.get("from"),
+            "message_id": message.get("message_id"),
+            "timestamp": message.get("timestamp"),
+            "via": via_peer,
+        }
+        targets = list(self._gossip_handlers.get(topic, []))
+        targets.extend(self._gossip_handlers.get("*", []))
+        logger.debug("[network][gossip] Delivering topic=%s id=%s to %d handlers via=%s", topic, envelope.get("message_id"), len(targets), via_peer)
+        for handler in targets:
+            try:
+                maybe = handler(envelope)
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+            except Exception:
+                logger.debug("[network][gossip] Handler %s raised exception", handler, exc_info=True)
+                continue
+
+    async def _handle_transaction_gossip(self, envelope: Dict[str, Any]) -> None:
+        if self._host and envelope.get("origin") == self._host.get_id():
+            return
+        payload = envelope.get("payload")
+        if not isinstance(payload, str):
+            logger.debug("[network][gossip] Ignoring TX gossip with non-string payload: %s", type(payload))
+            return
+        logger.debug("[network][gossip] Processing TX gossip message_id=%s origin=%s", envelope.get("message_id"), envelope.get("origin"))
+        try:
+            await asyncio.to_thread(sendtx.queue_transaction, payload, False)
+        except TypeError:
+            # Fallback for legacy signature without propagate flag (during upgrades)
+            await asyncio.to_thread(sendtx.queue_transaction, payload)
+        except Exception as exc:
+            logger.debug("Failed to ingest transaction from gossip: %s", exc)
+
+    async def _handle_block_gossip(self, envelope: Dict[str, Any]) -> None:
+        if self._host and envelope.get("origin") == self._host.get_id():
+            return
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict):
+            logger.debug("[network][gossip] Ignoring block gossip with invalid payload type=%s", type(payload))
+            return
+        peer_id = envelope.get("origin") or envelope.get("via")
+        if not isinstance(peer_id, str) or not peer_id:
+            return
+        logger.debug("[network][gossip] Processing block gossip message_id=%s from=%s", envelope.get("message_id"), peer_id)
+        locator: List[str] = []
+        try:
+            tip_hash = self._get_tip_hash()
+            if tip_hash:
+                locator = [tip_hash]
+        except Exception:
+            locator = []
+        try:
+            logger.debug("[network][gossip] Attempting subscription sync to peer %s before block sync", peer_id)
+            await self._send_local_subscriptions_to_peer(peer_id)
+        except Exception as exc:
+            logger.debug("[network][gossip] Failed sending subscriptions to %s: %s", peer_id, exc)
+        try:
+            await self._sync_and_ingest_from_peer(peer_id, locator)
+        except Exception as exc:
+            logger.debug("Block gossip sync from %s failed: %s", peer_id, exc)
 
     async def _sync_and_ingest_from_peer(self, peer_id: str, locator: List[str], stop: Optional[str] = None, limit: int = 2000) -> int:
         """Send SYNC to peer, request bodies for unknown headers, ingest, and rebuild state.
@@ -434,6 +663,86 @@ class NetworkService:
             pass
         await stream.close()
 
+    async def _handle_gossip(self, stream) -> None:
+        raw = await stream.read()
+        decoded = raw.decode(errors='ignore') if raw else ''
+        print(f"[DEBUG][network] <- GOSSIP raw='{decoded}'")
+        try:
+            packet = json.loads(decoded) if decoded else {}
+        except Exception:
+            packet = {}
+        response: Dict[str, Any]
+        if not isinstance(packet, dict):
+            response = {"ok": False, "error": "invalid gossipsub frame"}
+            await stream.write(json.dumps(response).encode())
+            await stream.close()
+            return
+
+        rpc = packet.get("rpc")
+        if not isinstance(rpc, dict):
+            response = {"ok": False, "error": "missing gossipsub rpc"}
+            await stream.write(json.dumps(response).encode())
+            await stream.close()
+            return
+
+        peer_id = packet.get("peer_id") if isinstance(packet.get("peer_id"), str) else None
+
+        subs_updated = 0
+        subs = rpc.get("subscriptions")
+        if isinstance(subs, list) and peer_id:
+            topics = self._gossip_peer_topics.setdefault(peer_id, set())
+            for entry in subs:
+                if not isinstance(entry, dict):
+                    continue
+                topic = entry.get("topic")
+                if not isinstance(topic, str) or not topic:
+                    continue
+                subscribe = bool(entry.get("subscribe", True))
+                if subscribe:
+                    if topic not in topics:
+                        topics.add(topic)
+                        subs_updated += 1
+                else:
+                    if topic in topics:
+                        topics.discard(topic)
+                        subs_updated += 1
+
+        duplicates: List[Dict[str, Any]] = []
+        messages = rpc.get("messages")
+        loop = asyncio.get_event_loop()
+        if isinstance(messages, list):
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                topic = msg.get("topic")
+                message_id = msg.get("message_id")
+                if not isinstance(topic, str) or not isinstance(message_id, str):
+                    continue
+                duplicate = message_id in self._gossip_seen
+                logger.debug("[network][gossip] Handling incoming message topic=%s id=%s duplicate=%s via=%s", topic, message_id, duplicate, peer_id)
+                if not duplicate:
+                    now = loop.time()
+                    self._gossip_seen[message_id] = now
+                    msg.setdefault("timestamp", now)
+                    if not isinstance(msg.get("from"), str) and peer_id:
+                        msg["from"] = peer_id
+                    exclude: Optional[Set[str]] = {peer_id} if peer_id else None
+                    await self._deliver_gossip(msg, via_peer=peer_id)
+                    await self._rebroadcast_gossip_message(msg, exclude=exclude)
+                duplicates.append({
+                    "message_id": message_id,
+                    "duplicate": duplicate,
+                    "topic": topic,
+                })
+
+        response = {
+            "ok": True,
+            "subscriptions_updated": subs_updated,
+            "messages": duplicates,
+        }
+        await stream.write(json.dumps(response).encode())
+        await stream.close()
+
     async def _handle_tx(self, stream) -> None:
         raw = await stream.read()
         decoded = raw.decode(errors='ignore') if raw else ''
@@ -499,59 +808,12 @@ class NetworkService:
         print(f"[DEBUG][network] -> STATE response: {json.dumps(response)[:512]}")
         await stream.close()
 
-    async def _handle_announce(self, stream) -> None:
-        # Accept block/header announcements and trigger sync from announcer
-        raw = await stream.read()
-        print(f"[DEBUG][network] <- ANNOUNCE raw='{raw.decode(errors='ignore') if raw else ''}'")
-        announcer_id = None
-        addrs = []
-        try:
-            data = json.loads(raw.decode()) if raw else {}
-        except Exception:
-            data = {}
-        if isinstance(data, dict):
-            announcer_id = data.get("from_id")
-            addrs = data.get("from_addrs") or []
-        # Record announcer addrs if provided
-        if announcer_id and addrs:
-            try:
-                self._host.get_peerstore().add_addrs(announcer_id, [multiaddr.Multiaddr(a) for a in addrs], 600)
-            except Exception:
-                pass
-        # Respond ack
-        try:
-            await stream.write(json.dumps({"ok": True}).encode())
-        except Exception:
-            pass
-        await stream.close()
-
-        # Kick off a targeted sync from announcer
-        if announcer_id:
-            try:
-                # Ensure connection
-                pi = PeerInfo(announcer_id, [multiaddr.Multiaddr(a) for a in addrs] if addrs else [])
-                self._host.get_peerstore().add_addrs(pi.peer_id, pi.addrs, 600)
-                try:
-                    await self._host.connect(pi)
-                except Exception:
-                    pass
-                locator = []
-                try:
-                    if self._get_tip_hash():
-                        locator = [self._get_tip_hash()]
-                except Exception:
-                    locator = []
-                added = await self._sync_and_ingest_from_peer(announcer_id, locator)
-                print(f"[INFO][network] ANNOUNCE-driven sync from {announcer_id}: added={added}")
-            except Exception:
-                pass
-
     def _register_handlers(self) -> None:
         self._host.set_stream_handler(TAU_PROTOCOL_HANDSHAKE, self._handle_handshake)
         self._host.set_stream_handler(TAU_PROTOCOL_PING, self._handle_ping)
         self._host.set_stream_handler(TAU_PROTOCOL_SYNC, self._handle_sync)
-        self._host.set_stream_handler(TAU_PROTOCOL_ANNOUNCE, self._handle_announce)
         self._host.set_stream_handler(TAU_PROTOCOL_BLOCKS, self._handle_blocks)
+        self._host.set_stream_handler(TAU_PROTOCOL_GOSSIP, self._handle_gossip)
         self._host.set_stream_handler(TAU_PROTOCOL_TX, self._handle_tx)
         self._host.set_stream_handler(TAU_PROTOCOL_STATE, self._handle_state)
 
@@ -571,35 +833,38 @@ class NetworkService:
                         "block_hash": tip_hash,
                     }
                     addrs = [str(a) for a in (self._host.get_addrs() or [])]
-                    payload = {
-                        "type": "new_headers",
-                        "from_id": self._host.get_id(),
-                        "from_addrs": addrs,
-                        "headers": [hdr],
-                        "tip_number": tip_num,
-                        "tip_hash": tip_hash,
-                    }
-                    # Broadcast to configured bootstrap peers for now
-                    for p in self._config.bootstrap_peers:
-                        try:
-                            pi = PeerInfo(p.peer_id, p.addrs)
-                            self._host.get_peerstore().add_addrs(pi.peer_id, pi.addrs, 600)
-                            try:
-                                await self._host.connect(pi)
-                            except Exception:
-                                pass
-                            st = await self._host.new_stream(pi.peer_id, [TAU_PROTOCOL_ANNOUNCE])
-                            await st.write(json.dumps(payload).encode())
-                            await st.read()
-                            await st.close()
-                        except Exception:
-                            continue
+                    try:
+                        await self.publish_gossip(
+                            TAU_GOSSIP_TOPIC_BLOCKS,
+                            {
+                                "headers": [hdr],
+                                "tip_number": tip_num,
+                                "tip_hash": tip_hash,
+                            },
+                            message_id=hdr.get("block_hash") or uuid.uuid4().hex,
+                        )
+                    except Exception as exc:
+                        logger.debug("Failed to gossip new block header: %s", exc)
                     self._last_announced_tip = tip_hash
             except asyncio.CancelledError:
                 break
             except Exception:
                 pass
             await asyncio.sleep(1.0)
+
+    async def _gossip_cleanup_loop(self) -> None:
+        while True:
+            try:
+                now = asyncio.get_event_loop().time()
+                cutoff = now - max(self._gossip_seen_ttl, 1.0)
+                for message_id, timestamp in list(self._gossip_seen.items()):
+                    if timestamp < cutoff:
+                        self._gossip_seen.pop(message_id, None)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+            await asyncio.sleep(max(1.0, self._gossip_seen_ttl / 2))
 
     def _restore_peerstore(self) -> None:
         mapping = self._peerstore_persist.load()
@@ -641,6 +906,7 @@ class NetworkService:
                 await self._host.connect(peer_info)
                 print(f"[INFO][network] Connected to bootstrap peer {peer_info.peer_id}")
                 self._save_peer_basic(peer_info)
+                await self._send_local_subscriptions_to_peer(peer_info.peer_id)
 
                 # Perform a best-effort handshake
                 try:
@@ -675,6 +941,7 @@ class NetworkService:
     async def start(self) -> None:
         if self._host is not None:
             return
+        self._loop = asyncio.get_event_loop()
         self._host = new_host(listen_addrs=self._config.listen_addrs)
         self._register_handlers()
         self._restore_peerstore()
@@ -683,9 +950,13 @@ class NetworkService:
         except Exception:
             addrs = []
         print(f"[INFO][network] Service started. NodeID={self._host.get_id()} listen_addrs={addrs}")
+        bus.register(self)
+        await self.join_gossip_topic(TAU_GOSSIP_TOPIC_TRANSACTIONS, self._handle_transaction_gossip)
+        await self.join_gossip_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
         # attempt bootstrap and head watcher in background
         self._tasks.append(asyncio.create_task(self._bootstrap()))
         self._tasks.append(asyncio.create_task(self._watch_head_and_announce()))
+        self._tasks.append(asyncio.create_task(self._gossip_cleanup_loop()))
 
     async def stop(self) -> None:
         if self._host is None:
@@ -694,9 +965,12 @@ class NetworkService:
         print(f"[INFO][network] Service stopping. NodeID={self._host.get_id()}")
         await self._host.close()
         self._host = None
+        bus.unregister(self)
         for t in self._tasks:
             t.cancel()
         self._tasks.clear()
+        self._loop = None
+        self._gossip_peer_topics.clear()
 
     @property
     def host(self):

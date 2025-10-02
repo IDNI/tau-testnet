@@ -19,8 +19,14 @@ class PeerStore:
                 self._peer_id_to_addrs[peer_id].append(addr)
                 existing.add(str(addr))
 
+    def get_addrs(self, peer_id: str) -> List[multiaddr.Multiaddr]:
+        return list(self._peer_id_to_addrs.get(peer_id, []))
+
     def peers(self):
         return set(self._peer_id_to_addrs.keys())
+
+    def peer_ids(self) -> List[str]:
+        return list(self._peer_id_to_addrs.keys())
 
 
 class _Listener:
@@ -65,6 +71,10 @@ class _DuplexStream:
 
 class BasicHost:
     _registry: Dict[str, "BasicHost"] = {}
+
+    @classmethod
+    def register_peer(cls, peer_id: str, host: "BasicHost") -> None:
+        cls._registry[peer_id] = host
 
     def __init__(self, listen_addrs: Optional[List[multiaddr.Multiaddr]] = None) -> None:
         # generate simple peer id
@@ -235,6 +245,11 @@ def new_host(listen_addrs: Optional[List[multiaddr.Multiaddr]] = None) -> BasicH
 
 # Re-export for compatibility if needed by external imports
 __all__ = ["new_host", "BasicHost"]
+
+class PeerInfo:
+    def __init__(self, peer_id: str, addrs: List[multiaddr.Multiaddr]):
+        self.peer_id = peer_id
+        self.addrs = list(addrs)
 
 class _TCPOutboundStream:
     def __init__(self, addrs: List[multiaddr.Multiaddr], protocol_id: str) -> None:

@@ -179,25 +179,30 @@ def handle_client(conn, addr, container: ServiceContainer):
                     logger.info("Create block requested by %s", client_label)
                     try:
                         block_data = createblock.create_block_from_mempool()
-                        tx_count = len(block_data.get("transactions", []))
-                        block_hash = block_data["block_hash"]
-                        block_number = block_data["header"]["block_number"]
-                        merkle_root = block_data["header"]["merkle_root"]
-                        timestamp = block_data["header"]["timestamp"]
+                        if not block_data or "block_hash" not in block_data:
+                            message = block_data.get("message") if isinstance(block_data, dict) else None
+                            resp = (message or "Mempool is empty. No block created.") + "\r\n"
+                            logger.info("Create block skipped for %s: %s", client_label, message or "empty mempool")
+                        else:
+                            tx_count = len(block_data.get("transactions", []))
+                            block_hash = block_data["block_hash"]
+                            block_number = block_data["header"]["block_number"]
+                            merkle_root = block_data["header"]["merkle_root"]
+                            timestamp = block_data["header"]["timestamp"]
 
-                        resp_lines = [
-                            f"SUCCESS: Block #{block_number} created successfully!",
-                            f"  - Transactions: {tx_count}",
-                            f"  - Block Hash: {block_hash}",
-                            f"  - Merkle Root: {merkle_root}",
-                            f"  - Timestamp: {timestamp}",
-                        ]
-                        for idx, tx in enumerate(block_data.get("transactions", []), start=1):
-                            tx_json = json.dumps(tx, sort_keys=True)
-                            resp_lines.append(f"  - TX#{idx}: {tx_json}")
-                        resp_lines.append("  - Mempool cleared\r\n")
-                        resp = "\n".join(resp_lines)
-                        logger.info("Block #%s created via client %s", block_number, client_label)
+                            resp_lines = [
+                                f"SUCCESS: Block #{block_number} created successfully!",
+                                f"  - Transactions: {tx_count}",
+                                f"  - Block Hash: {block_hash}",
+                                f"  - Merkle Root: {merkle_root}",
+                                f"  - Timestamp: {timestamp}",
+                            ]
+                            for idx, tx in enumerate(block_data.get("transactions", []), start=1):
+                                tx_json = json.dumps(tx, sort_keys=True)
+                                resp_lines.append(f"  - TX#{idx}: {tx_json}")
+                            resp_lines.append("  - Mempool cleared\r\n")
+                            resp = "\n".join(resp_lines)
+                            logger.info("Block #%s created via client %s", block_number, client_label)
                     except Exception:
                         logger.exception("Block creation failed for %s", client_label)
                         resp = "ERROR: Failed to create block\r\n"
