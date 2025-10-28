@@ -1,9 +1,10 @@
-import asyncio
 import logging
 import os
 import socket
 import sys
 import threading
+import trio
+import argparse
 
 from app.container import ServiceContainer
 from network import NetworkService
@@ -28,28 +29,21 @@ NETWORK_STOP_FLAG = threading.Event()
 # --- NetworkService helpers ---
 def _start_network_background(container: ServiceContainer) -> None:
     """
-    Start NetworkService in a dedicated asyncio thread.
+    Start NetworkService in a dedicated Trio thread.
     """
     global NETWORK_THREAD
     cfg = container.build_network_config()
 
     def _runner():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         service = NetworkService(cfg)
-        async def main():
+        async def main() -> None:
             await service.start()
-            # Periodically check the stop flag
             try:
                 while not NETWORK_STOP_FLAG.is_set():
-                    await asyncio.sleep(0.25)
+                    await trio.sleep(0.25)
             finally:
                 await service.stop()
-        try:
-            loop.run_until_complete(main())
-        finally:
-            loop.stop()
-            loop.close()
+        trio.run(main)
 
     t = threading.Thread(target=_runner, name="NetworkServiceThread", daemon=True)
     t.start()
@@ -380,8 +374,16 @@ def _run_server(container: ServiceContainer):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Tau Testnet Server")
+    parser.add_argument(
+        "--ephemeral-identity",
+        action="store_true",
+        help="Use an ephemeral libp2p identity for this run (do not load/generate persistent key)",
+    )
+    args = parser.parse_args()
+
     tau_logging.configure(getattr(config, "LOGGING", None))
-    container = ServiceContainer.build(overrides={"logger": logger})
+    container = ServiceContainer.build(overrides={"logger": logger, "ephemeral_identity": args.ephemeral_identity})
     tau_module = container.tau_manager
     try:
         _run_server(container)

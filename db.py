@@ -188,6 +188,22 @@ def get_latest_block() -> Optional[Dict]:
         else:
             return None
 
+def get_block_by_hash(block_hash: str) -> Optional[Dict]:
+    """Return the block with the given hash as a parsed dict, or None if missing."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT block_data FROM blocks WHERE block_hash = ? LIMIT 1', (block_hash,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except json.JSONDecodeError:
+        logger.debug("Stored block hash %s contains invalid JSON", block_hash, exc_info=True)
+        return None
+
 def get_all_blocks() -> List[Dict]:
     """Returns all blocks ordered by block_number ascending as parsed dicts."""
     if _db_conn is None:

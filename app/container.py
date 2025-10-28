@@ -1,6 +1,8 @@
 """Dependency wiring helpers for the Tau Testnet server."""
 from __future__ import annotations
 
+import os
+import secrets
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -15,6 +17,7 @@ import tau_manager
 from commands import createblock, getmempool, gettimestamp, sendtx
 from errors import DependencyError
 from network import BootstrapPeer, NetworkConfig
+from network.identity import IDENTITY_SEED_SIZE
 
 
 @dataclass
@@ -86,12 +89,70 @@ class ServiceContainer:
             except Exception as exc:
                 self.logger.warning("Skipping invalid bootstrap peer %s: %s", entry, exc)
 
+        identity_key_bytes = None
+        if not self.overrides.get("ephemeral_identity"):
+            key_path = self.settings.network.identity_key_path or os.path.join(config.DATA_DIR, "identity.key")
+            try:
+                if not os.path.exists(key_path):
+                    try:
+                        os.makedirs(os.path.dirname(key_path) or ".", exist_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        generated_key = secrets.token_bytes(IDENTITY_SEED_SIZE)
+                    except Exception as exc:
+                        self.logger.warning("Failed to generate identity key: %s", exc)
+                        generated_key = None
+                    if generated_key is not None:
+                        try:
+                            with open(key_path, "wb") as f:
+                                f.write(generated_key)
+                            try:
+                                os.chmod(key_path, 0o600)
+                            except Exception:
+                                pass
+                        except Exception as exc:
+                            self.logger.warning("Failed to write identity key to %s: %s", key_path, exc)
+                # Load key if present
+                if os.path.exists(key_path):
+                    try:
+                        with open(key_path, "rb") as f:
+                            identity_key_bytes = f.read()
+                        if identity_key_bytes and len(identity_key_bytes) != IDENTITY_SEED_SIZE:
+                            self.logger.warning(
+                                "Ignoring identity key at %s with unexpected length %s (expected %s)",
+                                key_path,
+                                len(identity_key_bytes),
+                                IDENTITY_SEED_SIZE,
+                            )
+                            identity_key_bytes = None
+                            try:
+                                regenerated = secrets.token_bytes(IDENTITY_SEED_SIZE)
+                                with open(key_path, "wb") as f:
+                                    f.write(regenerated)
+                                try:
+                                    os.chmod(key_path, 0o600)
+                                except Exception:
+                                    pass
+                                identity_key_bytes = regenerated
+                            except Exception as regen_exc:
+                                self.logger.warning(
+                                    "Failed to refresh identity key at %s: %s",
+                                    key_path,
+                                    regen_exc,
+                                )
+                    except Exception as exc:
+                        self.logger.warning("Failed to read identity key from %s: %s", key_path, exc)
+            except Exception as exc:
+                self.logger.warning("Identity key setup error: %s", exc)
+
         return NetworkConfig(
             network_id=self.settings.network.network_id,
             genesis_hash=self.settings.network.genesis_hash,
             listen_addrs=listen_addrs,
             bootstrap_peers=bootstrap_peers,
             peerstore_path=self.settings.network.peerstore_path,
+            identity_key=identity_key_bytes,
         )
 
     def get_command_handler(self, name: str) -> Any:

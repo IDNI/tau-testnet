@@ -11,7 +11,7 @@ from errors import ConfigurationError
 
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-DEFAULT_PROD_DB_PATH = "strings.db"
+DEFAULT_PROD_DB_PATH = "node.db"
 
 
 @dataclass
@@ -76,6 +76,8 @@ class NetworkSettings:
     listen: List[str] = field(default_factory=lambda: ["/ip4/127.0.0.1/tcp/0"])
     bootstrap_peers: List[Dict[str, Any]] = field(default_factory=list)
     peerstore_path: Optional[str] = None
+    # Optional path to a private key file for persistent libp2p identity
+    identity_key_path: Optional[str] = None
 
     def validate(self) -> None:
         if not self.network_id:
@@ -145,15 +147,16 @@ BASE_DEFAULTS: Dict[str, Any] = {
         "listen": ["/ip4/127.0.0.1/tcp/0"], 
         "bootstrap_peers": [
             {
-                "peer_id": "d03579f7dbd8e8c1",
-                "addrs": ["/ip4/127.0.0.1/tcp/13190"],
+                "peer_id": "QmPYSDVWUsEKg3MnsK3k72TsZWB6RRZ1Uw6x59ZWdm7iE2",
+                "addrs": ["/ip4/127.0.0.1/tcp/59925"],
             },
-            {
-                "peer_id": "089cbcf47b4cbf3b",
-                "addrs": ["/ip4/127.0.0.1/tcp/58570"],
-            },
+            # {
+            #     "peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC", #MAIN NODE
+            #     "addrs": ["/ip4/127.0.0.1/tcp/4001"],
+            # },
         ],
         "peerstore_path": None,
+        "identity_key_path": None,
     },
     "logging": asdict(LoggingSettings()),
 }
@@ -196,6 +199,7 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_NETWORK_LISTEN": ("network", "listen", lambda value: [addr.strip() for addr in value.split(',') if addr.strip()]),
     "TAU_BOOTSTRAP_PEERS": ("network", "bootstrap_peers", lambda value: json.loads(value)),
     "TAU_PEERSTORE_PATH": ("network", "peerstore_path", str),
+    "TAU_IDENTITY_KEY_PATH": ("network", "identity_key_path", str),
     "TAU_LOG_LEVEL": ("logging", "level", str),
     "TAU_LOG_FORMAT": ("logging", "format", str),
     "TAU_LOG_DATEFMT": ("logging", "datefmt", str),

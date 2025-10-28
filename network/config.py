@@ -20,5 +20,7 @@ class NetworkConfig:
     bootstrap_peers: List[BootstrapPeer] = field(default_factory=list)
     agent: str = "tau-testnet/0.1"
     peerstore_path: Optional[str] = None
+    # Optional raw private key bytes for persistent identity (implementation-specific)
+    identity_key: Optional[bytes] = None
 
 
