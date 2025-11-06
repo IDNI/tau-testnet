@@ -628,6 +628,181 @@ async def test_gossip_dht_peer_resolution(two_nodes, monkeypatch):
     assert find_calls, "Expected DHT find_peer to be invoked for route discovery"
 
 
+async def test_gossip_opportunistic_seeding(two_nodes, monkeypatch):
+    from network.protocols import TAU_PROTOCOL_GOSSIP
+
+    svc1, svc2, _ = two_nodes
+
+    addrs2 = await _wait_for_addrs(svc2.host)
+    pid2 = svc2.host.get_id()
+
+    try:
+        svc1.host.get_peerstore().peer_data_map[pid2].clear_addrs()
+    except Exception:
+        pass
+
+    async def fake_find_peer(peer_id):
+        return PeerInfo(peer_id, addrs2)
+
+    add_calls: List[PeerInfo] = []
+
+    async def fake_add_peer(peer_info):
+        add_calls.append(peer_info)
+        return True
+
+    monkeypatch.setattr(svc1._dht.peer_routing, "find_peer", fake_find_peer)
+    monkeypatch.setattr(svc1._dht.routing_table, "add_peer", fake_add_peer)
+
+    addrs1 = await _wait_for_addrs(svc1.host)
+    svc2.host.get_peerstore().add_addrs(svc1.host.get_id(), addrs1, 60)
+
+    stream = await svc2.host.new_stream(svc1.host.get_id(), [TAU_PROTOCOL_GOSSIP])
+    message = {
+        "topic": "bootstrap.topic",
+        "message_id": "bootstrap-msg",
+        "data": {"hello": 1},
+    }
+    payload = {"peer_id": str(pid2), "rpc": {"messages": [message]}}
+    await stream.write(json.dumps(payload).encode())
+    await stream.read()
+    await stream.close()
+
+    with trio.fail_after(5):
+        while not add_calls:
+            await trio.sleep(0.05)
+
+    assert str(add_calls[0].peer_id) == str(pid2)
+    assert str(pid2) in svc1._opportunistic_peers
+
+
+async def test_handshake_opportunistic_seeding(two_nodes, monkeypatch):
+    from network.protocols import TAU_PROTOCOL_HANDSHAKE
+
+    svc1, svc2, _ = two_nodes
+
+    addrs2 = await _wait_for_addrs(svc2.host)
+    pid2 = svc2.host.get_id()
+
+    try:
+        svc1.host.get_peerstore().peer_data_map[pid2].clear_addrs()
+    except Exception:
+        pass
+
+    async def fake_find_peer(peer_id):
+        return PeerInfo(peer_id, addrs2)
+
+    add_calls: List[PeerInfo] = []
+
+    async def fake_add_peer(peer_info):
+        add_calls.append(peer_info)
+        return True
+
+    monkeypatch.setattr(svc1._dht.peer_routing, "find_peer", fake_find_peer)
+    monkeypatch.setattr(svc1._dht.routing_table, "add_peer", fake_add_peer)
+
+    addrs1 = await _wait_for_addrs(svc1.host)
+    svc2.host.get_peerstore().add_addrs(svc1.host.get_id(), addrs1, 60)
+
+    stream = await svc2.host.new_stream(svc1.host.get_id(), [TAU_PROTOCOL_HANDSHAKE])
+    await stream.write(b"hello")
+    await stream.read()
+    await stream.close()
+
+    with trio.fail_after(5):
+        while not add_calls:
+            await trio.sleep(0.05)
+
+    assert str(add_calls[0].peer_id) == str(pid2)
+    assert str(pid2) in svc1._opportunistic_peers
+
+
+async def test_gossip_dht_multi_hop_routing(monkeypatch):
+    from network.config import NetworkConfig
+    from network.protocols import TAU_PROTOCOL_GOSSIP
+
+    cfg = NetworkConfig(
+        network_id="multi-hop-testnet",
+        genesis_hash="genesis_hash_xyz",
+        listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
+    )
+
+    from network.service import NetworkService
+
+    svc_a = NetworkService(cfg)
+    svc_b = NetworkService(cfg)
+    svc_c = NetworkService(cfg)
+    await svc_a.start()
+    await svc_b.start()
+    await svc_c.start()
+
+    try:
+        addrs_a = await _wait_for_addrs(svc_a.host)
+        addrs_b = await _wait_for_addrs(svc_b.host)
+        addrs_c = await _wait_for_addrs(svc_c.host)
+
+        peer_info_b = PeerInfo(svc_b.host.get_id(), addrs_b)
+        svc_a.host.get_peerstore().add_addrs(peer_info_b.peer_id, peer_info_b.addrs, 60)
+        await svc_a.host.connect(peer_info_b)
+
+        peer_info_c = PeerInfo(svc_c.host.get_id(), addrs_c)
+        svc_b.host.get_peerstore().add_addrs(peer_info_c.peer_id, peer_info_c.addrs, 60)
+        await svc_b.host.connect(peer_info_c)
+
+        await svc_a.host.get_network().close_peer(svc_b.host.get_id())
+        await svc_b.host.get_network().close_peer(svc_a.host.get_id())
+        assert not list(svc_a.host.get_connected_peers())
+
+        topic = "multi.hop.route"
+        received = trio.Event()
+        seen_b = trio.Event()
+        latency: Dict[str, Any] = {}
+
+        async def handler_b(envelope):
+            if envelope.get("topic") == topic:
+                latency.setdefault("b_seen_at", trio.current_time())
+                seen_b.set()
+
+        svc_b.subscribe_gossip("*", handler_b)
+
+        async def handler_c(envelope):
+            if envelope.get("topic") == topic:
+                latency["latency"] = trio.current_time() - latency["start"]
+                latency["origin"] = envelope.get("origin")
+                latency["via"] = envelope.get("via")
+                latency["message_id"] = envelope.get("message_id")
+                received.set()
+
+        await svc_c.join_gossip_topic(topic, handler_c)
+
+        latency["start"] = trio.current_time()
+        message_id = await svc_a.publish_gossip(
+            topic,
+            {"value": 999},
+        )
+
+        with trio.fail_after(10):
+            await seen_b.wait()
+
+        with trio.fail_after(10):
+            await received.wait()
+
+        b_seen_time = latency.get("b_seen_at")
+        assert b_seen_time is not None
+        assert b_seen_time >= latency["start"]
+        assert latency["message_id"] == message_id
+        assert latency["origin"] == str(svc_a.host.get_id())
+        assert latency["latency"] < 5.0
+        assert latency["via"] in {
+            str(svc_b.host.get_id()),
+            str(svc_a.host.get_id()),
+        }
+        assert str(svc_c.host.get_id()) in svc_a._opportunistic_peers
+    finally:
+        await svc_c.stop()
+        await svc_b.stop()
+        await svc_a.stop()
+
+
 async def test_dht_bucket_refresh_cycle():
     from network.config import NetworkConfig
     from network.service import NetworkService

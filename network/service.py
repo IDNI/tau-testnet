@@ -166,6 +166,11 @@ class NetworkService:
             "dht_last_refresh": 0.0,
             "dht_last_bucket_refresh": 0.0,
         }
+        self._opportunistic_peers: Dict[str, float] = {}
+        self._opportunistic_peer_cooldown = max(
+            5.0,
+            float(getattr(config, "dht_opportunistic_cooldown", 120.0) or 120.0),
+        )
 
     # ------------------------------------------------------------------ Gossip API
     def subscribe_gossip(self, topic: str, handler: Callable[[Dict[str, Any]], Any]) -> None:
@@ -424,6 +429,23 @@ class NetworkService:
                     await stream.close()
                 except Exception:
                     pass
+        self._schedule_opportunistic_seed(str(peer_id))
+
+    def _schedule_opportunistic_seed(
+        self,
+        peer_id: Optional[str],
+        addrs: Optional[Iterable[multiaddr.Multiaddr]] = None,
+    ) -> None:
+        if not peer_id:
+            return
+
+        async def _seed() -> None:
+            await self._opportunistic_seed_peer(peer_id, addrs)
+
+        if self._nursery is not None:
+            self._nursery.start_soon(_seed)
+        else:
+            trio.lowlevel.spawn_system_task(_seed)
 
     async def _attempt_dht_gossip(self, message: Dict[str, Any]) -> bool:
         if self._host is None or self._dht is None:
@@ -481,6 +503,7 @@ class NetworkService:
 
     async def _ensure_route_to_peer(self, peer_id: str) -> bool:
         if self._can_reach_peer(peer_id):
+            self._schedule_opportunistic_seed(peer_id)
             return True
         if self._host is None or self._dht is None:
             return False
@@ -488,6 +511,7 @@ class NetworkService:
             pid = self._ensure_peer_id(peer_id)
         except ValueError:
             return False
+        peer_info: Optional[PeerInfo]
         try:
             peer_info = await self._dht.peer_routing.find_peer(pid)
         except Exception:
@@ -503,7 +527,10 @@ class NetworkService:
             await self._host.connect(peer_info)
         except Exception:
             logger.debug("Failed to open connection to DHT-discovered peer %s", peer_id, exc_info=True)
-        return self._can_reach_peer(peer_id)
+        if self._can_reach_peer(peer_id):
+            self._schedule_opportunistic_seed(peer_id, peer_info.addrs if peer_info else None)
+            return True
+        return False
 
     @staticmethod
     def _queue_transaction_sync(payload: str, propagate: bool = False) -> str:
@@ -1139,6 +1166,59 @@ class NetworkService:
         else:
             trio.lowlevel.spawn_system_task(_add)
 
+    async def _opportunistic_seed_peer(
+        self,
+        peer_id_str: str,
+        addrs: Optional[Iterable[multiaddr.Multiaddr]] = None,
+    ) -> None:
+        if self._host is None:
+            return
+        if not peer_id_str or peer_id_str == str(self._host.get_id()):
+            return
+        now = time.time()
+        seen_at = self._opportunistic_peers.get(peer_id_str)
+        if seen_at is not None and now - seen_at < self._opportunistic_peer_cooldown:
+            return
+        self._opportunistic_peers[peer_id_str] = now
+
+        try:
+            peer_id = self._ensure_peer_id(peer_id_str)
+        except ValueError:
+            return
+
+        addr_list: List[multiaddr.Multiaddr] = []
+        if addrs:
+            try:
+                addr_list.extend(self._normalize_peer_addrs(addrs))
+            except Exception:
+                logger.debug("Failed to normalize opportunistic addresses for %s", peer_id_str, exc_info=True)
+        if not addr_list:
+            try:
+                addr_list = list(self._host.get_peerstore().addrs(peer_id) or [])
+            except Exception:
+                addr_list = []
+
+        if not addr_list and self._dht is not None:
+            try:
+                peer_info = await self._dht.peer_routing.find_peer(peer_id)
+            except Exception:
+                logger.debug("DHT find_peer failed during opportunistic seed for %s", peer_id_str, exc_info=True)
+                peer_info = None
+            if peer_info and getattr(peer_info, "addrs", None):
+                addr_list = self._normalize_peer_addrs(peer_info.addrs)
+
+        if not addr_list:
+            return
+
+        try:
+            self._host.get_peerstore().add_addrs(peer_id, addr_list, PERMANENT_ADDR_TTL)
+        except Exception:
+            logger.debug("Failed to persist opportunistic peer %s into peerstore", peer_id_str, exc_info=True)
+
+        peer_info = PeerInfo(peer_id, addr_list)
+        self._save_peer_basic(peer_info)
+        self._insert_peer_into_dht(peer_id_str, addr_list)
+
     async def _deliver_gossip(self, message: Dict[str, Any], via_peer: Optional[str]) -> None:
         topic = message.get("topic")
         if not isinstance(topic, str) or not topic:
@@ -1152,6 +1232,12 @@ class NetworkService:
             "timestamp": message.get("timestamp"),
             "via": via_peer,
         }
+
+        origin = envelope.get("origin")
+        if isinstance(origin, str):
+            self._schedule_opportunistic_seed(origin)
+        if isinstance(via_peer, str):
+            self._schedule_opportunistic_seed(via_peer)
 
         handlers: List[Callable[[Dict[str, Any]], Any]] = []
         handlers.extend(self._gossip_handlers.get(topic, []))
@@ -1260,6 +1346,15 @@ class NetworkService:
 
     # ---------------------------------------------------------------- Stream handlers
     async def _handle_handshake(self, stream) -> None:
+        peer_id_str: Optional[str] = None
+        muxed_conn = getattr(stream, "muxed_conn", None)
+        peer_obj = getattr(muxed_conn, "peer_id", None) if muxed_conn is not None else None
+        if peer_obj is not None:
+            try:
+                peer_id_str = str(peer_obj)
+            except Exception:
+                peer_id_str = None
+
         await self._read_stream(stream, timeout=1.0)
         resp = self._build_handshake()
         try:
@@ -1270,6 +1365,8 @@ class NetworkService:
                     await stream.close()
                 except Exception:
                     pass
+        if peer_id_str:
+            self._schedule_opportunistic_seed(peer_id_str)
 
     async def _handle_ping(self, stream) -> None:
         raw = await self._read_stream(stream, timeout=1.0)
@@ -1410,6 +1507,9 @@ class NetworkService:
 
         peer_id = packet.get("peer_id")
         peer_id_str = str(peer_id) if isinstance(peer_id, (str, ID)) else None
+
+        if peer_id_str:
+            self._schedule_opportunistic_seed(peer_id_str)
 
         subs_updated = 0
         subs = rpc.get("subscriptions")

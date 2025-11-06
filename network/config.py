@@ -30,3 +30,4 @@ class NetworkConfig:
     dht_bucket_refresh_limit: int = 8
     dht_stale_peer_threshold: float = 3600.0
     gossip_health_window: float = 120.0
+    dht_opportunistic_cooldown: float = 120.0
