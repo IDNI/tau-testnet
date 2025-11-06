@@ -50,6 +50,21 @@ The architecture is designed around the principle of extralogical processing. Th
 *   **SQLite Mempool**: Persists transactions awaiting inclusion in a block.
 *   **BLS12-381 Public Key Validation**: Format and optional cryptographic checks for public keys.
 
+### DHT Configuration & Gossip Health
+
+The libp2p-based DHT layer now exposes several runtime knobs through `NetworkConfig`:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `dht_refresh_interval` | `60.0` | Seconds between background calls to `KadDHT.refresh_routing_table`. |
+| `dht_bucket_refresh_interval` | `dht_refresh_interval` | Interval for opportunistic stale peer refresh/eviction. |
+| `dht_bucket_refresh_limit` | `8` | Maximum stale peers revalidated per cycle. |
+| `dht_stale_peer_threshold` | `3600.0` | Age (seconds) before a peer is considered stale. |
+| `dht_opportunistic_cooldown` | `120.0` | Minimum time between reseeding the same peer discovered via gossip/handshake. |
+| `gossip_health_window` | `120.0` | Sliding window used by `get_metrics_snapshot()` to flag gossip as healthy/stale. |
+
+Call `NetworkService.get_metrics_snapshot()` (or read the periodic `[metrics]` log line) to monitor gossip activity, routing table counts, and bucket refresh results.
+
 ## Setup and Running
 
 ### Prerequisites
@@ -134,7 +149,7 @@ netcat 127.0.0.1 65432
     - `test_persistent_chain_state.py`: Tests for persistent chain state management (currently skipped).
     - `test_state_reconstruction.py`: Tests for state reconstruction from blockchain data.
     - `test_p2p.py`: Connectivity and custom protocol round-trip using libp2p shim.
-    - `test_network_protocols.py`: End-to-end tests for Tau protocols (handshake, ping, sync, blocks, state, tx, gossip) including header sync, transaction gossip, and subscription handling.
+    - `test_network_protocols.py`: End-to-end tests for Tau protocols (handshake, ping, sync, blocks, state, tx, gossip). Coverage includes header sync, transaction gossip, subscription handling, DHT routing-table refresh, gossip health metrics, opportunistic peer seeding, and multi-hop gossip propagation driven solely by KadDHT lookups.
 
 ## Console Wallet
 
