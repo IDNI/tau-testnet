@@ -5,7 +5,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 
 import multiaddr
 import trio
@@ -190,6 +190,8 @@ class NetworkService:
         payload: Any,
         *,
         message_id: Optional[str] = None,
+        target_peers: Optional[Iterable[Union[str, ID]]] = None,
+        content_keys: Optional[Iterable[Union[str, bytes]]] = None,
     ) -> str:
         if self._host is None:
             raise RuntimeError("network service is not started")
@@ -219,8 +221,29 @@ class NetworkService:
         self._gossip_seen[message_id] = now
         self._metrics["gossip_published"] += 1
         self._metric_timestamps["gossip_last_publish"] = now
+        target_peer_ids: List[str] = []
+        if target_peers:
+            for peer in target_peers:
+                peer_id_str = None
+                if isinstance(peer, ID):
+                    peer_id_str = str(peer)
+                elif isinstance(peer, str):
+                    peer_id_str = peer
+                else:
+                    try:
+                        peer_id_str = str(peer)
+                    except Exception:
+                        peer_id_str = None
+                if peer_id_str:
+                    target_peer_ids.append(peer_id_str)
+
         await self._deliver_gossip(envelope, via_peer=None)
-        await self._rebroadcast_gossip_message(envelope, exclude={str(self._host.get_id())})
+        await self._rebroadcast_gossip_message(
+            envelope,
+            exclude={str(self._host.get_id())},
+            target_peers=target_peer_ids or None,
+            content_keys=content_keys,
+        )
         return message_id
 
     def broadcast_transaction(self, payload: str, message_id: str) -> None:
@@ -250,17 +273,54 @@ class NetworkService:
         message: Dict[str, Any],
         *,
         exclude: Optional[Set[str]] = None,
+        target_peers: Optional[Iterable[str]] = None,
+        content_keys: Optional[Iterable[Union[str, bytes]]] = None,
     ) -> None:
         if self._host is None:
             return
 
+        self_id = str(self._host.get_id())
         exclude_ids = set(exclude or set())
-        exclude_ids.add(str(self._host.get_id()))
+        exclude_ids.add(self_id)
+        seen: Set[str] = set()
+        candidate_peers: List[str] = []
+        topic = message.get("topic")
+        content_key_list: Optional[List[Union[str, bytes]]] = (
+            list(content_keys) if content_keys is not None else None
+        )
+
+        def add_candidate(peer_id: Optional[str]) -> None:
+            if not isinstance(peer_id, str) or not peer_id:
+                return
+            if peer_id == self_id or peer_id in exclude_ids or peer_id in seen:
+                return
+            seen.add(peer_id)
+            candidate_peers.append(peer_id)
 
         try:
-            peer_ids = [str(pid) for pid in self._host.get_connected_peers()]
+            connected_ids = [str(pid) for pid in self._host.get_connected_peers()]
         except Exception:  # pragma: no cover - defensive
-            peer_ids = []
+            connected_ids = []
+        for peer in connected_ids:
+            add_candidate(peer)
+
+        if target_peers:
+            for peer in target_peers:
+                add_candidate(peer)
+
+        if isinstance(topic, str) and topic:
+            for peer_id, topics in self._gossip_peer_topics.items():
+                if topic in topics:
+                    add_candidate(peer_id)
+
+        if (content_key_list is not None and content_key_list) or not candidate_peers:
+            dht_targets = await self._find_gossip_targets_via_dht(
+                message,
+                extra_keys=content_key_list,
+                include_closest=False,
+            )
+            for peer_id in dht_targets:
+                add_candidate(str(peer_id))
 
         payload = json.dumps(
             {
@@ -271,8 +331,11 @@ class NetworkService:
 
         sent = False
         sent_peers: List[str] = []
-        for peer in peer_ids:
+        for peer in candidate_peers:
             if peer in exclude_ids:
+                continue
+            reachable = await self._ensure_route_to_peer(peer)
+            if not reachable:
                 continue
             await self._send_gossip_rpc(peer, payload)
             sent = True
@@ -317,7 +380,7 @@ class NetworkService:
     async def _send_local_subscriptions_to_peer(self, peer_id: str) -> None:
         if self._host is None or not self._gossip_local_topics:
             return
-        if not self._can_reach_peer(peer_id):
+        if not await self._ensure_route_to_peer(peer_id):
             logger.debug("Skipping subscription push; no route to %s", peer_id)
             return
         payload = json.dumps(
@@ -365,55 +428,8 @@ class NetworkService:
     async def _attempt_dht_gossip(self, message: Dict[str, Any]) -> bool:
         if self._host is None or self._dht is None:
             return False
-        topic = message.get("topic")
-        if topic == TAU_GOSSIP_TOPIC_TRANSACTIONS:
-            payload = message.get("data")
-            if isinstance(payload, str):
-                try:
-                    tx_payload = json.loads(payload)
-                except json.JSONDecodeError:
-                    tx_payload = None
-                if isinstance(tx_payload, dict):
-                    try:
-                        message_id, _ = sendtx._compute_transaction_message_id(tx_payload)
-                    except Exception:
-                        message_id = None
-                else:
-                    message_id = None
-            else:
-                message_id = None
-            search_key = f"tx:{message_id}".encode() if message_id else None
-        elif topic == TAU_GOSSIP_TOPIC_BLOCKS:
-            data = message.get("data")
-            block_hash = None
-            if isinstance(data, dict):
-                try:
-                    headers = data.get("headers") or []
-                    if headers:
-                        block_hash = headers[0].get("block_hash")
-                    else:
-                        block_hash = data.get("tip_hash")
-                except Exception:
-                    block_hash = None
-            search_key = f"block:{block_hash}".encode() if block_hash else None
-        else:
-            search_key = None
 
-        provider_ids: List[ID] = []
-        if search_key:
-            try:
-                providers = await self._dht.find_providers(search_key, count=20)
-                provider_ids.extend([p.peer_id for p in providers])
-            except Exception:
-                logger.debug("DHT find_providers failed for key %s", search_key, exc_info=True)
-
-        if not provider_ids:
-            try:
-                closest = await self._dht.peer_routing.find_closest_peers_network(search_key or message.get("message_id", uuid.uuid4().hex).encode())
-                provider_ids.extend(closest)
-            except Exception:
-                logger.debug("DHT find_closest_peers_network failed", exc_info=True)
-
+        provider_ids = await self._find_gossip_targets_via_dht(message)
         if not provider_ids:
             return False
 
@@ -425,20 +441,22 @@ class NetworkService:
         ).encode()
 
         sent = False
+        sent_peers: List[str] = []
         for peer_id in provider_ids:
             peer_str = str(peer_id)
             if peer_str == str(self._host.get_id()):
                 continue
-            if not self._can_reach_peer(peer_str):
+            if not await self._ensure_route_to_peer(peer_str):
                 continue
             await self._send_gossip_rpc(peer_str, payload_bytes)
             sent = True
+            sent_peers.append(peer_str)
 
         if sent:
             logger.debug(
                 "Gossip message %s delivered via DHT fallback peers %s",
                 message.get("message_id"),
-                [str(pid) for pid in provider_ids],
+                sent_peers,
             )
         else:
             logger.debug("Unable to deliver gossip message %s via DHT fallback", message.get("message_id"))
@@ -460,6 +478,32 @@ class NetworkService:
             return bool(addrs)
         except Exception:
             return False
+
+    async def _ensure_route_to_peer(self, peer_id: str) -> bool:
+        if self._can_reach_peer(peer_id):
+            return True
+        if self._host is None or self._dht is None:
+            return False
+        try:
+            pid = self._ensure_peer_id(peer_id)
+        except ValueError:
+            return False
+        try:
+            peer_info = await self._dht.peer_routing.find_peer(pid)
+        except Exception:
+            logger.debug("DHT find_peer failed for %s", peer_id, exc_info=True)
+            return False
+        if peer_info is None or not getattr(peer_info, "addrs", None):
+            return False
+        try:
+            self._host.get_peerstore().add_addrs(peer_info.peer_id, peer_info.addrs, PERMANENT_ADDR_TTL)
+        except Exception:
+            logger.debug("Failed to persist DHT-discovered addresses for %s", peer_id, exc_info=True)
+        try:
+            await self._host.connect(peer_info)
+        except Exception:
+            logger.debug("Failed to open connection to DHT-discovered peer %s", peer_id, exc_info=True)
+        return self._can_reach_peer(peer_id)
 
     @staticmethod
     def _queue_transaction_sync(payload: str, propagate: bool = False) -> str:
@@ -661,6 +705,118 @@ class NetworkService:
             and block_hash == suffix
             and isinstance(accounts, dict)
         )
+
+    def _collect_gossip_provider_keys(
+        self,
+        message: Dict[str, Any],
+        extra_keys: Optional[Iterable[Union[str, bytes]]] = None,
+    ) -> List[bytes]:
+        keys: List[bytes] = []
+        seen: Set[bytes] = set()
+
+        def add_key(raw: Optional[Union[str, bytes]]) -> None:
+            if raw is None:
+                return
+            if isinstance(raw, bytes):
+                key_bytes = raw
+            elif isinstance(raw, str):
+                try:
+                    key_bytes = raw.encode("utf-8")
+                except Exception:
+                    return
+            else:
+                try:
+                    key_bytes = str(raw).encode("utf-8")
+                except Exception:
+                    return
+            if key_bytes in seen:
+                return
+            seen.add(key_bytes)
+            keys.append(key_bytes)
+
+        if extra_keys:
+            for key in extra_keys:
+                add_key(key)
+
+        topic = message.get("topic")
+        if topic == TAU_GOSSIP_TOPIC_TRANSACTIONS:
+            payload = message.get("data")
+            tx_payload: Optional[Dict[str, Any]]
+            if isinstance(payload, str):
+                try:
+                    tx_payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    tx_payload = None
+            else:
+                tx_payload = None
+            if isinstance(tx_payload, dict):
+                try:
+                    message_id, _ = sendtx._compute_transaction_message_id(tx_payload)
+                except Exception:
+                    message_id = None
+                if message_id:
+                    add_key(f"tx:{message_id}".encode("utf-8"))
+        elif topic == TAU_GOSSIP_TOPIC_BLOCKS:
+            data = message.get("data")
+            block_hash: Optional[str] = None
+            if isinstance(data, dict):
+                headers = data.get("headers") or []
+                if headers:
+                    header0 = headers[0]
+                    block_hash = header0.get("block_hash")
+                else:
+                    block_hash = data.get("tip_hash")
+            if isinstance(block_hash, str):
+                add_key(f"block:{block_hash}")
+        return keys
+
+    async def _find_gossip_targets_via_dht(
+        self,
+        message: Dict[str, Any],
+        *,
+        extra_keys: Optional[Iterable[Union[str, bytes]]] = None,
+        include_closest: bool = True,
+    ) -> List[ID]:
+        if self._dht is None:
+            return []
+        keys = self._collect_gossip_provider_keys(message, extra_keys)
+        provider_ids: List[ID] = []
+        seen: Set[ID] = set()
+
+        for key in keys:
+            try:
+                providers = await self._dht.find_providers(key, count=20)
+            except Exception:
+                logger.debug("DHT find_providers failed for key %s", key.decode("utf-8", "ignore"), exc_info=True)
+                continue
+            for provider in providers:
+                peer_id = provider.peer_id
+                if peer_id not in seen:
+                    provider_ids.append(peer_id)
+                    seen.add(peer_id)
+
+        if provider_ids or not include_closest:
+            return provider_ids
+
+        fallback_key: Optional[bytes] = keys[0] if keys else None
+        if fallback_key is None:
+            msg_id = message.get("message_id")
+            if isinstance(msg_id, str):
+                fallback_key = msg_id.encode("utf-8", "ignore")
+        if fallback_key is None:
+            fallback_key = uuid.uuid4().hex.encode("utf-8")
+
+        try:
+            closest_peers = await self._dht.peer_routing.find_closest_peers_network(fallback_key)
+        except Exception:
+            logger.debug("DHT find_closest_peers_network failed", exc_info=True)
+            return provider_ids
+
+        for peer_id in closest_peers:
+            if peer_id not in seen:
+                provider_ids.append(peer_id)
+                seen.add(peer_id)
+        return provider_ids
 
     async def _refresh_dht_routing_table_once(self) -> None:
         if self._dht is None:

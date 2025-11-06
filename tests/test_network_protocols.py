@@ -588,6 +588,46 @@ async def test_gossip_metrics_snapshot(two_nodes):
     assert snap2["gossip"]["health"]["status"] == "healthy"
 
 
+async def test_gossip_dht_peer_resolution(two_nodes, monkeypatch):
+    topic = "dht.peer.route"
+    svc1, svc2, _ = two_nodes
+
+    peer_id_str = str(svc2.host.get_id())
+    event = trio.Event()
+
+    async def handler(envelope):
+        if envelope.get("topic") == topic:
+            event.set()
+
+    await svc2.join_gossip_topic(topic, handler)
+
+    svc1._gossip_peer_topics[peer_id_str] = {topic}
+
+    try:
+        pid = svc1._ensure_peer_id(peer_id_str)
+        svc1.host.get_peerstore().peer_data_map[pid].clear_addrs()
+    except Exception:
+        pass
+
+    addrs2 = await _wait_for_addrs(svc2.host)
+    peer_info = PeerInfo(svc2.host.get_id(), addrs2)
+
+    find_calls: List[ID] = []
+
+    async def fake_find_peer(peer_id):
+        find_calls.append(peer_id)
+        return peer_info
+
+    monkeypatch.setattr(svc1._dht.peer_routing, "find_peer", fake_find_peer)
+
+    await svc1.publish_gossip(topic, {"ping": True}, target_peers=[peer_id_str])
+
+    with trio.fail_after(5):
+        await event.wait()
+
+    assert find_calls, "Expected DHT find_peer to be invoked for route discovery"
+
+
 async def test_dht_bucket_refresh_cycle():
     from network.config import NetworkConfig
     from network.service import NetworkService
