@@ -89,6 +89,18 @@ class ServiceContainer:
             except Exception as exc:
                 self.logger.warning("Skipping invalid bootstrap peer %s: %s", entry, exc)
 
+        dht_bootstrap_peers: list[BootstrapPeer] = []
+        for entry in self.settings.dht.bootstrap_peers:
+            try:
+                peer_id = entry.get("peer_id")
+                addr_list = entry.get("addrs", [])
+                if not peer_id:
+                    raise DependencyError("DHT bootstrap peer missing 'peer_id'")
+                addrs = [multiaddr.Multiaddr(a) for a in addr_list]
+                dht_bootstrap_peers.append(BootstrapPeer(peer_id=peer_id, addrs=addrs))
+            except Exception as exc:
+                self.logger.warning("Skipping invalid DHT bootstrap peer %s: %s", entry, exc)
+
         identity_key_bytes = None
         if not self.overrides.get("ephemeral_identity"):
             key_path = self.settings.network.identity_key_path or os.path.join(config.DATA_DIR, "identity.key")
@@ -153,6 +165,9 @@ class ServiceContainer:
             bootstrap_peers=bootstrap_peers,
             peerstore_path=self.settings.network.peerstore_path,
             identity_key=identity_key_bytes,
+            dht_record_ttl=self.settings.dht.record_ttl,
+            dht_validator_namespaces=list(self.settings.dht.validator_namespaces),
+            dht_bootstrap_peers=dht_bootstrap_peers,
         )
 
     def get_command_handler(self, name: str) -> Any:

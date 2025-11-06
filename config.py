@@ -107,6 +107,27 @@ class LoggingSettings:
 
 
 @dataclass
+class DHTSettings:
+    record_ttl: int = 24 * 60 * 60
+    validator_namespaces: List[str] = field(default_factory=lambda: ["block", "tx", "state"])
+    bootstrap_peers: List[Dict[str, Any]] = field(default_factory=list)
+
+    def validate(self) -> None:
+        if self.record_ttl <= 0:
+            raise ConfigurationError("DHT record TTL must be positive.")
+        for namespace in self.validator_namespaces:
+            if not isinstance(namespace, str) or not namespace.strip():
+                raise ConfigurationError(f"Invalid DHT validator namespace: {namespace!r}")
+        for peer in self.bootstrap_peers:
+            if not isinstance(peer, dict):
+                raise ConfigurationError("DHT bootstrap peer entries must be dictionaries.")
+            if "peer_id" not in peer or "addrs" not in peer:
+                raise ConfigurationError(f"Invalid DHT bootstrap peer entry: {peer}")
+            if not isinstance(peer["addrs"], list):
+                raise ConfigurationError(f"DHT bootstrap peer addrs must be a list: {peer}")
+
+
+@dataclass
 class Settings:
     env: str
     server: ServerSettings
@@ -114,6 +135,7 @@ class Settings:
     timeouts: TimeoutSettings
     database: DatabaseSettings
     network: NetworkSettings
+    dht: DHTSettings
     logging: LoggingSettings
 
     def validate(self) -> None:
@@ -122,6 +144,7 @@ class Settings:
         self.timeouts.validate()
         self.database.validate()
         self.network.validate()
+        self.dht.validate()
         self.logging.validate()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -132,6 +155,7 @@ class Settings:
             "timeouts": asdict(self.timeouts),
             "database": asdict(self.database),
             "network": asdict(self.network),
+            "dht": asdict(self.dht),
             "logging": asdict(self.logging),
         }
 
@@ -147,8 +171,8 @@ BASE_DEFAULTS: Dict[str, Any] = {
         "listen": ["/ip4/127.0.0.1/tcp/0"], 
         "bootstrap_peers": [
             {
-                "peer_id": "QmPYSDVWUsEKg3MnsK3k72TsZWB6RRZ1Uw6x59ZWdm7iE2",
-                "addrs": ["/ip4/127.0.0.1/tcp/59925"],
+                "peer_id": "QmWn7pKWd8PQ6mPfjYT8Au7sf2h75VBgZi6bDVU3p8xsHY",
+                "addrs": ["/ip4/127.0.0.1/tcp/58399"],
             },
             # {
             #     "peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC", #MAIN NODE
@@ -158,6 +182,7 @@ BASE_DEFAULTS: Dict[str, Any] = {
         "peerstore_path": None,
         "identity_key_path": None,
     },
+    "dht": asdict(DHTSettings()),
     "logging": asdict(LoggingSettings()),
 }
 
@@ -200,6 +225,13 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_BOOTSTRAP_PEERS": ("network", "bootstrap_peers", lambda value: json.loads(value)),
     "TAU_PEERSTORE_PATH": ("network", "peerstore_path", str),
     "TAU_IDENTITY_KEY_PATH": ("network", "identity_key_path", str),
+    "TAU_DHT_TTL": ("dht", "record_ttl", int),
+    "TAU_DHT_VALIDATORS": (
+        "dht",
+        "validator_namespaces",
+        lambda value: [ns.strip() for ns in value.split(',') if ns.strip()],
+    ),
+    "TAU_DHT_BOOTSTRAP": ("dht", "bootstrap_peers", lambda value: json.loads(value)),
     "TAU_LOG_LEVEL": ("logging", "level", str),
     "TAU_LOG_FORMAT": ("logging", "format", str),
     "TAU_LOG_DATEFMT": ("logging", "datefmt", str),
@@ -237,6 +269,7 @@ def _settings_from_dict(env: str, payload: Dict[str, Any]) -> Settings:
         timeouts=TimeoutSettings(**payload["timeouts"]),
         database=DatabaseSettings(**payload["database"]),
         network=NetworkSettings(**payload["network"]),
+        dht=DHTSettings(**payload["dht"]),
         logging=LoggingSettings(**payload["logging"]),
     )
 
@@ -260,6 +293,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     global PROCESS_TIMEOUT, COMM_TIMEOUT, CLIENT_WAIT_TIMEOUT, SHUTDOWN_TIMEOUT
     global STRING_DB_PATH
     global BOOTSTRAP_PEERS, NETWORK_ID, GENESIS_HASH, NETWORK_LISTEN, PEERSTORE_PATH, peerstore_path
+    global DHT_RECORD_TTL, DHT_VALIDATOR_NAMESPACES, DHT_BOOTSTRAP_PEERS
     global LOGGING
 
     HOST = current.server.host
@@ -284,6 +318,10 @@ def _sync_legacy_exports(current: Settings) -> None:
     BOOTSTRAP_PEERS = current.network.bootstrap_peers
     PEERSTORE_PATH = current.network.peerstore_path
     peerstore_path = current.network.peerstore_path
+
+    DHT_RECORD_TTL = current.dht.record_ttl
+    DHT_VALIDATOR_NAMESPACES = current.dht.validator_namespaces
+    DHT_BOOTSTRAP_PEERS = current.dht.bootstrap_peers
 
     LOGGING = current.logging
 
@@ -316,6 +354,7 @@ __all__ = [
     "TimeoutSettings",
     "DatabaseSettings",
     "NetworkSettings",
+    "DHTSettings",
     "LoggingSettings",
     "DATA_DIR",
     "DEFAULT_PROD_DB_PATH",
@@ -337,5 +376,8 @@ __all__ = [
     "NETWORK_LISTEN",
     "PEERSTORE_PATH",
     "peerstore_path",
+    "DHT_RECORD_TTL",
+    "DHT_VALIDATOR_NAMESPACES",
+    "DHT_BOOTSTRAP_PEERS",
     "LOGGING",
 ]

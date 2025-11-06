@@ -8,7 +8,9 @@ from typing import Any, Dict, List
 import multiaddr
 import pytest
 import trio
+from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo
+from commands import sendtx
 
 
 pytestmark = pytest.mark.trio
@@ -322,6 +324,49 @@ async def test_block_gossip_fallback_to_via(monkeypatch):
         await svc_a.stop()
 
 
+async def test_dht_value_validators(two_nodes):
+    svc1, _, _ = two_nodes
+
+    dht = getattr(svc1, "_dht", None)
+    assert dht is not None
+
+    with pytest.raises(ValueError):
+        dht.value_store.put(b"block:bad", b"{}")
+
+    block_hash = "abc123"
+    block_payload = json.dumps({"block_hash": block_hash}).encode()
+    dht.value_store.put(f"block:{block_hash}".encode(), block_payload)
+    assert dht.value_store.get(f"block:{block_hash}".encode()) == block_payload
+
+    tx_payload = {
+        "sender_pubkey": "b" * 96,
+        "sequence_number": 1,
+        "expiration_time": 9999999999,
+        "operations": {"1": [["b" * 96, "c" * 96, "1"]]},
+        "fee_limit": "0",
+        "signature": "0" * 192,
+    }
+    tx_id, canonical = sendtx._compute_transaction_message_id(tx_payload)
+    with pytest.raises(ValueError):
+        dht.value_store.put(f"tx:{tx_id}".encode(), b"{}")
+    canonical_bytes = canonical.encode()
+    dht.value_store.put(f"tx:{tx_id}".encode(), canonical_bytes)
+    assert dht.value_store.get(f"tx:{tx_id}".encode()) == canonical_bytes
+
+    state_hash = "statehash"
+    state_payload = json.dumps({"block_hash": state_hash, "accounts": {}}).encode()
+    dht.value_store.put(f"state:{state_hash}".encode(), state_payload)
+    with pytest.raises(ValueError):
+        dht.value_store.put(
+            f"state:{state_hash}".encode(),
+            json.dumps({"block_hash": "other", "accounts": {}}).encode(),
+        )
+
+    peer_info = PeerInfo(svc1.host.get_id(), svc1.host.get_addrs())
+    with pytest.raises(ValueError):
+        dht.provider_store.add_provider(b"block:", peer_info)
+
+
 async def test_state_protocol_accounts(two_nodes):
     from network.protocols import TAU_PROTOCOL_STATE
     import block as block_module
@@ -501,3 +546,101 @@ async def test_block_gossip_triggers_sync(two_nodes, monkeypatch):
         await event.wait()
     assert recorded_args["peer_id"] == str(svc1.host.get_id())
     assert recorded_args["locator"]
+
+
+async def test_gossip_metrics_snapshot(two_nodes):
+    svc1, svc2, _ = two_nodes
+
+    initial = svc1.get_metrics_snapshot()
+    baseline_publish = initial["gossip"]["published_total"]
+    assert initial["gossip"]["health"]["status"] in {"idle", "healthy", "stale"}
+
+    initial_remote = svc2.get_metrics_snapshot()
+    baseline_receive = initial_remote["gossip"]["received_total"]
+
+    addrs2 = await _wait_for_addrs(svc2.host)
+    peer_info = PeerInfo(svc2.host.get_id(), addrs2)
+    svc1.host.get_peerstore().add_addrs(peer_info.peer_id, peer_info.addrs, 60)
+    await svc1.host.connect(peer_info)
+
+    gossip_event = trio.Event()
+
+    async def _metrics_handler(envelope):
+        if envelope.get("topic") == "metrics.topic":
+            gossip_event.set()
+
+    await svc2.join_gossip_topic("metrics.topic", _metrics_handler)
+
+    await svc1.publish_gossip("metrics.topic", {"value": 456})
+
+    with trio.fail_after(5):
+        await gossip_event.wait()
+
+    snap1 = svc1.get_metrics_snapshot()
+    snap2 = svc2.get_metrics_snapshot()
+
+    assert snap1["gossip"]["published_total"] == baseline_publish + 1
+    assert snap1["gossip"]["last_published"] is not None
+    assert snap1["gossip"]["health"]["status"] == "healthy"
+
+    assert snap2["gossip"]["received_total"] >= baseline_receive + 1
+    assert snap2["gossip"]["last_received"] is not None
+    assert snap2["gossip"]["health"]["status"] == "healthy"
+
+
+async def test_dht_bucket_refresh_cycle():
+    from network.config import NetworkConfig
+    from network.service import NetworkService
+
+    cfg = NetworkConfig(
+        network_id="metricsnet",
+        genesis_hash="0000",
+        listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
+        dht_refresh_interval=0.01,
+        dht_bucket_refresh_interval=0.01,
+        dht_bucket_refresh_limit=16,
+        dht_stale_peer_threshold=0,
+    )
+    svc = NetworkService(cfg)
+
+    peer_active = ID(os.urandom(32))
+    peer_stale = ID(os.urandom(32))
+
+    class DummyRoutingTable:
+        def __init__(self):
+            self.added: List[ID] = []
+            self.removed: List[ID] = []
+
+        def get_stale_peers(self, threshold: int):
+            return [peer_active, peer_stale]
+
+        async def add_peer(self, peer_info):
+            self.added.append(peer_info.peer_id)
+
+        def remove_peer(self, peer_id):
+            self.removed.append(peer_id)
+            return True
+
+    class DummyPeerRouting:
+        def __init__(self):
+            self.calls: List[ID] = []
+
+        async def find_peer(self, peer_id):
+            self.calls.append(peer_id)
+            if peer_id == peer_active:
+                return PeerInfo(peer_id, [multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/6000")])
+            return None
+
+    routing_table = DummyRoutingTable()
+    peer_routing = DummyPeerRouting()
+    svc._dht = types.SimpleNamespace(routing_table=routing_table, peer_routing=peer_routing)
+
+    results = await svc._refresh_dht_buckets_once()
+
+    assert results["checked"] == 2
+    assert results["refreshed"] == 1
+    assert results["removed"] == 1
+    assert results["errors"] == 0
+    assert routing_table.added == [peer_active]
+    assert routing_table.removed == [peer_stale]
+    assert svc._metric_timestamps["dht_last_bucket_refresh"] > 0

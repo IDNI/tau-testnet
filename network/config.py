@@ -22,5 +22,11 @@ class NetworkConfig:
     peerstore_path: Optional[str] = None
     # Optional raw private key bytes for persistent identity (implementation-specific)
     identity_key: Optional[bytes] = None
-
-
+    dht_record_ttl: int = 24 * 60 * 60
+    dht_validator_namespaces: List[str] = field(default_factory=lambda: ["block", "tx", "state"])
+    dht_bootstrap_peers: List[BootstrapPeer] = field(default_factory=list)
+    dht_refresh_interval: float = 60.0
+    dht_bucket_refresh_interval: float = 0.0
+    dht_bucket_refresh_limit: int = 8
+    dht_stale_peer_threshold: float = 3600.0
+    gossip_health_window: float = 120.0

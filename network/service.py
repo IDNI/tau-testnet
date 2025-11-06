@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import time
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
@@ -10,12 +11,15 @@ import multiaddr
 import trio
 from libp2p import new_host
 from libp2p.abc import IHost, INotifee
+from libp2p.kad_dht import common as dht_common
+from libp2p.kad_dht.kad_dht import KadDHT, DHTMode
 from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo
 from libp2p.peer.peerstore import (
     PERMANENT_ADDR_TTL,
     PeerStoreError,
 )
+from libp2p.tools.async_service import background_trio_service
 
 from . import bus
 from .config import BootstrapPeer, NetworkConfig
@@ -128,6 +132,40 @@ class NetworkService:
         self._runner_stop: Optional[trio.Event] = None
         self._nursery: Optional[trio.Nursery] = None
         self._trio_token: Optional[trio.lowlevel.TrioToken] = None
+        self._dht: Optional[KadDHT] = None
+        self._dht_manager: Optional[Any] = None
+        self._dht_validators: Dict[str, Callable[[bytes, bytes], bool]] = {}
+        self._dht_allowed_namespaces: Set[str] = set()
+        self._dht_value_store_put: Optional[Callable[..., Any]] = None
+        self._dht_provider_add: Optional[Callable[..., Any]] = None
+        self._dht_refresh_interval = float(getattr(config, "dht_refresh_interval", 60.0) or 60.0)
+        bucket_interval_default = self._dht_refresh_interval
+        self._dht_bucket_refresh_interval = float(
+            getattr(config, "dht_bucket_refresh_interval", bucket_interval_default)
+            or bucket_interval_default
+        )
+        self._dht_bucket_refresh_limit = max(1, int(getattr(config, "dht_bucket_refresh_limit", 8) or 1))
+        self._dht_stale_peer_threshold = max(
+            0.0, float(getattr(config, "dht_stale_peer_threshold", 3600.0) or 3600.0)
+        )
+        self._gossip_health_window = max(
+            0.0, float(getattr(config, "gossip_health_window", 120.0) or 120.0)
+        )
+        self._metrics: Dict[str, float] = {
+            "gossip_published": 0,
+            "gossip_received": 0,
+            "dht_refresh_success": 0,
+            "dht_refresh_failure": 0,
+            "dht_bucket_checks": 0,
+            "dht_bucket_replacements": 0,
+            "dht_bucket_errors": 0,
+        }
+        self._metric_timestamps: Dict[str, float] = {
+            "gossip_last_publish": 0.0,
+            "gossip_last_receive": 0.0,
+            "dht_last_refresh": 0.0,
+            "dht_last_bucket_refresh": 0.0,
+        }
 
     # ------------------------------------------------------------------ Gossip API
     def subscribe_gossip(self, topic: str, handler: Callable[[Dict[str, Any]], Any]) -> None:
@@ -159,7 +197,7 @@ class NetworkService:
             raise ValueError("topic must be a non-empty string")
 
         message_id = message_id or uuid.uuid4().hex
-        now = trio.current_time()
+        now = time.time()
         envelope = {
             "from": str(self._host.get_id()),
             "topic": topic,
@@ -179,6 +217,8 @@ class NetworkService:
             payload,
         )
         self._gossip_seen[message_id] = now
+        self._metrics["gossip_published"] += 1
+        self._metric_timestamps["gossip_last_publish"] = now
         await self._deliver_gossip(envelope, via_peer=None)
         await self._rebroadcast_gossip_message(envelope, exclude={str(self._host.get_id())})
         return message_id
@@ -220,10 +260,7 @@ class NetworkService:
         try:
             peer_ids = [str(pid) for pid in self._host.get_connected_peers()]
         except Exception:  # pragma: no cover - defensive
-            return
-
-        if not peer_ids:
-            return
+            peer_ids = []
 
         payload = json.dumps(
             {
@@ -232,10 +269,26 @@ class NetworkService:
             }
         ).encode()
 
+        sent = False
+        sent_peers: List[str] = []
         for peer in peer_ids:
             if peer in exclude_ids:
                 continue
             await self._send_gossip_rpc(peer, payload)
+            sent = True
+            sent_peers.append(peer)
+
+        if sent:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Gossip message %s propagated via connected peers %s",
+                    message.get("message_id"),
+                    sent_peers,
+                )
+            return
+
+        if await self._attempt_dht_gossip(message):
+            return
 
     async def _broadcast_gossip_subscriptions(self, subs: List[Dict[str, Any]]) -> None:
         if self._host is None or not subs:
@@ -309,6 +362,88 @@ class NetworkService:
                 except Exception:
                     pass
 
+    async def _attempt_dht_gossip(self, message: Dict[str, Any]) -> bool:
+        if self._host is None or self._dht is None:
+            return False
+        topic = message.get("topic")
+        if topic == TAU_GOSSIP_TOPIC_TRANSACTIONS:
+            payload = message.get("data")
+            if isinstance(payload, str):
+                try:
+                    tx_payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    tx_payload = None
+                if isinstance(tx_payload, dict):
+                    try:
+                        message_id, _ = sendtx._compute_transaction_message_id(tx_payload)
+                    except Exception:
+                        message_id = None
+                else:
+                    message_id = None
+            else:
+                message_id = None
+            search_key = f"tx:{message_id}".encode() if message_id else None
+        elif topic == TAU_GOSSIP_TOPIC_BLOCKS:
+            data = message.get("data")
+            block_hash = None
+            if isinstance(data, dict):
+                try:
+                    headers = data.get("headers") or []
+                    if headers:
+                        block_hash = headers[0].get("block_hash")
+                    else:
+                        block_hash = data.get("tip_hash")
+                except Exception:
+                    block_hash = None
+            search_key = f"block:{block_hash}".encode() if block_hash else None
+        else:
+            search_key = None
+
+        provider_ids: List[ID] = []
+        if search_key:
+            try:
+                providers = await self._dht.find_providers(search_key, count=20)
+                provider_ids.extend([p.peer_id for p in providers])
+            except Exception:
+                logger.debug("DHT find_providers failed for key %s", search_key, exc_info=True)
+
+        if not provider_ids:
+            try:
+                closest = await self._dht.peer_routing.find_closest_peers_network(search_key or message.get("message_id", uuid.uuid4().hex).encode())
+                provider_ids.extend(closest)
+            except Exception:
+                logger.debug("DHT find_closest_peers_network failed", exc_info=True)
+
+        if not provider_ids:
+            return False
+
+        payload_bytes = json.dumps(
+            {
+                "peer_id": str(self._host.get_id()),
+                "rpc": {"messages": [message]},
+            }
+        ).encode()
+
+        sent = False
+        for peer_id in provider_ids:
+            peer_str = str(peer_id)
+            if peer_str == str(self._host.get_id()):
+                continue
+            if not self._can_reach_peer(peer_str):
+                continue
+            await self._send_gossip_rpc(peer_str, payload_bytes)
+            sent = True
+
+        if sent:
+            logger.debug(
+                "Gossip message %s delivered via DHT fallback peers %s",
+                message.get("message_id"),
+                [str(pid) for pid in provider_ids],
+            )
+        else:
+            logger.debug("Unable to deliver gossip message %s via DHT fallback", message.get("message_id"))
+        return sent
+
     def _can_reach_peer(self, peer_id: str) -> bool:
         if self._host is None:
             return False
@@ -356,6 +491,353 @@ class NetworkService:
         if self._nursery is not None:
             self._nursery.start_soon(self._retry_pending_transaction, message_id)
 
+    def _setup_dht_validators(self) -> None:
+        if self._dht is None:
+            return
+        ttl = getattr(self._config, "dht_record_ttl", None)
+        if isinstance(ttl, int) and ttl > 0:
+            dht_common.DEFAULT_TTL = ttl
+            dht_common.TTL = ttl
+        self._register_default_dht_validators()
+
+        value_store = getattr(self._dht, "value_store", None)
+        if value_store is not None and self._dht_value_store_put is None:
+            original_put = value_store.put
+
+            def validating_put(key: bytes, value: bytes, validity: float = 0.0):
+                if not self._validate_dht_record(key, value):
+                    raise ValueError("DHT record failed validation")
+                return original_put(key, value, validity)
+
+            value_store.put = validating_put  # type: ignore[assignment]
+            self._dht_value_store_put = original_put
+
+        provider_store = getattr(self._dht, "provider_store", None)
+        if provider_store is not None and self._dht_provider_add is None:
+            original_add = provider_store.add_provider
+
+            def validating_add(key: bytes, provider_info: Any):
+                if not self._validate_dht_key(key):
+                    raise ValueError("Invalid DHT provider key")
+                return original_add(key, provider_info)
+
+            provider_store.add_provider = validating_add  # type: ignore[assignment]
+            self._dht_provider_add = original_add
+
+    async def _seed_dht_bootstrap_peers(self) -> None:
+        if self._host is None or self._dht is None:
+            return
+        combined: Dict[str, BootstrapPeer] = {}
+        for entry in getattr(self._config, "bootstrap_peers", []):
+            combined[str(entry.peer_id)] = entry
+        for entry in getattr(self._config, "dht_bootstrap_peers", []):
+            combined[str(entry.peer_id)] = entry
+
+        for entry in combined.values():
+            try:
+                peer_id = self._ensure_peer_id(entry.peer_id)
+            except ValueError:
+                logger.debug("Skipping invalid DHT bootstrap peer id: %s", entry.peer_id)
+                continue
+            addrs = self._normalize_peer_addrs(entry.addrs)
+            addrs_for_store = addrs or list(entry.addrs)
+            try:
+                self._host.get_peerstore().add_addrs(peer_id, addrs_for_store, PERMANENT_ADDR_TTL)
+            except Exception:
+                logger.debug("Failed to persist DHT bootstrap peer %s to peerstore", peer_id, exc_info=True)
+            try:
+                await self._dht.routing_table.add_peer(PeerInfo(peer_id, addrs_for_store))
+                if logger.isEnabledFor(logging.DEBUG):
+                    try:
+                        peers_snapshot = [str(pid) for pid in self._dht.routing_table.get_peer_ids()]
+                        logger.debug("DHT routing table updated; peers=%s", peers_snapshot)
+                    except Exception:
+                        logger.debug("Failed to inspect DHT routing table after insert", exc_info=True)
+            except Exception:
+                logger.debug("Failed to add DHT bootstrap peer %s to routing table", peer_id, exc_info=True)
+
+    def _register_default_dht_validators(self) -> None:
+        self._dht_validators.clear()
+        available = {
+            "block": self._validate_block_record,
+            "tx": self._validate_transaction_record,
+            "state": self._validate_state_record,
+        }
+        namespaces = list(getattr(self._config, "dht_validator_namespaces", []) or available.keys())
+        self._dht_allowed_namespaces = set(namespaces)
+        for name in namespaces:
+            validator = available.get(name)
+            if validator is not None:
+                self._dht_validators[name] = validator
+            else:
+                logger.warning("No built-in validator for DHT namespace '%s'; records will be accepted without extra checks", name)
+
+    def _extract_dht_namespace(self, key: bytes) -> Optional[str]:
+        try:
+            key_str = key.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        if ":" not in key_str:
+            return None
+        namespace, _ = key_str.split(":", 1)
+        return namespace
+
+    def _validate_dht_key(self, key: bytes) -> bool:
+        namespace = self._extract_dht_namespace(key)
+        if namespace is None:
+            return False
+        if self._dht_allowed_namespaces and namespace not in self._dht_allowed_namespaces:
+            return False
+        try:
+            suffix = key.decode("ascii").split(":", 1)[1]
+        except (UnicodeDecodeError, IndexError):
+            return False
+        return bool(suffix)
+
+    def _validate_dht_record(self, key: bytes, value: bytes) -> bool:
+        if not self._validate_dht_key(key):
+            logger.debug("Rejected DHT record with invalid key: %s", key)
+            return False
+        namespace = self._extract_dht_namespace(key)
+        if not namespace:
+            return True
+        validator = self._dht_validators.get(namespace)
+        if validator is None:
+            return True
+        try:
+            return bool(validator(key, value))
+        except Exception:
+            logger.debug("DHT validator for %s raised", namespace, exc_info=True)
+            return False
+
+    def _validate_block_record(self, key: bytes, value: bytes) -> bool:
+        key_str = key.decode("ascii")
+        _, suffix = key_str.split(":", 1)
+        try:
+            payload = json.loads(value.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            logger.debug("Block DHT record payload not valid JSON")
+            return False
+        if not isinstance(payload, dict):
+            return False
+        block_hash = payload.get("block_hash")
+        return isinstance(block_hash, str) and block_hash == suffix
+
+    def _validate_transaction_record(self, key: bytes, value: bytes) -> bool:
+        key_str = key.decode("ascii")
+        _, suffix = key_str.split(":", 1)
+        try:
+            json_str = value.decode("utf-8")
+            payload = json.loads(json_str)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            logger.debug("Transaction DHT record payload not valid JSON")
+            return False
+        if not isinstance(payload, dict):
+            return False
+        try:
+            message_id, canonical = sendtx._compute_transaction_message_id(payload)
+        except Exception:
+            logger.debug("Failed to compute transaction message id", exc_info=True)
+            return False
+        if message_id != suffix:
+            return False
+        expected = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return canonical == expected
+
+    def _validate_state_record(self, key: bytes, value: bytes) -> bool:
+        key_str = key.decode("ascii")
+        _, suffix = key_str.split(":", 1)
+        try:
+            payload = json.loads(value.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            logger.debug("State DHT record payload not valid JSON")
+            return False
+        if not isinstance(payload, dict):
+            return False
+        block_hash = payload.get("block_hash")
+        accounts = payload.get("accounts")
+        return (
+            isinstance(block_hash, str)
+            and block_hash == suffix
+            and isinstance(accounts, dict)
+        )
+
+    async def _refresh_dht_routing_table_once(self) -> None:
+        if self._dht is None:
+            return
+        await self._dht.refresh_routing_table()
+        self._metric_timestamps["dht_last_refresh"] = time.time()
+
+    async def _refresh_dht_buckets_once(self) -> Dict[str, int]:
+        results: Dict[str, int] = {
+            "checked": 0,
+            "refreshed": 0,
+            "removed": 0,
+            "errors": 0,
+        }
+        if self._dht is None:
+            return results
+
+        routing_table = getattr(self._dht, "routing_table", None)
+        peer_routing = getattr(self._dht, "peer_routing", None)
+        if routing_table is None or peer_routing is None:
+            return results
+
+        try:
+            stale_peers = list(
+                routing_table.get_stale_peers(int(self._dht_stale_peer_threshold))
+            )
+        except Exception:
+            logger.debug(
+                "Failed to gather stale peers for DHT bucket refresh", exc_info=True
+            )
+            results["errors"] += 1
+            return results
+
+        if not stale_peers:
+            self._metric_timestamps["dht_last_bucket_refresh"] = time.time()
+            return results
+
+        limit = min(self._dht_bucket_refresh_limit, len(stale_peers))
+        selected = stale_peers[:limit]
+        results["checked"] = len(selected)
+
+        for peer_id in selected:
+            peer_info = None
+            try:
+                peer_info = await peer_routing.find_peer(peer_id)
+            except Exception:
+                results["errors"] += 1
+                logger.debug("Failed to refresh peer %s via find_peer", peer_id, exc_info=True)
+
+            if peer_info and getattr(peer_info, "addrs", None):
+                try:
+                    await routing_table.add_peer(peer_info)
+                    results["refreshed"] += 1
+                    continue
+                except Exception:
+                    results["errors"] += 1
+                    logger.debug("Failed to reinsert peer %s into routing table", peer_id, exc_info=True)
+
+            try:
+                if routing_table.remove_peer(peer_id):
+                    results["removed"] += 1
+            except Exception:
+                results["errors"] += 1
+                logger.debug("Failed to evict stale peer %s", peer_id, exc_info=True)
+
+        self._metric_timestamps["dht_last_bucket_refresh"] = time.time()
+        return results
+
+    async def _dht_refresh_loop(self) -> None:
+        try:
+            last_bucket_refresh = 0.0
+            while True:
+                if self._dht is None:
+                    return
+                try:
+                    await self._refresh_dht_routing_table_once()
+                    self._metrics["dht_refresh_success"] += 1
+                except Exception:
+                    self._metrics["dht_refresh_failure"] += 1
+                    logger.debug("DHT routing table refresh failed", exc_info=True)
+                now = time.time()
+                if now - last_bucket_refresh >= self._dht_bucket_refresh_interval:
+                    try:
+                        bucket_results = await self._refresh_dht_buckets_once()
+                    except Exception:
+                        self._metrics["dht_bucket_errors"] += 1
+                        logger.debug("DHT bucket refresh failed", exc_info=True)
+                    else:
+                        self._metrics["dht_bucket_checks"] += bucket_results.get("checked", 0)
+                        self._metrics["dht_bucket_replacements"] += bucket_results.get("removed", 0)
+                        self._metrics["dht_bucket_errors"] += bucket_results.get("errors", 0)
+                    last_bucket_refresh = now
+                await trio.sleep(max(0.01, self._dht_refresh_interval))
+        except trio.Cancelled:
+            return
+
+    async def _metrics_log_loop(self) -> None:
+        try:
+            while True:
+                snapshot = self.get_metrics_snapshot()
+                logger.info("[metrics] gossip=%s dht=%s", snapshot.get("gossip"), snapshot.get("dht"))
+                await trio.sleep(60.0)
+        except trio.Cancelled:
+            return
+
+    def get_metrics_snapshot(self) -> Dict[str, Any]:
+        now = time.time()
+        last_publish = self._metric_timestamps.get("gossip_last_publish") or 0.0
+        last_receive = self._metric_timestamps.get("gossip_last_receive") or 0.0
+        last_activity = max(last_publish, last_receive)
+
+        if last_activity == 0:
+            health_status = {"status": "idle", "stale_for": None}
+        else:
+            stale_for = max(0.0, now - last_activity)
+            status = "healthy" if stale_for <= self._gossip_health_window else "stale"
+            health_status = {"status": status, "stale_for": stale_for}
+
+        gossip_snapshot: Dict[str, Any] = {
+            "published_total": self._metrics["gossip_published"],
+            "received_total": self._metrics["gossip_received"],
+            "local_topics": sorted(self._gossip_local_topics),
+            "peer_topics": {
+                peer_id: sorted(list(topics))
+                for peer_id, topics in self._gossip_peer_topics.items()
+            },
+            "last_published": last_publish or None,
+            "last_received": last_receive or None,
+            "health": health_status,
+        }
+
+        dht_snapshot: Dict[str, Any] = {
+            "refresh_success": self._metrics["dht_refresh_success"],
+            "refresh_failure": self._metrics["dht_refresh_failure"],
+            "bucket_checks": self._metrics["dht_bucket_checks"],
+            "bucket_replacements": self._metrics["dht_bucket_replacements"],
+            "bucket_errors": self._metrics["dht_bucket_errors"],
+            "last_refresh": self._metric_timestamps.get("dht_last_refresh") or None,
+            "last_bucket_refresh": self._metric_timestamps.get("dht_last_bucket_refresh") or None,
+        }
+
+        dht = self._dht
+        if dht is not None:
+            routing_table = getattr(dht, "routing_table", None)
+            if routing_table is not None:
+                try:
+                    dht_snapshot["routing_table_size"] = routing_table.size()
+                except Exception:
+                    logger.debug("Failed to read DHT routing table size", exc_info=True)
+                try:
+                    buckets = getattr(routing_table, "buckets", [])
+                    dht_snapshot["bucket_count"] = len(buckets)
+                except Exception:
+                    logger.debug("Failed to inspect DHT bucket count", exc_info=True)
+                try:
+                    dht_snapshot["stale_peers"] = len(
+                        routing_table.get_stale_peers(int(self._dht_stale_peer_threshold))
+                    )
+                except Exception:
+                    logger.debug("Failed to compute DHT stale peers", exc_info=True)
+            value_store = getattr(dht, "value_store", None)
+            if value_store is not None:
+                try:
+                    value_store_records = getattr(value_store, "store", {})
+                    dht_snapshot["value_records"] = len(value_store_records)
+                except Exception:
+                    logger.debug("Failed to gather DHT value store metrics", exc_info=True)
+            provider_store = getattr(dht, "provider_store", None)
+            if provider_store is not None:
+                try:
+                    providers = getattr(provider_store, "providers", {})
+                    dht_snapshot["provider_records"] = sum(len(v) for v in providers.values())
+                except Exception:
+                    logger.debug("Failed to gather DHT provider metrics", exc_info=True)
+
+        return {"gossip": gossip_snapshot, "dht": dht_snapshot}
+
     async def _retry_pending_transaction(self, message_id: str) -> None:
         backoff = (1.0, 2.0, 4.0, 8.0, 16.0)
         for delay in backoff:
@@ -390,6 +872,7 @@ class NetworkService:
             peer_id = None
         if not peer_id or peer_id == str(self._host.get_id()):
             return
+        self._insert_peer_into_dht(peer_id)
         self._schedule_mempool_sync(peer_id)
 
     async def _try_block_sync(self, peer_id: str, locator: List[str]) -> bool:
@@ -473,6 +956,33 @@ class NetworkService:
             await self._send_gossip_rpc(peer_id, json.dumps(envelope).encode())
             await trio.sleep(0)
 
+    def _insert_peer_into_dht(self, peer_id_str: str, addrs: Optional[List[multiaddr.Multiaddr]] = None) -> None:
+        if self._dht is None:
+            return
+        try:
+            peer_id = self._ensure_peer_id(peer_id_str)
+        except ValueError:
+            return
+        if addrs is None:
+            try:
+                addrs = self._host.get_peerstore().addrs(peer_id)
+            except Exception:
+                addrs = []
+        if not addrs:
+            return
+        async def _add() -> None:
+            try:
+                await self._dht.routing_table.add_peer(PeerInfo(peer_id, addrs))
+                if logger.isEnabledFor(logging.DEBUG):
+                    peers_snapshot = [str(pid) for pid in self._dht.routing_table.get_peer_ids()]
+                    logger.debug("DHT routing table updated; peers=%s", peers_snapshot)
+            except Exception:
+                logger.debug("Failed to insert peer %s into DHT routing table", peer_id, exc_info=True)
+        if self._nursery is not None:
+            self._nursery.start_soon(_add)
+        else:
+            trio.lowlevel.spawn_system_task(_add)
+
     async def _deliver_gossip(self, message: Dict[str, Any], via_peer: Optional[str]) -> None:
         topic = message.get("topic")
         if not isinstance(topic, str) or not topic:
@@ -498,6 +1008,9 @@ class NetworkService:
                     await result  # type: ignore[func-returns-value]
             except Exception:
                 logger.debug("Gossip handler %s failed", handler, exc_info=True)
+        if self._host and envelope.get("origin") != str(self._host.get_id()):
+            self._metrics["gossip_received"] += 1
+            self._metric_timestamps["gossip_last_receive"] = time.time()
 
     async def _handle_transaction_gossip(self, envelope: Dict[str, Any]) -> None:
         if self._host and envelope.get("origin") == str(self._host.get_id()):
@@ -1325,6 +1838,10 @@ class NetworkService:
                 except Exception:  # pragma: no cover - defensive
                     logger.debug("Failed to register network notifee", exc_info=True)
 
+                self._dht = KadDHT(self._host, DHTMode.SERVER)
+                self._setup_dht_validators()
+                await self._seed_dht_bootstrap_peers()
+
                 async with self._host.run(self._config.listen_addrs):
                     self._trio_token = trio.lowlevel.current_trio_token()
                     logger.info(
@@ -1335,16 +1852,21 @@ class NetworkService:
                     )
                     bus.register(self)
 
-                    async with trio.open_nursery() as nursery:
-                        self._nursery = nursery
-                        await self.join_gossip_topic(TAU_GOSSIP_TOPIC_TRANSACTIONS, self._handle_transaction_gossip)
-                        await self.join_gossip_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
-                        nursery.start_soon(self._bootstrap)
-                        nursery.start_soon(self._watch_head_and_announce)
-                        nursery.start_soon(self._gossip_cleanup_loop)
-                        self._runner_started.set()
-                        await self._runner_stop.wait()
-                        nursery.cancel_scope.cancel()
+                    async with background_trio_service(self._dht) as dht_manager:
+                        self._dht_manager = dht_manager
+                        async with trio.open_nursery() as nursery:
+                            self._nursery = nursery
+                            await self.join_gossip_topic(TAU_GOSSIP_TOPIC_TRANSACTIONS, self._handle_transaction_gossip)
+                            await self.join_gossip_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
+                            nursery.start_soon(self._bootstrap)
+                            nursery.start_soon(self._watch_head_and_announce)
+                            nursery.start_soon(self._gossip_cleanup_loop)
+                            if self._dht is not None:
+                                nursery.start_soon(self._dht_refresh_loop)
+                                nursery.start_soon(self._metrics_log_loop)
+                            self._runner_started.set()
+                            await self._runner_stop.wait()
+                            nursery.cancel_scope.cancel()
             except Exception:
                 logger.exception("Network service runner crashed")
                 self._runner_started.set()
@@ -1357,9 +1879,33 @@ class NetworkService:
 
                 bus.unregister(self)
 
+                # Best-effort explicit shutdown of network/host to avoid socket leaks
+                try:
+                    if self._host is not None:
+                        try:
+                            network = self._host.get_network()
+                            close_network = getattr(network, "close", None)
+                            if callable(close_network):
+                                await close_network()
+                        except Exception:
+                            logger.debug("Failed to close libp2p network", exc_info=True)
+                        try:
+                            host_close = getattr(self._host, "close", None)
+                            if callable(host_close):
+                                await host_close()
+                        except Exception:
+                            logger.debug("Failed to close libp2p host", exc_info=True)
+                except Exception:
+                    logger.debug("Unexpected error during host shutdown", exc_info=True)
+
                 self._host = None
                 self._nursery = None
                 self._trio_token = None
+                self._dht_manager = None
+                self._dht = None
+                self._dht_validators.clear()
+                self._dht_value_store_put = None
+                self._dht_provider_add = None
                 self._gossip_peer_topics.clear()
                 self._mempool_synced_peers.clear()
                 self._pending_tx.clear()
