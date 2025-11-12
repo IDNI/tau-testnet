@@ -11,3 +11,4 @@ TAU_PROTOCOL_GOSSIP = "/tau/gossip/1.0.0"
 # Gossipsub topics
 TAU_GOSSIP_TOPIC_BLOCKS = "tau/blocks/1.0.0"
 TAU_GOSSIP_TOPIC_TRANSACTIONS = "tau/transactions/1.0.0"
+TAU_GOSSIP_TOPIC_PEERS = "tau/peers/1.0.0"

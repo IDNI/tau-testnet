@@ -239,8 +239,8 @@ The `block.py` module provides the `Block` and `BlockHeader` classes, along with
 
 ## Future Work
 
-*   Implement a fee model.
+*   Fork choice mechanism.
+*   Expansion of Tau logic.
+*   Full consensus mechanism implementation.
 *   More robust error handling and reporting.
-*   Expansion of Tau-validated logic and commands.
-*   Implementation of a simple P2P networking layer for node synchronization. (Initial version landed: handshake, ping, sync, blocks; tx stub.)
 *   More comprehensive unit and integration tests.

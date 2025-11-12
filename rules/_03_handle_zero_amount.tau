@@ -10,4 +10,4 @@
 # Logic:
 # If amount == 0, the check fails (output #b0).
 # Otherwise, the check passes (output #b1).
-((i1[t] =_ #b0) ? (o4[t] =_ #b0) : (o4[t] =_ #b1))
+always ((i1[t] = #b0) ? o4[t] = #b0 : o4[t] = #b1).

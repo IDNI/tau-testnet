@@ -170,10 +170,6 @@ BASE_DEFAULTS: Dict[str, Any] = {
         "genesis_hash": "GENESIS",
         "listen": ["/ip4/127.0.0.1/tcp/0"], 
         "bootstrap_peers": [
-            {
-                "peer_id": "QmWn7pKWd8PQ6mPfjYT8Au7sf2h75VBgZi6bDVU3p8xsHY",
-                "addrs": ["/ip4/127.0.0.1/tcp/58399"],
-            },
             # {
             #     "peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC", #MAIN NODE
             #     "addrs": ["/ip4/127.0.0.1/tcp/4001"],

@@ -9,8 +9,11 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 
 import multiaddr
 import trio
+from google.protobuf.message import DecodeError
 from libp2p import new_host
 from libp2p.abc import IHost, INotifee
+from libp2p.identity.identify import ID as IDENTIFY_PROTOCOL_ID
+from libp2p.identity.identify.pb.identify_pb2 import Identify as IdentifyMessage
 from libp2p.kad_dht import common as dht_common
 from libp2p.kad_dht.kad_dht import KadDHT, DHTMode
 from libp2p.peer.id import ID
@@ -26,6 +29,7 @@ from .config import BootstrapPeer, NetworkConfig
 from .protocols import (
     TAU_GOSSIP_TOPIC_BLOCKS,
     TAU_GOSSIP_TOPIC_TRANSACTIONS,
+    TAU_GOSSIP_TOPIC_PEERS,
     TAU_PROTOCOL_BLOCKS,
     TAU_PROTOCOL_GOSSIP,
     TAU_PROTOCOL_HANDSHAKE,
@@ -167,9 +171,30 @@ class NetworkService:
             "dht_last_bucket_refresh": 0.0,
         }
         self._opportunistic_peers: Dict[str, float] = {}
+        self._identifying_peers: Set[str] = set()
         self._opportunistic_peer_cooldown = max(
             5.0,
             float(getattr(config, "dht_opportunistic_cooldown", 120.0) or 120.0),
+        )
+        self._handshake_peer_limit = max(
+            0, int(getattr(config, "dht_handshake_max_peers", 16) or 0)
+        )
+        self._handshake_provider_limit = max(
+            0, int(getattr(config, "dht_handshake_max_providers", 16) or 0)
+        )
+        self._peer_advertisement_interval = max(
+            0.0, float(getattr(config, "peer_advertisement_interval", 180.0) or 180.0)
+        )
+        self._peer_advertisement_max_peers = max(
+            0, int(getattr(config, "peer_advertisement_max_peers", 16) or 0)
+        )
+        recent_window_default = float(
+            getattr(config, "peer_advertisement_recent_window", 600.0) or 600.0
+        )
+        self._peer_advertisement_recent_window = max(
+            1.0,
+            recent_window_default,
+            self._peer_advertisement_interval if self._peer_advertisement_interval > 0 else 0.0,
         )
 
     # ------------------------------------------------------------------ Gossip API
@@ -447,6 +472,114 @@ class NetworkService:
         else:
             trio.lowlevel.spawn_system_task(_seed)
 
+    def _ingest_peer_entries(
+        self,
+        entries: Iterable[Dict[str, Any]],
+        source: str,
+    ) -> List[str]:
+        ingested: List[str] = []
+        if self._host is None:
+            return ingested
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            peer_id = entry.get("peer_id")
+            addrs_raw = entry.get("addrs", [])
+            if not isinstance(peer_id, str) or not peer_id:
+                continue
+            addrs: List[multiaddr.Multiaddr] = []
+            if isinstance(addrs_raw, list):
+                for addr_str in addrs_raw:
+                    if not isinstance(addr_str, str):
+                        continue
+                    try:
+                        addrs.append(multiaddr.Multiaddr(addr_str))
+                    except Exception:
+                        logger.debug("Invalid peer address from %s: %s", source, addr_str, exc_info=True)
+            if not addrs:
+                continue
+            try:
+                pid_obj = self._ensure_peer_id(peer_id)
+            except ValueError:
+                continue
+            try:
+                self._host.get_peerstore().add_addrs(pid_obj, addrs, PERMANENT_ADDR_TTL)
+            except Exception:
+                logger.debug("Failed to persist peer %s from %s", peer_id, source, exc_info=True)
+            self._schedule_opportunistic_seed(peer_id, addrs)
+            ingested.append(peer_id)
+        return ingested
+
+    def _ingest_provider_entries(
+        self,
+        entries: Iterable[Dict[str, Any]],
+        source: str,
+    ) -> None:
+        if self._dht is None:
+            return
+        provider_store = getattr(self._dht, "provider_store", None)
+        if provider_store is None:
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            key = entry.get("key")
+            peer_id = entry.get("peer_id")
+            addrs_raw = entry.get("addrs", [])
+            if not isinstance(key, str) or not isinstance(peer_id, str):
+                continue
+            try:
+                key_bytes = key.encode("utf-8")
+            except Exception:
+                continue
+            try:
+                pid_obj = self._ensure_peer_id(peer_id)
+            except ValueError:
+                continue
+            addrs: List[multiaddr.Multiaddr] = []
+            if isinstance(addrs_raw, list):
+                for addr_str in addrs_raw:
+                    if not isinstance(addr_str, str):
+                        continue
+                    try:
+                        addrs.append(multiaddr.Multiaddr(addr_str))
+                    except Exception:
+                        logger.debug("Invalid provider addr from %s: %s", source, addr_str, exc_info=True)
+            peer_info = PeerInfo(pid_obj, addrs)
+            try:
+                provider_store.add_provider(key_bytes, peer_info)
+            except Exception:
+                logger.debug("Failed to ingest provider record %s from %s", key, source, exc_info=True)
+            self._schedule_opportunistic_seed(peer_id, addrs)
+
+    def _schedule_iterative_lookups(self, peer_ids: Iterable[str]) -> None:
+        if self._dht is None:
+            return
+        targets: List[ID] = []
+        for peer_id in peer_ids:
+            if not isinstance(peer_id, str) or not peer_id:
+                continue
+            try:
+                targets.append(self._ensure_peer_id(peer_id))
+            except ValueError:
+                continue
+            if len(targets) >= 16:
+                break
+        if not targets:
+            return
+
+        async def _run() -> None:
+            for target in targets:
+                try:
+                    await self._dht.peer_routing.find_peer(target)
+                except Exception:
+                    logger.debug("Iterative lookup for %s failed", target, exc_info=True)
+
+        if self._nursery is not None:
+            self._nursery.start_soon(_run)
+        else:
+            trio.lowlevel.spawn_system_task(_run)
+
     async def _attempt_dht_gossip(self, message: Dict[str, Any]) -> bool:
         if self._host is None or self._dht is None:
             return False
@@ -527,6 +660,10 @@ class NetworkService:
             await self._host.connect(peer_info)
         except Exception:
             logger.debug("Failed to open connection to DHT-discovered peer %s", peer_id, exc_info=True)
+        else:
+            if getattr(peer_info, "addrs", None):
+                self._store_peer_addresses(peer_info.peer_id, peer_info.addrs)
+            self._schedule_identify(peer_id)
         if self._can_reach_peer(peer_id):
             self._schedule_opportunistic_seed(peer_id, peer_info.addrs if peer_info else None)
             return True
@@ -1047,6 +1184,8 @@ class NetworkService:
     async def _on_peer_connected(self, conn: Any) -> None:
         if self._host is None:
             return
+        peer_id_obj = None
+        peer_id = None
         try:
             muxed_conn = getattr(conn, "muxed_conn", None)
             peer_id_obj = getattr(muxed_conn, "peer_id", None)
@@ -1055,7 +1194,47 @@ class NetworkService:
             peer_id = None
         if not peer_id or peer_id == str(self._host.get_id()):
             return
-        self._insert_peer_into_dht(peer_id)
+        logger.info("Peer connected: %s", peer_id)
+
+        # Extract remote address from connection
+        remote_addrs = []
+        try:
+            # Try to get remote address from connection
+            if hasattr(conn, "remote_addr"):
+                remote_addr = getattr(conn, "remote_addr")
+                if remote_addr:
+                    remote_addrs.append(remote_addr)
+            elif hasattr(conn, "remote_addrs"):
+                remote_addrs.extend(getattr(conn, "remote_addrs", []))
+        except Exception:
+            logger.debug("Failed to extract remote address from connection", exc_info=True)
+
+        stored_addrs: List[multiaddr.Multiaddr] = []
+        if peer_id_obj is not None:
+            inline_candidates: List[multiaddr.Multiaddr] = []
+            for entry in remote_addrs:
+                if isinstance(entry, multiaddr.Multiaddr):
+                    inline_candidates.append(entry)
+                elif isinstance(entry, str):
+                    try:
+                        inline_candidates.append(multiaddr.Multiaddr(entry))
+                    except Exception:
+                        logger.debug("Invalid remote address string from connection: %s", entry, exc_info=True)
+                else:
+                    try:
+                        inline_candidates.append(multiaddr.Multiaddr(str(entry)))
+                    except Exception:
+                        logger.debug("Unsupported remote address type from connection: %r", entry, exc_info=True)
+
+            if inline_candidates:
+                stored_addrs = self._store_peer_addresses(peer_id_obj, inline_candidates)
+                if stored_addrs:
+                    self._schedule_identify(peer_id)
+
+            if not stored_addrs:
+                stored_addrs = await self._identify_peer(peer_id_obj)
+
+        self._insert_peer_into_dht(peer_id, stored_addrs if stored_addrs else None)
         self._schedule_mempool_sync(peer_id)
 
     async def _try_block_sync(self, peer_id: str, locator: List[str]) -> bool:
@@ -1141,17 +1320,21 @@ class NetworkService:
 
     def _insert_peer_into_dht(self, peer_id_str: str, addrs: Optional[List[multiaddr.Multiaddr]] = None) -> None:
         if self._dht is None:
+            logger.warning("DHT not initialized, cannot insert peer %s", peer_id_str)
             return
         try:
             peer_id = self._ensure_peer_id(peer_id_str)
         except ValueError:
+            logger.warning("Invalid peer ID %s", peer_id_str)
             return
         if addrs is None:
             try:
                 addrs = self._host.get_peerstore().addrs(peer_id)
             except Exception:
                 addrs = []
+        logger.info("Inserting peer %s into DHT with addrs %s", peer_id_str, addrs)
         if not addrs:
+            logger.warning("No addresses for peer %s, skipping DHT insertion", peer_id_str)
             return
         async def _add() -> None:
             try:
@@ -1160,11 +1343,106 @@ class NetworkService:
                     peers_snapshot = [str(pid) for pid in self._dht.routing_table.get_peer_ids()]
                     logger.debug("DHT routing table updated; peers=%s", peers_snapshot)
             except Exception:
-                logger.debug("Failed to insert peer %s into DHT routing table", peer_id, exc_info=True)
+                logger.warning("Failed to insert peer %s into DHT routing table", peer_id, exc_info=True)
         if self._nursery is not None:
             self._nursery.start_soon(_add)
         else:
             trio.lowlevel.spawn_system_task(_add)
+
+    def _store_peer_addresses(
+        self,
+        peer_id: ID,
+        addresses: Iterable[multiaddr.Multiaddr],
+    ) -> List[multiaddr.Multiaddr]:
+        if self._host is None:
+            return []
+        normalized = self._normalize_peer_addrs(addresses)
+        if not normalized:
+            return []
+        try:
+            self._host.get_peerstore().add_addrs(peer_id, normalized, PERMANENT_ADDR_TTL)
+        except Exception:
+            logger.debug("Failed to persist addresses for %s", peer_id, exc_info=True)
+        self._save_peer_basic(PeerInfo(peer_id, normalized))
+        peer_id_str = str(peer_id)
+        self._opportunistic_peers[peer_id_str] = time.time()
+        self._schedule_opportunistic_seed(peer_id_str, normalized)
+        return normalized
+
+    async def _identify_peer(self, peer_id: ID) -> List[multiaddr.Multiaddr]:
+        if self._host is None:
+            return []
+        try:
+            stream = await self._host.new_stream(peer_id, [IDENTIFY_PROTOCOL_ID])
+        except Exception:
+            logger.debug("Identify: failed to open stream to %s", peer_id, exc_info=True)
+            return []
+
+        try:
+            payload = await self._read_stream(stream, timeout=2.0, max_bytes=262144)
+        finally:
+            with trio.CancelScope(shield=True):
+                try:
+                    await stream.close()
+                except Exception:
+                    pass
+
+        if not payload:
+            return []
+
+        identify_msg = IdentifyMessage()
+        try:
+            identify_msg.ParseFromString(payload)
+        except DecodeError:
+            logger.debug("Identify: failed to parse response from %s", peer_id, exc_info=True)
+            return []
+
+        discovered: List[multiaddr.Multiaddr] = []
+        for raw_addr in identify_msg.listen_addrs:
+            try:
+                discovered.append(multiaddr.Multiaddr(raw_addr))
+            except Exception:
+                logger.debug("Identify: invalid listen address from %s", peer_id, exc_info=True)
+        if identify_msg.observed_addr:
+            try:
+                discovered.append(multiaddr.Multiaddr(identify_msg.observed_addr))
+            except Exception:
+                logger.debug("Identify: invalid observed address from %s", peer_id, exc_info=True)
+
+        if not discovered:
+            return []
+
+        addresses = self._store_peer_addresses(peer_id, discovered)
+        if addresses and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Identify: learned addresses for %s: %s",
+                peer_id,
+                [str(addr) for addr in addresses],
+            )
+        return addresses
+
+    def _schedule_identify(self, peer_id: str) -> None:
+        if self._host is None or self._nursery is None:
+            return
+        if not isinstance(peer_id, str) or not peer_id:
+            return
+        if peer_id in self._identifying_peers:
+            return
+        try:
+            peer_id_obj = self._ensure_peer_id(peer_id)
+        except ValueError:
+            return
+
+        async def _task() -> None:
+            try:
+                addrs = await self._identify_peer(peer_id_obj)
+                if addrs:
+                    self._insert_peer_into_dht(peer_id, addrs)
+            finally:
+                self._identifying_peers.discard(peer_id)
+
+        self._identifying_peers.add(peer_id)
+        self._nursery.start_soon(_task)
 
     async def _opportunistic_seed_peer(
         self,
@@ -1311,6 +1589,22 @@ class NetworkService:
                 return
         logger.debug("Block gossip: no reachable peers for candidates %s", candidates)
 
+    async def _handle_peer_advertisement(self, envelope: Dict[str, Any]) -> None:
+        if self._host and envelope.get("origin") == str(self._host.get_id()):
+            return
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict):
+            return
+        peer_entries = payload.get("peers")
+        ingested: List[str] = []
+        if isinstance(peer_entries, list):
+            ingested = self._ingest_peer_entries(peer_entries, "peer-advertisement")
+        provider_entries = payload.get("providers")
+        if isinstance(provider_entries, list):
+            self._ingest_provider_entries(provider_entries, "peer-advertisement")
+        if ingested:
+            self._schedule_iterative_lookups(ingested)
+
     # ---------------------------------------------------------------- Database helpers
     def _get_tip(self) -> Optional[Dict[str, Any]]:
         try:
@@ -1332,8 +1626,94 @@ class NetworkService:
         except Exception:
             return self._config.genesis_hash
 
-    def _build_handshake(self) -> bytes:
-        payload = {
+    def _collect_peer_snapshot(self, limit: int, *, recent_only: bool = False) -> List[Dict[str, Any]]:
+        if limit <= 0 or self._host is None:
+            return []
+
+        candidates: List[str] = []
+        seen: Set[str] = set()
+        if recent_only:
+            cutoff = time.time() - self._peer_advertisement_recent_window
+            for peer_id, seen_at in self._opportunistic_peers.items():
+                if peer_id and seen_at >= cutoff:
+                    candidates.append(peer_id)
+        else:
+            if self._dht is not None:
+                try:
+                    candidates.extend(str(pid) for pid in self._dht.routing_table.get_peer_ids())
+                except Exception:
+                    logger.debug("Failed to read DHT routing table for snapshot", exc_info=True)
+        # Always include opportunistic peers as fallback
+        if not recent_only:
+            for peer_id in self._opportunistic_peers.keys():
+                candidates.append(peer_id)
+
+        snapshot: List[Dict[str, Any]] = []
+        for peer_id in candidates:
+            if not isinstance(peer_id, str) or not peer_id:
+                continue
+            if peer_id in seen or (self._host and peer_id == str(self._host.get_id())):
+                continue
+            try:
+                pid = self._ensure_peer_id(peer_id)
+            except ValueError:
+                continue
+            try:
+                addrs = self._host.get_peerstore().addrs(pid)
+            except Exception:
+                addrs = []
+            if not addrs:
+                continue
+            try:
+                addr_strings = [str(addr) for addr in addrs]
+            except Exception:
+                continue
+            snapshot.append({"peer_id": peer_id, "addrs": addr_strings})
+            seen.add(peer_id)
+            if len(snapshot) >= limit:
+                break
+        return snapshot
+
+    def _collect_provider_snapshot(self, limit: int) -> List[Dict[str, Any]]:
+        if limit <= 0 or self._dht is None:
+            return []
+        provider_store = getattr(self._dht, "provider_store", None)
+        if provider_store is None:
+            return []
+        entries: List[Dict[str, Any]] = []
+        try:
+            providers_map = getattr(provider_store, "providers", {})
+            items = list(providers_map.items())
+        except Exception:
+            logger.debug("Failed to gather provider snapshot", exc_info=True)
+            return []
+
+        for key_bytes, provider_dict in items:
+            try:
+                key_str = key_bytes.decode("utf-8")
+            except Exception:
+                continue
+            for record in provider_dict.values():
+                info = getattr(record, "provider_info", None)
+                if info is None:
+                    continue
+                try:
+                    addr_strings = [str(addr) for addr in info.addrs]
+                except Exception:
+                    addr_strings = []
+                entries.append(
+                    {
+                        "key": key_str,
+                        "peer_id": str(info.peer_id),
+                        "addrs": addr_strings,
+                    }
+                )
+                if len(entries) >= limit:
+                    return entries
+        return entries[:limit]
+
+    def _build_handshake_payload(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
             "network_id": self._config.network_id,
             "node_id": str(self._host.get_id()) if self._host else "",
             "agent": self._config.agent,
@@ -1342,7 +1722,27 @@ class NetworkService:
             "head_hash": self._get_tip_hash(),
             "time": trio.current_time(),
         }
-        return json.dumps(payload).encode()
+        if self._handshake_peer_limit:
+            payload["dht_peers"] = self._collect_peer_snapshot(self._handshake_peer_limit)
+        if self._handshake_provider_limit:
+            payload["dht_providers"] = self._collect_provider_snapshot(self._handshake_provider_limit)
+        return payload
+
+    def _build_handshake(self) -> bytes:
+        return json.dumps(self._build_handshake_payload()).encode()
+
+    def _ingest_handshake_snapshot(self, payload: Dict[str, Any], source: str) -> None:
+        if not isinstance(payload, dict):
+            return
+        peer_entries = payload.get("dht_peers")
+        ingested: List[str] = []
+        if isinstance(peer_entries, list):
+            ingested = self._ingest_peer_entries(peer_entries, source)
+        provider_entries = payload.get("dht_providers")
+        if isinstance(provider_entries, list):
+            self._ingest_provider_entries(provider_entries, source)
+        if ingested:
+            self._schedule_iterative_lookups(ingested)
 
     # ---------------------------------------------------------------- Stream handlers
     async def _handle_handshake(self, stream) -> None:
@@ -1355,7 +1755,15 @@ class NetworkService:
             except Exception:
                 peer_id_str = None
 
-        await self._read_stream(stream, timeout=1.0)
+        raw_req = await self._read_stream(stream, timeout=1.0)
+        if raw_req:
+            try:
+                request_payload = json.loads(raw_req.decode())
+            except Exception:
+                request_payload = None
+            if isinstance(request_payload, dict):
+                self._ingest_handshake_snapshot(request_payload, "handshake-request")
+
         resp = self._build_handshake()
         try:
             await stream.write(resp)
@@ -1365,6 +1773,12 @@ class NetworkService:
                     await stream.close()
                 except Exception:
                     pass
+        try:
+            response_payload = json.loads(resp.decode())
+        except Exception:
+            response_payload = None
+        if isinstance(response_payload, dict):
+            self._ingest_handshake_snapshot(response_payload, "handshake-response")
         if peer_id_str:
             self._schedule_opportunistic_seed(peer_id_str)
 
@@ -1675,6 +2089,37 @@ class NetworkService:
         except trio.Cancelled:
             return
 
+    async def _peer_advertisement_loop(self) -> None:
+        if self._peer_advertisement_interval <= 0:
+            return
+        try:
+            while True:
+                await trio.sleep(self._peer_advertisement_interval)
+                peers = self._collect_peer_snapshot(
+                    self._peer_advertisement_max_peers,
+                    recent_only=True,
+                )
+                if not peers:
+                    peers = self._collect_peer_snapshot(self._peer_advertisement_max_peers)
+                providers: List[Dict[str, Any]] = []
+                if self._handshake_provider_limit:
+                    providers = self._collect_provider_snapshot(
+                        min(self._handshake_provider_limit, self._peer_advertisement_max_peers)
+                    )
+                if not peers and not providers:
+                    continue
+                payload: Dict[str, Any] = {}
+                if peers:
+                    payload["peers"] = peers
+                if providers:
+                    payload["providers"] = providers
+                try:
+                    await self.publish_gossip(TAU_GOSSIP_TOPIC_PEERS, payload)
+                except Exception:
+                    logger.debug("Failed to publish peer advertisement gossip", exc_info=True)
+        except trio.Cancelled:
+            return
+
     # ---------------------------------------------------------------- Persistence helpers
     def _restore_peerstore(self) -> None:
         if self._host is None:
@@ -1771,7 +2216,8 @@ class NetworkService:
             logger.debug("Handshake: failed to open stream to %s", peer_id, exc_info=True)
             return
         try:
-            await stream.write(b"hi")
+            request_payload = self._build_handshake_payload()
+            await stream.write(json.dumps(request_payload).encode())
             raw = await self._read_stream(stream, timeout=1.0)
             if raw:
                 try:
@@ -1782,10 +2228,12 @@ class NetworkService:
                         data.get("head_number"),
                         str(data.get("head_hash"))[:12],
                     )
+                    self._ingest_handshake_snapshot(data, "handshake-response")
                 except Exception:
                     logger.debug("Handshake: non-JSON payload from %s: %r", peer_id, raw[:64], exc_info=True)
             else:
                 logger.debug("Handshake: empty response from %s", peer_id)
+            self._ingest_handshake_snapshot(request_payload, "handshake-request")
         finally:
             with trio.CancelScope(shield=True):
                 try:
@@ -2114,12 +2562,15 @@ class NetworkService:
                             self._nursery = nursery
                             await self.join_gossip_topic(TAU_GOSSIP_TOPIC_TRANSACTIONS, self._handle_transaction_gossip)
                             await self.join_gossip_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
+                            await self.join_gossip_topic(TAU_GOSSIP_TOPIC_PEERS, self._handle_peer_advertisement)
                             nursery.start_soon(self._bootstrap)
                             nursery.start_soon(self._watch_head_and_announce)
                             nursery.start_soon(self._gossip_cleanup_loop)
                             if self._dht is not None:
                                 nursery.start_soon(self._dht_refresh_loop)
                                 nursery.start_soon(self._metrics_log_loop)
+                            if self._peer_advertisement_interval > 0:
+                                nursery.start_soon(self._peer_advertisement_loop)
                             self._runner_started.set()
                             await self._runner_stop.wait()
                             nursery.cancel_scope.cancel()

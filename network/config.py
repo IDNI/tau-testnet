@@ -31,3 +31,8 @@ class NetworkConfig:
     dht_stale_peer_threshold: float = 3600.0
     gossip_health_window: float = 120.0
     dht_opportunistic_cooldown: float = 120.0
+    dht_handshake_max_peers: int = 16
+    dht_handshake_max_providers: int = 16
+    peer_advertisement_interval: float = 180.0
+    peer_advertisement_max_peers: int = 16
+    peer_advertisement_recent_window: float = 600.0

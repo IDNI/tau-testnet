@@ -20,6 +20,7 @@ import android.widget.ArrayAdapter
 import android.widget.Spinner
 import androidx.appcompat.app.AlertDialog
 import java.util.ArrayDeque
+import org.tau.wallet.crypto.Bls
 
 class MainActivity : AppCompatActivity() {
 
@@ -38,6 +39,7 @@ class MainActivity : AppCompatActivity() {
 
     private var privateKeyBytes: ByteArray? = null
     private var publicKeyHex: String? = null
+    private val secureRandom = SecureRandom()
 
     private lateinit var sharedPreferences: SharedPreferences
     private val wallets = mutableMapOf<String, String>()
@@ -75,6 +77,11 @@ class MainActivity : AppCompatActivity() {
         setupWalletSpinner()
         loadWallets()
         setupRuleValidation()
+        try {
+            Bls.isAvailable()
+        } catch (e: IllegalStateException) {
+            tvResult.text = "Error: ${e.message}"
+        }
     }
 
     private fun setupRuleValidation() {
@@ -144,7 +151,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveWallet(name: String) {
-        val skHex = privateKeyBytes?.joinToString("") { String.format("%02x", it) } ?: return
+        val sk = privateKeyBytes ?: run {
+            tvResult.text = "Error: No private key to save."
+            return
+        }
+        if (sk.size != 32) {
+            tvResult.text = "Error: Private key must be 32 bytes before saving."
+            return
+        }
+        val skHex = bytesToHex(sk)
         with(sharedPreferences.edit()) {
             putString(name, skHex)
             apply()
@@ -159,20 +174,34 @@ class MainActivity : AppCompatActivity() {
 
     private fun loadWallet(name: String) {
         val skHex = wallets[name] ?: return
-        val skBytes = skHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        val skBytes = try {
+            hexToBytes(skHex)
+        } catch (e: IllegalArgumentException) {
+            tvResult.text = "Error loading wallet '$name': ${e.message}"
+            return
+        }
 
-        privateKeyBytes = skBytes
-        // Assuming the same stub logic for pk generation
-        val pk = skBytes // Stub: pk = sk
-        val pkHex = pk.joinToString("") { String.format("%02x", it) }
-        publicKeyHex = pkHex
+        if (skBytes.size != 32) {
+            tvResult.text = "Error loading wallet '$name': Expected 32-byte private key, found ${skBytes.size} bytes. Please regenerate or re-import this wallet."
+            return
+        }
 
-        tvPrivKeyHex.text = "Private key (hex): $skHex"
-        tvPubKeyHex.text = "Public key (hex): $pkHex"
-        // Clear old results
-        tvBalance.text = "Balance: -"
-        tvHistory.text = "History: -"
-        tvResult.text = "Result:"
+        try {
+            val pkBytes = Bls.skToPk(skBytes)
+            val normalizedSkHex = bytesToHex(skBytes)
+            val pkHex = bytesToHex(pkBytes)
+
+            privateKeyBytes = skBytes
+            publicKeyHex = pkHex
+
+            tvPrivKeyHex.text = "Private key (hex): $normalizedSkHex"
+            tvPubKeyHex.text = "Public key (hex): $pkHex"
+            tvBalance.text = "Balance: -"
+            tvHistory.text = "History: -"
+            tvResult.text = "Result: Loaded wallet '$name'."
+        } catch (e: Exception) {
+            tvResult.text = "Error loading wallet '$name': ${e.message}"
+        }
     }
 
 
@@ -262,22 +291,39 @@ class MainActivity : AppCompatActivity() {
 
 
     private fun generateKeypair() {
-        val random = SecureRandom()
-        val ikm = ByteArray(32)
-        random.nextBytes(ikm)
-        // Stub: Derive a 48-byte private key using SHA-512 truncated to 48 bytes
-        val sk = sha512(ikm).copyOfRange(0, 48)
-        privateKeyBytes = sk
-        // Stub public key equals private key (matches py_ecc_stub behavior)
-        val pk = sk
-        val pkHex = pk.joinToString("") { String.format("%02x", it) }
-        val skHex = sk.joinToString("") { String.format("%02x", it) }
-        publicKeyHex = pkHex
-        tvPrivKeyHex.text = "Private key (hex): $skHex"
-        tvPubKeyHex.text = "Public key (hex): $pkHex"
+        try {
+            val (sk, pk) = generateKeypairBytes()
+            privateKeyBytes = sk
+            val skHex = bytesToHex(sk)
+            val pkHex = bytesToHex(pk)
+            publicKeyHex = pkHex
+            tvPrivKeyHex.text = "Private key (hex): $skHex"
+            tvPubKeyHex.text = "Public key (hex): $pkHex"
 
-        // Deselect spinner to indicate this is a new, unsaved wallet
-        spinnerWallets.setSelection(AdapterView.INVALID_POSITION)
+            // Deselect spinner to indicate this is a new, unsaved wallet
+            spinnerWallets.setSelection(AdapterView.INVALID_POSITION)
+            tvBalance.text = "Balance: -"
+            tvHistory.text = "History: -"
+            tvResult.text = "Result: Generated new keypair."
+        } catch (e: Exception) {
+            tvResult.text = "Error generating keypair: ${e.message}"
+        }
+    }
+
+    private fun generateKeypairBytes(): Pair<ByteArray, ByteArray> {
+        while (true) {
+            val candidateSk = ByteArray(32)
+            secureRandom.nextBytes(candidateSk)
+            if (candidateSk.all { it == 0.toByte() }) {
+                continue
+            }
+            try {
+                val pk = Bls.skToPk(candidateSk)
+                return candidateSk to pk
+            } catch (_: IllegalArgumentException) {
+                // Out-of-range secret key, try again.
+            }
+        }
     }
 
     private fun queryBalance() {
@@ -308,7 +354,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun sendTx() {
         val sk = privateKeyBytes ?: run {
-            runOnUiThread { tvResult.text = "Error: Private key not generated or wallet not loaded." }
+            tvResult.text = "Error: Private key not generated or wallet not loaded."
+            return
+        }
+        if (sk.size != 32) {
+            tvResult.text = "Error: Private key must be 32 bytes. Please regenerate or reload your wallet."
             return
         }
         val senderPk = publicKeyHex ?: run {
@@ -368,9 +418,15 @@ class MainActivity : AppCompatActivity() {
                 "fee_limit" to "0"
             )
             val signingJson = canonicalJson(payloadNoSig)
-            val msgHash = sha256(signingJson.toByteArray())
-            val sig = sha256(sk + msgHash) // aligns with py_ecc_stub Verify
-            val sigHex = sig.joinToString("") { String.format("%02x", it) }
+            val signingBytes = signingJson.toByteArray()
+            val msgHash = sha256(signingBytes)
+            val sig = try {
+                Bls.sign(sk, msgHash)
+            } catch (e: Exception) {
+                runOnUiThread { tvResult.text = "Error signing transaction: ${e.message}" }
+                return@thread
+            }
+            val sigHex = bytesToHex(sig)
 
             val payload = payloadNoSig + mapOf("signature" to sigHex)
             val blob = compactJson(payload)
@@ -431,13 +487,34 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun sha256(input: ByteArray): ByteArray {
-        val md = java.security.MessageDigest.getInstance("SHA-256")
-        return md.digest(input)
+    private fun bytesToHex(bytes: ByteArray): String {
+        return bytes.joinToString("") { String.format("%02x", it) }
     }
 
-    private fun sha512(input: ByteArray): ByteArray {
-        val md = java.security.MessageDigest.getInstance("SHA-512")
+    private fun hexToBytes(hex: String): ByteArray {
+        val clean = hex.trim()
+        if (clean.isEmpty()) {
+            return ByteArray(0)
+        }
+        if (clean.length % 2 != 0) {
+            throw IllegalArgumentException("Hex string must contain an even number of characters.")
+        }
+        val result = ByteArray(clean.length / 2)
+        var i = 0
+        while (i < clean.length) {
+            val byteValue = try {
+                clean.substring(i, i + 2).toInt(16)
+            } catch (e: NumberFormatException) {
+                throw IllegalArgumentException("Hex string contains invalid characters.", e)
+            }
+            result[i / 2] = byteValue.toByte()
+            i += 2
+        }
+        return result
+    }
+
+    private fun sha256(input: ByteArray): ByteArray {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
         return md.digest(input)
     }
 }

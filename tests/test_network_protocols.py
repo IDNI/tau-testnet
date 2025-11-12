@@ -10,6 +10,7 @@ import pytest
 import trio
 from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo
+from libp2p.peer.peerstore import PeerStoreError
 from commands import sendtx
 
 
@@ -281,6 +282,7 @@ async def test_block_gossip_fallback_to_via(monkeypatch):
 
     try:
         addrs_a = await _wait_for_addrs(svc_a.host)
+        addrs_b = await _wait_for_addrs(svc_b.host)
         addrs_b = await _wait_for_addrs(svc_b.host)
         addrs_c = await _wait_for_addrs(svc_c.host)
 
@@ -714,6 +716,164 @@ async def test_handshake_opportunistic_seeding(two_nodes, monkeypatch):
 
     assert str(add_calls[0].peer_id) == str(pid2)
     assert str(pid2) in svc1._opportunistic_peers
+
+
+async def test_handshake_exchanges_peer_snapshot(monkeypatch):
+    from network.config import NetworkConfig
+    from network.service import NetworkService
+
+    cfg = NetworkConfig(
+        network_id="snapshotnet",
+        genesis_hash="genesis",
+        listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
+        dht_handshake_max_peers=8,
+        dht_handshake_max_providers=8,
+        peer_advertisement_interval=0.0,
+    )
+
+    svc_a = NetworkService(cfg)
+    svc_b = NetworkService(cfg)
+    svc_c = NetworkService(cfg)
+
+    await svc_a.start()
+    await svc_b.start()
+    await svc_c.start()
+    try:
+        addrs_a = await _wait_for_addrs(svc_a.host)
+        addrs_b = await _wait_for_addrs(svc_b.host)
+        addrs_c = await _wait_for_addrs(svc_c.host)
+
+        peer_info_c = PeerInfo(svc_c.host.get_id(), addrs_c)
+        svc_a.host.get_peerstore().add_addrs(peer_info_c.peer_id, peer_info_c.addrs, 60)
+        await svc_a.host.connect(peer_info_c)
+        await svc_a._opportunistic_seed_peer(str(peer_info_c.peer_id), peer_info_c.addrs)
+        await trio.sleep(0.1)
+        await svc_a._dht.routing_table.add_peer(peer_info_c)
+        provider_key = "block:handshake"
+        svc_a._dht.provider_store.add_provider(provider_key.encode(), peer_info_c)
+
+        original_payload = svc_a._build_handshake_payload
+        recorded_payload: Dict[str, Any] = {}
+
+        def instrumented_payload():
+            payload = original_payload()
+            recorded_payload["last"] = payload
+            return payload
+
+        monkeypatch.setattr(svc_a, "_build_handshake_payload", instrumented_payload)
+
+        original_find = svc_b._dht.peer_routing.find_peer
+        lookup_ids: List[ID] = []
+
+        async def instrumented_find(peer_id):
+            lookup_ids.append(peer_id)
+            return await original_find(peer_id)
+
+        monkeypatch.setattr(svc_b._dht.peer_routing, "find_peer", instrumented_find)
+
+        svc_a.host.get_peerstore().add_addrs(svc_b.host.get_id(), addrs_b, 60)
+        svc_b.host.get_peerstore().add_addrs(svc_a.host.get_id(), addrs_a, 60)
+        await svc_a._perform_handshake(svc_b.host.get_id())
+
+        advertised_payload = recorded_payload.get("last", {})
+        advertised_peers = advertised_payload.get("dht_peers", [])
+        assert any(entry.get("peer_id") == str(svc_c.host.get_id()) for entry in advertised_peers)
+        advertised_providers = advertised_payload.get("dht_providers", [])
+        assert any(entry.get("key") == provider_key for entry in advertised_providers)
+
+        with trio.fail_after(3):
+            while True:
+                try:
+                    known = svc_b.host.get_peerstore().addrs(svc_c.host.get_id())
+                    if known:
+                        break
+                except PeerStoreError:
+                    pass
+                await trio.sleep(0.05)
+
+        provider_snapshot = getattr(svc_b._dht.provider_store, "providers", {})
+        assert any(entry_key == provider_key.encode() for entry_key in provider_snapshot.keys())
+        assert any(str(peer_id) == str(svc_c.host.get_id()) for peer_id in lookup_ids)
+    finally:
+        await svc_c.stop()
+        await svc_b.stop()
+        await svc_a.stop()
+
+
+async def test_peer_advertisement_gossip(monkeypatch):
+    from network.config import NetworkConfig
+    from network.protocols import TAU_GOSSIP_TOPIC_PEERS
+    from network.service import NetworkService
+
+    cfg = NetworkConfig(
+        network_id="adnet",
+        genesis_hash="genesis",
+        listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
+        dht_handshake_max_peers=0,
+        dht_handshake_max_providers=8,
+        peer_advertisement_interval=0.2,
+        peer_advertisement_max_peers=4,
+    )
+
+    svc_a = NetworkService(cfg)
+    svc_b = NetworkService(cfg)
+    svc_c = NetworkService(cfg)
+
+    await svc_a.start()
+    await svc_b.start()
+    await svc_c.start()
+    try:
+        addrs_a = await _wait_for_addrs(svc_a.host)
+        addrs_b = await _wait_for_addrs(svc_b.host)
+        addrs_c = await _wait_for_addrs(svc_c.host)
+
+        peer_info_c = PeerInfo(svc_c.host.get_id(), addrs_c)
+        await svc_a._opportunistic_seed_peer(str(peer_info_c.peer_id), peer_info_c.addrs)
+        svc_a._dht.provider_store.add_provider(b"block:advert", peer_info_c)
+
+        svc_b.host.get_peerstore().add_addrs(svc_a.host.get_id(), addrs_a, 60)
+        await svc_b.host.connect(PeerInfo(svc_a.host.get_id(), addrs_a))
+
+        original_find = svc_b._dht.peer_routing.find_peer
+        lookup_ids: List[ID] = []
+
+        async def instrumented_find(peer_id):
+            lookup_ids.append(peer_id)
+            return await original_find(peer_id)
+
+        monkeypatch.setattr(svc_b._dht.peer_routing, "find_peer", instrumented_find)
+
+        advertisement_seen = trio.Event()
+
+        captured_payload: Dict[str, Any] = {}
+
+        async def peer_handler(envelope):
+            if envelope.get("topic") == TAU_GOSSIP_TOPIC_PEERS:
+                captured_payload["payload"] = envelope.get("payload")
+                advertisement_seen.set()
+
+        svc_b.subscribe_gossip("*", peer_handler)
+
+        with trio.fail_after(5):
+            await advertisement_seen.wait()
+
+        with trio.fail_after(2):
+            while True:
+                try:
+                    known = svc_b.host.get_peerstore().addrs(svc_c.host.get_id())
+                    if known:
+                        break
+                except PeerStoreError:
+                    pass
+                await trio.sleep(0.05)
+
+        provider_snapshot = getattr(svc_b._dht.provider_store, "providers", {})
+        assert any(key == b"block:advert" for key in provider_snapshot.keys())
+        assert any(str(peer_id) == str(svc_c.host.get_id()) for peer_id in lookup_ids)
+    finally:
+        await svc_c.stop()
+        await svc_b.stop()
+        await svc_a.stop()
 
 
 async def test_gossip_dht_multi_hop_routing(monkeypatch):

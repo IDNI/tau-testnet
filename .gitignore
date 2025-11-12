@@ -3,8 +3,6 @@
 /tmp/
 /venv/
 /_old.git/
-/android/build/
-/scripts
 
 # Logs
 logs
@@ -29,13 +27,9 @@ node_modules/
 *.sln
 *.sw?
 
-# OS specific
-.DS_Store
-
-# Task files
-# tasks.json
-# tasks/ 
-/scripts/
+# Temprorary files
+docs/*.md
+*.txt
 
 # Python
 __pycache__/
@@ -53,7 +47,6 @@ pip-delete-this-directory.txt
 nosetests.xml
 coverage.xml
 *.cover
-*.log
 .pytest_cache/
 
 # Database files
