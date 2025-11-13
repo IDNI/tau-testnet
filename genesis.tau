@@ -1,0 +1,11 @@
+tau i0 = console.
+
+(
+    (!(i0[t] = 0)) # Check if rule proposal data is present
+    ? ( # --- Process Rule Proposal from i0[t] ---
+        u[t] = i0[t] & { u[t] = i0[t] & { u[t] = i0[t] } } #assign to pointwise revision
+        &&
+        o999[t] = this[t] &&
+        o0[t] = 0
+    ) : o0[t] = 1
+)

@@ -70,7 +70,7 @@ class TestBlockCreation(unittest.TestCase):
     def setUp(self):
         """Set up a temporary database for testing block creation."""
         self.test_db_path = "test_blockchain_db.sqlite"
-        config.STRING_DB_PATH = self.test_db_path
+        config.set_database_path(self.test_db_path)
         init_db()
         
         self.tx1_json = json.dumps({"sender": "a", "recipient": "b", "amount": 10, "operations": {"1": []}})
@@ -86,7 +86,7 @@ class TestBlockCreation(unittest.TestCase):
         if os.path.exists(self.test_db_path):
             os.remove(self.test_db_path)
         # Restore original db path if needed elsewhere
-        config.STRING_DB_PATH = config.DEFAULT_PROD_DB_PATH
+        config.set_database_path(config.DEFAULT_PROD_DB_PATH)
 
     def test_genesis_block_creation(self):
         """Test creating the first block (genesis block) from the mempool."""

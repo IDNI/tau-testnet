@@ -1,7 +1,7 @@
 
 
 import unittest, os, sys, json, time, hashlib
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from py_ecc.bls import G2Basic as bls
 
 # Add project root
@@ -118,3 +118,20 @@ class TestSendTxBasic(unittest.TestCase):
         self.assertEqual(chain_state.get_balance(GENESIS), 10)
         self.assertEqual(chain_state.get_balance(ADDR_A), 0)
         self.assertEqual(len(db.get_mempool_txs()), 0)
+
+    def test_queue_transaction_notifies_network_bus(self):
+        tx_json = self._create_tx([[GENESIS, ADDR_A, "1"]])
+        canonical = json.dumps(json.loads(tx_json), sort_keys=True, separators=(",", ":"))
+
+        mock_service = Mock()
+        with patch('commands.sendtx.network_bus.get', return_value=mock_service):
+            result = sendtx.queue_transaction(tx_json)
+
+        self.assertTrue(result.startswith("SUCCESS"))
+        self.assertTrue(mock_service.broadcast_transaction.called)
+        args, kwargs = mock_service.broadcast_transaction.call_args
+        self.assertEqual(len(args), 2)
+        payload_arg, message_id_arg = args
+        self.assertEqual(payload_arg, canonical)
+        self.assertIsInstance(message_id_arg, str)
+        self.assertEqual(len(message_id_arg), 64)

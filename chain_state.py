@@ -22,15 +22,20 @@ _rules_lock = threading.Lock()
 _current_rules_state = ""
 _last_processed_block_hash = ""
 
+# Genesis address and balance used across tests and reconstruction
 GENESIS_ADDRESS = "91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6"
-GENESIS_BALANCE = 15
-# Private Key (integer): 8054597235389493115102853815869281665959971363731141151742872399797457604361
+GENESIS_BALANCE = 1234567890
+# Alice
 # Private Key (hex, 32 bytes): 11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09
 # Public Key (hex, 48 bytes, G1 compressed): 91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6
 
-# Private Key (integer): 3046806499649528081017455507187410877623448292955181009054900221062259370659
+# Bob
 # Private Key (hex, 32 bytes): 06bc6e6e15a4b40df028da6901e471fa1facc5e9fad04408ab864c7ccb036aa3
 # Public Key (hex, 48 bytes, G1 compressed): 893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2
+
+# Charlie
+# Private Key (hex, 32 bytes): 856a44bee7630b40c4f91576037c8eebb729af956c608e447aa7afd6c80c3d45
+# Public Key (hex, 48 bytes, G1 compressed): 82c43817d598d9bcfdad9f9e514d2a9105fd62b368faace355cb3e130431ed3798408d8634633284befdb93b0311824f
 
 def rebuild_state_from_blockchain(start_block=0):
     """
@@ -236,10 +241,10 @@ def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, a
 
     with _balance_lock:
         current_from_balance = _balances.get(from_address_hex, 0)
-        
-        # This check should be redundant if Python pre-validation + Tau validation occurred
+
+        # Enforce sufficient funds during balance updates to avoid negative balances
         if current_from_balance < amount:
-            print(f"[ERROR][chain_state] Insufficient funds for {from_address_hex[:10]}... to send {amount}. Has: {current_from_balance}. THIS SHOULD NOT HAPPEN IF PRE-VALIDATED.")
+            print(f"[ERROR][chain_state] Insufficient funds for {from_address_hex[:10]}... to send {amount}. Has: {current_from_balance}.")
             return False
 
         current_to_balance = _balances.get(to_address_hex, 0)

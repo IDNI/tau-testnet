@@ -2,14 +2,17 @@ import utils
 import json
 import sbf_defs
 from db import get_mempool_txs
+import logging
+
+logger = logging.getLogger(__name__)
 
 def encode_command(command_parts):
     """Encodes the getMempool command (01) into an SBF atom."""
-    print("  [DEBUG][getmempool] Encoding getMempool command.")
-    # Command 10 from tool_code.tau logic
+    logger.debug("Encoding getMempool command.")
+    # Command 10 from genesis.tau logic
     bit_pattern = "10" + "0" * 9
     sbf_atom = utils.bits_to_sbf_atom(bit_pattern)
-    print(f"  [DEBUG][getmempool] Encoded SBF for Tau: '{sbf_atom}'")
+    logger.debug(f"Encoded SBF for Tau: {sbf_atom}")
     return sbf_atom
 
 def decode_output(output_sbf_str, original_input_sbf_str):
@@ -18,17 +21,17 @@ def decode_output(output_sbf_str, original_input_sbf_str):
     Returns True on expected success output, False otherwise.
     """
     output_sbf_str = output_sbf_str.strip()
-    print(f"  [DEBUG][getmempool] Decoding Tau output: '{output_sbf_str}'")
-    print(f"  [DEBUG][getmempool] Expecting success code: '{sbf_defs.CODE_X2000_SBF}'")
+    logger.debug(f"Decoding Tau output: {output_sbf_str}")
+    logger.debug(f"Expecting success code: {sbf_defs.CODE_X2000_SBF}")
 
     if output_sbf_str == sbf_defs.CODE_X2000_SBF:
-        print("  [DEBUG][getmempool] Matched CODE_X2000_SBF.")
+        logger.debug("Matched CODE_X2000_SBF.")
         return True # Indicate success
     elif output_sbf_str == sbf_defs.SBF_ZERO:
-         print(f"  [DEBUG][getmempool] Matched SBF_ZERO -> Generic Failure.")
+         logger.debug("Matched SBF_ZERO -> Generic Failure.")
          return False # Indicate failure
     else:
-        print(f"  [DEBUG][getmempool] Output '{output_sbf_str}' did not match known codes.")
+        logger.debug(f"Output {output_sbf_str} did not match known codes.")
         return False # Indicate unexpected output / failure
 
 def handle_result(decoded_success, sbf_input, mempool_state):

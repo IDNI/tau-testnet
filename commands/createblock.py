@@ -157,23 +157,26 @@ def handle_result(decoded: str, sbf_input: str, mempool_state: Dict) -> str:
     """
     try:
         block_data = create_block_from_mempool()
-        
+        if not block_data or "block_hash" not in block_data:
+            message = block_data.get("message") if isinstance(block_data, dict) else "Mempool is empty. No block created."
+            return message
+
         # Return a detailed summary of the created block
         tx_count = len(block_data["transactions"])
         block_hash = block_data["block_hash"]
         block_number = block_data["header"]["block_number"]
         merkle_root = block_data["header"]["merkle_root"]
         timestamp = block_data["header"]["timestamp"]
-        
+
         result = f"SUCCESS: Block #{block_number} created successfully!\n"
         result += f"  - Transactions: {tx_count}\n"
         result += f"  - Block Hash: {block_hash}\n"
         result += f"  - Merkle Root: {merkle_root}\n"
         result += f"  - Timestamp: {timestamp}\n"
         result += f"  - Mempool cleared"
-        
+
         return result
-        
+
     except Exception as e:
         print(f"[ERROR][createblock] Block creation failed: {e}")
         return f"ERROR: Failed to create block: {e}" 

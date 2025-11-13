@@ -8,6 +8,20 @@ The architecture is designed around the principle of extralogical processing. Th
 ## Features
 
 *   **TCP Server**: Handles client connections and commands.
+*   **P2P Networking (libp2p shim)**:
+    *   Protocols (all implemented on the libp2p shim):
+        - `TAU_PROTOCOL_HANDSHAKE` (`/tau/handshake/1.0.0`): Exchange node info and current tip.
+        - `TAU_PROTOCOL_PING` (`/tau/ping/1.0.0`): Latency/keepalive round-trip with a nonce.
+        - `TAU_PROTOCOL_SYNC` (`/tau/sync/1.0.0`): Header/tip synchronization with locator/stop/limit semantics.
+        - `TAU_PROTOCOL_BLOCKS` (`/tau/blocks/1.0.0`): Serve block bodies by hash list or by range (`from`/`from_number` + `limit`).
+        - `TAU_PROTOCOL_STATE` (`/tau/state/1.0.0`): Fetch the latest known block metadata alongside requested account/receipt data.
+        - `TAU_PROTOCOL_TX` (`/tau/tx/1.0.0`): Compatibility channel for submitting transactions, which queues locally and re-broadcasts over gossipsub.
+        - `TAU_PROTOCOL_GOSSIP` (`/tau/gossip/1.0.0`): Gossipsub-style transport used for topic-based dissemination.
+    *   Gossip topics:
+        - `tau/blocks/1.0.0`: Propagates new headers/tip summaries prior to full sync.
+        - `tau/transactions/1.0.0`: Propagates canonical, signed transactions across the mesh.
+    *   Bootstrapping connects to peers, performs handshake + sync, fetches missing blocks, rebuilds state, and replays gossip subscriptions so the node immediately participates in block/transaction mesh traffic.
+    *   Verbose debug logging traces requests/responses and bootstrap progress for easier development.
 *   **Persistent Blockchain**:
     *   Creates blocks from transactions stored in the mempool.
     *   Links blocks together in a chain by referencing the previous block's hash.
@@ -30,11 +44,26 @@ The architecture is designed around the principle of extralogical processing. Th
             *   For transfers in `operations["1"]`, the `from_pubkey` of each transfer must match the top-level `sender_pubkey`.
         *   `fee_limit` (string/integer): Placeholder for future fee models.
         *   `signature` (string): Hex-encoded BLS signature over a canonical form of the other fields.
-*   **Tau Integration for Operation Validation**: The `tool_code.tau` program validates the logic of operations within a transaction (e.g., coin transfers via SBF). This now includes robust structural validation to ensure transfer data is complete and well-formed.
+*   **Tau Integration for Operation Validation**: The `genesis.tau` program validates the logic of operations within a transaction (e.g., coin transfers via SBF). This now includes robust structural validation to ensure transfer data is complete and well-formed.
 *   **String-to-ID Mapping**: Dynamically assigns `y<ID>` identifiers for Tau SBF.
 *   **In-Memory Balances & Sequence Numbers**: Tracks account balances and sequence numbers for rapid validation.
 *   **SQLite Mempool**: Persists transactions awaiting inclusion in a block.
 *   **BLS12-381 Public Key Validation**: Format and optional cryptographic checks for public keys.
+
+### DHT Configuration & Gossip Health
+
+The libp2p-based DHT layer now exposes several runtime knobs through `NetworkConfig`:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `dht_refresh_interval` | `60.0` | Seconds between background calls to `KadDHT.refresh_routing_table`. |
+| `dht_bucket_refresh_interval` | `dht_refresh_interval` | Interval for opportunistic stale peer refresh/eviction. |
+| `dht_bucket_refresh_limit` | `8` | Maximum stale peers revalidated per cycle. |
+| `dht_stale_peer_threshold` | `3600.0` | Age (seconds) before a peer is considered stale. |
+| `dht_opportunistic_cooldown` | `120.0` | Minimum time between reseeding the same peer discovered via gossip/handshake. |
+| `gossip_health_window` | `120.0` | Sliding window used by `get_metrics_snapshot()` to flag gossip as healthy/stale. |
+
+Call `NetworkService.get_metrics_snapshot()` (or read the periodic `[metrics]` log line) to monitor gossip activity, routing table counts, and bucket refresh results.
 
 ## Setup and Running
 
@@ -58,8 +87,8 @@ The architecture is designed around the principle of extralogical processing. Th
     source venv/bin/activate 
     pip install py_ecc
     ```
-3.  **Ensure `tool_code.tau` is Present:**
-    Place your `tool_code.tau` file in the location specified by `config.TAU_PROGRAM_FILE` (defaults to the project root).
+3.  **Ensure `genesis.tau` is Present:**
+    Place your `genesis.tau` file in the location specified by `config.TAU_PROGRAM_FILE` (defaults to the project root).
 
 4.  **Ensure Tau Docker Image:**
     Make sure the Docker image specified in `config.TAU_DOCKER_IMAGE` (default: `tau`) is available.
@@ -69,6 +98,18 @@ The architecture is designed around the principle of extralogical processing. Th
     python server.py 
     ```
     The server will initialize the database and manage the Tau Docker process.
+
+6.  **Optional: Configure Bootstrap Peers**
+    Edit `config.py` to point at one or more peers to sync from:
+    ```py
+    BOOTSTRAP_PEERS = [
+        {
+            "peer_id": "<REMOTE_NODE_ID>",
+            "addrs": ["/ip4/127.0.0.1/tcp/12345"]
+        },
+    ]
+    ```
+    On start, the node will connect, handshake, sync headers, request missing block bodies, and rebuild its state.
 
 ### Connecting to the Server
 
@@ -86,12 +127,13 @@ netcat 127.0.0.1 65432
     *   `getmempool.py`: Retrieves mempool content.
     *   `createblock.py`: Creates new blocks from mempool transactions.
 *   **`db.py`**: SQLite database interface, managing the mempool, string-to-ID mappings, and persistent block storage.
+*   **`network/`**: P2P protocols and service implementation (`handshake`, `ping`, `sync`, `blocks`, `tx`).
 *   **`chain_state.py`**: Manages in-memory state (account balances, sequence numbers).
 *   **`sbf_defs.py`**: Symbolic Boolean Formula (SBF) constants for Tau communication.
 *   **`utils.py`**: Utilities for SBF, data conversions, and transaction message canonicalization.
 *   **`config.py`**: Centralized configuration.
 *   **`block.py`**: Defines block data structures (block header, transactions list) and merkle root computation.
-*   **`tool_code.tau`**: The Tau logic program for validating operations, including structural checks on transaction data and logic for applying new rules via pointwise revision.
+*   **`genesis.tau`**: The Tau logic program for validating operations, including structural checks on transaction data and logic for applying new rules via pointwise revision.
 *   **`wallet.py`**: Command-line wallet interface for interacting with the Tau node (see `WALLET_USAGE.md` for comprehensive usage guide).
 *   **`rules/`**: Directory containing Tau rule files:
     *   `01_handle_insufficient_funds.tau`: Logic for handling insufficient fund scenarios.
@@ -101,11 +143,13 @@ netcat 127.0.0.1 65432
     - `test_sendtx_tx_meta.py`: Transaction metadata handling tests.
     - `test_sendtx_crypto.py`: Cryptographic signature verification tests.
     - `test_sendtx_sequential.py`: Sequential multi-operation transaction tests.
-    - `test_tau_logic.py`: Tests all logic paths and validation rules directly within `tool_code.tau`.
+    - `test_tau_logic.py`: Tests all logic paths and validation rules directly within `genesis.tau`.
     - `test_chain_state.py`: Tests balance and sequence number management.
     - `test_block.py`: Tests the block data structure and the persistent block creation/chaining logic.
     - `test_persistent_chain_state.py`: Tests for persistent chain state management (currently skipped).
     - `test_state_reconstruction.py`: Tests for state reconstruction from blockchain data.
+    - `test_p2p.py`: Connectivity and custom protocol round-trip using libp2p shim.
+    - `test_network_protocols.py`: End-to-end tests for Tau protocols (handshake, ping, sync, blocks, state, tx, gossip). Coverage includes header sync, transaction gossip, subscription handling, DHT routing-table refresh, gossip health metrics, opportunistic peer seeding, and multi-hop gossip propagation driven solely by KadDHT lookups.
 
 ## Console Wallet
 
@@ -187,7 +231,7 @@ The `block.py` module provides the `Block` and `BlockHeader` classes, along with
 ## Known Issues / Notes
 
 *   The fee model (`fee_limit`) is a placeholder and not yet enforced.
-*   The chain state (balances, sequence numbers) is updated in memory *before* a transaction is included in a block. A server crash between transaction validation and block creation could lead to a state inconsistency.
+*   Gossipsub topics (`tau/blocks/1.0.0`, `tau/transactions/1.0.0`) must be subscribed to by peers that expect block or transaction updates.
 
 ## Project Status
 
@@ -195,9 +239,8 @@ The `block.py` module provides the `Block` and `BlockHeader` classes, along with
 
 ## Future Work
 
-*   Implement a fee model.
-*   Reconcile in-memory chain state with the persistent block data to enhance fault tolerance.
+*   Fork choice mechanism.
+*   Expansion of Tau logic.
+*   Full consensus mechanism implementation.
 *   More robust error handling and reporting.
-*   Expansion of Tau-validated logic and commands.
-*   Implementation of a simple P2P networking layer for node synchronization.
 *   More comprehensive unit and integration tests.

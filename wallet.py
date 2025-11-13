@@ -185,22 +185,25 @@ def cmd_send(args):
 
 def main():
     parser = argparse.ArgumentParser(prog="wallet", description="Tau Testnet Alpha Console Wallet")
-    parser.add_argument("--host", default=config.HOST, help="Node host")
-    parser.add_argument("--port", type=int, default=config.PORT, help="Node port")
+    # Common options allowed after the subcommand as well
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--host", default=config.HOST, help="Node host")
+    common.add_argument("--port", type=int, default=config.PORT, help="Node port")
+
     sub = parser.add_subparsers(dest="command", required=True)
-    p_new = sub.add_parser("new", help="Generate new BLS keypair")
+    p_new = sub.add_parser("new", help="Generate new BLS keypair", parents=[common])
     p_new.set_defaults(func=cmd_new)
-    p_bal = sub.add_parser("balance", help="Query account balance")
+    p_bal = sub.add_parser("balance", help="Query account balance", parents=[common])
     gb = p_bal.add_mutually_exclusive_group(required=True)
     gb.add_argument("--privkey", "-k", help="Private key (hex or decimal)")
     gb.add_argument("--address", "-a", help="Public key hex")
     p_bal.set_defaults(func=cmd_balance)
-    p_hist = sub.add_parser("history", help="List transaction history")
+    p_hist = sub.add_parser("history", help="List transaction history", parents=[common])
     gh = p_hist.add_mutually_exclusive_group(required=True)
     gh.add_argument("--privkey", "-k", help="Private key (hex or decimal)")
     gh.add_argument("--address", "-a", help="Public key hex")
     p_hist.set_defaults(func=cmd_history)
-    p_send = sub.add_parser("send", help="Send a transaction")
+    p_send = sub.add_parser("send", help="Send a transaction", parents=[common])
     p_send.add_argument("--privkey", "-k", required=True, help="Private key (hex or decimal)")
     
     # Simple transfer options (backwards compatibility)
@@ -219,7 +222,7 @@ def main():
     p_send.set_defaults(func=cmd_send)
     
     # Create block command
-    p_createblock = sub.add_parser("createblock", help="Create a new block from mempool")
+    p_createblock = sub.add_parser("createblock", help="Create a new block from mempool", parents=[common])
     p_createblock.set_defaults(func=cmd_createblock)
     
     args = parser.parse_args()

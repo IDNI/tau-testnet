@@ -1,0 +1,16 @@
+#((i1[t] <= ({x8 & x12 | x8' & x12'}:sbf & {x9 & x13 | x9' & x13'}:sbf
+ & {x10 & x14 | x10' & x14'}:sbf & {x11 & x15 | x11' & x15'}:sbf)) ? (o1[t] = 0) : (o1[t] = i1[t]))
+# --- VALIDITY CHECK 2: Source Address == Destination Address ---
+# This rule checks if the source and destination addresses are identical.
+# It outputs its result as a boolean flag to the dedicated stream o3[t].
+#
+# Streams (Input):
+# i3[t]: Source address (bitvector).
+# i4[t]: Destination address (bitvector).
+# Streams (Output):
+# o3[t]: Validity flag. #b1 (true) if check passes, #b0 (false) if it fails.
+#
+# Logic:
+# If source == destination, the check fails (output #b0).
+# Otherwise, the check passes (output #b1).
+always ((i3[t] = i4[t]) ? o3[t] = #b0 : o3[t] = #b1).

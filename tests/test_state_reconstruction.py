@@ -44,7 +44,7 @@ class TestStateReconstruction(unittest.TestCase):
         
         # Configure the database path for testing
         self.original_db_path = config.STRING_DB_PATH
-        config.STRING_DB_PATH = self.temp_db_path
+        config.set_database_path(self.temp_db_path)
         
         # Clear any existing module state
         if hasattr(chain_state, '_balances'):
@@ -70,7 +70,7 @@ class TestStateReconstruction(unittest.TestCase):
             except Exception:
                 pass
         # Restore original database path
-        config.STRING_DB_PATH = self.original_db_path
+        config.set_database_path(self.original_db_path)
         
         # Close database connections if they exist
         import db
@@ -266,11 +266,8 @@ class TestStateReconstruction(unittest.TestCase):
             # -------- Rebuild & Assertions --------
             rebuild_state_from_blockchain()
 
-            # Expected balances after all transactions:
-            #   addr1: 15 - (4+3+3) + 1 + (2+1) = 9
-            #   addr2: 0  + (4+3) - (2+1+3) + 2 = 3
-            #   addr3: 0  + 3 + (2+3) - (2+2+1) = 3
-            self.assertEqual(get_balance(self.addr1), 9)
+            # Expected balances after all transactions (net change -6 for addr1).
+            self.assertEqual(get_balance(self.addr1), GENESIS_BALANCE - 6)
             self.assertEqual(get_balance(self.addr2), 3)
             self.assertEqual(get_balance(self.addr3), 3)
 
@@ -293,11 +290,11 @@ class TestStateReconstruction(unittest.TestCase):
             transfers=[[self.addr1, self.addr2, "5"]]
         )
         
-        # Invalid transaction: insufficient funds
+        # Invalid transaction: insufficient funds (amount exceeds remaining balance)
         invalid_tx = self.create_test_transaction(
             sender_pubkey=self.addr1,
             sequence_number=1,
-            transfers=[[self.addr1, self.addr3, "20"]]  # More than genesis balance
+            transfers=[[self.addr1, self.addr3, str(GENESIS_BALANCE + 100)]]
         )
         
         # Transaction with invalid amount format
@@ -318,7 +315,7 @@ class TestStateReconstruction(unittest.TestCase):
         rebuild_state_from_blockchain()
         
         # Only the valid transaction should have been processed
-        self.assertEqual(get_balance(self.addr1), GENESIS_BALANCE - 5)  # 10
+        self.assertEqual(get_balance(self.addr1), GENESIS_BALANCE - 5)
         self.assertEqual(get_balance(self.addr2), 5)
         self.assertEqual(get_balance(self.addr3), 0)  # Invalid transfers should be ignored
         
@@ -330,7 +327,7 @@ class TestStateReconstruction(unittest.TestCase):
         print("\n=== Testing state consistency between live and reconstructed state ===")
         
         # Set up initial state manually (simulating live processing)
-        chain_state._balances[self.addr1] = 8
+        chain_state._balances[self.addr1] = GENESIS_BALANCE - 7
         chain_state._balances[self.addr2] = 4
         chain_state._balances[self.addr3] = 3
         chain_state._sequence_numbers[self.addr1] = 2
