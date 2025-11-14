@@ -5,6 +5,10 @@
 This project is the codebase for the Tau Testnet Alpha Blockchain. Its primary goal is to provide a live, working demonstration of a blockchain where core state transitions and rules are governed by Tau's formal logic.
 The architecture is designed around the principle of extralogical processing. The core engine, written in Python, handles networking, storage, and any operations not yet implemented in pure Tau logic, such as cryptographic signature verification. This engine prepares transactions and validates them against a separate Tau logic program (executed via Docker), which serves as the ultimate arbiter of the chain's rules. This hybrid model allows us to build a robust and feature-complete testnet today, showcasing the power of Tau's logical core while providing all the necessary functions for a working blockchain.
 
+## Tau Execution Mode
+Tau logic is fully integrated into the blockchain pipeline, but runtime evaluation is currently disabled by default through the TAU_FORCE_FAKE switch. When this flag is enabled, the node bypasses real Tau logic execution and uses a deterministic “fake” validator path instead. This allows development and debugging without requiring a running Tau Docker instance.
+To enable true Tau-driven validation, unset TAU_FORCE_FAKE in your environment or configuration.
+
 ## Features
 
 *   **TCP Server**: Handles client connections and commands.
@@ -232,6 +236,10 @@ The `block.py` module provides the `Block` and `BlockHeader` classes, along with
 
 *   The fee model (`fee_limit`) is a placeholder and not yet enforced.
 *   Gossipsub topics (`tau/blocks/1.0.0`, `tau/transactions/1.0.0`) must be subscribed to by peers that expect block or transaction updates.
+
+## Submitting issues
+
+Please submit issues at the following link: [Tau Testnet issues](https://github.com/IDNI/tau-lang/issues)
 
 ## Project Status
 
