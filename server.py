@@ -227,7 +227,7 @@ def handle_client(conn, addr, container: ServiceContainer):
                     continue
 
                 try:
-                    sbf_input = handler.encode_command(parts)
+                    tau_input = handler.encode_command(parts)
                 except Exception as exc:
                     logger.exception("Encoding command %s failed for %s", command_name, client_label)
                     conn.sendall(f"ERROR: {exc}".encode('utf-8'))
@@ -239,9 +239,9 @@ def handle_client(conn, addr, container: ServiceContainer):
                     continue
 
                 try:
-                    sbf_output = tau_module.communicate_with_tau(sbf_input)
-                    decoded = handler.decode_output(sbf_output, sbf_input)
-                    result_message = handler.handle_result(decoded, sbf_input, mempool_state)
+                    tau_output = tau_module.communicate_with_tau(tau_input)
+                    decoded = handler.decode_output(tau_output, tau_input)
+                    result_message = handler.handle_result(decoded, tau_input, mempool_state)
                 except TimeoutError:
                     logger.error("Timeout communicating with Tau for %s", client_label)
                     result_message = "ERROR: Timeout communicating with Tau process."

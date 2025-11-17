@@ -73,7 +73,7 @@ def configure(logging_settings: Optional[Any] = None, *, force: bool = True) -> 
         "chain_state",
         "db",
         "block",
-        "sbf_defs",
+        "tau_defs",
         "utils",
         "tau_manager",
         "server",

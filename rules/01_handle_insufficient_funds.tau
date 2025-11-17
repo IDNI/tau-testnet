@@ -12,4 +12,4 @@
 # Logic:
 # If amount > balance, the check fails (output #b0).
 # Otherwise, the check passes (output #b1).
-always ((i1[t] > i2[t]) ? o2[t] = #b0 : o2[t] = #b1).
+always ((i1[t] : bv > i2[t]) ? o2[t] = { #b0 }:bv : o2[t] = { #b1 }:bv).

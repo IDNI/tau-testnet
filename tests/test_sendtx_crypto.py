@@ -11,7 +11,7 @@ if project_root not in sys.path:
 os.environ["TAU_DB_PATH"] = "test_tau_string_db.sqlite"
 
 from commands import sendtx
-import chain_state, db, sbf_defs, utils
+import chain_state, db, tau_defs, utils
 from commands.sendtx import _get_signing_message_bytes
 
 GENESIS = chain_state.GENESIS_ADDRESS
@@ -27,25 +27,40 @@ class TestSendTxCrypto(unittest.TestCase):
             db._db_conn.close(); db._db_conn = None
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.init_chain_state()
-        def mock_tau_response(input_sbf, target_output_stream_index=1):
+        def mock_tau_response(rule_text, target_output_stream_index=1, input_stream_values=None):
             # New bitvector model: return boolean on o1
             if target_output_stream_index == 0:
-                return sbf_defs.ACK_RULE_PROCESSED
-            lines = input_sbf.strip().split('\n')
+                return tau_defs.ACK_RULE_PROCESSED
+            parts = rule_text.strip().split('\n') if rule_text else []
+
+            def _resolve(idx, default):
+                value_str = None
+                if input_stream_values and idx in input_stream_values:
+                    stream_value = input_stream_values[idx]
+                    if isinstance(stream_value, (list, tuple)):
+                        stream_value = stream_value[0] if stream_value else None
+                    if stream_value is not None:
+                        value_str = str(stream_value)
+                elif len(parts) >= idx:
+                    value_str = parts[idx - 1]
+                if value_str is None or value_str == "":
+                    return default
+                return int(value_str)
+
             try:
-                amount = int(lines[0]) if len(lines) > 0 else 0
-                balance = int(lines[1]) if len(lines) > 1 else 0
-                from_id = int(lines[2]) if len(lines) > 2 else -1
-                to_id = int(lines[3]) if len(lines) > 3 else -2
-            except ValueError:
-                return sbf_defs.SBF_LOGICAL_ZERO
+                amount = _resolve(1, 0)
+                balance = _resolve(2, 0)
+                from_id = _resolve(3, -1)
+                to_id = _resolve(4, -2)
+            except (TypeError, ValueError):
+                return tau_defs.TAU_VALUE_ZERO
             if amount <= 0:
-                return sbf_defs.SBF_LOGICAL_ZERO
+                return tau_defs.TAU_VALUE_ZERO
             if from_id == to_id:
-                return sbf_defs.SBF_LOGICAL_ZERO
+                return tau_defs.TAU_VALUE_ZERO
             if amount > balance:
-                return sbf_defs.SBF_LOGICAL_ZERO
-            return sbf_defs.SBF_LOGICAL_ONE
+                return tau_defs.TAU_VALUE_ZERO
+            return tau_defs.TAU_VALUE_ONE
         self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau', mock_tau_response).start()
 
     def tearDown(self):

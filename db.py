@@ -35,8 +35,8 @@ def init_db():
             ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS mempool (
-                    id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                    sbf  TEXT    NOT NULL
+                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    payload TEXT    NOT NULL
                 );
             ''')
             conn.execute('''
@@ -73,6 +73,12 @@ def init_db():
                     last_seen    INTEGER
                 );
             ''')
+            # Backwards compatibility: older databases used the column name 'sbf'
+            cur = conn.execute("PRAGMA table_info(mempool);")
+            column_names = {row[1] for row in cur.fetchall()}
+            if "payload" not in column_names and "sbf" in column_names:
+                conn.execute('ALTER TABLE mempool RENAME COLUMN sbf TO payload;')
+
     except (sqlite3.Error, OSError) as exc:
         raise DatabaseError(f"Failed to initialize database at {config.STRING_DB_PATH}: {exc}") from exc
 
@@ -131,7 +137,7 @@ def add_mempool_tx(tx_data: str):
         if tx_data.strip().startswith('{') and tx_data.strip().endswith('}'):
             prefix = "json:"
         cur = _db_conn.cursor()
-        cur.execute('INSERT INTO mempool(sbf) VALUES(?)', (prefix + tx_data,))
+        cur.execute('INSERT INTO mempool(payload) VALUES(?)', (prefix + tx_data,))
         _db_conn.commit()
 
 def get_mempool_txs() -> list:
@@ -139,7 +145,7 @@ def get_mempool_txs() -> list:
         init_db()
     with _db_lock:
         cur = _db_conn.cursor()
-        cur.execute('SELECT sbf FROM mempool ORDER BY id')
+        cur.execute('SELECT payload FROM mempool ORDER BY id')
         return [row[0] for row in cur.fetchall()]
 
 def clear_mempool():

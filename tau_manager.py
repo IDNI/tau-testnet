@@ -7,10 +7,16 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
+
+# ANSI color codes for debug output
+COLOR_BLUE = "\033[94m"
+COLOR_YELLOW = "\033[93m"
+COLOR_RESET = "\033[0m"
 
 # Import shared state and config
 import config
-import sbf_defs
+import tau_defs
 import utils
 from errors import TauCommunicationError, TauProcessError
 
@@ -23,7 +29,7 @@ tau_process_lock = threading.Lock()
 tau_ready = threading.Event()  # Signals when Tau process has printed the ready signal
 server_should_stop = threading.Event()  # Signals background threads to stop
 tau_stderr_lines = queue.Queue(maxsize=100)  # Store recent stderr lines
-tau_fake_mode = False  # When True, simulate Tau responses without Docker
+tau_test_mode = False  # When True, simulate Tau responses without Docker
 
 def read_stderr():
     """
@@ -49,7 +55,7 @@ def read_stderr():
                 line_strip = line.strip()
                 if line_strip:
                     # Print live stderr output
-                    logger.error("[TAU_STDERR_LIVE] %s", line_strip)
+                    logger.info(f"{COLOR_YELLOW}[TAU_STDERR] %s{COLOR_RESET}", line_strip)
                     # Store in queue (optional, keep for potential later inspection)
                     try:
                         tau_stderr_lines.put_nowait(line_strip)
@@ -78,16 +84,16 @@ def start_and_manage_tau_process():
     and monitors it. Runs in a loop attempting restarts until server_should_stop is set.
     """
     # Access global state safely
-    global tau_process, tau_ready, server_should_stop, tau_process_lock, tau_fake_mode
+    global tau_process, tau_ready, server_should_stop, tau_process_lock, tau_test_mode
 
     # Ensure previous stop signals from earlier runs are cleared when starting anew
     server_should_stop.clear()
     tau_ready.clear()
 
-    # Fast path: allow forcing FAKE MODE via environment (default enabled for tests)
-    if os.environ.get("TAU_FORCE_FAKE", "1") == "1":
-        logger.warning("TAU_FORCE_FAKE enabled. Running in FAKE MODE without Docker.")
-        tau_fake_mode = True
+    # Fast path: allow forcing TEST MODE via environment (default disabled for tests)
+    if os.environ.get("TAU_FORCE_TEST", "0") == "1":
+        logger.warning("TAU_FORCE_TEST enabled. Running in TEST MODE without Docker.")
+        tau_test_mode = True
         tau_ready.set()
         # Idle loop until shutdown requested
         while not server_should_stop.is_set():
@@ -187,7 +193,7 @@ def start_and_manage_tau_process():
                     if not line:
                         logger.error("Tau process stdout stream ended before sending ready signal.")
                         break
-                    logger.info("[TAU_STDOUT_INIT] %s", line.strip())
+                    logger.info(f"{COLOR_BLUE}[TAU_STDOUT_INIT] %s{COLOR_RESET}", line.strip())
                     if config.TAU_READY_SIGNAL in line:
                         logger.info("Tau ready signal detected!")
                         tau_ready.set()
@@ -267,17 +273,17 @@ def start_and_manage_tau_process():
         if not ready_signal_found:
             failure_count += 1
 
-        # If we have failed several times, enable fake mode to unblock tests that only need readiness and simple o0 acks
+        # If we have failed several times, enable test mode to unblock tests that only need readiness and simple o0 acks
         if failure_count >= 3 and not server_should_stop.is_set():
-            if not tau_fake_mode:
+            if not tau_test_mode:
                 logger.warning(
-                    "Enabling Tau FAKE MODE after repeated startup failures. Tau responses will be simulated."
+                    "Enabling Tau TEST MODE after repeated startup failures. Tau responses will be simulated."
                 )
-                tau_fake_mode = True
+                tau_test_mode = True
                 tau_ready.set()
 
         # Restart logic (outside finally block)
-        if not server_should_stop.is_set() and not tau_fake_mode:
+        if not server_should_stop.is_set() and not tau_test_mode:
             logger.warning(
                 "Tau process management loop finished for one instance. Waiting 5s before attempting restart."
             )
@@ -286,40 +292,73 @@ def start_and_manage_tau_process():
     logger.info("Server shutdown requested or fatal error, Tau manager thread exiting.")
 
 
-def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 0):
+def communicate_with_tau(
+    rule_text: str | None = None,
+    target_output_stream_index: int = 0,
+    input_stream_values: dict[int | str, str | list[str]] | None = None,
+):
     """
-    Sends an SBF string to the persistent Tau process via stdin
-    and reads the corresponding SBF output from stdout, focusing on a specific output stream.
+    Sends input to the persistent Tau process via stdin and reads the corresponding
+    output from stdout, focusing on a specific output stream.
 
     Args:
-        input_sbf (str): The SBF string to send.
+        rule_text (str | None): Legacy single-stream payload written whenever Tau prompts
+            the stream identified by target_output_stream_index. Primarily used for rule input (i0).
         target_output_stream_index (int): The index of the Tau output stream (e.g., 0 for o0, 1 for o1)
                                          from which to primarily parse the output.
+        input_stream_values (dict | None): Optional mapping of Tau input stream indices to the
+            exact value(s) that should be written when Tau prompts them. Each dict value can be
+            a single string/int or an iterable of such values, which will be consumed in order.
 
     Returns:
-        str: The parsed SBF output line from Tau's stdout from the target output stream.
+        str: The parsed Tau output line from Tau's stdout from the target output stream.
 
     Raises:
         Exception: If Tau process is not running/ready or communication fails/times out.
         TimeoutError: If Tau does not respond within COMM_TIMEOUT.
     """
     global tau_process, tau_process_lock, tau_ready  # Include tau_ready
-    logger.debug("communicate_with_tau(%s, %s)", input_sbf, target_output_stream_index)
+    logger.info(
+        "communicate_with_tau(rule_text=%s, target_output=%s, input_stream_values=%s)",
+        rule_text,
+        target_output_stream_index,
+        input_stream_values,
+    )
+
+    stream_input_queues: dict[int, deque[str]] = {}
+    if input_stream_values:
+        for raw_idx, raw_value in input_stream_values.items():
+            if raw_value is None:
+                continue
+            try:
+                idx = int(raw_idx)
+            except (TypeError, ValueError):
+                logger.debug("communicate_with_tau: Skipping non-integer stream index %s", raw_idx)
+                continue
+
+            if isinstance(raw_value, (list, tuple)):
+                values = [str(v) for v in raw_value if v is not None]
+            else:
+                values = [str(raw_value)]
+
+            if not values:
+                continue
+            stream_input_queues[idx] = deque(values)
 
     # Quick check if ready before locking; allow fake mode to bypass
-    if not tau_ready.is_set() and not tau_fake_mode:
+    if not tau_ready.is_set() and not tau_test_mode:
         raise Exception("Tau process is not ready.")
 
     # If in fake mode, synthesize minimal responses needed by tests
-    if tau_fake_mode:
+    if tau_test_mode:
         # For rule confirmations on o0, return non-zero ack
         if target_output_stream_index == 0:
-            return sbf_defs.ACK_RULE_PROCESSED
+            return tau_defs.ACK_RULE_PROCESSED
         # For transfer validation on o1, return success
         elif target_output_stream_index == 1:
-            return sbf_defs.TRANSACTION_VALIDATION_SUCCESS
+            return tau_defs.TRANSACTION_VALIDATION_SUCCESS
         # For other streams, return logical zero by default
-        return sbf_defs.SBF_LOGICAL_ZERO
+        return tau_defs.TAU_VALUE_ZERO
 
     with tau_process_lock:
         # Double-check process status *after* acquiring lock
@@ -334,29 +373,21 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 0):
             tau_ready.clear()  # Mark as not ready
             raise Exception("Tau process stdin/stdout pipes not available or closed.")
 
-            # Send the input block (including any rule text or SBF atoms) as-is for this step
-            # try:
-            #     if input_sbf.strip():
-            #         logger.debug(
-            #             "communicate_with_tau: Sending input block for step %s:\n%s",
-            #             target_output_stream_index,
-            #             input_sbf,
-            #         )
-            #         current_stdin.write(input_sbf + '\n')
-            #         current_stdin.flush()
-            #     else:
-            #         logger.debug(
-            #             "communicate_with_tau: No data for i%s; awaiting prompt.",
-            #             target_output_stream_index,
-            #         )
-            #
-            # except (OSError, BrokenPipeError, ValueError) as e:
-            #     logger.error("communicate_with_tau: Error writing to Tau stdin: %s", e)
-            #     tau_ready.clear()  # Mark as not ready
-            #     raise Exception(f"Failed to write to Tau process stdin: {e}") from e
-            #
+        def _send_value_to_tau(stream_idx: int, value, reason: str):
+            """Helper that logs and writes a value to Tau's stdin."""
+            value_str = "" if value is None else str(value)
+            logger.info(
+                "communicate_with_tau: Tau prompting on i%s. %s",
+                stream_idx,
+                reason,
+            )
+            for line_part in value_str.split('\n'):
+                logger.info("Sending to Tau (stdin) >>> %s", line_part)
+            current_stdin.write(value_str + '\n')
+            current_stdin.flush()
+
         # Read stdout line by line
-        sbf_output_line = sbf_defs.SBF_LOGICAL_ZERO  # Default if no specific oN output found
+        tau_output_line = tau_defs.TAU_VALUE_ZERO  # Default if no specific oN output found
         output_lines_read = []
         expect_stream_value_for = None  # track which oN prompt we're waiting for
         start_comm_time = time.monotonic()
@@ -364,16 +395,27 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 0):
         error_count = 0  # Track repeated errors to prevent infinite loops
         max_errors = 3  # Maximum number of errors before giving up
         try:
-            while time.monotonic() - start_comm_time < config.COMM_TIMEOUT:
+            while time.monotonic() - start_comm_time < config   .COMM_TIMEOUT:
                 # We may need to wait for Tau to prompt i0[...] := before returning
                 if 'waiting_for_next_i0' not in locals():
                     waiting_for_next_i0 = False
 
                 # Check if process died while we are waiting for output
                 if tau_process.poll() is not None:
-                    logger.error("communicate_with_tau: Tau process exited while waiting for output.")
+                    exit_code = tau_process.poll()
+                    stderr_lines = get_recent_stderr()
+                    logger.error(
+                        "communicate_with_tau: Tau process exited (code %s) while waiting for output.\n"
+                        "Target stream: o%s\n"
+                        "Input was: %r\n"
+                        "Recent stderr: %s",
+                        exit_code,
+                        target_output_stream_index,
+                        rule_text,
+                        "\n".join(stderr_lines)
+                    )
                     tau_ready.clear()
-                    raise Exception("Tau process exited unexpectedly during communication.")
+                    raise Exception(f"Tau process exited unexpectedly (code {exit_code}) during communication.")
 
                 # Read either until newline or until prompt ':=' appears, with debug
                 buf = bytearray()
@@ -423,7 +465,7 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 0):
                 #         continue
 
                 output_lines_read.append(line_strip)
-                logger.debug("[TAU_STDOUT_COMM] %s", line_strip)
+                logger.info(f"{COLOR_BLUE}[TAU_STDOUT] %s{COLOR_RESET}", line_strip)
 
                 # ---- Handle Tau errors ------------------------------------
                 if "(Error)" in line_strip:
@@ -448,11 +490,11 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 0):
                 if expect_stream_value_for is not None:
                     # This line is the value for o{expect_stream_value_for}
                     if expect_stream_value_for == target_output_stream_index:
-                        sbf_output_line = line_strip  # keep only our target
+                        tau_output_line = line_strip  # keep only our target
                         logger.debug(
                             "communicate_with_tau: Captured value for o%s: '%s'",
                             target_output_stream_index,
-                            sbf_output_line,
+                            tau_output_line,
                         )
                         found_target_output = True
                         waiting_for_next_i0 = True  # wait for new i0 prompt
@@ -484,34 +526,21 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 0):
                 prompt_match = re.match(r"^i(\d+)\[[^\]]+\]\s*(:=|=)\s*$", line_strip)
                 if prompt_match:
                     stream_idx = int(prompt_match.group(1))
-                    # If we have queued data for this stream, send the next piece; else send logical zero
 
-                    if stream_idx == target_output_stream_index:
-                        logger.debug(
-                            "communicate_with_tau: Tau prompting on i%s. Sending queued input: '%s'",
-                            stream_idx,
-                            input_sbf,
-                        )
-                        current_stdin.write(input_sbf + '\n')
-                        current_stdin.flush()
-                    else:
-                        # logger.debug(f"  [DEBUG] communicate_with_tau: Tau prompting on i{stream_idx}. "
-                        #         f"No queued input; sending SBF_LOGICAL_ZERO.")
-                        if stream_idx == 0:
-                            logger.error(
-                                "Tau prompting on i%s; sending %s",
-                                stream_idx,
-                                sbf_defs.SBF_LOGICAL_ZERO,
-                            )
-                            current_stdin.write(sbf_defs.SBF_LOGICAL_ZERO + '\n')
-                        else:
-                            logger.error(
-                                "Tau prompting on i%s, sending %s",
-                                stream_idx,
-                                sbf_defs.SBF_LOGICAL_ZERO,
-                            )
-                            current_stdin.write(sbf_defs.SBF_LOGICAL_ZERO + '\n')
-                        current_stdin.flush()
+                    stream_queue = stream_input_queues.get(stream_idx)
+                    if stream_queue:
+                        value_to_send = stream_queue.popleft()
+                        if not stream_queue:
+                            del stream_input_queues[stream_idx]
+                        _send_value_to_tau(stream_idx, value_to_send, "Sending queued per-stream input.")
+                        continue
+
+                    if stream_idx == target_output_stream_index and rule_text is not None:
+                        _send_value_to_tau(stream_idx, rule_text, "Sending legacy single-stream input.")
+                        continue
+
+                    fallback_value = "F" if stream_idx == 0 else tau_defs.TAU_VALUE_ZERO
+                    _send_value_to_tau(stream_idx, fallback_value, "Sending fallback value.")
                     continue
 
                 # --- Skip completely unrecognised prompt lines ---------------------------
@@ -521,20 +550,20 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 0):
                     # logger.debug("  [DEBUG] communicate_with_tau: Unrecognised prompt skipped.")
                     continue
                 # Specifically look for o<target_output_stream_index> assignment
-                # Regex to match "oN[<any_digits_or_t>] = <sbf_part>" or "oN = <sbf_part>"
+                # Regex to match "oN[<any_digits_or_t>] = <value>" or "oN = <value>"
                 # Tau source uses '=', not ':=' for oN assignment. Example: o0[t] = fail_code_value
                 # Use target_output_stream_index in the regex
                 target_stream_name = f"o{target_output_stream_index}"
                 match = re.match(rf"^{re.escape(target_stream_name)}(?:\s*\[\w+\])?\s*=\s*(.*)", line_strip)
                 if match:
-                    sbf_candidate = match.group(1).strip()
-                    # This sbf_candidate is the direct value assigned to oN by Tau.
-                    sbf_output_line = sbf_candidate
+                    tau_candidate = match.group(1).strip()
+                    # This tau_candidate is the direct value assigned to oN by Tau.
+                    tau_output_line = tau_candidate
                     found_target_output = True  # Renamed
                     logger.debug(
-                        "communicate_with_tau: Extracted SBF output for %s: '%s' from line '%s'",
+                        "communicate_with_tau: Extracted Tau output for %s: '%s' from line '%s'",
                         target_stream_name,
-                        sbf_output_line,
+                        tau_output_line,
                         line_strip,
                     )
                     break  # Found definitive oN output, stop reading further lines for this communication
@@ -553,28 +582,6 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 0):
                     tau_ready.clear()
                     raise Exception(
                         f"Tau process exited just before communication timeout or without {target_stream_name} output.")
-                # Fallback to old heuristic if no oN assignment found, this might catch echoes or other formats
-                # but is less reliable. Consider if this fallback is desirable or should raise error.
-                # For now, let's try to use the last plausible line if any was identified by the old heuristic
-                # This part is a bit speculative and might need removal if it causes issues.
-                logger.warning(
-                    "communicate_with_tau: No explicit '%s = <value>' line found. Applying old heuristic to all read lines.",
-                    target_stream_name,
-                )
-                temp_sbf_output = sbf_defs.SBF_LOGICAL_ZERO
-                for read_line in reversed(output_lines_read):
-                    if utils.sbf_output_heuristic_check(read_line, input_sbf, sbf_defs):
-                        temp_sbf_output = read_line
-                        logger.debug(
-                            "communicate_with_tau: Fallback heuristic chose line: '%s'",
-                            temp_sbf_output,
-                        )
-                        break
-
-                sbf_output_line = temp_sbf_output
-                if not found_target_output and sbf_output_line == sbf_defs.SBF_LOGICAL_ZERO:  # if still default after fallback
-                    raise TimeoutError(
-                        f"Timeout or no valid SBF output from Tau for {target_stream_name} after {config.COMM_TIMEOUT} seconds. Check Tau logs for errors. Read output: {all_output}")
 
         except (OSError, ValueError) as e:
             logger.error("communicate_with_tau: Error reading Tau stdout: %s", e)
@@ -583,10 +590,10 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 0):
 
         # Normalize output atoms to canonical '&'-separated sorted form
         try:
-            sbf_output_line = utils.normalize_sbf_atoms(sbf_output_line)
+            tau_output_line = utils.normalize_tau_atoms(tau_output_line)
         except Exception:
             pass
-        return sbf_output_line
+        return tau_output_line
 
 
 def get_tau_process_status():

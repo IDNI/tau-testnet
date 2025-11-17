@@ -6,17 +6,17 @@ This module is simplified to reflect the new boolean validation model.
 
 # --- Generic Logical Values ----
 # These are the primary values returned by validation logic.
-SBF_LOGICAL_ZERO = "#b0"  # Represents logical false, failure, or zero.
-SBF_LOGICAL_ONE = "#b1"   # Represents logical true, success, or one.
+TAU_VALUE_ZERO = "#b0"  # Represents logical false, failure, or zero.
+TAU_VALUE_ONE = "#b1"   # Represents logical true, success, or one.
 
 # --- Failure/Success Codes from Tau ---
 # The new bitvector-based transaction validation returns a single boolean on o1.
 # #b0 for any failure, #b1 for success.
-TRANSACTION_VALIDATION_FAIL = SBF_LOGICAL_ZERO
-TRANSACTION_VALIDATION_SUCCESS = SBF_LOGICAL_ONE
+TRANSACTION_VALIDATION_FAIL = TAU_VALUE_ZERO
+TRANSACTION_VALIDATION_SUCCESS = TAU_VALUE_ONE
 
 # --- Success / Acknowledgement Codes for other operations ---
-ACK_RULE_PROCESSED = SBF_LOGICAL_ONE
+ACK_RULE_PROCESSED = TAU_VALUE_ONE
 
 # --- Tau Pin/Stream Names (Symbolic, for clarity in wrapper logic) ---
 # Inputs

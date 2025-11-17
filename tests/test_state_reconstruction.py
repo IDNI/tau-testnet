@@ -6,7 +6,7 @@ import sys
 
 import threading
 import tau_manager
-import sbf_defs
+import tau_defs
 import random
 
 # Ensure project root is on sys.path
@@ -259,7 +259,7 @@ class TestStateReconstruction(unittest.TestCase):
             for idx, rule in enumerate(all_rules, start=1):
                 confirmation = tau_manager.communicate_with_tau(rule, target_output_stream_index=0)
                 self.assertNotEqual(
-                    confirmation, sbf_defs.SBF_LOGICAL_ZERO,
+                    confirmation, tau_defs.TAU_VALUE_ZERO,
                     f"Tau confirmation for rule #{idx} should not be logical zero. Got: {confirmation}"
                 )
 
@@ -399,7 +399,7 @@ class TestStateReconstruction(unittest.TestCase):
             # --- Send rule to Tau and expect a non‑zero confirmation ---
             confirmation = tau_manager.communicate_with_tau(rule_text, target_output_stream_index=0)
             self.assertNotEqual(
-                confirmation, sbf_defs.SBF_LOGICAL_ZERO,
+                confirmation, tau_defs.TAU_VALUE_ZERO,
                 f"Tau confirmation should not be logical zero. Got: {confirmation}"
             )
 

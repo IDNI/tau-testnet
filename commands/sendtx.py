@@ -1,88 +1,3 @@
-def _parse_bitvector_string(bv_str: str) -> int:
-    """Helper to parse a bitvector string from Tau's output (#b, #x, or decimal)."""
-    bv_str = bv_str.strip()
-    if bv_str.startswith('#b'):
-        return int(bv_str[2:], 2)
-    elif bv_str.startswith('#x'):
-        return int(bv_str[2:], 16)
-    else:
-        return int(bv_str)
-
-def _prepare_transfer_inputs(transfer_entry, sender_balance: int) -> dict:
-    """
-    Prepares a dictionary of integer inputs for a single transfer for Tau validation.
-    The values will be formatted into bitvector strings just before sending.
-    """
-    if not (isinstance(transfer_entry, (list, tuple)) and len(transfer_entry) == 3):
-        raise ValueError(f"Invalid transfer entry format: {transfer_entry}")
-    from_addr_key, to_addr_key, amount_decimal_str = map(str, transfer_entry)
-
-    # Basic format validation (full cryptographic validation is done elsewhere)
-    if not (isinstance(from_addr_key, str) and len(from_addr_key) == 96):
-         raise ValueError(f"Invalid 'from' address format: {from_addr_key}")
-    if not (isinstance(to_addr_key, str) and len(to_addr_key) == 96):
-         raise ValueError(f"Invalid 'to' address format: {to_addr_key}")
-
-    from_yid = db.get_string_id(from_addr_key)
-    to_yid = db.get_string_id(to_addr_key)
-    
-    try:
-        from_id = int(from_yid[1:])
-        to_id = int(to_yid[1:])
-    except (ValueError, IndexError):
-        raise ValueError(f"Could not parse numeric ID from yID '{from_yid}' or '{to_yid}'")
-
-    try:
-        amount = int(amount_decimal_str)
-        if amount < 0:
-            raise ValueError("Amount cannot be negative.")
-    except ValueError:
-        raise ValueError(f"Invalid amount: '{amount_decimal_str}'")
-
-    if not isinstance(sender_balance, int) or sender_balance < 0:
-        raise ValueError(f"Invalid sender balance: {sender_balance}")
-
-    # Return a dictionary of integers.
-    return {
-        'amount': amount,
-        'balance': sender_balance,
-        'from_id': from_id,
-        'to_id': to_id,
-        'from_key': from_addr_key,
-        'to_key': to_addr_key,
-    }
-
-def _decode_single_transfer_output(output_bv_str: str, expected_amount_int: int) -> bool:
-    """
-    Decodes Tau's bitvector output for a single transfer validation.
-    Returns True if successful (echoed amount), False otherwise.
-    """
-    output_bv_str = output_bv_str.strip()
-    if not output_bv_str:
-        logger.warning("Received empty output from Tau.")
-        return False
-
-    try:
-        output_val = _parse_bitvector_string(output_bv_str)
-    except ValueError:
-        logger.warning("Unexpected Tau output format: '%s'", output_bv_str)
-        return False
-
-    # The new rules return 0 on any failure, and echo the amount on success.
-    if output_val == 0:
-        logger.debug("Tau rejected transfer (output was 0).")
-        return False
-    elif output_val == expected_amount_int:
-        logger.debug("Tau accepted transfer; echoed input amount.")
-        return True
-    else:
-        logger.warning(
-            "Unexpected Tau output value: '%s' (parsed as %s), expected %s",
-            output_bv_str,
-            output_val,
-            expected_amount_int,
-        )
-        return False
 import hashlib
 import json
 import logging
@@ -90,7 +5,7 @@ import time
 
 import chain_state
 import db
-import sbf_defs
+import tau_defs
 import tau_manager
 import utils
 from db import add_mempool_tx
@@ -220,10 +135,9 @@ def _prepare_transfer_inputs(transfer_entry, sender_balance: int) -> dict:
     }
 
 
-def _decode_transfer_validation_output(output_bv_str: str) -> bool:
+def _decode_single_transfer_output(output_bv_str: str, expected_amount_int: int) -> bool:
     """
-    Decodes Tau's single boolean output for transfer validation.
-    Returns True if valid (output is 1), False otherwise.
+    Tau emits the original transfer amount on success and 0 on failure.
     """
     output_bv_str = output_bv_str.strip()
     if not output_bv_str:
@@ -236,19 +150,21 @@ def _decode_transfer_validation_output(output_bv_str: str) -> bool:
         logger.warning("Unexpected Tau output format: '%s'", output_bv_str)
         return False
 
-    if output_val == 1:
-        logger.debug("Tau accepted transaction (output was 1).")
+    if output_val == 0:
+        logger.debug("Tau rejected transfer (output was 0).")
+        return False
+
+    if output_val == expected_amount_int:
+        logger.debug("Tau accepted transfer; echoed input amount.")
         return True
-    elif output_val == 0:
-        logger.debug("Tau rejected transaction (output was 0).")
-        return False
-    else:
-        logger.warning(
-            "Unexpected Tau output value: '%s' (parsed as %s), expected 0 or 1.",
-            output_bv_str,
-            output_val,
-        )
-        return False
+
+    logger.warning(
+        "Unexpected Tau output value: '%s' (parsed as %s), expected %s",
+        output_bv_str,
+        output_val,
+        expected_amount_int,
+    )
+    return False
 
 
 def _get_signing_message_bytes(payload: dict) -> bytes:
@@ -279,6 +195,7 @@ def _process_transfers_operation(transfers, sender_pubkey):
     
     validated_transfers = []
     tau_inputs = []
+    remaining_balances: dict[str, int] = {}
     
     logger.info("Processing %s transfers...", len(transfers))
     for i, transfer_entry in enumerate(transfers):
@@ -291,14 +208,17 @@ def _process_transfers_operation(transfers, sender_pubkey):
         if from_addr_key != sender_pubkey:
             return False, None, f"Transfer #{i+1} 'from' address does not match sender_pubkey."
 
-        actual_sender_balance = chain_state.get_balance(from_addr_key)
+        if from_addr_key not in remaining_balances:
+            remaining_balances[from_addr_key] = chain_state.get_balance(from_addr_key)
+        available_balance = remaining_balances[from_addr_key]
         
         try:
-            transfer_input_dict = _prepare_transfer_inputs(transfer_entry, actual_sender_balance)
+            transfer_input_dict = _prepare_transfer_inputs(transfer_entry, available_balance)
             # Store the full integer amount for post-validation balance updates
             amount_int = transfer_input_dict['amount']
             validated_transfers.append((from_addr_key, to_addr_key, amount_int))
             tau_inputs.append(transfer_input_dict)
+            remaining_balances[from_addr_key] = max(available_balance - amount_int, 0)
         except ValueError as e:
             return False, None, f"Error processing transfer #{i+1}: {e}"
         except Exception as e:
@@ -392,7 +312,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
             rule_text = operations.get("0", "").strip()
             if rule_text:
                 logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
-                tau_output_rules = tau_manager.communicate_with_tau(input_sbf=rule_text, target_output_stream_index=0)
+                tau_output_rules = tau_manager.communicate_with_tau(rule_text=rule_text, target_output_stream_index=0)
                 if "Error" in tau_output_rules:
                     return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
                 logger.info("Tau rule validation successful.")
@@ -404,20 +324,25 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                 
                 # Tau program expects inputs on separate streams for the single-pass validation
                 # i1: amount, i2: balance, i3: from_id, i4: to_id
-                tau_input_string = (
-                    f"{tau_input_dict['amount']}\n"
-                    f"{tau_input_dict['balance']}\n"
-                    f"{tau_input_dict['from_id']}\n"
-                    f"{tau_input_dict['to_id']}"
+                tau_input_stream_values = {
+                    1: str(tau_input_dict['amount']),
+                    2: str(tau_input_dict['balance']),
+                    3: str(tau_input_dict['from_id']),
+                    4: str(tau_input_dict['to_id']),
+                }
+
+                logger.info(
+                    "Sending Tau inputs for transfer #%s validation: %s",
+                    i + 1,
+                    tau_input_stream_values,
                 )
-                
-                # The final boolean result is on o1
                 tau_output_transfer = tau_manager.communicate_with_tau(
-                    input_sbf=tau_input_string,
-                    target_output_stream_index=1 
+                    target_output_stream_index=1,
+                    input_stream_values=tau_input_stream_values,
                 )
 
-                if not _decode_transfer_validation_output(tau_output_transfer):
+                expected_amount = transfer_details[2]
+                if not _decode_single_transfer_output(tau_output_transfer, expected_amount):
                     return (f"FAILURE: Transaction rejected by Tau logic for transfer #{i+1} "
                             f"({transfer_details}). Tau output: {tau_output_transfer}")
             logger.info("All Tau transfer validations successful.")

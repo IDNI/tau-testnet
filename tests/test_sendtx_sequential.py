@@ -18,7 +18,7 @@ import commands.sendtx as sendtx_module # So we can patch its internals
 from commands.sendtx import queue_transaction, _get_signing_message_bytes
 import chain_state
 import db
-import sbf_defs
+import tau_defs
 from py_ecc.bls import G2Basic
 import hashlib
 
@@ -42,7 +42,7 @@ class MockTauManagerSequential:
             print(f"  [MOCK_TAU] Returning: {response}")
             return response
         print("  [MOCK_TAU] WARN: No more pre-set responses. Returning SBF_LOGICAL_ONE by default.")
-        return sbf_defs.SBF_LOGICAL_ONE # Default success if not specified
+        return tau_defs.TAU_VALUE_ONE # Default success if not specified
 
 # --- Test Helper ---
 def _create_signed_tx_json(sender_privkey_int, operations, seq_num, expiration_offset=1000):
@@ -90,7 +90,7 @@ def run_test_sequential_ops():
     # --- Test Case 1: Rule (Op 0) + Transfer (Op 1) --- 
     print("\n--- Test Case 1: Rule (Op 0) + Transfer (Op 1) ---")
     mock_tau_manager.set_responses([
-        sbf_defs.ACK_RULE_PROCESSED_SBF, # Response for Op 0 (rule)
+        tau_defs.ACK_RULE_PROCESSED, # Response for Op 0 (rule)
         sendtx_module._encode_single_transfer_sbf( # Response for Op 1 (transfer) - echo SBF
             [sender_pub_key, recipient_pub_key, "5"], 
             min(chain_state.get_balance(sender_pub_key), 15) # Correct balance_for_tau
@@ -119,7 +119,7 @@ def run_test_sequential_ops():
 
     # --- Test Case 2: Op 0 (Rule) fails --- 
     print("\n--- Test Case 2: Op 0 (Rule) Fails ---")
-    mock_tau_manager.set_responses([sbf_defs.SBF_LOGICAL_ZERO]) # Op 0 fails
+    mock_tau_manager.set_responses([tau_defs.TAU_VALUE_ZERO]) # Op 0 fails
     operations2 = {"0": "bad_rule"}
     tx_json2 = _create_signed_tx_json(sender_priv_key, operations2, 1)
     result2 = queue_transaction(tx_json2)
@@ -136,8 +136,8 @@ def run_test_sequential_ops():
     # --- Test Case 3: Op 1 (Transfer) fails after Op 0 (Rule) succeeds --- 
     print("\n--- Test Case 3: Op 1 (Transfer) Fails ---")
     mock_tau_manager.set_responses([
-        sbf_defs.ACK_RULE_PROCESSED_SBF, # Op 0 (rule) succeeds
-        sbf_defs.FAIL_INSUFFICIENT_FUNDS_SBF # Op 1 (transfer) fails
+        tau_defs.ACK_RULE_PROCESSED, # Op 0 (rule) succeeds
+        tau_defs.TAU_VALUE_ZERO # Op 1 (transfer) fails
     ])
     operations3 = {
         "0": "o2[t]=i1[t]",
@@ -157,11 +157,11 @@ def run_test_sequential_ops():
     # --- Test Case 4: Operations 0, 2, 4 (gaps) --- 
     print("\n--- Test Case 4: Operations 0, 2, 4 (with gaps) ---")
     mock_tau_manager.set_responses([
-        sbf_defs.ACK_RULE_PROCESSED_SBF,    # Op 0 (rule)
-        sbf_defs.SBF_LOGICAL_ONE,           # Op 1 (implicit F, Tau sees F\nF)
-        sbf_defs.SBF_LOGICAL_ONE,           # Op 2 (custom, Tau sees F\nF\n<custom_sbf>)
-        sbf_defs.SBF_LOGICAL_ONE,           # Op 3 (implicit F, Tau sees F\nF\nF\nF)
-        sbf_defs.SBF_LOGICAL_ONE            # Op 4 (custom, Tau sees F\nF\nF\nF\n<custom_sbf>)
+        tau_defs.ACK_RULE_PROCESSED,    # Op 0 (rule)
+        tau_defs.TAU_VALUE_ONE,           # Op 1 (implicit F, Tau sees F\nF)
+        tau_defs.TAU_VALUE_ONE,           # Op 2 (custom, Tau sees F\nF\n<custom_sbf>)
+        tau_defs.TAU_VALUE_ONE,           # Op 3 (implicit F, Tau sees F\nF\nF\nF)
+        tau_defs.TAU_VALUE_ONE            # Op 4 (custom, Tau sees F\nF\nF\nF\n<custom_sbf>)
     ])
     operations4 = {
         "0": "a_rule",

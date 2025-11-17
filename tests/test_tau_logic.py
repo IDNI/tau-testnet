@@ -59,8 +59,8 @@ TEST_DB_PATH = "test_tau_logic_db.sqlite" # Separate DB for these tests
 os.environ["TAU_DB_PATH"] = TEST_DB_PATH
 
 import tau_manager
-import sbf_defs
-import utils # For bits_to_sbf_atom
+import tau_defs
+import utils # For bits_to_tau_literal
 import config # For TAU_READY_SIGNAL, etc.
 import db # To cleanup
 
@@ -137,7 +137,7 @@ class TestTauLogic(unittest.TestCase):
         to_bits = format(to_id_idx, '04b')
         
         full_bit_pattern = amount_bits + balance_bits + from_bits + to_bits
-        return utils.bits_to_sbf_atom(full_bit_pattern, length=16)
+        return utils.bits_to_tau_literal(full_bit_pattern, length=16)
 
     def _assert_tau_response(self, sbf_input: str, expected_output: str, msg: str, output_stream: int = 1):
         """Helper to assert Tau's response on a specific output stream."""
@@ -160,17 +160,17 @@ class TestTauLogic(unittest.TestCase):
     def test_02_insufficient_funds(self):
         print("\n[TAU_LOGIC_CASE] Insufficient funds: amount=10, balance=5, from=1, to=2")
         sbf_in = self._construct_sbf_input(amount=10, balance=5, from_id_idx=1, to_id_idx=2)
-        self._assert_tau_response(sbf_in, sbf_defs.FAIL_INSUFFICIENT_FUNDS_SBF, "Tau should return FAIL_INSUFFICIENT_FUNDS_SBF.")
+        self._assert_tau_response(sbf_in, tau_defs.FAIL_INSUFFICIENT_FUNDS_SBF, "Tau should return FAIL_INSUFFICIENT_FUNDS_SBF.")
 
     def test_03_source_equals_destination(self):
         print("\n[TAU_LOGIC_CASE] Source equals destination: amount=5, balance=10, from=1, to=1")
         sbf_in = self._construct_sbf_input(amount=5, balance=10, from_id_idx=1, to_id_idx=1)
-        self._assert_tau_response(sbf_in, sbf_defs.FAIL_SRC_EQ_DEST_SBF, "Tau should return FAIL_SRC_EQ_DEST_SBF.")
+        self._assert_tau_response(sbf_in, tau_defs.FAIL_SRC_EQ_DEST_SBF, "Tau should return FAIL_SRC_EQ_DEST_SBF.")
 
     def test_04_zero_amount(self):
         print("\n[TAU_LOGIC_CASE] Zero amount: amount=0, balance=10, from=1, to=2")
         sbf_in = self._construct_sbf_input(amount=0, balance=10, from_id_idx=1, to_id_idx=2)
-        self._assert_tau_response(sbf_in, sbf_defs.FAIL_ZERO_AMOUNT_SBF, "Tau should return FAIL_ZERO_AMOUNT_SBF.")
+        self._assert_tau_response(sbf_in, tau_defs.FAIL_ZERO_AMOUNT_SBF, "Tau should return FAIL_ZERO_AMOUNT_SBF.")
         
     def test_05_amount_equals_balance_valid(self):
         print("\n[TAU_LOGIC_CASE] Valid transfer (edge case): amount=10, balance=10, from=1, to=2")
@@ -185,20 +185,20 @@ class TestTauLogic(unittest.TestCase):
     def test_07_insufficient_funds_at_zero_balance(self):
         print("\n[TAU_LOGIC_CASE] Insufficient funds: amount=1, balance=0, from=1, to=2")
         sbf_in = self._construct_sbf_input(amount=1, balance=0, from_id_idx=1, to_id_idx=2)
-        self._assert_tau_response(sbf_in, sbf_defs.FAIL_INSUFFICIENT_FUNDS_SBF, "Tau should return FAIL_INSUFFICIENT_FUNDS_SBF when balance is 0 and amount > 0.")
+        self._assert_tau_response(sbf_in, tau_defs.FAIL_INSUFFICIENT_FUNDS_SBF, "Tau should return FAIL_INSUFFICIENT_FUNDS_SBF when balance is 0 and amount > 0.")
 
     # ===== Format Validation Tests =====
 
     def test_08_invalid_format_incomplete_bits(self):
         print("\n[TAU_LOGIC_CASE] Invalid format: incomplete SBF (just x0)")
         incomplete_sbf = "x0"  # Only specifies x0, not x1-x15
-        self._assert_tau_response(incomplete_sbf, sbf_defs.FAIL_INVALID_FORMAT_SBF, 
+        self._assert_tau_response(incomplete_sbf, tau_defs.FAIL_INVALID_FORMAT_SBF, 
                                 "Tau should return FAIL_INVALID_FORMAT_SBF for incomplete SBF.")
 
     def test_09_invalid_format_ambiguous_bits(self):
         print("\n[TAU_LOGIC_CASE] Invalid format: ambiguous SBF (x0 & x1)")
         ambiguous_sbf = "x0 & x1"  # Only specifies x0 and x1, not x2-x15
-        self._assert_tau_response(ambiguous_sbf, sbf_defs.FAIL_INVALID_FORMAT_SBF, 
+        self._assert_tau_response(ambiguous_sbf, tau_defs.FAIL_INVALID_FORMAT_SBF, 
                                 "Tau should return FAIL_INVALID_FORMAT_SBF for ambiguous SBF.")
 
     # ===== i0 Rule Processing Tests =====
@@ -206,14 +206,14 @@ class TestTauLogic(unittest.TestCase):
     def test_10_rule_processing_i0_simple(self):
         print("\n[TAU_LOGIC_CASE] Rule processing: simple rule on i0")
         rule_sbf = "o1[t] = 1"  # Simple rule for i0
-        self._assert_tau_response(rule_sbf, sbf_defs.ACK_RULE_PROCESSED_SBF, 
+        self._assert_tau_response(rule_sbf, tau_defs.ACK_RULE_PROCESSED_SBF, 
                                 "Tau should return ACK_RULE_PROCESSED_SBF for rule processing.", 
                                 output_stream=0)
 
     def test_11_rule_processing_i0_complex(self):
         print("\n[TAU_LOGIC_CASE] Rule processing: complex rule on i0")
         complex_rule = "always o1[t] = i1[t] && o2[t] = 0"  # More complex rule
-        self._assert_tau_response(complex_rule, sbf_defs.ACK_RULE_PROCESSED_SBF, 
+        self._assert_tau_response(complex_rule, tau_defs.ACK_RULE_PROCESSED_SBF, 
                                 "Tau should return ACK_RULE_PROCESSED_SBF for complex rule.", 
                                 output_stream=0)
 
@@ -221,15 +221,15 @@ class TestTauLogic(unittest.TestCase):
 
     def test_12_fallback_fail_invalid_both_zero(self):
         print("\n[TAU_LOGIC_CASE] Fallback: both i0 and i1 are zero/inactive")
-        zero_sbf = sbf_defs.SBF_LOGICAL_ZERO  # Should trigger fallback
-        self._assert_tau_response(zero_sbf, sbf_defs.FAIL_INVALID_SBF, 
+        zero_sbf = tau_defs.TAU_VALUE_ZERO  # Should trigger fallback
+        self._assert_tau_response(zero_sbf, tau_defs.FAIL_INVALID_SBF, 
                                 "Tau should return FAIL_INVALID_SBF when both streams are inactive.")
 
     def test_13_fallback_fail_invalid_unrecognized(self):
         print("\n[TAU_LOGIC_CASE] Fallback: unrecognized input pattern")
         # Create an SBF that's not zero but also not a valid 16-bit format for i1
-        unrecognized_sbf = utils.bits_to_sbf_atom("101010", length=6)  # 6-bit SBF
-        self._assert_tau_response(unrecognized_sbf, sbf_defs.FAIL_INVALID_SBF, 
+        unrecognized_sbf = utils.bits_to_tau_literal("101010", length=6)  # 6-bit Tau literal
+        self._assert_tau_response(unrecognized_sbf, tau_defs.FAIL_INVALID_SBF, 
                                 "Tau should return FAIL_INVALID_SBF for unrecognized patterns.")
 
     # ===== Pointwise Revision Test =====
@@ -241,7 +241,7 @@ class TestTauLogic(unittest.TestCase):
         # The actual pointwise revision testing would require more sophisticated setup
         revision_rule = "o1[t] = 42"  # Rule that should go to u[t]
         # Test that the rule is acknowledged on o0
-        self._assert_tau_response(revision_rule, sbf_defs.ACK_RULE_PROCESSED_SBF, 
+        self._assert_tau_response(revision_rule, tau_defs.ACK_RULE_PROCESSED_SBF, 
                                 "Tau should acknowledge rule processing for pointwise revision.", 
                                 output_stream=0)
         # Note: Testing the actual u[t] assignment would require monitoring that stream,

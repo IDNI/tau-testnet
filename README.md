@@ -6,8 +6,8 @@ This project is the codebase for the Tau Testnet Alpha Blockchain. Its primary g
 The architecture is designed around the principle of extralogical processing. The core engine, written in Python, handles networking, storage, and any operations not yet implemented in pure Tau logic, such as cryptographic signature verification. This engine prepares transactions and validates them against a separate Tau logic program (executed via Docker), which serves as the ultimate arbiter of the chain's rules. This hybrid model allows us to build a robust and feature-complete testnet today, showcasing the power of Tau's logical core while providing all the necessary functions for a working blockchain.
 
 ## Tau Execution Mode
-Tau logic is fully integrated into the blockchain pipeline, but runtime evaluation is currently disabled by default through the TAU_FORCE_FAKE switch. When this flag is enabled, the node bypasses real Tau logic execution and uses a deterministic “fake” validator path instead. This allows development and debugging without requiring a running Tau Docker instance.
-To enable true Tau-driven validation, unset TAU_FORCE_FAKE in your environment or configuration.
+Tau logic is fully integrated into the blockchain pipeline, but runtime evaluation is currently disabled by default through the TAU_FORCE_TEST switch. When this flag is enabled, the node bypasses real Tau logic execution and uses a deterministic "test" validator path instead. This allows development and debugging without requiring a running Tau Docker instance.
+To enable true Tau-driven validation, unset TAU_FORCE_TEST in your environment or configuration.
 
 ## Features
 
@@ -48,8 +48,8 @@ To enable true Tau-driven validation, unset TAU_FORCE_FAKE in your environment o
             *   For transfers in `operations["1"]`, the `from_pubkey` of each transfer must match the top-level `sender_pubkey`.
         *   `fee_limit` (string/integer): Placeholder for future fee models.
         *   `signature` (string): Hex-encoded BLS signature over a canonical form of the other fields.
-*   **Tau Integration for Operation Validation**: The `genesis.tau` program validates the logic of operations within a transaction (e.g., coin transfers via SBF). This now includes robust structural validation to ensure transfer data is complete and well-formed.
-*   **String-to-ID Mapping**: Dynamically assigns `y<ID>` identifiers for Tau SBF.
+*   **Tau Integration for Operation Validation**: The `genesis.tau` program validates the logic of operations within a transaction (e.g., coin transfers via Tau bitvectors). This now includes robust structural validation to ensure transfer data is complete and well-formed.
+*   **String-to-ID Mapping**: Dynamically assigns `y<ID>` identifiers for Tau payloads.
 *   **In-Memory Balances & Sequence Numbers**: Tracks account balances and sequence numbers for rapid validation.
 *   **SQLite Mempool**: Persists transactions awaiting inclusion in a block.
 *   **BLS12-381 Public Key Validation**: Format and optional cryptographic checks for public keys.
@@ -133,8 +133,8 @@ netcat 127.0.0.1 65432
 *   **`db.py`**: SQLite database interface, managing the mempool, string-to-ID mappings, and persistent block storage.
 *   **`network/`**: P2P protocols and service implementation (`handshake`, `ping`, `sync`, `blocks`, `tx`).
 *   **`chain_state.py`**: Manages in-memory state (account balances, sequence numbers).
-*   **`sbf_defs.py`**: Symbolic Boolean Formula (SBF) constants for Tau communication.
-*   **`utils.py`**: Utilities for SBF, data conversions, and transaction message canonicalization.
+*   **`tau_defs.py`**: Tau stream constants for validator interaction.
+*   **`utils.py`**: Utilities for Tau bitvectors, data conversions, and transaction message canonicalization.
 *   **`config.py`**: Centralized configuration.
 *   **`block.py`**: Defines block data structures (block header, transactions list) and merkle root computation.
 *   **`genesis.tau`**: The Tau logic program for validating operations, including structural checks on transaction data and logic for applying new rules via pointwise revision.

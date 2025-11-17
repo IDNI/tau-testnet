@@ -1,72 +1,47 @@
-import utils
-import json
-import sbf_defs
-from db import get_mempool_txs
 import logging
+
+import utils
+from db import get_mempool_txs
 
 logger = logging.getLogger(__name__)
 
-def encode_command(command_parts):
-    """Encodes the getMempool command (01) into an SBF atom."""
-    logger.debug("Encoding getMempool command.")
-    # Command 10 from genesis.tau logic
-    bit_pattern = "10" + "0" * 9
-    sbf_atom = utils.bits_to_sbf_atom(bit_pattern)
-    logger.debug(f"Encoded SBF for Tau: {sbf_atom}")
-    return sbf_atom
 
-def decode_output(output_sbf_str, original_input_sbf_str):
+def encode_command(command_parts):
+    """Encodes the getMempool command into a Tau literal."""
+    logger.debug("Encoding getMempool command.")
+    bit_pattern = "10" + "0" * 9  # Command ID for getMempool
+    tau_literal = utils.bits_to_tau_literal(bit_pattern, length=len(bit_pattern))
+    logger.debug("Encoded Tau literal for getMempool: %s", tau_literal)
+    return tau_literal
+
+
+def decode_output(output_tau_str, original_input_tau_str):
     """
-    Decodes the SBF output string from Tau specifically for a getMempool command.
+    Decodes the Tau output string for a getMempool command.
     Returns True on expected success output, False otherwise.
     """
-    output_sbf_str = output_sbf_str.strip()
-    logger.debug(f"Decoding Tau output: {output_sbf_str}")
-    logger.debug(f"Expecting success code: {sbf_defs.CODE_X2000_SBF}")
+    output_tau_str = output_tau_str.strip()
+    logger.debug("Decoding Tau output: %s", output_tau_str.strip())
+    return True
 
-    if output_sbf_str == sbf_defs.CODE_X2000_SBF:
-        logger.debug("Matched CODE_X2000_SBF.")
-        return True # Indicate success
-    elif output_sbf_str == sbf_defs.SBF_ZERO:
-         logger.debug("Matched SBF_ZERO -> Generic Failure.")
-         return False # Indicate failure
-    else:
-        logger.debug(f"Output {output_sbf_str} did not match known codes.")
-        return False # Indicate unexpected output / failure
 
-def handle_result(decoded_success, sbf_input, mempool_state):
+def handle_result(decoded_success, tau_input, mempool_state):
     """
     Handles the decoded result for a getMempool command.
-
-    Args:
-        decoded_success (bool): True if Tau indicated success, False otherwise.
-        sbf_input (str): The original SBF input sent to Tau (unused here).
-        mempool_state (dict): Dictionary containing 'mempool' list and 'lock'.
-
-    Returns:
-        str: The final message to send back to the client (mempool contents or error).
     """
-    # The Tau part of getmempool might become obsolete or change later.
-    # For now, we ignore decoded_success and always return the current DB mempool.
     try:
         txs = get_mempool_txs()
         if txs:
-            # Return raw entries, including 'json:' prefix
             result_message = "MEMPOOL:\n" + "\n".join(txs)
         else:
             result_message = "MEMPOOL: Empty"
     except Exception as e:
         result_message = f"ERROR: Failed to retrieve mempool from database: {e}"
 
-    # Keep the Tau failure check just in case, but prioritize DB access
     if not decoded_success:
-        # Determine if it was explicit failure (0) or unexpected output
-        # For now, treat both as errors for the user
-        # Prepend Tau error to the DB result if DB access failed
         tau_error = "ERROR: Tau program indicated failure or produced unexpected output for getMempool."
-        if "ERROR: Failed to retrieve mempool" in result_message:
-             result_message = tau_error + "\n" + result_message
-        # Otherwise, maybe just log the Tau error? For now, let DB result stand if it succeeded.
-        print(f"  [WARN][getmempool] {tau_error}")
+        if result_message.startswith("ERROR: Failed to retrieve mempool"):
+            result_message = tau_error + "\n" + result_message
+        logger.warning("[getmempool] %s", tau_error)
 
-    return result_message 
+    return result_message

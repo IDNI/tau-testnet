@@ -144,14 +144,14 @@ def encode_command(parts: List[str]) -> str:
     return "createblock"
 
 
-def decode_output(sbf_output: str, sbf_input: str) -> str:
+def decode_output(tau_output: str, tau_input: str) -> str:
     """
     Decode output - not applicable for createblock as it doesn't use Tau.
     """
     return "block_created"
 
 
-def handle_result(decoded: str, sbf_input: str, mempool_state: Dict) -> str:
+def handle_result(decoded: str, tau_input: str, mempool_state: Dict) -> str:
     """
     Handle the result of block creation.
     """

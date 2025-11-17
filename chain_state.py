@@ -24,7 +24,7 @@ _last_processed_block_hash = ""
 
 # Genesis address and balance used across tests and reconstruction
 GENESIS_ADDRESS = "91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6"
-GENESIS_BALANCE = 1234567890
+GENESIS_BALANCE = 65535
 # Alice
 # Private Key (hex, 32 bytes): 11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09
 # Public Key (hex, 48 bytes, G1 compressed): 91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6
@@ -134,7 +134,7 @@ def rebuild_state_from_blockchain(start_block=0):
                                 
                                 # Send rule to Tau (same as live processing)
                                 print(f"[DEBUG][chain_state]         Sending rule to Tau core...")
-                                tau_output = tau_manager.communicate_with_tau(input_sbf=op_data.strip(), target_output_stream_index=0)
+                                tau_output = tau_manager.communicate_with_tau(rule_text=op_data.strip(), target_output_stream_index=0)
                                 
                                 if tau_output.strip().lower() == "x1001":
                                     print(f"[DEBUG][chain_state]         Rule successfully applied to Tau core")
@@ -389,7 +389,7 @@ def initialize_persistent_state():
                         if rule_text:
                             print(f"[INFO][chain_state] Injecting built-in rule '{fname}' into Tau i0")
                             print(f"[DEBUG][chain_state] Rule content: {rule_text}")
-                            tau_manager.communicate_with_tau(input_sbf=rule_text,
+                            tau_manager.communicate_with_tau(rule_text=rule_text,
                                                              target_output_stream_index=0)
             else:
                 print(f"[DEBUG][chain_state] Rules directory not found at: {rules_dir}")
