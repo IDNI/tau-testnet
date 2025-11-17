@@ -23,7 +23,7 @@ tau_process_lock = threading.Lock()
 tau_ready = threading.Event()  # Signals when Tau process has printed the ready signal
 server_should_stop = threading.Event()  # Signals background threads to stop
 tau_stderr_lines = queue.Queue(maxsize=100)  # Store recent stderr lines
-tau_fake_mode = False  # When True, simulate Tau responses without Docker
+tau_test_mode = False  # When True, simulate Tau responses without Docker
 
 def read_stderr():
     """
@@ -78,16 +78,16 @@ def start_and_manage_tau_process():
     and monitors it. Runs in a loop attempting restarts until server_should_stop is set.
     """
     # Access global state safely
-    global tau_process, tau_ready, server_should_stop, tau_process_lock, tau_fake_mode
+    global tau_process, tau_ready, server_should_stop, tau_process_lock, tau_test_mode
 
     # Ensure previous stop signals from earlier runs are cleared when starting anew
     server_should_stop.clear()
     tau_ready.clear()
 
-    # Fast path: allow forcing FAKE MODE via environment (default enabled for tests)
-    if os.environ.get("TAU_FORCE_FAKE", "1") == "1":
-        logger.warning("TAU_FORCE_FAKE enabled. Running in FAKE MODE without Docker.")
-        tau_fake_mode = True
+    # Fast path: allow forcing TEST MODE via environment (default enabled for tests)
+    if os.environ.get("TAU_FORCE_TEST", "1") == "1":
+        logger.warning("TAU_FORCE_TEST enabled. Running in TEST MODE without Docker.")
+        tau_test_mode = True
         tau_ready.set()
         # Idle loop until shutdown requested
         while not server_should_stop.is_set():
@@ -267,17 +267,17 @@ def start_and_manage_tau_process():
         if not ready_signal_found:
             failure_count += 1
 
-        # If we have failed several times, enable fake mode to unblock tests that only need readiness and simple o0 acks
+        # If we have failed several times, enable test mode to unblock tests that only need readiness and simple o0 acks
         if failure_count >= 3 and not server_should_stop.is_set():
-            if not tau_fake_mode:
+            if not tau_test_mode:
                 logger.warning(
-                    "Enabling Tau FAKE MODE after repeated startup failures. Tau responses will be simulated."
+                    "Enabling Tau TEST MODE after repeated startup failures. Tau responses will be simulated."
                 )
-                tau_fake_mode = True
+                tau_test_mode = True
                 tau_ready.set()
 
         # Restart logic (outside finally block)
-        if not server_should_stop.is_set() and not tau_fake_mode:
+        if not server_should_stop.is_set() and not tau_test_mode:
             logger.warning(
                 "Tau process management loop finished for one instance. Waiting 5s before attempting restart."
             )
@@ -307,11 +307,11 @@ def communicate_with_tau(input_sbf: str, target_output_stream_index: int = 0):
     logger.debug("communicate_with_tau(%s, %s)", input_sbf, target_output_stream_index)
 
     # Quick check if ready before locking; allow fake mode to bypass
-    if not tau_ready.is_set() and not tau_fake_mode:
+    if not tau_ready.is_set() and not tau_test_mode:
         raise Exception("Tau process is not ready.")
 
     # If in fake mode, synthesize minimal responses needed by tests
-    if tau_fake_mode:
+    if tau_test_mode:
         # For rule confirmations on o0, return non-zero ack
         if target_output_stream_index == 0:
             return sbf_defs.ACK_RULE_PROCESSED

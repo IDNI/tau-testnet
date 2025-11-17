@@ -22,7 +22,7 @@ def test_environment() -> Iterator[None]:
     """Ensure tests run with the dedicated 'test' configuration and logging."""
     original_env = os.environ.get("TAU_ENV")
     os.environ["TAU_ENV"] = "test"
-    os.environ.setdefault("TAU_FORCE_FAKE", "1")
+    os.environ.setdefault("TAU_FORCE_TEST", "1")
 
     config.reload_settings(env="test")
     tau_logging.configure(config.LOGGING, force=True)

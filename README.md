@@ -6,8 +6,8 @@ This project is the codebase for the Tau Testnet Alpha Blockchain. Its primary g
 The architecture is designed around the principle of extralogical processing. The core engine, written in Python, handles networking, storage, and any operations not yet implemented in pure Tau logic, such as cryptographic signature verification. This engine prepares transactions and validates them against a separate Tau logic program (executed via Docker), which serves as the ultimate arbiter of the chain's rules. This hybrid model allows us to build a robust and feature-complete testnet today, showcasing the power of Tau's logical core while providing all the necessary functions for a working blockchain.
 
 ## Tau Execution Mode
-Tau logic is fully integrated into the blockchain pipeline, but runtime evaluation is currently disabled by default through the TAU_FORCE_FAKE switch. When this flag is enabled, the node bypasses real Tau logic execution and uses a deterministic “fake” validator path instead. This allows development and debugging without requiring a running Tau Docker instance.
-To enable true Tau-driven validation, unset TAU_FORCE_FAKE in your environment or configuration.
+Tau logic is fully integrated into the blockchain pipeline, but runtime evaluation is currently disabled by default through the TAU_FORCE_TEST switch. When this flag is enabled, the node bypasses real Tau logic execution and uses a deterministic "test" validator path instead. This allows development and debugging without requiring a running Tau Docker instance.
+To enable true Tau-driven validation, unset TAU_FORCE_TEST in your environment or configuration.
 
 ## Features
 
