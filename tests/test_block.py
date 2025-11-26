@@ -9,7 +9,14 @@ import time
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-from block import Block, BlockHeader, compute_tx_hash, compute_merkle_root
+from block import (
+    Block,
+    BlockHeader,
+    compute_tx_hash,
+    compute_merkle_root,
+    bls_signing_available,
+    EMPTY_STATE_HASH,
+)
 from commands import createblock
 from db import init_db, add_mempool_tx, get_latest_block, clear_mempool
 import config
@@ -50,6 +57,8 @@ class TestBlock(unittest.TestCase):
             block.header.merkle_root,
             hashlib.sha256(b'').hexdigest()
         )
+        self.assertEqual(block.header.state_hash, EMPTY_STATE_HASH)
+        self.assertEqual(block.tx_ids, [])
         self.assertEqual(len(block.block_hash), 64)
         d = block.to_dict()
         self.assertEqual(d['header']['block_number'], 0)
@@ -62,7 +71,21 @@ class TestBlock(unittest.TestCase):
         block = Block.create(block_number=1, previous_hash=prev_hash, transactions=[tx1, tx2])
         tx_hashes = [compute_tx_hash(tx1), compute_tx_hash(tx2)]
         self.assertEqual(block.header.merkle_root, compute_merkle_root(tx_hashes))
+        self.assertEqual(block.tx_ids, tx_hashes)
         self.assertEqual(len(block.block_hash), 64)
+
+    @unittest.skipUnless(bls_signing_available(), "py_ecc is required for signature tests")
+    def test_block_signature_roundtrip(self):
+        prev_hash = 'bb' * 32
+        block = Block.create(
+            block_number=2,
+            previous_hash=prev_hash,
+            transactions=[{"foo": "bar"}],
+            state_hash="12" * 32,
+            signing_key_hex=config.MINER_PRIVKEY,
+        )
+        self.assertIsNotNone(block.block_signature)
+        self.assertTrue(block.verify_signature(config.MINER_PUBKEY))
 
 
 class TestBlockCreation(unittest.TestCase):

@@ -30,7 +30,13 @@ node_modules/
 # Temprorary files
 docs/*.md
 *.txt
+*.md
+.env*
+!README.md
+!WALLET.md
 !NOTICE.txt
+!LICENSE.md
+!WALLET_USAGE.md
 
 # Python
 __pycache__/
@@ -94,13 +100,10 @@ ehthumbs_vista.db
 *.stackdump
 [Dd]esktop.ini
 $RECYCLE.BIN/
+.taskmaster
 *.cab
 *.msi
 *.msix
 *.msm
 *.msp
 *.lnk
-AGENTS.md
-.env*
-.gemini*
-.taskmaster*

@@ -23,3 +23,9 @@ def test_reload_settings_switch_environment(monkeypatch):
 def test_set_database_path(temp_database):
     expected = temp_database
     assert config.STRING_DB_PATH == expected
+
+
+def test_authority_settings_defaults():
+    assert config.MINER_PUBKEY.endswith("d2eebce6")
+    assert config.STATE_LOCATOR_NAMESPACE == "state"
+    assert config.BLOCK_SIGNATURE_SCHEME == "bls_g2"

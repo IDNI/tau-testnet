@@ -100,7 +100,7 @@ python wallet.py send --privkey <private_key> \
 The wallet supports the following operation types:
 
 - **Operation "0"**: Rules/Logic formulas (sent as-is to Tau)
-- **Operation "1"**: Coin transfers (SBF-encoded by the server)
+- **Operation "1"**: Coin transfers
 - **Operation "2", "3", etc.**: Custom operations (encoding depends on server implementation)
 
 ## Examples

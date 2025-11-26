@@ -9,11 +9,9 @@ WALLET="$DIR/wallet.py"
 HOST="127.0.0.1"
 PORT="65432"
 DB_PATH="$DIR/strings.db"
-
-# Identities (from chain_state.py)
-ALICE_SK="11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09"
-BOB_SK="06bc6e6e15a4b40df028da6901e471fa1facc5e9fad04408ab864c7ccb036aa3"
-CHARLIE_SK="856a44bee7630b40c4f91576037c8eebb729af956c608e447aa7afd6c80c3d45"
+ENV_FILE="$DIR/.env"
+IDENTITIES=(BOB CHARLIE)
+DEMO_PREFIX="DEMO_TRANSFERS"
 
 RESET="0"
 
@@ -23,6 +21,81 @@ usage() {
   echo "         - --blocks N: number of blocks to create (0 means no blocks)"
   echo "         - --tx-per-block M: number of random transactions to send per block (or total if --blocks=0)"
   echo "         - --max-amount A: max random transfer amount (default 100)"
+}
+
+source_env_file() {
+  if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+  fi
+}
+
+ensure_demo_keys() {
+  source_env_file
+
+  local -a missing=()
+  for ident in "${IDENTITIES[@]}"; do
+    local sk_var="${DEMO_PREFIX}_${ident}_SK"
+    local addr_var="${DEMO_PREFIX}_${ident}_ADDR"
+    if [[ -z "${!sk_var:-}" ]] || [[ -z "${!addr_var:-}" ]]; then
+      missing+=("$ident")
+    fi
+  done
+
+  if (( ${#missing[@]} == 0 )); then
+    return
+  fi
+
+  echo "[SETUP] Generating demo identities: ${missing[*]}"
+
+  local python_output
+  python_output="$("$PY" - "$DEMO_PREFIX" "${missing[@]}" <<'PY'
+import os
+import sys
+
+try:
+    from py_ecc.bls import G2ProofOfPossession as bls
+except ModuleNotFoundError:
+    sys.stderr.write("py_ecc is required to generate demo keys.\n")
+    sys.exit(1)
+
+prefix = sys.argv[1] if len(sys.argv) > 1 else "DEMO_TRANSFERS"
+labels = sys.argv[2:] or ["ALICE", "BOB", "CHARLIE"]
+for label in labels:
+    seed = os.urandom(32)
+    sk_int = bls.KeyGen(seed)
+    print(f"{prefix}_{label}_SK={sk_int.to_bytes(32, 'big').hex()}")
+    print(f"{prefix}_{label}_ADDR={bls.SkToPk(sk_int).hex()}")
+PY
+)"
+
+  local regex
+  regex=$(printf '%s|' "${missing[@]}")
+  regex="${regex%|}"
+
+  local tmp_existing
+  tmp_existing="$(mktemp)"
+  if [[ -f "$ENV_FILE" ]]; then
+    grep -Ev "^${DEMO_PREFIX}_(${regex})_(SK|ADDR)=" "$ENV_FILE" > "$tmp_existing" || true
+  else
+    : > "$tmp_existing"
+  fi
+
+  local tmp_full
+  tmp_full="$(mktemp)"
+  cat "$tmp_existing" > "$tmp_full"
+  if [[ -s "$tmp_full" ]]; then
+    printf '\n' >> "$tmp_full"
+  fi
+  printf '# Demo transfer identities generated %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$tmp_full"
+  printf '%s\n' "$python_output" >> "$tmp_full"
+
+  mv "$tmp_full" "$ENV_FILE"
+  rm -f "$tmp_existing"
+
+  source_env_file
 }
 
 while [[ $# -gt 0 ]]; do
@@ -61,40 +134,16 @@ BLOCKS="${BLOCKS:-}"
 TX_PER_BLOCK="${TX_PER_BLOCK:-}"
 MAX_AMOUNT="${MAX_AMOUNT:-100}"
 
-# Derive valid (sk, pk) pair from a provided 32-byte hex. If the hex is not a valid
-# private key per py_ecc, use it as IKM seed to KeyGen to derive a valid key.
-derive_pair() {
-  "$PY" - "$@" <<'PY'
-from py_ecc.bls import G2Basic
-from eth_utils import ValidationError
-import sys
-ikm_hex = sys.argv[1]
-ikm = bytes.fromhex(ikm_hex)
-sk_int = int.from_bytes(ikm, 'big')
-try:
-    pk = G2Basic.SkToPk(sk_int)
-    sk_bytes = ikm
-except ValidationError:
-    # Derive from seed using KeyGen to ensure validity
-    sk_int = G2Basic.KeyGen(ikm)
-    sk_bytes = sk_int.to_bytes(32, 'big')
-    pk = G2Basic.SkToPk(sk_int)
-print(sk_bytes.hex())
-print(pk.hex())
-PY
-}
+ensure_demo_keys
 
-ALICE_SK_FINAL_AND_ADDR="$(derive_pair "$ALICE_SK")"
-ALICE_SK_FINAL="$(echo "$ALICE_SK_FINAL_AND_ADDR" | sed -n '1p')"
-ALICE_ADDR="$(echo "$ALICE_SK_FINAL_AND_ADDR" | sed -n '2p')"
+ALICE_SK="11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09"
+ALICE_ADDR="91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6"
 
-BOB_SK_FINAL_AND_ADDR="$(derive_pair "$BOB_SK")"
-BOB_SK_FINAL="$(echo "$BOB_SK_FINAL_AND_ADDR" | sed -n '1p')"
-BOB_ADDR="$(echo "$BOB_SK_FINAL_AND_ADDR" | sed -n '2p')"
+BOB_SK="$DEMO_TRANSFERS_BOB_SK"
+BOB_ADDR="$DEMO_TRANSFERS_BOB_ADDR"
 
-CHARLIE_SK_FINAL_AND_ADDR="$(derive_pair "$CHARLIE_SK")"
-CHARLIE_SK_FINAL="$(echo "$CHARLIE_SK_FINAL_AND_ADDR" | sed -n '1p')"
-CHARLIE_ADDR="$(echo "$CHARLIE_SK_FINAL_AND_ADDR" | sed -n '2p')"
+CHARLIE_SK="$DEMO_TRANSFERS_CHARLIE_SK"
+CHARLIE_ADDR="$DEMO_TRANSFERS_CHARLIE_ADDR"
 
 echo "[INFO] Alice  : $ALICE_ADDR"
 echo "[INFO] Bob    : $BOB_ADDR"
@@ -126,7 +175,7 @@ run "$PY" "$WALLET" balance --address "$CHARLIE_ADDR" --host "$HOST" --port "$PO
 # Helper to send a single random transaction among Alice/Bob/Charlie
 send_random_tx() {
   # Arrays of senders' private keys and corresponding addresses
-  local sks=("$ALICE_SK_FINAL" "$BOB_SK_FINAL" "$CHARLIE_SK_FINAL")
+  local sks=("$ALICE_SK" "$BOB_SK" "$CHARLIE_SK")
   local addrs=("$ALICE_ADDR" "$BOB_ADDR" "$CHARLIE_ADDR")
 
   # Fetch current balances to bias towards funded senders
@@ -187,8 +236,8 @@ if [[ -n "$BLOCKS" || -n "$TX_PER_BLOCK" ]]; then
 else
   # Backwards-compatible fixed demo flow
   echo "\n=== Round 1: Alice -> Bob (100), Alice -> Charlie (50) ==="
-  run "$PY" "$WALLET" send --privkey "$ALICE_SK_FINAL" --transfer "$BOB_ADDR:100" --host "$HOST" --port "$PORT"
-  run "$PY" "$WALLET" send --privkey "$ALICE_SK_FINAL" --transfer "$CHARLIE_ADDR:50" --host "$HOST" --port "$PORT"
+  run "$PY" "$WALLET" send --privkey "$ALICE_SK" --transfer "$BOB_ADDR:100" --host "$HOST" --port "$PORT"
+  run "$PY" "$WALLET" send --privkey "$ALICE_SK" --transfer "$CHARLIE_ADDR:50" --host "$HOST" --port "$PORT"
 
   echo "\n[BLOCK] Assembling a new block from current mempool"
   run "$PY" "$WALLET" createblock --host "$HOST" --port "$PORT"
@@ -199,7 +248,7 @@ else
   run "$PY" "$WALLET" balance --address "$CHARLIE_ADDR" --host "$HOST" --port "$PORT"
 
   echo "\n=== Round 2: Bob -> Charlie (30) ==="
-  run "$PY" "$WALLET" send --privkey "$BOB_SK_FINAL" --transfer "$CHARLIE_ADDR:30" --host "$HOST" --port "$PORT"
+  run "$PY" "$WALLET" send --privkey "$BOB_SK" --transfer "$CHARLIE_ADDR:30" --host "$HOST" --port "$PORT"
 
   echo "\n[BLOCK] Assembling a new block from current mempool"
   run "$PY" "$WALLET" createblock --host "$HOST" --port "$PORT"
@@ -210,7 +259,7 @@ else
   run "$PY" "$WALLET" balance --address "$CHARLIE_ADDR" --host "$HOST" --port "$PORT"
 
   echo "\n=== Round 3: Charlie -> Alice (10) ==="
-  run "$PY" "$WALLET" send --privkey "$CHARLIE_SK_FINAL" --transfer "$ALICE_ADDR:10" --host "$HOST" --port "$PORT"
+  run "$PY" "$WALLET" send --privkey "$CHARLIE_SK" --transfer "$ALICE_ADDR:10" --host "$HOST" --port "$PORT"
 
   echo "\n[BLOCK] Assembling a new block from current mempool"
   run "$PY" "$WALLET" createblock --host "$HOST" --port "$PORT"

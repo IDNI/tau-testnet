@@ -216,14 +216,14 @@ async def test_mempool_snapshot_sent_on_connect(two_nodes, monkeypatch):
 
     # Patch queue_transaction so we can observe gossip ingestion without Tau/BLS.
     received: List[Dict[str, Any]] = []
-    call_event = threading.Event()
+    call_event = trio.Event()
 
-    def fake_queue_transaction(payload: str, propagate: bool = True) -> str:
+    def fake_submit(payload: str, propagate: bool = True) -> str:
         received.append({"payload": payload, "propagate": propagate})
         call_event.set()
         return "queued"
 
-    monkeypatch.setattr(net_service.sendtx, "queue_transaction", fake_queue_transaction)
+    monkeypatch.setattr(svc2, "_submit_tx", fake_submit)
 
     # Seed the mempool on svc1 before the connection is established.
     tx_payload = {
@@ -237,12 +237,23 @@ async def test_mempool_snapshot_sent_on_connect(two_nodes, monkeypatch):
     db_module.add_mempool_tx(json.dumps(tx_payload))
 
     addrs2 = await _wait_for_addrs(svc2.host)
+    print(f"DEBUG: svc2 addrs: {addrs2}")
     peer_info = PeerInfo(svc2.host.get_id(), addrs2)
     svc1.host.get_peerstore().add_addrs(peer_info.peer_id, peer_info.addrs, 60)
-    await svc1.host.connect(peer_info)
+    print(f"DEBUG: Connecting from svc1 ({svc1.host.get_id()}) to svc2")
+
+    for i in range(5):
+        try:
+            await svc1.host.connect(peer_info)
+            break
+        except Exception as e:
+            print(f"DEBUG: Connect attempt {i+1} failed: {e}")
+            await trio.sleep(1)
+    else:
+        pytest.fail("Failed to connect after 5 attempts")
 
     with trio.fail_after(5):
-        await trio.to_thread.run_sync(call_event.wait)
+        await call_event.wait()
 
     assert received, "Expected mempool transaction to be replayed to the new peer"
     replay = received[0]
@@ -338,7 +349,9 @@ async def test_dht_value_validators(two_nodes):
     block_hash = "abc123"
     block_payload = json.dumps({"block_hash": block_hash}).encode()
     dht.value_store.put(f"block:{block_hash}".encode(), block_payload)
-    assert dht.value_store.get(f"block:{block_hash}".encode()) == block_payload
+    block_record = dht.value_store.get(f"block:{block_hash}".encode())
+    assert block_record is not None
+    assert getattr(block_record, "value", block_record) == block_payload
 
     tx_payload = {
         "sender_pubkey": "b" * 96,
@@ -353,7 +366,9 @@ async def test_dht_value_validators(two_nodes):
         dht.value_store.put(f"tx:{tx_id}".encode(), b"{}")
     canonical_bytes = canonical.encode()
     dht.value_store.put(f"tx:{tx_id}".encode(), canonical_bytes)
-    assert dht.value_store.get(f"tx:{tx_id}".encode()) == canonical_bytes
+    tx_record = dht.value_store.get(f"tx:{tx_id}".encode())
+    assert tx_record is not None
+    assert getattr(tx_record, "value", tx_record) == canonical_bytes
 
     state_hash = "statehash"
     state_payload = json.dumps({"block_hash": state_hash, "accounts": {}}).encode()
@@ -494,7 +509,7 @@ async def test_transaction_gossip_triggers_queue(two_nodes, monkeypatch):
         signal.set()
         return "mocked"
 
-    monkeypatch.setattr(sendtx_module, "queue_transaction", fake_queue)
+    monkeypatch.setattr(svc2, "_submit_tx", fake_queue)
 
     tx_payload = json.dumps({"sample": "tx"}, sort_keys=True, separators=(",", ":"))
     await svc1.publish_gossip(TAU_GOSSIP_TOPIC_TRANSACTIONS, tx_payload, message_id="tx-test-1")

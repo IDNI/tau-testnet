@@ -226,6 +226,79 @@ def get_all_blocks() -> List[Dict]:
                 continue
     return out
 
+def get_blocks_after(block_number: int) -> List[Dict]:
+    """
+    Returns all blocks with block_number >= the given number, ordered by block_number ASC.
+    """
+    if _db_conn is None:
+        init_db()
+    out: List[Dict] = []
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT block_data FROM blocks WHERE block_number >= ? ORDER BY block_number ASC', (block_number,))
+        rows = cur.fetchall()
+        for (block_json,) in rows:
+            try:
+                out.append(json.loads(block_json))
+            except Exception:
+                continue
+    return out
+
+def load_chain_state() -> tuple[Dict[str, int], Dict[str, int], str, str]:
+    """
+    Loads the persisted chain state (balances, sequences, rules, last_block_hash).
+    Returns: (balances, sequence_numbers, current_rules, last_processed_block_hash)
+    """
+    if _db_conn is None:
+        init_db()
+    
+    balances: Dict[str, int] = {}
+    sequences: Dict[str, int] = {}
+    current_rules = ""
+    last_processed_block_hash = ""
+
+    with _db_lock:
+        # Load accounts
+        cur = _db_conn.execute('SELECT address, balance, sequence_number FROM accounts')
+        for address, balance, seq in cur.fetchall():
+            balances[address] = balance
+            sequences[address] = seq
+        
+        # Load state
+        cur = _db_conn.execute(
+            'SELECT key, value FROM chain_state WHERE key IN (?, ?)',
+            ('current_rules', 'last_processed_block_hash')
+        )
+        entries = dict(cur.fetchall())
+        current_rules = entries.get('current_rules', '')
+        last_processed_block_hash = entries.get('last_processed_block_hash', '')
+        
+    return balances, sequences, current_rules, last_processed_block_hash
+
+def save_chain_state(balances: Dict[str, int], sequences: Dict[str, int], rules: str, last_block_hash: str):
+    """
+    Saves the chain state to the database atomically.
+    """
+    if _db_conn is None:
+        init_db()
+        
+    with _db_lock:
+        with _db_conn: # Transaction
+            _db_conn.execute(
+                'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+                ('current_rules', rules)
+            )
+            _db_conn.execute(
+                'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+                ('last_processed_block_hash', last_block_hash)
+            )
+            for address, balance in balances.items():
+                seq = sequences.get(address, 0)
+                _db_conn.execute(
+                    'INSERT OR REPLACE INTO accounts (address, balance, sequence_number) VALUES (?, ?, ?)',
+                    (address, balance, seq)
+                )
+
 # --- Peerstore DB-backed functions ---
 from typing import Optional, Dict, List
 

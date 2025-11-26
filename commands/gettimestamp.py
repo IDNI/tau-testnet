@@ -26,7 +26,13 @@ def decode_output(output_tau_str, original_input_tau_str):
 
 def handle_result(decoded_success, tau_input, mempool_state):
     """
-    Handles the decoded result for a getCurrentTimestamp command.
+    Handles the decoded result for a getTimestamp command.
     """
-    current_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    return f"Current Timestamp (UTC): {current_time}"
+    # Tau is no longer authoritative for timestamp. Server provides it.
+    # This function might not be used if we switch to local execution.
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return f"Current Timestamp (UTC): {now}"
+
+def execute(raw_command: str, container):
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return f"Current Timestamp (UTC): {now}"

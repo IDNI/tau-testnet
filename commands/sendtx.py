@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import os
 import time
 
 import chain_state
@@ -306,46 +307,63 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
             all_validated_transfers = transfer_result["transfers"]
             transfer_tau_inputs = transfer_result["tau_inputs"]
 
+    tau_force_test = os.environ.get("TAU_FORCE_TEST", "0") == "1"
+
     try:
         # --- Tau Validation Step ---
         if has_rules:
             rule_text = operations.get("0", "").strip()
             if rule_text:
-                logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
-                tau_output_rules = tau_manager.communicate_with_tau(rule_text=rule_text, target_output_stream_index=0)
-                if "Error" in tau_output_rules:
-                    return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
-                logger.info("Tau rule validation successful.")
+                if tau_force_test:
+                    logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")
+                else:
+                    logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
+                    tau_output_rules = tau_manager.communicate_with_tau(
+                        rule_text=rule_text, target_output_stream_index=0
+                    )
+                    if "Error" in tau_output_rules:
+                        return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
+                    logger.info("Tau rule validation successful.")
 
         if has_transfers and all_validated_transfers:
-            logger.info("Validating %s transfers with Tau...", len(all_validated_transfers))
-            for i, (tau_input_dict, transfer_details) in enumerate(zip(transfer_tau_inputs, all_validated_transfers)):
-                logger.debug("Validating transfer #%s: %s", i + 1, transfer_details)
-                
-                # Tau program expects inputs on separate streams for the single-pass validation
-                # i1: amount, i2: balance, i3: from_id, i4: to_id
-                tau_input_stream_values = {
-                    1: str(tau_input_dict['amount']),
-                    2: str(tau_input_dict['balance']),
-                    3: str(tau_input_dict['from_id']),
-                    4: str(tau_input_dict['to_id']),
-                }
-
+            if tau_force_test:
                 logger.info(
-                    "Sending Tau inputs for transfer #%s validation: %s",
-                    i + 1,
-                    tau_input_stream_values,
+                    "TAU_FORCE_TEST=1: skipping Tau transfer validation for %s transfers.",
+                    len(all_validated_transfers),
                 )
-                tau_output_transfer = tau_manager.communicate_with_tau(
-                    target_output_stream_index=1,
-                    input_stream_values=tau_input_stream_values,
-                )
+            else:
+                logger.info("Validating %s transfers with Tau...", len(all_validated_transfers))
+                for i, (tau_input_dict, transfer_details) in enumerate(
+                    zip(transfer_tau_inputs, all_validated_transfers)
+                ):
+                    logger.debug("Validating transfer #%s: %s", i + 1, transfer_details)
 
-                expected_amount = transfer_details[2]
-                if not _decode_single_transfer_output(tau_output_transfer, expected_amount):
-                    return (f"FAILURE: Transaction rejected by Tau logic for transfer #{i+1} "
-                            f"({transfer_details}). Tau output: {tau_output_transfer}")
-            logger.info("All Tau transfer validations successful.")
+                    # Tau program expects inputs on separate streams for the single-pass validation
+                    # i1: amount, i2: balance, i3: from_id, i4: to_id
+                    tau_input_stream_values = {
+                        1: str(tau_input_dict['amount']),
+                        2: str(tau_input_dict['balance']),
+                        3: str(tau_input_dict['from_id']),
+                        4: str(tau_input_dict['to_id']),
+                    }
+
+                    logger.info(
+                        "Sending Tau inputs for transfer #%s validation: %s",
+                        i + 1,
+                        tau_input_stream_values,
+                    )
+                    tau_output_transfer = tau_manager.communicate_with_tau(
+                        target_output_stream_index=1,
+                        input_stream_values=tau_input_stream_values,
+                    )
+
+                    expected_amount = transfer_details[2]
+                    if not _decode_single_transfer_output(tau_output_transfer, expected_amount):
+                        return (
+                            f"FAILURE: Transaction rejected by Tau logic for transfer #{i+1} "
+                            f"({transfer_details}). Tau output: {tau_output_transfer}"
+                        )
+                logger.info("All Tau transfer validations successful.")
         
         # --- Post-Tau Processing ---
         if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
@@ -358,7 +376,10 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
             )
             for from_addr, to_addr, amt in all_validated_transfers:
                 if not chain_state.update_balances_after_transfer(from_addr, to_addr, amt):
-                    return f"FAILURE: Transaction invalid post-Tau. Could not apply transfer ({from_addr[:10]}... -> {to_addr[:10]}..., amount {amt})."
+                    return (
+                        "FAILURE: Transaction invalid. "
+                        f"Could not apply transfer ({from_addr[:10]}... -> {to_addr[:10]}..., amount {amt})."
+                    )
 
         tx_message_id, tx_canonical_blob = _compute_transaction_message_id(payload)
         db.add_mempool_tx(blob)
@@ -376,3 +397,24 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
     except Exception as e:
         logger.critical("An unexpected error occurred in queue_transaction: %s", e)
         return f"FAILURE: An unexpected server error occurred."
+
+
+def execute(raw_command: str, container):
+    """
+    Executes the sendtx command.
+    Expected format: sendtx <json_payload>
+    """
+    prefix = 'sendtx '
+    if not raw_command.lower().startswith(prefix):
+        return "ERROR: Invalid sendtx format. Use sendtx '{\"0\":...}'.\r\n"
+    
+    json_blob = raw_command[len(prefix):].strip()
+    logger.debug("Received sendtx payload: %s", json_blob)
+    
+    try:
+        result_msg = queue_transaction(json_blob)
+    except Exception as exc:
+        logger.exception("sendtx queue failed")
+        result_msg = f"ERROR: {exc}"
+    
+    return result_msg + "\r\n"

@@ -14,7 +14,7 @@ import config
 import re
 import json
 from commands import createblock, sendtx  # Import command handlers
-from errors import ConfigurationError, TauProcessError
+from errors import ConfigurationError, TauProcessError, TauTestnetError
 import tau_logging
 
 
@@ -84,141 +84,20 @@ def handle_client(conn, addr, container: ServiceContainer):
                     conn.sendall(b"ERROR: Invalid UTF-8 encoding\n")
                     continue
 
-                if raw.lower().startswith('sendtx '):
-                    json_blob = raw[len('sendtx '):].strip()
-                    logger.debug("Received sendtx payload from %s: %s", client_label, json_blob)
-                    try:
-                        result_msg = sendtx.queue_transaction(json_blob)
-                    except Exception as exc:
-                        logger.exception("sendtx queue failed for %s", client_label)
-                        result_msg = f"ERROR: {exc}"
-                    conn.sendall((result_msg + "\r\n").encode('utf-8'))
-                    continue
-
                 command_str = raw.lower()
                 if not command_str:
                     conn.sendall(b"ERROR: Received empty command.")
                     continue
 
-                logger.debug("Received command from %s: %s", client_label, command_str)
-
-                parts = command_str.split()
-                if len(parts) >= 2:
-                    cmd = parts[0]
-                    mapped = [cmd]
-                    mapped_params = []
-                    for param in parts[1:]:
-                        if re.fullmatch(r"[01]+", param) or param.isdigit():
-                            mapped.append(param)
-                            mapped_params.append(param)
-                        else:
-                            yid = db_module.get_string_id(param)
-                            mapped.append(yid)
-                            mapped_params.append(f"{param}->{yid}")
-                    logger.debug("Mapped parameters for %s: %s", cmd, mapped_params)
-                    parts = mapped
-                command_name = parts[0]
-
-                if command_name in ("gettimestamp", "getcurrenttimestamp"):
-                    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    resp = f"Current Timestamp (UTC): {now}\r\n"
-                    conn.sendall(resp.encode('utf-8'))
+                # Determine command name (first word)
+                parts = raw.split()
+                if not parts:
                     continue
+                command_name = parts[0].lower()
 
-                if raw.lower().startswith("getbalance "):
-                    parts_raw = raw.split()
-                    if len(parts_raw) != 2:
-                        resp = "ERROR: Usage: getbalance <address>\r\n"
-                    else:
-                        bal = chain_state_module.get_balance(parts_raw[1])
-                        resp = f"BALANCE: {bal}\r\n"
-                    conn.sendall(resp.encode('utf-8'))
-                    continue
+                logger.debug("Received command from %s: %s", client_label, command_name)
 
-                if raw.lower().startswith("getsequence "):
-                    parts_raw = raw.split()
-                    if len(parts_raw) != 2:
-                        resp = "ERROR: Usage: getsequence <address>\r\n"
-                    else:
-                        seq = chain_state_module.get_sequence_number(parts_raw[1])
-                        resp = f"SEQUENCE: {seq}\r\n"
-                    conn.sendall(resp.encode('utf-8'))
-                    continue
-
-                if raw.lower().startswith("history "):
-                    parts_raw = raw.split()
-                    if len(parts_raw) != 2:
-                        resp = "ERROR: Usage: history <address>\r\n"
-                    else:
-                        history_addr = parts_raw[1]
-                        items = []
-                        for entry in db_module.get_mempool_txs():
-                            if entry.startswith("json:"):
-                                try:
-                                    payload = json.loads(entry[5:])
-                                except Exception:
-                                    logger.debug("Skipping invalid mempool json entry for history")
-                                    continue
-                                ops = payload.get("operations", {}).get("1", [])
-                                if payload.get("sender_pubkey") == history_addr or any(isinstance(op, (list, tuple)) and history_addr in op for op in ops):
-                                    items.append(json.dumps(payload, separators=(",", ":"), sort_keys=True))
-                        if items:
-                            resp = "HISTORY:\n" + "\n".join(items) + "\r\n"
-                        else:
-                            resp = "HISTORY: empty\r\n"
-                    conn.sendall(resp.encode('utf-8'))
-                    continue
-
-                if raw.lower().strip() == "createblock":
-                    logger.info("Create block requested by %s", client_label)
-                    try:
-                        block_data = createblock.create_block_from_mempool()
-                        if not block_data or "block_hash" not in block_data:
-                            message = block_data.get("message") if isinstance(block_data, dict) else None
-                            resp = (message or "Mempool is empty. No block created.") + "\r\n"
-                            logger.info("Create block skipped for %s: %s", client_label, message or "empty mempool")
-                        else:
-                            tx_count = len(block_data.get("transactions", []))
-                            block_hash = block_data["block_hash"]
-                            block_number = block_data["header"]["block_number"]
-                            merkle_root = block_data["header"]["merkle_root"]
-                            timestamp = block_data["header"]["timestamp"]
-
-                            resp_lines = [
-                                f"SUCCESS: Block #{block_number} created successfully!",
-                                f"  - Transactions: {tx_count}",
-                                f"  - Block Hash: {block_hash}",
-                                f"  - Merkle Root: {merkle_root}",
-                                f"  - Timestamp: {timestamp}",
-                            ]
-                            for idx, tx in enumerate(block_data.get("transactions", []), start=1):
-                                tx_json = json.dumps(tx, sort_keys=True)
-                                resp_lines.append(f"  - TX#{idx}: {tx_json}")
-                            resp_lines.append("  - Mempool cleared\r\n")
-                            resp = "\n".join(resp_lines)
-                            logger.info("Block #%s created via client %s", block_number, client_label)
-                    except Exception:
-                        logger.exception("Block creation failed for %s", client_label)
-                        resp = "ERROR: Failed to create block\r\n"
-                    conn.sendall(resp.encode('utf-8'))
-                    continue
-
-                if raw.lower().strip() == "getblocks":
-                    logger.debug("getblocks requested by %s", client_label)
-                    try:
-                        blocks = db_module.get_all_blocks()
-                        resp = json.dumps({"blocks": blocks}, separators=(",", ":")) + "\r\n"
-                    except Exception:
-                        logger.exception("getblocks failed for %s", client_label)
-                        resp = "ERROR: Failed to fetch blocks\r\n"
-                    conn.sendall(resp.encode('utf-8'))
-                    continue
-
-                if command_name == 'sendtx':
-                    logger.warning("sendtx was not parsed correctly for %s", client_label)
-                    conn.sendall(b"ERROR: Invalid sendtx format. Use sendtx '{\"0\":...}'.\r\n")
-                    continue
-
+                # Look up handler
                 handler = command_handlers.get(command_name)
                 if not handler:
                     msg = f"ERROR: Unknown command '{command_name}'\n"
@@ -226,8 +105,37 @@ def handle_client(conn, addr, container: ServiceContainer):
                     conn.sendall(msg.encode('utf-8'))
                     continue
 
+                # 1. Local execution path (if handler supports it)
+                if hasattr(handler, 'execute'):
+                    try:
+                        resp = handler.execute(raw, container)
+                        conn.sendall(resp.encode('utf-8'))
+                    except Exception as exc:
+                        logger.exception("Error executing local command %s for %s", command_name, client_label)
+                        conn.sendall(f"ERROR: {exc}\r\n".encode('utf-8'))
+                    continue
+
+                # 2. Tau execution path
+                # Map parameters to IDs for Tau commands
+                mapped = [parts[0]]
+                mapped_params = []
+                for param in parts[1:]:
+                    if re.fullmatch(r"[01]+", param) or param.isdigit():
+                        mapped.append(param)
+                        mapped_params.append(param)
+                    else:
+                        yid = db_module.get_string_id(param)
+                        mapped.append(yid)
+                        mapped_params.append(f"{param}->{yid}")
+                logger.debug("Mapped parameters for %s: %s", command_name, mapped_params)
+                parts = mapped
+
                 try:
                     tau_input = handler.encode_command(parts)
+                except TauTestnetError as exc:
+                    logger.warning("Encoding command %s failed for %s: %s", command_name, client_label, exc)
+                    conn.sendall(f"ERROR: {exc}".encode('utf-8'))
+                    continue
                 except Exception as exc:
                     logger.exception("Encoding command %s failed for %s", command_name, client_label)
                     conn.sendall(f"ERROR: {exc}".encode('utf-8'))
@@ -245,6 +153,9 @@ def handle_client(conn, addr, container: ServiceContainer):
                 except TimeoutError:
                     logger.error("Timeout communicating with Tau for %s", client_label)
                     result_message = "ERROR: Timeout communicating with Tau process."
+                except TauTestnetError as e:
+                    logger.warning("Tau error processing %s for %s: %s", command_name, client_label, e)
+                    result_message = f"ERROR: {e}"
                 except Exception:
                     logger.exception("Internal error processing %s for %s", command_name, client_label)
                     result_message = "ERROR: Internal error processing command."

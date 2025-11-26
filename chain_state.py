@@ -1,6 +1,8 @@
 import threading
 import json
 from typing import Dict, List, Optional
+import db
+import tau_manager
 
 # Lock for thread-safe access to balances
 _balance_lock = threading.Lock()
@@ -29,21 +31,12 @@ GENESIS_BALANCE = 65535
 # Private Key (hex, 32 bytes): 11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09
 # Public Key (hex, 48 bytes, G1 compressed): 91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6
 
-# Bob
-# Private Key (hex, 32 bytes): 06bc6e6e15a4b40df028da6901e471fa1facc5e9fad04408ab864c7ccb036aa3
-# Public Key (hex, 48 bytes, G1 compressed): 893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2
-
-# Charlie
-# Private Key (hex, 32 bytes): 856a44bee7630b40c4f91576037c8eebb729af956c608e447aa7afd6c80c3d45
-# Public Key (hex, 48 bytes, G1 compressed): 82c43817d598d9bcfdad9f9e514d2a9105fd62b368faace355cb3e130431ed3798408d8634633284befdb93b0311824f
-
 def rebuild_state_from_blockchain(start_block=0):
     """
     Rebuilds or updates the chain state by replaying transactions from the database.
     If start_block is 0, it clears existing state.
     """
-    # Import here to avoid circular imports
-    import db
+    
     
     print(f"[INFO][chain_state] Starting blockchain state reconstruction from block {start_block}...")
     global _last_processed_block_hash
@@ -62,13 +55,8 @@ def rebuild_state_from_blockchain(start_block=0):
         print(f"[INFO][chain_state] Initialized genesis balance: {GENESIS_ADDRESS[:10]}... = {GENESIS_BALANCE}")
     
     # Get all blocks from database, ordered by block number
-    if not hasattr(db, '_db_conn') or db._db_conn is None:
-        db.init_db()
-    
-    with db._db_lock:
-        cursor = db._db_conn.cursor()
-        cursor.execute('SELECT block_data FROM blocks WHERE block_number >= ? ORDER BY block_number ASC', (start_block,))
-        block_rows = cursor.fetchall()
+    # Get all blocks from database, ordered by block number
+    block_rows = db.get_blocks_after(start_block)
     
     if not block_rows:
         print(f"[INFO][chain_state] No new blocks found since block {start_block -1}. State is up to date.")
@@ -79,9 +67,10 @@ def rebuild_state_from_blockchain(start_block=0):
     total_transactions_processed = 0
     
     # Process each block in chronological order
-    for block_idx, (block_data_json,) in enumerate(block_rows):
+    # Process each block in chronological order
+    for block_idx, block_data in enumerate(block_rows):
         try:
-            block_data = json.loads(block_data_json)
+            # block_data is already a dict from db.get_blocks_after
             block_number = block_data['header']['block_number']
             block_hash = block_data['block_hash'][:16] + "..."
             transactions = block_data.get('transactions', [])
@@ -124,8 +113,7 @@ def rebuild_state_from_blockchain(start_block=0):
                             print(f"[DEBUG][chain_state]         Rule operation: '{op_data[:50]}{'...' if len(op_data) > 50 else ''}'")
                             # Rules must be sent to Tau core to recreate the exact Tau state
                             try:
-                                # Import here to avoid circular imports
-                                import tau_manager
+                                
                                 
                                 # Wait for Tau to be ready
                                 if not tau_manager.tau_ready.wait(timeout=10):
@@ -288,33 +276,24 @@ def load_state_from_db() -> bool:
     Returns True if accounts were found in the database, False if no state exists.
     """
     import db
-    db.init_db()
-    with db._db_lock:
-        conn = db._db_conn
-        # Load accounts into balances and sequence numbers
-        cursor = conn.execute(
-            'SELECT address, balance, sequence_number FROM accounts'
-        )
-        rows = cursor.fetchall()
-        if not rows:
-            return False
-        with _balance_lock, _sequence_lock:
-            _balances.clear()
-            _sequence_numbers.clear()
-            for address, balance, seq in rows:
-                _balances[address] = balance
-                _sequence_numbers[address] = seq
-        # Load rules state and last processed block hash
-        cursor = conn.execute(
-            'SELECT key, value FROM chain_state WHERE key IN (?, ?)',
-            ('current_rules', 'last_processed_block_hash')
-        )
-        entries = dict(cursor.fetchall())
-        with _rules_lock:
-            global _current_rules_state
-            _current_rules_state = entries.get('current_rules', '')
+    
+    balances, sequences, current_rules, last_processed_block_hash = db.load_chain_state()
+    
+    if not balances:
+        return False
+        
+    with _balance_lock, _sequence_lock, _rules_lock:
+        _balances.clear()
+        _sequence_numbers.clear()
+        _balances.update(balances)
+        _sequence_numbers.update(sequences)
+        
+        global _current_rules_state
+        _current_rules_state = current_rules
+        
         global _last_processed_block_hash
-        _last_processed_block_hash = entries.get('last_processed_block_hash', '')
+        _last_processed_block_hash = last_processed_block_hash
+        
     return True
 
 def commit_state_to_db(block_hash: str):
@@ -322,24 +301,13 @@ def commit_state_to_db(block_hash: str):
     Commits the in-memory state (balances, sequence numbers, rules) to the database atomically,
     associating it with the provided block_hash.
     """
-    import db
-    db.init_db()
-    with db._db_lock, db._db_conn:
-        conn = db._db_conn
-        conn.execute(
-            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-            ('current_rules', _current_rules_state)
-        )
-        conn.execute(
-            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-            ('last_processed_block_hash', block_hash)
-        )
-        for address, balance in _balances.items():
-            seq = _sequence_numbers.get(address, 0)
-            conn.execute(
-                'INSERT OR REPLACE INTO accounts (address, balance, sequence_number) VALUES (?, ?, ?)',
-                (address, balance, seq)
-            )
+    # Snapshot state under locks
+    with _balance_lock, _sequence_lock, _rules_lock:
+        balances_snapshot = _balances.copy()
+        sequences_snapshot = _sequence_numbers.copy()
+        rules_snapshot = _current_rules_state
+        
+    db.save_chain_state(balances_snapshot, sequences_snapshot, rules_snapshot, block_hash)
 
 def initialize_persistent_state():
     """
@@ -348,7 +316,6 @@ def initialize_persistent_state():
     On mismatch between stored state and blockchain, rebuilds and commits state.
     """
     print("[DEBUG][chain_state] > initialize_persistent_state started")
-    import db
     db.init_db()
 
     print("[DEBUG][chain_state] Attempting to load state from database...")
@@ -374,7 +341,7 @@ def initialize_persistent_state():
         commit_state_to_db(latest_hash)
         # Load built-in rules into Tau from rules directory
         try:
-            import os, tau_manager
+            import os
 
             rules_dir = os.path.join(os.path.dirname(__file__), 'rules')
             if os.path.isdir(rules_dir):

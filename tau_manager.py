@@ -30,6 +30,12 @@ tau_ready = threading.Event()  # Signals when Tau process has printed the ready 
 server_should_stop = threading.Event()  # Signals background threads to stop
 tau_stderr_lines = queue.Queue(maxsize=100)  # Store recent stderr lines
 tau_test_mode = False  # When True, simulate Tau responses without Docker
+_rules_handler = None  # Callback for saving rules state
+
+def set_rules_handler(handler):
+    """Sets the callback function for handling rules state updates (o999)."""
+    global _rules_handler
+    _rules_handler = handler
 
 def read_stderr():
     """
@@ -167,27 +173,19 @@ def start_and_manage_tau_process():
                         logger.error("Tau process exited unexpectedly while waiting for ready signal.")
                         break  # Exit the loop
 
-                    # Debug init: wait for newline or prompt without newline
                     buf = bytearray()
                     fd_init = stdout_stream.fileno()
-                    # logger.debug(f"[DEBUG INIT] start init-read loop, fd={fd_init}")
                     while True:
-                        # logger.debug(f"[DEBUG INIT] select on fd_init={fd_init}")
                         rlist, _, _ = select.select([fd_init], [], [], 0.1)
-                        # logger.debug(f"[DEBUG INIT] select returned rlist={rlist}")
                         if not rlist:
                             continue
                         chunk = os.read(fd_init, 1)
-                        # logger.debug(f"[DEBUG INIT] read chunk={chunk!r}")
                         if not chunk:  # EOF
-                            # logger.debug("[DEBUG INIT] EOF on init read")
                             break
                         buf += chunk
                         if chunk == b'\n':
-                            # logger.debug("[DEBUG INIT] newline detected on init")
                             break
                         if config.TAU_READY_SIGNAL.encode() in buf:
-                            # logger.debug("[DEBUG INIT] ready signal bytes detected in buf")
                             break
                     line = buf.decode('utf-8', errors='replace')
                     if not line:
@@ -314,8 +312,8 @@ def communicate_with_tau(
         str: The parsed Tau output line from Tau's stdout from the target output stream.
 
     Raises:
-        Exception: If Tau process is not running/ready or communication fails/times out.
-        TimeoutError: If Tau does not respond within COMM_TIMEOUT.
+        TauProcessError: If Tau process is not running/ready.
+        TauCommunicationError: If communication fails or times out.
     """
     global tau_process, tau_process_lock, tau_ready  # Include tau_ready
     logger.info(
@@ -347,7 +345,7 @@ def communicate_with_tau(
 
     # Quick check if ready before locking; allow fake mode to bypass
     if not tau_ready.is_set() and not tau_test_mode:
-        raise Exception("Tau process is not ready.")
+        raise TauProcessError("Tau process is not ready.")
 
     # If in fake mode, synthesize minimal responses needed by tests
     if tau_test_mode:
@@ -364,14 +362,14 @@ def communicate_with_tau(
         # Double-check process status *after* acquiring lock
         if not tau_process or tau_process.poll() is not None:
             tau_ready.clear()  # Mark as not ready if it died
-            raise Exception("Tau process is not running.")
+            raise TauProcessError("Tau process is not running.")
 
         # Perform checks within the lock
         current_stdin = tau_process.stdin
         current_stdout = tau_process.stdout
         if not current_stdin or not current_stdout or current_stdin.closed or current_stdout.closed:
             tau_ready.clear()  # Mark as not ready
-            raise Exception("Tau process stdin/stdout pipes not available or closed.")
+            raise TauProcessError("Tau process stdin/stdout pipes not available or closed.")
 
         def _send_value_to_tau(stream_idx: int, value, reason: str):
             """Helper that logs and writes a value to Tau's stdin."""
@@ -415,7 +413,7 @@ def communicate_with_tau(
                         "\n".join(stderr_lines)
                     )
                     tau_ready.clear()
-                    raise Exception(f"Tau process exited unexpectedly (code {exit_code}) during communication.")
+                    raise TauProcessError(f"Tau process exited unexpectedly (code {exit_code}) during communication.")
 
                 # Read either until newline or until prompt ':=' appears, with debug
                 buf = bytearray()
@@ -478,10 +476,10 @@ def communicate_with_tau(
                     )
                     # If it's a syntax error, we should fail fast rather than loop
                     if "Syntax Error" in line_strip:
-                        raise Exception(f"Tau syntax error: {line_strip}")
+                        raise TauCommunicationError(f"Tau syntax error: {line_strip}")
                     # If we've seen too many errors, give up to prevent infinite loops
                     if error_count >= max_errors:
-                        raise Exception(f"Too many errors from Tau ({error_count}). Last error: {line_strip}")
+                        raise TauCommunicationError(f"Too many errors from Tau ({error_count}). Last error: {line_strip}")
                     # For other errors, continue reading to see if there's more context
                     continue
 
@@ -500,13 +498,14 @@ def communicate_with_tau(
                         waiting_for_next_i0 = True  # wait for new i0 prompt
                     elif expect_stream_value_for == 999:
                         logger.debug("communicate_with_tau: Captured value for o999: '%s'", line_strip)
-                        try:
-                            # Import here to avoid circular imports
-                            import chain_state
-                            chain_state.save_rules_state(line_strip)
-                            logger.info("communicate_with_tau: Successfully saved rules state to chain state")
-                        except Exception as e:
-                            logger.error("communicate_with_tau: Failed to save rules state: %s", e)
+                        if _rules_handler:
+                            try:
+                                _rules_handler(line_strip)
+                                logger.info("communicate_with_tau: Successfully saved rules state via handler")
+                            except Exception as e:
+                                logger.error("communicate_with_tau: Failed to save rules state via handler: %s", e)
+                        else:
+                            logger.warning("communicate_with_tau: No rules handler registered, ignoring o999 output")
                     # In every case, stop expecting another line
                     expect_stream_value_for = None
                     continue
@@ -580,13 +579,13 @@ def communicate_with_tau(
                 # Check if process died right at the end
                 if tau_process and tau_process.poll() is not None:
                     tau_ready.clear()
-                    raise Exception(
+                    raise TauProcessError(
                         f"Tau process exited just before communication timeout or without {target_stream_name} output.")
 
         except (OSError, ValueError) as e:
             logger.error("communicate_with_tau: Error reading Tau stdout: %s", e)
             tau_ready.clear()
-            raise Exception(f"Failed to read from Tau process stdout: {e}") from e
+            raise TauCommunicationError(f"Failed to read from Tau process stdout: {e}") from e
 
         # Normalize output atoms to canonical '&'-separated sorted form
         try:

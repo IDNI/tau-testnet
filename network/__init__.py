@@ -26,3 +26,4 @@ __all__ = [
     "TAU_GOSSIP_TOPIC_BLOCKS",
     "TAU_GOSSIP_TOPIC_TRANSACTIONS",
 ]
+

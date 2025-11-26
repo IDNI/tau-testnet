@@ -10,6 +10,8 @@ from typing import List, Dict
 import db
 import block
 import chain_state
+import config
+from poa.state import compute_state_hash
 
 
 def create_block_from_mempool() -> Dict:
@@ -66,10 +68,16 @@ def create_block_from_mempool() -> Dict:
     
     # Create the block
     print(f"[INFO][createblock] Computing transaction hashes and Merkle root...")
+    rules_blob = chain_state.get_rules_state().encode("utf-8")
+    state_hash = compute_state_hash(rules_blob)
+    state_locator = f"{config.STATE_LOCATOR_NAMESPACE}:{state_hash}"
     new_block = block.Block.create(
         block_number=block_number,
         previous_hash=previous_hash,
-        transactions=transactions
+        transactions=transactions,
+        state_hash=state_hash,
+        state_locator=state_locator,
+        signing_key_hex=config.MINER_PRIVKEY,
     )
     
     print(f"[INFO][createblock] Block created successfully!")
@@ -78,6 +86,7 @@ def create_block_from_mempool() -> Dict:
     print(f"[INFO][createblock]   - Timestamp: {new_block.header.timestamp}")
     print(f"[INFO][createblock]   - Transaction Count: {len(transactions)}")
     print(f"[INFO][createblock]   - Merkle Root: {new_block.header.merkle_root}")
+    print(f"[INFO][createblock]   - State Hash: {new_block.header.state_hash}")
     print(f"[INFO][createblock]   - Block Hash: {new_block.block_hash}")
     
     # Show transaction summary
@@ -148,7 +157,44 @@ def decode_output(tau_output: str, tau_input: str) -> str:
     """
     Decode output - not applicable for createblock as it doesn't use Tau.
     """
-    return "block_created"
+    return block_data
+
+
+def execute(raw_command: str, container):
+    """
+    Executes the createblock command.
+    """
+    logger.info("Create block requested")
+    try:
+        block_data = create_block_from_mempool()
+        if not block_data or "block_hash" not in block_data:
+            message = block_data.get("message") if isinstance(block_data, dict) else None
+            resp = (message or "Mempool is empty. No block created.") + "\r\n"
+            logger.info("Create block skipped: %s", message or "empty mempool")
+        else:
+            tx_count = len(block_data.get("transactions", []))
+            block_hash = block_data["block_hash"]
+            block_number = block_data["header"]["block_number"]
+            merkle_root = block_data["header"]["merkle_root"]
+            timestamp = block_data["header"]["timestamp"]
+
+            resp_lines = [
+                f"SUCCESS: Block #{block_number} created successfully!",
+                f"  - Transactions: {tx_count}",
+                f"  - Block Hash: {block_hash}",
+                f"  - Merkle Root: {merkle_root}",
+                f"  - Timestamp: {timestamp}",
+            ]
+            for idx, tx in enumerate(block_data.get("transactions", []), start=1):
+                tx_json = json.dumps(tx, sort_keys=True)
+                resp_lines.append(f"  - TX#{idx}: {tx_json}")
+            resp_lines.append("  - Mempool cleared\r\n")
+            resp = "\n".join(resp_lines)
+            logger.info("Block #%s created", block_number)
+    except Exception:
+        logger.exception("Block creation failed")
+        resp = "ERROR: Failed to create block\r\n"
+    return resp
 
 
 def handle_result(decoded: str, tau_input: str, mempool_state: Dict) -> str:
@@ -166,6 +212,7 @@ def handle_result(decoded: str, tau_input: str, mempool_state: Dict) -> str:
         block_hash = block_data["block_hash"]
         block_number = block_data["header"]["block_number"]
         merkle_root = block_data["header"]["merkle_root"]
+        state_hash = block_data["header"].get("state_hash")
         timestamp = block_data["header"]["timestamp"]
 
         result = f"SUCCESS: Block #{block_number} created successfully!\n"
@@ -173,6 +220,8 @@ def handle_result(decoded: str, tau_input: str, mempool_state: Dict) -> str:
         result += f"  - Block Hash: {block_hash}\n"
         result += f"  - Merkle Root: {merkle_root}\n"
         result += f"  - Timestamp: {timestamp}\n"
+        if state_hash:
+            result += f"  - State Hash: {state_hash}\n"
         result += f"  - Mempool cleared"
 
         return result

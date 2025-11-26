@@ -14,7 +14,7 @@ import chain_state
 import config
 import db
 import tau_manager
-from commands import createblock, getmempool, gettimestamp, sendtx
+from commands import createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks
 from errors import DependencyError
 from network import BootstrapPeer, NetworkConfig
 from network.identity import IDENTITY_SEED_SIZE
@@ -48,7 +48,12 @@ class ServiceContainer:
             "sendtx": sendtx,
             "getmempool": getmempool,
             "getcurrenttimestamp": gettimestamp,
+            "gettimestamp": gettimestamp,
             "createblock": createblock,
+            "getbalance": getbalance,
+            "getsequence": getsequence,
+            "history": history,
+            "getblocks": getblocks,
         }
 
         mempool = override_map.get("mempool") or []
@@ -58,14 +63,23 @@ class ServiceContainer:
             "lock": mempool_lock,
         }
 
+
+        db_module = override_map.get("db", db)
+        chain_state_module = override_map.get("chain_state", chain_state)
+        tau_manager_module = override_map.get("tau_manager", tau_manager)
+
+        # Wire up circular dependencies via callbacks
+        if hasattr(tau_manager_module, "set_rules_handler") and hasattr(chain_state_module, "save_rules_state"):
+            tau_manager_module.set_rules_handler(chain_state_module.save_rules_state)
+
         return cls(
             settings=resolved_settings,
             logger=logger,
             command_handlers=command_handlers,
             mempool_state=mempool_state,
-            db=override_map.get("db", db),
-            chain_state=override_map.get("chain_state", chain_state),
-            tau_manager=override_map.get("tau_manager", tau_manager),
+            db=db_module,
+            chain_state=chain_state_module,
+            tau_manager=tau_manager_module,
             overrides=override_map,
         )
 
