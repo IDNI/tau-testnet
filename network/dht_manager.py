@@ -42,12 +42,13 @@ class DHTManager:
         # If not local and we have a token, try network
         if self._dht and self._trio_token:
             try:
-                # We use trio.from_thread.run to execute async get_value on the trio thread
-                return trio.from_thread.run(
-                    self._dht.get_value,
-                    key,
-                    trio_token=self._trio_token
-                )
+                async def _get_value_with_timeout() -> bytes | None:
+                    with trio.move_on_after(timeout):
+                        return await self._dht.get_value(key)
+                    return None
+
+                # Execute async get_value on the trio thread (bounded by timeout).
+                return trio.from_thread.run(_get_value_with_timeout, trio_token=self._trio_token)
             except (trio.RunFinishedError, trio.Cancelled, RuntimeError):
                 # Network might be down or shutting down
                 return None
@@ -174,19 +175,106 @@ class DHTManager:
             return False
 
     def _validate_state_record(self, key: bytes, value: bytes) -> bool:
+        """
+        Validate a `state:<hash>` record.
+
+        Back-compat: older code/tests store JSON blobs under `state:<id>` that look like:
+          {"block_hash": "<id>", "accounts": {...}}
+
+        New mode (Tau rules snapshot distribution): store the raw Tau specification bytes
+        under `state:<blake3_hex>`, validated by hashing the bytes and comparing to the
+        key suffix.
+        """
         import json
         try:
             key_str = key.decode("ascii")
             if not key_str.startswith("state:"):
                 return False
-            state_hash = key_str.split(":", 1)[1]
-            
-            data = json.loads(value.decode("utf-8"))
-            if data.get("block_hash") != state_hash:
-                return False
-            return True
+            suffix = key_str.split(":", 1)[1]
         except Exception:
             return False
+
+        # 1) Legacy JSON payload (keep accepting for existing tests/protocols)
+        try:
+            data = json.loads(value.decode("utf-8"))
+            if isinstance(data, dict) and data.get("block_hash") == suffix:
+                return True
+        except Exception:
+            pass
+
+        # 2) Raw Tau state bytes: validate by hash
+        try:
+            from poa.state import compute_state_hash
+
+            return compute_state_hash(value) == suffix
+        except Exception:
+            return False
+
+    def put_record_sync(self, key: bytes, value: bytes, timeout: float = 5.0) -> bool:
+        """
+        Best-effort synchronous DHT publish helper.
+
+        - Always writes to the local value_store (so local lookups work immediately).
+        - If running with a Trio token, also performs a network `put_value` so peers
+          can fetch the record via KadDHT lookups.
+        """
+        # Debug: show what we're storing for state snapshots (balances + tau spec).
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                key_str = key.decode("ascii", errors="replace")
+            except Exception:
+                key_str = repr(key)
+            if key_str.startswith("state:"):
+                try:
+                    decoded = value.decode("utf-8", errors="replace")
+                except Exception:
+                    decoded = repr(value)
+                # Try to label payload type.
+                label = "raw"
+                if isinstance(decoded, str) and decoded.lstrip().startswith("{"):
+                    try:
+                        import json
+
+                        parsed = json.loads(decoded)
+                        if isinstance(parsed, dict) and "accounts" in parsed:
+                            label = "accounts_snapshot"
+                        else:
+                            label = "state_json"
+                    except Exception:
+                        label = "state_text"
+                else:
+                    label = "tau_spec"
+                logger.debug("DHT put_record_sync (%s) key=%s value=%s", label, key, decoded)
+
+        # Local store first
+        if self._dht and getattr(self._dht, "value_store", None):
+            try:
+                self._dht.value_store.put(key, value)
+            except Exception:
+                return False
+
+        # Network replication if possible
+        if self._dht and self._trio_token:
+            try:
+                import trio
+
+                def _put() -> None:
+                    return None
+
+                # Run `put_value` on the Trio thread. Note: KadDHT.put_value is async.
+                trio.from_thread.run(
+                    self._dht.put_value,
+                    key,
+                    value,
+                    trio_token=self._trio_token,
+                )
+            except (trio.RunFinishedError, trio.Cancelled, RuntimeError):
+                return True  # local store already succeeded
+            except Exception as exc:
+                logger.debug("DHT put_record_sync network publish failed: %s", exc)
+                return True  # local store already succeeded
+
+        return True
 
     def _validate_formula_record(self, key: bytes, value: bytes) -> bool:
         """

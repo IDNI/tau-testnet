@@ -390,6 +390,8 @@ def communicate_with_tau(
         expect_stream_value_for = None  # track which oN prompt we're waiting for
         start_comm_time = time.monotonic()
         found_target_output = False  # Renamed from found_o1_output
+        capturing_updated_spec = False
+        updated_spec_lines: list[str] = []
         error_count = 0  # Track repeated errors to prevent infinite loops
         max_errors = 3  # Maximum number of errors before giving up
         try:
@@ -415,12 +417,20 @@ def communicate_with_tau(
                     tau_ready.clear()
                     raise TauProcessError(f"Tau process exited unexpectedly (code {exit_code}) during communication.")
 
-                # Read either until newline or until prompt ':=' appears, with debug
+                # Read either until newline or until prompt ':=' appears, with debug.
+                # IMPORTANT: Tau may block waiting for input after printing a prompt; ensure we
+                # honor COMM_TIMEOUT even if Tau produces no further stdout bytes.
                 buf = bytearray()
                 fd = current_stdout.fileno()
                 # logger.debug(f"[DEBUG] prompt-detect: start read loop, fd={fd}")
                 while True:
                     # logger.debug(f"[DEBUG] prompt-detect: select on fd={fd}")
+                    # Respect COMM_TIMEOUT even if there's no output ready.
+                    elapsed = time.monotonic() - start_comm_time
+                    if elapsed >= config.COMM_TIMEOUT:
+                        raise TauCommunicationError(
+                            f"Timeout ({config.COMM_TIMEOUT}s) waiting for Tau stdout."
+                        )
                     rlist, _, _ = select.select([fd], [], [], 0.1)
                     # logger.debug(f"[DEBUG] prompt-detect: select returned rlist={rlist}")
                     if not rlist:
@@ -447,6 +457,29 @@ def communicate_with_tau(
                 # global iteration.  That means the current interactive exchange is done
                 # and the caller should start a new communicate_with_tau() cycle.
                 if line_strip.startswith("Execution step:"):
+                    # If Tau printed an updated specification immediately before the next
+                    # execution step, persist it now.
+                    if capturing_updated_spec and updated_spec_lines:
+                        updated_spec = "\n".join(updated_spec_lines).strip()
+                        capturing_updated_spec = False
+                        updated_spec_lines = []
+                        if updated_spec and _rules_handler:
+                            try:
+                                _rules_handler(updated_spec)
+                                logger.info("communicate_with_tau: Saved updated specification via handler (len=%s).", len(updated_spec))
+                                try:
+                                    from poa.state import compute_state_hash
+
+                                    state_hash = compute_state_hash(updated_spec.encode("utf-8"))
+                                except Exception:
+                                    state_hash = None
+                                logger.debug(
+                                    "communicate_with_tau: Tau state snapshot saved (len=%s state_hash=%s).",
+                                    len(updated_spec),
+                                    state_hash,
+                                )
+                            except Exception as e:
+                                logger.error("communicate_with_tau: Failed to save updated specification via handler: %s", e)
                     # logger.debug("  [DEBUG] communicate_with_tau: Detected 'Execution step' marker; returning to caller.")
                     break
                 if line_strip == "":
@@ -455,7 +488,7 @@ def communicate_with_tau(
 
                 # If we've captured our oN value, hold until we see the next i0 prompt
                 # if waiting_for_next_i0:
-                #     if re.match(r"^i0\[\d+\]\s*(:=|=)\s*$", line_strip):
+                #     if re.match(r"^i0\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*$", line_strip):
                 #         logger.debug("communicate_with_tau: Next i0 prompt observed; returning to caller.")
                 #         break  # safe to return, caller will handle new step
                 #     # Do NOT respond to prompts while waiting
@@ -501,7 +534,11 @@ def communicate_with_tau(
                     continue
 
                 # Detect 'oN[...] :=' prompts signalling the next line contains the value.
-                o_prompt_match = re.match(r"^o(\d+)\[[^\]]+\]\s*(:=|=)\s*$", line_strip)
+                # Tau may include a type annotation between the ']' and ':=' like:
+                #   o0[0]:bv :=
+                #   o0[0]:tau :=
+                # Type annotations can also include bit-width, e.g., :bv[16] or :tau[0].
+                o_prompt_match = re.match(r"^o(\d+)\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*$", line_strip)
                 if o_prompt_match:
                     expect_stream_value_for = int(o_prompt_match.group(1))
                     logger.debug(
@@ -511,21 +548,63 @@ def communicate_with_tau(
                     continue
 
                 # Updated specification:
-                o_prompt_match = re.match(r"^Updated\s*specification\:\s*$", line_strip)
-                if o_prompt_match:
-                    logger.debug("communicate_with_tau: Captured value for updated specification: '%s'", line_strip)
-                    if _rules_handler:
-                        try:
-                            _rules_handler(line_strip)
-                            logger.info("communicate_with_tau: Successfully saved rules state via handler")
-                        except Exception as e:
-                            logger.error("communicate_with_tau: Failed to save rules state via handler: %s", e)
+                # Tau can print either:
+                #   Updated specification:
+                #   <normalized-spec>
+                # OR (same-line form):
+                #   Updated specification: <normalized-spec>
+                #
+                # Capture the body and hand it off to the registered rules handler.
+                updated_spec_match = re.match(r"^Updated\s*specification\:\s*(.*)$", line_strip)
+                if updated_spec_match:
+                    capturing_updated_spec = True
+                    updated_spec_lines = []
+                    inline = (updated_spec_match.group(1) or "").strip()
+                    if inline:
+                        updated_spec_lines.append(inline)
+                    logger.debug(
+                        "communicate_with_tau: Entering updated-spec capture mode (inline=%s)",
+                        bool(inline),
+                    )
+                    continue
+
+                if capturing_updated_spec:
+                    # Specifically match iN[...] and oN[...] prompts with optional type annotations.
+                    if re.match(r"^(?:i|o)\d+\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*$", line_strip):
+                        updated_spec = "\n".join(updated_spec_lines).strip()
+                        capturing_updated_spec = False
+                        updated_spec_lines = []
+                        if updated_spec and _rules_handler:
+                            try:
+                                _rules_handler(updated_spec)
+                                logger.info("communicate_with_tau: Saved updated specification via handler (len=%s).", len(updated_spec))
+                                try:
+                                    from poa.state import compute_state_hash
+
+                                    state_hash = compute_state_hash(updated_spec.encode("utf-8"))
+                                except Exception:
+                                    state_hash = None
+                                logger.debug(
+                                    "communicate_with_tau: Tau state snapshot saved (len=%s state_hash=%s).",
+                                    len(updated_spec),
+                                    state_hash,
+                                )
+                            except Exception as e:
+                                logger.error("communicate_with_tau: Failed to save updated specification via handler: %s", e)
+                        # Process this prompt line normally.
                     else:
-                        logger.warning("communicate_with_tau: No rules handler registered, ignoring updated specification output")
+                        updated_spec_lines.append(line_strip)
+                        continue
                 # ---------------------------------------------------------------------
 
-                # Handle Tau input prompts (e.g., "i1[0] :=", "i2[0] :=")
-                prompt_match = re.match(r"^i(\d+)\[[^\]]+\]\s*(:=|=)\s*$", line_strip)
+                # Handle Tau input prompts (e.g., "i1[0] :=", "i2[0] :=", "o0[0]:tau :=").
+                # Tau may include a type annotation between the ']' and ':=' like:
+                #   i0[0]:tau :=
+                #   i1[0]:bv :=
+                #   o0[0]:tau :=
+                #   o1[0]:bv :=
+                # Type annotations can also include bit-width, e.g., :bv[16] or :tau[0].
+                prompt_match = re.match(r"^[io](\d+)\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*$", line_strip)
                 if prompt_match:
                     stream_idx = int(prompt_match.group(1))
 
@@ -551,12 +630,11 @@ def communicate_with_tau(
                 if re.match(r".*(:=|=)\s*$", line_strip):
                     # logger.debug("  [DEBUG] communicate_with_tau: Unrecognised prompt skipped.")
                     continue
-                # Specifically look for o<target_output_stream_index> assignment
-                # Regex to match "oN[<any_digits_or_t>] = <value>" or "oN = <value>"
-                # Tau source uses '=', not ':=' for oN assignment. Example: o0[t] = fail_code_value
+                # Regex to match "oN[<any_digits_or_t>] :type := <value>" or "oN = <value>"
+                # Tau can use '=' or ':=' for oN assignment.
                 # Use target_output_stream_index in the regex
                 target_stream_name = f"o{target_output_stream_index}"
-                match = re.match(rf"^{re.escape(target_stream_name)}(?:\s*\[\w+\])?\s*=\s*(.*)", line_strip)
+                match = re.match(rf"^{re.escape(target_stream_name)}(?:\s*\[[^\]]*\])?\s*(?::[^\s]+)?\s*(?::=|=)\s*(.*)", line_strip)
                 if match:
                     tau_candidate = match.group(1).strip()
                     # This tau_candidate is the direct value assigned to oN by Tau.

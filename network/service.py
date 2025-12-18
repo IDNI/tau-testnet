@@ -693,6 +693,8 @@ class NetworkService:
                         "previous_hash": hdr.get("previous_hash"),
                         "timestamp": hdr.get("timestamp"),
                         "merkle_root": hdr.get("merkle_root"),
+                        "state_hash": hdr.get("state_hash"),
+                        "state_locator": hdr.get("state_locator"),
                         "block_hash": bh,
                     }
                 )
@@ -1059,6 +1061,8 @@ class NetworkService:
                         "previous_hash": header.get("previous_hash"),
                         "timestamp": header.get("timestamp"),
                         "merkle_root": header.get("merkle_root"),
+                        "state_hash": header.get("state_hash"),
+                        "state_locator": header.get("state_locator"),
                         "block_hash": block_hash,
                     }
                 ],

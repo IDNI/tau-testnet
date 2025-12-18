@@ -14,13 +14,16 @@ IDENTITIES=(BOB CHARLIE)
 DEMO_PREFIX="DEMO_TRANSFERS"
 
 RESET="0"
+RULES_PROB="0" # percent chance per tx to include a random Tau rule (0..100)
 
 usage() {
-  echo "Usage: $0 [--reset] [--host HOST] [--port PORT] [--blocks N] [--tx-per-block M] [--max-amount A]"
+  echo "Usage: $0 [--reset] [--host HOST] [--port PORT] [--blocks N] [--tx-per-block M] [--max-amount A] [--with-rules] [--rules-prob PCT]"
   echo "       When --blocks/--tx-per-block are provided, runs a configurable randomized demo:"
   echo "         - --blocks N: number of blocks to create (0 means no blocks)"
   echo "         - --tx-per-block M: number of random transactions to send per block (or total if --blocks=0)"
   echo "         - --max-amount A: max random transfer amount (default 100)"
+  echo "         - --with-rules: include a random simple Tau rule in every transfer tx"
+  echo "         - --rules-prob PCT: include a random rule with probability PCT (0..100) per tx"
 }
 
 source_env_file() {
@@ -112,6 +115,10 @@ while [[ $# -gt 0 ]]; do
       TX_PER_BLOCK="${2:-}"; shift 2 ;;
     --max-amount)
       MAX_AMOUNT="${2:-$MAX_AMOUNT}"; shift 2 ;;
+    --with-rules)
+      RULES_PROB="100"; shift ;;
+    --rules-prob)
+      RULES_PROB="${2:-$RULES_PROB}"; shift 2 ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -162,7 +169,7 @@ check_server() {
 
 run() {
   echo "+ $*"
-  eval "$*"
+  "$@"
 }
 
 check_server
@@ -171,6 +178,84 @@ echo "\n=== Initial Balances ==="
 run "$PY" "$WALLET" balance --address "$ALICE_ADDR" --host "$HOST" --port "$PORT"
 run "$PY" "$WALLET" balance --address "$BOB_ADDR" --host "$HOST" --port "$PORT"
 run "$PY" "$WALLET" balance --address "$CHARLIE_ADDR" --host "$HOST" --port "$PORT"
+
+# Generate a random *simple* Tau rule to ship alongside transfers.
+# IMPORTANT: We avoid touching `o1[t]` (transfer validation output) and we only
+# reference `i1..i4` so the node already provides those inputs during transfer
+# validation. This keeps rule injection "safe" while still exercising Tau's
+# parser/type system with a bit of structure.
+random_tau_rule() {
+  local out_idx=$(( 5 + (RANDOM % 10) )) # o5..o14
+
+  # "Broken-down" building blocks inspired by more complex SBF-style rules.
+  # Here we stick to bitvectors (`:bv`) since the chain's built-in Tau rules
+  # cast i1..i4 as bitvectors.
+  local -a exprs=(
+    "(i1[t] & i2[t] | { #b0 }:bv)"
+    "(i3[t] | i4[t] | { #b0 }:bv)"
+    "((i1[t] | { #b0 }:bv)')"
+    "((i1[t] | i2[t]) & (i3[t] | { 170 }:bv))"
+    "((i4[t] | { 66 }:bv)' | (i1[t] & i2[t]))"
+    "(((i1[t] | i2[t]) & i3[t]) | { #b0 }:bv)"
+    "(((i1[t] & i2[t] | { #b0 }:bv) | (i3[t] | i4[t] | { #b0 }:bv)))"
+  )
+
+  local expr="${exprs[$(( RANDOM % ${#exprs[@]} ))]}"
+
+  # Pick a small family of rule shapes (simple assignment vs. small conditional).
+  local shape=$(( RANDOM % 4 ))
+  case "$shape" in
+    0)
+      # simplest: just define an unused output stream
+      printf 'always (o%s[t] = %s).' "$out_idx" "$expr"
+      ;;
+    1)
+      # conditional (mirrors examples like "cond ? o = expr : o = (expr)'")
+      printf "always ((%s != { #b0 }:bv) ? o%s[t] = %s : o%s[t] = (%s)')." \
+        "$expr" "$out_idx" "$expr" "$out_idx" "$expr"
+      ;;
+    2)
+      # same structure, but flip the comparator
+      printf "always ((%s = { #b0 }:bv) ? o%s[t] = %s : o%s[t] = (%s)')." \
+        "$expr" "$out_idx" "$expr" "$out_idx" "$expr"
+      ;;
+    *)
+      # constant output (keeps a very small/cheap option in the mix)
+      local bit=$(( RANDOM % 2 )) # 0 or 1
+      printf 'always (o%s[t] = { #b%s }:bv).' "$out_idx" "$bit"
+      ;;
+  esac
+}
+
+should_include_rule() {
+  local p="${RULES_PROB:-0}"
+  if [[ -z "$p" ]]; then
+    p="0"
+  fi
+  if ! [[ "$p" =~ ^[0-9]+$ ]]; then
+    echo "[ERROR] --rules-prob must be an integer 0..100 (got: '$p')" >&2
+    exit 1
+  fi
+  if (( p < 0 || p > 100 )); then
+    echo "[ERROR] --rules-prob must be in range 0..100 (got: $p)" >&2
+    exit 1
+  fi
+  (( p > 0 )) && (( (RANDOM % 100) < p ))
+}
+
+send_transfer_tx() {
+  local sender_sk="$1"
+  local to_addr="$2"
+  local amount="$3"
+
+  local cmd=( "$PY" "$WALLET" send --privkey "$sender_sk" --transfer "$to_addr:$amount" --host "$HOST" --port "$PORT" )
+  if should_include_rule; then
+    local rule
+    rule="$(random_tau_rule)"
+    cmd+=( --rule "$rule" )
+  fi
+  run "${cmd[@]}"
+}
 
 # Helper to send a single random transaction among Alice/Bob/Charlie
 send_random_tx() {
@@ -205,14 +290,14 @@ send_random_tx() {
   local sender_sk="${sks[$sidx]}"
   local to_addr="${addrs[$tidx]}"
 
-  run "$PY" "$WALLET" send --privkey "$sender_sk" --transfer "$to_addr:$amount" --host "$HOST" --port "$PORT"
+  send_transfer_tx "$sender_sk" "$to_addr" "$amount"
 }
 
 # If either --blocks or --tx-per-block is provided, run configurable randomized mode.
 if [[ -n "$BLOCKS" || -n "$TX_PER_BLOCK" ]]; then
   BLOCKS="${BLOCKS:-0}"
   TX_PER_BLOCK="${TX_PER_BLOCK:-1}"
-  echo "\n[CONFIG] blocks=$BLOCKS, tx_per_block=$TX_PER_BLOCK, max_amount=$MAX_AMOUNT"
+  echo "\n[CONFIG] blocks=$BLOCKS, tx_per_block=$TX_PER_BLOCK, max_amount=$MAX_AMOUNT, rules_prob=${RULES_PROB}%"
 
   if [[ "$BLOCKS" -eq 0 ]]; then
     echo "\n=== Sending $TX_PER_BLOCK random transaction(s) (no blocks will be created) ==="
@@ -236,8 +321,8 @@ if [[ -n "$BLOCKS" || -n "$TX_PER_BLOCK" ]]; then
 else
   # Backwards-compatible fixed demo flow
   echo "\n=== Round 1: Alice -> Bob (100), Alice -> Charlie (50) ==="
-  run "$PY" "$WALLET" send --privkey "$ALICE_SK" --transfer "$BOB_ADDR:100" --host "$HOST" --port "$PORT"
-  run "$PY" "$WALLET" send --privkey "$ALICE_SK" --transfer "$CHARLIE_ADDR:50" --host "$HOST" --port "$PORT"
+  send_transfer_tx "$ALICE_SK" "$BOB_ADDR" "100"
+  send_transfer_tx "$ALICE_SK" "$CHARLIE_ADDR" "50"
 
   echo "\n[BLOCK] Assembling a new block from current mempool"
   run "$PY" "$WALLET" createblock --host "$HOST" --port "$PORT"
@@ -248,7 +333,7 @@ else
   run "$PY" "$WALLET" balance --address "$CHARLIE_ADDR" --host "$HOST" --port "$PORT"
 
   echo "\n=== Round 2: Bob -> Charlie (30) ==="
-  run "$PY" "$WALLET" send --privkey "$BOB_SK" --transfer "$CHARLIE_ADDR:30" --host "$HOST" --port "$PORT"
+  send_transfer_tx "$BOB_SK" "$CHARLIE_ADDR" "30"
 
   echo "\n[BLOCK] Assembling a new block from current mempool"
   run "$PY" "$WALLET" createblock --host "$HOST" --port "$PORT"
@@ -259,7 +344,7 @@ else
   run "$PY" "$WALLET" balance --address "$CHARLIE_ADDR" --host "$HOST" --port "$PORT"
 
   echo "\n=== Round 3: Charlie -> Alice (10) ==="
-  run "$PY" "$WALLET" send --privkey "$CHARLIE_SK" --transfer "$ALICE_ADDR:10" --host "$HOST" --port "$PORT"
+  send_transfer_tx "$CHARLIE_SK" "$ALICE_ADDR" "10"
 
   echo "\n[BLOCK] Assembling a new block from current mempool"
   run "$PY" "$WALLET" createblock --host "$HOST" --port "$PORT"

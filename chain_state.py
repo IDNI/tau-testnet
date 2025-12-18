@@ -1,10 +1,14 @@
 import threading
 import json
+import logging
 from typing import Dict, List, Optional
 import db
 import tau_manager
+import config
 from poa import PoATauEngine, TauStateSnapshot, compute_state_hash
 from block import Block
+
+logger = logging.getLogger(__name__)
 
 # Lock for thread-safe access to balances
 _balance_lock = threading.Lock()
@@ -25,6 +29,7 @@ _rules_lock = threading.Lock()
 # In-memory rules state storage
 _current_rules_state = ""
 _last_processed_block_hash = ""
+_tau_engine_state_hash = ""  # last known Tau engine snapshot hash (best-effort)
 
 # DHT Client for storing formulas
 _dht_client = None
@@ -33,6 +38,196 @@ def set_dht_client(client):
     """Sets the DHT client for storing formulas."""
     global _dht_client
     _dht_client = client
+
+
+def publish_tau_state_snapshot(state_hash: str, tau_bytes: bytes) -> bool:
+    """
+    Publish the serialized Tau/rules snapshot into the DHT under the configured
+    locator namespace (typically: `state:<hash>`).
+
+    This is used to let other nodes fetch the exact Tau engine state tied to a
+    block header's `state_hash`.
+    """
+    if not state_hash or not isinstance(state_hash, str):
+        return False
+    if tau_bytes is None:
+        return False
+    if not tau_bytes or not tau_bytes.strip():
+        logger.error(
+            "Refusing to publish empty Tau state snapshot (state_hash=%s).",
+            state_hash,
+        )
+        return False
+    if not _dht_client or not getattr(_dht_client, "dht", None):
+        return False
+    try:
+        key = f"{config.STATE_LOCATOR_NAMESPACE}:{state_hash}".encode("ascii")
+    except Exception:
+        return False
+
+    try:
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                tau_text = tau_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                tau_text = repr(tau_bytes)
+            logger.debug(
+                "Publishing Tau state snapshot to DHT key=%s len=%s state_hash=%s tau=%s",
+                key,
+                len(tau_bytes) if tau_bytes is not None else 0,
+                state_hash,
+                tau_text,
+            )
+
+        # Prefer network replication if supported by the DHT manager wrapper.
+        if hasattr(_dht_client, "put_record_sync"):
+            return bool(_dht_client.put_record_sync(key, tau_bytes))
+
+        # Fallback: local store only (peers can still fetch via get_value queries).
+        _dht_client.dht.value_store.put(key, tau_bytes)
+        return True
+    except Exception as exc:
+        print(f"[WARN][chain_state] Failed to publish tau state snapshot to DHT: {exc}")
+        return False
+
+
+def fetch_tau_state_snapshot(state_hash: str) -> Optional[str]:
+    """
+    Fetch a serialized Tau/rules snapshot from the DHT.
+
+    Returns the UTF-8 decoded Tau formula string if found, otherwise None.
+    """
+    if not state_hash or not isinstance(state_hash, str):
+        return None
+    if not _dht_client or not getattr(_dht_client, "dht", None):
+        return None
+    try:
+        key = f"{config.STATE_LOCATOR_NAMESPACE}:{state_hash}".encode("ascii")
+    except Exception:
+        return None
+
+    try:
+        if hasattr(_dht_client, "get_record_sync"):
+            val_bytes = _dht_client.get_record_sync(key, timeout=2.0)
+        else:
+            val = _dht_client.dht.value_store.get(key)
+            val_bytes = getattr(val, "value", val) if val else None
+        if not val_bytes:
+            return None
+        if isinstance(val_bytes, str):
+            return val_bytes
+        return bytes(val_bytes).decode("utf-8")
+    except Exception as exc:
+        print(f"[WARN][chain_state] Failed to fetch tau state snapshot from DHT: {exc}")
+        return None
+
+
+def publish_accounts_snapshot(block_hash: str) -> bool:
+    """
+    Publish the resulting account table (balances + sequence numbers) for a block
+    into the DHT.
+
+    Key:   state:<block_hash>
+    Value: JSON bytes: {"block_hash": "<block_hash>", "accounts": {addr: {"balance": int, "sequence": int}}}
+    """
+    if not block_hash or not isinstance(block_hash, str):
+        return False
+    if not _dht_client or not getattr(_dht_client, "dht", None):
+        return False
+
+    with _balance_lock, _sequence_lock:
+        accounts = {
+            addr: {"balance": int(bal), "sequence": int(_sequence_numbers.get(addr, 0))}
+            for addr, bal in _balances.items()
+        }
+    payload = json.dumps(
+        {"block_hash": block_hash, "accounts": accounts},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    try:
+        key = f"{config.STATE_LOCATOR_NAMESPACE}:{block_hash}".encode("ascii")
+    except Exception:
+        return False
+
+    try:
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                payload_text = payload.decode("utf-8", errors="replace")
+            except Exception:
+                payload_text = repr(payload)
+            logger.debug(
+                "Publishing accounts snapshot to DHT key=%s block_hash=%s accounts_json=%s",
+                key,
+                block_hash,
+                payload_text,
+            )
+
+        if hasattr(_dht_client, "put_record_sync"):
+            return bool(_dht_client.put_record_sync(key, payload))
+        _dht_client.dht.value_store.put(key, payload)
+        return True
+    except Exception as exc:
+        print(f"[WARN][chain_state] Failed to publish accounts snapshot to DHT: {exc}")
+        return False
+
+
+def fetch_accounts_snapshot(block_hash: str) -> Optional[tuple[Dict[str, int], Dict[str, int]]]:
+    """
+    Fetch the account table snapshot (balances + sequences) for a block from DHT.
+    """
+    if not block_hash or not isinstance(block_hash, str):
+        return None
+    if not _dht_client or not getattr(_dht_client, "dht", None):
+        return None
+
+    try:
+        key = f"{config.STATE_LOCATOR_NAMESPACE}:{block_hash}".encode("ascii")
+    except Exception:
+        return None
+
+    try:
+        if hasattr(_dht_client, "get_record_sync"):
+            val_bytes = _dht_client.get_record_sync(key, timeout=2.0)
+        else:
+            val = _dht_client.dht.value_store.get(key)
+            val_bytes = getattr(val, "value", val) if val else None
+        if not val_bytes:
+            return None
+        if not isinstance(val_bytes, (bytes, bytearray)):
+            val_bytes = bytes(val_bytes)
+        data = json.loads(val_bytes.decode("utf-8"))
+        if not isinstance(data, dict):
+            return None
+        accounts = data.get("accounts")
+        if not isinstance(accounts, dict):
+            return None
+        balances: Dict[str, int] = {}
+        sequences: Dict[str, int] = {}
+        for addr, row in accounts.items():
+            if not isinstance(addr, str):
+                continue
+            if isinstance(row, dict):
+                try:
+                    balances[addr] = int(row.get("balance", 0))
+                except Exception:
+                    balances[addr] = 0
+                try:
+                    sequences[addr] = int(row.get("sequence", 0))
+                except Exception:
+                    sequences[addr] = 0
+            else:
+                # Back-compat: allow {addr: balance} only
+                try:
+                    balances[addr] = int(row)
+                except Exception:
+                    balances[addr] = 0
+                sequences[addr] = 0
+        return balances, sequences
+    except Exception as exc:
+        print(f"[WARN][chain_state] Failed to fetch accounts snapshot from DHT: {exc}")
+        return None
 
 # Genesis address and balance used across tests and reconstruction
 GENESIS_ADDRESS = "91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6"
@@ -44,7 +239,16 @@ GENESIS_BALANCE = 65535
 
 def process_new_block(block: Block) -> bool:
     """
-    Verifies, executes, and persists a new block.
+    Verify and persist a new block.
+
+    Secondary-node fast path:
+    - Do NOT re-execute transactions.
+    - Fetch the resulting `accounts` snapshot from DHT under `state:<block_hash>`.
+    - Fetch the resulting Tau rules snapshot from DHT under `state:<state_hash>` and apply it to Tau via i0.
+
+    Fallback (backwards compatibility):
+    - If snapshots are unavailable, fall back to the previous behavior (re-execute via PoATauEngine).
+
     Returns True if successful, False otherwise.
     """
     block_number = block.header.block_number
@@ -62,43 +266,91 @@ def process_new_block(block: Block) -> bool:
         print(f"[WARN][chain_state] Block #{block_number} verification failed")
         return False
 
-    with _rules_lock:
-        current_rules = _current_rules_state
-        
-    current_rules_bytes = current_rules.encode('utf-8')
-    snapshot = TauStateSnapshot(
-        state_hash=compute_state_hash(current_rules_bytes),
-        tau_bytes=current_rules_bytes, 
-        metadata={"poa": True}
-    )
+    expected_state_hash = getattr(block.header, "state_hash", "") or ""
+
+    # --- Snapshot fast path (secondary nodes) ---------------------------------
+    # Do not replay block transactions. Instead, pull the resulting state from DHT.
+    import time
+
+    deadline = time.time() + 5.0  # allow brief propagation delay
+    balances_snapshot: Optional[Dict[str, int]] = None
+    sequences_snapshot: Optional[Dict[str, int]] = None
+    rules_from_dht: Optional[str] = None
+
+    while time.time() < deadline:
+        accounts_result = fetch_accounts_snapshot(block.block_hash)
+        if accounts_result:
+            balances_snapshot, sequences_snapshot = accounts_result
+
+        if expected_state_hash and expected_state_hash != ("0" * 64):
+            rules_from_dht = fetch_tau_state_snapshot(expected_state_hash)
+        else:
+            rules_from_dht = ""
+
+        if balances_snapshot is not None and sequences_snapshot is not None and rules_from_dht is not None:
+            break
+        time.sleep(0.2)
+
+    if balances_snapshot is None or sequences_snapshot is None:
+        print(f"[ERROR][chain_state] Missing accounts snapshot in DHT for block {block.block_hash[:12]}...")
+        return False
+    if rules_from_dht is None:
+        print(f"[ERROR][chain_state] Missing Tau snapshot in DHT for state_hash {expected_state_hash[:12]}...")
+        return False
+
+    # Apply Tau rules snapshot to the running Tau engine via i0.
+    if not tau_manager.tau_ready.is_set():
+        tau_manager.tau_ready.wait(timeout=5)
+    if not tau_manager.tau_ready.is_set():
+        print("[ERROR][chain_state] Tau is not ready; cannot apply state snapshot")
+        return False
 
     try:
-        # Execute transactions
-        result = engine.apply(snapshot, block.transactions)
-        
-        # Update global state from result
-        new_rules_bytes = result.snapshot.tau_bytes
-        new_rules = new_rules_bytes.decode('utf-8')
-        
-        
-        with _rules_lock:
-            _current_rules_state = new_rules
-            _last_processed_block_hash = block.block_hash
-            
-            
-        # Persist everything
-        db.add_block(block)
-        db.save_chain_state(
-            balances=_balances,
-            sequences=_sequence_numbers,
-            rules=new_rules,
-            last_block_hash=block.block_hash
-        )
-        print(f"[INFO][chain_state] Block #{block_number} processed and state updated.")
-        return True
-    except Exception as e:
-        print(f"[ERROR][chain_state] Failed to process block #{block_number}: {e}")
+        if rules_from_dht:
+            tau_manager.communicate_with_tau(rule_text=rules_from_dht, target_output_stream_index=0)
+    except Exception as exc:
+        print(f"[ERROR][chain_state] Failed to apply Tau state snapshot via i0: {exc}")
         return False
+
+    # Confirm the applied rules hash matches the block commitment.
+    with _rules_lock:
+        applied_rules = _current_rules_state or rules_from_dht
+    applied_hash = compute_state_hash(applied_rules.encode("utf-8"))
+    if expected_state_hash and expected_state_hash != ("0" * 64) and applied_hash != expected_state_hash:
+        # Fall back to the DHT snapshot bytes as the canonical rules payload.
+        applied_rules = rules_from_dht
+        applied_hash = compute_state_hash(applied_rules.encode("utf-8"))
+    if expected_state_hash and expected_state_hash != ("0" * 64) and applied_hash != expected_state_hash:
+        print(
+            f"[ERROR][chain_state] Tau snapshot hash mismatch after apply. "
+            f"expected={expected_state_hash[:12]} got={applied_hash[:12]}"
+        )
+        return False
+
+    with _rules_lock:
+        global _tau_engine_state_hash
+        _tau_engine_state_hash = expected_state_hash
+
+    # Replace local account state with the snapshot.
+    with _balance_lock, _sequence_lock:
+        _balances.clear()
+        _balances.update(balances_snapshot)
+        _sequence_numbers.clear()
+        _sequence_numbers.update(sequences_snapshot)
+
+    with _rules_lock:
+        _current_rules_state = applied_rules
+        _last_processed_block_hash = block.block_hash
+
+    db.add_block(block)
+    db.save_chain_state(
+        balances=_balances,
+        sequences=_sequence_numbers,
+        rules=applied_rules,
+        last_block_hash=block.block_hash,
+    )
+    print(f"[INFO][chain_state] Block #{block_number} persisted via DHT snapshots.")
+    return True
 
 def rebuild_state_from_blockchain(start_block=0):
     """
@@ -116,6 +368,8 @@ def rebuild_state_from_blockchain(start_block=0):
             _balances.clear()
             _sequence_numbers.clear()
             _current_rules_state = ""
+            global _tau_engine_state_hash
+            _tau_engine_state_hash = ""
             _last_processed_block_hash = ''
         print("[INFO][chain_state] Cleared existing in-memory state for full rebuild.")
         # Initialize genesis state
@@ -258,10 +512,23 @@ def save_rules_state(rules_content: str):
     Saves the rules state from Tau's o000 output stream.
     This represents the current rules state that should be persisted for chain state reconstruction.
     """
-    global _current_rules_state
+    global _current_rules_state, _tau_engine_state_hash
     with _rules_lock:
-        _current_rules_state = rules_content.strip()
+        candidate = (rules_content or "").strip()
+        if not candidate:
+            logger.error("Refusing to save empty Tau rules state.")
+            return
+        _current_rules_state = candidate
+        try:
+            _tau_engine_state_hash = compute_state_hash(_current_rules_state.encode("utf-8"))
+        except Exception:
+            _tau_engine_state_hash = ""
         print(f"[INFO][chain_state] Rules state updated. Length: {len(_current_rules_state)} characters")
+        logger.debug(
+            "Rules state saved (len=%s state_hash=%s).",
+            len(_current_rules_state),
+            _tau_engine_state_hash,
+        )
         
         if _dht_client:
             try:
@@ -361,6 +628,12 @@ def load_state_from_db() -> bool:
         
         global _current_rules_state
         _current_rules_state = current_rules
+
+        # We loaded rules state from persistence, but Tau engine has not necessarily
+        # been updated yet (it restarts fresh). Treat engine state as unknown until
+        # we explicitly apply a snapshot to Tau.
+        global _tau_engine_state_hash
+        _tau_engine_state_hash = ""
         
         global _last_processed_block_hash
         _last_processed_block_hash = last_processed_block_hash

@@ -25,11 +25,15 @@ To enable true Tau-driven validation, unset TAU_FORCE_TEST in your environment o
         - `tau/blocks/1.0.0`: Propagates new headers/tip summaries prior to full sync.
         - `tau/transactions/1.0.0`: Propagates canonical, signed transactions across the mesh.
     *   Bootstrapping connects to peers, performs handshake + sync, fetches missing blocks, rebuilds state, and replays gossip subscriptions so the node immediately participates in block/transaction mesh traffic.
+    *   **Tip semantics**: Block numbers are **0-indexed**. A node with no persisted blocks may still report `head_number: 0` with `head_hash` set to the `genesis_hash` sentinel. A node with exactly one block (block `#0`) will also report `head_number: 0`, but with `head_hash` equal to that block hash. Sync decisions must consider `head_hash` (not just `head_number`).
     *   Verbose debug logging traces requests/responses and bootstrap progress for easier development.
 *   **Persistent Blockchain**:
     *   Creates blocks from transactions stored in the mempool.
     *   Links blocks together in a chain by referencing the previous block's hash.
     *   Persists the entire chain of blocks to a SQLite database.
+*   **Proof-of-Authority (PoA) Blocks (BLS signatures)**:
+    *   Blocks can be signed by the configured authority key (`TAU_MINER_PRIVKEY`) and verified against `TAU_MINER_PUBKEY` (when `py_ecc` is available).
+    *   The PoA execution path integrates with the Tau rule/state snapshot (`state_hash`) to keep block ↔ state linkage explicit.
 *   **Authenticated Transactions via BLS Signatures**:
     *   Transactions are cryptographically signed using BLS12-381 signatures.
     *   The server verifies the signature against the `sender_pubkey` and a canonical representation of the transaction data.
@@ -114,6 +118,16 @@ Call `NetworkService.get_metrics_snapshot()` (or read the periodic `[metrics]` l
     ]
     ```
     On start, the node will connect, handshake, sync headers, request missing block bodies, and rebuild its state.
+
+### Running tests (Trio)
+
+This project uses **Trio** for async tests. Recommended invocation (Trio-only, disable asyncio plugin):
+
+```bash
+./venv/bin/python3 -m pytest -p no:asyncio
+```
+
+To bypass Tau Docker during tests/dev, set `TAU_FORCE_TEST=1` (see **Tau Execution Mode** above).
 
 ### Connecting to the Server
 
@@ -225,10 +239,15 @@ A block is a fundamental data structure that organizes transactions into an atom
   - `previous_hash` (string): Hex-encoded SHA256 hash of the previous block's header.
   - `timestamp` (integer): Unix timestamp when the block was created.
   - `merkle_root` (string): Hex-encoded Merkle root of the included transactions.
+  - `state_hash` (string): Hex-encoded hash of the current Tau/rules snapshot (used to bind state to a block).
+  - `state_locator` (string): A namespaced lookup key (e.g. `state:<hash>`) for DHT/state distribution.
 - A **block body** containing:
   - `transactions` (list): Ordered list of transactions (each is the JSON object accepted by `sendtx`).
+- Optional **PoA fields**:
+  - `block_signature` (string): Hex-encoded BLS signature over the canonical header bytes (PoA mode).
+  - `tx_ids` (list): Transaction hashes used to build the Merkle root.
 
-Blocks do **not** include proof-of-work or signatures at this alpha stage.
+Blocks do **not** include proof-of-work. In PoA mode, blocks are **signed** by an authority key and verified against the configured `TAU_MINER_PUBKEY` (when `py_ecc` is available).
 
 The `block.py` module provides the `Block` and `BlockHeader` classes, along with utility functions for computing transaction hashes (`compute_tx_hash`), Merkle roots (`compute_merkle_root`), and block hashes.
 
@@ -249,6 +268,6 @@ Please submit issues at the following link: [Tau Testnet issues](https://github.
 
 *   Fork choice mechanism.
 *   Expansion of Tau logic.
-*   Full consensus mechanism implementation.
+*   Multi-authority PoA (validator set, rotation) and stronger fork-choice/finality rules.
 *   More robust error handling and reporting.
 *   More comprehensive unit and integration tests.

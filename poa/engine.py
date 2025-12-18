@@ -75,9 +75,12 @@ class PoATauEngine(TauEngine):
         rejected_txs = []
         receipts = {}
 
-        # We'll accumulate the "tau bytes" (rules) to update the snapshot hash
-        # This is a simplification; real Tau state is in the Tau process.
-        # We track the rule history hash here.
+        # Track the serialized Tau/rules snapshot bytes.
+        # In production, `tau_manager` prints the normalized updated specification
+        # after successful pointwise revision; `chain_state.save_rules_state(...)`
+        # persists that string. When that is available, we use it to build the
+        # snapshot. In tests/mocks (no rules handler), fall back to concatenating
+        # rule payloads for determinism.
         current_tau_bytes = snapshot.tau_bytes
 
         for i, tx in enumerate(transactions):
@@ -143,8 +146,22 @@ class PoATauEngine(TauEngine):
                                 # We'll log it.
                                 tx_receipt["logs"].append(f"Tau output: {output}")
                             else:
-                                # Update local snapshot bytes
-                                current_tau_bytes += op_data.encode('utf-8')
+                                # Prefer the persisted "updated specification" snapshot if available.
+                                rules_text = None
+                                try:
+                                    candidate = getattr(chain_state, "get_rules_state", None)
+                                    if callable(candidate):
+                                        val = candidate()
+                                        if isinstance(val, str):
+                                            rules_text = val
+                                except Exception:
+                                    rules_text = None
+
+                                if rules_text is not None:
+                                    current_tau_bytes = rules_text.encode("utf-8")
+                                else:
+                                    # Fallback for tests/mocks: deterministic accumulation.
+                                    current_tau_bytes += op_data.encode("utf-8")
                                 tx_receipt["logs"].append("Rule applied")
 
                         except Exception as e:

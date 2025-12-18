@@ -33,7 +33,6 @@ docs/*.md
 *.md
 .env*
 !README.md
-!WALLET.md
 !NOTICE.txt
 !LICENSE.md
 !WALLET_USAGE.md

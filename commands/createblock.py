@@ -138,6 +138,32 @@ def create_block_from_mempool() -> Dict:
         # Clear mempool
         conn.execute('DELETE FROM mempool')
     print(f"[INFO][createblock] Block, state committed; mempool cleared.")
+
+    # Publish the Tau/rules snapshot tied to this block so peers can fetch it by
+    # (state_hash/state_locator) and apply it to their Tau engine.
+    try:
+        published = False
+        if hasattr(chain_state, "publish_tau_state_snapshot"):
+            published = bool(chain_state.publish_tau_state_snapshot(state_hash, rules_blob))
+        if published:
+            print(f"[INFO][createblock] Published Tau state snapshot to DHT: {state_locator}")
+        else:
+            print(f"[DEBUG][createblock] Tau state snapshot not published to DHT (no DHT client?)")
+    except Exception as e:
+        print(f"[WARN][createblock] Failed to publish Tau state snapshot to DHT: {e}")
+
+    # Publish the resulting accounts table so secondary nodes can update balances
+    # without re-executing transactions.
+    try:
+        published_accounts = False
+        if hasattr(chain_state, "publish_accounts_snapshot"):
+            published_accounts = bool(chain_state.publish_accounts_snapshot(new_block.block_hash))
+        if published_accounts:
+            print(f"[INFO][createblock] Published accounts snapshot to DHT: {config.STATE_LOCATOR_NAMESPACE}:{new_block.block_hash}")
+        else:
+            print(f"[DEBUG][createblock] Accounts snapshot not published to DHT (no DHT client?)")
+    except Exception as e:
+        print(f"[WARN][createblock] Failed to publish accounts snapshot to DHT: {e}")
     
     print(f"[INFO][createblock] Block creation process completed!")
     
