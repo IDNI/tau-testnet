@@ -47,9 +47,15 @@ class NetworkService:
         self._runner_cancel_scope: Optional[trio.CancelScope] = None
         self._runner_stop = trio.Event()
         self._loop_ready = trio.Event()
+        # Trio token for scheduling work from non-Trio threads (e.g. TCP server thread).
+        self._trio_token: Optional[trio.lowlevel.TrioToken] = None
         
         # Metrics
         self._metric_timestamps: Dict[str, float] = {}
+        # Track peers we've already processed a "connected" event for to avoid
+        # duplicate handshakes/subscription spam when libp2p emits multiple
+        # connected notifications for the same peer.
+        self._connected_peer_ids: Set[str] = set()
 
     async def _on_host_event(self, event: str, conn: Any) -> None:
         logger.debug("Host event: %s", event)
@@ -63,6 +69,11 @@ class NetworkService:
 
     async def _on_peer_connected(self, conn: Any) -> None:
         peer_id = conn.muxed_conn.peer_id
+        peer_key = str(peer_id)
+        if peer_key in self._connected_peer_ids:
+            logger.debug("Duplicate peer connected event ignored: %s", peer_id)
+            return
+        self._connected_peer_ids.add(peer_key)
         logger.info("Peer connected: %s", peer_id)
         
         # Manually add peer address to peerstore for inbound connections
@@ -91,13 +102,27 @@ class NetworkService:
         # Small delay to ensure connection is fully registered
         await trio.sleep(0.1)
         
+        # Send our current subscriptions so the remote knows what to forward.
+        if self._nursery:
+            try:
+                local_topics = getattr(self._gossip_manager, "_local_topics", set()) or set()
+                if local_topics:
+                    subs = [{"topic": t, "subscribe": True} for t in local_topics]
+                    self._nursery.start_soon(self._gossip_manager.send_subscriptions, peer_id, subs)
+            except Exception:
+                logger.debug("Failed to send subscriptions to %s", peer_id, exc_info=True)
+
         # Schedule handshake
         if self._nursery:
             self._nursery.start_soon(self._perform_handshake, peer_id)
             self._nursery.start_soon(self._send_mempool_snapshot, peer_id)
 
     async def _on_peer_disconnected(self, conn: Any) -> None:
-        pass
+        try:
+            peer_id = conn.muxed_conn.peer_id
+            self._connected_peer_ids.discard(str(peer_id))
+        except Exception:
+            pass
 
     async def _perform_handshake(self, peer_id: Any) -> None:
         from .protocols import TAU_PROTOCOL_HANDSHAKE
@@ -112,9 +137,87 @@ class NetworkService:
             # Process response
             if data:
                 resp = json.loads(data.decode())
-                # Ingest peer info from response if any
-                # (Tests expect peer advertisement in handshake)
-                pass
+                # Persist basic peer metadata so later routing/sync has context.
+                try:
+                    import time
+                    import db
+
+                    try:
+                        addrs = [str(a) for a in (self.host.get_peerstore().addrs(peer_id) or [])]
+                    except Exception:
+                        addrs = []
+
+                    db.upsert_peer_basic(
+                        peer_id=str(peer_id),
+                        addrs=addrs,
+                        agent=resp.get("agent"),
+                        network_id=resp.get("network_id"),
+                        genesis_hash=resp.get("genesis_hash"),
+                        head_number=resp.get("head_number"),
+                        head_hash=resp.get("head_hash"),
+                        last_seen=int(time.time()),
+                    )
+                except Exception:
+                    logger.debug("Failed to persist handshake peer metadata", exc_info=True)
+
+                # Best-effort bootstrap sync: if peer advertises a head we don't have yet,
+                # request headers/blocks up to that head.
+                try:
+                    remote_head = resp.get("head_hash")
+                    remote_head_number = resp.get("head_number")
+                    if remote_head:
+                        import db
+
+                        local_latest = db.get_latest_block()
+                        local_head_number = 0
+                        local_head_hash = self._config.genesis_hash
+                        local_has_blocks = bool(local_latest and isinstance(local_latest, dict) and local_latest.get("block_hash"))
+                        try:
+                            if local_latest and isinstance(local_latest, dict) and local_latest.get("header"):
+                                local_head_number = int(local_latest["header"].get("block_number") or 0)
+                                local_head_hash = str(local_latest.get("block_hash") or local_head_hash)
+                        except Exception:
+                            local_head_number = 0
+
+                        # Avoid spurious sync attempts when both peers are at genesis.
+                        need_sync = False
+                        try:
+                            if remote_head_number is not None:
+                                remote_n = int(remote_head_number)
+                                remote_h = str(remote_head)
+                                remote_has_blocks = bool(remote_h and remote_h != self._config.genesis_hash)
+                                # If we have no blocks but the remote has a real head hash (e.g. block #0),
+                                # we must sync even though head_number == 0 on both sides.
+                                if (not local_has_blocks) and remote_has_blocks:
+                                    need_sync = True
+                                else:
+                                    need_sync = remote_n > local_head_number
+                                    # Same height but different hash -> fetch if we don't have it.
+                                    if (not need_sync) and remote_has_blocks and remote_h != str(local_head_hash):
+                                        need_sync = db.get_block_by_hash(remote_h) is None
+                            else:
+                                # Fallback: only consider syncing if the remote tip differs from ours.
+                                remote_h = str(remote_head)
+                                remote_has_blocks = bool(remote_h and remote_h != self._config.genesis_hash)
+                                if remote_has_blocks and (not local_has_blocks):
+                                    need_sync = True
+                                elif remote_has_blocks and remote_h != str(local_head_hash):
+                                    need_sync = db.get_block_by_hash(remote_h) is None
+                        except Exception:
+                            need_sync = False
+
+                        if need_sync:
+                            locator = self._build_block_locator()
+                            if self._nursery:
+                                self._nursery.start_soon(
+                                    self._sync_and_ingest_from_peer,
+                                    peer_id,
+                                    locator,
+                                    remote_head,
+                                    2000,
+                                )
+                except Exception:
+                    logger.debug("Handshake-triggered sync failed to schedule", exc_info=True)
         except Exception:
             logger.warning("Handshake failed with %s", peer_id, exc_info=True)
 
@@ -128,6 +231,15 @@ class NetworkService:
             "head_number": 0,
             "head_hash": self._config.genesis_hash,
         }
+        # Prefer the persisted chain tip if available.
+        try:
+            import db
+            latest = db.get_latest_block()
+            if latest and "header" in latest:
+                payload["head_number"] = int(latest["header"].get("block_number", payload["head_number"]))
+                payload["head_hash"] = str(latest.get("block_hash") or payload["head_hash"])
+        except Exception:
+            logger.debug("Failed to compute local tip for handshake payload", exc_info=True)
         
         # Add dht peers/providers if available
         if self._dht_manager.dht:
@@ -214,6 +326,28 @@ class NetworkService:
                 
         return payload
 
+    def _build_block_locator(self, max_entries: int = 32) -> List[str]:
+        """
+        Build a tip-first block hash locator for header sync.
+        Always appends configured genesis_hash as a final fallback.
+        """
+        locator: List[str] = []
+        try:
+            import db
+
+            blocks = db.get_all_blocks()
+            hashes = [b.get("block_hash") for b in blocks if isinstance(b, dict) and b.get("block_hash")]
+            if hashes:
+                locator.extend(list(reversed(hashes[-max_entries:])))
+        except Exception:
+            logger.debug("Failed to build locator from db", exc_info=True)
+
+        if not locator:
+            locator = [self._config.genesis_hash]
+        elif self._config.genesis_hash not in locator:
+            locator.append(self._config.genesis_hash)
+        return locator
+
     async def _send_mempool_snapshot(self, peer_id: Any) -> None:
         import db
         import json
@@ -252,9 +386,10 @@ class NetworkService:
             TAU_GOSSIP_TOPIC_BLOCKS,
             TAU_GOSSIP_TOPIC_PEERS,
         )
-        self._gossip_manager.subscribe(TAU_GOSSIP_TOPIC_TRANSACTIONS, self._on_transaction_gossip)
-        self._gossip_manager.subscribe(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
-        self._gossip_manager.subscribe(TAU_GOSSIP_TOPIC_PEERS, self._on_peer_advertisement)
+        # Track our interests so we can forward them on connect.
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_TRANSACTIONS, self._on_transaction_gossip)
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PEERS, self._on_peer_advertisement)
         
         # Start background tasks in a system task to allow start() to return
         # This mimics the behavior expected by server.py and tests
@@ -275,11 +410,61 @@ class NetworkService:
                 self._dht_manager.set_dht(dht, self._dht_manager)
             except Exception:
                 logger.warning("Failed to initialize DHT", exc_info=True)
+
+        # Seed DHT/bootstrap routes and dial configured bootstrap peers.
+        try:
+            await self._discovery_manager.seed_dht_bootstrap_peers(
+                self._config.bootstrap_peers,
+                getattr(self._config, "dht_bootstrap_peers", []),
+            )
+        except Exception:
+            logger.debug("Failed to seed DHT bootstrap peers", exc_info=True)
+
+        if self._nursery:
+            try:
+                bootstraps = list(self._config.bootstrap_peers or []) + list(getattr(self._config, "dht_bootstrap_peers", []) or [])
+                for peer_cfg in bootstraps:
+                    self._nursery.start_soon(self._connect_to_bootstrap_peer, peer_cfg)
+            except Exception:
+                logger.debug("Failed to schedule bootstrap dials", exc_info=True)
         
         # Peer advertisement loop
         if self._config.peer_advertisement_interval and self._config.peer_advertisement_interval > 0:
             if self._nursery:
                 self._nursery.start_soon(self._peer_advertisement_loop)
+
+    async def _connect_to_bootstrap_peer(self, peer_cfg: Any) -> None:
+        """Dial a configured bootstrap peer and seed its addrs into the peerstore."""
+        try:
+            import multiaddr
+
+            pid_str = getattr(peer_cfg, "peer_id", None) if not isinstance(peer_cfg, dict) else peer_cfg.get("peer_id")
+            addrs_raw = getattr(peer_cfg, "addrs", None) if not isinstance(peer_cfg, dict) else peer_cfg.get("addrs", [])
+            if not pid_str or not addrs_raw:
+                return
+
+            pid = ID.from_base58(str(pid_str))
+            if str(pid) == str(self.get_id()):
+                return
+
+            maddrs = []
+            for a in addrs_raw:
+                try:
+                    maddrs.append(a if isinstance(a, multiaddr.Multiaddr) else multiaddr.Multiaddr(str(a)))
+                except Exception:
+                    continue
+            if not maddrs:
+                return
+
+            try:
+                self.host.get_peerstore().add_addrs(pid, maddrs, 86400)
+            except Exception:
+                pass
+
+            await self.host.connect(PeerInfo(pid, maddrs))
+            logger.info("Connected to bootstrap peer: %s", pid)
+        except Exception:
+            logger.debug("Failed to connect to bootstrap peer", exc_info=True)
         
     async def _on_transaction_gossip(self, envelope: Dict[str, Any]) -> None:
         payload = envelope.get("payload")
@@ -332,6 +517,15 @@ class NetworkService:
             "head_number": 0,
             "head_hash": self._config.genesis_hash,
         }
+        # Prefer the persisted chain tip if available.
+        try:
+            import db
+            latest = db.get_latest_block()
+            if latest and "header" in latest:
+                resp["head_number"] = int(latest["header"].get("block_number", resp["head_number"]))
+                resp["head_hash"] = str(latest.get("block_hash") or resp["head_hash"])
+        except Exception:
+            logger.debug("Failed to compute local tip for handshake response", exc_info=True)
 
         try:
             # Read payload
@@ -435,13 +629,85 @@ class NetworkService:
 
     async def _handle_sync(self, stream) -> None:
         import json
+        import db
         try:
-            # Dummy sync response for now
-            resp = {
-                "headers": [],
-                "tip_number": 0,
-                "tip_hash": self._config.genesis_hash,
-            }
+            # Some callers (tests/debug tools) may "send" an empty request by writing b"".
+            # libp2p streams won't deliver that as data, so a naive read() would block forever.
+            # Use a short timeout and treat "no bytes" as an empty/default request.
+            data = b""
+            with trio.move_on_after(0.25) as scope:
+                data = await stream.read(65535)
+            if scope.cancelled_caught:
+                data = b""
+            req: Dict[str, Any] = {}
+            if data:
+                if data.strip() == b"get_headers":
+                    req = {"type": "get_headers"}
+                else:
+                    try:
+                        req = json.loads(data.decode())
+                    except Exception:
+                        req = {}
+            logger.debug("SYNC request parsed: %s", req if req else "<empty>")
+
+            # Compute local tip
+            latest = db.get_latest_block()
+            if latest and isinstance(latest, dict) and latest.get("header"):
+                tip_number = int(latest["header"].get("block_number", 0))
+                tip_hash = str(latest.get("block_hash") or self._config.genesis_hash)
+            else:
+                tip_number = 0
+                tip_hash = self._config.genesis_hash
+
+            locator = req.get("locator") if isinstance(req.get("locator"), list) else []
+            stop = req.get("stop")
+            try:
+                limit = int(req.get("limit") or 2000)
+            except Exception:
+                limit = 2000
+            limit = max(1, min(limit, 2000))
+
+            # Find the first locator hash we recognize and start after it.
+            start_block = 0
+            for h in locator:
+                try:
+                    blk = db.get_block_by_hash(str(h))
+                except Exception:
+                    blk = None
+                if blk and isinstance(blk, dict) and blk.get("header"):
+                    try:
+                        start_block = int(blk["header"].get("block_number", 0)) + 1
+                    except Exception:
+                        start_block = 0
+                    break
+
+            headers: List[Dict[str, Any]] = []
+            for blk in db.get_blocks_after(start_block):
+                if not isinstance(blk, dict):
+                    continue
+                bh = blk.get("block_hash")
+                hdr = blk.get("header") or {}
+                headers.append(
+                    {
+                        "block_number": hdr.get("block_number"),
+                        "previous_hash": hdr.get("previous_hash"),
+                        "timestamp": hdr.get("timestamp"),
+                        "merkle_root": hdr.get("merkle_root"),
+                        "block_hash": bh,
+                    }
+                )
+                if stop and bh == stop:
+                    break
+                if len(headers) >= limit:
+                    break
+
+            resp = {"headers": headers, "tip_number": tip_number, "tip_hash": tip_hash}
+            logger.debug(
+                "SYNC response: headers=%d tip_number=%s tip_hash=%s",
+                len(headers),
+                tip_number,
+                tip_hash,
+            )
             await stream.write(json.dumps(resp).encode())
         except Exception:
             pass
@@ -450,7 +716,90 @@ class NetworkService:
 
     async def _handle_blocks(self, stream) -> None:
         import json
+        import db
         try:
+            data = await stream.read(10 * 1024 * 1024)
+            req: Dict[str, Any] = {}
+            if data:
+                try:
+                    req = json.loads(data.decode())
+                except Exception:
+                    req = {}
+
+            blocks: List[Dict[str, Any]] = []
+
+            # Back-compat: older internal client used {"block_hashes":[...]}
+            if isinstance(req, dict) and isinstance(req.get("block_hashes"), list):
+                hashes = [str(h) for h in req.get("block_hashes") if h]
+                for h in hashes:
+                    blk = db.get_block_by_hash(h)
+                    if blk:
+                        blocks.append(blk)
+                resp = {"blocks": blocks}
+                await stream.write(json.dumps(resp).encode())
+                return
+
+            if not isinstance(req, dict) or req.get("type") != "get_blocks":
+                resp = {"blocks": []}
+                await stream.write(json.dumps(resp).encode())
+                return
+
+            # By hashes
+            if isinstance(req.get("hashes"), list):
+                hashes = [str(h) for h in req["hashes"] if h]
+                for h in hashes:
+                    blk = db.get_block_by_hash(h)
+                    if blk:
+                        blocks.append(blk)
+                resp = {"blocks": blocks}
+                await stream.write(json.dumps(resp).encode())
+                return
+
+            # By range after a known hash
+            if req.get("from") is not None:
+                from_hash = str(req.get("from"))
+                try:
+                    limit = int(req.get("limit") or 1)
+                except Exception:
+                    limit = 1
+                limit = max(1, min(limit, 2000))
+
+                start_number = 0
+                from_blk = db.get_block_by_hash(from_hash)
+                if from_blk and from_blk.get("header"):
+                    try:
+                        start_number = int(from_blk["header"].get("block_number", 0)) + 1
+                    except Exception:
+                        start_number = 0
+
+                for blk in db.get_blocks_after(start_number):
+                    blocks.append(blk)
+                    if len(blocks) >= limit:
+                        break
+                resp = {"blocks": blocks}
+                await stream.write(json.dumps(resp).encode())
+                return
+
+            # By range from a block number
+            if req.get("from_number") is not None:
+                try:
+                    start_number = int(req.get("from_number") or 0)
+                except Exception:
+                    start_number = 0
+                try:
+                    limit = int(req.get("limit") or 1)
+                except Exception:
+                    limit = 1
+                limit = max(1, min(limit, 2000))
+
+                for blk in db.get_blocks_after(start_number):
+                    blocks.append(blk)
+                    if len(blocks) >= limit:
+                        break
+                resp = {"blocks": blocks}
+                await stream.write(json.dumps(resp).encode())
+                return
+
             resp = {"blocks": []}
             await stream.write(json.dumps(resp).encode())
         except Exception:
@@ -537,26 +886,45 @@ class NetworkService:
         import json
         try:
             data = await stream.read(65535)
-            req = json.loads(data.decode())
-            
+            req = json.loads((data or b"{}").decode())
+
             sender_pid = req.get("peer_id")
+            if not sender_pid:
+                # Fallback to stream peer id if the RPC didn't include it.
+                try:
+                    sender_pid = str(stream.muxed_conn.peer_id)
+                except Exception:
+                    sender_pid = None
+
             if sender_pid:
                 await self._ensure_peer_route(sender_pid)
-            
-            # Process incoming messages
-            messages = req.get("rpc", {}).get("messages", [])
-            # Stamp via for route tracking if missing
-            for msg in messages:
-                msg.setdefault("via", sender_pid or str(self.get_id()))
-            for msg in messages:
-                if self._nursery:
-                    self._nursery.start_soon(self._gossip_manager.receive, msg)
-            
+
+            rpc = req.get("rpc", {}) if isinstance(req, dict) else {}
+            if not isinstance(rpc, dict):
+                rpc = {}
+
+            # Stamp via for route tracking (and to support block-gossip fallback logic).
+            messages = rpc.get("messages", [])
+            if isinstance(messages, list) and sender_pid:
+                for msg in messages:
+                    if isinstance(msg, dict):
+                        msg.setdefault("via", str(sender_pid))
+
+            try:
+                if sender_pid:
+                    logger.debug(
+                        "Gossip RPC from %s: keys=%s",
+                        sender_pid,
+                        list(rpc.keys()),
+                    )
+                await self._gossip_manager.handle_rpc(rpc, str(sender_pid or self.get_id()))
+            except Exception:
+                logger.debug("Failed to process gossip RPC", exc_info=True)
+
             # Opportunistically seed the sender
             if sender_pid:
                 try:
                     pid_obj = self._ensure_peer_id(sender_pid)
-                    addrs = []
                     try:
                         addrs = self.host.get_peerstore().addrs(pid_obj) or []
                     except Exception:
@@ -565,17 +933,13 @@ class NetworkService:
                 except Exception:
                     pass
 
-            # Handle direct gossip RPC
-            # For now just ack
-            resp = {
-                "ok": True,
-                "messages": [
-                    {
-                        "message_id": m.get("message_id"),
-                        "duplicate": False
-                    } for m in messages
-                ]
-            }
+            # Ack message ids (duplicate tracking is handled on the receiver side).
+            ack_messages: List[Dict[str, Any]] = []
+            if isinstance(messages, list):
+                for m in messages:
+                    if isinstance(m, dict):
+                        ack_messages.append({"message_id": m.get("message_id"), "duplicate": False})
+            resp = {"ok": True, "messages": ack_messages}
             await stream.write(json.dumps(resp).encode())
         except Exception:
             pass
@@ -588,6 +952,17 @@ class NetworkService:
             self._nursery = nursery
             self._discovery_manager.set_nursery(nursery)
             self._gossip_manager.set_nursery(nursery)
+            try:
+                self._trio_token = trio.lowlevel.current_trio_token()
+            except Exception:
+                self._trio_token = None
+            
+            # Inject trio token for sync-async bridging in DHTManager
+            try:
+                self._dht_manager.set_trio_token(trio.lowlevel.current_trio_token())
+            except Exception:
+                pass
+                
             self._loop_ready.set() 
 
             nursery.start_soon(self._host_manager.run_loop)
@@ -610,6 +985,21 @@ class NetworkService:
 
     def subscribe_gossip(self, topic: str, handler: Callable[[Dict[str, Any]], Any]) -> None:
         self._gossip_manager.subscribe(topic, handler)
+        # Wildcard subscription: treat "*" as "subscribe to everything" for our simple
+        # gossipsub shim. This is primarily used by tests and debugging.
+        if topic == "*":
+            try:
+                self._gossip_manager._local_topics.add("*")  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            if self._nursery:
+                try:
+                    self._nursery.start_soon(
+                        self._gossip_manager.broadcast_subscriptions,
+                        [{"topic": "*", "subscribe": True}],
+                    )
+                except Exception:
+                    pass
 
     async def join_gossip_topic(self, topic: str, handler: Callable[[Dict[str, Any]], Any]) -> None:
         await self._gossip_manager.join_topic(topic, handler)
@@ -621,9 +1011,82 @@ class NetworkService:
         return await self._gossip_manager.publish(topic, payload, **kwargs)
 
     def broadcast_transaction(self, payload: str, message_id: str) -> None:
-        # Bridge to gossip manager
-        if self._nursery:
-            self._nursery.start_soon(self._gossip_manager.publish, "tau-transactions", payload, message_id)
+        """Thread-safe helper to broadcast a transaction envelope over gossip."""
+        from .protocols import TAU_GOSSIP_TOPIC_TRANSACTIONS
+
+        if not self._nursery:
+            return
+
+        token = getattr(self, "_trio_token", None)
+        if token is not None:
+            try:
+                token.run_sync_soon(
+                    self._nursery.start_soon,
+                    self._gossip_manager.publish,
+                    TAU_GOSSIP_TOPIC_TRANSACTIONS,
+                    payload,
+                    message_id,
+                )
+                return
+            except Exception:
+                # Fall back to direct scheduling (works if called on the Trio thread).
+                pass
+
+        try:
+            self._nursery.start_soon(self._gossip_manager.publish, TAU_GOSSIP_TOPIC_TRANSACTIONS, payload, message_id)
+        except Exception:
+            pass
+
+    def broadcast_block(self, block_data: Dict[str, Any]) -> None:
+        """Thread-safe helper to announce a new block over gossip."""
+        from .protocols import TAU_GOSSIP_TOPIC_BLOCKS
+
+        if not self._nursery:
+            return
+
+        payload: Dict[str, Any]
+        message_id: Optional[str] = None
+        try:
+            header = block_data.get("header") if isinstance(block_data, dict) else None
+            header = header if isinstance(header, dict) else {}
+            block_hash = block_data.get("block_hash") if isinstance(block_data, dict) else None
+            if block_hash:
+                message_id = f"block:{block_hash}"
+            payload = {
+                "headers": [
+                    {
+                        "block_number": header.get("block_number"),
+                        "previous_hash": header.get("previous_hash"),
+                        "timestamp": header.get("timestamp"),
+                        "merkle_root": header.get("merkle_root"),
+                        "block_hash": block_hash,
+                    }
+                ],
+                "tip_number": header.get("block_number"),
+                "tip_hash": block_hash,
+                "block_hash": block_hash,
+            }
+        except Exception:
+            payload = {"block_hash": str(block_data)}
+
+        token = getattr(self, "_trio_token", None)
+        if token is not None:
+            try:
+                token.run_sync_soon(
+                    self._nursery.start_soon,
+                    self._gossip_manager.publish,
+                    TAU_GOSSIP_TOPIC_BLOCKS,
+                    payload,
+                    message_id,
+                )
+                return
+            except Exception:
+                pass
+
+        try:
+            self._nursery.start_soon(self._gossip_manager.publish, TAU_GOSSIP_TOPIC_BLOCKS, payload, message_id)
+        except Exception:
+            pass
     
     def _queue_tx(self, payload: str, propagate: bool = True) -> str:
         """
@@ -781,6 +1244,12 @@ class NetworkService:
         (or the via peer if provided).
         """
         payload = envelope.get("payload") or {}
+        if isinstance(payload, str):
+            import json
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
         via = envelope.get("via")
         origin = envelope.get("origin")
         peer_id = via or origin
@@ -788,12 +1257,22 @@ class NetworkService:
             return
 
         headers = payload.get("headers") or []
-        locator = [h.get("block_hash") for h in headers if isinstance(h, dict) and h.get("block_hash")]
-        if not locator and payload.get("tip_hash"):
-            locator.append(payload["tip_hash"])
-        if not locator:
-            locator = [self._config.genesis_hash]
+        remote_tip = payload.get("tip_hash") or payload.get("block_hash")
+        if (not remote_tip) and headers and isinstance(headers, list):
+            try:
+                remote_tip = headers[-1].get("block_hash")
+            except Exception:
+                remote_tip = None
 
+        # Use a locator based on our local chain, and (optionally) stop at the announced tip.
+        locator = self._build_block_locator()
+        # Be defensive: tests may monkeypatch _try_block_sync with a legacy signature.
+        if remote_tip:
+            try:
+                await self._try_block_sync(peer_id, locator, stop=remote_tip)
+                return
+            except TypeError:
+                pass
         await self._try_block_sync(peer_id, locator)
 
     async def _try_block_sync(self, peer_id: Any, locator: Iterable[str], stop: Optional[str] = None, limit: int = 2000) -> Any:
@@ -803,10 +1282,128 @@ class NetworkService:
         return await self._sync_and_ingest_from_peer(peer_id, locator_list, stop=stop, limit=limit)
 
     async def _sync_and_ingest_from_peer(self, peer_id: Any, locator: List[str], stop: Optional[str] = None, limit: int = 2000) -> int:
-        # Stub for test_block_gossip_triggers_sync
-        # The test patches this method, so the real implementation doesn't matter much for the test.
-        # But for correctness, it should send get_headers.
-        return 0
+        """
+        Header sync (locator/stop/limit) + fetch missing block bodies + ingest into local DB/state.
+        Returns number of newly ingested blocks.
+        """
+        from .protocols import TAU_PROTOCOL_SYNC, TAU_PROTOCOL_BLOCKS
+        import json
+        import db
+
+        try:
+            limit = int(limit or 2000)
+        except Exception:
+            limit = 2000
+        limit = max(1, min(limit, 2000))
+
+        if not locator:
+            locator = [self._config.genesis_hash]
+
+        pid_obj = peer_id
+        try:
+            pid_obj = self._ensure_peer_id(peer_id)
+        except Exception:
+            pass
+
+        # Ensure we have at least some route information before opening streams.
+        try:
+            if hasattr(self, "_ensure_peer_route"):
+                await self._ensure_peer_route(pid_obj)
+        except Exception:
+            pass
+
+        # 1) Request headers
+        headers: List[Dict[str, Any]] = []
+        try:
+            req = {"type": "get_headers", "locator": list(locator), "stop": stop, "limit": limit}
+            stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_SYNC])
+            await stream.write(json.dumps(req).encode())
+            resp_raw = await stream.read(2 * 1024 * 1024)
+            await stream.close()
+            resp = json.loads((resp_raw or b"{}").decode())
+            headers = resp.get("headers") or []
+        except Exception:
+            logger.warning("Failed to sync headers from %s", peer_id, exc_info=True)
+            return 0
+
+        if not headers:
+            logger.debug("No headers received from %s during sync", peer_id)
+            return 0
+
+        # 2) Determine which blocks we are missing locally
+        missing_hashes: List[str] = []
+        for h in headers:
+            if not isinstance(h, dict):
+                continue
+            bh = h.get("block_hash")
+            if not bh:
+                continue
+            if not db.get_block_by_hash(str(bh)):
+                missing_hashes.append(str(bh))
+
+        if not missing_hashes:
+            logger.debug("Header sync from %s: nothing missing (headers=%d)", peer_id, len(headers))
+            return 0
+        logger.info(
+            "Header sync from %s: headers=%d missing=%d stop=%s",
+            peer_id,
+            len(headers),
+            len(missing_hashes),
+            stop,
+        )
+
+        # 3) Fetch missing blocks by hash
+        blocks: List[Dict[str, Any]] = []
+        chunk_size = 128
+        for i in range(0, len(missing_hashes), chunk_size):
+            chunk = missing_hashes[i : i + chunk_size]
+            try:
+                req = {"type": "get_blocks", "hashes": chunk}
+                stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_BLOCKS])
+                await stream.write(json.dumps(req).encode())
+                resp_raw = await stream.read(20 * 1024 * 1024)
+                await stream.close()
+                resp = json.loads((resp_raw or b"{}").decode())
+                blocks.extend(resp.get("blocks") or [])
+            except Exception:
+                logger.warning("Failed to fetch block bodies from %s", peer_id, exc_info=True)
+                break
+
+        if not blocks:
+            logger.debug("No block bodies received from %s during sync", peer_id)
+            return 0
+
+        # 4) Ingest blocks in order (avoid blocking Trio with Tau/DB work)
+        def _ingest(sorted_blocks: List[Dict[str, Any]]) -> int:
+            import chain_state
+            from block import Block
+
+            ingested = 0
+            for b in sorted_blocks:
+                try:
+                    blk = Block.from_dict(b)
+                    if chain_state.process_new_block(blk):
+                        ingested += 1
+                except Exception:
+                    continue
+            return ingested
+
+        try:
+            blocks_sorted = sorted(
+                [b for b in blocks if isinstance(b, dict) and b.get("header")],
+                key=lambda b: int((b.get("header") or {}).get("block_number", 0)),
+            )
+        except Exception:
+            blocks_sorted = [b for b in blocks if isinstance(b, dict)]
+
+        try:
+            ingested = await trio.to_thread.run_sync(_ingest, blocks_sorted)
+            if ingested:
+                logger.info("Ingested %d blocks from %s", ingested, peer_id)
+            return ingested
+        except Exception:
+            logger.warning("Failed to ingest blocks from %s", peer_id, exc_info=True)
+            return 0
 
     def get_metrics_snapshot(self) -> Dict[str, Any]:
         # Stub for test_gossip_metrics_snapshot

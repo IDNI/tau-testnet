@@ -157,8 +157,15 @@ def decode_output(tau_output: str, tau_input: str) -> str:
     """
     Decode output - not applicable for createblock as it doesn't use Tau.
     """
-    return block_data
+    # This function is not expected to be called for createblock,
+    # as the result is handled directly by the execute function.
+    # Returning an empty string or raising an error might be more appropriate
+    # depending on how this is used elsewhere.
+    return ""
 
+
+import logging
+logger = logging.getLogger(__name__)
 
 def execute(raw_command: str, container):
     """
@@ -191,6 +198,19 @@ def execute(raw_command: str, container):
             resp_lines.append("  - Mempool cleared\r\n")
             resp = "\n".join(resp_lines)
             logger.info("Block #%s created", block_number)
+            
+            # Broadcast the new block to the network
+            try:
+                from network import bus
+                service = bus.get()
+                if service:
+                    service.broadcast_block(block_data)
+                    logger.info("Block #%s broadcasted to network", block_number)
+                else:
+                    logger.warning("Network service not available, block not broadcasted")
+            except Exception:
+                logger.exception("Failed to broadcast block")
+
     except Exception:
         logger.exception("Block creation failed")
         resp = "ERROR: Failed to create block\r\n"

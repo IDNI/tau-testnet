@@ -33,7 +33,7 @@ tau_test_mode = False  # When True, simulate Tau responses without Docker
 _rules_handler = None  # Callback for saving rules state
 
 def set_rules_handler(handler):
-    """Sets the callback function for handling rules state updates (o999)."""
+    """Sets the callback function for handling rules state updates."""
     global _rules_handler
     _rules_handler = handler
 
@@ -496,16 +496,6 @@ def communicate_with_tau(
                         )
                         found_target_output = True
                         waiting_for_next_i0 = True  # wait for new i0 prompt
-                    elif expect_stream_value_for == 999:
-                        logger.debug("communicate_with_tau: Captured value for o999: '%s'", line_strip)
-                        if _rules_handler:
-                            try:
-                                _rules_handler(line_strip)
-                                logger.info("communicate_with_tau: Successfully saved rules state via handler")
-                            except Exception as e:
-                                logger.error("communicate_with_tau: Failed to save rules state via handler: %s", e)
-                        else:
-                            logger.warning("communicate_with_tau: No rules handler registered, ignoring o999 output")
                     # In every case, stop expecting another line
                     expect_stream_value_for = None
                     continue
@@ -519,6 +509,19 @@ def communicate_with_tau(
                         expect_stream_value_for,
                     )
                     continue
+
+                # Updated specification:
+                o_prompt_match = re.match(r"^Updated\s*specification\:\s*$", line_strip)
+                if o_prompt_match:
+                    logger.debug("communicate_with_tau: Captured value for updated specification: '%s'", line_strip)
+                    if _rules_handler:
+                        try:
+                            _rules_handler(line_strip)
+                            logger.info("communicate_with_tau: Successfully saved rules state via handler")
+                        except Exception as e:
+                            logger.error("communicate_with_tau: Failed to save rules state via handler: %s", e)
+                    else:
+                        logger.warning("communicate_with_tau: No rules handler registered, ignoring updated specification output")
                 # ---------------------------------------------------------------------
 
                 # Handle Tau input prompts (e.g., "i1[0] :=", "i2[0] :=")

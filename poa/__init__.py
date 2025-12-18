@@ -2,6 +2,7 @@
 
 from .state import StateStore, TauStateSnapshot, compute_state_hash
 from .tau_engine import TauEngine, TauExecutionResult, MockTauEngine
+from .engine import PoATauEngine
 from . import mempool
 
 __all__ = [
@@ -10,6 +11,7 @@ __all__ = [
     "TauEngine",
     "TauExecutionResult",
     "MockTauEngine",
+    "PoATauEngine",
     "compute_state_hash",
     "mempool",
 ]

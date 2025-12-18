@@ -20,7 +20,42 @@ class DHTManager:
         self._dht_validators: Dict[str, Callable[[bytes, bytes], bool]] = {}
         self._dht_allowed_namespaces: Set[str] = set()
         self._dht_value_store_put: Optional[Callable[..., Any]] = None
+        self._dht_value_store_put: Optional[Callable[..., Any]] = None
         self._dht_provider_add: Optional[Callable[..., Any]] = None
+        self._trio_token = None
+
+    def set_trio_token(self, token) -> None:
+        self._trio_token = token
+
+    def get_record_sync(self, key: bytes, timeout: float = 5.0) -> bytes | None:
+        """
+        Retrieves a record from the DHT synchronously, bridging to the network thread if needed.
+        """
+        import trio
+        
+        # Try local store first
+        if self._dht and getattr(self._dht, "value_store", None):
+            val = self._dht.value_store.get(key)
+            if val:
+                return getattr(val, "value", val)
+        
+        # If not local and we have a token, try network
+        if self._dht and self._trio_token:
+            try:
+                # We use trio.from_thread.run to execute async get_value on the trio thread
+                return trio.from_thread.run(
+                    self._dht.get_value,
+                    key,
+                    trio_token=self._trio_token
+                )
+            except (trio.RunFinishedError, trio.Cancelled, RuntimeError):
+                # Network might be down or shutting down
+                return None
+            except Exception as e:
+                logger.warning("DHT sync retrieval failed: %s", e)
+                return None
+        
+        return None
 
     def set_dht(self, dht: KadDHT, manager: Any) -> None:
         self._dht = dht
@@ -86,6 +121,7 @@ class DHTManager:
         self.register_validator("block", self._validate_block_record)
         self.register_validator("tx", self._validate_tx_record)
         self.register_validator("state", self._validate_state_record)
+        self.register_validator("formula", self._validate_formula_record)
 
     def _validate_block_record(self, key: bytes, value: bytes) -> bool:
         import json
@@ -149,6 +185,28 @@ class DHTManager:
             if data.get("block_hash") != state_hash:
                 return False
             return True
+        except Exception:
+            return False
+
+    def _validate_formula_record(self, key: bytes, value: bytes) -> bool:
+        """
+        Validates a formula record.
+        Key: formula:<hash>
+        Value: raw bytes of the formula (rules text)
+        Validation: SHA256(value) == hash
+        """
+        import hashlib
+        try:
+            key_str = key.decode("ascii")
+            if not key_str.startswith("formula:"):
+                return False
+            expected_hash = key_str.split(":", 1)[1]
+            
+            # Compute hash of the value
+            # We use SHA256 for formula hashes in DHT keys
+            computed_hash = hashlib.sha256(value).hexdigest()
+            
+            return computed_hash == expected_hash
         except Exception:
             return False
 

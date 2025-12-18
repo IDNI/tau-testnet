@@ -4,8 +4,10 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import trio
+import multiaddr
 from libp2p import new_host
 from libp2p.abc import IHost, INotifee
+from libp2p.peer.id import ID
 from libp2p.peer.peerstore import PERMANENT_ADDR_TTL
 
 import db
@@ -87,16 +89,28 @@ class HostManager:
             return
 
         key_pair = None
+        identity_source = "ephemeral"
         if self._config.identity_key:
             try:
                 key_pair = keypair_from_seed(self._config.identity_key)
+                identity_source = "persistent"
             except Exception:
                 logger.warning("Failed to load identity key from config", exc_info=True)
         
         if not key_pair:
-             # Generate ephemeral key if no persistent key provided
-             import os
-             key_pair = keypair_from_seed(os.urandom(32))
+            # Generate ephemeral key if no persistent key provided
+            import os
+            key_pair = keypair_from_seed(os.urandom(32))
+        
+        try:
+            expected_peer_id = str(ID.from_pubkey(key_pair.public_key))
+            logger.info(
+                "Network identity ready peer_id=%s source=%s",
+                expected_peer_id,
+                identity_source,
+            )
+        except Exception:
+            logger.debug("Failed to compute peer_id from identity key", exc_info=True)
 
         self._host = new_host(
             key_pair=key_pair,
@@ -117,6 +131,22 @@ class HostManager:
             return
         # BasicHost.run is an async context manager that handles listening
         async with self._host.run(self._config.listen_addrs):
+            try:
+                listen_addrs = getattr(self._host.get_network(), "listen_addrs", None) or []
+                listen_strs = [str(a) for a in listen_addrs]
+            except Exception:
+                listen_strs = [str(a) for a in self._config.listen_addrs]
+            try:
+                peer_id_str = str(self.get_id())
+            except Exception:
+                peer_id_str = "<unknown>"
+            connect_hints = [f"{addr}/p2p/{peer_id_str}" for addr in listen_strs]
+            logger.info(
+                "NetworkService listening peer_id=%s addrs=%s connect=%s",
+                peer_id_str,
+                listen_strs,
+                connect_hints,
+            )
             await trio.sleep_forever()
 
     @property

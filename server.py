@@ -36,6 +36,15 @@ def _start_network_background(container: ServiceContainer) -> None:
 
     def _runner():
         service = NetworkService(cfg)
+        
+        # Register service with global bus so commands (e.g. sendtx) can access it
+        from network import bus
+        bus.register(service)
+        
+        # Inject DHT manager into chain_state so it can store formulas
+        if hasattr(container.chain_state, "set_dht_client"):
+            container.chain_state.set_dht_client(service._dht_manager)
+            
         async def main() -> None:
             await service.start()
             try:

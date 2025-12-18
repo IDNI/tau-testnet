@@ -210,7 +210,8 @@ BASE_DEFAULTS: Dict[str, Any] = {
             },
         ],
         "peerstore_path": None,
-        "identity_key_path": None,
+        # Persist the libp2p identity here unless --ephemeral-identity is set.
+        "identity_key_path": os.path.join(DATA_DIR, "identity.key"),
     },
     "dht": asdict(DHTSettings()),
     "logging": asdict(LoggingSettings()),

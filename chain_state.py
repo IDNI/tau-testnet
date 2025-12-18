@@ -3,6 +3,8 @@ import json
 from typing import Dict, List, Optional
 import db
 import tau_manager
+from poa import PoATauEngine, TauStateSnapshot, compute_state_hash
+from block import Block
 
 # Lock for thread-safe access to balances
 _balance_lock = threading.Lock()
@@ -24,12 +26,79 @@ _rules_lock = threading.Lock()
 _current_rules_state = ""
 _last_processed_block_hash = ""
 
+# DHT Client for storing formulas
+_dht_client = None
+
+def set_dht_client(client):
+    """Sets the DHT client for storing formulas."""
+    global _dht_client
+    _dht_client = client
+
 # Genesis address and balance used across tests and reconstruction
 GENESIS_ADDRESS = "91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6"
 GENESIS_BALANCE = 65535
 # Alice
 # Private Key (hex, 32 bytes): 11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09
 # Public Key (hex, 48 bytes, G1 compressed): 91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6
+
+
+def process_new_block(block: Block) -> bool:
+    """
+    Verifies, executes, and persists a new block.
+    Returns True if successful, False otherwise.
+    """
+    block_number = block.header.block_number
+    # Basic deduplication
+    existing = db.get_block_by_hash(block.block_hash)
+    if existing:
+        return True
+
+    global _current_rules_state, _last_processed_block_hash
+
+    print(f"[INFO][chain_state] Processing new block #{block_number} ({block.block_hash[:8]}...)")
+    
+    engine = PoATauEngine()
+    if not engine.verify_block(block):
+        print(f"[WARN][chain_state] Block #{block_number} verification failed")
+        return False
+
+    with _rules_lock:
+        current_rules = _current_rules_state
+        
+    current_rules_bytes = current_rules.encode('utf-8')
+    snapshot = TauStateSnapshot(
+        state_hash=compute_state_hash(current_rules_bytes),
+        tau_bytes=current_rules_bytes, 
+        metadata={"poa": True}
+    )
+
+    try:
+        # Execute transactions
+        result = engine.apply(snapshot, block.transactions)
+        
+        # Update global state from result
+        new_rules_bytes = result.snapshot.tau_bytes
+        new_rules = new_rules_bytes.decode('utf-8')
+        
+        
+        with _rules_lock:
+            _current_rules_state = new_rules
+            _last_processed_block_hash = block.block_hash
+            
+            
+        # Persist everything
+        db.add_block(block)
+        db.save_chain_state(
+            balances=_balances,
+            sequences=_sequence_numbers,
+            rules=new_rules,
+            last_block_hash=block.block_hash
+        )
+        print(f"[INFO][chain_state] Block #{block_number} processed and state updated.")
+        return True
+    except Exception as e:
+        print(f"[ERROR][chain_state] Failed to process block #{block_number}: {e}")
+        return False
 
 def rebuild_state_from_blockchain(start_block=0):
     """
@@ -77,107 +146,38 @@ def rebuild_state_from_blockchain(start_block=0):
             
             print(f"[INFO][chain_state] Processing block #{block_number} ({block_hash}) with {len(transactions)} transactions")
             
-            # Process each transaction in the block
-            for tx_idx, transaction in enumerate(transactions):
-                print(f"[DEBUG][chain_state]   Processing TX #{tx_idx + 1} in block #{block_number}")
-                
-                # Extract transaction details
-                sender_pubkey = transaction.get('sender_pubkey')
-                sequence_number = transaction.get('sequence_number')
-                operations = transaction.get('operations', {})
-                
-                if not sender_pubkey:
-                    print(f"[WARN][chain_state]   TX #{tx_idx + 1}: Missing sender_pubkey, skipping")
-                    continue
-                
-                # Update sequence number first (this happens for all valid transactions)
-                if sequence_number is not None:
-                    with _sequence_lock:
-                        current_seq = _sequence_numbers.get(sender_pubkey, 0)
-                        expected_seq = sequence_number
-                        if expected_seq == current_seq:
-                            _sequence_numbers[sender_pubkey] = expected_seq + 1
-                            print(f"[DEBUG][chain_state]     Updated sequence for {sender_pubkey[:10]}...: {current_seq} -> {expected_seq + 1}")
-                        else:
-                            print(f"[WARN][chain_state]     Sequence mismatch for {sender_pubkey[:10]}...: expected {expected_seq}, had {current_seq}")
-                
-                # Process all operations in the transaction
-                print(f"[DEBUG][chain_state]     Processing {len(operations)} operations: {list(operations.keys())}")
-                
-                for op_key, op_data in operations.items():
-                    print(f"[DEBUG][chain_state]       Processing operation '{op_key}'")
-                    
-                    if op_key == "0":
-                        # Handle rules (operation "0")
-                        if isinstance(op_data, str) and op_data.strip():
-                            print(f"[DEBUG][chain_state]         Rule operation: '{op_data[:50]}{'...' if len(op_data) > 50 else ''}'")
-                            # Rules must be sent to Tau core to recreate the exact Tau state
-                            try:
-                                
-                                
-                                # Wait for Tau to be ready
-                                if not tau_manager.tau_ready.wait(timeout=10):
-                                    print(f"[ERROR][chain_state]         Tau not ready for rule processing, skipping rule")
-                                    continue
-                                
-                                # Send rule to Tau (same as live processing)
-                                print(f"[DEBUG][chain_state]         Sending rule to Tau core...")
-                                tau_output = tau_manager.communicate_with_tau(rule_text=op_data.strip(), target_output_stream_index=0)
-                                
-                                if tau_output.strip().lower() == "x1001":
-                                    print(f"[DEBUG][chain_state]         Rule successfully applied to Tau core")
-                                else:
-                                    print(f"[ERROR][chain_state]         Tau rejected rule during reconstruction. Output: {tau_output}")
-                                    # In reconstruction, we might want to be more lenient since this was historically valid
-                                    print(f"[WARN][chain_state]         Continuing reconstruction despite Tau rejection (historical inconsistency)")
-                                
-                            except Exception as e:
-                                print(f"[ERROR][chain_state]         Failed to send rule to Tau during reconstruction: {e}")
-                                print(f"[WARN][chain_state]         Continuing reconstruction without rule application")
-                        else:
-                            print(f"[DEBUG][chain_state]         Empty or invalid rule data, skipping")
-                    
-                    elif op_key == "1":
-                        # Handle transfers (operation "1") 
-                        if not (isinstance(op_data, list)):
-                            print(f"[WARN][chain_state]         Transfer operation must be a list, got {type(op_data).__name__}")
-                            continue
-                        
-                        if not op_data:  # Empty transfer list
-                            print(f"[DEBUG][chain_state]         Empty transfer list")
-                            continue
-                        
-                        print(f"[DEBUG][chain_state]         Processing {len(op_data)} transfers")
-                        
-                        for transfer_idx, transfer in enumerate(op_data):
-                            if not (isinstance(transfer, (list, tuple)) and len(transfer) == 3):
-                                print(f"[WARN][chain_state]           Transfer #{transfer_idx + 1}: Invalid format, skipping")
-                                continue
-                            
-                            from_addr, to_addr, amount_str = transfer
-                            try:
-                                amount = int(amount_str)
-                            except (ValueError, TypeError):
-                                print(f"[WARN][chain_state]           Transfer #{transfer_idx + 1}: Invalid amount '{amount_str}', skipping")
-                                continue
-                            
-                            if amount <= 0:
-                                print(f"[WARN][chain_state]           Transfer #{transfer_idx + 1}: Non-positive amount {amount}, skipping")
-                                continue
-                            
-                            # Use the same function as live transaction processing
-                            success = update_balances_after_transfer(from_addr, to_addr, amount)
-                            if not success:
-                                print(f"[ERROR][chain_state]           Transfer #{transfer_idx + 1}: Failed to apply transfer")
-                            else:
-                                print(f"[DEBUG][chain_state]           Transfer #{transfer_idx + 1}: Successfully applied {from_addr[:10]}... -> {to_addr[:10]}... amount={amount}")
-                    
-                    else:
-                        # Handle unknown operation types
-                        print(f"[WARN][chain_state]         Unknown operation type '{op_key}', skipping")
-                        print(f"[DEBUG][chain_state]         Operation data: {str(op_data)[:100]}{'...' if len(str(op_data)) > 100 else ''}")
-                
-                total_transactions_processed += 1
+            # Verify and process block using PoATauEngine
+            block = Block.from_dict(block_data)
+            engine = PoATauEngine()
+            
+            if not engine.verify_block(block):
+                print(f"[WARN][chain_state] Block #{block_number} verification failed (signature/validator)")
+                # We continue for reconstruction but log it
+            
+            # Prepare snapshot from current rules state
+            current_rules_bytes = _current_rules_state.encode('utf-8')
+            snapshot = TauStateSnapshot(
+                state_hash=compute_state_hash(current_rules_bytes),
+                tau_bytes=current_rules_bytes,
+                metadata={"source": "chain_state"}
+            )
+            
+            # Apply transactions
+            result = engine.apply(snapshot, block.transactions)
+            
+            # Update rules state from result
+            # The engine accumulates bytes in snapshot.tau_bytes
+            new_rules = result.snapshot.tau_bytes.decode('utf-8')
+            if new_rules != _current_rules_state:
+                save_rules_state(new_rules)
+            
+            total_transactions_processed += len(result.accepted_transactions)
+            
+            # Log results
+            if result.rejected_transactions:
+                print(f"[WARN][chain_state]   {len(result.rejected_transactions)} transactions rejected in block #{block_number}")
+            
+            print(f"[DEBUG][chain_state]   Processed {len(result.accepted_transactions)} accepted transactions")
             
         except json.JSONDecodeError as e:
             print(f"[ERROR][chain_state] Failed to parse block #{block_idx}: {e}")
@@ -262,6 +262,77 @@ def save_rules_state(rules_content: str):
     with _rules_lock:
         _current_rules_state = rules_content.strip()
         print(f"[INFO][chain_state] Rules state updated. Length: {len(_current_rules_state)} characters")
+        
+        if _dht_client:
+            try:
+                import hashlib
+                # Compute hash
+                rules_bytes = _current_rules_state.encode('utf-8')
+                rules_hash = hashlib.sha256(rules_bytes).hexdigest()
+                key = f"formula:{rules_hash}".encode('ascii')
+                
+                # Store in DHT
+                # We assume _dht_client has a 'dht' property which is the KadDHT instance
+                # or it IS the DHTManager.
+                # DHTManager has .dht property.
+                if _dht_client.dht:
+                    # value_store.put(key, value)
+                    # But we should use provide? Or just store value?
+                    # The plan said "Store Tau State Formula in DHT".
+                    # Usually we store value.
+                    _dht_client.dht.value_store.put(key, rules_bytes)
+                    print(f"[INFO][chain_state] Stored formula in DHT: {key.decode()}")
+                    
+                    # Also provide?
+                    # _dht_client.dht.provide(key)
+            except Exception as e:
+                print(f"[ERROR][chain_state] Failed to store formula in DHT: {e}")
+        
+
+def fetch_formula_from_dht(formula_hash: str) -> Optional[str]:
+    """
+    Retrieves a formula from the DHT using its hash.
+    Returns the formula content as a string if found, None otherwise.
+    """
+    if not _dht_client or not _dht_client.dht:
+        print("[WARN][chain_state] DHT client not available for formula retrieval")
+        return None
+        
+    try:
+        key = f"formula:{formula_hash}".encode('ascii')
+        # We use get_value which should return the value if found
+        # Note: libp2p KadDHT.get_value returns the value bytes
+        # It's an async method usually, but here we might be in sync context?
+        # Wait, chain_state is mostly sync.
+        # If KadDHT methods are async, we might have a problem calling them from sync code.
+        # But save_rules_state called value_store.put which is sync (in-memory store).
+        # However, real DHT operations are async.
+        # For now, let's assume we are accessing the local value store or we need to bridge to async.
+        # But wait, save_rules_state used `_dht_client.dht.value_store.put`. That is the LOCAL storage.
+        # If we want to retrieve from the network, we need `dht.get_value(key)`.
+        # That is definitely async.
+        # But maybe for this task, we just want to verify we can retrieve what we stored?
+        # If we stored it in local value_store, we can retrieve it from local value_store.
+        
+        if hasattr(_dht_client, "get_record_sync"):
+            val_bytes = _dht_client.get_record_sync(key)
+            if val_bytes:
+                return val_bytes.decode('utf-8')
+            else:
+                print(f"[DEBUG][chain_state] Formula {formula_hash} not found in DHT (local or network)")
+                return None
+        
+        # Fallback for old clients (local check only)
+        val = _dht_client.dht.value_store.get(key)
+        if val:
+            return val.decode('utf-8')
+        else:
+            print(f"[DEBUG][chain_state] Formula {formula_hash} not found in local DHT store")
+            return None
+            
+    except Exception as e:
+        print(f"[ERROR][chain_state] Failed to fetch formula from DHT: {e}")
+        return None
         
 
 def get_rules_state() -> str:
