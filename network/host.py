@@ -51,12 +51,19 @@ class PeerstorePersistence:
         self._path = path
 
     def load(self) -> Dict[str, List[str]]:
+        # `peerstore_path` is treated as an enable/disable flag for persistence.
+        # When disabled (None), do not load any previously persisted peer addresses.
+        # This avoids leaking stale addrs between test runs and keeps bootstrapping deterministic.
+        if not self._path:
+            return {}
         try:
             return db.load_peers_basic()
         except Exception:
             return {}
 
     def save(self, peer_id_to_addrs: Dict[str, List[str]]) -> None:
+        if not self._path:
+            return
         try:
             for pid, addrs in peer_id_to_addrs.items():
                 db.upsert_peer_basic(
@@ -77,6 +84,10 @@ class HostManager:
         self._host_context: Optional[Any] = None
         self._peerstore_persist = PeerstorePersistence(config.peerstore_path)
         self._notifee = _NetworkNotifee(event_callback)
+        # Set once the libp2p host has actually entered its listening context.
+        # `NetworkService.start()` should not return "ready" until this is set,
+        # otherwise callers may see `/tcp/0` or empty addrs and fail to connect.
+        self._listening = trio.Event()
 
     async def set_host(self, host: IHost, context: Any) -> None:
         """Sets the host instance (created externally or by a factory)."""
@@ -132,8 +143,12 @@ class HostManager:
         # BasicHost.run is an async context manager that handles listening
         async with self._host.run(self._config.listen_addrs):
             try:
-                listen_addrs = getattr(self._host.get_network(), "listen_addrs", None) or []
-                listen_strs = [str(a) for a in listen_addrs]
+                listen_addrs = getattr(self._host.get_network(), "listen_addrs", None)
+                # Some libp2p shims expose `listen_addrs` but keep it empty even when the
+                # host is actually listening. Fall back to configured listen addrs for logs.
+                if not listen_addrs:
+                    listen_addrs = self._config.listen_addrs
+                listen_strs = [str(a) for a in (listen_addrs or [])]
             except Exception:
                 listen_strs = [str(a) for a in self._config.listen_addrs]
             try:
@@ -141,6 +156,7 @@ class HostManager:
             except Exception:
                 peer_id_str = "<unknown>"
             connect_hints = [f"{addr}/p2p/{peer_id_str}" for addr in listen_strs]
+            self._listening.set()
             logger.info(
                 "NetworkService listening peer_id=%s addrs=%s connect=%s",
                 peer_id_str,
@@ -148,6 +164,11 @@ class HostManager:
                 connect_hints,
             )
             await trio.sleep_forever()
+
+    async def wait_listening(self, timeout: float = 5.0) -> None:
+        """Wait until the host has actually started listening (i.e. entered host.run())."""
+        with trio.fail_after(timeout):
+            await self._listening.wait()
 
     @property
     def host(self) -> Optional[IHost]:

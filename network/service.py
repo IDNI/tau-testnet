@@ -17,6 +17,8 @@ from commands import sendtx
 logger = logging.getLogger(__name__)
 
 
+MAX_HANDSHAKE_PROVIDERS = 50
+
 class NetworkService:
     def __init__(
         self,
@@ -246,81 +248,122 @@ class NetworkService:
             try:
                 # Peers from routing table
                 peers = []
-                # routing_table.buckets is list of buckets. Each bucket has peers.
-                # Or we can iterate if it supports it.
-                # libp2p routing table usually has .get_peers() or similar?
-                # Or we can just access buckets directly if we know structure.
-                # But let's check if there's a public method.
-                # If not, we can try to iterate buckets.
-                # For now, let's try to get all peers.
-                # routing_table.get_peers() might not exist.
-                # But the test adds peers to routing table.
-                
-                # Let's assume we can iterate buckets or use a helper.
-                # For the test, we just need the one we added.
-                # routing_table.buckets is a list of KBucket.
-                # KBucket has .peers which is list of PeerInfo.
-                
-                # We can also use self._dht_manager.routing_table property.
                 rt = self._dht_manager.routing_table
                 if rt:
                     for bucket in rt.buckets:
                         for peer in bucket.peers:
-                            # peer might be PeerInfo or ID depending on implementation
                             if hasattr(peer, "peer_id"):
                                 pid = peer.peer_id
                                 addrs = peer.addrs
                             else:
                                 pid = peer
-                                # Try to get addrs from peerstore
                                 try:
                                     addrs = self.host.get_peerstore().addrs(pid)
                                 except Exception:
                                     addrs = []
-                            
                             peers.append({
                                 "peer_id": str(pid),
                                 "addrs": [str(a) for a in addrs]
                             })
-                logger.debug("Handshake DHT peers: %s", peers)
+                
+                # Cap peers list (outbound cap) to avoid sending too many (e.g. 100)
+                if len(peers) > 100:
+                    peers = peers[:100]
+                
+                logger.debug("Handshake DHT peers count: %d", len(peers))
                 payload["dht_peers"] = peers
                 
-                # Providers from provider store
-                providers = []
-                # provider_store.providers is dict mapping key (bytes) to list of PeerInfo?
-                # Or dict mapping key to something else.
-                # The test accesses svc_b._dht.provider_store.providers
+                # --- Optimized Provider Collection ---
+                # Providers from provider store (bounded to avoid unbounded handshake growth)
+                providers_by_key: Dict[str, List[Dict[str, Any]]] = {}
+
                 ps = getattr(self._dht_manager.dht, "provider_store", None)
                 if ps:
-                    # Access internal providers dict if possible, or use public method?
-                    # provider_store.get_providers(key)
-                    # But we want ALL providers.
-                    # provider_store.providers is likely the dict.
-                    store = getattr(ps, "providers", {})
-                    logger.debug("Handshake DHT provider store keys: %s", list(store.keys()))
+                    store = getattr(ps, "providers", {}) or {}
                     for key, provider_list in store.items():
-                        # key is bytes
-                        key_str = key.decode("utf-8", errors="ignore")
-                        
-                        # provider_list is list of PeerInfo or ID?
-                        # Usually PeerInfo.
-                        provs = []
-                        for p in provider_list:
-                            # p is PeerInfo?
+                        key_str = key.decode("utf-8", errors="ignore") if isinstance(key, (bytes, bytearray)) else str(key)
+                        if not key_str:
+                            continue
+
+                        provs: List[Dict[str, Any]] = []
+                        for p in (provider_list or []):
                             if hasattr(p, "peer_id"):
                                 pid = str(p.peer_id)
-                                addrs = [str(a) for a in p.addrs]
+                                addrs = [str(a) for a in (getattr(p, "addrs", None) or [])]
                             else:
                                 pid = str(p)
                                 addrs = []
                             provs.append({"peer_id": pid, "addrs": addrs})
-                            
-                        providers.append({
-                            "key": key_str,
-                            "providers": provs
-                        })
-                logger.debug("Handshake DHT providers: %s", providers)
-                payload["dht_providers"] = providers
+
+                        if provs:
+                            providers_by_key[key_str] = provs
+
+                # Add local value_store keys as "self provides"
+                local_pid = str(self.get_id())
+                try:
+                    local_addrs = [str(a) for a in self.host.get_addrs()]
+                except Exception:
+                    local_addrs = []
+
+                vs_keys: List[Union[str, bytes]] = []
+                vs = getattr(self._dht_manager.dht, "value_store", None)
+                if vs:
+                    try:
+                        if hasattr(vs, "get_keys") and callable(vs.get_keys):
+                            vs_keys = list(vs.get_keys() or [])
+                    except Exception:
+                        vs_keys = []
+                    if not vs_keys and hasattr(vs, "store"):
+                        try:
+                            s = vs.store
+                            if isinstance(s, dict):
+                                vs_keys = list(s.keys())
+                            elif hasattr(s, "keys") and callable(s.keys):
+                                vs_keys = list(s.keys())
+                        except Exception:
+                            vs_keys = []
+
+                for key in vs_keys:
+                    key_str = key.decode("utf-8", errors="ignore") if isinstance(key, (bytes, bytearray)) else str(key)
+                    if not key_str:
+                        continue
+                    entry = providers_by_key.setdefault(key_str, [])
+                    if not any(p.get("peer_id") == local_pid for p in entry):
+                        entry.append({"peer_id": local_pid, "addrs": local_addrs})
+
+                # Heuristic prioritization
+                head_hash = str(payload.get("head_hash") or self._config.genesis_hash)
+                genesis_hash = str(payload.get("genesis_hash") or self._config.genesis_hash)
+
+                preferred = [f"state:{head_hash}", f"state:{genesis_hash}"]
+
+                def prio(k: str) -> tuple:
+                    if k == preferred[0]:
+                        return (0, k)
+                    if k == preferred[1]:
+                        return (1, k)
+                    if k.startswith("formula:"):
+                        return (2, k)
+                    if k.startswith("state:"):
+                        return (3, k)
+                    return (4, k)
+
+                ordered: List[str] = [k for k in preferred if k in providers_by_key]
+                rest = [k for k in providers_by_key.keys() if k not in ordered]
+                rest.sort(key=prio)
+                # Extend ordered with the unique rest of keys
+                for k in rest:
+                    ordered.append(k)
+
+                trimmed = ordered[:MAX_HANDSHAKE_PROVIDERS]
+                payload["dht_providers"] = [{"key": k, "providers": providers_by_key[k]} for k in trimmed if providers_by_key.get(k)]
+
+                logger.debug(
+                    "Handshake DHT providers advertised=%d total_known=%d max=%d",
+                    len(payload["dht_providers"]),
+                    len(ordered),
+                    MAX_HANDSHAKE_PROVIDERS,
+                )
             except Exception:
                 logger.warning("Failed to add DHT info to handshake", exc_info=True)
                 
@@ -379,7 +422,7 @@ class NetworkService:
     async def start(self) -> None:
         await self._host_manager.start()
         self._setup_stream_handlers()
-        
+
         # Subscribe to core topics
         from .protocols import (
             TAU_GOSSIP_TOPIC_TRANSACTIONS,
@@ -390,21 +433,24 @@ class NetworkService:
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_TRANSACTIONS, self._on_transaction_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PEERS, self._on_peer_advertisement)
-        
-        # Start background tasks in a system task to allow start() to return
-        # This mimics the behavior expected by server.py and tests
-        try:
-            trio.lowlevel.spawn_system_task(self._run_loop)
-        except RuntimeError:
-            # Fallback if not in a trio task (unlikely)
-            logger.error("Could not spawn system task for NetworkService loop")
-        # Wait until _run_loop has initialized the nursery
+
+        # Start background tasks in a system task to allow start() to return.
+        trio.lowlevel.spawn_system_task(self._run_loop)
+
+        # Wait until _run_loop has initialized the nursery.
         await self._loop_ready.wait()
-        
+        # Also wait until the host is actually listening, so callers can safely
+        # fetch listen addrs and dial immediately (tests rely on this).
+        try:
+            await self._host_manager.wait_listening(timeout=5.0)
+        except Exception:
+            logger.debug("NetworkService: timed out waiting for host to start listening", exc_info=True)
+
         # Initialize DHT if not already set (tests might mock it)
         if not self._dht_manager.dht:
             try:
                 from libp2p.kad_dht.kad_dht import KadDHT, DHTMode
+
                 # Use Server mode by default for nodes
                 dht = KadDHT(self.host, DHTMode.SERVER)
                 self._dht_manager.set_dht(dht, self._dht_manager)
@@ -427,7 +473,7 @@ class NetworkService:
                     self._nursery.start_soon(self._connect_to_bootstrap_peer, peer_cfg)
             except Exception:
                 logger.debug("Failed to schedule bootstrap dials", exc_info=True)
-        
+
         # Peer advertisement loop
         if self._config.peer_advertisement_interval and self._config.peer_advertisement_interval > 0:
             if self._nursery:
@@ -539,9 +585,14 @@ class NetworkService:
                 try:
                     payload = json.loads(data.decode())
                     
-                    # Process dht_peers
-                    dht_peers = payload.get("dht_peers", [])
+                    # Process dht_peers (truncated)
+                    dht_peers = payload.get("dht_peers", []) or []
+                    if len(dht_peers) > 100:
+                        dht_peers = dht_peers[:100]
+
                     for peer_data in dht_peers:
+                        if not isinstance(peer_data, dict):
+                            continue
                         pid_str = peer_data.get("peer_id")
                         addrs_str = peer_data.get("addrs", [])
                         if pid_str:
@@ -571,16 +622,26 @@ class NetworkService:
                             except Exception:
                                 logger.warning("Failed to process handshake peer %s", pid_str, exc_info=True)
 
-                    # Process dht_providers
-                    dht_providers = payload.get("dht_providers", [])
+                    # Process dht_providers (truncated)
+                    dht_providers = payload.get("dht_providers", []) or []
+                    if len(dht_providers) > MAX_HANDSHAKE_PROVIDERS + 10: # Accept slightly more than we send
+                        dht_providers = dht_providers[:MAX_HANDSHAKE_PROVIDERS + 10]
+                        
                     for provider_data in dht_providers:
+                        if not isinstance(provider_data, dict):
+                            continue
                         key_str = provider_data.get("key")
                         provs = provider_data.get("providers", [])
                         
                         if key_str and self._dht_manager.dht:
+                            # Truncate provider entries per key
+                            if len(provs) > 20:
+                                provs = provs[:20]
                             try:
                                 key = key_str.encode("utf-8")
                                 for p_data in provs:
+                                    if not isinstance(p_data, dict):
+                                        continue
                                     pid_str = p_data.get("peer_id")
                                     addrs_str = p_data.get("addrs", [])
                                     if pid_str:

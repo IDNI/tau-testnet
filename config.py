@@ -428,3 +428,6 @@ __all__ = [
     "BLOCK_SIGNATURE_SCHEME",
     "STATE_LOCATOR_NAMESPACE",
 ]
+
+# Feature flags
+TESTNET_AUTO_FAUCET = True

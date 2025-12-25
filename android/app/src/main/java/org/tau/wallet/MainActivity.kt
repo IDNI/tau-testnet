@@ -2,6 +2,7 @@ package org.tau.wallet
 
 import android.os.Bundle
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -14,27 +15,29 @@ import kotlin.concurrent.thread
 import android.content.SharedPreferences
 import android.text.Editable
 import android.text.TextWatcher
-import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
-import android.widget.Spinner
+import android.widget.AutoCompleteTextView
 import androidx.appcompat.app.AlertDialog
 import java.util.ArrayDeque
 import org.tau.wallet.crypto.Bls
+import org.json.JSONArray
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var etHost: EditText
+    private lateinit var actHost: AutoCompleteTextView
     private lateinit var etPort: EditText
     private lateinit var tvPrivKeyHex: TextView
     private lateinit var tvPubKeyHex: TextView
     private lateinit var tvBalance: TextView
     private lateinit var tvHistory: TextView
     private lateinit var etRule: EditText
-    private lateinit var etTo: EditText
+    private lateinit var actTo: AutoCompleteTextView
     private lateinit var etAmount: EditText
+
     private lateinit var tvResult: TextView
-    private lateinit var spinnerWallets: Spinner
+    private lateinit var actWallets: AutoCompleteTextView
+    // cbRandomRule removed
     private lateinit var tvRuleValidationStatus: TextView
 
     private var privateKeyBytes: ByteArray? = null
@@ -45,6 +48,7 @@ class MainActivity : AppCompatActivity() {
     private val wallets = mutableMapOf<String, String>()
     private lateinit var walletAdapter: ArrayAdapter<String>
     private var isRuleValid = true
+    private var selectedWalletName: String? = null
 
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -53,18 +57,28 @@ class MainActivity : AppCompatActivity() {
 
         sharedPreferences = getSharedPreferences("tau_wallet", MODE_PRIVATE)
 
-        etHost = findViewById(R.id.etHost)
+        actHost = findViewById(R.id.actHost)
+        setupHostDropdown()
         etPort = findViewById(R.id.etPort)
         tvPrivKeyHex = findViewById(R.id.tvPrivKeyHex)
         tvPubKeyHex = findViewById(R.id.tvPubKeyHex)
         tvBalance = findViewById(R.id.tvBalance)
         tvHistory = findViewById(R.id.tvHistory)
         etRule = findViewById(R.id.etRule)
-        etTo = findViewById(R.id.etTo)
+        actTo = findViewById(R.id.actTo)
+        setupRecipientValidation()
         etAmount = findViewById(R.id.etAmount)
         tvResult = findViewById(R.id.tvResult)
-        spinnerWallets = findViewById(R.id.spinnerWallets)
+        actWallets = findViewById(R.id.actWallets)
+        // cbRandomRule removed
         tvRuleValidationStatus = findViewById(R.id.tvRuleValidationStatus)
+
+        findViewById<Button>(R.id.btnGenerateRule).setOnClickListener { 
+             etRule.setText(generateRandomTauRule()) 
+        }
+        findViewById<Button>(R.id.btnFetchPeers).setOnClickListener { 
+             queryAllAccounts(verbose = true) 
+        }
 
         findViewById<Button>(R.id.btnGenKey).setOnClickListener { generateKeypair() }
         findViewById<Button>(R.id.btnBalance).setOnClickListener { queryBalance() }
@@ -74,7 +88,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnDeleteWallet).setOnClickListener { deleteSelectedWallet() }
 
 
-        setupWalletSpinner()
+        setupWalletDropdown()
         loadWallets()
         setupRuleValidation()
         try {
@@ -94,37 +108,46 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    private fun setupWalletSpinner() {
-        walletAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, wallets.keys.toMutableList())
-        walletAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        spinnerWallets.adapter = walletAdapter
-
-        spinnerWallets.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
-                val selectedWalletName = parent.getItemAtPosition(position) as String
-                loadWallet(selectedWalletName)
-            }
-            override fun onNothingSelected(parent: AdapterView<*>) {}
+    private fun setupWalletDropdown() {
+        walletAdapter = ArrayAdapter(this, com.google.android.material.R.layout.mtrl_auto_complete_simple_item, wallets.keys.toMutableList())
+        actWallets.setAdapter(walletAdapter)
+        actWallets.onItemClickListener = AdapterView.OnItemClickListener { parent, _, position, _ ->
+            val name = parent.getItemAtPosition(position) as String
+            selectWallet(name)
         }
     }
 
-    private fun loadWallets() {
+    private fun loadWallets(preselect: String? = null) {
         val savedWallets = sharedPreferences.all
         wallets.clear()
         for ((key, value) in savedWallets) {
             wallets[key] = value as String
         }
-        updateWalletSpinner()
-        if (wallets.isNotEmpty()) {
-            spinnerWallets.setSelection(0)
-            loadWallet(wallets.keys.first())
+        updateWalletDropdown()
+
+        if (wallets.isEmpty()) {
+            selectedWalletName = null
+            actWallets.setText("", false)
+            return
         }
+
+        val desired = preselect
+            ?: selectedWalletName?.takeIf { wallets.containsKey(it) }
+            ?: wallets.keys.sorted().first()
+
+        selectWallet(desired)
     }
 
-    private fun updateWalletSpinner() {
+    private fun updateWalletDropdown() {
         walletAdapter.clear()
         walletAdapter.addAll(wallets.keys.sorted())
         walletAdapter.notifyDataSetChanged()
+    }
+
+    private fun selectWallet(name: String) {
+        selectedWalletName = name
+        actWallets.setText(name, false)
+        loadWallet(name)
     }
 
     private fun showSaveWalletDialog() {
@@ -164,12 +187,7 @@ class MainActivity : AppCompatActivity() {
             putString(name, skHex)
             apply()
         }
-        loadWallets()
-        // Set spinner to the newly saved wallet
-        val newPosition = walletAdapter.getPosition(name)
-        if (newPosition >= 0) {
-            spinnerWallets.setSelection(newPosition)
-        }
+        loadWallets(preselect = name)
     }
 
     private fun loadWallet(name: String) {
@@ -194,40 +212,113 @@ class MainActivity : AppCompatActivity() {
             privateKeyBytes = skBytes
             publicKeyHex = pkHex
 
-            tvPrivKeyHex.text = "Private key (hex): $normalizedSkHex"
-            tvPubKeyHex.text = "Public key (hex): $pkHex"
+            tvPrivKeyHex.text = normalizedSkHex
+            tvPubKeyHex.text = pkHex
             tvBalance.text = "Balance: -"
             tvHistory.text = "History: -"
-            tvResult.text = "Result: Loaded wallet '$name'."
+            tvResult.text = "Loaded wallet '$name'."
         } catch (e: Exception) {
             tvResult.text = "Error loading wallet '$name': ${e.message}"
+        }
+        queryAllAccounts()
+    }
+    
+    private fun queryAllAccounts(verbose: Boolean = false) {
+        val host = actHost.text.toString()
+        val port = etPort.text.toString().toIntOrNull() ?: return
+        thread {
+            val resp = rpc("getallaccounts\r\n", host, port).trim()
+            if (verbose) {
+                 runOnUiThread { tvResult.text = "Fetch Peers Response:\n$resp" }
+            }
+            if (resp.startsWith("[")) {
+                try {
+                    val jsonArray = JSONArray(resp)
+                    val accounts = mutableListOf<String>()
+                    for (i in 0 until jsonArray.length()) {
+                        accounts.add(jsonArray.getString(i))
+                    }
+                    val myHeader = publicKeyHex
+                    accounts.remove(myHeader) // remove self if present
+                    
+                    if (accounts.isNotEmpty()) {
+                        runOnUiThread {
+                            val adapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, accounts)
+                            actTo.setAdapter(adapter)
+                            if (verbose) {
+                                actTo.showDropDown()
+                                tvResult.append("\n\nFound ${accounts.size} peers.")
+                            }
+                        }
+                    } else if (verbose) {
+                        runOnUiThread { tvResult.append("\n\nNo other peers found.") }
+                    }
+                } catch (e: Exception) {
+                    if (verbose) {
+                        runOnUiThread { tvResult.append("\n\nJSON Parse Error: ${e.message}") }
+                    }
+                }
+            } else if (verbose) {
+                 runOnUiThread { tvResult.append("\n\nError: Unexpected response format.") }
+            }
         }
     }
 
 
     private fun deleteSelectedWallet() {
-        if (spinnerWallets.selectedItem == null) {
+        val name = selectedWalletName
+            ?: actWallets.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+
+        if (name == null || !wallets.containsKey(name)) {
             tvResult.text = "No wallet selected to delete."
             return
         }
-        val selectedWalletName = spinnerWallets.selectedItem as String
+
         with(sharedPreferences.edit()) {
-            remove(selectedWalletName)
+            remove(name)
             apply()
         }
-        wallets.remove(selectedWalletName)
-        updateWalletSpinner()
+        wallets.remove(name)
+        updateWalletDropdown()
 
         // Clear keys if the deleted wallet was the active one
-        if(wallets.isEmpty()){
+        if (wallets.isEmpty()) {
             privateKeyBytes = null
             publicKeyHex = null
-            tvPrivKeyHex.text = "Private key (hex):"
-            tvPubKeyHex.text = "Public key (hex):"
+            selectedWalletName = null
+            actWallets.setText("", false)
+            tvPrivKeyHex.text = "-"
+            tvPubKeyHex.text = "-"
         } else {
-             spinnerWallets.setSelection(0)
-             loadWallet(wallets.keys.first())
+            loadWallets()
         }
+    }
+
+
+    private fun setupHostDropdown() {
+        val hosts = listOf("10.0.2.2", "testnet.tau.net", "127.0.0.1")
+        val adapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, hosts)
+        actHost.setAdapter(adapter)
+    }
+
+    private fun setupRecipientValidation() {
+        actTo.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                val input = s.toString().trim()
+                if (input.isNotEmpty() && !isValidHexKey(input)) {
+                    actTo.error = "Invalid format: Must be 96-char hex string (BLS PK)"
+                } else {
+                    actTo.error = null
+                }
+            }
+        })
+    }
+    
+    // Checks for 96 hex characters (BLS public key size)
+    private fun isValidHexKey(hex: String): Boolean {
+        return hex.length == 96 && hex.matches(Regex("^[0-9a-fA-F]+$"))
     }
 
 
@@ -257,7 +348,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         // 2. Check for invalid characters
-        val allowedChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_[]()='&|!<>+-*/%^: \t\n\r"
+        val allowedChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_[]()='&|!<>+-*/%^: \t\n\r{}#?,."
         for (char in rule) {
             if (char !in allowedChars) {
                 errors.add("Invalid character '$char'.")
@@ -278,13 +369,13 @@ class MainActivity : AppCompatActivity() {
         }
         
         if (errors.isEmpty()) {
-            tvRuleValidationStatus.text = "Valid Syntax"
-            tvRuleValidationStatus.setTextColor(getColor(android.R.color.holo_green_dark))
+            tvRuleValidationStatus.text = "Valid syntax"
+            tvRuleValidationStatus.setTextColor(getColor(R.color.tau_success))
             isRuleValid = true
         } else {
             val errorText = "Invalid Syntax:\n- ${errors.joinToString("\n- ")}"
             tvRuleValidationStatus.text = errorText
-            tvRuleValidationStatus.setTextColor(getColor(android.R.color.holo_red_dark))
+            tvRuleValidationStatus.setTextColor(getColor(R.color.tau_error))
             isRuleValid = false
         }
     }
@@ -297,14 +388,15 @@ class MainActivity : AppCompatActivity() {
             val skHex = bytesToHex(sk)
             val pkHex = bytesToHex(pk)
             publicKeyHex = pkHex
-            tvPrivKeyHex.text = "Private key (hex): $skHex"
-            tvPubKeyHex.text = "Public key (hex): $pkHex"
+            tvPrivKeyHex.text = skHex
+            tvPubKeyHex.text = pkHex
 
-            // Deselect spinner to indicate this is a new, unsaved wallet
-            spinnerWallets.setSelection(AdapterView.INVALID_POSITION)
+            // Clear wallet selection to indicate this is a new, unsaved wallet
+            selectedWalletName = null
+            actWallets.setText("", false)
             tvBalance.text = "Balance: -"
             tvHistory.text = "History: -"
-            tvResult.text = "Result: Generated new keypair."
+            tvResult.text = "Generated new keypair."
         } catch (e: Exception) {
             tvResult.text = "Error generating keypair: ${e.message}"
         }
@@ -331,7 +423,7 @@ class MainActivity : AppCompatActivity() {
             tvBalance.text = "No wallet loaded."
             return
         }
-        val host = etHost.text.toString()
+        val host = actHost.text.toString()
         val port = etPort.text.toString().toIntOrNull() ?: return
         thread {
             val resp = rpc("getbalance $addr\r\n", host, port)
@@ -344,11 +436,28 @@ class MainActivity : AppCompatActivity() {
             tvHistory.text = "No wallet loaded."
             return
         }
-        val host = etHost.text.toString()
+        val host = actHost.text.toString()
         val port = etPort.text.toString().toIntOrNull() ?: return
         thread {
             val resp = rpc("history $addr\r\n", host, port)
-            runOnUiThread { tvHistory.text = resp.trim() }
+            
+            // Extract potential peers from history (heuristically)
+            val peers = mutableSetOf<String>()
+            val regex = Regex("[0-9a-fA-F]{96}") // Match BLS public keys
+            regex.findAll(resp).forEach { match ->
+                 val key = match.value
+                 if (key != addr) { // Don't include self
+                     peers.add(key)
+                 }
+            }
+            
+            runOnUiThread { 
+                tvHistory.text = resp.trim()
+                if (peers.isNotEmpty()) {
+                    val adapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, peers.toList())
+                    actTo.setAdapter(adapter)
+                }
+            }
         }
     }
 
@@ -372,10 +481,14 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+
+
         val rule = ruleInput.lines().joinToString(" ") { it.trim() }
-        val to = etTo.text.toString().trim()
+        // cbRandomRule logic removed, rule is now fully user controlled via etRule
+        
+        val to = actTo.text.toString().trim()
         val amountStr = etAmount.text.toString().trim()
-        val host = etHost.text.toString()
+        val host = actHost.text.toString()
         val port = etPort.text.toString().toIntOrNull() ?: return
 
         val operations = mutableMapOf<String, Any>()
@@ -469,7 +582,27 @@ class MainActivity : AppCompatActivity() {
     private fun toJson(value: Any?, sorted: Boolean): String {
         return when (value) {
             null -> "null"
-            is String -> "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+            is String -> {
+                val sb = StringBuilder("\"")
+                for (c in value) {
+                    when (c) {
+                        '\\' -> sb.append("\\\\")
+                        '"' -> sb.append("\\\"")
+                        '\n' -> sb.append("\\n")
+                        '\r' -> sb.append("\\r")
+                        '\t' -> sb.append("\\t")
+                        '\b' -> sb.append("\\b")
+                        '\u000C' -> sb.append("\\f")
+                        else -> if (c.code < 32) {
+                            sb.append(String.format("\\u%04x", c.code))
+                        } else {
+                            sb.append(c)
+                        }
+                    }
+                }
+                sb.append("\"")
+                sb.toString()
+            }
             is Number, is Boolean -> value.toString()
             is Map<*, *> -> {
                 val entries = if (sorted) value.keys.map { it as String }.sorted() else value.keys.map { it as String }
@@ -516,6 +649,32 @@ class MainActivity : AppCompatActivity() {
     private fun sha256(input: ByteArray): ByteArray {
         val md = java.security.MessageDigest.getInstance("SHA-256")
         return md.digest(input)
+    }
+    private fun generateRandomTauRule(): String {
+        // o5..o14
+        val outIdx = 5 + secureRandom.nextInt(10)
+        
+        val exprs = listOf(
+            "(i1[t] & i2[t] | { #b0 }:bv)",
+            "(i3[t] | i4[t] | { #b0 }:bv)",
+            "((i1[t] | { #b0 }:bv)')",
+            "((i1[t] | i2[t]) & (i3[t] | { 170 }:bv))",
+            "((i4[t] | { 66 }:bv)' | (i1[t] & i2[t]))",
+            "(((i1[t] | i2[t]) & i3[t]) | { #b0 }:bv)",
+            "(((i1[t] & i2[t] | { #b0 }:bv) | (i3[t] | i4[t] | { #b0 }:bv)))"
+        )
+        val expr = exprs[secureRandom.nextInt(exprs.size)]
+        
+        val shape = secureRandom.nextInt(4)
+        return when (shape) {
+            0 -> "always (o$outIdx[t] = $expr)."
+            1 -> "always (($expr != { #b0 }:bv) ? o$outIdx[t] = $expr : o$outIdx[t] = ($expr)')."
+            2 -> "always (($expr = { #b0 }:bv) ? o$outIdx[t] = $expr : o$outIdx[t] = ($expr)')."
+            else -> {
+                val bit = secureRandom.nextInt(2)
+                "always (o$outIdx[t] = { #b$bit }:bv)."
+            }
+        }
     }
 }
 

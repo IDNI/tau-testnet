@@ -3,6 +3,7 @@
 /tmp/
 /venv/
 /_old.git/
+/build/
 
 # Logs
 logs
@@ -32,6 +33,7 @@ docs/*.md
 *.txt
 *.md
 .env*
+MagicMock
 !README.md
 !NOTICE.txt
 !LICENSE.md

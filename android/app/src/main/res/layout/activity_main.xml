@@ -1,196 +1,396 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
-    android:layout_height="match_parent">
-    <LinearLayout
-        android:orientation="vertical"
-        android:padding="16dp"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="?android:attr/windowBackground">
+
+    <com.google.android.material.appbar.MaterialToolbar
+        android:id="@+id/toolbar"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content">
+        android:layout_height="wrap_content"
+        android:background="?attr/colorSurface"
+        app:title="@string/app_name"
+        app:subtitle="@string/app_subtitle"
+        app:titleCentered="true"
+        android:elevation="0dp" />
 
-        <TextView
-            android:id="@+id/tvNode"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Node host:port" />
-
-        <EditText
-            android:id="@+id/etHost"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="Host"
-            android:text="127.0.0.1" />
-
-        <EditText
-            android:id="@+id/etPort"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:inputType="number"
-            android:hint="Port"
-            android:text="7777" />
-
-        <View
-            android:layout_width="match_parent"
-            android:layout_height="16dp" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Wallet Management"
-            android:textSize="18sp"
-            android:textStyle="bold"/>
-
-        <Spinner
-            android:id="@+id/spinnerWallets"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:minHeight="48dp" />
+    <androidx.core.widget.NestedScrollView
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:fillViewport="true"
+        android:clipToPadding="false"
+        android:paddingBottom="24dp">
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="horizontal">
+            android:orientation="vertical"
+            android:padding="@dimen/page_padding">
 
-            <Button
-                android:id="@+id/btnSaveWallet"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:layout_marginEnd="4dp"
-                android:text="Save Current"/>
+        <!-- Connection Settings -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="@dimen/section_spacing"
+            app:cardBackgroundColor="?attr/colorSurface"
+            app:contentPadding="@dimen/page_padding"
+            app:cardCornerRadius="@dimen/card_radius"
+            app:strokeColor="@color/tau_outline"
+            app:strokeWidth="1dp"
+            app:cardElevation="0dp">
 
-            <Button
-                android:id="@+id/btnDeleteWallet"
-                android:layout_width="0dp"
+            <LinearLayout
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:layout_marginStart="4dp"
-                android:text="Delete Selected"/>
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="8dp"
+                    android:text="@string/section_connection"
+                    android:textAppearance="@style/TextAppearance.TauWallet.SectionTitle" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="2"
+                        android:layout_marginEnd="8dp"
+                        android:hint="@string/hint_host"
+                        style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox.ExposedDropdownMenu">
+
+                        <com.google.android.material.textfield.MaterialAutoCompleteTextView
+                            android:id="@+id/actHost"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:inputType="textNoSuggestions"
+                            android:text="testnet.tau.net" />
+
+                    </com.google.android.material.textfield.TextInputLayout>
+
+                    <com.google.android.material.textfield.TextInputLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:hint="@string/hint_port"
+                        style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+
+                        <com.google.android.material.textfield.TextInputEditText
+                            android:id="@+id/etPort"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:inputType="number"
+                            android:text="65432" />
+                    </com.google.android.material.textfield.TextInputLayout>
+                </LinearLayout>
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- Wallet Management -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="@dimen/section_spacing"
+            app:cardBackgroundColor="?attr/colorSurface"
+            app:contentPadding="@dimen/page_padding"
+            app:cardCornerRadius="@dimen/card_radius"
+            app:strokeColor="@color/tau_outline"
+            app:strokeWidth="1dp"
+            app:cardElevation="0dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="8dp"
+                    android:text="@string/section_wallet"
+                    android:textAppearance="@style/TextAppearance.TauWallet.SectionTitle" />
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="@dimen/field_spacing"
+                    android:hint="@string/hint_active_wallet"
+                    style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox.ExposedDropdownMenu">
+
+                    <com.google.android.material.textfield.MaterialAutoCompleteTextView
+                        android:id="@+id/actWallets"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="none" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginBottom="@dimen/field_spacing">
+
+                    <Button
+                        android:id="@+id/btnSaveWallet"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginEnd="4dp"
+                        android:text="@string/btn_save" />
+
+                    <Button
+                        android:id="@+id/btnDeleteWallet"
+                        style="@style/Widget.MaterialComponents.Button.TextButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginStart="4dp"
+                        android:text="@string/btn_delete" />
+                </LinearLayout>
+
+                <Button
+                    android:id="@+id/btnGenKey"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/btn_generate_keypair" />
+
+                <TextView
+                     android:layout_width="wrap_content"
+                     android:layout_height="wrap_content"
+                     android:text="@string/label_private_key"
+                     android:textAppearance="@style/TextAppearance.TauWallet.Caption"
+                     android:layout_marginTop="@dimen/field_spacing" />
+                <TextView
+                    android:id="@+id/tvPrivKeyHex"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="-"
+                    android:textIsSelectable="true"
+                    android:background="@drawable/bg_mono_field"
+                    android:textAppearance="@style/TextAppearance.TauWallet.MonoBody" />
+
+                <TextView
+                     android:layout_width="wrap_content"
+                     android:layout_height="wrap_content"
+                     android:text="@string/label_public_key"
+                     android:textAppearance="@style/TextAppearance.TauWallet.Caption"
+                     android:layout_marginTop="@dimen/field_spacing" />
+                <TextView
+                    android:id="@+id/tvPubKeyHex"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="-"
+                    android:textIsSelectable="true"
+                    android:background="@drawable/bg_mono_field"
+                    android:textAppearance="@style/TextAppearance.TauWallet.MonoBody" />
+
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:background="@color/tau_outline"
+                    android:layout_marginVertical="@dimen/field_spacing"/>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+                    
+                    <Button
+                        android:id="@+id/btnBalance"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginEnd="4dp"
+                        android:text="@string/btn_balance" />
+                        
+                    <Button
+                        android:id="@+id/btnHistory"
+                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginStart="4dp"
+                        android:text="@string/btn_history" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/tvBalance"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="@dimen/field_spacing"
+                    android:text="Balance: -"
+                    android:textStyle="bold"
+                    android:textIsSelectable="true" />
+
+                <TextView
+                    android:id="@+id/tvHistory"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="History: -"
+                    android:background="@drawable/bg_mono_field"
+                    android:textAppearance="@style/TextAppearance.TauWallet.MonoBody"
+                    android:maxLines="6"
+                    android:ellipsize="end"
+                    android:textIsSelectable="true" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- Transaction -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="@dimen/section_spacing"
+            app:cardBackgroundColor="?attr/colorSurface"
+            app:contentPadding="@dimen/page_padding"
+            app:cardCornerRadius="@dimen/card_radius"
+            app:strokeColor="@color/tau_outline"
+            app:strokeWidth="1dp"
+            app:cardElevation="0dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="@dimen/field_spacing"
+                    android:text="@string/section_send"
+                    android:textAppearance="@style/TextAppearance.TauWallet.SectionTitle" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="@dimen/field_spacing">
+                    
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="@string/hint_custom_rule"
+                        android:textAppearance="@style/TextAppearance.TauWallet.Caption"/>
+
+                    <Button
+                        android:id="@+id/btnGenerateRule"
+                        style="@style/Widget.MaterialComponents.Button.TextButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Generate Random"
+                        android:textSize="12sp"/>
+                </LinearLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="@dimen/field_spacing"
+                    style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/etRule"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textMultiLine"
+                        android:minLines="2" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <TextView
+                    android:id="@+id/tvRuleValidationStatus"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="@dimen/field_spacing"
+                    android:gravity="end"
+                    android:text=""
+                    android:textAppearance="@style/TextAppearance.TauWallet.Caption" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="end"
+                    android:layout_marginBottom="0dp">
+
+                    <Button
+                        android:id="@+id/btnFetchPeers"
+                        style="@style/Widget.MaterialComponents.Button.TextButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Fetch Peers"
+                        android:textSize="12sp"/>
+                </LinearLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:id="@+id/tilTo"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="@string/hint_recipient_pubkey"
+                    android:layout_marginBottom="@dimen/field_spacing"
+                    style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox.ExposedDropdownMenu">
+
+                    <com.google.android.material.textfield.MaterialAutoCompleteTextView
+                        android:id="@+id/actTo"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textNoSuggestions"
+                         />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="@string/hint_amount"
+                    android:layout_marginBottom="@dimen/field_spacing"
+                    style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/etAmount"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="number" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <Button
+                    android:id="@+id/btnSend"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="@string/btn_send_tx"
+                    android:backgroundTint="?attr/colorSecondary"
+                    android:textColor="?attr/colorOnSecondary" />
+                    
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="@dimen/field_spacing"
+                    android:text="@string/label_last_response"
+                    android:textAppearance="@style/TextAppearance.TauWallet.Caption" />
+
+                <TextView
+                    android:id="@+id/tvResult"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="-"
+                    android:textIsSelectable="true"
+                    android:background="@drawable/bg_mono_field"
+                    android:textAppearance="@style/TextAppearance.TauWallet.MonoBody" />
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
 
         </LinearLayout>
 
+    </androidx.core.widget.NestedScrollView>
 
-        <View
-            android:layout_width="match_parent"
-            android:layout_height="8dp" />
-
-        <Button
-            android:id="@+id/btnGenKey"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Generate Keypair" />
-
-        <TextView
-            android:id="@+id/tvPrivKeyHex"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textIsSelectable="true"
-            android:text="Private key (hex):" />
-
-        <TextView
-            android:id="@+id/tvPubKeyHex"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textIsSelectable="true"
-            android:text="Public key (hex):" />
-
-        <View
-            android:layout_width="match_parent"
-            android:layout_height="8dp" />
-
-        <Button
-            android:id="@+id/btnBalance"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Get Balance" />
-
-        <TextView
-            android:id="@+id/tvBalance"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textIsSelectable="true"
-            android:text="Balance: -" />
-
-        <Button
-            android:id="@+id/btnHistory"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Get History" />
-
-        <TextView
-            android:id="@+id/tvHistory"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textIsSelectable="true"
-            android:text="History: -" />
-
-        <View
-            android:layout_width="match_parent"
-            android:layout_height="16dp" />
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Transaction Operations"
-            android:textSize="18sp"
-            android:textStyle="bold" />
-
-        <EditText
-            android:id="@+id/etRule"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="Tau rule"
-            android:importantForAutofill="no"
-            android:inputType="textMultiLine"
-            android:gravity="top|start"
-            android:lines="4"
-            android:background="@android:drawable/edit_text"
-            android:padding="8dp"/>
-
-        <TextView
-            android:id="@+id/tvRuleValidationStatus"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:gravity="end"/>
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Simple Transfer (operation 1)"
-            android:layout_marginTop="8dp"/>
-
-        <EditText
-            android:id="@+id/etTo"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="Recipient pubkey (hex)"
-            android:importantForAutofill="no"
-            android:inputType="text"
-            android:minHeight="48dp" />
-
-        <EditText
-            android:id="@+id/etAmount"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:inputType="number"
-            android:hint="Amount"
-            android:importantForAutofill="no"
-            android:minHeight="48dp" />
-
-        <Button
-            android:id="@+id/btnSend"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Send Transaction" />
-
-        <TextView
-            android:id="@+id/tvResult"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:textIsSelectable="true"
-            android:text="Result:" />
-
-    </LinearLayout>
-</ScrollView>
-
+</LinearLayout>

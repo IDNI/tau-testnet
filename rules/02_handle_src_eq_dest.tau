@@ -12,4 +12,4 @@
 # Logic:
 # If source == destination, the check fails (output #b0).
 # Otherwise, the check passes (output #b1).
-always (((i3[t] = i4[t]:bv) ? o3[t] = { #b0 }:bv : o3[t] = { #b1 }:bv)).
+always (((i3[t] = i4[t]:bv[64]) ? o3[t] = { #b0 }:bv[1] : o3[t] = { #b1 }:bv[1])).

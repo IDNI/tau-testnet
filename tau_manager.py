@@ -12,6 +12,8 @@ from collections import deque
 # ANSI color codes for debug output
 COLOR_BLUE = "\033[94m"
 COLOR_YELLOW = "\033[93m"
+COLOR_GREEN = "\033[92m"
+COLOR_MAGENTA = "\033[95m"
 COLOR_RESET = "\033[0m"
 
 # Import shared state and config
@@ -22,6 +24,20 @@ from errors import TauCommunicationError, TauProcessError
 
 
 logger = logging.getLogger(__name__)
+
+# --- Tau stdout prompt patterns -------------------------------------------------
+# Tau prints prompts of the form:
+#   i0[0]:tau :=
+#   i1[0]:bv[16] :=
+# and output "prompts" (the next line contains the value):
+#   o0[0]:tau :=
+#   o1[0]:bv :=
+#
+# IMPORTANT: Only `i*` prompts require *us* to write a value to stdin.
+# `o*` prompts are *outputs*; we must never respond to them with input.
+TAU_INPUT_PROMPT_RE = re.compile(r"^i(\d+)\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*$")
+TAU_OUTPUT_PROMPT_RE = re.compile(r"^o(\d+)\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*$")
+TAU_ANY_PROMPT_RE = re.compile(r"^(?:i|o)\d+\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*$")
 
 # --- Global State (accessible by this module) ---
 tau_process: subprocess.Popen | None = None
@@ -134,7 +150,13 @@ def start_and_manage_tau_process():
         ready_signal_found = False
         try:
             # Start the process
-            logger.info("Starting Tau Docker process... step 2")
+            logger.info(
+                "Launching Tau via Docker (non-interactive, program=%s, image=%s). "
+                "This is not the interactive `tau>` REPL mode.",
+                container_tau_file_path,
+                config.TAU_DOCKER_IMAGE,
+            )
+            logger.debug("Tau docker command: %s", " ".join(docker_command))
             current_process = subprocess.Popen(
                 docker_command,
                 stdin=subprocess.PIPE,
@@ -145,7 +167,6 @@ def start_and_manage_tau_process():
                 bufsize=1  # Line buffering
             )
             # Set the global process variable *only after* successful start
-            logger.info("Starting Tau Docker process... step 3")
             with tau_process_lock:
                 tau_process = current_process
 
@@ -191,7 +212,9 @@ def start_and_manage_tau_process():
                     if not line:
                         logger.error("Tau process stdout stream ended before sending ready signal.")
                         break
-                    logger.info(f"{COLOR_BLUE}[TAU_STDOUT_INIT] %s{COLOR_RESET}", line.strip())
+                    # Tau prints a lot during startup (e.g., "Default typing" rules).
+                    # Keep it behind DEBUG so normal node startup isn't noisy.
+                    logger.debug(f"{COLOR_BLUE}[TAU_STDOUT_INIT] %s{COLOR_RESET}", line.strip())
                     if config.TAU_READY_SIGNAL in line:
                         logger.info("Tau ready signal detected!")
                         tau_ready.set()
@@ -375,12 +398,12 @@ def communicate_with_tau(
             """Helper that logs and writes a value to Tau's stdin."""
             value_str = "" if value is None else str(value)
             logger.info(
-                "communicate_with_tau: Tau prompting on i%s. %s",
+                f"{COLOR_MAGENTA}communicate_with_tau: Tau prompting on i%s. %s{COLOR_RESET}",
                 stream_idx,
                 reason,
             )
             for line_part in value_str.split('\n'):
-                logger.info("Sending to Tau (stdin) >>> %s", line_part)
+                logger.info(f"{COLOR_GREEN}Sending to Tau (stdin) >>> %s{COLOR_RESET}", line_part)
             current_stdin.write(value_str + '\n')
             current_stdin.flush()
 
@@ -538,7 +561,7 @@ def communicate_with_tau(
                 #   o0[0]:bv :=
                 #   o0[0]:tau :=
                 # Type annotations can also include bit-width, e.g., :bv[16] or :tau[0].
-                o_prompt_match = re.match(r"^o(\d+)\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*$", line_strip)
+                o_prompt_match = TAU_OUTPUT_PROMPT_RE.match(line_strip)
                 if o_prompt_match:
                     expect_stream_value_for = int(o_prompt_match.group(1))
                     logger.debug(
@@ -547,30 +570,50 @@ def communicate_with_tau(
                     )
                     continue
 
-                # Updated specification:
-                # Tau can print either:
-                #   Updated specification:
-                #   <normalized-spec>
-                # OR (same-line form):
+                # Updated specification (same-line form):
                 #   Updated specification: <normalized-spec>
                 #
                 # Capture the body and hand it off to the registered rules handler.
                 updated_spec_match = re.match(r"^Updated\s*specification\:\s*(.*)$", line_strip)
                 if updated_spec_match:
-                    capturing_updated_spec = True
-                    updated_spec_lines = []
+
                     inline = (updated_spec_match.group(1) or "").strip()
                     if inline:
-                        updated_spec_lines.append(inline)
-                    logger.debug(
-                        "communicate_with_tau: Entering updated-spec capture mode (inline=%s)",
-                        bool(inline),
-                    )
+                        if _rules_handler:
+                            try:
+                                _rules_handler(inline)
+                                logger.info(
+                                    "communicate_with_tau: Saved updated specification via handler (len=%s).",
+                                    len(inline),
+                                )
+                                try:
+                                    from poa.state import compute_state_hash
+
+                                    state_hash = compute_state_hash(inline.encode("utf-8"))
+                                except Exception:
+                                    state_hash = None
+                                logger.debug(
+                                    "communicate_with_tau: Tau state snapshot saved (len=%s state_hash=%s).",
+                                    len(inline),
+                                    state_hash,
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    "communicate_with_tau: Failed to save updated specification via handler: %s",
+                                    e,
+                                )
+                        continue
+
+                    # Fallback (rare): Tau prints "Updated specification:" then the spec on one
+                    # or more subsequent lines. Keep a capture mode for that format.
+                    capturing_updated_spec = True
+                    updated_spec_lines = []
+                    logger.debug("communicate_with_tau: Entering updated-spec capture mode (inline=False)")
                     continue
 
                 if capturing_updated_spec:
                     # Specifically match iN[...] and oN[...] prompts with optional type annotations.
-                    if re.match(r"^(?:i|o)\d+\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*$", line_strip):
+                    if TAU_ANY_PROMPT_RE.match(line_strip):
                         updated_spec = "\n".join(updated_spec_lines).strip()
                         capturing_updated_spec = False
                         updated_spec_lines = []
@@ -597,14 +640,12 @@ def communicate_with_tau(
                         continue
                 # ---------------------------------------------------------------------
 
-                # Handle Tau input prompts (e.g., "i1[0] :=", "i2[0] :=", "o0[0]:tau :=").
+                # Handle Tau *input* prompts (e.g., "i1[0] :=", "i2[0] :=").
                 # Tau may include a type annotation between the ']' and ':=' like:
                 #   i0[0]:tau :=
                 #   i1[0]:bv :=
-                #   o0[0]:tau :=
-                #   o1[0]:bv :=
                 # Type annotations can also include bit-width, e.g., :bv[16] or :tau[0].
-                prompt_match = re.match(r"^[io](\d+)\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*$", line_strip)
+                prompt_match = TAU_INPUT_PROMPT_RE.match(line_strip)
                 if prompt_match:
                     stream_idx = int(prompt_match.group(1))
 
@@ -617,7 +658,7 @@ def communicate_with_tau(
                         continue
 
                     if stream_idx == target_output_stream_index and rule_text is not None:
-                        _send_value_to_tau(stream_idx, rule_text, "Sending legacy single-stream input.")
+                        _send_value_to_tau(stream_idx, rule_text, "Sending single-stream input.")
                         continue
 
                     fallback_value = "F" if stream_idx == 0 else tau_defs.TAU_VALUE_ZERO

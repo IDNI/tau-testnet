@@ -47,6 +47,12 @@ def _start_network_background(container: ServiceContainer) -> None:
             
         async def main() -> None:
             await service.start()
+            
+            # Re-set DHT client to trigger hydration now that DHT is fully initialized
+            if hasattr(container.chain_state, "set_dht_client"):
+                logger.info("Re-triggering DHT hydration after NetworkService startup")
+                container.chain_state.set_dht_client(service._dht_manager)
+            
             try:
                 while not NETWORK_STOP_FLAG.is_set():
                     await trio.sleep(0.25)
@@ -215,12 +221,39 @@ def _run_server(container: ServiceContainer):
     logger.info("Initializing and loading chain state...")
     chain_state_module.initialize_persistent_state()
 
+    # If we have persisted rules/state, re-apply them to the fresh Tau process so a
+    # restarted node continues from the last committed chain state.
+    #
+    # This was previously deferred, which made restarts confusing: the DB had blocks/state,
+    # but Tau itself was reset to the genesis program until a manual injection happened.
+    restore_flag = os.environ.get("TAU_RESTORE_RULES_ON_STARTUP", "").strip().lower()
+    restore_enabled = restore_flag not in {"0", "false", "no", "off"}
+    # Keep test runs deterministic by default.
+    if container.settings.env == "test" and restore_flag == "":
+        restore_enabled = False
+
     logger.info("Starting NetworkService background thread...")
     _start_network_background(container)
 
     saved_rules = chain_state_module.get_rules_state()
-    if saved_rules:
-        logger.info("Persisted rules state detected; defer injection until explicit workflow.")
+    if saved_rules and restore_enabled:
+        try:
+            logger.info(
+                "Restoring persisted Tau rules/state into Tau process (len=%s) ...",
+                len(saved_rules),
+            )
+            out = tau_module.communicate_with_tau(
+                rule_text=saved_rules,
+                target_output_stream_index=0,
+            )
+            logger.info("Tau restore result (o0): %s", out)
+        except Exception:
+            logger.exception("Failed to restore persisted Tau rules/state on startup")
+    elif saved_rules:
+        logger.info(
+            "Persisted rules state detected; skipping automatic restore "
+            "(set TAU_RESTORE_RULES_ON_STARTUP=1 to enable)."
+        )
 
     server_socket = None
     actual_port = config.PORT

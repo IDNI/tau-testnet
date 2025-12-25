@@ -38,6 +38,42 @@ def set_dht_client(client):
     """Sets the DHT client for storing formulas."""
     global _dht_client
     _dht_client = client
+    # Hydrate DHT with currently loaded items so we can advertise them
+    try:
+        if _dht_client:
+             _republish_state_to_dht()
+        else:
+             logger.warning("set_dht_client called with None client; skipping hydration")
+    except Exception as e:
+        logger.error("Failed to hydrate DHT with persisted state: %s", e)
+
+
+def _republish_state_to_dht():
+    """
+    Publishes the currently loaded state (rules and accounts) to the local DHT value store.
+    This ensures that on node startup, the DHT is populated with the state loaded from DB,
+    allowing the node to advertise these keys during handshake.
+    """
+    global _last_processed_block_hash, _current_rules_state
+    
+    if not _last_processed_block_hash:
+        return
+
+    logger.info("Hydrating DHT with persisted state for block %s...", _last_processed_block_hash)
+    
+    # 1. Publish Accounts
+    publish_accounts_snapshot(_last_processed_block_hash)
+    
+    # 2. Publish Tau State / Rules
+    # We need the state_hash. If _tau_engine_state_hash is set, use it.
+    # Otherwise compute it from _current_rules_state.
+    state_hash = _tau_engine_state_hash
+    if not state_hash and _current_rules_state:
+        state_hash = compute_state_hash(_current_rules_state.encode("utf-8"))
+    
+    if state_hash and _current_rules_state:
+        publish_tau_state_snapshot(state_hash, _current_rules_state.encode("utf-8"))
+
 
 
 def publish_tau_state_snapshot(state_hash: str, tau_bytes: bytes) -> bool:
@@ -288,6 +324,24 @@ def process_new_block(block: Block) -> bool:
             rules_from_dht = ""
 
         if balances_snapshot is not None and sequences_snapshot is not None and rules_from_dht is not None:
+             # Cache fetched snapshots to local DHT store to assist network propagation
+            try:
+                 if _dht_client and _dht_client.dht:
+                    # Cache accounts
+                    accounts_payload = json.dumps(
+                         {"block_hash": block.block_hash, "accounts": {"...": "..."}}, # We don't have the original payload here easily to re-serialize exact
+                    ).encode("utf-8")
+                    # Actually we should use the fetched raw bytes if possible, but fetch_accounts_snapshot returns parsed dicts.
+                    # Re-serializing is fine for consistency, but to be safe let's just use what we have
+                    publish_accounts_snapshot(block.block_hash)
+                    
+                    # Cache rules
+                    if rules_from_dht:
+                        rules_bytes = rules_from_dht.encode("utf-8")
+                        rules_key = f"{config.STATE_LOCATOR_NAMESPACE}:{expected_state_hash}".encode("ascii")
+                        _dht_client.dht.value_store.put(rules_key, rules_bytes)
+            except Exception as e:
+                 print(f"[WARN][chain_state] Failed to cache snapshots to local DHT: {e}")
             break
         time.sleep(0.2)
 
@@ -469,6 +523,8 @@ def init_chain_state():
 def get_balance(address_hex: str) -> int:
     """Returns the balance of the given address. Returns 0 if address not found."""
     with _balance_lock:
+        if address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
+            return 100000
         return _balances.get(address_hex, 0)
 
 def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, amount: int) -> bool:
@@ -483,6 +539,10 @@ def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, a
 
     with _balance_lock:
         current_from_balance = _balances.get(from_address_hex, 0)
+
+        # Auto-faucet logic for sender: if missing, assume 100k
+        if from_address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
+             current_from_balance = 100000
 
         # Enforce sufficient funds during balance updates to avoid negative balances
         if current_from_balance < amount:
@@ -529,31 +589,31 @@ def save_rules_state(rules_content: str):
             len(_current_rules_state),
             _tau_engine_state_hash,
         )
-        
+
         if _dht_client:
-            try:
-                import hashlib
-                # Compute hash
-                rules_bytes = _current_rules_state.encode('utf-8')
-                rules_hash = hashlib.sha256(rules_bytes).hexdigest()
-                key = f"formula:{rules_hash}".encode('ascii')
-                
-                # Store in DHT
-                # We assume _dht_client has a 'dht' property which is the KadDHT instance
-                # or it IS the DHTManager.
-                # DHTManager has .dht property.
-                if _dht_client.dht:
-                    # value_store.put(key, value)
-                    # But we should use provide? Or just store value?
-                    # The plan said "Store Tau State Formula in DHT".
-                    # Usually we store value.
-                    _dht_client.dht.value_store.put(key, rules_bytes)
-                    print(f"[INFO][chain_state] Stored formula in DHT: {key.decode()}")
+                try:
+                    rules_bytes = _current_rules_state.encode('utf-8')
+                    # Use state_hash key as primary storage for Tau snapshots
+                    # state:<state_hash> -> raw bytes
+                    if _tau_engine_state_hash:
+                        key = f"{config.STATE_LOCATOR_NAMESPACE}:{_tau_engine_state_hash}".encode("ascii")
+                        if _dht_client.dht:
+                            _dht_client.dht.value_store.put(key, rules_bytes)
+                            print(f"[INFO][chain_state] Published Tau state snapshot to DHT: {key.decode()}")
                     
-                    # Also provide?
-                    # _dht_client.dht.provide(key)
-            except Exception as e:
-                print(f"[ERROR][chain_state] Failed to store formula in DHT: {e}")
+                    # Also store with formula hash for backward compatibility / direct formula lookup
+                    import hashlib
+                    # Compute hash
+                    rules_hash = hashlib.sha256(rules_bytes).hexdigest()
+                    key_formula = f"formula:{rules_hash}".encode('ascii')
+                    
+                    # Store in DHT
+                    if _dht_client.dht:
+                        _dht_client.dht.value_store.put(key_formula, rules_bytes)
+                        # print(f"[INFO][chain_state] Stored formula in DHT: {key_formula.decode()}")
+
+                except Exception as e:
+                    print(f"[ERROR][chain_state] Failed to store formula in DHT: {e}")
         
 
 def fetch_formula_from_dht(formula_hash: str) -> Optional[str]:

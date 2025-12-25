@@ -24,6 +24,14 @@ class TestChainDHTIntegration(unittest.TestCase):
             
         import chain_state
         self.chain_state = chain_state
+
+        # Ensure state hash computation is deterministic for assertions.
+        # chain_state imports compute_state_hash from poa.state; with our patched sys.modules,
+        # it's a MagicMock unless we give it a return value.
+        try:
+            self.chain_state.compute_state_hash.return_value = "deadbeef"
+        except Exception:
+            pass
         
         # Reset chain state
         self.chain_state._current_rules_state = ""
@@ -78,11 +86,18 @@ class TestChainDHTIntegration(unittest.TestCase):
         # 3. Verify it was stored in DHT
         expected_hash = hashlib.sha256(formula_content.encode('utf-8')).hexdigest()
         expected_key = f"formula:{expected_hash}".encode('ascii')
-        
-        self.mock_value_store.put.assert_called_once()
-        call_args = self.mock_value_store.put.call_args
-        self.assertEqual(call_args[0][0], expected_key)
-        self.assertEqual(call_args[0][1], formula_content.encode('utf-8'))
+
+        # chain_state.save_rules_state stores two entries when a DHT client is set:
+        # - state:<state_hash> -> rules bytes (primary snapshot)
+        # - formula:<sha256>   -> rules bytes (compat lookup)
+        expected_state_key = f"{self.chain_state.config.STATE_LOCATOR_NAMESPACE}:deadbeef".encode("ascii")
+
+        calls = self.mock_value_store.put.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].args[0], expected_state_key)
+        self.assertEqual(calls[0].args[1], formula_content.encode("utf-8"))
+        self.assertEqual(calls[1].args[0], expected_key)
+        self.assertEqual(calls[1].args[1], formula_content.encode("utf-8"))
         
         # 4. Verify retrieval
         retrieved_content = self.chain_state.fetch_formula_from_dht(expected_hash)
