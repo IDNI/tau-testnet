@@ -7,6 +7,31 @@ import tau_manager
 import config
 from poa import PoATauEngine, TauStateSnapshot, compute_state_hash
 from block import Block
+import hashlib
+from poa.state import compute_state_hash as compute_rules_hash
+
+def compute_accounts_hash(balances: Dict[str, int], sequences: Dict[str, int]) -> bytes:
+    """
+    Computes a canonical hash of the accounts state (balances + sequences).
+    Sorts keys to ensure determinism.
+    """
+    snapshot = {
+        "balances": balances,
+        "sequences": sequences
+    }
+    canonical_json = json.dumps(snapshot, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canonical_json.encode('utf-8')).digest()
+
+def compute_consensus_state_hash(rules_bytes: bytes, accounts_hash: bytes) -> str:
+    """
+    Computes the final block state hash committing to both Rules and Accounts.
+    state_hash = BLAKE3(rules_bytes + accounts_hash).hexdigest()
+    """
+    from blake3 import blake3
+    hasher = blake3()
+    hasher.update(rules_bytes)
+    hasher.update(accounts_hash)
+    return hasher.hexdigest()
 
 logger = logging.getLogger(__name__)
 
@@ -66,13 +91,20 @@ def _republish_state_to_dht():
     
     # 2. Publish Tau State / Rules
     # We need the state_hash. If _tau_engine_state_hash is set, use it.
-    # Otherwise compute it from _current_rules_state.
+    # Otherwise RECOMPUTE it using the consensus rules.
+    # state_hash = BLAKE3(rules + accounts_hash)
     state_hash = _tau_engine_state_hash
-    if not state_hash and _current_rules_state:
-        state_hash = compute_state_hash(_current_rules_state.encode("utf-8"))
+    if not state_hash:
+        # Recompute correct consensus hash on startup
+        with _balance_lock, _sequence_lock, _rules_lock:
+             acc_hash = compute_accounts_hash(_balances, _sequence_numbers)
+             rules_bytes = (_current_rules_state or "").encode("utf-8")
+        state_hash = compute_consensus_state_hash(rules_bytes, acc_hash)
     
-    if state_hash and _current_rules_state:
-        publish_tau_state_snapshot(state_hash, _current_rules_state.encode("utf-8"))
+    # Check if we have rules (even empty string is valid state now)
+    # Ensure we publish if state_hash is valid.
+    if state_hash and _current_rules_state is not None:
+        publish_tau_state_snapshot(state_hash, (_current_rules_state or "").encode("utf-8"))
 
 
 
@@ -88,12 +120,15 @@ def publish_tau_state_snapshot(state_hash: str, tau_bytes: bytes) -> bool:
         return False
     if tau_bytes is None:
         return False
-    if not tau_bytes or not tau_bytes.strip():
-        logger.error(
-            "Refusing to publish empty Tau state snapshot (state_hash=%s).",
+    if not tau_bytes and tau_bytes != b"":
+        # Only reject None
+        return False
+    if not tau_bytes.strip():
+        # Allow publishing empty rules.
+        logger.warning(
+            "Publishing empty Tau rules snapshot (state_hash=%s). This is normal for empty rules.",
             state_hash,
         )
-        return False
     if not _dht_client or not getattr(_dht_client, "dht", None):
         return False
     try:
@@ -148,7 +183,8 @@ def fetch_tau_state_snapshot(state_hash: str) -> Optional[str]:
         else:
             val = _dht_client.dht.value_store.get(key)
             val_bytes = getattr(val, "value", val) if val else None
-        if not val_bytes:
+            
+        if val_bytes is None:
             return None
         if isinstance(val_bytes, str):
             return val_bytes
@@ -328,15 +364,25 @@ def process_new_block(block: Block) -> bool:
             try:
                  if _dht_client and _dht_client.dht:
                     # Cache accounts
+                    # Do NOT call publish_accounts_snapshot() (which reads current global state).
+                    # Construct payload from FETCHED snapshots.
                     accounts_payload = json.dumps(
-                         {"block_hash": block.block_hash, "accounts": {"...": "..."}}, # We don't have the original payload here easily to re-serialize exact
+                         {
+                             "block_hash": block.block_hash, 
+                             "accounts": {
+                                 addr: {"balance": bal, "sequence": sequences_snapshot.get(addr, 0)} 
+                                 for addr, bal in balances_snapshot.items()
+                             }
+                         }, 
+                         sort_keys=True, separators=(",", ":")
                     ).encode("utf-8")
-                    # Actually we should use the fetched raw bytes if possible, but fetch_accounts_snapshot returns parsed dicts.
-                    # Re-serializing is fine for consistency, but to be safe let's just use what we have
-                    publish_accounts_snapshot(block.block_hash)
+                    
+                    # Store in LOCAL DHT cache
+                    acc_key = f"{config.STATE_LOCATOR_NAMESPACE}:{block.block_hash}".encode("ascii")
+                    _dht_client.dht.value_store.put(acc_key, accounts_payload)
                     
                     # Cache rules
-                    if rules_from_dht:
+                    if rules_from_dht is not None:
                         rules_bytes = rules_from_dht.encode("utf-8")
                         rules_key = f"{config.STATE_LOCATOR_NAMESPACE}:{expected_state_hash}".encode("ascii")
                         _dht_client.dht.value_store.put(rules_key, rules_bytes)
@@ -348,7 +394,8 @@ def process_new_block(block: Block) -> bool:
     if balances_snapshot is None or sequences_snapshot is None:
         print(f"[ERROR][chain_state] Missing accounts snapshot in DHT for block {block.block_hash[:12]}...")
         return False
-    if rules_from_dht is None:
+    # If expected_state_hash is present/non-empty, we demand rules
+    if expected_state_hash and expected_state_hash != ("0" * 64) and rules_from_dht is None:
         print(f"[ERROR][chain_state] Missing Tau snapshot in DHT for state_hash {expected_state_hash[:12]}...")
         return False
 
@@ -360,23 +407,34 @@ def process_new_block(block: Block) -> bool:
         return False
 
     try:
-        if rules_from_dht:
-            tau_manager.communicate_with_tau(rule_text=rules_from_dht, target_output_stream_index=0)
+        # Always reset Tau state even if empty
+        rule_text = rules_from_dht if rules_from_dht else ""
+        tau_manager.communicate_with_tau(rule_text=rule_text, target_output_stream_index=0)
     except Exception as exc:
         print(f"[ERROR][chain_state] Failed to apply Tau state snapshot via i0: {exc}")
         return False
 
-    # Confirm the applied rules hash matches the block commitment.
-    with _rules_lock:
-        applied_rules = _current_rules_state or rules_from_dht
-    applied_hash = compute_state_hash(applied_rules.encode("utf-8"))
-    if expected_state_hash and expected_state_hash != ("0" * 64) and applied_hash != expected_state_hash:
-        # Fall back to the DHT snapshot bytes as the canonical rules payload.
-        applied_rules = rules_from_dht
-        applied_hash = compute_state_hash(applied_rules.encode("utf-8"))
+    # Consensus State Verification
+    # Confirm the applied rules AND accounts match the block commitment.
+    
+    # 1. Compute Accounts Hash
+    accounts_hash = compute_accounts_hash(balances_snapshot, sequences_snapshot)
+    
+    # 2. Compute Consensus Hash
+    # Rules: existing logic tries `_current_rules_state` (if updated by communicate?) 
+    # But communicate_with_tau updates _current_rules_state via handler? 
+    # Let's rely on rules_from_dht since that's what we applied.
+    applied_rules = rules_from_dht or ""
+    rules_bytes = applied_rules.encode("utf-8")
+    
+    applied_hash = compute_consensus_state_hash(rules_bytes, accounts_hash)
+
+    # Allow fallback? If hash format changed, we might have issues.
+    # But for Phase 12 hardening, we enforce the new format.
+    
     if expected_state_hash and expected_state_hash != ("0" * 64) and applied_hash != expected_state_hash:
         print(
-            f"[ERROR][chain_state] Tau snapshot hash mismatch after apply. "
+            f"[ERROR][chain_state] Consensus state hash mismatch. "
             f"expected={expected_state_hash[:12]} got={applied_hash[:12]}"
         )
         return False
@@ -556,6 +614,20 @@ def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, a
         
         print(f"[INFO][chain_state] Balances updated: {from_address_hex[:10]}... now {_balances[from_address_hex]}, {to_address_hex[:10]}... now {_balances[to_address_hex]}")
         return True
+
+
+from contextlib import contextmanager
+
+@contextmanager
+def get_all_state_locks():
+    """
+    Context manager to acquire all state locks (balances, sequences, rules)
+    to ensure a consistent global snapshot.
+    """
+    with _balance_lock:
+        with _sequence_lock:
+            with _rules_lock:
+                yield
 
 def get_sequence_number(address_hex: str) -> int:
     """Returns the current sequence number for the given address (defaults to 0)."""

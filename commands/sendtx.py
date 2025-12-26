@@ -8,6 +8,7 @@ import chain_state
 import db
 import tau_defs
 import tau_manager
+from tau_manager import parse_tau_output
 import utils
 from db import add_mempool_tx
 from network import bus as network_bus
@@ -139,16 +140,12 @@ def _prepare_transfer_inputs(transfer_entry, sender_balance: int) -> dict:
 def _decode_single_transfer_output(output_bv_str: str, expected_amount_int: int) -> bool:
     """
     Tau emits the original transfer amount on success and 0 on failure.
+    Uses unified parsing helper.
     """
-    output_bv_str = output_bv_str.strip()
-    if not output_bv_str:
-        logger.warning("Received empty output from Tau.")
-        return False
-
     try:
-        output_val = _parse_bitvector_string(output_bv_str)
-    except ValueError:
-        logger.warning("Unexpected Tau output format: '%s'", output_bv_str)
+        output_val = parse_tau_output(output_bv_str)
+    except Exception as e:
+        logger.warning("Error parsing Tau output '%s': %s", output_bv_str, e)
         return False
 
     if output_val == 0:
@@ -366,23 +363,28 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                 logger.info("All Tau transfer validations successful.")
         
         # --- Post-Tau Processing ---
-        if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
-            chain_state.increment_sequence_number(sender_pubkey)
+        # Note: We do NOT increment sequence number or update balances here anymore.
+        # This is now an ingestion-only phase. State mutation happens during mining.
+        # if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
+        #     chain_state.increment_sequence_number(sender_pubkey)
 
         if all_validated_transfers:
             logger.info(
-                "Applying balance changes for %s validated transfers...",
+                "Validated %s transfers (dry-run). State will be updated upon mining.",
                 len(all_validated_transfers),
             )
-            for from_addr, to_addr, amt in all_validated_transfers:
-                if not chain_state.update_balances_after_transfer(from_addr, to_addr, amt):
-                    return (
-                        "FAILURE: Transaction invalid. "
-                        f"Could not apply transfer ({from_addr[:10]}... -> {to_addr[:10]}..., amount {amt})."
-                    )
+            # for from_addr, to_addr, amt in all_validated_transfers:
+            #     if not chain_state.update_balances_after_transfer(from_addr, to_addr, amt):
+            #         return (
+            #             "FAILURE: Transaction invalid. "
+            #             f"Could not apply transfer ({from_addr[:10]}... -> {to_addr[:10]}..., amount {amt})."
+            #         )
 
         tx_message_id, tx_canonical_blob = _compute_transaction_message_id(payload)
-        db.add_mempool_tx(blob)
+        # Use canonical blob for storage to ensure consistency
+        # Use milliseconds for received_at for better ordering resolution
+        received_at = int(time.time() * 1000)
+        db.add_mempool_tx(tx_canonical_blob, tx_message_id, received_at)
         logger.info("Transaction successfully queued in mempool.")
         if propagate:
             svc = network_bus.get()
@@ -407,6 +409,10 @@ def execute(raw_command: str, container):
     prefix = 'sendtx '
     if not raw_command.lower().startswith(prefix):
         return "ERROR: Invalid sendtx format. Use sendtx '{\"0\":...}'.\r\n"
+        
+    if not _PY_ECC_AVAILABLE:
+        logger.error("BLS library not available. Transaction rejected.")
+        return "ERROR: BLS signatures are required but py_ecc is missing.\r\n"
     
     json_blob = raw_command[len(prefix):].strip()
     logger.debug("Received sendtx payload: %s", json_blob)

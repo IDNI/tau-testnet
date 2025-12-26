@@ -777,6 +777,41 @@ def kill_tau_process():
                 logger.error("Error killing Tau process: %s", e)
 
 
+
+def parse_tau_output(output_val: str) -> int:
+    """
+    Parses a Tau output string (decimal, binary #b..., hex #x...) into an integer.
+    Examples:
+      "123" -> 123
+      "#b1111011" -> 123
+      "#x7B" -> 123
+      "#x7b" -> 123
+    Returns the integer value. 
+    If parsing fails, returns 0.
+    """
+    if not output_val:
+        return 0
+    val = output_val.strip()
+    converted_val = 0
+    try:
+        # Some outputs might have extra text? sendtx handles "result: ..."
+        # But here we just handle raw values or prefixed values.
+        # User warned: "Tau can emit extra tokens".
+        # Let's simple-strip known noise if any, but mostly focus on #b/#x
+        if val.startswith("result:"):
+             val = val[7:].strip()
+             
+        if val.startswith("#b"):
+            converted_val = int(val[2:], 2)
+        elif val.startswith("#x"):
+            converted_val = int(val[2:], 16)
+        else:
+            converted_val = int(val)
+    except Exception:
+        converted_val = 0
+    
+    return converted_val
+
 # Export for external use
 __all__ = [
     "communicate_with_tau",
@@ -784,4 +819,5 @@ __all__ = [
     "get_recent_stderr",
     "request_shutdown",
     "kill_tau_process",
+    "parse_tau_output",
 ]

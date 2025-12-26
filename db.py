@@ -35,8 +35,13 @@ def init_db():
             ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS mempool (
-                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                    payload TEXT    NOT NULL
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tx_hash     TEXT    NOT NULL UNIQUE,
+                    payload     TEXT    NOT NULL,
+                    received_at INTEGER NOT NULL,
+                    status      TEXT    NOT NULL DEFAULT 'pending', -- pending, reserved
+                    reserved_at INTEGER NOT NULL DEFAULT 0,
+                    batch_id    TEXT
                 );
             ''')
             conn.execute('''
@@ -73,11 +78,33 @@ def init_db():
                     last_seen    INTEGER
                 );
             ''')
-            # Backwards compatibility: older databases used the column name 'sbf'
+            # Migration to new schema: if old columns exist or table structure is wrong, drop and recreate.
+            # Since mempool is transient, we can safely drop it.
+            # Migration: Check schema against requirements
             cur = conn.execute("PRAGMA table_info(mempool);")
-            column_names = {row[1] for row in cur.fetchall()}
-            if "payload" not in column_names and "sbf" in column_names:
-                conn.execute('ALTER TABLE mempool RENAME COLUMN sbf TO payload;')
+            cols_info = {row[1]: row for row in cur.fetchall()}
+            
+            should_migrate = False
+            if "tx_hash" not in cols_info: 
+                should_migrate = True
+            elif "reserved_at" in cols_info and cols_info["reserved_at"][3] == 0: 
+                # Check 3rd index 'notnull': 0 means nullable (bad), 1 means NOT NULL (good)
+                should_migrate = True
+            
+            if should_migrate:
+                logger.info("Migrating mempool to new schema (dropping old table)...")
+                conn.execute("DROP TABLE IF EXISTS mempool;")
+                conn.execute('''
+                    CREATE TABLE mempool (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tx_hash     TEXT    NOT NULL UNIQUE,
+                        payload     TEXT    NOT NULL,
+                        received_at INTEGER NOT NULL,
+                        status      TEXT    NOT NULL DEFAULT 'pending', -- pending, reserved
+                        reserved_at INTEGER NOT NULL DEFAULT 0,
+                        batch_id    TEXT
+                    );
+                ''')
 
     except (sqlite3.Error, OSError) as exc:
         raise DatabaseError(f"Failed to initialize database at {config.STRING_DB_PATH}: {exc}") from exc
@@ -127,26 +154,146 @@ def get_text_by_id(yid: str) -> str:
         else:
             raise KeyError(f"No text found for Tau ID: {yid}")
 
-def add_mempool_tx(tx_data: str):
+def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int):
     """Adds data to the mempool. Prefixes with 'json:' if it looks like JSON."""
     if _db_conn is None:
         init_db()
+    
+    # Ensure canonical JSON payload (no 'json:' prefix needed if we are strict, but maintaining for now if callers depend on it)
+    # Actually, the plan says "no json: prefix needed". Let's clean it up.
+    # The caller is expected to provide canonical JSON. 
+    # But wait, sendtx currently sends "json:..." or just raw string.
+    # We will strip it here to be safe or assuming caller does it.
+    # The plan says: "payload TEXT NOT NULL (canonical JSON string, no “json:” prefix needed)"
+    
+    payload = tx_data
+    if payload.startswith("json:"):
+        payload = payload[5:]
+
     with _db_lock:
-        # Basic check to see if it might be JSON
-        prefix = ""
-        if tx_data.strip().startswith('{') and tx_data.strip().endswith('}'):
-            prefix = "json:"
         cur = _db_conn.cursor()
-        cur.execute('INSERT INTO mempool(payload) VALUES(?)', (prefix + tx_data,))
+        # Idempotency: INSERT OR IGNORE
+        cur.execute('''
+            INSERT OR IGNORE INTO mempool (tx_hash, payload, received_at, status)
+            VALUES (?, ?, ?, 'pending')
+        ''', (tx_hash, payload, received_at))
         _db_conn.commit()
 
 def get_mempool_txs() -> list:
+    """
+    Deprecated: Use reserve_mempool_txs for mining.
+    This just returns all payloads for legacy support / debugging.
+    """
     if _db_conn is None:
         init_db()
     with _db_lock:
         cur = _db_conn.cursor()
-        cur.execute('SELECT payload FROM mempool ORDER BY id')
+        cur.execute('SELECT payload FROM mempool ORDER BY received_at')
         return [row[0] for row in cur.fetchall()]
+
+def reserve_mempool_txs(limit: int = 1000, max_age_seconds: int = 60) -> List[Dict]:
+    """
+    Selects pending transactions from the mempool (FIFO by received_at)
+    AND releases stale reservations (older than max_age_seconds).
+    
+    Returns a list of dicts: {'id': int, 'tx_hash': str, 'payload': str}
+    """
+    import uuid
+    import time
+    if _db_conn is None:
+        init_db()
+    
+    batch_id = str(uuid.uuid4())
+    reservations = []
+    now_ms = int(time.time() * 1000)
+    stale_threshold = now_ms - (max_age_seconds * 1000)
+    
+    with _db_lock:
+        cur = _db_conn.cursor()
+        
+        # 1. Release stale reservations
+        # Ensure we handle NULL reserved_at by checking for > 0 (assuming we only set it to non-null on reservation)
+        # But for safety, checking (reserved_at IS NOT NULL AND reserved_at < ?) is better.
+        cur.execute('''
+            UPDATE mempool 
+            SET status='pending', batch_id=NULL, reserved_at=0
+            WHERE status='reserved' AND (reserved_at IS NULL OR reserved_at = 0 OR reserved_at < ?)
+        ''', (stale_threshold,))
+        released = cur.rowcount
+        if released > 0:
+            logger.info("Released %s stale mempool reservations", released)
+
+        # 2. Select pending
+        # We process in order of arrival (received_at)
+        cur.execute('''
+            SELECT id, tx_hash, payload FROM mempool 
+            WHERE status = 'pending' 
+            ORDER BY received_at ASC 
+            LIMIT ?
+        ''', (limit,))
+        rows = cur.fetchall()
+        
+        if not rows:
+            return []
+            
+        # 3. Mark reserved
+        ids = [row[0] for row in rows]
+        placeholders = ','.join(['?'] * len(ids))
+        cur.execute(f'''
+            UPDATE mempool 
+            SET status = 'reserved', reserved_at = ?, batch_id = ? 
+            WHERE id IN ({placeholders})
+        ''', (now_ms, batch_id, *ids))
+        
+        _db_conn.commit()
+        
+        for row in rows:
+            reservations.append({
+                'id': row[0],
+                'tx_hash': row[1],
+                'payload': row[2]
+            })
+            
+    return reservations
+
+def unreserve_mempool_txs(tx_ids: list[int]):
+    """
+    Reverts specified reserved transactions back to 'pending' state.
+    Used when block creation/execution fails for transient reasons (e.g. miner error),
+    preserving the transactions for the next attempt.
+    """
+    if not tx_ids:
+        return
+        
+    with _db_lock:
+        try:
+            placeholders = ','.join('?' for _ in tx_ids)
+            # Set reserved_at=0 to align with NOT NULL schema
+            _db_conn.execute(f'''
+                UPDATE mempool 
+                SET status='pending', batch_id=NULL, reserved_at=0
+                WHERE id IN ({placeholders})
+            ''', tx_ids)
+            _db_conn.commit()
+            logger.info("Unreserved %s transactions (returned to pending).", len(tx_ids))
+        except Exception as e:
+            logger.error("Failed to unreserve transactions: %s", e)
+
+def remove_transactions(tx_ids: List[int]):
+    """
+    Permanently deletes specific transactions (e.g. processed ones) from the mempool.
+    """
+    if not tx_ids:
+        return
+    if _db_conn is None:
+        init_db()
+        
+    with _db_lock:
+        cur = _db_conn.cursor()
+        placeholders = ','.join(['?'] * len(tx_ids))
+        cur.execute(f'DELETE FROM mempool WHERE id IN ({placeholders})', tuple(tx_ids))
+        _db_conn.commit()
+        logger.debug("Removed %s transactions from mempool", len(tx_ids))
 
 def clear_mempool():
     """Clears all transactions from the mempool."""
