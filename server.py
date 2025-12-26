@@ -18,7 +18,7 @@ from errors import ConfigurationError, TauProcessError, TauTestnetError
 import tau_logging
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("tau.server")
 
 # --- NetworkService globals ---
 NETWORK_THREAD = None
@@ -235,6 +235,11 @@ def _run_server(container: ServiceContainer):
     logger.info("Starting NetworkService background thread...")
     _start_network_background(container)
 
+    # Start Miner if configured
+    if container.miner:
+        logger.info("Starting Automated Miner...")
+        container.miner.start()
+
     saved_rules = chain_state_module.get_rules_state()
     if saved_rules and restore_enabled:
         try:
@@ -301,6 +306,14 @@ def _run_server(container: ServiceContainer):
                 server_socket.close()
             finally:
                 logger.info("Server socket closed.")
+        
+        # Stop Miner first to prevent new blocks during shutdown
+        if container.miner:
+             try:
+                 logger.info("Stopping Miner...")
+                 container.miner.stop()
+             except Exception:
+                 logger.warning("Error stopping Miner", exc_info=True)
 
         try:
             if NETWORK_THREAD is not None:

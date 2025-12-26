@@ -25,21 +25,21 @@ mock_blake3.blake3.side_effect = None # Remove lambda, return_value is enough fo
 # This returns `mock_hasher`.
 # `mock_hasher.hexdigest()` returns string.
 
-sys.modules["blake3"] = mock_blake3
-
-# Mock py_ecc
-mock_py_ecc = MagicMock()
-# If imported as 'from py_ecc.bls import G2Basic', and we set sys.modules['py_ecc.bls']=mock_py_ecc,
-# then G2Basic is mock_py_ecc.G2Basic.
-mock_py_ecc.G2Basic.Verify.return_value = True
-mock_py_ecc.G2Basic.Sign.return_value = b'\x00' * 48
-
-# If accessed as py_ecc.bls.G2Basic (via parent module)
-mock_py_ecc.bls.G2Basic.Verify.return_value = True
-mock_py_ecc.bls.G2Basic.Sign.return_value = b'\x00' * 48
-
-sys.modules["py_ecc"] = mock_py_ecc
-sys.modules["py_ecc.bls"] = mock_py_ecc
+# sys.modules["blake3"] = mock_blake3
+# 
+# # Mock py_ecc
+# mock_py_ecc = MagicMock()
+# # If imported as 'from py_ecc.bls import G2Basic', and we set sys.modules['py_ecc.bls']=mock_py_ecc,
+# # then G2Basic is mock_py_ecc.G2Basic.
+# mock_py_ecc.G2Basic.Verify.return_value = True
+# mock_py_ecc.G2Basic.Sign.return_value = b'\x00' * 48
+# 
+# # If accessed as py_ecc.bls.G2Basic (via parent module)
+# mock_py_ecc.bls.G2Basic.Verify.return_value = True
+# mock_py_ecc.bls.G2Basic.Sign.return_value = b'\x00' * 48
+# 
+# # sys.modules["py_ecc"] = mock_py_ecc
+# # sys.modules["py_ecc.bls"] = mock_py_ecc
 
 # Remove debug patch
 if hasattr(json, 'dumps') and getattr(json.dumps, '__name__', '') == 'debug_dumps':

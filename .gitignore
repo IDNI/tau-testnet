@@ -30,6 +30,7 @@ node_modules/
 
 # Temprorary files
 docs/*.md
+tests/*phase*
 *.txt
 *.md
 .env*

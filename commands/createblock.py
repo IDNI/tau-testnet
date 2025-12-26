@@ -499,7 +499,9 @@ def create_block_from_mempool() -> Dict:
     try:
         published = False
         if hasattr(chain_state, "publish_tau_state_snapshot"):
-            published = bool(chain_state.publish_tau_state_snapshot(state_hash, rules_blob))
+            # Compute accounts hash for consensus integrity
+            accounts_hash = chain_state.compute_accounts_hash(final_balances, final_sequences)
+            published = bool(chain_state.publish_tau_state_snapshot(state_hash, rules_blob, accounts_hash))
         if published:
             print(f"[INFO][createblock] Published Tau state snapshot to DHT: {state_locator}")
         else:

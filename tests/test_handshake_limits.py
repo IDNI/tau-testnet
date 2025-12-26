@@ -19,13 +19,21 @@ def mock_config():
 
 @pytest.fixture
 def service(mock_config):
-    with patch("network.service.HostManager"), \
+    with patch("network.service.HostManager") as MockHostManager, \
          patch("network.service.DHTManager"), \
          patch("network.service.DiscoveryManager"), \
          patch("network.service.GossipManager"):
+        
+        # Configure HostManager instance to have a 'host' attribute
+        mock_host_instance = MockHostManager.return_value
+        mock_host = MagicMock()
+        mock_host.get_id.return_value = "local_peer_id"
+        mock_host_instance.host = mock_host
+
         svc = NetworkService(mock_config)
-        # Mock get_id
-        svc._host_manager.host.get_id.return_value = "local_peer_id"
+        # svc.host is a property delegating to _host_manager.host, which is set above.
+        
+        # Mock get_id directly on service if it exists/delegates
         svc.get_id = MagicMock(return_value="local_peer_id")
         return svc
 
@@ -49,18 +57,29 @@ def test_outbound_handshake_capping(service):
     
     # 2. Setup Value Store with critical keys + more spam
     critical_keys = {
-        b"state:head123": "val",
-        b"state:genesis123": "val",
-        b"formula:rule1": "val",
+        b"/state/head123": "val",
+        b"/state/genesis123": "val",
+        # b"formula:rule1": "val", # Formula keys not prioritized anymore in service.py
     }
     spam_values = {}
     for i in range(100):
-        key_bytes = f"spam_val_{i}".encode('utf-8')
+        key_bytes = f"/state/spam_{i}".encode('utf-8')
         spam_values[key_bytes] = "val"
         
     all_values = {**critical_keys, **spam_values}
-    dht.value_store.store = all_values
-    dht.value_store.get_keys.return_value = list(all_values.keys())
+    
+    # Mock value_store.get to return if in dict
+    dht.value_store.get.side_effect = lambda k: all_values.get(k)
+    dht.value_store.store = all_values 
+    # dht.value_store.get_keys.return_value = list(all_values.keys()) # Not used anymore
+    
+    # Mock encoding helper to match expectations
+    # The service calls _dht_manager._encode_dht_key(ns, hash)
+    # We should let the real DHTManager do it or mock it if we patched DHTManager?
+    # We patched DHTManager in the fixture, but in the test we set service._dht_manager.dht
+    # service._dht_manager itself is a Mock from the fixture.
+    # So we need to ensure _encode_dht_key works.
+    service._dht_manager._encode_dht_key.side_effect = lambda ns, sfx: f"/{ns}/{sfx}".encode("utf-8")
     
     service._config.genesis_hash = "genesis123"
     # Mock db.get_latest_block in sys.modules
@@ -83,12 +102,17 @@ def test_outbound_handshake_capping(service):
         
         # Assertion 2: Critical keys present
         keys = [p["key"] for p in providers]
-        assert "state:head123" in keys, "Head state key missing"
-        assert "state:genesis123" in keys, "Genesis state key missing"
-        assert "formula:rule1" in keys, "Formula key missing"
+        assert "/state/head123" in keys, "Head state key missing"
+        assert "/state/genesis123" in keys, "Genesis state key missing"
+        # assert "formula:rule1" in keys, "Formula key missing"
         
-        # Assertion 3: Rest are filled (up to limit)
-        assert len(providers) == MAX_HANDSHAKE_PROVIDERS
+        # Assertion 3: Rest are filled? 
+        # Actually, new logic only advertises specific prioritized keys + local provider.
+        # It does NOT scan the whole value store anymore.
+        # So we expect ONLY the critical keys we found locally.
+        assert len(providers) == 2 # head + genesis (ourselves)
+        # Note: Previous test expected 50 (MAX). New logic is deterministic and small.
+        assert len(providers) <= MAX_HANDSHAKE_PROVIDERS
 
 @pytest.mark.trio
 async def test_inbound_handshake_truncation(service):

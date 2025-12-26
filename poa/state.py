@@ -12,6 +12,17 @@ def compute_state_hash(payload: bytes) -> str:
     return blake3(payload).hexdigest()
 
 
+def compute_consensus_state_hash(rules_bytes: bytes, accounts_hash: bytes) -> str:
+    """
+    Computes the final consensus state hash committing to both Rules and Accounts.
+    state_hash = BLAKE3(rules_bytes + accounts_hash).hexdigest()
+    """
+    hasher = blake3()
+    hasher.update(rules_bytes)
+    hasher.update(accounts_hash)
+    return hasher.hexdigest()
+
+
 @dataclass
 class TauStateSnapshot:
     state_hash: str

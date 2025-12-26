@@ -178,6 +178,16 @@ def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int):
             VALUES (?, ?, ?, 'pending')
         ''', (tx_hash, payload, received_at))
         _db_conn.commit()
+        
+def count_mempool_txs() -> int:
+    """Returns the number of pending transactions in the mempool."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM mempool WHERE status='pending'")
+        row = cur.fetchone()
+        return row[0] if row else 0
 
 def get_mempool_txs() -> list:
     """

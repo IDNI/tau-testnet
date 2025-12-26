@@ -14,7 +14,11 @@ from libp2p.peer.peerinfo import PeerInfo
 
 # Set imports
 import config as config_module
+import config as config_module
 import chain_state
+from poa.state import compute_consensus_state_hash
+from chain_state import compute_accounts_hash
+import base64
 
 pytestmark = pytest.mark.trio
 
@@ -27,6 +31,12 @@ def isolate_db(tmp_path):
     import db as db_module
     importlib.reload(config_module)
     importlib.reload(db_module)
+    importlib.reload(db_module)
+    # Clear internal chain state memory to prevent leaks from previous tests
+    chain_state._balances.clear()
+    chain_state._sequence_numbers.clear()
+    chain_state._current_rules_state = ""
+    chain_state._tau_engine_state_hash = ""
     yield
     if orig_env is None:
         os.environ.pop("TAU_DB_PATH", None)
@@ -34,6 +44,10 @@ def isolate_db(tmp_path):
         os.environ["TAU_DB_PATH"] = orig_env
     importlib.reload(config_module)
     importlib.reload(db_module)
+    chain_state._balances.clear()
+    chain_state._sequence_numbers.clear()
+    chain_state._current_rules_state = ""
+    chain_state._tau_engine_state_hash = ""
 
 # Helper for waiting for addresses
 def _strip_p2p(addr: multiaddr.Multiaddr) -> multiaddr.Multiaddr:
@@ -111,25 +125,38 @@ def sync_test_logic(node_a_dht_manager, node_b_dht_manager):
     
     # Check if retrieval fails locally first (sanity)
     formula_content = "some_unique_formula_content_" + str(time.time())
-    formula_hash = hashlib.sha256(formula_content.encode('utf-8')).hexdigest()
+    # formula_hash = hashlib.sha256(formula_content.encode('utf-8')).hexdigest()
+    
+    # Compute the expected State Hash (Rules + local accounts)
+    # Since isolate_db yields empty DBs, balances/sequences are empty.
+    empty_acc_hash = compute_accounts_hash({}, {})
+    expected_state_hash = compute_consensus_state_hash(formula_content.encode('utf-8'), empty_acc_hash)
     
     # 2. Save on Node A
     # This should store it in Node A's local store AND network (provider record)
-    print(f"[SyncWorker] Saving formula {formula_hash[:8]} on Node A")
+    # It now stores as tau_state:<expected_state_hash>
+    print(f"[SyncWorker] Saving formula (state_hash={expected_state_hash[:8]}) on Node A")
     chain_state.save_rules_state(formula_content)
     
     # Verify it is in Node A's store
-    local_val = node_a_dht_manager.dht.value_store.get(f"formula:{formula_hash}".encode('ascii'))
-    local_bytes = getattr(local_val, "value", local_val)
-    assert local_bytes == formula_content.encode('utf-8'), "Failed to store locally on Node A"
+    # Key should be /tau_state/<state_hash>
+    # chain_state uses _encode_dht_key now.
+    encoded_key = node_a_dht_manager._encode_dht_key("tau_state", expected_state_hash)
+    local_val = node_a_dht_manager.dht.value_store.get(encoded_key)
+    # The value is a JSON of {"rules":..., "accounts_hash":...}
+    # We verify it exists and contains our rules
+    assert local_val is not None, "Failed to store locally on Node A"
+    val_bytes = getattr(local_val, "value", local_val)
+    val_json = json.loads(val_bytes.decode('utf-8'))
+    assert val_json['rules'] == formula_content, "Stored content mismatch Node A"
     
     # 3. State: Node B
     print("[SyncWorker] Switching chain_state to Node B")
     chain_state.set_dht_client(node_b_dht_manager)
     
     # Ensure Node B does NOT have it locally
-    key = f"formula:{formula_hash}".encode('ascii')
-    if node_b_dht_manager.dht.value_store.get(key):
+    encoded_key = node_b_dht_manager._encode_dht_key("tau_state", expected_state_hash)
+    if node_b_dht_manager.dht.value_store.get(encoded_key):
         print("[SyncWorker] WARN: Node B already has the key locally? Deleting.")
         # If it somehow got it, remove it to force network fetch
         # Note: libp2p store doesn't easily support delete? Assuming it's absent.
@@ -137,14 +164,14 @@ def sync_test_logic(node_a_dht_manager, node_b_dht_manager):
         pass
         
     # 4. Retrieve on Node B
-    # This calls fetch_formula_from_dht -> get_record_sync -> trio.from_thread.run -> network get_value
+    # This calls fetch_tau_state_snapshot -> get_record_sync -> trio.from_thread.run -> network get_value
     print(f"[SyncWorker] Attempting retrieval on Node B (expecting network fetch)")
     # We might need multiple attempts if dht propagation is slow, but direct connection usually works fast.
     
     start_time = time.time()
     retrieved = None
     while time.time() - start_time < 5.0:
-        retrieved = chain_state.fetch_formula_from_dht(formula_hash)
+        retrieved = chain_state.fetch_tau_state_snapshot(expected_state_hash)
         if retrieved:
             break
         time.sleep(0.5)

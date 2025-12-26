@@ -31,6 +31,7 @@ class ServiceContainer:
     db: Any
     chain_state: Any
     tau_manager: Any
+    miner: Any = None
     overrides: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -73,6 +74,15 @@ class ServiceContainer:
         if hasattr(tau_manager_module, "set_rules_handler") and hasattr(chain_state_module, "save_rules_state"):
             tau_manager_module.set_rules_handler(chain_state_module.save_rules_state)
 
+        # Instantiate Miner if configured
+        miner_instance = None
+        if resolved_settings.authority.miner_privkey:
+            from miner.service import SoleMiner
+            # We might need to pass custom engine/state store if mocked, but for now use defaults
+            miner_instance = SoleMiner(max_block_interval=30.0) 
+        else:
+            miner_instance = None
+
         return cls(
             settings=resolved_settings,
             logger=logger,
@@ -81,6 +91,7 @@ class ServiceContainer:
             db=db_module,
             chain_state=chain_state_module,
             tau_manager=tau_manager_module,
+            miner=miner_instance,
             overrides=override_map,
         )
 

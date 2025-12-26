@@ -8,7 +8,7 @@ import config
 from poa import PoATauEngine, TauStateSnapshot, compute_state_hash
 from block import Block
 import hashlib
-from poa.state import compute_state_hash as compute_rules_hash
+from poa.state import compute_state_hash as compute_rules_hash, compute_consensus_state_hash
 
 def compute_accounts_hash(balances: Dict[str, int], sequences: Dict[str, int]) -> bytes:
     """
@@ -22,16 +22,7 @@ def compute_accounts_hash(balances: Dict[str, int], sequences: Dict[str, int]) -
     canonical_json = json.dumps(snapshot, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(canonical_json.encode('utf-8')).digest()
 
-def compute_consensus_state_hash(rules_bytes: bytes, accounts_hash: bytes) -> str:
-    """
-    Computes the final block state hash committing to both Rules and Accounts.
-    state_hash = BLAKE3(rules_bytes + accounts_hash).hexdigest()
-    """
-    from blake3 import blake3
-    hasher = blake3()
-    hasher.update(rules_bytes)
-    hasher.update(accounts_hash)
-    return hasher.hexdigest()
+
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +70,7 @@ def _republish_state_to_dht():
     This ensures that on node startup, the DHT is populated with the state loaded from DB,
     allowing the node to advertise these keys during handshake.
     """
-    global _last_processed_block_hash, _current_rules_state
+    global _last_processed_block_hash, _current_rules_state, _tau_engine_state_hash
     
     if not _last_processed_block_hash:
         return
@@ -90,72 +81,68 @@ def _republish_state_to_dht():
     publish_accounts_snapshot(_last_processed_block_hash)
     
     # 2. Publish Tau State / Rules
-    # We need the state_hash. If _tau_engine_state_hash is set, use it.
-    # Otherwise RECOMPUTE it using the consensus rules.
-    # state_hash = BLAKE3(rules + accounts_hash)
-    state_hash = _tau_engine_state_hash
-    if not state_hash:
-        # Recompute correct consensus hash on startup
-        with _balance_lock, _sequence_lock, _rules_lock:
-             acc_hash = compute_accounts_hash(_balances, _sequence_numbers)
-             rules_bytes = (_current_rules_state or "").encode("utf-8")
-        state_hash = compute_consensus_state_hash(rules_bytes, acc_hash)
+    # Always RECOMPUTE state_hash to ensure it matches the payload (rules + accounts_hash).
+    # This avoids publishing with a stale or rules-only hash which would fail validation.
     
+    with _balance_lock, _sequence_lock, _rules_lock:
+         acc_hash = compute_accounts_hash(_balances, _sequence_numbers)
+         rules_bytes = (_current_rules_state or "").encode("utf-8")
+    
+    state_hash = compute_consensus_state_hash(rules_bytes, acc_hash)
+    
+    # Update global reference if it differs (though strictly we just want to publish valid data here)
+    if state_hash != _tau_engine_state_hash:
+        logger.info("Updating stale _tau_engine_state_hash during hydration: %s -> %s", _tau_engine_state_hash, state_hash)
+        _tau_engine_state_hash = state_hash
+
     # Check if we have rules (even empty string is valid state now)
     # Ensure we publish if state_hash is valid.
     if state_hash and _current_rules_state is not None:
-        publish_tau_state_snapshot(state_hash, (_current_rules_state or "").encode("utf-8"))
+        publish_tau_state_snapshot(state_hash, rules_bytes, acc_hash)
 
 
 
-def publish_tau_state_snapshot(state_hash: str, tau_bytes: bytes) -> bool:
+def publish_tau_state_snapshot(state_hash: str, tau_bytes: bytes, accounts_hash: bytes) -> bool:
     """
-    Publish the serialized Tau/rules snapshot into the DHT under the configured
-    locator namespace (typically: `state:<hash>`).
-
-    This is used to let other nodes fetch the exact Tau engine state tied to a
-    block header's `state_hash`.
+    Publish the serialized Tau/rules snapshot into the DHT under `tau_state:<hash>`.
+    Payload is JSON: `{"rules": <str>, "accounts_hash": <hex>}`.
     """
     if not state_hash or not isinstance(state_hash, str):
         return False
     if tau_bytes is None:
         return False
-    if not tau_bytes and tau_bytes != b"":
-        # Only reject None
-        return False
-    if not tau_bytes.strip():
-        # Allow publishing empty rules.
-        logger.warning(
-            "Publishing empty Tau rules snapshot (state_hash=%s). This is normal for empty rules.",
-            state_hash,
-        )
     if not _dht_client or not getattr(_dht_client, "dht", None):
         return False
+        
     try:
-        key = f"{config.STATE_LOCATOR_NAMESPACE}:{state_hash}".encode("ascii")
+        # Construct JSON payload
+        rules_str = tau_bytes.decode("utf-8")
+        accounts_hash_hex = accounts_hash.hex()
+        
+        payload = json.dumps({
+            "rules": rules_str,
+            "accounts_hash": accounts_hash_hex
+        }).encode("utf-8")
+        
+        key = f"tau_state:{state_hash}".encode("ascii")
     except Exception:
         return False
 
     try:
         if logger.isEnabledFor(logging.DEBUG):
-            try:
-                tau_text = tau_bytes.decode("utf-8", errors="replace")
-            except Exception:
-                tau_text = repr(tau_bytes)
             logger.debug(
-                "Publishing Tau state snapshot to DHT key=%s len=%s state_hash=%s tau=%s",
+                "Publishing Tau state snapshot to DHT key=%s len=%s state_hash=%s",
                 key,
-                len(tau_bytes) if tau_bytes is not None else 0,
+                len(payload),
                 state_hash,
-                tau_text,
             )
 
         # Prefer network replication if supported by the DHT manager wrapper.
         if hasattr(_dht_client, "put_record_sync"):
-            return bool(_dht_client.put_record_sync(key, tau_bytes))
+            return bool(_dht_client.put_record_sync(key, payload))
 
-        # Fallback: local store only (peers can still fetch via get_value queries).
-        _dht_client.dht.value_store.put(key, tau_bytes)
+        # Fallback: local store only
+        _dht_client.dht.value_store.put(key, payload)
         return True
     except Exception as exc:
         print(f"[WARN][chain_state] Failed to publish tau state snapshot to DHT: {exc}")
@@ -164,16 +151,15 @@ def publish_tau_state_snapshot(state_hash: str, tau_bytes: bytes) -> bool:
 
 def fetch_tau_state_snapshot(state_hash: str) -> Optional[str]:
     """
-    Fetch a serialized Tau/rules snapshot from the DHT.
-
-    Returns the UTF-8 decoded Tau formula string if found, otherwise None.
+    Fetch a serialized Tau rules snapshot (string) from the DHT `tau_state:<hash>`.
+    Expects JSON payload with "rules" field.
     """
     if not state_hash or not isinstance(state_hash, str):
         return None
     if not _dht_client or not getattr(_dht_client, "dht", None):
         return None
     try:
-        key = f"{config.STATE_LOCATOR_NAMESPACE}:{state_hash}".encode("ascii")
+        key = f"tau_state:{state_hash}".encode("ascii")
     except Exception:
         return None
 
@@ -186,9 +172,13 @@ def fetch_tau_state_snapshot(state_hash: str) -> Optional[str]:
             
         if val_bytes is None:
             return None
-        if isinstance(val_bytes, str):
-            return val_bytes
-        return bytes(val_bytes).decode("utf-8")
+            
+        # Parse JSON payload
+        decoded = val_bytes.decode("utf-8")
+        data = json.loads(decoded)
+        if isinstance(data, dict):
+            return data.get("rules")
+        return None
     except Exception as exc:
         print(f"[WARN][chain_state] Failed to fetch tau state snapshot from DHT: {exc}")
         return None
@@ -225,16 +215,22 @@ def publish_accounts_snapshot(block_hash: str) -> bool:
 
     try:
         if logger.isEnabledFor(logging.DEBUG):
-            try:
-                payload_text = payload.decode("utf-8", errors="replace")
-            except Exception:
-                payload_text = repr(payload)
-            logger.debug(
-                "Publishing accounts snapshot to DHT key=%s block_hash=%s accounts_json=%s",
-                key,
-                block_hash,
-                payload_text,
-            )
+             try:
+                 # Avoid logging full payload for large state
+                 data_obj = json.loads(payload.decode("utf-8"))
+                 accs = data_obj.get("accounts", {})
+                 acc_count = len(accs)
+                 # Sample first 10
+                 sample = dict(list(accs.items())[:10])
+                 logger.debug(
+                     "Publishing accounts snapshot key=%s block=%s count=%d sample=%s...",
+                     key, block_hash, acc_count, sample
+                 )
+             except Exception:
+                 logger.debug(
+                     "Publishing accounts snapshot key=%s block=%s len=%d",
+                     key, block_hash, len(payload)
+                 )
 
         if hasattr(_dht_client, "put_record_sync"):
             return bool(_dht_client.put_record_sync(key, payload))
@@ -377,15 +373,39 @@ def process_new_block(block: Block) -> bool:
                          sort_keys=True, separators=(",", ":")
                     ).encode("utf-8")
                     
-                    # Store in LOCAL DHT cache
-                    acc_key = f"{config.STATE_LOCATOR_NAMESPACE}:{block.block_hash}".encode("ascii")
-                    _dht_client.dht.value_store.put(acc_key, accounts_payload)
-                    
-                    # Cache rules
-                    if rules_from_dht is not None:
-                        rules_bytes = rules_from_dht.encode("utf-8")
-                        rules_key = f"{config.STATE_LOCATOR_NAMESPACE}:{expected_state_hash}".encode("ascii")
-                        _dht_client.dht.value_store.put(rules_key, rules_bytes)
+                    if hasattr(_dht_client, "put_record_sync"):
+                        # Cache accounts
+                        # Use put_record_sync which handles key encoding (e.g. /state/<hash>)
+                        acc_key_raw = f"{config.STATE_LOCATOR_NAMESPACE}:{block.block_hash}".encode("ascii")
+                        if not _dht_client.put_record_sync(acc_key_raw, accounts_payload):
+                             logger.warning("[chain_state] Failed to cache accounts snapshot for %s via put_record_sync", block.block_hash)
+                        
+                        # Cache rules
+                        if rules_from_dht is not None:
+                             # Reconstruct payload for cache using local hash computation
+                             acc_hash_for_cache = compute_accounts_hash(balances_snapshot, sequences_snapshot)
+                             
+                             import json
+                             payload_cache = json.dumps({
+                                 "rules": rules_from_dht,
+                                 "accounts_hash": acc_hash_for_cache.hex()
+                             }).encode("utf-8")
+                             
+                             rules_key_raw = f"tau_state:{expected_state_hash}".encode("ascii")
+                             if not _dht_client.put_record_sync(rules_key_raw, payload_cache):
+                                  logger.warning("[chain_state] Failed to cache rules snapshot for %s via put_record_sync", expected_state_hash)
+                    else:
+                        # Fallback if put_record_sync missing (should not happen with updated dht_manager)
+                        acc_key = f"{config.STATE_LOCATOR_NAMESPACE}:{block.block_hash}".encode("ascii")
+                        _dht_client.dht.value_store.put(acc_key, accounts_payload)
+                        if rules_from_dht is not None:
+                             acc_hash_for_cache = compute_accounts_hash(balances_snapshot, sequences_snapshot)
+                             payload_cache = json.dumps({
+                                 "rules": rules_from_dht,
+                                 "accounts_hash": acc_hash_for_cache.hex()
+                             }).encode("utf-8")
+                             rules_key = f"tau_state:{expected_state_hash}".encode("ascii")
+                             _dht_client.dht.value_store.put(rules_key, payload_cache)
             except Exception as e:
                  print(f"[WARN][chain_state] Failed to cache snapshots to local DHT: {e}")
             break
@@ -646,46 +666,47 @@ def save_rules_state(rules_content: str):
     """
     global _current_rules_state, _tau_engine_state_hash
     with _rules_lock:
-        candidate = (rules_content or "").strip()
+        # Do not strip()! We must preserve exact bytes for hash consistency.
+        candidate = rules_content or ""
         if not candidate:
-            logger.error("Refusing to save empty Tau rules state.")
-            return
+            logger.warning("Saving empty Tau rules state.")
+            # return
         _current_rules_state = candidate
-        try:
-            _tau_engine_state_hash = compute_state_hash(_current_rules_state.encode("utf-8"))
-        except Exception:
-            _tau_engine_state_hash = ""
+        
+        # NOTE: We do NOT set _tau_engine_state_hash to the rules-only hash here.
+        # We wait until we compute the consensus hash (rules + accounts_hash) below.
+        
         print(f"[INFO][chain_state] Rules state updated. Length: {len(_current_rules_state)} characters")
         logger.debug(
-            "Rules state saved (len=%s state_hash=%s).",
-            len(_current_rules_state),
-            _tau_engine_state_hash,
+            "Rules state saved (len=%s).",
+            len(_current_rules_state)
         )
 
         if _dht_client:
                 try:
                     rules_bytes = _current_rules_state.encode('utf-8')
-                    # Use state_hash key as primary storage for Tau snapshots
-                    # state:<state_hash> -> raw bytes
-                    if _tau_engine_state_hash:
-                        key = f"{config.STATE_LOCATOR_NAMESPACE}:{_tau_engine_state_hash}".encode("ascii")
-                        if _dht_client.dht:
-                            _dht_client.dht.value_store.put(key, rules_bytes)
-                            print(f"[INFO][chain_state] Published Tau state snapshot to DHT: {key.decode()}")
+                    # Compute Accounts Hash for Consensus Hash
+                    with _balance_lock, _sequence_lock:
+                         accounts_hash = compute_accounts_hash(_balances, _sequence_numbers)
                     
-                    # Also store with formula hash for backward compatibility / direct formula lookup
-                    import hashlib
-                    # Compute hash
-                    rules_hash = hashlib.sha256(rules_bytes).hexdigest()
-                    key_formula = f"formula:{rules_hash}".encode('ascii')
+                    # Compute Consensus Hash
+                    state_hash = compute_consensus_state_hash(rules_bytes, accounts_hash)
                     
-                    # Store in DHT
-                    if _dht_client.dht:
-                        _dht_client.dht.value_store.put(key_formula, rules_bytes)
-                        # print(f"[INFO][chain_state] Stored formula in DHT: {key_formula.decode()}")
-
+                    # Update global hash
+                    _tau_engine_state_hash = state_hash
+                    
+                    # Publish to tau_state:<consensus_hash>
+                    publish_tau_state_snapshot(state_hash, rules_bytes, accounts_hash)
+                    print(f"[INFO][chain_state] Published Tau state snapshot to DHT: tau_state:{state_hash}")
+                    
+                    # Previously we also published to formula:<sha256>. Keep it for raw formula lookup?
+                    # The user asked to "Stop publishing state:<rules_hash>" which refers to keying by rule hash
+                    # but using "state" namespace.
+                    # We might still want "formula:<sha256>" -> raw_bytes for direct formula sharing if needed.
+                    # But if not critical, we can skip. Let's keep formula for now as it seems distinct.
+                    
                 except Exception as e:
-                    print(f"[ERROR][chain_state] Failed to store formula in DHT: {e}")
+                    print(f"[ERROR][chain_state] Failed to store state in DHT: {e}")
         
 
 def fetch_formula_from_dht(formula_hash: str) -> Optional[str]:

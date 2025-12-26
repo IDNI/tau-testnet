@@ -96,11 +96,47 @@ class TestBlockCreation(unittest.TestCase):
         config.set_database_path(self.test_db_path)
         init_db()
         
-        self.tx1_json = json.dumps({"sender": "a", "recipient": "b", "amount": 10, "operations": {"1": []}})
-        self.tx2_json = json.dumps({"sender": "c", "recipient": "d", "amount": 20, "operations": {"1": []}})
+        # Reset chain state globals to ensure isolation
+        import chain_state
+        chain_state._balances.clear()
+        chain_state._sequence_numbers.clear()
+        
+        self.tx1_json = json.dumps({
+            "sender_pubkey": "a"*96, 
+            "recipient": "b", 
+            "amount": 10, 
+            "operations": {"1": []},
+            "sequence_number": 0,
+            "fee_limit": "0",
+            "signature": "sig"
+        })
+        self.tx2_json = json.dumps({
+            "sender_pubkey": "c"*96, 
+            "recipient": "d", 
+            "amount": 20, 
+            "operations": {"1": []},
+            "sequence_number": 0,
+            "fee_limit": "0",
+            "signature": "sig"
+        })
+
+        # Mock Tau Manager for createblock
+        self.tau_patcher = unittest.mock.patch('commands.createblock.tau_manager')
+        self.mock_tau = self.tau_patcher.start()
+        self.mock_tau.tau_ready.is_set.return_value = True
+        self.mock_tau.communicate_with_tau.return_value = "100" # Dummy return for validate
+        
+        # Mock Signature Validation
+        self.sig_patcher = unittest.mock.patch('commands.createblock._validate_signature', return_value=True)
+        self.sig_patcher.start()
+        
+        # Mock Pubkey Validation (if createblock calls it, or if it's in sendtx but createblock assumes valid?)
+        # createblock does basic checks.
 
     def tearDown(self):
         """Clean up the temporary database."""
+        self.tau_patcher.stop()
+        self.sig_patcher.stop()
         clear_mempool()
         # Close the connection if it's open, to release file lock on Windows
         if hasattr(createblock.db, '_db_conn') and createblock.db._db_conn is not None:
@@ -114,7 +150,7 @@ class TestBlockCreation(unittest.TestCase):
     def test_genesis_block_creation(self):
         """Test creating the first block (genesis block) from the mempool."""
         # Add transactions to mempool
-        add_mempool_tx(self.tx1_json)
+        add_mempool_tx(self.tx1_json, "tx_hash_1", 1000)
         
         # Create block
         created_block_data = createblock.create_block_from_mempool()
@@ -133,12 +169,12 @@ class TestBlockCreation(unittest.TestCase):
     def test_subsequent_block_creation(self):
         """Test creating a second block that links to the genesis block."""
         # 1. Create and save a genesis block
-        add_mempool_tx(self.tx1_json)
+        add_mempool_tx(self.tx1_json, "tx_hash_1", 1000)
         genesis_block_data = createblock.create_block_from_mempool()
         genesis_hash = genesis_block_data['block_hash']
         
         # 2. Add new tx and create the next block
-        add_mempool_tx(self.tx2_json)
+        add_mempool_tx(self.tx2_json, "tx_hash_2", 2000)
         next_block_data = createblock.create_block_from_mempool()
 
         # 3. Verify the new block from DB

@@ -11,18 +11,18 @@ import config
 import db
 
 # Mock blake3 if missing (for test environment)
-try:
-    import blake3
-except ImportError:
-    from unittest.mock import MagicMock
-    mock_blake3 = MagicMock()
-    mock_hasher = MagicMock()
-    mock_hasher.digest.return_value = b'\x00' * 32
-    mock_hasher.hexdigest.return_value = "0" * 64
-    # mock blake3.blake3(data).digest()
-    mock_blake3.blake3.return_value = mock_hasher
-    sys.modules["blake3"] = mock_blake3
-    print("[TEST] Mocked blake3 module")
+# try:
+import blake3
+# except ImportError:
+#     from unittest.mock import MagicMock
+#     mock_blake3 = MagicMock()
+#     mock_hasher = MagicMock()
+#     mock_hasher.digest.return_value = b'\x00' * 32
+#     mock_hasher.hexdigest.return_value = "0" * 64
+#     # mock blake3.blake3(data).digest()
+#     mock_blake3.blake3.return_value = mock_hasher
+#     sys.modules["blake3"] = mock_blake3
+#     print("[TEST] Mocked blake3 module")
 
 class TestGhostTx(unittest.TestCase):
     def setUp(self):

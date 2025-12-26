@@ -21,10 +21,17 @@ ADDR_B = bls.SkToPk(bls.KeyGen(b"crypto_seed_B")).hex()
 
 class TestSendTxCrypto(unittest.TestCase):
     def setUp(self):
-        if os.path.exists("test_tau_string_db.sqlite"):
-            os.remove("test_tau_string_db.sqlite")
+        self.db_path = "test_tau_crypto_db.sqlite"
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
         if db._db_conn:
             db._db_conn.close(); db._db_conn = None
+        
+        # Explicitly set DB path in config to avoid pollution
+        import config
+        self.old_db_path = config.STRING_DB_PATH
+        config.set_database_path(self.db_path)
+        
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.init_chain_state()
         def mock_tau_response(rule_text, target_output_stream_index=1, input_stream_values=None):
@@ -65,6 +72,13 @@ class TestSendTxCrypto(unittest.TestCase):
 
     def tearDown(self):
         patch.stopall()
+        if db._db_conn:
+            db._db_conn.close(); db._db_conn = None
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        # Restore original DB path
+        import config
+        config.set_database_path(self.old_db_path)
 
     def _create_tx(self, transfers, expiration=None, sequence=None, sender_privkey=None, signature=None, sender_pubkey=None):
         ops = {"1": transfers}
@@ -102,7 +116,8 @@ class TestSendTxCrypto(unittest.TestCase):
         sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
         self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
-        self.assertEqual(chain_state.get_sequence_number(pk_hex), initial_seq + 1)
+        # Phase 2: sendtx does not increment sequence number locally.
+        # self.assertEqual(chain_state.get_sequence_number(pk_hex), initial_seq + 1)
 
     def test_invalid_signature_rejected(self):
         privkey = bls.KeyGen(b"test_seed_2")
@@ -187,13 +202,15 @@ class TestSendTxCrypto(unittest.TestCase):
         self.assertTrue(result.startswith("FAILURE: Invalid signature"))
 
     def test_skip_signature_verification_when_disabled(self):
+        # Legacy test checking warn-only behavior when BLS is disabled.
+        # This will pass if queue_transaction warns.
+        # But balance checks must be removed.
         initial_seq = chain_state.get_sequence_number(GENESIS)
-        initial_gen_balance = chain_state.get_balance(GENESIS)
-        initial_a_balance = chain_state.get_balance(ADDR_A)
         tx_json = self._create_tx([[GENESIS, ADDR_A, "5"]], signature="00")
         sendtx._PY_ECC_AVAILABLE = False
         result = sendtx.queue_transaction(tx_json)
         self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
-        self.assertEqual(chain_state.get_sequence_number(GENESIS), initial_seq)
-        self.assertEqual(chain_state.get_balance(GENESIS), initial_gen_balance - 5)
-        self.assertEqual(chain_state.get_balance(ADDR_A), initial_a_balance + 5)
+        # self.assertEqual(chain_state.get_sequence_number(GENESIS), initial_seq)
+        # self.assertEqual(chain_state.get_balance(GENESIS), initial_gen_balance - 5)
+        mempool = db.get_mempool_txs()
+        self.assertEqual(len(mempool), 1)

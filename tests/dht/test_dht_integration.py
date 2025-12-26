@@ -67,7 +67,7 @@ async def test_dht_value_propagation(dht_two_nodes):
     assert svc1._dht is not None and svc2._dht is not None  # type: ignore[attr-defined]
 
     block_hash = "abc123"
-    key = f"block:{block_hash}".encode()
+    key = f"/block/{block_hash}"
     payload = json.dumps({"block_hash": block_hash}).encode()
 
     await svc1._dht.put_value(key, payload)  # type: ignore[call-arg]
@@ -81,8 +81,8 @@ async def test_dht_provider_propagation(dht_two_nodes):
     svc1, svc2 = dht_two_nodes
     assert svc1._dht is not None and svc2._dht is not None  # type: ignore[attr-defined]
 
-    block_hash = "def456"
-    key = f"block:{block_hash}".encode()
+    block_hash = "abc123"
+    key = f"/block/{block_hash}"
     payload = json.dumps({"block_hash": block_hash}).encode()
 
     await svc1._dht.put_value(key, payload)  # type: ignore[call-arg]

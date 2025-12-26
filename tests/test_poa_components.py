@@ -6,46 +6,59 @@ import config
 import db
 from miner import SoleMiner
 from poa import mempool as mempool_utils
-from poa.state import StateStore
-from poa.tau_engine import MockTauEngine
 
 
 def test_mempool_reconcile_with_block(temp_database):
     tx_payload = {"sender_pubkey": config.MINER_PUBKEY, "sequence_number": 0}
-    db.add_mempool_tx(json.dumps(tx_payload))
+    db.add_mempool_tx(json.dumps(tx_payload), "tx_hash_a", 1000)
     stats = mempool_utils.reconcile_with_block({"transactions": [tx_payload]})
     assert stats["removed"] == 1
     assert stats["kept"] == 0
 
 
 def test_sole_miner_mines_block_when_threshold_met(temp_database):
-    # Seed mempool with a placeholder transaction
-    sample_tx = {
-        "sender_pubkey": config.MINER_PUBKEY,
-        "sequence_number": 0,
-        "expiration_time": 9999999999,
-        "operations": {"1": []},
-        "fee_limit": "0",
-        "signature": "00",
-    }
-    db.add_mempool_tx(json.dumps(sample_tx))
+    # Setup mocks for validation
+    from commands import createblock
+    original_validate = createblock._validate_signature
+    createblock._validate_signature = lambda p: True
+    createblock._BLS_AVAILABLE = True
+    
+    # Also mock tau_manager for createblock
+    import tau_manager
+    tau_manager.tau_ready.set()
+    original_communicate = tau_manager.communicate_with_tau
+    tau_manager.communicate_with_tau = lambda **kwargs: ""
 
-    mined_blocks = []
+    try:
+        # Seed mempool with a valid-looking transaction
+        sample_tx = {
+            "sender_pubkey": config.MINER_PUBKEY or "0"*96,
+            "sequence_number": 0,
+            "expiration_time": 9999999999,
+            "operations": {"1": []},
+            "fee_limit": 1000,
+            "signature": "00"*96,
+        }
+        db.add_mempool_tx(json.dumps(sample_tx), "tx_hash_b", 2000)
 
-    def _capture_block(new_block):
-        mined_blocks.append(new_block.to_dict())
+        # New SoleMiner only takes threshold/interval
+        miner = SoleMiner(
+            threshold=1,
+            max_block_interval=1.0,
+        )
 
-    miner = SoleMiner(
-        threshold=1,
-        max_block_interval=1.0,
-        state_store=StateStore(),
-        tau_engine=MockTauEngine(),
-        block_committer=_capture_block,
-    )
-
-    block_obj = miner.try_mine()
-    assert block_obj is not None
-    assert block_obj.header.state_hash
-    assert len(mined_blocks) == 1
-    assert db.get_mempool_txs() == []
+        # Mimic mining behavior
+        miner.try_mine()
+        
+        # Verify via DB side effects
+        latest = db.get_latest_block()
+        assert latest is not None
+        assert latest["header"]["state_hash"]
+        assert db.count_mempool_txs() == 0
+        
+    finally:
+        # Cleanup mocks
+        createblock._validate_signature = original_validate
+        tau_manager.communicate_with_tau = original_communicate
+        tau_manager.tau_ready.clear()
 

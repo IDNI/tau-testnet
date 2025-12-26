@@ -232,6 +232,7 @@ class NetworkService:
             "node_id": str(self.get_id()),
             "head_number": 0,
             "head_hash": self._config.genesis_hash,
+            "head_state_hash": "",
         }
         # Prefer the persisted chain tip if available.
         try:
@@ -240,6 +241,7 @@ class NetworkService:
             if latest and "header" in latest:
                 payload["head_number"] = int(latest["header"].get("block_number", payload["head_number"]))
                 payload["head_hash"] = str(latest.get("block_hash") or payload["head_hash"])
+                payload["head_state_hash"] = str(latest["header"].get("state_hash") or "")
         except Exception:
             logger.debug("Failed to compute local tip for handshake payload", exc_info=True)
         
@@ -274,96 +276,67 @@ class NetworkService:
                 payload["dht_peers"] = peers
                 
                 # --- Optimized Provider Collection ---
-                # Providers from provider store (bounded to avoid unbounded handshake growth)
-                providers_by_key: Dict[str, List[Dict[str, Any]]] = {}
+                # Only advertise specific, high-value keys to prevent handshake bloat/DoS.
+                # We advertise ourselves as a provider for the head and genesis state.
+                
+                head_hash = str(payload.get("head_hash") or self._config.genesis_hash)
+                genesis_hash = str(payload.get("genesis_hash") or self._config.genesis_hash)
+                head_state_hash = str(payload.get("head_state_hash") or "")
 
-                ps = getattr(self._dht_manager.dht, "provider_store", None)
-                if ps:
-                    store = getattr(ps, "providers", {}) or {}
-                    for key, provider_list in store.items():
-                        key_str = key.decode("utf-8", errors="ignore") if isinstance(key, (bytes, bytearray)) else str(key)
-                        if not key_str:
-                            continue
+                # Slash-prefixed keys matching internal storage/validation
+                target_keys = []
+                
+                # Helper to check if we have data locally
+                def has_local_data(enc_key_str: str) -> bool:
+                    if not self._dht_manager.dht:
+                        return False
+                    # Check value_store (sync)
+                    # Note: we are accessing internal value_store, which is safe for simple presence check
+                    # assuming it is thread-safe or we are ok with best-effort.
+                    # dht_manager internal key encoding logic
+                    return bool(self._dht_manager.dht.value_store.get(enc_key_str.encode("utf-8")))
 
-                        provs: List[Dict[str, Any]] = []
-                        for p in (provider_list or []):
-                            if hasattr(p, "peer_id"):
-                                pid = str(p.peer_id)
-                                addrs = [str(a) for a in (getattr(p, "addrs", None) or [])]
-                            else:
-                                pid = str(p)
-                                addrs = []
-                            provs.append({"peer_id": pid, "addrs": addrs})
+                # 1. Head Accounts
+                k1 = self._dht_manager._encode_dht_key("state", head_hash).decode("utf-8")
+                if has_local_data(k1):
+                     target_keys.append(k1)
+                     
+                # 2. Head Tau State
+                if head_state_hash:
+                     k2 = self._dht_manager._encode_dht_key("tau_state", head_state_hash).decode("utf-8")
+                     if has_local_data(k2):
+                          target_keys.append(k2)
+                          
+                # 3. Genesis Accounts
+                k3 = self._dht_manager._encode_dht_key("state", genesis_hash).decode("utf-8")
+                # We always advertise genesis state if we have it
+                if has_local_data(k3):
+                    target_keys.append(k3)
 
-                        if provs:
-                            providers_by_key[key_str] = provs
-
-                # Add local value_store keys as "self provides"
+                providers_payload = []
+                
+                # Get local peer info
                 local_pid = str(self.get_id())
                 try:
                     local_addrs = [str(a) for a in self.host.get_addrs()]
                 except Exception:
                     local_addrs = []
+                
+                local_provider_entry = {"peer_id": local_pid, "addrs": local_addrs}
 
-                vs_keys: List[Union[str, bytes]] = []
-                vs = getattr(self._dht_manager.dht, "value_store", None)
-                if vs:
-                    try:
-                        if hasattr(vs, "get_keys") and callable(vs.get_keys):
-                            vs_keys = list(vs.get_keys() or [])
-                    except Exception:
-                        vs_keys = []
-                    if not vs_keys and hasattr(vs, "store"):
-                        try:
-                            s = vs.store
-                            if isinstance(s, dict):
-                                vs_keys = list(s.keys())
-                            elif hasattr(s, "keys") and callable(s.keys):
-                                vs_keys = list(s.keys())
-                        except Exception:
-                            vs_keys = []
+                for k_str in target_keys:
+                    # improved payload structure: key + list of providers
+                    # For handshake, we primarily advertise OURSELVES.
+                    # We could also look up if we know others, but let's keep it minimal for now to avoid DoS.
+                    # The goal is to ensure the receiver knows WE have this data.
+                    providers_payload.append({
+                        "key": k_str, 
+                        "providers": [local_provider_entry]
+                    })
 
-                for key in vs_keys:
-                    key_str = key.decode("utf-8", errors="ignore") if isinstance(key, (bytes, bytearray)) else str(key)
-                    if not key_str:
-                        continue
-                    entry = providers_by_key.setdefault(key_str, [])
-                    if not any(p.get("peer_id") == local_pid for p in entry):
-                        entry.append({"peer_id": local_pid, "addrs": local_addrs})
+                logger.debug("Handshake DHT providers advertised: %d keys", len(providers_payload))
+                payload["dht_providers"] = providers_payload
 
-                # Heuristic prioritization
-                head_hash = str(payload.get("head_hash") or self._config.genesis_hash)
-                genesis_hash = str(payload.get("genesis_hash") or self._config.genesis_hash)
-
-                preferred = [f"state:{head_hash}", f"state:{genesis_hash}"]
-
-                def prio(k: str) -> tuple:
-                    if k == preferred[0]:
-                        return (0, k)
-                    if k == preferred[1]:
-                        return (1, k)
-                    if k.startswith("formula:"):
-                        return (2, k)
-                    if k.startswith("state:"):
-                        return (3, k)
-                    return (4, k)
-
-                ordered: List[str] = [k for k in preferred if k in providers_by_key]
-                rest = [k for k in providers_by_key.keys() if k not in ordered]
-                rest.sort(key=prio)
-                # Extend ordered with the unique rest of keys
-                for k in rest:
-                    ordered.append(k)
-
-                trimmed = ordered[:MAX_HANDSHAKE_PROVIDERS]
-                payload["dht_providers"] = [{"key": k, "providers": providers_by_key[k]} for k in trimmed if providers_by_key.get(k)]
-
-                logger.debug(
-                    "Handshake DHT providers advertised=%d total_known=%d max=%d",
-                    len(payload["dht_providers"]),
-                    len(ordered),
-                    MAX_HANDSHAKE_PROVIDERS,
-                )
             except Exception:
                 logger.warning("Failed to add DHT info to handshake", exc_info=True)
                 
@@ -453,7 +426,7 @@ class NetworkService:
 
                 # Use Server mode by default for nodes
                 dht = KadDHT(self.host, DHTMode.SERVER)
-                self._dht_manager.set_dht(dht, self._dht_manager)
+                self._dht_manager.set_dht(dht, self._dht_manager, host=self.host)
             except Exception:
                 logger.warning("Failed to initialize DHT", exc_info=True)
 
@@ -576,7 +549,9 @@ class NetworkService:
         try:
             # Read payload
             data = await stream.read(65535)
-            logger.debug("Handshake received data: %s", data)
+            if logger.isEnabledFor(logging.DEBUG):
+                 # Log length only to confirm receipt without flooding raw bytes
+                 logger.debug("Handshake received %d bytes", len(data))
             
             if hasattr(stream, "muxed_conn") and getattr(stream.muxed_conn, "peer_id", None):
                 await self._ensure_peer_route(stream.muxed_conn.peer_id)
@@ -595,6 +570,13 @@ class NetworkService:
                             continue
                         pid_str = peer_data.get("peer_id")
                         addrs_str = peer_data.get("addrs", [])
+                        
+                        # Input Validation Checks
+                        if not pid_str or len(pid_str) > 128:
+                             continue
+                        if len(addrs_str) > 20:
+                             addrs_str = addrs_str[:20]
+                             
                         if pid_str:
                             try:
                                 from libp2p.peer.id import ID
@@ -634,9 +616,14 @@ class NetworkService:
                         provs = provider_data.get("providers", [])
                         
                         if key_str and self._dht_manager.dht:
-                            # Truncate provider entries per key
-                            if len(provs) > 20:
-                                provs = provs[:20]
+                            # 1. Cap Key Length
+                            if len(key_str) > 256:
+                                 continue
+                                 
+                            # 2. Cap Providers List
+                            if len(provs) > 10:
+                                provs = provs[:10]
+                                
                             try:
                                 key = key_str.encode("utf-8")
                                 for p_data in provs:
@@ -644,6 +631,11 @@ class NetworkService:
                                         continue
                                     pid_str = p_data.get("peer_id")
                                     addrs_str = p_data.get("addrs", [])
+                                    
+                                    # 3. Cap Address List per Provider
+                                    if len(addrs_str) > 10:
+                                        addrs_str = addrs_str[:10]
+                                        
                                     if pid_str:
                                         from libp2p.peer.id import ID
                                         from libp2p.peer.peerinfo import PeerInfo
@@ -651,6 +643,9 @@ class NetworkService:
                                         pid = ID.from_base58(pid_str)
                                         maddrs = []
                                         for a in addrs_str:
+                                            # 4. Cap Address String Length
+                                            if len(a) > 256:
+                                                continue
                                             try:
                                                 maddrs.append(multiaddr.Multiaddr(a))
                                             except Exception:

@@ -234,7 +234,7 @@ async def test_mempool_snapshot_sent_on_connect(two_nodes, monkeypatch):
         "fee_limit": "0",
         "signature": "0" * 192,
     }
-    db_module.add_mempool_tx(json.dumps(tx_payload))
+    db_module.add_mempool_tx(json.dumps(tx_payload), "protocol_tx_1", 1000)
 
     addrs2 = await _wait_for_addrs(svc2.host)
     print(f"DEBUG: svc2 addrs: {addrs2}")
@@ -773,7 +773,14 @@ async def test_handshake_exchanges_peer_snapshot(monkeypatch):
         await svc_a._opportunistic_seed_peer(str(peer_info_c.peer_id), peer_info_c.addrs)
         await trio.sleep(0.1)
         await svc_a._dht.routing_table.add_peer(peer_info_c)
-        provider_key = "block:handshake"
+        await svc_a._dht.routing_table.add_peer(peer_info_c)
+        # Use a critical key (state for genesis) that _build_handshake_payload will actually advertise
+        # Note: chain_state keys are now slash-prefixed.
+        provider_key = f"/state/{cfg.genesis_hash}"
+        # Also ensure we have the value locally so has_local_data returns true
+        # Must be valid state record (JSON with block_hash matching suffix)
+        state_payload = json.dumps({"block_hash": cfg.genesis_hash}).encode("utf-8")
+        svc_a._dht.value_store.put(provider_key.encode(), state_payload)
         svc_a._dht.provider_store.add_provider(provider_key.encode(), peer_info_c)
 
         original_payload = svc_a._build_handshake_payload
@@ -853,7 +860,20 @@ async def test_peer_advertisement_gossip(monkeypatch):
 
         peer_info_c = PeerInfo(svc_c.host.get_id(), addrs_c)
         await svc_a._opportunistic_seed_peer(str(peer_info_c.peer_id), peer_info_c.addrs)
-        svc_a._dht.provider_store.add_provider(b"block:advert", peer_info_c)
+        
+        # Use critical key that is actually advertised
+        # Key: /state/<genesis_hash>
+        # ensure has_local_data pass
+        provider_key = f"/state/{cfg.genesis_hash}"
+        provider_key_bytes = provider_key.encode("utf-8")
+        
+        # We must put a valid value so has_local_data returns True
+        # And strict validation requires valid JSON payload for 'state' namespace
+        import json
+        state_payload = json.dumps({"block_hash": cfg.genesis_hash}).encode("utf-8")
+        svc_a._dht.value_store.put(provider_key_bytes, state_payload)
+        
+        svc_a._dht.provider_store.add_provider(provider_key_bytes, peer_info_c)
 
         svc_b.host.get_peerstore().add_addrs(svc_a.host.get_id(), addrs_a, 60)
         await svc_b.host.connect(PeerInfo(svc_a.host.get_id(), addrs_a))
@@ -892,7 +912,10 @@ async def test_peer_advertisement_gossip(monkeypatch):
                 await trio.sleep(0.05)
 
         provider_snapshot = getattr(svc_b._dht.provider_store, "providers", {})
-        assert any(key == b"block:advert" for key in provider_snapshot.keys())
+        # Check for the key we used
+        # Note: provider_store keys are bytes
+        expected_key = provider_key.encode("utf-8")
+        assert any(key == expected_key for key in provider_snapshot.keys())
         assert any(str(peer_id) == str(svc_c.host.get_id()) for peer_id in lookup_ids)
     finally:
         await svc_c.stop()
