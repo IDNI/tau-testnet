@@ -1,0 +1,210 @@
+:root {
+    --primary: #3498db;
+    --primary-dark: #2980b9;
+    --bg: #f4f4f9;
+    --panel-bg: #fff;
+    --text: #333;
+    --border: #ddd;
+    --success: #2ecc71;
+    --error: #e74c3c;
+    --warning: #f1c40f;
+}
+
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background-color: var(--bg);
+    color: var(--text);
+    margin: 0;
+    display: flex;
+    justify-content: center;
+    padding: 20px;
+}
+
+.container {
+    width: 100%;
+    max-width: 800px;
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+}
+
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+header h1 {
+    margin: 0;
+    font-size: 1.5rem;
+}
+
+.status {
+    padding: 5px 10px;
+    border-radius: 4px;
+    font-weight: bold;
+    font-size: 0.9rem;
+}
+
+.status.connected {
+    background-color: var(--success);
+    color: white;
+}
+
+.status.disconnected {
+    background-color: var(--error);
+    color: white;
+}
+
+section {
+    background: var(--panel-bg);
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+    border: 1px solid var(--border);
+}
+
+section.disabled {
+    opacity: 0.6;
+    pointer-events: none;
+    filter: grayscale(0.5);
+}
+
+h2 {
+    margin-top: 0;
+    font-size: 1.2rem;
+    border-bottom: 2px solid var(--bg);
+    padding-bottom: 10px;
+    margin-bottom: 15px;
+}
+
+.input-group {
+    margin-bottom: 15px;
+}
+
+label {
+    display: block;
+    margin-bottom: 5px;
+    font-weight: 500;
+}
+
+input[type="text"],
+input[type="number"],
+input[type="password"],
+textarea {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    box-sizing: border-box;
+    font-family: inherit;
+}
+
+textarea {
+    min-height: 80px;
+    resize: vertical;
+}
+
+button {
+    background-color: var(--primary);
+    color: white;
+    border: none;
+    padding: 10px 15px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 1rem;
+    transition: background 0.2s;
+}
+
+button:hover {
+    background-color: var(--primary-dark);
+}
+
+.row {
+    display: flex;
+    gap: 10px;
+}
+
+.key-display {
+    margin-top: 15px;
+}
+
+.copy-row {
+    display: flex;
+    gap: 5px;
+}
+
+.copy-btn {
+    padding: 8px;
+    font-size: 0.8rem;
+    background-color: #7f8c8d;
+}
+
+.stats-row {
+    display: flex;
+    gap: 20px;
+    margin-bottom: 15px;
+}
+
+.stat {
+    background: var(--bg);
+    padding: 10px;
+    border-radius: 4px;
+    flex: 1;
+    text-align: center;
+}
+
+.stat .label {
+    display: block;
+    font-size: 0.8rem;
+    color: #777;
+}
+
+.stat .value {
+    font-size: 1.2rem;
+    font-weight: bold;
+}
+
+/* Tabs styles removed - utilizing Bootstrap */
+
+#logs {
+    background: #2c3e50;
+    color: #ecf0f1;
+    padding: 10px;
+    border-radius: 4px;
+    font-family: 'Consolas', monospace;
+    font-size: 0.9rem;
+    height: 150px;
+    overflow-y: auto;
+    margin-bottom: 10px;
+}
+
+.log-entry {
+    margin-bottom: 5px;
+    border-bottom: 1px solid #34495e;
+    padding-bottom: 3px;
+}
+
+.log-entry .time {
+    color: #95a5a6;
+    margin-right: 5px;
+}
+
+.log-entry.sent {
+    color: #3498db;
+}
+
+.log-entry.recv {
+    color: #2ecc71;
+}
+
+.log-entry.error {
+    color: #e74c3c;
+}
+
+.hint {
+    font-size: 0.8rem;
+    color: #666;
+    margin-top: 5px;
+}

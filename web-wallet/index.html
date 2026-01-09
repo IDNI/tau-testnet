@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tau Testnet Web Wallet</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="style.css?v=2">
+
+    <!-- Load BLS library -->
+    <!-- Import Map for Noble Crypto -->
+    <script type="importmap">
+    {
+        "imports": {
+            "@noble/curves/bls12-381": "https://esm.sh/@noble/curves@1.2.0/bls12-381",
+            "@noble/hashes/utils": "https://esm.sh/@noble/hashes@1.3.2/utils",
+            "@noble/hashes/sha256": "https://esm.sh/@noble/hashes@1.3.2/sha256"
+        }
+    }
+    </script>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Tau Testnet Web Wallet</h1>
+            <div id="connection-status" class="status disconnected">Disconnected</div>
+        </header>
+
+        <section id="connection-panel">
+            <h2>Connection</h2>
+            <div class="input-group">
+                <label for="host">Host:</label>
+                <input type="text" id="host" value="localhost">
+            </div>
+            <div class="input-group">
+                <label for="port">Port (WS):</label>
+                <input type="number" id="port" value="65433">
+            </div>
+            <button id="btn-connect">Connect</button>
+            <div id="connection-info" class="hint"></div>
+        </section>
+
+        <section id="wallet-panel" class="disabled">
+            <h2>Wallet Management</h2>
+
+            <div class="row">
+                <div class="input-group" style="flex: 2;">
+                    <label>Saved Wallets:</label>
+                    <select id="wallet-select">
+                        <option value="">-- Select Wallet --</option>
+                    </select>
+                </div>
+                <div class="input-group" style="flex: 1;">
+                    <button id="btn-delete-wallet" class="danger-btn" disabled>Delete</button>
+                </div>
+            </div>
+
+            <div class="row" style="margin-top: 10px; border-top: 1px solid #444; padding-top: 10px;">
+                <button id="btn-generate">Generate New</button>
+                <button id="btn-import">Import Hex</button>
+            </div>
+
+            <!-- Save Current Wallet UI -->
+            <div id="save-wallet-area" style="display:none; margin-top: 10px;">
+                <div class="input-group">
+                    <label>Wallet Name:</label>
+                    <input type="text" id="wallet-name" placeholder="e.g. My Primary Wallet">
+                    <button id="btn-save-wallet">Save</button>
+                </div>
+            </div>
+
+            <div id="import-area" style="display:none; margin-top: 10px;">
+                <label>Private Key (Hex):</label>
+                <input type="password" id="import-sk">
+                <button id="btn-confirm-import">Load</button>
+            </div>
+
+            <div id="wallet-display"
+                style="display:none; margin-top: 15px; background: #2a2a2a; padding: 10px; border-radius: 4px;">
+                <div class="key-display">
+                    <label>Public Key:</label>
+                    <div class="copy-row">
+                        <input type="text" id="pubkey" readonly>
+                        <button class="copy-btn" data-target="pubkey">Copy</button>
+                    </div>
+                </div>
+                <div class="key-display">
+                    <label>Private Key:</label>
+                    <div class="copy-row">
+                        <input type="password" id="privkey" readonly>
+                        <button id="btn-reveal-sk">Reveal</button>
+                        <button class="copy-btn" data-target="privkey">Copy</button>
+                    </div>
+                </div>
+                <button id="btn-show-save" style="margin-top:5px; width: 100%;">Save This Wallet</button>
+            </div>
+        </section>
+
+        <section id="info-panel" class="disabled">
+            <h2>Info</h2>
+            <div class="stats-row">
+                <div class="stat">
+                    <span class="label">Balance:</span>
+                    <span id="stat-balance" class="value">-</span>
+                </div>
+                <div class="stat">
+                    <span class="label">Sequence:</span>
+                    <span id="stat-sequence" class="value">-</span>
+                </div>
+            </div>
+            <button id="btn-refresh">Refresh Info</button>
+        </section>
+
+        <section id="tx-panel" class="disabled">
+            <h2>Send Transaction</h2>
+            <h5 class="card-title">Sign & Send Transaction</h5>
+
+            <!-- Global Recipient Field -->
+            <div class="mb-3">
+                <label for="tx-recipient" class="form-label">Recipient Public Key</label>
+                <div class="input-group">
+                    <input type="text" class="form-control" id="tx-recipient" list="known-accounts"
+                        placeholder="96-char hex">
+                    <datalist id="known-accounts"></datalist>
+                    <button class="btn btn-outline-secondary" type="button" id="btn-refresh-accounts"
+                        title="Fetch known accounts from node">
+                        &#x21bb; <!-- Refresh Icon -->
+                    </button>
+                </div>
+            </div>
+
+            <ul class="nav nav-tabs" id="txTabs" role="tablist">
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link active" id="tab-transfer-btn" data-bs-toggle="tab"
+                        data-bs-target="#tab-transfer" type="button" role="tab">Transfer</button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="tab-rule-btn" data-bs-toggle="tab" data-bs-target="#tab-rule"
+                        type="button" role="tab">Rule</button>
+                </li>
+            </ul>
+
+            <div class="tab-content mt-3" id="txTabContent">
+                <!-- Transfer Tab -->
+                <div class="tab-pane fade show active" id="tab-transfer" role="tabpanel">
+                    <div class="mb-3">
+                        <label for="tx-amount" class="form-label">Amount</label>
+                        <input type="number" class="form-control" id="tx-amount" placeholder="0">
+                    </div>
+                </div>
+
+                <!-- Rule Tab -->
+                <div class="tab-pane fade" id="tab-rule" role="tabpanel">
+                    <div class="mb-3">
+                        <div class="d-flex justify-content-between align-items-center mb-1">
+                            <label for="tx-rule" class="form-label mb-0">Rule Definition</label>
+                            <button class="btn btn-sm btn-outline-primary" type="button" id="btn-random-rule">Random
+                                Rule</button>
+                        </div>
+                        <textarea class="form-control font-monospace" id="tx-rule" rows="3"
+                            placeholder="e.g. always (o5[t] = { #b1 }:bv)."></textarea>
+                        <div id="rule-validation-status" class="form-text mt-1"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Fee Limit removed -->
+
+            <button id="btn-send">Sign & Send Transaction</button>
+        </section>
+
+        <section id="log-panel">
+            <h2>Logs</h2>
+            <div id="logs"></div>
+            <button id="btn-clear-logs">Clear Logs</button>
+        </section>
+    </div>
+
+    <!-- Main Logic -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script type="module" src="app.js"></script>
+</body>
+
+</html>
