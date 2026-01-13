@@ -191,13 +191,13 @@ random_tau_rule() {
   # Here we stick to bitvectors (`:bv`) since the chain's built-in Tau rules
   # cast i1..i4 as bitvectors.
   local -a exprs=(
-    "(i1[t] & i2[t] | { #b0 }:bv)"
-    "(i3[t] | i4[t] | { #b0 }:bv)"
-    "((i1[t] | { #b0 }:bv)')"
-    "((i1[t] | i2[t]) & (i3[t] | { 170 }:bv))"
-    "((i4[t] | { 66 }:bv)' | (i1[t] & i2[t]))"
-    "(((i1[t] | i2[t]) & i3[t]) | { #b0 }:bv)"
-    "(((i1[t] & i2[t] | { #b0 }:bv) | (i3[t] | i4[t] | { #b0 }:bv)))"
+    "(i1[t] & i2[t] | { #b0 }:bv[64])"
+    "(i3[t] | i4[t] | { #b0 }:bv[64])"
+    "((i1[t] | { #b0 }:bv[64])')"
+    "((i1[t] | i2[t]) & (i3[t] | { 170 }:bv[64]))"
+    "((i4[t] | { 66 }:bv[64])' | (i1[t] & i2[t]))"
+    "(((i1[t] | i2[t]) & i3[t]) | { #b0 }:bv[64])"
+    "(((i1[t] & i2[t] | { #b0 }:bv[64]) | (i3[t] | i4[t] | { #b0 }:bv[64])))"
   )
 
   local expr="${exprs[$(( RANDOM % ${#exprs[@]} ))]}"
@@ -211,18 +211,18 @@ random_tau_rule() {
       ;;
     1)
       # conditional (mirrors examples like "cond ? o = expr : o = (expr)'")
-      printf "always ((%s != { #b0 }:bv) ? o%s[t] = %s : o%s[t] = (%s)')." \
+      printf "always ((%s != { #b0 }:bv[64]) ? o%s[t] = %s : o%s[t] = (%s)')." \
         "$expr" "$out_idx" "$expr" "$out_idx" "$expr"
       ;;
     2)
       # same structure, but flip the comparator
-      printf "always ((%s = { #b0 }:bv) ? o%s[t] = %s : o%s[t] = (%s)')." \
+      printf "always ((%s = { #b0 }:bv[64]) ? o%s[t] = %s : o%s[t] = (%s)')." \
         "$expr" "$out_idx" "$expr" "$out_idx" "$expr"
       ;;
     *)
       # constant output (keeps a very small/cheap option in the mix)
       local bit=$(( RANDOM % 2 )) # 0 or 1
-      printf 'always (o%s[t] = { #b%s }:bv).' "$out_idx" "$bit"
+      printf 'always (o%s[t] = { #b%s }:bv[64]).' "$out_idx" "$bit"
       ;;
   esac
 }

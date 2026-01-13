@@ -34,7 +34,7 @@ class TestSendTxCrypto(unittest.TestCase):
         
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.init_chain_state()
-        def mock_tau_response(rule_text, target_output_stream_index=1, input_stream_values=None):
+        def mock_tau_response(rule_text=None, target_output_stream_index=1, input_stream_values=None):
             # New bitvector model: return boolean on o1
             if target_output_stream_index == 0:
                 return tau_defs.ACK_RULE_PROCESSED
@@ -79,6 +79,16 @@ class TestSendTxCrypto(unittest.TestCase):
         # Restore original DB path
         import config
         config.set_database_path(self.old_db_path)
+        
+        # Reset globals
+        if hasattr(sendtx, '_PY_ECC_AVAILABLE'):
+            try:
+                import py_ecc.bls
+                sendtx._PY_ECC_AVAILABLE = True
+                sendtx._PY_ECC_BLS = py_ecc.bls
+            except ImportError:
+                sendtx._PY_ECC_AVAILABLE = False
+                sendtx._PY_ECC_BLS = None
 
     def _create_tx(self, transfers, expiration=None, sequence=None, sender_privkey=None, signature=None, sender_pubkey=None):
         ops = {"1": transfers}
@@ -115,7 +125,7 @@ class TestSendTxCrypto(unittest.TestCase):
         sendtx._PY_ECC_AVAILABLE = True
         sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
+        self.assertTrue(result.startswith("SUCCESS: Transaction queued"), msg=f"Transaction failed: {result}")
         # Phase 2: sendtx does not increment sequence number locally.
         # self.assertEqual(chain_state.get_sequence_number(pk_hex), initial_seq + 1)
 
@@ -209,7 +219,7 @@ class TestSendTxCrypto(unittest.TestCase):
         tx_json = self._create_tx([[GENESIS, ADDR_A, "5"]], signature="00")
         sendtx._PY_ECC_AVAILABLE = False
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
+        self.assertTrue(result.startswith("SUCCESS: Transaction queued"), msg=f"Transaction failed: {result}")
         # self.assertEqual(chain_state.get_sequence_number(GENESIS), initial_seq)
         # self.assertEqual(chain_state.get_balance(GENESIS), initial_gen_balance - 5)
         mempool = db.get_mempool_txs()

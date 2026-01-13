@@ -16,7 +16,16 @@ TRANSACTION_VALIDATION_FAIL = TAU_VALUE_ZERO
 TRANSACTION_VALIDATION_SUCCESS = TAU_VALUE_ONE
 
 # --- Success / Acknowledgement Codes for other operations ---
+# --- Success / Acknowledgement Codes for other operations ---
 ACK_RULE_PROCESSED = TAU_VALUE_ONE
+ACK_RULE_PROCESSED_SBF = TAU_VALUE_ONE
+
+# --- Legacy Error Codes (Mapped to Generic Failure #b0) ---
+FAIL_INSUFFICIENT_FUNDS_SBF = TAU_VALUE_ZERO
+FAIL_SRC_EQ_DEST_SBF = TAU_VALUE_ZERO
+FAIL_ZERO_AMOUNT_SBF = TAU_VALUE_ZERO
+FAIL_INVALID_FORMAT_SBF = TAU_VALUE_ZERO
+FAIL_INVALID_SBF = TAU_VALUE_ZERO
 
 # --- Tau Pin/Stream Names (Symbolic, for clarity in wrapper logic) ---
 # Inputs

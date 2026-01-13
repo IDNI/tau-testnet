@@ -20,6 +20,9 @@ class TauProcessError(TauTestnetError):
 
 class TauCommunicationError(TauTestnetError):
     """Raised when communication with the Tau process fails."""
+    def __init__(self, message: str, last_state: str | None = None):
+        super().__init__(message)
+        self.last_state = last_state
 
 
 class CommandError(TauTestnetError):

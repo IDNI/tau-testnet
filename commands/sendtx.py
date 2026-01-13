@@ -152,12 +152,13 @@ def _decode_single_transfer_output(output_bv_str: str, expected_amount_int: int)
         logger.debug("Tau rejected transfer (output was 0).")
         return False
 
-    if output_val == expected_amount_int:
-        logger.debug("Tau accepted transfer; echoed input amount.")
+    # Accept either explicit amount echo OR generic success flag (1)
+    if output_val == expected_amount_int or output_val == 1:
+        logger.debug("Tau accepted transfer (output=%s).", output_val)
         return True
 
     logger.warning(
-        "Unexpected Tau output value: '%s' (parsed as %s), expected %s",
+        "Unexpected Tau output value: '%s' (parsed as %s), expected %s or 1",
         output_bv_str,
         output_val,
         expected_amount_int,

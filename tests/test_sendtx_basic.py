@@ -30,7 +30,7 @@ class TestSendTxBasic(unittest.TestCase):
         db.init_db(); chain_state.init_chain_state()
         db.clear_mempool()  # Clear mempool for test isolation
         # patch Tau and disable signature verification/sequence enforcement for basic tests
-        def mock_tau_response(rule_text, target_output_stream_index=1, input_stream_values=None):
+        def mock_tau_response(rule_text=None, target_output_stream_index=1, input_stream_values=None):
             # Tau returns echoed amount on success, 0 on failure
             if target_output_stream_index == 0:
                 return tau_defs.ACK_RULE_PROCESSED
@@ -64,7 +64,7 @@ class TestSendTxBasic(unittest.TestCase):
                 return tau_defs.TAU_VALUE_ZERO
             if amount > balance:
                 return tau_defs.TAU_VALUE_ZERO
-            return str(amount)
+            return tau_defs.TAU_VALUE_ONE
         self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau', mock_tau_response).start()
         sendtx._PY_ECC_AVAILABLE = False
         # Patch pubkey validation to bypass format checks for basic tests
@@ -74,6 +74,16 @@ class TestSendTxBasic(unittest.TestCase):
 
     def tearDown(self):
         patch.stopall()
+        # Reset globals that might affect other tests
+        if hasattr(sendtx, '_PY_ECC_AVAILABLE'):
+            # Re-detect or set to default
+            try:
+                import py_ecc.bls
+                sendtx._PY_ECC_AVAILABLE = True
+                sendtx._PY_ECC_BLS = py_ecc.bls
+            except ImportError:
+                sendtx._PY_ECC_AVAILABLE = False
+                sendtx._PY_ECC_BLS = None
 
     def _create_tx(self, transfers, expiration=None, sequence=None, signature="SIG", sender_pubkey=None):
         # copy helper logic verbatim from original _create_tx_json

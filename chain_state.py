@@ -836,29 +836,6 @@ def initialize_persistent_state():
         rebuild_state_from_blockchain(start_block=0)
         print(f"[DEBUG][chain_state] Rebuild complete. Committing state with latest block hash: '{latest_hash[:16]}...'")
         commit_state_to_db(latest_hash)
-        # Load built-in rules into Tau from rules directory
-        try:
-            import os
-
-            rules_dir = os.path.join(os.path.dirname(__file__), 'rules')
-            if os.path.isdir(rules_dir):
-                print(f"[DEBUG][chain_state] Found rules directory at: {rules_dir}")
-                for fname in sorted(os.listdir(rules_dir)):
-                    path = os.path.join(rules_dir, fname)
-                    if os.path.isfile(path) and fname and fname[0].isdigit():
-                        with open(path, 'r', encoding='utf-8') as f:
-                            # Read all lines, filter out comments (lines starting with #), and join them.
-                            rule_text = " ".join([line.strip() for line in f if not line.strip().startswith('#')]).strip()
-                        
-                        if rule_text:
-                            print(f"[INFO][chain_state] Injecting built-in rule '{fname}' into Tau i0")
-                            print(f"[DEBUG][chain_state] Rule content: {rule_text}")
-                            tau_manager.communicate_with_tau(rule_text=rule_text,
-                                                             target_output_stream_index=0)
-            else:
-                print(f"[DEBUG][chain_state] Rules directory not found at: {rules_dir}")
-        except Exception as e:
-            print(f"[ERROR][chain_state] Failed to inject built-in rules into Tau: {e}")
     else:
         # Verify consistency with blockchain head
         print("[DEBUG][chain_state] Verifying consistency between loaded state and blockchain head...")
@@ -872,3 +849,30 @@ def initialize_persistent_state():
             print(f"[INFO][chain_state] Persistent state is consistent and up-to-date with the blockchain.")
 
     print("[DEBUG][chain_state] > initialize_persistent_state finished")
+
+
+def load_builtin_rules_from_disk() -> list[str]:
+    """
+    Load built-in Tau rule statements from the local `rules/` directory.
+
+    Each file is expected to contain one or more Tau rule statements. Lines starting with '#'
+    are treated as comments and ignored.
+    """
+    import os
+
+    rules_dir = os.path.join(os.path.dirname(__file__), "rules")
+    if not os.path.isdir(rules_dir):
+        return []
+
+    rules: list[str] = []
+    for fname in sorted(os.listdir(rules_dir)):
+        path = os.path.join(rules_dir, fname)
+        # Keep existing convention: only numeric-prefixed rule files are injected.
+        if not (os.path.isfile(path) and fname and fname[0].isdigit()):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            # Read all lines, filter out comments, and join into a single Tau input.
+            rule_text = " ".join([line.strip() for line in f if not line.strip().startswith("#")]).strip()
+        if rule_text:
+            rules.append(rule_text)
+    return rules

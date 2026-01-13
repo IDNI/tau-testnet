@@ -5,6 +5,8 @@ import sys
 import threading
 import trio
 import argparse
+import trio_websocket
+
 
 from app.container import ServiceContainer
 from network import NetworkService
@@ -24,6 +26,120 @@ logger = logging.getLogger("tau.server")
 NETWORK_THREAD = None
 NETWORK_STOP_FLAG = threading.Event()
 # --- Command Dispatch Table ---
+
+
+def process_command(raw_command: str, container: ServiceContainer, client_label: str) -> tuple[bool, str]:
+    """
+    Process a single command string from any source (TCP or WS).
+    
+    Args:
+        raw_command: The full command string (e.g., "getbalance <key>")
+        container: ServiceContainer instance
+        client_label: Identifier for logging (IP:Port or WS ID)
+        
+    Returns:
+        (success, response_string)
+        success: True if the command was processed (even if it resulted in a Tau error).
+                 False if it was a protocol level error (empty, unknown command, malformed).
+        response_string: The response to send back to the client. Does NOT include trailing newline.
+    """
+    if not raw_command:
+        return False, "ERROR: Received empty command."
+
+    # Handle Handshake (Virtual Command)
+    if raw_command.startswith("hello version="):
+        # Format: hello version=1
+        try:
+            version_val = raw_command.split("=")[1].strip()
+            if version_val == "1":
+                # Return standard handshake response
+                # We can inject node_id if we want, for now minimal is fine
+                return True, f"ok version=1 env={container.settings.env} node=tau-node"
+            else:
+                return False, f"error unsupported_version expected=1 got={version_val}"
+        except IndexError:
+            return False, "error malformed_handshake"
+
+    command_str = raw_command.lower()
+    parts = raw_command.split()
+    if not parts:
+        return False, "ERROR: Empty command."
+        
+    command_name = parts[0].lower()
+    logger.debug("Processing command from %s: %s", client_label, command_name)
+
+    command_handlers = container.command_handlers
+    handler = command_handlers.get(command_name)
+    
+    if not handler:
+        logger.warning("Unknown command from %s: %s", client_label, command_name)
+        return False, f"ERROR: Unknown command '{command_name}'"
+
+    # 1. Local execution path
+    if hasattr(handler, 'execute'):
+        try:
+            resp = handler.execute(raw_command, container)
+            return True, resp.rstrip() # Ensure we control newlines
+        except Exception as exc:
+            logger.exception("Error executing local command %s for %s", command_name, client_label)
+            return True, f"ERROR: {exc}"
+
+    # 2. Tau execution path
+    db_module = container.db
+    tau_module = container.tau_manager
+    mempool_state = container.mempool_state
+
+    # Map parameters to IDs for Tau commands
+    mapped = [parts[0]]
+    # We don't really need mapped_params list for logic, just for debug if we wanted
+    for param in parts[1:]:
+        if re.fullmatch(r"[01]+", param) or param.isdigit():
+            mapped.append(param)
+        else:
+            yid = db_module.get_string_id(param)
+            mapped.append(yid)
+    
+    parts = mapped
+
+    try:
+        tau_input = handler.encode_command(parts)
+    except TauTestnetError as exc:
+        logger.warning("Encoding command %s failed for %s: %s", command_name, client_label, exc)
+        return True, f"ERROR: {exc}"
+    except Exception as exc:
+        logger.exception("Encoding command %s failed for %s", command_name, client_label)
+        return True, f"ERROR: {exc}"
+
+    if not tau_module.tau_ready.wait(timeout=config.CLIENT_WAIT_TIMEOUT):
+        logger.error("Tau process not ready for command %s from %s", command_name, client_label)
+        return True, "ERROR: Tau process not ready."
+
+    try:
+        tau_output = tau_module.communicate_with_tau(tau_input)
+        decoded = handler.decode_output(tau_output, tau_input)
+        result_message = handler.handle_result(decoded, tau_input, mempool_state)
+    except TimeoutError:
+        logger.error("Timeout communicating with Tau for %s", client_label)
+        result_message = "ERROR: Timeout communicating with Tau process."
+    except TauTestnetError as e:
+        logger.warning("Tau error processing %s for %s: %s", command_name, client_label, e)
+        result_message = f"ERROR: {e}"
+    except Exception:
+        logger.exception("Internal error processing %s for %s", command_name, client_label)
+        result_message = "ERROR: Internal error processing command."
+
+    # Reverse map IDs
+    try:
+        result_message = re.sub(
+            r"y(\\d+)",
+            lambda m: db_module.get_text_by_id("y" + m.group(1)),
+            result_message,
+        )
+    except Exception:
+        logger.debug("Failed to reverse-map Tau IDs for %s", client_label)
+    
+    return True, result_message
+
 
 
 # --- NetworkService helpers ---
@@ -65,26 +181,148 @@ def _start_network_background(container: ServiceContainer) -> None:
     NETWORK_THREAD = t
 
 
+# --- WebSocket Server ---
+async def websocket_handler(request):
+    """
+    Handles WebSocket connections.
+    Includes Handshake, Origin Check, and Command Processing.
+    """
+    container = request.server_container
+    ws = await request.accept()
+    
+    # Origin Check (Basic)
+    headers = dict(request.headers)
+    origin = headers.get("Origin") or headers.get("origin")
+    
+    # Allow missing origin (localhost tools) or localhost/file
+    allowed = False
+    if not origin:
+        allowed = True
+    elif origin == "null":
+        allowed = True
+    elif "localhost" in origin or "127.0.0.1" in origin:
+        allowed = True
+        
+    if not allowed:
+        logger.warning("Rejected WS connection from disallowed origin: %s", origin)
+        await ws.send_message("error disallowed_origin")
+        await ws.aclose()
+        return
+
+    client_label = f"WS:{id(ws)}"
+    logger.info("WS Connection accepted: %s (Origin: %s)", client_label, origin)
+
+    # Rate Limiting State (Basic Token Bucket)
+    # Rate: 5 req/sec, Burst: 10
+    bucket_tokens = 10.0
+    last_check = trio.current_time()
+    
+    try:
+        while True:
+            try:
+                message = await ws.get_message()
+            except trio_websocket.ConnectionClosed:
+                break
+                
+            # Rate Limit Check
+            now = trio.current_time()
+            elapsed = now - last_check
+            last_check = now
+            bucket_tokens = min(10.0, bucket_tokens + elapsed * 5.0)
+            
+            if bucket_tokens < 1.0:
+                 logger.warning("Rate limit exceeded for %s", client_label)
+                 await ws.send_message("error rate_limit_exceeded")
+                 # Optionally close, or just drop
+                 continue
+            bucket_tokens -= 1.0
+            
+            # Process
+            success, response = process_command(message, container, client_label)
+            await ws.send_message(response)
+            
+            # Close on fatal protocol errors if desired, or keep open.
+            # Here we keep open unless handshake failed fatally? 
+            # process_command returns success=False for protocol errors, but we usually want to keep connection for invalid commands (typos)
+            # Only close if it was a handshake failure that mandated it?
+            # For now, keep open.
+            
+    except Exception as e:
+        logger.error("WS Handler Error %s: %s", client_label, e)
+    finally:
+        logger.info("WS Client disconnected: %s", client_label)
+
+
+def _start_websocket_server(container: ServiceContainer) -> None:
+    """
+    Starts the Trio WebSocket server in a separate daemon thread.
+    """
+    def _ws_runner():
+        ws_port = config.PORT + 1
+        # Try to find a free port if busy, or just fail? 
+        # Plan says: Handle port conflicts (start at config.PORT + 1, scan if busy).
+        
+        # We need a partial to pass container to handler, or attach it to the request object wrapper?
+        # trio-websocket handler signature is fn(request).
+        # We can wrap it.
+        
+        async def handler_with_container(request):
+            request.server_container = container
+            await websocket_handler(request)
+
+        async def main():
+            # Port scanning logic
+            actual_ws_port = ws_port
+            # Simple scan
+            for i in range(10):
+                try:
+                    p = actual_ws_port + i
+                    logger.info("Attempting to bind WS to 127.0.0.1:%s", p)
+                    # serve_websocket blocks until cancelled.
+                    # We need to run it.
+                    await trio_websocket.serve_websocket(
+                        handler_with_container, 
+                        "127.0.0.1", 
+                        p, 
+                        ssl_context=None
+                    )
+                    # If it returns, it finished?
+                    logger.warning("WS serve returned (unexpected).")
+                    break 
+                except OSError:
+                    logger.warning("WS Port %s busy, trying next...", p)
+                except Exception as e:
+                    logger.error("WS Server failed to start: %s", e)
+                    break
+        
+        try:
+           logger.info("WebSocket Thread running trio loop...")
+           trio.run(main)
+        except Exception as e:
+           logger.error("WS Thread crashed: %s", e)
+
+    t = threading.Thread(target=_ws_runner, name="WebSocketServerThread", daemon=True)
+    t.start()
+
+
+
 def handle_client(conn, addr, container: ServiceContainer):
     """Handles a single client connection, supports multiple commands."""
-    import datetime
     import socket
 
     client_label = f"{addr[0]}:{addr[1]}" if isinstance(addr, tuple) else str(addr)
     logger.info("Connection accepted from %s", client_label)
-
-    db_module = container.db
-    chain_state_module = container.chain_state
-    tau_module = container.tau_manager
-    mempool_state = container.mempool_state
-    command_handlers = container.command_handlers
 
     try:
         with conn:
             while True:
                 try:
                     data = conn.recv(config.BUFFER_SIZE)
-                except socket.error as exc:
+                except (ConnectionResetError, ConnectionAbortedError):
+                    # Normal client disconnect patterns (e.g. browser probes, clients closing early).
+                    logger.info("Client %s reset/aborted connection", client_label)
+                    break
+                except socket.error:
                     logger.exception("Socket error with %s", client_label)
                     break
 
@@ -99,93 +337,18 @@ def handle_client(conn, addr, container: ServiceContainer):
                     conn.sendall(b"ERROR: Invalid UTF-8 encoding\n")
                     continue
 
-                command_str = raw.lower()
-                if not command_str:
-                    conn.sendall(b"ERROR: Received empty command.")
-                    continue
-
-                # Determine command name (first word)
-                parts = raw.split()
-                if not parts:
-                    continue
-                command_name = parts[0].lower()
-
-                logger.debug("Received command from %s: %s", client_label, command_name)
-
-                # Look up handler
-                handler = command_handlers.get(command_name)
-                if not handler:
-                    msg = f"ERROR: Unknown command '{command_name}'\n"
-                    logger.warning("Unknown command from %s: %s", client_label, command_name)
-                    conn.sendall(msg.encode('utf-8'))
-                    continue
-
-                # 1. Local execution path (if handler supports it)
-                if hasattr(handler, 'execute'):
-                    try:
-                        resp = handler.execute(raw, container)
-                        conn.sendall(resp.encode('utf-8'))
-                    except Exception as exc:
-                        logger.exception("Error executing local command %s for %s", command_name, client_label)
-                        conn.sendall(f"ERROR: {exc}\r\n".encode('utf-8'))
-                    continue
-
-                # 2. Tau execution path
-                # Map parameters to IDs for Tau commands
-                mapped = [parts[0]]
-                mapped_params = []
-                for param in parts[1:]:
-                    if re.fullmatch(r"[01]+", param) or param.isdigit():
-                        mapped.append(param)
-                        mapped_params.append(param)
-                    else:
-                        yid = db_module.get_string_id(param)
-                        mapped.append(yid)
-                        mapped_params.append(f"{param}->{yid}")
-                logger.debug("Mapped parameters for %s: %s", command_name, mapped_params)
-                parts = mapped
-
+                # Use shared process_command logic
+                success, result_message = process_command(raw, container, client_label)
+                
+                # Append newline for TCP clients if missing (process_command returns raw response)
+                if not result_message.endswith("\n"):
+                    result_message += "\r\n"
+                
                 try:
-                    tau_input = handler.encode_command(parts)
-                except TauTestnetError as exc:
-                    logger.warning("Encoding command %s failed for %s: %s", command_name, client_label, exc)
-                    conn.sendall(f"ERROR: {exc}".encode('utf-8'))
-                    continue
-                except Exception as exc:
-                    logger.exception("Encoding command %s failed for %s", command_name, client_label)
-                    conn.sendall(f"ERROR: {exc}".encode('utf-8'))
-                    continue
-
-                if not tau_module.tau_ready.wait(timeout=config.CLIENT_WAIT_TIMEOUT):
-                    logger.error("Tau process not ready for command %s from %s", command_name, client_label)
-                    conn.sendall(b"ERROR: Tau process not ready.")
-                    continue
-
-                try:
-                    tau_output = tau_module.communicate_with_tau(tau_input)
-                    decoded = handler.decode_output(tau_output, tau_input)
-                    result_message = handler.handle_result(decoded, tau_input, mempool_state)
-                except TimeoutError:
-                    logger.error("Timeout communicating with Tau for %s", client_label)
-                    result_message = "ERROR: Timeout communicating with Tau process."
-                except TauTestnetError as e:
-                    logger.warning("Tau error processing %s for %s: %s", command_name, client_label, e)
-                    result_message = f"ERROR: {e}"
-                except Exception:
-                    logger.exception("Internal error processing %s for %s", command_name, client_label)
-                    result_message = "ERROR: Internal error processing command."
-
-                try:
-                    result_message = re.sub(
-                        r"y(\\d+)",
-                        lambda m: db_module.get_text_by_id("y" + m.group(1)),
-                        result_message,
-                    ) + "\r\n"
-                except Exception:
-                    logger.debug("Failed to reverse-map Tau IDs for %s", client_label)
-                    result_message = result_message + "\r\n"
-
-                conn.sendall(result_message.encode('utf-8'))
+                    conn.sendall(result_message.encode('utf-8'))
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    logger.info("Client %s disconnected during send", client_label)
+                    break
     except Exception:
         logger.exception("Unexpected error in handle_client for %s", client_label)
     finally:
@@ -208,57 +371,92 @@ def _run_server(container: ServiceContainer):
     logger.info("Initializing database at %s", config.STRING_DB_PATH)
     db_module.init_db()
 
+    # Initialize Chain State EARLY (so we can restore it on first boot if needed)
+    logger.info("Initializing and loading chain state...")
+    chain_state_module.initialize_persistent_state()
+
+    # Define the State Restore Callback
+    # This will be called by the Tau Manager thread whenever the process comes up (fresh or restart)
+    def _restore_callback():
+        restore_flag = os.environ.get("TAU_RESTORE_RULES_ON_STARTUP", "").strip().lower()
+        restore_enabled = restore_flag not in {"0", "false", "no", "off"}
+        if container.settings.env == "test" and restore_flag == "":
+            restore_enabled = False
+        
+        saved_rules = chain_state_module.get_rules_state()
+        
+        # Safe Mode Fallback:
+        # If TAU_FORCE_FRESH_START is set (e.g. by tau_manager after a crash),
+        # we ignore the persisted (potentially bad) state and force a fresh load of built-in rules.
+        if os.environ.get("TAU_FORCE_FRESH_START") == "1":
+            logger.warning("TAU_FORCE_FRESH_START=1 detected: Ignoring persisted DB state to recover with Safe Mode (Genesis + Built-ins).")
+            saved_rules = None
+
+        if saved_rules and restore_enabled:
+            try:
+                logger.info("Restoring persisted Tau rules/state (len=%s)...", len(saved_rules))
+                # Note: communicate_with_tau checks 'tau_process_ready' which is SET before this callback runs.
+                out = tau_module.communicate_with_tau(
+                    rule_text=saved_rules,
+                    target_output_stream_index=0,
+                )
+                logger.info("Tau restore result (o0): %s", out)
+            except Exception:
+                logger.exception("Failed to restore persisted Tau rules/state during callback")
+        elif saved_rules:
+             logger.info("Persisted rules found but restore is disabled (set TAU_RESTORE_RULES_ON_STARTUP=1).")
+        else:
+            # No persisted rules yet (fresh DB / genesis). Load built-in rule files after Tau is up.
+            try:
+                builtin_rules = []
+                if hasattr(chain_state_module, "load_builtin_rules_from_disk"):
+                    builtin_rules = chain_state_module.load_builtin_rules_from_disk()
+
+                if builtin_rules:
+                    logger.info("No persisted Tau rules found; injecting %s built-in rules from disk...", len(builtin_rules))
+                    for rule_text in builtin_rules:
+                        tau_module.communicate_with_tau(rule_text=rule_text, target_output_stream_index=0)
+
+                    # Persist the resulting rules snapshot so restarts don't re-inject.
+                    latest = db_module.get_latest_block()
+                    latest_hash = latest["block_hash"] if latest else ""
+                    chain_state_module.commit_state_to_db(latest_hash)
+                    logger.info("Built-in rules injected and persisted (last_block_hash=%s).", latest_hash[:16] if latest_hash else "")
+                else:
+                    logger.info("No persisted Tau rules found and no built-in rules on disk; leaving Tau spec as-is.")
+            except Exception:
+                logger.exception("Failed to inject built-in rules during Tau restore callback")
+
+    # Register the callback BEFORE starting the manager
+    tau_module.set_state_restore_callback(_restore_callback)
+
     logger.info("Starting Tau Process Manager Thread...")
     manager_thread = threading.Thread(target=tau_module.start_and_manage_tau_process, daemon=True)
     manager_thread.start()
 
     logger.info("Waiting for Tau to signal readiness...")
+    # This waits for 'tau_ready', which is set AFTER the callback completes
     if not tau_module.tau_ready.wait(timeout=config.CLIENT_WAIT_TIMEOUT):
         tau_module.request_shutdown()
         raise TauProcessError("Tau did not signal readiness within the expected timeout.")
 
     logger.info("Tau is ready.")
-    logger.info("Initializing and loading chain state...")
-    chain_state_module.initialize_persistent_state()
-
-    # If we have persisted rules/state, re-apply them to the fresh Tau process so a
-    # restarted node continues from the last committed chain state.
-    #
-    # This was previously deferred, which made restarts confusing: the DB had blocks/state,
-    # but Tau itself was reset to the genesis program until a manual injection happened.
-    restore_flag = os.environ.get("TAU_RESTORE_RULES_ON_STARTUP", "").strip().lower()
-    restore_enabled = restore_flag not in {"0", "false", "no", "off"}
-    # Keep test runs deterministic by default.
-    if container.settings.env == "test" and restore_flag == "":
-        restore_enabled = False
+    
+    # (Removed old restore logic block here as it's now handled by the callback)
 
     logger.info("Starting NetworkService background thread...")
     _start_network_background(container)
+
+    # Start WebSocket Server
+    logger.info("Starting WebSocket Server background thread...")
+    _start_websocket_server(container)
 
     # Start Miner if configured
     if container.miner:
         logger.info("Starting Automated Miner...")
         container.miner.start()
 
-    saved_rules = chain_state_module.get_rules_state()
-    if saved_rules and restore_enabled:
-        try:
-            logger.info(
-                "Restoring persisted Tau rules/state into Tau process (len=%s) ...",
-                len(saved_rules),
-            )
-            out = tau_module.communicate_with_tau(
-                rule_text=saved_rules,
-                target_output_stream_index=0,
-            )
-            logger.info("Tau restore result (o0): %s", out)
-        except Exception:
-            logger.exception("Failed to restore persisted Tau rules/state on startup")
-    elif saved_rules:
-        logger.info(
-            "Persisted rules state detected; skipping automatic restore "
-            "(set TAU_RESTORE_RULES_ON_STARTUP=1 to enable)."
-        )
+
 
     server_socket = None
     actual_port = config.PORT

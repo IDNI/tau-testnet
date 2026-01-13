@@ -501,27 +501,13 @@ function validateRuleSyntax(rule) {
 }
 
 function generateRandomTauRule() {
-    const outIdx = 5 + Math.floor(Math.random() * 10);
-    const exprs = [
-        "(i1[t] & i2[t] | { #b0 }:bv)",
-        "(i3[t] | i4[t] | { #b0 }:bv)",
-        "((i1[t] | { #b0 }:bv)')",
-        "((i1[t] | i2[t]) & (i3[t] | { 170 }:bv))",
-        "((i4[t] | { 66 }:bv)' | (i1[t] & i2[t]))",
-        "(((i1[t] | i2[t]) & i3[t]) | { #b0 }:bv)",
-        "(((i1[t] & i2[t] | { #b0 }:bv) | (i3[t] | i4[t] | { #b0 }:bv)))"
-    ];
-    const expr = exprs[Math.floor(Math.random() * exprs.length)];
-    const shape = Math.floor(Math.random() * 4);
+    // Generate using stream indices beyond the pre-defined rules.
+    const RESERVED_MAX_IDX = 4;
+    const outIdx = (RESERVED_MAX_IDX + 1) + Math.floor(Math.random() * 10); // o5..o14
+    const bit = Math.floor(Math.random() * 2);
 
-    let rule = "";
-    if (shape === 0) rule = `always (o${outIdx}[t] = ${expr}).`;
-    else if (shape === 1) rule = `always ((${expr} != { #b0 }:bv) ? o${outIdx}[t] = ${expr} : o${outIdx}[t] = (${expr})').`;
-    else if (shape === 2) rule = `always ((${expr} = { #b0 }:bv) ? o${outIdx}[t] = ${expr} : o${outIdx}[t] = (${expr})').`;
-    else {
-        const bit = Math.floor(Math.random() * 2);
-        rule = `always (o${outIdx}[t] = { #b${bit} }:bv).`;
-    }
+    // Keep this intentionally simple: constant boolean on an unused output stream.
+    const rule = `always (o${outIdx}[t] = { #b${bit} }:bv[1]).`;
     return rule;
 }
 

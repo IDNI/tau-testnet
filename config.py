@@ -35,6 +35,7 @@ class TauSettings:
     docker_image: str = 'tau'
     container_workdir: str = '/data'
     ready_signal: str = "Execution step: 0"
+    comm_debug_path: Optional[str] = None
 
     def validate(self) -> None:
         if not self.program_file:
@@ -50,7 +51,7 @@ class TauSettings:
 @dataclass
 class TimeoutSettings:
     process_timeout: int = 120
-    comm_timeout: int = 99999
+    comm_timeout: int = 60
     client_wait_timeout: int = 10
     shutdown_timeout: int = 1
 
@@ -246,6 +247,7 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_DOCKER_IMAGE": ("tau", "docker_image", str),
     "TAU_CONTAINER_WORKDIR": ("tau", "container_workdir", str),
     "TAU_READY_SIGNAL": ("tau", "ready_signal", str),
+    "TAU_COMM_DEBUG_PATH": ("tau", "comm_debug_path", str),
     "TAU_PROCESS_TIMEOUT": ("timeouts", "process_timeout", int),
     "TAU_COMM_TIMEOUT": ("timeouts", "comm_timeout", int),
     "TAU_CLIENT_WAIT_TIMEOUT": ("timeouts", "client_wait_timeout", int),
@@ -326,7 +328,7 @@ def load_settings(env: Optional[str] = None, overrides: Optional[Dict[str, Any]]
 
 def _sync_legacy_exports(current: Settings) -> None:
     global HOST, PORT, BUFFER_SIZE
-    global TAU_PROGRAM_FILE, TAU_DOCKER_IMAGE, CONTAINER_WORKDIR, TAU_READY_SIGNAL
+    global TAU_PROGRAM_FILE, TAU_DOCKER_IMAGE, CONTAINER_WORKDIR, TAU_READY_SIGNAL, COMM_DEBUG_PATH
     global PROCESS_TIMEOUT, COMM_TIMEOUT, CLIENT_WAIT_TIMEOUT, SHUTDOWN_TIMEOUT
     global STRING_DB_PATH
     global BOOTSTRAP_PEERS, NETWORK_ID, GENESIS_HASH, NETWORK_LISTEN, PEERSTORE_PATH, peerstore_path
@@ -342,6 +344,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     TAU_DOCKER_IMAGE = current.tau.docker_image
     CONTAINER_WORKDIR = current.tau.container_workdir
     TAU_READY_SIGNAL = current.tau.ready_signal
+    COMM_DEBUG_PATH = current.tau.comm_debug_path
 
     PROCESS_TIMEOUT = current.timeouts.process_timeout
     COMM_TIMEOUT = current.timeouts.comm_timeout
@@ -408,6 +411,7 @@ __all__ = [
     "TAU_DOCKER_IMAGE",
     "CONTAINER_WORKDIR",
     "TAU_READY_SIGNAL",
+    "COMM_DEBUG_PATH",
     "PROCESS_TIMEOUT",
     "COMM_TIMEOUT",
     "CLIENT_WAIT_TIMEOUT",
