@@ -194,6 +194,12 @@ class ServiceContainer:
             dht_record_ttl=self.settings.dht.record_ttl,
             dht_validator_namespaces=list(self.settings.dht.validator_namespaces),
             dht_bootstrap_peers=dht_bootstrap_peers,
+            conn_low_water=self.settings.network.conn_low_water,
+            conn_high_water=self.settings.network.conn_high_water,
+            conn_grace_period=self.settings.network.conn_grace_period,
+            max_connections=self.settings.network.max_connections,
+            rate_limit_per_peer=self.settings.network.rate_limit_per_peer,
+            burst_per_peer=self.settings.network.burst_per_peer,
         )
 
     def get_command_handler(self, name: str) -> Any:

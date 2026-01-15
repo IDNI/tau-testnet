@@ -22,6 +22,15 @@ class NetworkConfig:
     peerstore_path: Optional[str] = None
     # Optional raw private key bytes for persistent identity (implementation-specific)
     identity_key: Optional[bytes] = None
+    
+    # Connection Limits
+    conn_low_water: int = 50
+    conn_high_water: int = 100
+    conn_grace_period: float = 20.0
+    max_connections: int = 200
+    rate_limit_per_peer: float = 2.0
+    burst_per_peer: float = 10.0
+
     dht_record_ttl: int = 24 * 60 * 60
     dht_validator_namespaces: List[str] = field(default_factory=lambda: ["block", "tx", "state"])
     dht_bootstrap_peers: List[BootstrapPeer] = field(default_factory=list)

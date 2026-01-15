@@ -79,6 +79,14 @@ class NetworkSettings:
     peerstore_path: Optional[str] = None
     # Optional path to a private key file for persistent libp2p identity
     identity_key_path: Optional[str] = None
+    
+    # Connection Limits
+    conn_low_water: int = 50
+    conn_high_water: int = 100
+    conn_grace_period: float = 20.0
+    max_connections: int = 200
+    rate_limit_per_peer: float = 2.0
+    burst_per_peer: float = 10.0
 
     def validate(self) -> None:
         if not self.network_id:
@@ -207,12 +215,18 @@ BASE_DEFAULTS: Dict[str, Any] = {
         "bootstrap_peers": [
             {
                 "peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC", #MAIN NODE
-                "addrs": ["/ip4/127.0.0.1/tcp/4001"],
+                "addrs": ["/dns4/testnet.tau.net/tcp/4001"],
             },
         ],
         "peerstore_path": None,
         # Persist the libp2p identity here unless --ephemeral-identity is set.
         "identity_key_path": os.path.join(DATA_DIR, "identity.key"),
+        "conn_low_water": 50,
+        "conn_high_water": 100,
+        "conn_grace_period": 20.0,
+        "max_connections": 200,
+        "rate_limit_per_peer": 2.0,
+        "burst_per_peer": 10.0,
     },
     "dht": asdict(DHTSettings()),
     "logging": asdict(LoggingSettings()),
@@ -228,6 +242,14 @@ ENVIRONMENT_OVERRIDES: Dict[str, Dict[str, Any]] = {
             "comm_timeout": 60,
             "client_wait_timeout": 5,
             "shutdown_timeout": 1,
+        },
+        "network": {
+            "bootstrap_peers": [
+                {
+                    "peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC",
+                    "addrs": ["/ip4/127.0.0.1/tcp/4001"],
+                },
+            ],
         },
     },
     "production": {
@@ -259,6 +281,12 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_BOOTSTRAP_PEERS": ("network", "bootstrap_peers", lambda value: json.loads(value)),
     "TAU_PEERSTORE_PATH": ("network", "peerstore_path", str),
     "TAU_IDENTITY_KEY_PATH": ("network", "identity_key_path", str),
+    "TAU_CONN_LOW_WATER": ("network", "conn_low_water", int),
+    "TAU_CONN_HIGH_WATER": ("network", "conn_high_water", int),
+    "TAU_CONN_GRACE_PERIOD": ("network", "conn_grace_period", float),
+    "TAU_MAX_CONNECTIONS": ("network", "max_connections", int),
+    "TAU_RATE_LIMIT_PER_PEER": ("network", "rate_limit_per_peer", float),
+    "TAU_BURST_PER_PEER": ("network", "burst_per_peer", float),
     "TAU_DHT_TTL": ("dht", "record_ttl", int),
     "TAU_DHT_VALIDATORS": (
         "dht",

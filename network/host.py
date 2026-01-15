@@ -9,6 +9,8 @@ from libp2p import new_host
 from libp2p.abc import IHost, INotifee
 from libp2p.peer.id import ID
 from libp2p.peer.peerstore import PERMANENT_ADDR_TTL
+from libp2p.rcmgr.manager import ResourceManager, ResourceLimits
+from libp2p.rcmgr.connection_limits import ConnectionLimits
 
 import db
 from .config import NetworkConfig
@@ -123,13 +125,43 @@ class HostManager:
         except Exception:
             logger.debug("Failed to compute peer_id from identity key", exc_info=True)
 
+        # Configure Resource Manager
+        # Map config values to ResourceLimits and ConnectionLimits
+        # max_connections: Global hard cap (conn_max_connections)
+        # conn_high_water: Used here as max established inbound limit for safety
+        
+        res_limits = ResourceLimits(
+            max_connections=self._config.max_connections,
+            max_streams=10000, # Default
+        )
+        
+        conn_limits = ConnectionLimits(
+            max_established_total=self._config.max_connections,
+            max_established_inbound=self._config.conn_high_water,
+            max_established_per_peer=self._config.conn_high_water, # Allow robust peer connections but capped
+            max_pending_inbound=self._config.conn_low_water, # Use low water as pending limit?
+        )
+        
+        resource_manager = ResourceManager(
+            limits=res_limits,
+            connection_limits=conn_limits,
+            enable_metrics=True,
+            enable_rate_limiting=True,
+            connections_per_peer_per_sec=self._config.rate_limit_per_peer,
+            burst_connections_per_peer=self._config.burst_per_peer,
+        )
+
         self._host = new_host(
             key_pair=key_pair,
             listen_addrs=self._config.listen_addrs,
+            resource_manager=resource_manager,
         )
-        self._host.get_network().register_notifee(self._notifee)
         
-        # Load peerstore
+        # Explicitly ensure RM is attached
+        if hasattr(self._host.get_network(), "set_resource_manager"):
+            self._host.get_network().set_resource_manager(resource_manager)
+
+        self._host.get_network().register_notifee(self._notifee)
         peers = self._peerstore_persist.load()
         for pid, addrs in peers.items():
             try:
