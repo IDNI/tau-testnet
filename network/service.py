@@ -19,6 +19,33 @@ logger = logging.getLogger(__name__)
 
 MAX_HANDSHAKE_PROVIDERS = 50
 
+# Monkeypatch QUICStream._cleanup_resources to handle NoneType await error
+# This occurs during stream closure race conditions where resource_scope.done() 
+# seems to trigger an await on None (possibly in deeper libp2p code).
+try:
+    from libp2p.transport.quic.stream import QUICStream
+    
+    _orig_cleanup = QUICStream._cleanup_resources
+    
+    async def _safe_cleanup_resources(self) -> None:
+        try:
+             await _orig_cleanup(self)
+        except TypeError as e:
+             if "NoneType" in str(e) and "await" in str(e):
+                 # Swallow the specific error: object NoneType can't be used in 'await' expression
+                 logger.debug("Swallowed benign cleanup error in QUICStream: %s", e)
+             else:
+                 raise
+        except Exception:
+             # Let other exceptions bubble (or be logged by original handler if it catches them)
+             raise
+
+    QUICStream._cleanup_resources = _safe_cleanup_resources
+    logger.info("Monkeypatched QUICStream._cleanup_resources for safety")
+
+except Exception as e:
+    logger.warning("Failed to monkeypatch QUICStream: %s", e)
+
 class NetworkService:
     def __init__(
         self,

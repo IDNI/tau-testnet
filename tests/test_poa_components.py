@@ -17,6 +17,13 @@ def test_mempool_reconcile_with_block(temp_database):
 
 
 def test_sole_miner_mines_block_when_threshold_met(temp_database):
+    # Fix: ensure MINER_PRIVKEY is set for SoleMiner and block creation
+    original_privkey = config.MINER_PRIVKEY
+    original_pubkey = config.MINER_PUBKEY
+    config.MINER_PRIVKEY = "0" * 63 + "1"
+    if not config.MINER_PUBKEY:
+        config.MINER_PUBKEY = "0" * 96
+
     # Setup mocks for validation
     from commands import createblock
     original_validate = createblock._validate_signature
@@ -61,4 +68,8 @@ def test_sole_miner_mines_block_when_threshold_met(temp_database):
         createblock._validate_signature = original_validate
         tau_manager.communicate_with_tau = original_communicate
         tau_manager.tau_ready.clear()
+        
+        # Restore config
+        config.MINER_PRIVKEY = original_privkey
+        config.MINER_PUBKEY = original_pubkey
 

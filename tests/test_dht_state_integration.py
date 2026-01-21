@@ -29,6 +29,14 @@ def isolate_db(tmp_path):
     db_file = tmp_path / "dht_integration_test.db"
     os.environ["TAU_DB_PATH"] = str(db_file)
     import db as db_module
+    
+    # Close any existing connection before reloading to avoid leaks
+    if getattr(db_module, "_db_conn", None):
+        try:
+            db_module._db_conn.close()
+        except Exception:
+            pass
+    
     importlib.reload(config_module)
     importlib.reload(db_module)
     importlib.reload(db_module)
@@ -38,6 +46,14 @@ def isolate_db(tmp_path):
     chain_state._current_rules_state = ""
     chain_state._tau_engine_state_hash = ""
     yield
+    
+    # Close our test connection before restoring
+    if getattr(db_module, "_db_conn", None):
+        try:
+            db_module._db_conn.close()
+        except Exception:
+            pass
+            
     if orig_env is None:
         os.environ.pop("TAU_DB_PATH", None)
     else:
@@ -138,6 +154,14 @@ def sync_test_logic(node_a_dht_manager, node_b_dht_manager):
     print(f"[SyncWorker] Saving formula (state_hash={expected_state_hash[:8]}) on Node A")
     chain_state.save_rules_state(formula_content)
     
+    # NEW MANUAL PUBLISH STEP (since save_rules_state no longer auto-publishes)
+    print(f"[SyncWorker] Manually publishing snapshot to simulate block finalization")
+    chain_state.publish_tau_state_snapshot(
+        expected_state_hash, 
+        formula_content.encode('utf-8'), 
+        empty_acc_hash
+    )
+    
     # Verify it is in Node A's store
     # Key should be /tau_state/<state_hash>
     # chain_state uses _encode_dht_key now.
@@ -171,8 +195,13 @@ def sync_test_logic(node_a_dht_manager, node_b_dht_manager):
     start_time = time.time()
     retrieved = None
     while time.time() - start_time < 5.0:
-        retrieved = chain_state.fetch_tau_state_snapshot(expected_state_hash)
-        if retrieved:
+        retrieved_result = chain_state.fetch_tau_state_snapshot(expected_state_hash)
+        if retrieved_result:
+            # retrieved_result is (rules, remote_accounts_hash) or rules (back-compat, but code is updated)
+            if isinstance(retrieved_result, tuple):
+                retrieved = retrieved_result[0]
+            else:
+                retrieved = retrieved_result
             break
         time.sleep(0.5)
         

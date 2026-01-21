@@ -455,11 +455,17 @@ function canonicalize(obj) {
 function validateRuleSyntax(rule) {
     if (!rule || !rule.trim()) {
         ruleValidationStatus.textContent = "";
-        return true; // Empty rule is skipped, not invalid
+        return true;
     }
     const errors = [];
+    const trimmed = rule.trim();
 
-    // 1. Check brackets
+    // 1. Check: Must end with '.'
+    if (!trimmed.endsWith('.')) {
+        errors.push("Rule must end with a period '.'.");
+    }
+
+    // 2. Check brackets
     const stack = [];
     const pairs = { ')': '(', ']': '[', '}': '{' };
     for (let char of rule) {
@@ -473,7 +479,7 @@ function validateRuleSyntax(rule) {
     }
     if (stack.length > 0) errors.push(`Unclosed brackets: ${stack.join(', ')}.`);
 
-    // 2. Check invalid chars
+    // 3. Check invalid chars
     const allowedChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_[]()='&|!<>+-*/%^: \t\n\r{}#?,.";
     for (let char of rule) {
         if (!allowedChars.includes(char)) {
@@ -481,12 +487,48 @@ function validateRuleSyntax(rule) {
         }
     }
 
-    // 3. Basic operator checks
-    const tokens = rule.trim().split(/\s+/).filter(t => t);
+    // 4. Basic operator checks
+    const tokens = trimmed.split(/\s+/).filter(t => t);
     const operators = new Set(["&&", "||", "&", "|", "=", "->", "<-", "<->"]);
     if (tokens.length > 0) {
         if (operators.has(tokens[0])) errors.push(`Rule cannot start with operator: '${tokens[0]}'.`);
         if (operators.has(tokens[tokens.length - 1])) errors.push(`Rule cannot end with operator: '${tokens[tokens.length - 1]}'.`);
+    }
+
+    // 5. Check for consecutive operands (garbage words)
+    // Identify words/identifiers and check if two appear without an operator between them (unless first is keyword).
+    const keywords = new Set(["always", "eventually", "next", "future", "tau", "forall", "exists", "release", "until"]);
+    const reWord = /[a-zA-Z0-9_#]+/g;
+    let match;
+    const words = [];
+    while ((match = reWord.exec(rule)) !== null) {
+        words.push({ text: match[0], index: match.index, end: match.index + match[0].length });
+    }
+
+    for (let i = 0; i < words.length - 1; i++) {
+        const curr = words[i];
+        const next = words[i + 1];
+
+        // Check text between them
+        const substring = rule.slice(curr.end, next.index);
+
+        // If there is ONLY whitespace between two identifiers, it's suspicious unless the first is a keyword.
+        if (!substring.trim()) {
+            if (!keywords.has(curr.text)) {
+                errors.push(`Unexpected sequence: '${curr.text} ${next.text}'. Missing operator?`);
+                break; // One error is enough
+            }
+        }
+    }
+
+    // 6. Heuristic for meaningful content (Backup check)
+    if (errors.length === 0) {
+        const hasOperator = ['=', ':=', '->', '<-', '<->'].some(op => rule.includes(op));
+        const firstWord = tokens[0] ? tokens[0].split(/[^\w]/)[0] : "";
+        const startsWithKeyword = keywords.has(firstWord);
+        if (!hasOperator && !startsWithKeyword) {
+            errors.push("Rule must contain an assignment/operator or start with a keyword (always, tau, etc).");
+        }
     }
 
     if (errors.length === 0) {

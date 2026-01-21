@@ -57,6 +57,7 @@ from commands import createblock
 class TestMinerHardening(unittest.TestCase):
     def setUp(self):
         self.test_db = "test_hardening.db"
+        self.original_db_path = config.STRING_DB_PATH
         config.STRING_DB_PATH = self.test_db
         db._db_conn = None 
         if os.path.exists(self.test_db):
@@ -69,17 +70,26 @@ class TestMinerHardening(unittest.TestCase):
         chain_state._current_rules_state = ""
         
         # Disable auto-faucet for strict balance testing
+        self.original_faucet = config.TESTNET_AUTO_FAUCET
         config.TESTNET_AUTO_FAUCET = False
         
         # Pre-seed UserOverspend balance
         chain_state._balances["UserOverspend"] = 100
 
+        # Fix: Helper MINER_PRIVKEY for PoA mining (must be non-zero for BLS)
+        self.original_miner_key = config.MINER_PRIVKEY
+        config.MINER_PRIVKEY = "0" * 63 + "1"
+
     def tearDown(self):
+        config.TESTNET_AUTO_FAUCET = self.original_faucet
+        config.MINER_PRIVKEY = self.original_miner_key
+        
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
         if os.path.exists(self.test_db):
             os.remove(self.test_db)
+        config.STRING_DB_PATH = self.original_db_path
 
     def test_stale_reservation_release(self):
         print("\n[TEST] Verifying Stale Mempool Reservation Release...")
@@ -153,8 +163,10 @@ class TestMinerHardening(unittest.TestCase):
         
         print("[TEST] Intra-TX overspend rejected.")
 
-    def test_strict_bls_enforcement(self):
+    @patch('commands.createblock.tau_manager')
+    def test_strict_bls_enforcement(self, mock_tau):
         print("\n[TEST] Verifying Strict BLS Enforcement...")
+        mock_tau.tau_ready.is_set.return_value = True
         
         # We need to UN-MOCK _BLS_AVAILABLE in createblock if it was imported as True
         # But wait, createblock imports it at module level.

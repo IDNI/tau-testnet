@@ -6,8 +6,8 @@ This module is simplified to reflect the new boolean validation model.
 
 # --- Generic Logical Values ----
 # These are the primary values returned by validation logic.
-TAU_VALUE_ZERO = "#b0"  # Represents logical false, failure, or zero.
-TAU_VALUE_ONE = "#b1"   # Represents logical true, success, or one.
+TAU_VALUE_ZERO = "0"    # Represents logical false, failure, or zero.
+TAU_VALUE_ONE = "1"     # Represents logical true, success, or one.
 
 # --- Failure/Success Codes from Tau ---
 # The new bitvector-based transaction validation returns a single boolean on o1.

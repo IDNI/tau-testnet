@@ -119,6 +119,38 @@ Call `NetworkService.get_metrics_snapshot()` (or read the periodic `[metrics]` l
     ```
     On start, the node will connect, handshake, sync headers, request missing block bodies, and rebuild its state.
 
+### Running a local test miner (no testnet connection)
+
+This runs an isolated PoA miner against a local DB without connecting to `testnet.tau.net`.
+
+1. **Generate a local test PoA keypair** (outside the repo is fine):
+   ```bash
+   python scripts/gen.py
+   ```
+   Save the **private key hex** to `data/test_miner.key` and the **public key hex** to `data/test_miner.pub`.
+
+2. **Start in test env with no bootstrap peers:**
+   ```bash
+   TAU_ENV=test \
+   TAU_BOOTSTRAP_PEERS='[]' \
+   TAU_NETWORK_LISTEN='/ip4/127.0.0.1/tcp/4001' \
+   python server.py
+   ```
+   The `test` env defaults look for `data/test_miner.key` and `data/test_miner.pub`, so mining will start locally.
+
+### Running as a node in the testnet (default)
+
+This runs as a follower node that syncs from `testnet.tau.net`. Mining stays off unless you explicitly configure a miner key.
+
+```bash
+python server.py
+```
+
+Optional safety (explicitly disable mining on followers):
+```bash
+TAU_MINING_ENABLED=false python server.py
+```
+
 ### Running tests (Trio)
 
 This project uses **Trio** for async tests. Recommended invocation (Trio-only, disable asyncio plugin):

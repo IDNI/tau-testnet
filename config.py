@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -139,13 +141,16 @@ class DHTSettings:
 @dataclass
 class AuthoritySettings:
     miner_pubkey: str = (
-        "91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6"
+        "a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b"
     )
-    miner_privkey: Optional[str] = (
-        "11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09"
+    miner_pubkey_path: Optional[str] = None
+    miner_privkey: Optional[str] = None
+    miner_privkey_path: Optional[str] = field(
+        default_factory=lambda: os.path.join(DATA_DIR, "test_miner.key")
     )
     block_signature_scheme: str = "bls_g2"
     state_locator_namespace: str = "state"
+    mining_enabled: bool = True
 
     def validate(self) -> None:
         if not (isinstance(self.miner_pubkey, str) and len(self.miner_pubkey) == 96):
@@ -161,6 +166,12 @@ class AuthoritySettings:
                 bytes.fromhex(self.miner_privkey)
             except ValueError as exc:
                 raise ConfigurationError("Authority miner_privkey must be valid hexadecimal.") from exc
+        if self.miner_privkey_path is not None:
+            if not isinstance(self.miner_privkey_path, str) or not self.miner_privkey_path.strip():
+                raise ConfigurationError("Authority miner_privkey_path must be a non-empty string or None.")
+        if self.miner_pubkey_path is not None:
+            if not isinstance(self.miner_pubkey_path, str) or not self.miner_pubkey_path.strip():
+                raise ConfigurationError("Authority miner_pubkey_path must be a non-empty string or None.")
         if not isinstance(self.block_signature_scheme, str) or not self.block_signature_scheme:
             raise ConfigurationError("Authority block_signature_scheme must be a non-empty string.")
         if not isinstance(self.state_locator_namespace, str) or not self.state_locator_namespace.strip():
@@ -215,7 +226,7 @@ BASE_DEFAULTS: Dict[str, Any] = {
         "bootstrap_peers": [
             {
                 "peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC", #MAIN NODE
-                "addrs": ["/dns4/testnet.tau.net/tcp/4001"],
+                "addrs": ["/ip4/34.251.82.246/tcp/4001"],
             },
         ],
         "peerstore_path": None,
@@ -242,6 +253,10 @@ ENVIRONMENT_OVERRIDES: Dict[str, Dict[str, Any]] = {
             "comm_timeout": 60,
             "client_wait_timeout": 5,
             "shutdown_timeout": 1,
+        },
+        "authority": {
+            "miner_pubkey_path": os.path.join(DATA_DIR, "test_miner.pub"),
+            "miner_privkey_path": os.path.join(DATA_DIR, "test_miner.key"),
         },
         "network": {
             "bootstrap_peers": [
@@ -298,10 +313,101 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_LOG_FORMAT": ("logging", "format", str),
     "TAU_LOG_DATEFMT": ("logging", "datefmt", str),
     "TAU_MINER_PUBKEY": ("authority", "miner_pubkey", str),
+    "TAU_MINER_PUBKEY_PATH": ("authority", "miner_pubkey_path", str),
     "TAU_MINER_PRIVKEY": ("authority", "miner_privkey", str),
+    "TAU_MINER_PRIVKEY_PATH": ("authority", "miner_privkey_path", str),
     "TAU_BLOCK_SIGNATURE_SCHEME": ("authority", "block_signature_scheme", str),
     "TAU_STATE_LOCATOR_NAMESPACE": ("authority", "state_locator_namespace", str),
+    "TAU_MINING_ENABLED": ("authority", "mining_enabled", lambda v: v.lower() in ("true", "1", "yes")),
 }
+
+
+def _load_miner_privkey_from_path(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logging.getLogger(__name__).warning("Unable to read miner key file: %s", exc)
+        return None
+
+    if not raw:
+        return None
+
+    try:
+        content = raw.decode("utf-8").strip()
+    except UnicodeError:
+        return None
+
+    if not content:
+        return None
+
+    if content.startswith("0x"):
+        content = content[2:].strip()
+
+    if len(content) == 64:
+        try:
+            bytes.fromhex(content)
+            return content
+        except ValueError:
+            return None
+
+    match = re.search(r"[0-9a-fA-F]{64}", content)
+    if match:
+        candidate = match.group(0)
+        try:
+            bytes.fromhex(candidate)
+            return candidate
+        except ValueError:
+            return None
+    return None
+
+
+def _load_miner_pubkey_from_path(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logging.getLogger(__name__).warning("Unable to read miner pubkey file: %s", exc)
+        return None
+
+    if not raw:
+        return None
+
+    try:
+        content = raw.decode("utf-8").strip()
+    except UnicodeError:
+        return None
+
+    if not content:
+        return None
+
+    if content.startswith("0x"):
+        content = content[2:].strip()
+
+    if len(content) == 96:
+        try:
+            bytes.fromhex(content)
+            return content
+        except ValueError:
+            return None
+
+    match = re.search(r"[0-9a-fA-F]{96}", content)
+    if match:
+        candidate = match.group(0)
+        try:
+            bytes.fromhex(candidate)
+            return candidate
+        except ValueError:
+            return None
+    return None
 
 
 def _deep_merge(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
@@ -350,6 +456,18 @@ def load_settings(env: Optional[str] = None, overrides: Optional[Dict[str, Any]]
     if overrides:
         base = _deep_merge(base, overrides)
     settings_obj = _settings_from_dict(env_name, base)
+    if not settings_obj.authority.miner_privkey:
+        settings_obj.authority.miner_privkey = _load_miner_privkey_from_path(
+            settings_obj.authority.miner_privkey_path
+        )
+    if settings_obj.authority.miner_pubkey_path:
+        pub_from_file = _load_miner_pubkey_from_path(settings_obj.authority.miner_pubkey_path)
+        if pub_from_file:
+            if settings_obj.authority.miner_pubkey and settings_obj.authority.miner_pubkey != pub_from_file:
+                logging.getLogger(__name__).warning(
+                    "Overriding miner_pubkey with value from %s", settings_obj.authority.miner_pubkey_path
+                )
+            settings_obj.authority.miner_pubkey = pub_from_file
     settings_obj.validate()
     return settings_obj
 

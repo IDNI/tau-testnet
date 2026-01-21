@@ -71,7 +71,7 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
     Executes a batch of transactions against a SNAPSHOT of the chain state.
     Returns (final_txs, final_reserved_ids, final_rules, final_balances, final_sequences)
     """
-    # 1. Capture Consistent State Snapshot (Phase 9.2 multi-lock)
+    # 1. Capture Consistent State Snapshot
     with chain_state.get_all_state_locks():
         temp_balances = chain_state._balances.copy()
         temp_sequences = chain_state._sequence_numbers.copy()
@@ -84,16 +84,24 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
     if not tau_manager.tau_ready.is_set():
         tau_manager.tau_ready.wait(timeout=5)
         
-    # Phase 9.3 / 10.2: Tau Baseline Reset (Strict)
-    # Ensure local Tau process state matches our snapshot before we begin
+    # Tau Baseline Reset
+    # Ensure local Tau process state matches our snapshot before we begin.
     # Even if temp_rules is empty, we must reset Tau to "clean".
     try:
-        # Send explicit state (even if empty string) to stream 0.
-        rule_text_to_send = temp_rules if temp_rules else ""
-        tau_manager.communicate_with_tau(rule_text=rule_text_to_send, target_output_stream_index=0)
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                logger.debug(
+                    "Mining with Tau state len=%s hash=%s preview=%r",
+                    len(temp_rules or ""),
+                    import_hashlib().sha256((temp_rules or "").encode("utf-8")).hexdigest(),
+                    (temp_rules or "")[:200],
+                )
+            except Exception:
+                logger.debug("Mining with Tau state (debug logging failed)")
+        tau_manager.reset_tau_state(temp_rules or "", source="createblock-reset")
     except Exception as e:
         logger.error("Failed to reset Tau baseline: %s", e)
-        # Phase 13: Fail batch so we can unreserve
+        # Fail batch so we can unreserve
         raise RuntimeError(f"Failed to reset Tau baseline: {e}")
 
     for i, tx in enumerate(transactions):
@@ -103,7 +111,7 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
         
         # --- 1. Validation ---
         
-        # A. Signature (Strict Phase 9.3)
+        # A. Signature
         if not _BLS_AVAILABLE:
             print(f"[ERROR][miner] BLS library missing. Cannot validate signature.")
             continue
@@ -112,7 +120,7 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
             print(f"[WARN][miner] TX {i} rejected: Invalid signature")
             continue
             
-        # B. Expiry (Phase 11.6: Consistent Type Check)
+        # B. Expiry
         if tx.get('expiration_time') and int(tx.get('expiration_time', 0)) < int(time.time()):
             print(f"[WARN][miner] TX {i} rejected: Expired")
             continue
@@ -142,12 +150,17 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
                     tx_success = False
                 else:
                     # Tentatively accepted
-                    pass 
+                    try:
+                        # Capture the updated specification emitted by Tau.
+                        temp_rules = chain_state.get_rules_state()
+                    except Exception:
+                        # If we can't read it, keep the prior snapshot.
+                        pass
             except Exception as e:
                 print(f"[WARN][miner] TX {i} rejected: Tau rule exception: {e}")
                 tx_success = False
 
-        # Phase 9.4: Intra-Transaction Balance Tracking & Tau Validation
+        # Intra-Transaction Balance Tracking & Tau Validation
         pending_balance_deductions = {} # local tracking for this tx
         
         if tx_success and transfer_op:
@@ -155,7 +168,7 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
             pending_transfers_list = [] # Store validated transfers for commit: (f_addr, t_addr, amt)
             
             for t_entry in transfer_op:
-                # Phase 14: Safe Validation (Structure)
+                # Safe Validation (Structure)
                 if not isinstance(t_entry, list) or len(t_entry) < 3:
                     print(f"[WARN][miner] TX {i} rejected: Invalid transfer entry format")
                     tx_success = False; break
@@ -165,7 +178,7 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
                 except ValueError:
                     tx_success = False; break
                 
-                # Phase 11.3: Enforce Anti-Theft
+                # Enforce Anti-Theft
                 if f_addr != sender:
                     print(f"[WARN][miner] TX {i} rejected: Theft attempt (From {f_addr} != Sender {sender})")
                     tx_success = False; break
@@ -177,7 +190,7 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
                     logger.warning("TX %s rejected: Invalid amount %s", i, amt_str)
                     tx_success = False; break
             
-                # Helper: Faucet Logic Check (Pre-calculation)
+                # Faucet Logic Check (Pre-calculation)
                 if f_addr not in temp_balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
                      current_bal = 100000
                 else:
@@ -190,13 +203,13 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
                      logger.warning("TX %s rejected: Insufficient funds (Intra-TX overspend)", i)
                      tx_success = False; break
                 
-                # Tau Validation (Transfer) Phase 10.3 / 11.1 / 11.2
+                # Tau Validation (Transfer)
                 try:
-                     # Phase 11.1: Fix ID Conversion (expect int, strip 'y')
+                     # Fix ID Conversion (expect int, strip 'y')
                      sender_id_str = db.get_string_id(f_addr)
                      receiver_id_str = db.get_string_id(t_addr)
                      
-                     # Phase 15: Strict Tau ID (No 0 fallback)
+                     # Strict Tau ID (No 0 fallback)
                      if not sender_id_str:
                         logger.warning("TX %s rejected: Sender Tau ID missing", i)
                         tx_success = False; break
@@ -227,9 +240,10 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
                      tau_output_transfer = tau_manager.communicate_with_tau(
                         target_output_stream_index=1,
                         input_stream_values=tau_input_stream_values,
+                        apply_rules_update=False,
                      )
                      
-                     # Phase 11.2 / 12.2: Output Parsing (Unified)
+                     # Output Parsing (Unified)
                      converted_val = parse_tau_output(tau_output_transfer)
                          
                      # Validation: output must equal amount
@@ -249,17 +263,12 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
 
         if tx_success:
             # Apply changes to temp state (Commit)
-            if rule_op:
-                 if temp_rules:
-                     temp_rules += "\n" + rule_op
-                 else:
-                     temp_rules = rule_op
 
             if transfer_op:
                 for f_addr, t_addr, amt in pending_transfers_list:
-                    # Phase 15: Safe Commit (Apply validated transfers)
+                    # Safe Commit (Apply validated transfers)
                     
-                    # Phase 10.4: Faucet Logic Safety (Commit)
+                    # Faucet Logic Safety (Commit)
                     if f_addr not in temp_balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
                         temp_balances[f_addr] = 100000
                     
@@ -298,6 +307,14 @@ def create_block_from_mempool() -> Dict:
     saves it to the database, and clears the mempool.
     """
     print(f"[INFO][createblock] Starting block creation process...")
+
+    if not config.MINER_PRIVKEY:
+        print("[ERROR][createblock] PoA mining requires MINER_PRIVKEY to be configured.")
+        return {"error": "PoA mining requires a configured miner key."}
+
+    if not block.bls_signing_available():
+        print("[ERROR][createblock] BLS signing not available; cannot sign PoA block.")
+        return {"error": "BLS signing is required for PoA blocks."}
     
     # Get batch of reserved transactions from mempool
     reserved_txs = db.reserve_mempool_txs(limit=1000)
@@ -313,7 +330,7 @@ def create_block_from_mempool() -> Dict:
     mempool_txs = [rtx['payload'] for rtx in reserved_txs]
     reserved_ids = [rtx['id'] for rtx in reserved_txs]
     
-    # Phase 10.5: Fix JSON alignment
+    # Fix JSON alignment
     # We must filter reserved_ids and transactions in lockstep
     transactions = []
     filtered_reserved_ids = []
@@ -353,7 +370,7 @@ def create_block_from_mempool() -> Dict:
         final_txs, final_reserved_ids, final_rules, final_balances, final_sequences = execute_batch(transactions, filtered_reserved_ids)
     except Exception as e:
         print(f"[ERROR][createblock] Block creation failed during batch execution: {e}")
-        # Phase 13: Liveness Fix - Unreserve so they can be retried immediately
+        # Liveness Fix - Unreserve so they can be retried immediately
         import db as _db
         _db.unreserve_mempool_txs(reserved_ids)
         return {"error": str(e)}
@@ -363,15 +380,6 @@ def create_block_from_mempool() -> Dict:
     if not final_txs:
         print("[INFO][createblock] All transactions rejected. No block created.")
         # We should still delete the rejected txs!
-        # Handled by Phase 6 logic (final_reserved_ids contains accepted ones, but we want to delete REJECTED ones too?)
-        # "delete processed mempool rows... delete accepted... delete rejected"
-        # My `execute_batch` only returns `accepted` IDs.
-        # I should assume ALL reserved IDs are "processed" and should be deleted?
-        # Yes, if they are rejected, they are invalid and removed from mempool.
-        # So we should delete ALL `reserved_ids`.
-        # But wait, if we return empty `final_txs`, do we create an empty block?
-        # Probably not.
-        # So we should delete them and return.
         if reserved_ids:
             import db as _db
             _db.remove_transactions(reserved_ids)
@@ -395,12 +403,11 @@ def create_block_from_mempool() -> Dict:
     print(f"[INFO][createblock] Creating block #{block_number} with previous hash: {previous_hash[:16]}...")
     
     # Create the block
-    # Create the block
     print(f"[INFO][createblock] Computing transaction hashes and Merkle root...")
     # Use FINAL RULES from execution, not global state
     rules_blob = final_rules.encode("utf-8")
     
-    # Phase 12.6: Consensus State Commitment (Rules + Accounts)
+    # Consensus State Commitment (Rules + Accounts)
     accounts_hash = chain_state.compute_accounts_hash(final_balances, final_sequences)
     state_hash = chain_state.compute_consensus_state_hash(rules_blob, accounts_hash)
     
@@ -475,7 +482,7 @@ def create_block_from_mempool() -> Dict:
             placeholders = ','.join(['?'] * len(reserved_ids))
             conn.execute(f'DELETE FROM mempool WHERE id IN ({placeholders})', tuple(reserved_ids))
         
-    # Phase 9.5 / 10.6: In-Memory Swap Correctness
+    # In-Memory Swap Correctness
     # We acquire ALL locks to ensure no readers see partial state during update
     print(f"[INFO][createblock] Block committed. Updating in-memory state...")
     try:
@@ -501,6 +508,19 @@ def create_block_from_mempool() -> Dict:
         if hasattr(chain_state, "publish_tau_state_snapshot"):
             # Compute accounts hash for consensus integrity
             accounts_hash = chain_state.compute_accounts_hash(final_balances, final_sequences)
+            if logger.isEnabledFor(logging.DEBUG):
+                try:
+                    rules_text = rules_blob.decode("utf-8")
+                    logger.debug(
+                        "Publishing Tau state snapshot: state_hash=%s accounts_hash=%s rules_len=%s rules_hash=%s preview=%r",
+                        state_hash,
+                        accounts_hash.hex(),
+                        len(rules_text),
+                        import_hashlib().sha256(rules_text.encode("utf-8")).hexdigest(),
+                        rules_text[:200],
+                    )
+                except Exception:
+                    logger.debug("Publishing Tau state snapshot (debug logging failed)")
             published = bool(chain_state.publish_tau_state_snapshot(state_hash, rules_blob, accounts_hash))
         if published:
             print(f"[INFO][createblock] Published Tau state snapshot to DHT: {state_locator}")
@@ -558,7 +578,9 @@ def execute(raw_command: str, container):
     try:
         block_data = create_block_from_mempool()
         if not block_data or "block_hash" not in block_data:
-            message = block_data.get("message") if isinstance(block_data, dict) else None
+            message = None
+            if isinstance(block_data, dict):
+                message = block_data.get("message") or block_data.get("error")
             resp = (message or "Mempool is empty. No block created.") + "\r\n"
             logger.info("Create block skipped: %s", message or "empty mempool")
         else:
@@ -607,7 +629,12 @@ def handle_result(decoded: str, tau_input: str, mempool_state: Dict) -> str:
     try:
         block_data = create_block_from_mempool()
         if not block_data or "block_hash" not in block_data:
-            message = block_data.get("message") if isinstance(block_data, dict) else "Mempool is empty. No block created."
+            if isinstance(block_data, dict):
+                message = block_data.get("message") or block_data.get("error")
+            else:
+                message = None
+            if not message:
+                message = "Mempool is empty. No block created."
             return message
 
         # Return a detailed summary of the created block

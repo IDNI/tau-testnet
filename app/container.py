@@ -76,7 +76,7 @@ class ServiceContainer:
 
         # Instantiate Miner if configured
         miner_instance = None
-        if resolved_settings.authority.miner_privkey:
+        if resolved_settings.authority.miner_privkey and resolved_settings.authority.mining_enabled:
             from miner.service import SoleMiner
             # We might need to pass custom engine/state store if mocked, but for now use defaults
             miner_instance = SoleMiner(max_block_interval=30.0) 
@@ -156,6 +156,8 @@ class ServiceContainer:
                     try:
                         with open(key_path, "rb") as f:
                             identity_key_bytes = f.read()
+                        if identity_key_bytes:
+                            self.logger.info("Loaded libp2p identity key from %s", key_path)
                         if identity_key_bytes and len(identity_key_bytes) != IDENTITY_SEED_SIZE:
                             self.logger.warning(
                                 "Ignoring identity key at %s with unexpected length %s (expected %s)",

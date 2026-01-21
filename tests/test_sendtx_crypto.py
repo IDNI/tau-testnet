@@ -1,6 +1,6 @@
 
 
-import unittest, os, sys, json, time, hashlib
+import unittest, os, sys, json, time, hashlib, importlib
 from unittest.mock import patch
 from py_ecc.bls import G2Basic as bls
 
@@ -8,8 +8,7 @@ from py_ecc.bls import G2Basic as bls
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-os.environ["TAU_DB_PATH"] = "test_tau_string_db.sqlite"
-
+import config
 from commands import sendtx
 import chain_state, db, tau_defs, utils
 from commands.sendtx import _get_signing_message_bytes
@@ -21,6 +20,7 @@ ADDR_B = bls.SkToPk(bls.KeyGen(b"crypto_seed_B")).hex()
 
 class TestSendTxCrypto(unittest.TestCase):
     def setUp(self):
+        importlib.reload(sendtx)
         self.db_path = "test_tau_crypto_db.sqlite"
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
@@ -34,7 +34,7 @@ class TestSendTxCrypto(unittest.TestCase):
         
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.init_chain_state()
-        def mock_tau_response(rule_text=None, target_output_stream_index=1, input_stream_values=None):
+        def mock_tau_response(rule_text=None, target_output_stream_index=1, input_stream_values=None, **kwargs):
             # New bitvector model: return boolean on o1
             if target_output_stream_index == 0:
                 return tau_defs.ACK_RULE_PROCESSED
@@ -126,8 +126,6 @@ class TestSendTxCrypto(unittest.TestCase):
         sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
         self.assertTrue(result.startswith("SUCCESS: Transaction queued"), msg=f"Transaction failed: {result}")
-        # Phase 2: sendtx does not increment sequence number locally.
-        # self.assertEqual(chain_state.get_sequence_number(pk_hex), initial_seq + 1)
 
     def test_invalid_signature_rejected(self):
         privkey = bls.KeyGen(b"test_seed_2")

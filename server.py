@@ -399,6 +399,7 @@ def _run_server(container: ServiceContainer):
                 out = tau_module.communicate_with_tau(
                     rule_text=saved_rules,
                     target_output_stream_index=0,
+                    wait_for_ready=False,
                 )
                 logger.info("Tau restore result (o0): %s", out)
             except Exception:
@@ -415,7 +416,11 @@ def _run_server(container: ServiceContainer):
                 if builtin_rules:
                     logger.info("No persisted Tau rules found; injecting %s built-in rules from disk...", len(builtin_rules))
                     for rule_text in builtin_rules:
-                        tau_module.communicate_with_tau(rule_text=rule_text, target_output_stream_index=0)
+                        tau_module.communicate_with_tau(
+                            rule_text=rule_text,
+                            target_output_stream_index=0,
+                            wait_for_ready=False,
+                        )
 
                     # Persist the resulting rules snapshot so restarts don't re-inject.
                     latest = db_module.get_latest_block()

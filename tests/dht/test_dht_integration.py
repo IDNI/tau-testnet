@@ -23,7 +23,7 @@ async def _wait_for_listen_addrs(host, timeout: float = 5.0) -> List[multiaddr.M
 
 
 @pytest.fixture
-async def dht_two_nodes():
+async def dht_two_nodes(temp_database):
     cfg_kwargs = {
         "network_id": "dht-testnet",
         "genesis_hash": "genesis",

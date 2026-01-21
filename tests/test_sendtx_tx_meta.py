@@ -1,6 +1,6 @@
 
 
-import unittest, os, sys, json, time, hashlib
+import unittest, os, sys, json, time, hashlib, importlib
 from unittest.mock import patch
 from py_ecc.bls import G2Basic as bls
 
@@ -8,8 +8,8 @@ from py_ecc.bls import G2Basic as bls
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-os.environ["TAU_DB_PATH"] = "test_tau_string_db.sqlite"
 
+import config
 from commands import sendtx
 import chain_state, db, tau_defs, utils
 from commands.sendtx import _get_signing_message_bytes
@@ -21,10 +21,19 @@ ADDR_B = bls.SkToPk(bls.KeyGen(b"meta_seed_B")).hex()
 
 class TestSendTxTxMeta(unittest.TestCase):
     def setUp(self):
-        if os.path.exists("test_tau_string_db.sqlite"):
-            os.remove("test_tau_string_db.sqlite")
+        importlib.reload(sendtx)
+        self.test_db = "test_tau_string_db.sqlite"
+        self.original_db_path = config.STRING_DB_PATH
+        config.set_database_path(self.test_db)
+        
         if db._db_conn:
             db._db_conn.close(); db._db_conn = None
+        if os.path.exists(self.test_db):
+            os.remove(self.test_db)
+            
+        chain_state._balances.clear(); chain_state._sequence_numbers.clear()
+        db.init_db(); chain_state.init_chain_state()
+        db.clear_mempool()  # Clear mempool for test isolation
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.init_chain_state()
         db.clear_mempool()  # Clear mempool for test isolation
@@ -69,6 +78,12 @@ class TestSendTxTxMeta(unittest.TestCase):
 
     def tearDown(self):
         patch.stopall()
+        if db._db_conn:
+            db._db_conn.close()
+            db._db_conn = None
+        if os.path.exists(self.test_db):
+            os.remove(self.test_db)
+        config.set_database_path(self.original_db_path)
 
     def _create_tx(self, transfers, expiration=None, sequence=None, signature="SIG", sender_pubkey=None):
         ops = {"1": transfers}

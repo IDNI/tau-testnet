@@ -14,14 +14,18 @@ from errors import TauTestnetError, TauProcessError, TauCommunicationError
 
 @pytest.fixture
 def mock_db_path(tmp_path):
+    original_path = config.STRING_DB_PATH
     db_path = tmp_path / "test_tau.db"
     config.STRING_DB_PATH = str(db_path)
     # Reset db connection
+    if getattr(db, "_db_conn", None):
+        db._db_conn.close()
     db._db_conn = None
     yield str(db_path)
     if db._db_conn:
         db._db_conn.close()
         db._db_conn = None
+    config.STRING_DB_PATH = original_path
 
 @pytest.fixture
 def mock_chain_state(mock_db_path):

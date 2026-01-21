@@ -105,6 +105,10 @@ class TestGhostTxIntegration(unittest.TestCase):
             os.remove(self.test_db)
         db.init_db()
         
+        # Set dummy miner key for block creation
+        self.original_privkey = config.MINER_PRIVKEY
+        config.MINER_PRIVKEY = "0" * 63 + "1"
+        
         # Reset Chain State (Important for isolation)
         import chain_state
         chain_state._balances = {}
@@ -117,38 +121,58 @@ class TestGhostTxIntegration(unittest.TestCase):
             db._db_conn = None
         if os.path.exists(self.test_db):
             os.remove(self.test_db)
+        config.MINER_PRIVKEY = self.original_privkey
 
     @patch('commands.createblock.tau_manager')
     @patch('commands.createblock._validate_signature')
     def test_rule_change_and_rejection(self, mock_sig, mock_tau):
         # Mock Tau Manager
         mock_tau.tau_ready.is_set.return_value = True
-        mock_tau.communicate_with_tau.return_value = "Success"
+        # Side effect to simulate Tau returning the "Updated specification" or createblock capturing it
+        def tau_side_effect(**kwargs):
+            if kwargs.get('rule_text'):
+                # Simulate Tau accepting the rule
+                return "Success"
+            return "Success"
+        mock_tau.communicate_with_tau.side_effect = tau_side_effect
         
-        # Mock Sig Validation (Always valid for this test)
-        mock_sig.return_value = True
+        # We also need to mock chain_state.get_rules_state() to return "rule X" 
+        # AFTER it's supposedly updated. 
+        # But `createblock` sets `temp_rules` by calling `chain_state.get_rules_state()` 
+        # if `communicate_with_tau` succeeds (assuming it emits "Updated spec" or we fetch it).
         
-        print("\n[TEST] Verifying Rule Changes & Rejection Logic (Integration)...")
+        # In createblock.py:
+        # res = tau_manager.communicate_with_tau(rule_text=rule_op...)
+        # if "error" not in res:
+        #      temp_rules = chain_state.get_rules_state()
         
-        # 1. Test Rule Application
-        # Insert TX with Rule
-        payload_rule = json.dumps({
-            "sender_pubkey": "UserRule",
-            "sequence_number": 0,
-            "expiration_time": int(time.time() + 3600),
-            "operations": {"0": "rule X"}
-        })
-        db.add_mempool_tx(payload_rule, "hash_rule", 1000)
+        # So we need to patch chain_state.get_rules_state to return "rule X" when called inside execution.
+        # However, chain_state is imported both in test and in createblock.
         
-        # Run Mining
-        block_res = createblock.create_block_from_mempool()
+        with patch('chain_state.get_rules_state', return_value="rule X"):
+             # Mock Sig Validation (Always valid for this test)
+             mock_sig.return_value = True
+             
+             print("\n[TEST] Verifying Rule Changes & Rejection Logic (Integration)...")
+            
+             # 1. Test Rule Application
+             # Insert TX with Rule
+             payload_rule = json.dumps({
+                 "sender_pubkey": "UserRule",
+                 "sequence_number": 0,
+                 "expiration_time": int(time.time() + 3600),
+                 "operations": {"0": "rule X"}
+             })
+             db.add_mempool_tx(payload_rule, "hash_rule", 1000)
+             
+             # Run Mining
+             block_res = createblock.create_block_from_mempool()
         
         # Verify Block
         self.assertEqual(len(block_res['transactions']), 1)
         self.assertNotEqual(block_res['header']['state_hash'], "", "State hash must be set")
         
         # Verify Global State (simulating next block effect)
-        # Note: createblock updates the global chain_state object in Phase 6
         import chain_state
         self.assertEqual(chain_state._current_rules_state, "rule X")
         

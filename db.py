@@ -305,6 +305,24 @@ def remove_transactions(tx_ids: List[int]):
         _db_conn.commit()
         logger.debug("Removed %s transactions from mempool", len(tx_ids))
 
+def remove_mempool_by_hashes(tx_hashes: List[str]) -> int:
+    """
+    Removes mempool transactions matching the provided tx_hash list.
+    Returns the number of rows removed.
+    """
+    if not tx_hashes:
+        return 0
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        placeholders = ",".join(["?"] * len(tx_hashes))
+        cur.execute(f"DELETE FROM mempool WHERE tx_hash IN ({placeholders})", tuple(tx_hashes))
+        _db_conn.commit()
+        removed = cur.rowcount or 0
+        logger.debug("Removed %s transactions from mempool by hash", removed)
+        return removed
+
 def clear_mempool():
     """Clears all transactions from the mempool."""
     if _db_conn is None:

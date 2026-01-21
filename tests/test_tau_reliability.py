@@ -57,13 +57,15 @@ def test_timeout_triggers_kill_once_and_releases_lock(reset_tau_manager_globals)
     # 2. Mock environment to force timeout
     with patch.object(config, 'COMM_TIMEOUT', 0.1):
         with patch('select.select', return_value=([], [], [])):
-            # Fixed list of times to ensure test doesn't loop forever
-            # Start: 100.0
-            # Loop 1: 100.05
-            # Loop 2: 100.15 (triggers timeout > 0.1)
-            # Extra values for subsequent calls
-            times = [100.0, 100.05, 100.15, 100.2, 100.2] 
-            with patch('time.monotonic', side_effect=times) as mock_time:
+            # Use a generator to provide increasing time values
+            # This ensures we don't run out of values (StopIteration) which hangs the loop
+            def fake_time():
+                t = 100.0
+                while True:
+                    yield t
+                    t += 0.1 # Increment enough to eventually trigger timeout
+            
+            with patch('time.monotonic', side_effect=fake_time()) as mock_time:
                 
                 with patch('tau_manager.kill_tau_process') as mock_kill:
                     def verify_no_locks_held():
@@ -73,7 +75,7 @@ def test_timeout_triggers_kill_once_and_releases_lock(reset_tau_manager_globals)
                     mock_kill.side_effect = verify_no_locks_held
                     
                     with pytest.raises(tau_manager.TauCommunicationError):
-                        tau_manager.communicate_with_tau(target_output_stream_index=0)
+                        tau_manager.communicate_with_tau(target_output_stream_index=0, wait_for_ready=False)
                     
                     assert mock_kill.call_count == 1
                     
@@ -102,11 +104,16 @@ def test_thundering_herd_protection(reset_tau_manager_globals):
         with patch('select.select', return_value=([], [], [])):
             with patch('time.monotonic', side_effect=lambda: time.time()): # Real time is fine with short timeout
                with patch('tau_manager.kill_tau_process') as mock_kill:
+                   def kill_side_effect():
+                       tau_manager.tau_ready.clear()
+                       tau_manager.tau_process_ready.clear()
+                   
+                   mock_kill.side_effect = kill_side_effect
                    
                    # Case 1: Initiator
                    tau_manager.restart_in_progress.clear()
                    try:
-                       tau_manager.communicate_with_tau(target_output_stream_index=0)
+                       tau_manager.communicate_with_tau(target_output_stream_index=0, wait_for_ready=False)
                    except tau_manager.TauCommunicationError:
                        pass
                    assert mock_kill.call_count == 1
@@ -116,8 +123,8 @@ def test_thundering_herd_protection(reset_tau_manager_globals):
                    mock_kill.reset_mock()
                    # restart_in_progress is already set
                    try:
-                       tau_manager.communicate_with_tau(target_output_stream_index=0)
-                   except tau_manager.TauCommunicationError:
+                       tau_manager.communicate_with_tau(target_output_stream_index=0, wait_for_ready=False)
+                   except (tau_manager.TauCommunicationError, tau_manager.TauProcessError):
                        pass
                    
                    # Should NOT have called kill again

@@ -13,14 +13,34 @@ from poa.state import compute_state_hash as compute_rules_hash, compute_consensu
 def compute_accounts_hash(balances: Dict[str, int], sequences: Dict[str, int]) -> bytes:
     """
     Computes a canonical hash of the accounts state (balances + sequences).
-    Sorts keys to ensure determinism.
+    Normalizes keys so missing sequence/balance entries default to 0.
     """
+    keys = set(balances.keys()) | set(sequences.keys())
+    normalized_balances: Dict[str, int] = {}
+    normalized_sequences: Dict[str, int] = {}
+    for addr in keys:
+        if not isinstance(addr, str):
+            continue
+        normalized_balances[addr] = int(balances.get(addr, 0))
+        normalized_sequences[addr] = int(sequences.get(addr, 0))
     snapshot = {
-        "balances": balances,
-        "sequences": sequences
+        "balances": normalized_balances,
+        "sequences": normalized_sequences,
     }
-    canonical_json = json.dumps(snapshot, sort_keys=True, separators=(',', ':'))
-    return hashlib.sha256(canonical_json.encode('utf-8')).digest()
+    canonical_json = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    json_bytes = canonical_json.encode("utf-8")
+    digest = hashlib.sha256(json_bytes).digest()
+
+    # Debug log to trace determinism issues
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "compute_accounts_hash: %s len=%s content=%s...",
+            digest.hex(),
+            len(json_bytes),
+            canonical_json[:100],
+        )
+
+    return digest
 
 
 
@@ -149,10 +169,10 @@ def publish_tau_state_snapshot(state_hash: str, tau_bytes: bytes, accounts_hash:
         return False
 
 
-def fetch_tau_state_snapshot(state_hash: str) -> Optional[str]:
+def fetch_tau_state_snapshot(state_hash: str) -> Optional[tuple[str, Optional[str]]]:
     """
-    Fetch a serialized Tau rules snapshot (string) from the DHT `tau_state:<hash>`.
-    Expects JSON payload with "rules" field.
+    Fetch a serialized Tau rules snapshot from the DHT `tau_state:<hash>`.
+    Returns (rules_str, accounts_hash_hex_or_None).
     """
     if not state_hash or not isinstance(state_hash, str):
         return None
@@ -164,11 +184,14 @@ def fetch_tau_state_snapshot(state_hash: str) -> Optional[str]:
         return None
 
     try:
+        source = "unknown"
         if hasattr(_dht_client, "get_record_sync"):
             val_bytes = _dht_client.get_record_sync(key, timeout=2.0)
+            source = "get_record_sync"
         else:
             val = _dht_client.dht.value_store.get(key)
             val_bytes = getattr(val, "value", val) if val else None
+            source = "local_value_store"
             
         if val_bytes is None:
             return None
@@ -177,7 +200,21 @@ def fetch_tau_state_snapshot(state_hash: str) -> Optional[str]:
         decoded = val_bytes.decode("utf-8")
         data = json.loads(decoded)
         if isinstance(data, dict):
-            return data.get("rules")
+            rules = data.get("rules")
+            accounts_hash = data.get("accounts_hash")
+            if logger.isEnabledFor(logging.DEBUG) and isinstance(rules, str):
+                try:
+                    logger.debug(
+                        "Fetched Tau state snapshot source=%s len=%s hash=%s has_newline=%s preview=%r",
+                        source,
+                        len(rules),
+                        hashlib.sha256(rules.encode("utf-8")).hexdigest(),
+                        "\n" in rules,
+                        rules[:200],
+                    )
+                except Exception:
+                    logger.debug("Fetched Tau state snapshot (debug logging failed)")
+            return rules, accounts_hash
         return None
     except Exception as exc:
         print(f"[WARN][chain_state] Failed to fetch tau state snapshot from DHT: {exc}")
@@ -198,9 +235,14 @@ def publish_accounts_snapshot(block_hash: str) -> bool:
         return False
 
     with _balance_lock, _sequence_lock:
+        keys = set(_balances.keys()) | set(_sequence_numbers.keys())
         accounts = {
-            addr: {"balance": int(bal), "sequence": int(_sequence_numbers.get(addr, 0))}
-            for addr, bal in _balances.items()
+            addr: {
+                "balance": int(_balances.get(addr, 0)),
+                "sequence": int(_sequence_numbers.get(addr, 0)),
+            }
+            for addr in keys
+            if isinstance(addr, str)
         }
     payload = json.dumps(
         {"block_hash": block_hash, "accounts": accounts},
@@ -298,12 +340,8 @@ def fetch_accounts_snapshot(block_hash: str) -> Optional[tuple[Dict[str, int], D
         return None
 
 # Genesis address and balance used across tests and reconstruction
-GENESIS_ADDRESS = "91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6"
-GENESIS_BALANCE = 65535
-# Alice
-# Private Key (hex, 32 bytes): 11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09
-# Public Key (hex, 48 bytes, G1 compressed): 91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6
-
+GENESIS_ADDRESS = "a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b"
+GENESIS_BALANCE = 1000000
 
 def process_new_block(block: Block) -> bool:
     """
@@ -319,13 +357,23 @@ def process_new_block(block: Block) -> bool:
 
     Returns True if successful, False otherwise.
     """
+    global _current_rules_state, _last_processed_block_hash, _tau_engine_state_hash
     block_number = block.header.block_number
     # Basic deduplication
+    # NOTE: Even if the block already exists in DB, we may still need to apply its
+    # state snapshot to advance in-memory balances/sequences/rules (especially on
+    # secondary nodes after restart or when blocks are pre-inserted).
     existing = db.get_block_by_hash(block.block_hash)
     if existing:
-        return True
+        with _rules_lock:
+            already_applied = (_last_processed_block_hash == block.block_hash)
+        if already_applied:
+            return True
+        logger.info(
+            "[chain_state] Block %s already exists in DB but state is not applied yet; applying snapshot.",
+            block.block_hash[:12],
+        )
 
-    global _current_rules_state, _last_processed_block_hash
 
     print(f"[INFO][chain_state] Processing new block #{block_number} ({block.block_hash[:8]}...)")
     
@@ -340,75 +388,103 @@ def process_new_block(block: Block) -> bool:
     # Do not replay block transactions. Instead, pull the resulting state from DHT.
     import time
 
-    deadline = time.time() + 5.0  # allow brief propagation delay
+    deadline = time.time() + 8.0  # allow brief propagation delay
     balances_snapshot: Optional[Dict[str, int]] = None
     sequences_snapshot: Optional[Dict[str, int]] = None
     rules_from_dht: Optional[str] = None
+    remote_accounts_hash: Optional[str] = None
 
     while time.time() < deadline:
+        # 1) Fetch accounts snapshot for this block
         accounts_result = fetch_accounts_snapshot(block.block_hash)
         if accounts_result:
             balances_snapshot, sequences_snapshot = accounts_result
 
+        # 2) Fetch tau_state snapshot for the expected consensus state hash
         if expected_state_hash and expected_state_hash != ("0" * 64):
-            rules_from_dht = fetch_tau_state_snapshot(expected_state_hash)
+            snapshot_result = fetch_tau_state_snapshot(expected_state_hash)
+            if snapshot_result and isinstance(snapshot_result, tuple):
+                rules_from_dht, remote_accounts_hash = snapshot_result
+            else:
+                # Back-compat / safeguard
+                rules_from_dht = snapshot_result  # type: ignore
+                remote_accounts_hash = None
         else:
+            # Genesis / empty rules are allowed
             rules_from_dht = ""
+            remote_accounts_hash = None
 
+        # 3) If we have both pieces, verify that they refer to the SAME accounts hash
         if balances_snapshot is not None and sequences_snapshot is not None and rules_from_dht is not None:
-             # Cache fetched snapshots to local DHT store to assist network propagation
             try:
-                 if _dht_client and _dht_client.dht:
-                    # Cache accounts
-                    # Do NOT call publish_accounts_snapshot() (which reads current global state).
-                    # Construct payload from FETCHED snapshots.
+                if remote_accounts_hash:
+                    local_accounts_hash_hex = compute_accounts_hash(balances_snapshot, sequences_snapshot).hex()
+                    if local_accounts_hash_hex != remote_accounts_hash:
+                        logger.warning(
+                            "[chain_state] DHT snapshot mismatch for block %s: accounts_hash(local)=%s != accounts_hash(remote)=%s; retrying...",
+                            block.block_hash[:12],
+                            local_accounts_hash_hex[:12],
+                            remote_accounts_hash[:12],
+                        )
+                        # Retry - either accounts snapshot or tau_state snapshot is from a different moment
+                        balances_snapshot = None
+                        sequences_snapshot = None
+                        # Keep rules_from_dht / remote_accounts_hash as-is; next loop may fetch newer accounts
+                        time.sleep(0.2)
+                        continue
+
+                # 4) Cache fetched snapshots to local DHT store to assist network propagation
+                if _dht_client and _dht_client.dht:
                     accounts_payload = json.dumps(
-                         {
-                             "block_hash": block.block_hash, 
-                             "accounts": {
-                                 addr: {"balance": bal, "sequence": sequences_snapshot.get(addr, 0)} 
-                                 for addr, bal in balances_snapshot.items()
-                             }
-                         }, 
-                         sort_keys=True, separators=(",", ":")
+                        {
+                            "block_hash": block.block_hash,
+                            "accounts": {
+                                addr: {"balance": bal, "sequence": sequences_snapshot.get(addr, 0)}
+                                for addr, bal in balances_snapshot.items()
+                            },
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
                     ).encode("utf-8")
-                    
-                    if hasattr(_dht_client, "put_record_sync"):
-                        # Cache accounts
-                        # Use put_record_sync which handles key encoding (e.g. /state/<hash>)
-                        acc_key_raw = f"{config.STATE_LOCATOR_NAMESPACE}:{block.block_hash}".encode("ascii")
-                        if not _dht_client.put_record_sync(acc_key_raw, accounts_payload):
-                             logger.warning("[chain_state] Failed to cache accounts snapshot for %s via put_record_sync", block.block_hash)
-                        
-                        # Cache rules
-                        if rules_from_dht is not None:
-                             # Reconstruct payload for cache using local hash computation
-                             acc_hash_for_cache = compute_accounts_hash(balances_snapshot, sequences_snapshot)
-                             
-                             import json
-                             payload_cache = json.dumps({
-                                 "rules": rules_from_dht,
-                                 "accounts_hash": acc_hash_for_cache.hex()
-                             }).encode("utf-8")
-                             
-                             rules_key_raw = f"tau_state:{expected_state_hash}".encode("ascii")
-                             if not _dht_client.put_record_sync(rules_key_raw, payload_cache):
-                                  logger.warning("[chain_state] Failed to cache rules snapshot for %s via put_record_sync", expected_state_hash)
+
+                    # Cache accounts snapshot
+                    acc_key_raw = f"{config.STATE_LOCATOR_NAMESPACE}:{block.block_hash}".encode("ascii")
+
+                    # Cache rules snapshot (always preserve the remote accounts_hash when available)
+                    if remote_accounts_hash:
+                        acc_hash_hex = remote_accounts_hash
                     else:
-                        # Fallback if put_record_sync missing (should not happen with updated dht_manager)
-                        acc_key = f"{config.STATE_LOCATOR_NAMESPACE}:{block.block_hash}".encode("ascii")
-                        _dht_client.dht.value_store.put(acc_key, accounts_payload)
-                        if rules_from_dht is not None:
-                             acc_hash_for_cache = compute_accounts_hash(balances_snapshot, sequences_snapshot)
-                             payload_cache = json.dumps({
-                                 "rules": rules_from_dht,
-                                 "accounts_hash": acc_hash_for_cache.hex()
-                             }).encode("utf-8")
-                             rules_key = f"tau_state:{expected_state_hash}".encode("ascii")
-                             _dht_client.dht.value_store.put(rules_key, payload_cache)
+                        acc_hash_hex = compute_accounts_hash(balances_snapshot, sequences_snapshot).hex()
+
+                    rules_payload_cache = json.dumps(
+                        {"rules": rules_from_dht, "accounts_hash": acc_hash_hex},
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+
+                    rules_key_raw = f"tau_state:{expected_state_hash}".encode("ascii")
+
+                    if hasattr(_dht_client, "put_record_sync"):
+                        if not _dht_client.put_record_sync(acc_key_raw, accounts_payload):
+                            logger.warning(
+                                "[chain_state] Failed to cache accounts snapshot for %s via put_record_sync",
+                                block.block_hash,
+                            )
+                        if expected_state_hash and expected_state_hash != ("0" * 64):
+                            if not _dht_client.put_record_sync(rules_key_raw, rules_payload_cache):
+                                logger.warning(
+                                    "[chain_state] Failed to cache rules snapshot for %s via put_record_sync",
+                                    expected_state_hash,
+                                )
+                    else:
+                        _dht_client.dht.value_store.put(acc_key_raw, accounts_payload)
+                        if expected_state_hash and expected_state_hash != ("0" * 64):
+                            _dht_client.dht.value_store.put(rules_key_raw, rules_payload_cache)
+
             except Exception as e:
-                 print(f"[WARN][chain_state] Failed to cache snapshots to local DHT: {e}")
+                print(f"[WARN][chain_state] Failed to cache/verify snapshots from DHT: {e}")
+
             break
+
         time.sleep(0.2)
 
     if balances_snapshot is None or sequences_snapshot is None:
@@ -427,9 +503,15 @@ def process_new_block(block: Block) -> bool:
         return False
 
     try:
-        # Always reset Tau state even if empty
+        # Always reset Tau state even if empty. Do not let Tau recompute/override
+        # the snapshot; we trust the DHT-provided state.
         rule_text = rules_from_dht if rules_from_dht else ""
-        tau_manager.communicate_with_tau(rule_text=rule_text, target_output_stream_index=0)
+        tau_manager.communicate_with_tau(
+            rule_text=rule_text,
+            target_output_stream_index=0,
+            apply_rules_update=False,
+            source="snapshot-restore",
+        )
     except Exception as exc:
         print(f"[ERROR][chain_state] Failed to apply Tau state snapshot via i0: {exc}")
         return False
@@ -441,22 +523,36 @@ def process_new_block(block: Block) -> bool:
     accounts_hash = compute_accounts_hash(balances_snapshot, sequences_snapshot)
     
     # 2. Compute Consensus Hash
-    # Rules: existing logic tries `_current_rules_state` (if updated by communicate?) 
-    # But communicate_with_tau updates _current_rules_state via handler? 
-    # Let's rely on rules_from_dht since that's what we applied.
     applied_rules = rules_from_dht or ""
     rules_bytes = applied_rules.encode("utf-8")
     
     applied_hash = compute_consensus_state_hash(rules_bytes, accounts_hash)
 
-    # Allow fallback? If hash format changed, we might have issues.
-    # But for Phase 12 hardening, we enforce the new format.
-    
     if expected_state_hash and expected_state_hash != ("0" * 64) and applied_hash != expected_state_hash:
         print(
             f"[ERROR][chain_state] Consensus state hash mismatch. "
             f"expected={expected_state_hash[:12]} got={applied_hash[:12]}"
         )
+        if logger.isEnabledFor(logging.DEBUG) or True: # Force log for now
+            logger.error("\n--- HASH MISMATCH DEBUG INFO ---")
+            logger.error(f"Expected: {expected_state_hash}")
+            logger.error(f"Got:      {applied_hash}")
+            logger.error(f"Rules Len: {len(rules_bytes)}")
+            logger.error(f"Rules Hash (SHA256): {hashlib.sha256(rules_bytes).hexdigest()}")
+            logger.error(f"Fetched Rules Sample: {rules_bytes[:100]!r}...")
+            
+            logger.error(f"Accounts Hash (SHA256): {accounts_hash.hex()}")
+            logger.error(f"Remote Accts Hash:      {remote_accounts_hash if remote_accounts_hash else 'N/A'}")
+            logger.error(f"Balances Count: {len(balances_snapshot)}")
+            logger.error(f"Sequences Count: {len(sequences_snapshot)}")
+            
+            # Dump accounts for offline verification if needed
+            # Sample first 5 sorted
+            sorted_accs = sorted(balances_snapshot.keys())[:5]
+            for addr in sorted_accs:
+                 logger.error(f"Addr: {addr} Bal: {balances_snapshot[addr]} Seq: {sequences_snapshot.get(addr, 0)}")
+            logger.error("--------------------------------\n")
+
         return False
 
     with _rules_lock:
@@ -474,13 +570,26 @@ def process_new_block(block: Block) -> bool:
         _current_rules_state = applied_rules
         _last_processed_block_hash = block.block_hash
 
-    db.add_block(block)
+    if not existing:
+        db.add_block(block)
     db.save_chain_state(
         balances=_balances,
         sequences=_sequence_numbers,
         rules=applied_rules,
         last_block_hash=block.block_hash,
     )
+    # Drop transactions that are now confirmed in this block.
+    try:
+        tx_hashes = [h for h in (block.tx_ids or []) if isinstance(h, str)]
+        if not tx_hashes:
+            from block import compute_tx_hash
+            tx_hashes = [compute_tx_hash(tx) for tx in (block.transactions or []) if isinstance(tx, dict)]
+        if tx_hashes:
+            removed = db.remove_mempool_by_hashes(tx_hashes)
+            if removed:
+                print(f"[INFO][chain_state] Removed {removed} mempool txs included in block #{block_number}.")
+    except Exception as exc:
+        logger.warning("Failed to remove block transactions from mempool: %s", exc)
     print(f"[INFO][chain_state] Block #{block_number} persisted via DHT snapshots.")
     return True
 
@@ -672,6 +781,19 @@ def save_rules_state(rules_content: str):
             logger.warning("Saving empty Tau rules state.")
             # return
         _current_rules_state = candidate
+
+        # Detailed debug of saved Tau state (size, hash, snippet) to trace drift.
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                preview = _current_rules_state[:200]
+                logger.debug(
+                    "Saved Tau state snapshot len=%s hash=%s preview=%r",
+                    len(_current_rules_state),
+                    hashlib.sha256(_current_rules_state.encode("utf-8")).hexdigest(),
+                    preview,
+                )
+            except Exception:
+                logger.debug("Saved Tau state snapshot (debug logging failed)")
         
         # NOTE: We do NOT set _tau_engine_state_hash to the rules-only hash here.
         # We wait until we compute the consensus hash (rules + accounts_hash) below.
@@ -682,31 +804,17 @@ def save_rules_state(rules_content: str):
             len(_current_rules_state)
         )
 
+        # NOTE:
+        # Do NOT publish tau_state:<consensus_hash> from here.
+        # At this point we might be mid-block (accounts not final yet), so embedding accounts_hash here
+        # can create inconsistencies between `tau_state:<state_hash>` and `state:<block_hash>` snapshots.
+        # The authoritative publishing of (rules + accounts_hash) MUST happen at block-finalization time.
         if _dht_client:
-                try:
-                    rules_bytes = _current_rules_state.encode('utf-8')
-                    # Compute Accounts Hash for Consensus Hash
-                    with _balance_lock, _sequence_lock:
-                         accounts_hash = compute_accounts_hash(_balances, _sequence_numbers)
-                    
-                    # Compute Consensus Hash
-                    state_hash = compute_consensus_state_hash(rules_bytes, accounts_hash)
-                    
-                    # Update global hash
-                    _tau_engine_state_hash = state_hash
-                    
-                    # Publish to tau_state:<consensus_hash>
-                    publish_tau_state_snapshot(state_hash, rules_bytes, accounts_hash)
-                    print(f"[INFO][chain_state] Published Tau state snapshot to DHT: tau_state:{state_hash}")
-                    
-                    # Previously we also published to formula:<sha256>. Keep it for raw formula lookup?
-                    # The user asked to "Stop publishing state:<rules_hash>" which refers to keying by rule hash
-                    # but using "state" namespace.
-                    # We might still want "formula:<sha256>" -> raw_bytes for direct formula sharing if needed.
-                    # But if not critical, we can skip. Let's keep formula for now as it seems distinct.
-                    
-                except Exception as e:
-                    print(f"[ERROR][chain_state] Failed to store state in DHT: {e}")
+            try:
+                # Keep a best-effort local marker only (optional)
+                _tau_engine_state_hash = ""
+            except Exception:
+                pass
         
 
 def fetch_formula_from_dht(formula_hash: str) -> Optional[str]:

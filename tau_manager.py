@@ -40,31 +40,31 @@ TAU_OUTPUT_PROMPT_RE = re.compile(r"^o(\d+)\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*
 TAU_ANY_PROMPT_RE = re.compile(r"^(?:i|o)\d+\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*$")
 
 # --- Rule sanitation -----------------------------------------------------------
-# Some rules in the wild use an unsized bitvector annotation `:bv` instead of
-# `:bv[64]` / `:bv[16]` / etc. Tau can be strict about typing, so we normalize
-# unsized occurrences to a default width (64-bit) before sending rules to Tau.
+# Normalize all bitvector annotations to a default width (64-bit) before sending
+# rules to Tau (e.g. :bv, :bv[1], :bv[16], :bv[128] -> :bv[64]).
 #
 # We intentionally scope this to type annotations (":bv") rather than replacing
 # every "bv" substring in the rule text.
 DEFAULT_RULE_BV_WIDTH = 64
-_UNSIZED_BV_TYPE_RE = re.compile(r":\s*bv\b(?!\s*\[)")
+_BV_TYPE_RE = re.compile(r":\s*bv(?:\s*\[\s*\d+\s*\])?")
 
 
 def normalize_rule_bitvector_sizes(rule_text: str, default_width: int = DEFAULT_RULE_BV_WIDTH) -> str:
     """
-    Normalize Tau rule text so that any unsized bitvector type annotation `:bv`
-    becomes `:bv[<default_width>]`.
+    Normalize Tau rule text so that any bitvector type annotation `:bv` or
+    `:bv[<n>]` becomes `:bv[<default_width>]`.
 
     Examples:
       - `{ #b0 }:bv` -> `{ #b0 }:bv[64]`
-      - `x:t = y:bv[16]` (unchanged)
+      - `{ #b0 }:bv[1]` -> `{ #b0 }:bv[64]`
+      - `{ #b0 }:bv[128]` -> `{ #b0 }:bv[64]`
     """
     if not rule_text:
         return rule_text
-    normalized, replacements = _UNSIZED_BV_TYPE_RE.subn(f":bv[{int(default_width)}]", rule_text)
+    normalized, replacements = _BV_TYPE_RE.subn(f":bv[{int(default_width)}]", rule_text)
     if replacements:
         logger.debug(
-            "normalize_rule_bitvector_sizes: rewrote %s unsized ':bv' annotations to ':bv[%s]'",
+            "normalize_rule_bitvector_sizes: rewrote %s ':bv' annotations to ':bv[%s]'",
             replacements,
             default_width,
         )
@@ -443,6 +443,9 @@ def communicate_with_tau(
     rule_text: str | None = None,
     target_output_stream_index: int = 0,
     input_stream_values: dict[int | str, str | list[str]] | None = None,
+    source: str = "unknown",
+    apply_rules_update: bool = True,
+    wait_for_ready: bool = True,
 ):
     """
     Sends input to the persistent Tau process via stdin and reads the corresponding
@@ -456,139 +459,169 @@ def communicate_with_tau(
         input_stream_values (dict | None): Optional mapping of Tau input stream indices to the
             exact value(s) that should be written when Tau prompts them. Each dict value can be
             a single string/int or an iterable of such values, which will be consumed in order.
+        source (str): Identifier for the source of this communication (e.g., "node_A", "main").
+                      Used for debug logging to distinguish interleaved commands.
+        wait_for_ready (bool): If True (default), this function will block and wait for Tau to
+                               be ready if it is currently restarting or down. It will also
+                               automatically retry the operation after a crash/restart.
+                               Set to False for internal calls (like state restoration) that
+                               happen during the startup/init phase.
 
     Returns:
         str: The parsed Tau output line from Tau's stdout from the target output stream.
 
     Raises:
-        TauProcessError: If Tau process is not running/ready.
-        TauCommunicationError: If communication fails or times out.
+        TauProcessError: If Tau process is not running/ready (and wait_for_ready=False).
+        TauCommunicationError: If communication fails or times out (and wait_for_ready=False).
     """
     global tau_process, tau_process_lock, tau_ready, tau_process_ready, tau_comm_lock, restart_in_progress, last_known_tau_spec
     
     logger.info(
-        "communicate_with_tau(rule_text=%s, target_output=%s, input_stream_values=%s)",
-        rule_text,
+        "communicate_with_tau(rule_text=%s, target_output=%s, input_stream_values=%s, source=%s, wait=%s)",
+        rule_text[:50] + "..." if rule_text and len(rule_text) > 50 else rule_text,
         target_output_stream_index,
         input_stream_values,
+        source,
+        wait_for_ready
     )
 
-    # 1. Acquire High-Level Comm Lock (Serialization)
-    # This prevents multiple threads from interleaving IO with Tau.
-    try:
-        tau_comm_lock.acquire()
-    except Exception as e:
-         raise TauCommunicationError(f"Failed to acquire communications lock: {e}")
-
-    # Flag to indicate if *this* call triggered a kill/restart
-    _this_call_triggered_kill = False
-
-    try:
-        # ----------------------------------------------------
-        # PREPARATION
-        # ----------------------------------------------------
-
-        stream_input_queues: dict[int, deque[str]] = {}
-        if input_stream_values:
-            for raw_idx, raw_value in input_stream_values.items():
-                if raw_value is None:
-                    continue
-                try:
-                    idx = int(raw_idx)
-                except (TypeError, ValueError):
-                    logger.debug("communicate_with_tau: Skipping non-integer stream index %s", raw_idx)
-                    continue
-
-                if isinstance(raw_value, (list, tuple)):
-                    values = [str(v) for v in raw_value if v is not None]
-                else:
-                    values = [str(raw_value)]
-
-                if not values:
-                    continue
-                stream_input_queues[idx] = deque(values)
-
-        # 2. Check Process Readiness (Check internal process-up signal, not necessarily full 'readyfs')
-        if not tau_process_ready.is_set() and not tau_test_mode:
-            raise TauProcessError("Tau process is not running (not signaled ready).")
-
-        # If in fake mode, synthesize minimal responses needed by tests
-        if tau_test_mode:
-            # For rule confirmations on o0, return non-zero ack
-            if target_output_stream_index == 0:
-                return tau_defs.ACK_RULE_PROCESSED
-            # For transfer validation on o1, return success
-            elif target_output_stream_index == 1:
-                return tau_defs.TRANSACTION_VALIDATION_SUCCESS
-            # For other streams, return logical zero by default
-            return tau_defs.TAU_VALUE_ZERO
-
-        tau_output_line = tau_defs.TAU_VALUE_ZERO # Initialize early!
-
-        # ----------------------------------------------------
-        # INTERACTION LOOP
-        # ----------------------------------------------------
-        with tau_process_lock:
-            # Double-check process status *after* acquiring lock
-            if not tau_process or tau_process.poll() is not None:
-                tau_ready.clear() 
-                tau_process_ready.clear()
-                raise TauProcessError("Tau process is not running.")
-
-            current_stdin = tau_process.stdin
-            current_stdout = tau_process.stdout
-            if not current_stdin or not current_stdout or current_stdin.closed or current_stdout.closed:
-                tau_ready.clear()
-                tau_process_ready.clear()
-                raise TauProcessError("Tau process stdin/stdout pipes not available or closed.")
-
-            def _send_value_to_tau(stream_idx: int, value, reason: str):
-                """Helper that logs and writes a value to Tau's stdin."""
-                value_str = "" if value is None else str(value)
-                if value_str.lstrip().startswith("always"):
-                    value_str = normalize_rule_bitvector_sizes(value_str)
-                logger.info(
-                    f"{COLOR_MAGENTA}communicate_with_tau: Tau prompting on i%s. %s{COLOR_RESET}",
-                    stream_idx,
-                    reason,
-                )
-                for line_part in value_str.split('\n'):
-                    logger.info(f"{COLOR_GREEN}Sending to Tau (stdin) >>> %s{COLOR_RESET}", line_part)
+    # Track total wait time to prevent infinite hangs
+    total_wait_time = 0.0
+    
+    while True:
+        # 0. Wait for Readiness (if requested)
+        if wait_for_ready:
+            wait_step = config.CLIENT_WAIT_TIMEOUT * 2
+            if not tau_ready.wait(timeout=wait_step):
+                total_wait_time += wait_step
+                logger.warning("communicate_with_tau: Timeout waiting for Tau readiness (total wait: %.1fs). Retrying...", total_wait_time)
                 
-                if config.settings.tau.comm_debug_path:
+                if total_wait_time > config.PROCESS_TIMEOUT + 60:
+                     raise TauProcessError(f"Timed out ({total_wait_time}s) waiting for Tau to become ready.")
+
+                if server_should_stop.is_set():
+                    raise TauProcessError("Server is stopping.")
+                # Loop back to check readiness again
+                continue
+
+        # 1. Acquire High-Level Comm Lock (Serialization)
+        try:
+            tau_comm_lock.acquire()
+        except Exception as e:
+            logger.error("Failed to acquire tau_comm_lock: %s", e)
+            raise TauCommunicationError("Failed to acquire communication lock")
+
+        # Flag to indicate if *this* call triggered a kill/restart
+        _this_call_triggered_kill = False
+
+        try:
+            # Check if a restart is needed or in progress
+            # Check if a restart is needed or in progress
+            if restart_in_progress.is_set():
+                 # If we are not waiting (internal call like restore) AND the process is physically up, proceed.
+                 if not (not wait_for_ready and tau_process_ready.is_set()):
+                     raise TauProcessError("Tau process is restarting. Please retry later.")
+                 
+            if not tau_process and not tau_test_mode:
+                 raise TauProcessError("Tau process is not initialized.")
+
+            # Prepare input queues (Rebuild every attempt as deque is consumed)
+            stream_input_queues: dict[int, deque[str]] = {}
+            if input_stream_values:
+                for raw_idx, raw_value in input_stream_values.items():
+                    if raw_value is None:
+                        continue
                     try:
-                        with open(config.settings.tau.comm_debug_path, "a") as debug_f:
-                            debug_f.write(value_str + '\n')
-                            debug_f.flush()
-                    except Exception as e:
-                        logger.error(f"Failed to write to comm_debug_path: {e}")
+                        idx = int(raw_idx)
+                    except (TypeError, ValueError):
+                        logger.debug("communicate_with_tau: Skipping non-integer stream index %s", raw_idx)
+                        continue
 
-                current_stdin.write(value_str + '\n')
-                current_stdin.flush()
+                    if isinstance(raw_value, (list, tuple)):
+                        values = [str(v) for v in raw_value if v is not None]
+                    else:
+                        values = [str(raw_value)]
 
-            # State for the loop
-            output_lines_read = []
-            expect_stream_value_for = None  
-            start_comm_time = time.monotonic()
-            found_target_output = False  
-            capturing_updated_spec = False
-            updated_spec_lines: list[str] = []
-            error_count = 0  
-            max_errors = 3
-            
-            # Additional Diagnostics
-            last_prompt_seen = "None"
-            
-            try:
+                    if not values:
+                        continue
+                    stream_input_queues[idx] = deque(values)
+
+            # 2. Check Process Readiness (Check internal process-up signal)
+            if not tau_process_ready.is_set() and not tau_test_mode:
+                raise TauProcessError("Tau process is not running (not signaled ready).")
+
+            # If in fake mode, synthesize minimal responses
+            if tau_test_mode:
+                if target_output_stream_index == 0:
+                    return tau_defs.ACK_RULE_PROCESSED
+                elif target_output_stream_index == 1:
+                    return tau_defs.TRANSACTION_VALIDATION_SUCCESS
+                return tau_defs.TAU_VALUE_ZERO
+
+            tau_output_line = tau_defs.TAU_VALUE_ZERO 
+
+            # ----------------------------------------------------
+            # INTERACTION LOOP
+            # ----------------------------------------------------
+            with tau_process_lock:
+                # Double-check process status *after* acquiring lock
+                if not tau_process or tau_process.poll() is not None:
+                    tau_ready.clear() 
+                    tau_process_ready.clear()
+                    raise TauProcessError("Tau process is not running.")
+
+                current_stdin = tau_process.stdin
+                current_stdout = tau_process.stdout
+                if not current_stdin or not current_stdout or current_stdin.closed or current_stdout.closed:
+                    tau_ready.clear()
+                    tau_process_ready.clear()
+                    raise TauProcessError("Tau process stdin/stdout pipes not available or closed.")
+
+                def _send_value_to_tau(stream_idx: int, value, reason: str):
+                    """Helper that logs and writes a value to Tau's stdin."""
+                    value_str = "" if value is None else str(value)
+                    if value_str.lstrip().startswith("always"):
+                        value_str = normalize_rule_bitvector_sizes(value_str)
+                    logger.info(
+                        f"{COLOR_MAGENTA}communicate_with_tau: Tau prompting on i%s. %s{COLOR_RESET}",
+                        stream_idx,
+                        reason,
+                    )
+                    for line_part in value_str.split('\n'):
+                        logger.info(f"{COLOR_GREEN}Sending to Tau (stdin) >>> %s{COLOR_RESET}", line_part)
+                    
+                    if config.settings.tau.comm_debug_path:
+                        try:
+                            with open(config.settings.tau.comm_debug_path, "a") as debug_f:
+                                prefix = f"[{source}] " if source else ""
+                                debug_f.write(prefix + value_str + '\n')
+                                debug_f.flush()
+                        except Exception as e:
+                            logger.error(f"Failed to write to comm_debug_path: {e}")
+
+                    current_stdin.write(value_str + '\n')
+                    current_stdin.flush()
+
+                # State for the loop
+                output_lines_read = []
+                expect_stream_value_for = None  
+                start_comm_time = time.monotonic()
+                found_target_output = False  
+                capturing_updated_spec = False
+                updated_spec_lines: list[str] = []
+                
+                # Additional Diagnostics
+                last_prompt_seen = "None"
+                
                 while True:
                     elapsed = time.monotonic() - start_comm_time 
                     if elapsed > config.COMM_TIMEOUT:
                         break
-                    # We may need to wait for Tau to prompt i0[...] := before returning
                     if 'waiting_for_next_i0' not in locals():
                         waiting_for_next_i0 = False
-                    if elapsed > 10 and elapsed % 10:
-                        logger.warning("Tau process communication taking too long. %d seconds elapsed. PID: %s", elapsed, current_process.pid)
+                    if elapsed > 10 and int(elapsed) % 10 == 0:
+                        pid_val = tau_process.pid if tau_process else "unknown"
+                        logger.warning("Tau process communication taking too long. %d seconds elapsed. PID: %s", elapsed, pid_val)
 
                     # Check if process died
                     if tau_process.poll() is not None:
@@ -611,10 +644,8 @@ def communicate_with_tau(
                     fd = current_stdout.fileno()
                     
                     while True:
-                        # Check strict timeout INSIDE read loop too
                         elapsed = time.monotonic() - start_comm_time
                         if elapsed >= config.COMM_TIMEOUT:
-                             # TIMEOUT BREAK - handled below
                              break
                         
                         rlist, _, _ = select.select([fd], [], [], 0.1)
@@ -631,8 +662,6 @@ def communicate_with_tau(
                     
                     # Check timeout again after read loop
                     if time.monotonic() - start_comm_time >= config.COMM_TIMEOUT:
-                        # --- TIMEOUT DETECTED ---
-                        # Set flag to indicate this call triggered the kill
                         if not restart_in_progress.is_set():
                             restart_in_progress.set()
                             _this_call_triggered_kill = True
@@ -647,12 +676,12 @@ def communicate_with_tau(
                             updated_spec = "\n".join(updated_spec_lines).strip()
                             capturing_updated_spec = False
                             updated_spec_lines = []
-                            if updated_spec and _rules_handler:
+                            if updated_spec and _rules_handler and apply_rules_update:
                                 try:
                                     _rules_handler(updated_spec)
                                 except Exception as e:
                                     logger.error("Failed to save updated spec: %s", e)
-                        break # Return to caller
+                        break 
 
                     if line_strip == "":
                         continue
@@ -660,15 +689,8 @@ def communicate_with_tau(
                     output_lines_read.append(line_strip)
                     logger.info(f"{COLOR_BLUE}[TAU_STDOUT] %s{COLOR_RESET}", line_strip)
 
-                    # Error Handling
                     if "(Error)" in line_strip:
-                        error_count += 1
-                        logger.error("Tau Error (%s/%s): %s", error_count, max_errors, line_strip)
-                        if "Syntax Error" in line_strip:
-                            raise TauCommunicationError(f"Tau syntax error: {line_strip}")
-                        if error_count >= max_errors:
-                            raise TauCommunicationError(f"Too many errors ({error_count}). Last: {line_strip}")
-                        continue
+                        raise TauCommunicationError(f"Tau failed: {line_strip}")
 
                     # oN Prompt/Value Handling
                     if expect_stream_value_for is not None:
@@ -690,9 +712,8 @@ def communicate_with_tau(
                     if updated_spec_match:
                         inline = (updated_spec_match.group(1) or "").strip()
                         if inline:
-                            # Tracking state for error reporting
                             last_known_tau_spec = inline
-                            if _rules_handler:
+                            if _rules_handler and apply_rules_update:
                                 try:
                                     _rules_handler(inline)
                                 except Exception:
@@ -708,7 +729,7 @@ def communicate_with_tau(
                             last_known_tau_spec = updated_spec
                             capturing_updated_spec = False
                             updated_spec_lines = []
-                            if updated_spec and _rules_handler:
+                            if updated_spec and _rules_handler and apply_rules_update:
                                 try:
                                     _rules_handler(updated_spec)
                                 except Exception:
@@ -722,7 +743,6 @@ def communicate_with_tau(
                     if prompt_match:
                         stream_idx = int(prompt_match.group(1))
                         last_prompt_seen = f"i{stream_idx} prompt"
-
                         param_type = prompt_match.group(2)
                         
                         stream_queue = stream_input_queues.get(stream_idx)
@@ -735,17 +755,13 @@ def communicate_with_tau(
 
                         if stream_idx == target_output_stream_index and rule_text is not None:
                             _send_value_to_tau(stream_idx, normalize_rule_bitvector_sizes(rule_text), "Sending rule text")
-                            # Optimistically update known spec if we sent a rule on i0 logic
-                            # (Wait for echo confirmation usually, but this is a reasonable approximation for "last state used" context)
-                            if stream_idx == 0:
+                            if stream_idx == 0 and apply_rules_update:
                                 last_known_tau_spec = rule_text
                             continue
 
                         fallback_value = "F" if stream_idx == 0 else tau_defs.TAU_VALUE_ZERO
-                        # Special case: :sbf streams typically don't accept #b literals, expect decimal 0
                         if param_type and 'sbf' in param_type:
                             fallback_value = "0"
-                            
                         _send_value_to_tau(stream_idx, fallback_value, "Sending fallback")
                         continue
 
@@ -758,69 +774,72 @@ def communicate_with_tau(
                         break
 
                 if not found_target_output and time.monotonic() - start_comm_time >= config.COMM_TIMEOUT:
-                     # This case means the loop finished due to timeout, but no target output was found.
-                     # The TimeoutError would have been raised earlier if it was within the read loop.
-                     # This implies the process was alive but not producing expected output.
                      if not restart_in_progress.is_set():
                          restart_in_progress.set()
                          _this_call_triggered_kill = True
                      raise TauCommunicationError(f"Timeout ({config.COMM_TIMEOUT}s) waiting for Tau output. Last prompt: {last_prompt_seen}", last_state=last_known_tau_spec)
 
-            except TauCommunicationError as e:
-                # Log diagnostics for any TauCommunicationError (including timeouts)
-                logger.critical(
-                    "COMMUNICATION ERROR DETECTED.\n"
-                    "Error: %s\n"
-                    "Target Stream: o%s\n"
-                    "Time Elapsed: %.2fs\n"
-                    "Last Prompt Seen: %s\n"
-                    "Waiting For Value: o%s\n"
-                    "Last 20 Output Lines:\n%s\n"
-                    "Recent Stderr:\n%s\n"
-                    "Last Known Tau State:\n%s",
-                    e,
-                    target_output_stream_index,
-                    time.monotonic() - start_comm_time,
-                    last_prompt_seen,
-                    expect_stream_value_for,
-                    "\n".join(output_lines_read[-20:]),
-                    "\n".join(get_recent_stderr()),
-                    last_known_tau_spec if last_known_tau_spec else "N/A"
-                )
-                
-                # Check if we should trigger Safe Mode for next restart
-                # (Restart with Genesis + Predefined Rules)
-                logger.warning("Setting TAU_FORCE_FRESH_START=1 to trigger Safe Mode (Genesis + Rules) on restart.")
-                os.environ["TAU_FORCE_FRESH_START"] = "1"
-                
-                # If we construct a new error here, we ensure it carries the state
-                if not hasattr(e, 'last_state') or e.last_state is None:
-                     e.last_state = last_known_tau_spec
+            # Success!
+            try:
+                tau_output_line = utils.normalize_tau_atoms(tau_output_line)
+            except Exception:
+                pass
+            return tau_output_line
 
-                raise e # Re-raise to be caught by outer block
-            except (OSError, ValueError) as e:
-                logger.error("communicate_with_tau: IO Error: %s", e)
-                tau_ready.clear()
-                tau_process_ready.clear()
-                raise TauCommunicationError(f"IO Error: {e}", last_state=last_known_tau_spec)
-                
-    except TauCommunicationError as e:
-        raise e
+        except (TauProcessError, TauCommunicationError) as e:
+            if not wait_for_ready:
+                # If caller doesn't want to wait (e.g. initial restore), we fail fast.
+                if isinstance(e, TauCommunicationError):
+                     if not hasattr(e, 'last_state') or e.last_state is None:
+                         e.last_state = last_known_tau_spec
+                     logger.critical("Tau failed (no-wait). triggering kill for safety.")
+                     _this_call_triggered_kill = True
+                raise e
+
+            logger.warning("Tau communication failure (%s). Triggering Safe Mode and waiting for recovery...", e)
             
-    finally:
-        tau_comm_lock.release()
-        # If this thread initiated a restart, trigger the kill AFTER releasing the lock.
-        # This prevents deadlock where the restart logic (waiting for lock) blocks the killer (holding lock).
-        if '_this_call_triggered_kill' in locals() and _this_call_triggered_kill:
-             logger.warning("Initiating Tau process kill due to communication timeout/error.")
-             kill_tau_process()
+            # TRIGGER SAFE MODE
+            os.environ["TAU_FORCE_FRESH_START"] = "1"
+            
+            if isinstance(e, TauCommunicationError):
+                _this_call_triggered_kill = True
 
-    # Normalize output atoms to canonical '&'-separated sorted form
-    try:
-        tau_output_line = utils.normalize_tau_atoms(tau_output_line)
-    except Exception:
-        pass
-    return tau_output_line
+            # If this is a ProcessError, the process is already dead or dying.
+            # If CommunicationError, we flag it for kill.
+            
+            # We must release the lock before waiting, which the finally block handles.
+            # So we set a flag 'retry_needed' or just continue?
+            # We can't continue from here essentially because we need 'finally' to run.
+            # Python 'continue' in 'except' executes 'finally' then loops.
+            time.sleep(1.0)
+            continue
+
+        except (OSError, ValueError) as e:
+            logger.error("communicate_with_tau: IO Error: %s", e)
+            tau_ready.clear()
+            tau_process_ready.clear()
+            raise TauCommunicationError(f"IO Error: {e}", last_state=last_known_tau_spec)
+                
+        finally:
+            tau_comm_lock.release()
+            if '_this_call_triggered_kill' in locals() and _this_call_triggered_kill:
+                 logger.warning("Initiating Tau process kill due to communication timeout/error.")
+                 kill_tau_process()
+
+
+def reset_tau_state(rule_text: str, *, source: str = "unknown", apply_rules_update: bool = True) -> None:
+    """
+    Reset Tau state by sending a clear token followed by the provided spec.
+    This keeps the process in sync with a known snapshot before applying new rules.
+    """
+    # Restore the snapshot (block until ready if needed)
+    communicate_with_tau(
+        rule_text=rule_text or "",
+        target_output_stream_index=0,
+        source=source,
+        apply_rules_update=apply_rules_update,
+        wait_for_ready=True,  # Ensure we block if Tau has crashed
+    )
 
 
 def get_tau_process_status():

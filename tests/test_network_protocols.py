@@ -25,10 +25,25 @@ def isolate_db(tmp_path):
     os.environ["TAU_DB_PATH"] = str(db_file)
     import config as config_module
     import db as db_module
+    
+    # Close any existing connection before reloading to avoid leaks
+    if getattr(db_module, "_db_conn", None):
+        try:
+            db_module._db_conn.close()
+        except Exception:
+            pass
 
     importlib.reload(config_module)
     importlib.reload(db_module)
     yield
+    
+    # Close our test connection before restoring
+    if getattr(db_module, "_db_conn", None):
+        try:
+            db_module._db_conn.close()
+        except Exception:
+            pass
+
     if orig_env is None:
         os.environ.pop("TAU_DB_PATH", None)
     else:

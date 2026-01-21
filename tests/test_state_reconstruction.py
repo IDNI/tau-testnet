@@ -57,7 +57,7 @@ class TestStateReconstruction(unittest.TestCase):
         clear_mempool()
         
         # Sample addresses for testing
-        self.addr1 = "91423993fe5c3a7e0c0d466d9a26f502adf9d39f370649d25d1a6c2500d277212e8aa23e0e10c887cb4b6340d2eebce6"  # Genesis
+        self.addr1 = GENESIS_ADDRESS
         self.addr2 = "893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2"
         self.addr3 = "aabbccddee1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678"
         

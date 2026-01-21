@@ -1,5 +1,5 @@
 /py_ecc/
-/data/
+/data*
 /tmp/
 /venv/
 /_old.git/
@@ -30,7 +30,6 @@ node_modules/
 
 # Temprorary files
 docs/*.md
-tests/*phase*
 *.txt
 *.md
 .env*

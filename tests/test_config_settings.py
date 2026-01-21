@@ -26,6 +26,6 @@ def test_set_database_path(temp_database):
 
 
 def test_authority_settings_defaults():
-    assert config.MINER_PUBKEY.endswith("d2eebce6")
+    assert config.MINER_PUBKEY.endswith("be7d2b")
     assert config.STATE_LOCATOR_NAMESPACE == "state"
     assert config.BLOCK_SIGNATURE_SCHEME == "bls_g2"

@@ -21,6 +21,8 @@ from commands import createblock
 from db import init_db, add_mempool_tx, get_latest_block, clear_mempool
 import config
 
+TEST_MINER_PRIVKEY = "11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09"
+
 
 class TestMerkleRoot(unittest.TestCase):
     def test_empty(self):
@@ -76,16 +78,28 @@ class TestBlock(unittest.TestCase):
 
     @unittest.skipUnless(bls_signing_available(), "py_ecc is required for signature tests")
     def test_block_signature_roundtrip(self):
-        prev_hash = 'bb' * 32
-        block = Block.create(
-            block_number=2,
-            previous_hash=prev_hash,
-            transactions=[{"foo": "bar"}],
-            state_hash="12" * 32,
-            signing_key_hex=config.MINER_PRIVKEY,
-        )
-        self.assertIsNotNone(block.block_signature)
-        self.assertTrue(block.verify_signature(config.MINER_PUBKEY))
+        # Dynamically set MINER_PUBKEY to match TEST_MINER_PRIVKEY
+        from py_ecc.bls import G2Basic
+        priv_int = int(TEST_MINER_PRIVKEY, 16)
+        pub_bytes = G2Basic.SkToPk(priv_int)
+        pub_hex = pub_bytes.hex()
+        
+        original_pub = config.MINER_PUBKEY
+        config.MINER_PUBKEY = pub_hex
+        
+        try:
+            prev_hash = 'bb' * 32
+            block = Block.create(
+                block_number=2,
+                previous_hash=prev_hash,
+                transactions=[{"foo": "bar"}],
+                state_hash="12" * 32,
+                signing_key_hex=TEST_MINER_PRIVKEY,
+            )
+            self.assertIsNotNone(block.block_signature)
+            self.assertTrue(block.verify_signature(config.MINER_PUBKEY))
+        finally:
+            config.MINER_PUBKEY = original_pub
 
 
 class TestBlockCreation(unittest.TestCase):
@@ -93,8 +107,11 @@ class TestBlockCreation(unittest.TestCase):
     def setUp(self):
         """Set up a temporary database for testing block creation."""
         self.test_db_path = "test_blockchain_db.sqlite"
+        self.original_db_path = config.STRING_DB_PATH
         config.set_database_path(self.test_db_path)
         init_db()
+        self.original_miner_privkey = config.MINER_PRIVKEY
+        config.MINER_PRIVKEY = TEST_MINER_PRIVKEY
         
         # Reset chain state globals to ensure isolation
         import chain_state
@@ -145,7 +162,8 @@ class TestBlockCreation(unittest.TestCase):
         if os.path.exists(self.test_db_path):
             os.remove(self.test_db_path)
         # Restore original db path if needed elsewhere
-        config.set_database_path(config.DEFAULT_PROD_DB_PATH)
+        config.set_database_path(self.original_db_path)
+        config.MINER_PRIVKEY = self.original_miner_privkey
 
     def test_genesis_block_creation(self):
         """Test creating the first block (genesis block) from the mempool."""
@@ -201,6 +219,16 @@ class TestBlockCreation(unittest.TestCase):
         # Verify database has no blocks
         latest_block = get_latest_block()
         self.assertIsNone(latest_block)
+
+    def test_create_block_requires_miner_key(self):
+        """Blocks should not be created without a configured PoA key."""
+        original_key = config.MINER_PRIVKEY
+        config.MINER_PRIVKEY = None
+        try:
+            result = createblock.create_block_from_mempool()
+            self.assertIn("error", result)
+        finally:
+            config.MINER_PRIVKEY = original_key
 
 
 if __name__ == '__main__':

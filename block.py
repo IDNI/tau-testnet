@@ -40,7 +40,7 @@ def compute_tx_hash(tx: Dict) -> str:
     Compute the SHA256 hash of a transaction dictionary.
     Uses a canonical JSON representation with sorted keys.
     """
-    tx_bytes = json.dumps(tx, sort_keys=True).encode()
+    tx_bytes = json.dumps(tx, sort_keys=True, separators=(",", ":")).encode()
     return sha256_hex(tx_bytes)
 
 

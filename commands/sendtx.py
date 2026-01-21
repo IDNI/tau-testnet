@@ -10,6 +10,7 @@ import tau_defs
 import tau_manager
 from tau_manager import parse_tau_output
 import utils
+from errors import TauCommunicationError
 from db import add_mempool_tx
 from network import bus as network_bus
 
@@ -22,8 +23,11 @@ def _canonicalize_transaction(payload: dict) -> str:
 
 
 def _compute_transaction_message_id(payload: dict) -> tuple[str, str]:
+    # Keep mempool tx_hash aligned with block hashing (see block.compute_tx_hash).
+    import block as block_module
+
     canonical = _canonicalize_transaction(payload)
-    tx_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    tx_hash = block_module.compute_tx_hash(payload)
     return tx_hash, canonical
 
 _PY_ECC_AVAILABLE = False
@@ -317,10 +321,22 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                 else:
                     logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
                     tau_output_rules = tau_manager.communicate_with_tau(
-                        rule_text=rule_text, target_output_stream_index=0
+                        rule_text=rule_text,
+                        target_output_stream_index=0,
+                        apply_rules_update=False,
                     )
                     if "Error" in tau_output_rules:
                         return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
+                    # Restore prior Tau state so sendtx does not mutate state.
+                    try:
+                        prior_spec = chain_state.get_rules_state()
+                        tau_manager.reset_tau_state(
+                            prior_spec,
+                            source="sendtx-restore",
+                            apply_rules_update=False,
+                        )
+                    except Exception:
+                        logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
                     logger.info("Tau rule validation successful.")
 
         if has_transfers and all_validated_transfers:
@@ -353,6 +369,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                     tau_output_transfer = tau_manager.communicate_with_tau(
                         target_output_stream_index=1,
                         input_stream_values=tau_input_stream_values,
+                    apply_rules_update=False,
                     )
 
                     expected_amount = transfer_details[2]
@@ -397,6 +414,9 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
 
     except ValueError as e:
         return f"ERROR: Could not process transaction. {e}"
+    except TauCommunicationError as e:
+        logger.error("Tau rule validation failed: %s", e)
+        return f"FAILURE: Transaction rejected by Tau. {e}"
     except Exception as e:
         logger.critical("An unexpected error occurred in queue_transaction: %s", e)
         return f"FAILURE: An unexpected server error occurred."

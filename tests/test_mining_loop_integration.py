@@ -14,6 +14,7 @@ from poa.mempool import load_transactions
 class TestMiningLoopIntegration(unittest.TestCase):
     def setUp(self):
         self.db_path = "test_mining_loop.sqlite"
+        self.original_db_path = config.STRING_DB_PATH
         config.set_database_path(self.db_path)
         db.init_db()
         chain_state.init_chain_state()
@@ -49,6 +50,10 @@ class TestMiningLoopIntegration(unittest.TestCase):
         if hasattr(self, 'miner'):
             self.miner.stop()
         
+        if db._db_conn:
+            db._db_conn.close()
+            db._db_conn = None
+        
         # Restore tau_manager
         import tau_manager
         tau_manager.communicate_with_tau = self.original_communicate
@@ -57,6 +62,7 @@ class TestMiningLoopIntegration(unittest.TestCase):
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
         config.MINER_PRIVKEY = self.original_key
+        config.set_database_path(self.original_db_path)
 
     def test_mining_loop_automines(self):
         """Verify that the background thread mines a block when threshold is met."""

@@ -86,16 +86,15 @@ class TestChainDHTIntegration(unittest.TestCase):
         formula_content = "test formula content"
         self.chain_state.save_rules_state(formula_content)
         
-        # 3. Verify it was stored in DHT
-        expected_hash = hashlib.sha256(formula_content.encode('utf-8')).hexdigest()
-        expected_key = f"formula:{expected_hash}".encode('ascii')
-
-        # chain_state.save_rules_state now primarily publishes to tau_state:<consensus_hash>
-        # using put_record_sync if available.
-        # It no longer double-publishes to formula:<sha256> by default.
+        # 3. Verify it was NOT stored in DHT automatically (refactor)
+        calls = self.mock_dht_client.put_record_sync.call_args_list
+        self.assertEqual(len(calls), 0)
         
+        # 4. Manually publish (new workflow)
+        empty_acc_hash = b"\x00" * 32
         expected_state_key = f"tau_state:deadbeef".encode("ascii")
-
+        self.chain_state.publish_tau_state_snapshot("deadbeef", formula_content.encode("utf-8"), empty_acc_hash)
+        
         # Verify put_record_sync was called
         calls = self.mock_dht_client.put_record_sync.call_args_list
         self.assertEqual(len(calls), 1)
@@ -108,37 +107,15 @@ class TestChainDHTIntegration(unittest.TestCase):
         payload = json.loads(calls[0].args[1])
         self.assertEqual(payload.get("rules"), formula_content)
         
-        # 4. Verify retrieval (Mocking get_record_sync to return what we put)
-        # We need to ensure fetch_tau_state_snapshot works
-        
+        # 5. Verify retrieval (Mocking get_record_sync to return what we put)
         # Update mock to return our payload for the key
         self.store_data[expected_state_key] = calls[0].args[1]
         
-        # fetch_tau_state_snapshot uses consensus hash (from state header typically)
-        # Here we just ask for formula using the hash we know
-        # Wait, fetch_formula_from_dht uses "formula:<hash>"
-        # But we didn't store "formula:<hash>".
-        # So fetch_formula_from_dht will fail if we don't store it?
-        # save_rules_state stopped storing formula:<hash>.
-        # Does the user REQUIRE formula:<hash> lookup?
-        # The user said "Stop publishing state:<rules_hash>" 
-        # But if we rely on fetch_formula_from_dht in codebase, we might have broken it.
-        # Let's check where fetch_formula_from_dht is used.
-        # If it's used, we might need to restore formula publishing OR update it to look up by consensus hash? 
-        # But consensus hash depends on accounts. Formula hash is just rules.
-        # If we only have formula hash, we can't derive consensus hash to look up tau_state.
-        # So if we need lookup by formula hash, we MUST index it.
-        # Let's assume for this test fix we restore formula publishing in save_rules_state TEMPORARILY 
-        # OR update the test to test fetch_tau_state_snapshot.
-        # Given "Fixing integration failure", let's fix the test to match current behavior.
-        # Current behavior: Only tau_state.
-        # So fetch_formula_from_dht will likely fail/return None.
-        # I should test fetch_tau_state_snapshot instead?
-        # The test is named "test_store_and_retrieve_formula". 
-        # I'll update it to "test_store_and_retrieve_snapshot".
-        
-        retrieved_rules = self.chain_state.fetch_tau_state_snapshot("deadbeef")
-        self.assertEqual(retrieved_rules, formula_content)
+        retrieved = self.chain_state.fetch_tau_state_snapshot("deadbeef")
+        # Check tuple return
+        self.assertIsNotNone(retrieved)
+        self.assertTrue(isinstance(retrieved, tuple))
+        self.assertEqual(retrieved[0], formula_content)
         
     def test_retrieve_missing_formula(self):
         self.chain_state.set_dht_client(self.mock_dht_client)

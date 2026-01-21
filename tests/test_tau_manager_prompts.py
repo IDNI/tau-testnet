@@ -30,8 +30,9 @@ def test_normalize_rule_bitvector_sizes_rewrites_unsized_bv() -> None:
     # All unsized annotations should be removed.
     assert ":bv)" not in normalized
 
-    # Existing sizes must remain untouched.
+    # Existing sizes are also normalized to default width (64) logic.
     sized_rule = "always (o1[t]:bv[16] = i1[t]:bv[16])."
-    assert tau_manager.normalize_rule_bitvector_sizes(sized_rule) == sized_rule
+    expected_rule = "always (o1[t]:bv[64] = i1[t]:bv[64])."
+    assert tau_manager.normalize_rule_bitvector_sizes(sized_rule) == expected_rule
 
 

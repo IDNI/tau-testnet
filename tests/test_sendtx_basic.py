@@ -1,6 +1,6 @@
 
 
-import unittest, os, sys, json, time, hashlib
+import unittest, os, sys, json, time, hashlib, importlib
 from unittest.mock import Mock, patch
 from py_ecc.bls import G2Basic as bls
 
@@ -8,8 +8,8 @@ from py_ecc.bls import G2Basic as bls
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-os.environ["TAU_DB_PATH"] = "test_tau_string_db.sqlite"
 
+import config
 from commands import sendtx
 import chain_state, db, tau_defs, utils
 from commands.sendtx import _get_signing_message_bytes
@@ -21,16 +21,22 @@ ADDR_B = bls.SkToPk(bls.KeyGen(b"basic_seed_B")).hex()
 
 class TestSendTxBasic(unittest.TestCase):
     def setUp(self):
+        importlib.reload(sendtx)
         # cleanup and init
-        if os.path.exists("test_tau_string_db.sqlite"):
-            os.remove("test_tau_string_db.sqlite")
+        self.test_db = "test_tau_string_db.sqlite"
+        self.original_db_path = config.STRING_DB_PATH
+        config.set_database_path(self.test_db)
+        
         if db._db_conn:
             db._db_conn.close(); db._db_conn = None
+        if os.path.exists(self.test_db):
+            os.remove(self.test_db)
+            
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.init_chain_state()
         db.clear_mempool()  # Clear mempool for test isolation
         # patch Tau and disable signature verification/sequence enforcement for basic tests
-        def mock_tau_response(rule_text=None, target_output_stream_index=1, input_stream_values=None):
+        def mock_tau_response(rule_text=None, target_output_stream_index=1, input_stream_values=None, **kwargs):
             # Tau returns echoed amount on success, 0 on failure
             if target_output_stream_index == 0:
                 return tau_defs.ACK_RULE_PROCESSED
@@ -50,7 +56,6 @@ class TestSendTxBasic(unittest.TestCase):
                     return default
                 return int(value_str)
 
-            # Expect amount, balance, from_id, to_id
             try:
                 amount = _resolve(1, 0)
                 balance = _resolve(2, 0)
@@ -65,7 +70,8 @@ class TestSendTxBasic(unittest.TestCase):
             if amount > balance:
                 return tau_defs.TAU_VALUE_ZERO
             return tau_defs.TAU_VALUE_ONE
-        self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau', mock_tau_response).start()
+            
+        self.mock_tau = patch('tau_manager.communicate_with_tau', side_effect=mock_tau_response).start()
         sendtx._PY_ECC_AVAILABLE = False
         # Patch pubkey validation to bypass format checks for basic tests
         patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
@@ -74,6 +80,13 @@ class TestSendTxBasic(unittest.TestCase):
 
     def tearDown(self):
         patch.stopall()
+        if db._db_conn:
+            db._db_conn.close()
+            db._db_conn = None
+        if os.path.exists(self.test_db):
+            os.remove(self.test_db)
+        config.set_database_path(self.original_db_path)
+        
         # Reset globals that might affect other tests
         if hasattr(sendtx, '_PY_ECC_AVAILABLE'):
             # Re-detect or set to default
@@ -106,11 +119,8 @@ class TestSendTxBasic(unittest.TestCase):
         tx_json = self._create_tx([[GENESIS, ADDR_A, str(amount)]])
         result = sendtx.queue_transaction(tx_json)
         self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
-        # Phase 2: sendtx only enqueues, does not update state immediately.
-        # self.assertEqual(chain_state.get_balance(GENESIS), initial_genesis_balance - amount)
         mempool = db.get_mempool_txs()
         self.assertEqual(len(mempool), 1)
-        # Compare as objects to ignore key ordering/spacing diffs
         self.assertEqual(json.loads(mempool[0]), json.loads(tx_json))
 
     def test_successful_multiple_transfers(self):
@@ -123,15 +133,9 @@ class TestSendTxBasic(unittest.TestCase):
         tx_json = self._create_tx(tx_list)
         result = sendtx.queue_transaction(tx_json)
         self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
-        # Phase 2: sendtx only enqueues.
         mempool = db.get_mempool_txs()
         self.assertEqual(len(mempool), 1)
         self.assertEqual(json.loads(mempool[0]), json.loads(tx_json))
-
-    # def test_fail_insufficient_funds_tau(self):
-    #     # Legacy test: sendtx skips validation in test mode (TAU_FORCE_TEST=1)
-    #     # and does not update state suitable for this checkout.
-    #     pass
 
     def test_queue_transaction_notifies_network_bus(self):
         tx_json = self._create_tx([[GENESIS, ADDR_A, "1"]])

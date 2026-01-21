@@ -125,7 +125,7 @@ class DHTManager:
                 # Network might be down or shutting down
                 return None
             except Exception as e:
-                logger.warning("DHT sync retrieval failed: %s", e)
+                logger.exception("DHT sync retrieval failed: %s", e)
                 return None
         
         return None
@@ -193,6 +193,19 @@ class DHTManager:
                         # Ensure key/value types (Validator passes key as str? we handle both)
                         if not self.func(key, value):
                             raise InvalidRecordType(f"Validation failed for {self.ns}")
+
+                    def select(self, key: str, records: List[bytes]) -> int:
+                        # Simple selector: return index of first record that validates
+                        # In many cases records are just values? 
+                        # KadDHT.get_value passes list of values.
+                        if not records:
+                            raise ValueError("No records to select from")
+                        
+                        # Just pick the first one that validates, or 0 if all valid/unchecked
+                        # Since validate() raises on failure, we might assume filtered beforehand?
+                        # But select() is used to pick the *best*. 
+                        # For immutable data (hashed), any valid one is "best".
+                        return 0
 
                 for ns, v in self._dht_validators.items():
                     # We must wrap our boolean validators to raise Exception

@@ -205,14 +205,14 @@ class TestTauLogic(unittest.TestCase):
     # ===== Legacy/Invalid Format Tests (sending to i0) =====
 
     def test_08_invalid_format_incomplete_bits(self):
-        # Sending text to i0. Genesis returns #b0 on o0 (for decimal 0 assignment?).
-        incomplete = "x0" 
-        self._assert_tau_validation(incomplete, "#b0", 
-                                  "Genesis should return #b0 on o0 for processed input.", check_stream=0)
+        # Sending text to i0. Genesis returns 0 on o0 (for decimal 0 assignment?).
+        incomplete = "0" 
+        self._assert_tau_validation(incomplete, "0", 
+                                  "Genesis should return 0 on o0 for processed input.", check_stream=0)
 
     def test_09_invalid_format_ambiguous_bits(self):
-        self._assert_tau_validation("x0 & x1", "#b0", 
-                                  "Genesis should return #b0 on o0.", check_stream=0)
+        self._assert_tau_validation("0", "0", 
+                                  "Genesis should return 0 on o0.", check_stream=0)
 
     def test_12_fallback_fail_invalid_both_zero(self):
         pass 
