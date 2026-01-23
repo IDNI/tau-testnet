@@ -1,6 +1,7 @@
 import logging
 import os
 import socket
+import ssl
 import sys
 import threading
 import trio
@@ -270,21 +271,41 @@ def _start_websocket_server(container: ServiceContainer) -> None:
             request.server_container = container
             await websocket_handler(request)
 
+        def _build_ws_ssl_context() -> ssl.SSLContext | None:
+            cert_path = os.environ.get("TAU_WS_CERT_PATH", "").strip()
+            key_path = os.environ.get("TAU_WS_KEY_PATH", "").strip()
+            if not cert_path and not key_path:
+                return None
+            if not cert_path or not key_path:
+                logger.error(
+                    "WSS disabled: both TAU_WS_CERT_PATH and TAU_WS_KEY_PATH are required."
+                )
+                return None
+            try:
+                ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                ssl_ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+            except Exception:
+                logger.exception("Failed to load WSS cert/key; falling back to WS.")
+                return None
+            return ssl_ctx
+
         async def main():
             # Port scanning logic
             actual_ws_port = ws_port
+            ssl_context = _build_ws_ssl_context()
+            scheme = "wss" if ssl_context else "ws"
             # Simple scan
             for i in range(10):
                 try:
                     p = actual_ws_port + i
-                    logger.info("Attempting to bind WS to 127.0.0.1:%s", p)
+                    logger.info("Attempting to bind %s to 127.0.0.1:%s", scheme, p)
                     # serve_websocket blocks until cancelled.
                     # We need to run it.
                     await trio_websocket.serve_websocket(
                         handler_with_container, 
                         "127.0.0.1", 
                         p, 
-                        ssl_context=None
+                        ssl_context=ssl_context
                     )
                     # If it returns, it finished?
                     logger.warning("WS serve returned (unexpected).")

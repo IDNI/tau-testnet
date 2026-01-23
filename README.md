@@ -123,13 +123,19 @@ Call `NetworkService.get_metrics_snapshot()` (or read the periodic `[metrics]` l
 
 This runs an isolated PoA miner against a local DB without connecting to `testnet.tau.net`.
 
-1. **Generate a local test PoA keypair** (outside the repo is fine):
+1. **Generate a local test PoA keypair**:
    ```bash
-   python scripts/gen.py
+   python scripts/generate_miner_keys.py
    ```
-   Save the **private key hex** to `data/test_miner.key` and the **public key hex** to `data/test_miner.pub`.
+   This will create `test_miner.key` and `test_miner.pub`.
 
-2. **Start in test env with no bootstrap peers:**
+2. **Move keys to data directory**:
+   ```bash
+   mkdir -p data
+   mv test_miner.key test_miner.pub data/
+   ```
+
+3. **Start in test env with no bootstrap peers:**
    ```bash
    TAU_ENV=test \
    TAU_BOOTSTRAP_PEERS='[]' \
