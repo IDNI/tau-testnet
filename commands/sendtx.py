@@ -309,10 +309,40 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
             all_validated_transfers = transfer_result["transfers"]
             transfer_tau_inputs = transfer_result["tau_inputs"]
 
+    # --- Custom Input Parsing ---
+    custom_tau_inputs: dict[int, list[str]] = {}
+    for key, value in operations.items():
+        if key.isdigit():
+            idx = int(key)
+            # Reserved streams: 0=Rules, 1=Transfers (logic), 2=Balance, 3=From, 4=To
+            # We handle 0 and 1 explicitly above/below.
+            # But keys 2, 3, 4 provided by the user must be rejected to prevent conflict.
+            if idx in (0, 1):
+                continue
+            if idx in (2, 3, 4):
+                 return f"FAILURE: Invalid operation key '{key}'. Stream {idx} is reserved (0-4)."
+            
+            # Normalize value to list of strings
+            normalized_val = []
+            if isinstance(value, (str, int)):
+                normalized_val.append(str(value))
+            elif isinstance(value, (list, tuple)):
+                for v in value:
+                     if isinstance(v, (str, int)):
+                         normalized_val.append(str(v))
+                     else:
+                         return f"FAILURE: Invalid value type for stream {idx}. List items must be str or int."
+            else:
+                 return f"FAILURE: Invalid value type for stream {idx}. Must be str, int, or list thereof."
+            
+            custom_tau_inputs[idx] = normalized_val
+
     tau_force_test = os.environ.get("TAU_FORCE_TEST", "0") == "1"
 
     try:
-        # --- Tau Validation Step ---
+        # --- Tau Validation (Deterministic Two-Step) ---
+        
+        # Step 1: Rule Validation (if present)
         if has_rules:
             rule_text = operations.get("0", "").strip()
             if rule_text:
@@ -327,17 +357,40 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                     )
                     if "Error" in tau_output_rules:
                         return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
-                    # Restore prior Tau state so sendtx does not mutate state.
-                    try:
-                        prior_spec = chain_state.get_rules_state()
-                        tau_manager.reset_tau_state(
-                            prior_spec,
-                            source="sendtx-restore",
-                            apply_rules_update=False,
-                        )
-                    except Exception:
-                        logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
                     logger.info("Tau rule validation successful.")
+
+        # Step 2: Custom Input Validation (if present)
+        if custom_tau_inputs:
+             if tau_force_test:
+                logger.info("TAU_FORCE_TEST=1: skipping Tau custom input validation.")
+             else:
+                logger.info("Validating custom inputs with Tau: %s", custom_tau_inputs.keys())
+                # Send custom inputs targeting o0 (general ack/output)
+                # We send rule_text=None because we already validated usage in Step 1 (or rules aren't changing).
+                # This checks if the CURRENT (or just-updated conceptual) spec accepts these inputs 
+                # (i.e., prompts for them).
+                tau_output_custom = tau_manager.communicate_with_tau(
+                    rule_text=None,
+                    target_output_stream_index=0,
+                    input_stream_values=custom_tau_inputs,
+                    apply_rules_update=False,
+                )
+                if "Error" in tau_output_custom:
+                    return f"FAILURE: Transaction rejected by Tau (custom input validation). Output: {tau_output_custom}"
+                logger.info("Tau custom input validation successful.")
+        
+        # Cleanup: Restore prior Tau state so sendtx does not mutate global state.
+        if has_rules:
+            try:
+                prior_spec = chain_state.get_rules_state()
+                tau_manager.reset_tau_state(
+                    prior_spec,
+                    source="sendtx-restore",
+                    apply_rules_update=False,
+                )
+            except Exception:
+                logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
+
 
         if has_transfers and all_validated_transfers:
             if tau_force_test:

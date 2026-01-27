@@ -55,9 +55,10 @@ python wallet.py send --privkey <private_key> \
 ### Custom Operations
 ```bash
 python wallet.py send --privkey <private_key> \
-  --operation "2:custom_data" \
-  --operation "5:more_data"
+  --operation "5:custom_data" \
+  --operation "100:more_data"
 ```
+*Note: Keys 2, 3, and 4 are reserved. Use keys 5 and above for custom application data.*
 
 ### Complex Multi-Operation Transaction
 ```bash
@@ -101,7 +102,9 @@ The wallet supports the following operation types:
 
 - **Operation "0"**: Rules/Logic formulas (sent as-is to Tau)
 - **Operation "1"**: Coin transfers (SBF-encoded by the server)
-- **Operation "2", "3", etc.**: Custom operations (encoding depends on server implementation)
+- **Operation "0"**: Rules/Logic formulas (sent as-is to Tau)
+- **Operation "1"**: Coin transfers (SBF-encoded by the server)
+- **Operation "5" and above**: Custom operations. Note: Operations 2, 3, and 4 are reserved. Custom inputs are normalized to lists of strings.
 
 ## Examples
 

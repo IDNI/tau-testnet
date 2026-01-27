@@ -43,7 +43,9 @@ const knownAccountsList = document.getElementById('known-accounts');
 
 const txAmount = document.getElementById('tx-amount');
 const txRule = document.getElementById('tx-rule');
+const txCustom = document.getElementById('tx-custom'); // New element
 const ruleValidationStatus = document.getElementById('rule-validation-status');
+const customValidationStatus = document.getElementById('custom-validation-status');
 const btnRandomRule = document.getElementById('btn-random-rule');
 
 // Wallet Management DOM
@@ -398,6 +400,36 @@ async function onSendTransaction() {
             return;
         }
         ops["0"] = ruleInputPreCheck.split('\n').map(l => l.trim()).join(' ');
+    }
+
+    // 3. Custom Ops Logic
+    const customInput = txCustom.value.trim();
+    if (customInput) {
+        const lines = customInput.split('\n');
+        for (let line of lines) {
+            line = line.trim();
+            if (!line) continue;
+
+            const parts = line.split(':');
+            if (parts.length < 2) {
+                log(`Invalid custom op format: "${line}". Use Key:Value`, "error");
+                return;
+            }
+            const keyStr = parts[0].trim();
+            // Re-join the rest in case value contained colons
+            const valStr = parts.slice(1).join(':').trim();
+
+            const kInt = parseInt(keyStr);
+            if (isNaN(kInt)) {
+                log(`Custom key must be an integer: "${keyStr}"`, "error");
+                return;
+            }
+            if (kInt < 5) {
+                log(`Custom key must be >= 5 (reserved): "${keyStr}"`, "error");
+                return;
+            }
+            ops[keyStr] = valStr;
+        }
     }
 
     if (Object.keys(ops).length === 0) {

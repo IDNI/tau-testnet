@@ -57,6 +57,7 @@ To enable true Tau-driven validation, unset TAU_FORCE_TEST in your environment o
 *   **In-Memory Balances & Sequence Numbers**: Tracks account balances and sequence numbers for rapid validation.
 *   **SQLite Mempool**: Persists transactions awaiting inclusion in a block.
 *   **BLS12-381 Public Key Validation**: Format and optional cryptographic checks for public keys.
+*   **Strict Execution Validation**: Transactions that are structurally valid but fail during execution (e.g., Tau errors, insufficient funds) are accepted into the block (consuming the nonce) but marked with a "failed" status in the receipt.
 
 ### DHT Configuration & Gossip Health
 

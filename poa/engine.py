@@ -88,112 +88,192 @@ class PoATauEngine(TauEngine):
             operations = tx.get('operations', {})
             sender = tx.get('sender_pubkey')
             
-            tx_success = True
+            # By default, we consider the transaction valid for inclusion unless strictly malformed
+            # (e.g. signature issues are handled in verify_block, here we might assume validity).
+            # However, historically we used tx_success to mean "execution successful".
+            # We now split this:
+            # - accepted_in_block: True (unless we decide it's total garbage)
+            # - execution_success: True/False
+            
+            accepted_in_block = True
+            execution_success = True
             tx_receipt = {"logs": []}
 
-            # Update sequence number
+            # Sequence number handling: only increment if the tx is included/accepted.
             sequence_number = tx.get('sequence_number')
+            should_increment_seq = False
             if sequence_number is not None and sender:
-                # We need to check and update sequence number in chain_state
-                # This is a bit tight coupling, but necessary for now.
                 current_seq = chain_state.get_sequence_number(sender)
                 if sequence_number == current_seq:
-                    chain_state.increment_sequence_number(sender)
+                    should_increment_seq = True
                 else:
-                    logger.warning("Sequence mismatch for %s: expected %s, got %s", sender, current_seq, sequence_number)
-                    # Should we fail the tx? 
-                    # Original code just warned but proceeded? 
-                    # "Sequence mismatch ...: expected ..., had ..."
-                    # It didn't seem to stop processing.
-                    # But usually sequence mismatch invalidates tx.
-                    # Let's fail it to be safe, or follow original behavior?
-                    # Original code: print warning, then continue to process operations.
-                    # So it didn't fail. We'll replicate that but maybe we should fail?
-                    # For now, replicate.
-                    pass
+                    logger.warning(
+                        "Sequence mismatch for %s: expected %s, got %s",
+                        sender,
+                        current_seq,
+                        sequence_number,
+                    )
+                    # Keep legacy behavior: do not hard-fail here, but also do not increment.
 
             # Process operations
-            for op_key, op_data in operations.items():
-                if op_key == "0": # Rule
-                    if isinstance(op_data, str) and op_data.strip():
+            # Parse operations first to establish deterministic order:
+            # 1. Rule update (key "0")
+            # 2. Custom inputs (keys >= 5)
+            # 3. Transfers (key "1") - applied last to state, though input validation happened upstream
+
+            rule_op_data = operations.get("0")
+            transfers_op_data = operations.get("1")
+            
+            custom_tau_inputs: dict[int, list[str]] = {}
+            reserved_error = None
+            
+            for k, v in operations.items():
+                if k.isdigit():
+                    idx = int(k)
+                    if idx in (0, 1):
+                        continue
+                    if idx in (2, 3, 4):
+                         reserved_error = f"Operation key '{k}' matches reserved stream {idx}."
+                         break
+                    
+                    # Normalize value
+                    normalized_val = []
+                    valid_type = True
+                    if isinstance(v, (str, int)):
+                        normalized_val.append(str(v))
+                    elif isinstance(v, (list, tuple)):
+                        for item in v:
+                            if isinstance(item, (str, int)):
+                                normalized_val.append(str(item))
+                            else:
+                                valid_type = False
+                                break
+                    else:
+                        valid_type = False
+                    
+                    if not valid_type:
+                        reserved_error = f"Invalid value type for stream {idx}."
+                        break
+                    
+                    custom_tau_inputs[idx] = normalized_val
+
+            if reserved_error:
+                logger.error("Transaction invalid: %s", reserved_error)
+                execution_success = False
+                tx_receipt["logs"].append(f"Error: {reserved_error}")
+            else:
+                # --- Step 1: Rule Execution ---
+                if rule_op_data is not None:
+                     if isinstance(rule_op_data, str) and rule_op_data.strip():
                         try:
-                            # Send to Tau
-                            # We assume tau_manager is ready or we wait?
-                            # chain_state.rebuild_state_from_blockchain waits.
+                            # Wait for Tau availability logic
                             if not tau_manager.tau_ready.is_set():
-                                # Try to wait a bit?
                                 tau_manager.tau_ready.wait(timeout=5)
                             
                             if not tau_manager.tau_ready.is_set():
                                 logger.error("Tau process not ready for rule execution")
-                                tx_success = False
+                                execution_success = False
                                 tx_receipt["logs"].append("Tau not ready")
-                                break
-
-                            output = tau_manager.communicate_with_tau(
-                                rule_text=op_data.strip(), 
-                                target_output_stream_index=0
-                            )
-                            
-                            # Check output (simplified check)
-                            if "error" in output.lower() and "x1001" not in output.lower():
-                                # Basic error check, though Tau output format varies
-                                # x1001 is success (ACK_RULE_PROCESSED)
-                                logger.warning("Tau rejected rule: %s", output)
-                                # For now, we might not fail the TX if Tau rejects, 
-                                # or we might. Let's assume strictness.
-                                # But historical blocks might have invalid rules?
-                                # We'll log it.
-                                tx_receipt["logs"].append(f"Tau output: {output}")
+                                # Skip further processing if Tau is down
                             else:
-                                # Prefer the persisted "updated specification" snapshot if available.
+                                output = tau_manager.communicate_with_tau(
+                                    rule_text=rule_op_data.strip(), 
+                                    target_output_stream_index=0,
+                                    apply_rules_update=True # Apply update for consensus
+                                )
+                                
+                                tx_receipt["logs"].append(f"Tau(rule) o0: {output}")
+
+                                if "error" in output.lower() and "x1001" not in output.lower():
+                                    logger.warning("Tau rejected rule: %s", output)
+                                    execution_success = False
+                                    tx_receipt["logs"].append(f"Error: Tau rejected rule output: {output}")
+
+                                # Persist updated rules state
                                 rules_text = None
                                 try:
-                                    candidate = getattr(chain_state, "get_rules_state", None)
-                                    if callable(candidate):
-                                        val = candidate()
-                                        if isinstance(val, str):
-                                            rules_text = val
+                                    # Try to fetch authoritative state from global tracker (updated by handler)
+                                    val = chain_state.get_rules_state() if hasattr(chain_state, "get_rules_state") else None
+                                    if isinstance(val, str):
+                                        rules_text = val
                                 except Exception:
-                                    rules_text = None
+                                    pass
 
                                 if rules_text is not None:
                                     current_tau_bytes = rules_text.encode("utf-8")
                                 else:
-                                    # Fallback for tests/mocks: deterministic accumulation.
-                                    current_tau_bytes += op_data.encode("utf-8")
+                                    # Fallback
+                                    current_tau_bytes += rule_op_data.encode("utf-8")
                                 tx_receipt["logs"].append("Rule applied")
 
                         except Exception as e:
                             logger.error("Error applying rule: %s", e)
-                            tx_success = False
+                            execution_success = False
                             tx_receipt["logs"].append(f"Error: {e}")
-                            break
-                
-                elif op_key == "1": # Transfer
-                    if isinstance(op_data, list):
-                        for transfer in op_data:
+
+                # --- Step 2: Custom Inputs Execution ---
+                if execution_success and custom_tau_inputs:
+                     try:
+                        if not tau_manager.tau_ready.is_set():
+                             tau_manager.tau_ready.wait(timeout=5)
+                        
+                        if not tau_manager.tau_ready.is_set():
+                             logger.error("Tau process not ready for custom inputs")
+                             execution_success = False
+                             tx_receipt["logs"].append("Tau not ready")
+                        else:
+                            # Send inputs targeting o0 for general ack
+                            output = tau_manager.communicate_with_tau(
+                                rule_text=None,
+                                target_output_stream_index=0,
+                                input_stream_values=custom_tau_inputs,
+                                apply_rules_update=True
+                            )
+                            tx_receipt["logs"].append(f"Tau(custom) o0: {output}")
+
+                            if "Error" in output:
+                                logger.warning("Tau rejected custom inputs: %s", output)
+                                execution_success = False
+                                tx_receipt["logs"].append(f"Tau rejected custom inputs: {output}")
+                     except Exception as e:
+                         logger.error("Error applying custom inputs: %s", e)
+                         execution_success = False
+                         tx_receipt["logs"].append(f"Error (custom inputs): {e}")
+
+                # --- Step 3: Transfers (if rule/custom steps succeeded) ---
+                if execution_success and transfers_op_data is not None:
+                    if isinstance(transfers_op_data, list):
+                        for transfer in transfers_op_data:
                             if isinstance(transfer, (list, tuple)) and len(transfer) == 3:
                                 from_addr, to_addr, amount_val = transfer
                                 try:
                                     amount = int(amount_val)
-                                    # Use chain_state to update balances
-                                    # Note: This modifies global state!
-                                    # Ideally we should work on a copy or transactional state,
-                                    # but for now we follow the existing pattern.
                                     if not chain_state.update_balances_after_transfer(from_addr, to_addr, amount):
-                                        tx_success = False
+                                        execution_success = False
                                         tx_receipt["logs"].append("Transfer failed")
                                         break
                                 except Exception as e:
                                     logger.error("Error applying transfer: %s", e)
-                                    tx_success = False
+                                    execution_success = False
                                     break
-                        if not tx_success:
-                            break
+                        # Loop finishes, check if we broke out
+                    else:
+                        # logical error in tx format (should be caught by verify usually)
+                        pass
 
-            if tx_success:
+            if accepted_in_block:
+                if should_increment_seq and sender:
+                    try:
+                        chain_state.increment_sequence_number(sender)
+                    except Exception:
+                        logger.error("Failed to increment sequence number for %s", sender, exc_info=True)
+                        tx_receipt["logs"].append("Error: failed to increment sequence number")
+                        # execution_success = False ? No, sequence failure is bad but processed.
+
+            if accepted_in_block:
                 accepted_txs.append(tx)
+                status = "success" if execution_success else "failed"
+                tx_receipt["status"] = status
                 receipts[tx_id] = tx_receipt
             else:
                 rejected_txs.append(tx)

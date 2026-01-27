@@ -140,6 +140,10 @@
                     <button class="nav-link" id="tab-rule-btn" data-bs-toggle="tab" data-bs-target="#tab-rule"
                         type="button" role="tab">Rule</button>
                 </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="tab-custom-btn" data-bs-toggle="tab" data-bs-target="#tab-custom"
+                        type="button" role="tab">Custom</button>
+                </li>
             </ul>
 
             <div class="tab-content mt-3" id="txTabContent">
@@ -162,6 +166,17 @@
                         <textarea class="form-control font-monospace" id="tx-rule" rows="3"
                             placeholder="e.g. always (o5[t] = { #b1 }:bv)."></textarea>
                         <div id="rule-validation-status" class="form-text mt-1"></div>
+                    </div>
+                </div>
+
+                <!-- Custom Ops Tab -->
+                <div class="tab-pane fade" id="tab-custom" role="tabpanel">
+                    <div class="mb-3">
+                        <label for="tx-custom" class="form-label">Custom Operations</label>
+                        <textarea class="form-control font-monospace" id="tx-custom" rows="3"
+                            placeholder="Key:Value (e.g. 5:my_data)"></textarea>
+                        <div class="form-text">One operation per line. Keys must be &ge; 5.</div>
+                        <div id="custom-validation-status" class="form-text mt-1"></div>
                     </div>
                 </div>
             </div>

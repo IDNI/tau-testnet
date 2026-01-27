@@ -23,6 +23,10 @@ import java.util.ArrayDeque
 import org.tau.wallet.crypto.Bls
 import org.json.JSONArray
 
+import com.google.android.material.tabs.TabLayout
+import android.view.View
+import android.widget.LinearLayout
+
 class MainActivity : AppCompatActivity() {
 
     private lateinit var actHost: AutoCompleteTextView
@@ -34,6 +38,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etRule: EditText
     private lateinit var actTo: AutoCompleteTextView
     private lateinit var etAmount: EditText
+    private lateinit var etCustomOps: EditText
+
+    private lateinit var etCustomOps: EditText
+    private lateinit var tabLayoutTx: TabLayout
+    private lateinit var layoutTransfer: LinearLayout
+    private lateinit var layoutRule: LinearLayout
+    private lateinit var layoutCustom: LinearLayout
 
     private lateinit var tvResult: TextView
     private lateinit var actWallets: AutoCompleteTextView
@@ -68,10 +79,19 @@ class MainActivity : AppCompatActivity() {
         actTo = findViewById(R.id.actTo)
         setupRecipientValidation()
         etAmount = findViewById(R.id.etAmount)
+        etCustomOps = findViewById(R.id.etCustomOps)
+        
+        tabLayoutTx = findViewById(R.id.tabLayoutTx)
+        layoutTransfer = findViewById(R.id.layoutTransfer)
+        layoutRule = findViewById(R.id.layoutRule)
+        layoutCustom = findViewById(R.id.layoutCustom)
+        
         tvResult = findViewById(R.id.tvResult)
         actWallets = findViewById(R.id.actWallets)
         // cbRandomRule removed
         tvRuleValidationStatus = findViewById(R.id.tvRuleValidationStatus)
+        
+        setupTabs()
 
         findViewById<Button>(R.id.btnGenerateRule).setOnClickListener { 
              etRule.setText(generateRandomTauRule()) 
@@ -105,7 +125,25 @@ class MainActivity : AppCompatActivity() {
             override fun afterTextChanged(s: Editable?) {
                 validateRuleSyntax(s.toString())
             }
+        }
+
+    private fun setupTabs() {
+        tabLayoutTx.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
+            override fun onTabSelected(tab: TabLayout.Tab?) {
+                updateTabVisibility(tab?.position ?: 0)
+            }
+            override fun onTabUnselected(tab: TabLayout.Tab?) {}
+            override fun onTabReselected(tab: TabLayout.Tab?) {}
         })
+        // Initialize
+        updateTabVisibility(0)
+    }
+
+    private fun updateTabVisibility(position: Int) {
+        layoutTransfer.visibility = if (position == 0) View.VISIBLE else View.GONE
+        layoutRule.visibility = if (position == 1) View.VISIBLE else View.GONE
+        layoutCustom.visibility = if (position == 2) View.VISIBLE else View.GONE
+    })
     }
 
     private fun setupWalletDropdown() {
@@ -493,23 +531,76 @@ class MainActivity : AppCompatActivity() {
 
         val operations = mutableMapOf<String, Any>()
 
+        // Determine active tab
+        val selectedTabPos = tabLayoutTx.selectedTabPosition
+        
+        // Logic: Only process inputs from the visible tab? 
+        // OR process all valid inputs? 
+        // Web wallet processes all valid inputs. But typical UI implies only visible.
+        // Let's stick to visible for clarity, or loosely coupled.
+        // We'll process ALL present fields because user might switch tabs to "add" more ops.
+        // BUT for Transfer amount, if tab is invalid/hidden, maybe ignore?
+        // Actually, let's keep it simple: Read all fields. If empty, ignore.
+        
         if (rule.isNotEmpty()) {
             operations["0"] = rule
         }
 
-        if (to.isNotEmpty() && amountStr.isNotEmpty()) {
-            val amount = amountStr.toLongOrNull()
-            if (amount == null || amount < 0) {
-                runOnUiThread { tvResult.text = "Error: Invalid amount." }
-                return
+        val customOpsInput = etCustomOps.text.toString()
+        if (customOpsInput.isNotEmpty()) {
+            val lines = customOpsInput.lines()
+            for (line in lines) {
+                if (line.isBlank()) continue
+                val parts = line.split(":", limit = 2)
+                if (parts.size != 2) {
+                     runOnUiThread { tvResult.text = "Error: Invalid custom op format '$line'. Use Key:Value" }
+                     return
+                }
+                val keyStr = parts[0].trim()
+                val valStr = parts[1].trim()
+                
+                val kInt = keyStr.toIntOrNull()
+                if (kInt == null) {
+                    runOnUiThread { tvResult.text = "Error: Custom op key '$keyStr' must be an integer." }
+                    return
+                }
+                if (kInt < 5) {
+                    runOnUiThread { tvResult.text = "Error: Custom op key '$keyStr' is reserved (must be >= 5)." }
+                    return
+                }
+                operations[keyStr] = valStr
             }
-            val transfer = listOf(listOf(senderPk, to, amount.toString()))
-            operations["1"] = transfer
         }
-
-        if (operations.isEmpty()) {
-            runOnUiThread { tvResult.text = "Error: No operations specified. Enter a rule or a transfer." }
-            return
+        
+        // Transfer Logic
+        // In Web Wallet, we require amount if no Rule.
+        // In Android, similar logic.
+        // If Transfer tab is active, strict check on Amount?
+        // Let's follow Web Wallet logic: "If rule/custom present, amount is optional (unless entered)".
+        
+        val hasOtherOps = operations.isNotEmpty()
+        
+        if (to.isNotEmpty()) {
+             // If amount is specified, use it.
+             // If not specified, and we have other ops, maybe amount 0?
+             // But valid integer parsing handles standard cases.
+             if (amountStr.isNotEmpty()) {
+                 val amount = amountStr.toLongOrNull()
+                 if (amount == null || amount < 0) {
+                     runOnUiThread { tvResult.text = "Error: Invalid amount." }
+                     return
+                 }
+                 val transfer = listOf(listOf(senderPk, to, amount.toString()))
+                 operations["1"] = transfer
+             } else if (!hasOtherOps) {
+                 // No amount, no other ops -> Error
+                 runOnUiThread { tvResult.text = "Error: Amount required." }
+                 return
+             }
+        } else if (!hasOtherOps) {
+             // No To, no other ops
+             runOnUiThread { tvResult.text = "Error: Recipient or Rule/Custom Op required." }
+             return
         }
 
 
