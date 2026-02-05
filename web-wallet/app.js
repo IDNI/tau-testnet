@@ -9,6 +9,9 @@ let currentKeyPair = null;
 let isConnected = false;
 let savedWallets = {}; // name -> {priv: hex, pub: hex}
 
+const DEFAULT_RULE_BV_WIDTH = 16;
+const MAX_TAU_TRANSFER_AMOUNT = (1 << DEFAULT_RULE_BV_WIDTH) - 1;
+
 // --- DOM Elements ---
 const hostInput = document.getElementById('host');
 const portInput = document.getElementById('port');
@@ -101,6 +104,12 @@ function init() {
     btnSend.addEventListener('click', onSendTransaction);
     btnClearLogs.addEventListener('click', () => logsDiv.innerHTML = '');
     if (btnRefreshAccounts) btnRefreshAccounts.addEventListener('click', refreshKnownAccounts);
+
+    if (txAmount) {
+        txAmount.min = "0";
+        txAmount.max = String(MAX_TAU_TRANSFER_AMOUNT);
+        txAmount.step = "1";
+    }
 
     // Rule Logic
     txRule.addEventListener('input', () => validateRuleSyntax(txRule.value));
@@ -385,10 +394,18 @@ async function onSendTransaction() {
 
     // 1. Transfer Logic
     // User Requirement: If amount is 0 and rule is present, don't send the amount (transfer op).
-    const amountNum = parseFloat(amountVal);
+    const amountNum = amountVal === "" ? NaN : Number(amountVal);
     const shouldSendTransfer = recipient && amountVal && (amountNum !== 0 || !ruleInputPreCheck);
 
     if (shouldSendTransfer) {
+        if (!Number.isFinite(amountNum) || !Number.isInteger(amountNum)) {
+            log("Amount must be an integer.", "error");
+            return;
+        }
+        if (amountNum < 0 || amountNum > MAX_TAU_TRANSFER_AMOUNT) {
+            log(`Amount must be between 0 and ${MAX_TAU_TRANSFER_AMOUNT}.`, "error");
+            return;
+        }
         // "1" is transfer: [[from, to, amount]]
         ops["1"] = [[senderPub, recipient, amountVal.toString()]];
     }

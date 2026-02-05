@@ -18,6 +18,7 @@ import hashlib
 from py_ecc.bls import G2Basic
 from commands.sendtx import _get_signing_message_bytes
 import config
+from tau_manager import DEFAULT_RULE_BV_WIDTH
 
 
 def rpc_command(cmd_str, host, port):
@@ -26,6 +27,17 @@ def rpc_command(cmd_str, host, port):
         sock.sendall(cmd_str.encode('utf-8'))
         data = sock.recv(65536)
     return data.decode('utf-8')
+
+
+MAX_TAU_TRANSFER_AMOUNT = (1 << DEFAULT_RULE_BV_WIDTH) - 1
+
+
+def _validate_transfer_amount(amount: int) -> None:
+    if amount < 0 or amount > MAX_TAU_TRANSFER_AMOUNT:
+        raise ValueError(
+            f"Amount must be between 0 and {MAX_TAU_TRANSFER_AMOUNT} "
+            f"(bv[{DEFAULT_RULE_BV_WIDTH}])."
+        )
 
 
 def _parse_privkey(sk_str: str) -> bytes:
@@ -116,6 +128,7 @@ def cmd_send(args):
     
     # Backwards compatibility: if --to and --amount are provided, use them
     if hasattr(args, 'to') and hasattr(args, 'amount') and args.to and args.amount is not None:
+        _validate_transfer_amount(args.amount)
         transfers.append([sender_pk, args.to, str(args.amount)])
         print(f"Adding transfer: {args.amount} to {args.to}")
     
@@ -126,6 +139,7 @@ def cmd_send(args):
                 # Parse transfer string in format "to_address:amount"
                 to_addr, amount_str = transfer_str.split(':', 1)
                 amount = int(amount_str)
+                _validate_transfer_amount(amount)
                 transfers.append([sender_pk, to_addr.strip(), str(amount)])
                 print(f"Adding transfer: {amount} to {to_addr.strip()}")
             except ValueError as e:

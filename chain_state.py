@@ -341,7 +341,7 @@ def fetch_accounts_snapshot(block_hash: str) -> Optional[tuple[Dict[str, int], D
 
 # Genesis address and balance used across tests and reconstruction
 GENESIS_ADDRESS = "a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b"
-GENESIS_BALANCE = 1000000
+GENESIS_BALANCE = 10000
 
 def process_new_block(block: Block) -> bool:
     """
@@ -711,7 +711,7 @@ def get_balance(address_hex: str) -> int:
     """Returns the balance of the given address. Returns 0 if address not found."""
     with _balance_lock:
         if address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-            return 100000
+            return 1000
         return _balances.get(address_hex, 0)
 
 def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, amount: int) -> bool:
@@ -729,7 +729,7 @@ def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, a
 
         # Auto-faucet logic for sender: if missing, assume 100k
         if from_address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-             current_from_balance = 100000
+             current_from_balance = 1000
 
         # Enforce sufficient funds during balance updates to avoid negative balances
         if current_from_balance < amount:

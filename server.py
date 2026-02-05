@@ -437,6 +437,7 @@ def _run_server(container: ServiceContainer):
                 if builtin_rules:
                     logger.info("No persisted Tau rules found; injecting %s built-in rules from disk...", len(builtin_rules))
                     for rule_text in builtin_rules:
+                        logger.info("Injecting built-in rule: %s", rule_text)
                         tau_module.communicate_with_tau(
                             rule_text=rule_text,
                             target_output_stream_index=0,

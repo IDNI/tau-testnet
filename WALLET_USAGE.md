@@ -102,8 +102,6 @@ The wallet supports the following operation types:
 
 - **Operation "0"**: Rules/Logic formulas (sent as-is to Tau)
 - **Operation "1"**: Coin transfers (SBF-encoded by the server)
-- **Operation "0"**: Rules/Logic formulas (sent as-is to Tau)
-- **Operation "1"**: Coin transfers (SBF-encoded by the server)
 - **Operation "5" and above**: Custom operations. Note: Operations 2, 3, and 4 are reserved. Custom inputs are normalized to lists of strings.
 
 ## Examples

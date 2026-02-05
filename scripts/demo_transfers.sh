@@ -141,6 +141,32 @@ BLOCKS="${BLOCKS:-}"
 TX_PER_BLOCK="${TX_PER_BLOCK:-}"
 MAX_AMOUNT="${MAX_AMOUNT:-100}"
 
+read -r TAU_BV_WIDTH MAX_TAU_BV < <("$PY" - <<'PY'
+from tau_manager import DEFAULT_RULE_BV_WIDTH
+print(DEFAULT_RULE_BV_WIDTH, (1 << DEFAULT_RULE_BV_WIDTH) - 1)
+PY
+)
+
+if ! [[ "$TAU_BV_WIDTH" =~ ^[0-9]+$ ]] || ! [[ "$MAX_TAU_BV" =~ ^[0-9]+$ ]]; then
+  echo "[ERROR] Failed to determine Tau bitvector max amount." >&2
+  exit 1
+fi
+
+if ! [[ "$MAX_AMOUNT" =~ ^[0-9]+$ ]]; then
+  echo "[ERROR] --max-amount must be a positive integer (got: '$MAX_AMOUNT')" >&2
+  exit 1
+fi
+
+if (( MAX_AMOUNT < 1 )); then
+  echo "[ERROR] --max-amount must be >= 1 (got: $MAX_AMOUNT)" >&2
+  exit 1
+fi
+
+if (( MAX_AMOUNT > MAX_TAU_BV )); then
+  echo "[WARN] --max-amount capped at $MAX_TAU_BV to fit bv[$TAU_BV_WIDTH]" >&2
+  MAX_AMOUNT="$MAX_TAU_BV"
+fi
+
 ensure_demo_keys
 
 ALICE_SK="11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09"

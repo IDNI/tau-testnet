@@ -17,6 +17,16 @@ from network import bus as network_bus
 
 logger = logging.getLogger(__name__)
 
+_MAX_TAU_BV_VALUE = (1 << tau_manager.DEFAULT_RULE_BV_WIDTH) - 1
+
+
+def _validate_tau_bv_range(value: int, name: str) -> None:
+    if value < 0 or value > _MAX_TAU_BV_VALUE:
+        raise ValueError(
+            f"{name} exceeds Tau bitvector width {tau_manager.DEFAULT_RULE_BV_WIDTH} "
+            f"(max {_MAX_TAU_BV_VALUE})."
+        )
+
 
 def _canonicalize_transaction(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -121,6 +131,8 @@ def _prepare_transfer_inputs(transfer_entry, sender_balance: int) -> dict:
         to_id = int(to_yid[1:])
     except (ValueError, IndexError):
         raise ValueError(f"Could not parse numeric ID from yID '{from_yid}' or '{to_yid}'")
+    _validate_tau_bv_range(from_id, "From ID")
+    _validate_tau_bv_range(to_id, "To ID")
 
     try:
         # Amount is now a 32-byte (256-bit) integer, represented as a string.
@@ -129,9 +141,11 @@ def _prepare_transfer_inputs(transfer_entry, sender_balance: int) -> dict:
             raise ValueError("Amount must be a positive 256-bit integer.")
     except ValueError:
         raise ValueError(f"Invalid amount: '{amount_decimal_str}' is not a valid large integer.")
+    _validate_tau_bv_range(amount, "Amount")
 
     if not isinstance(sender_balance, int) or sender_balance < 0:
         raise ValueError(f"Invalid sender balance: {sender_balance}")
+    _validate_tau_bv_range(sender_balance, "Sender balance")
 
     return {
         'amount': amount,
@@ -214,9 +228,10 @@ def _process_transfers_operation(transfers, sender_pubkey):
         if from_addr_key not in remaining_balances:
             remaining_balances[from_addr_key] = chain_state.get_balance(from_addr_key)
         available_balance = remaining_balances[from_addr_key]
-        
+        logger.debug("Available balance for %s: %s", from_addr_key, available_balance)
         try:
             transfer_input_dict = _prepare_transfer_inputs(transfer_entry, available_balance)
+            logger.debug("Transfer input dictionary: %s", transfer_input_dict)
             # Store the full integer amount for post-validation balance updates
             amount_int = transfer_input_dict['amount']
             validated_transfers.append((from_addr_key, to_addr_key, amount_int))
@@ -304,6 +319,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
             empty_transfer_list = True
         else:
             success, transfer_result, err_msg = _process_transfers_operation(transfers_list, sender_pubkey)
+            logger.debug("Transfer result: %s", transfer_result)
             if not success:
                 return f"FAILURE: Transaction invalid. {err_msg}"
             all_validated_transfers = transfer_result["transfers"]
@@ -383,11 +399,16 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
         if has_rules:
             try:
                 prior_spec = chain_state.get_rules_state()
-                tau_manager.reset_tau_state(
-                    prior_spec,
-                    source="sendtx-restore",
-                    apply_rules_update=False,
-                )
+                if prior_spec:
+                    tau_manager.reset_tau_state(
+                        prior_spec,
+                        source="sendtx-restore",
+                        apply_rules_update=False,
+                    )
+                else:
+                    logger.warning(
+                        "No prior Tau spec available for restore; skipping sendtx-restore."
+                    )
             except Exception:
                 logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
 

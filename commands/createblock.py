@@ -192,7 +192,7 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
             
                 # Faucet Logic Check (Pre-calculation)
                 if f_addr not in temp_balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                     current_bal = 100000
+                     current_bal = 1000
                 else:
                      current_bal = temp_balances.get(f_addr, 0)
                 
@@ -270,7 +270,7 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
                     
                     # Faucet Logic Safety (Commit)
                     if f_addr not in temp_balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                        temp_balances[f_addr] = 100000
+                        temp_balances[f_addr] = 1000
                     
                     # Deduct from temp_balances
                     temp_balances[f_addr] = temp_balances.get(f_addr, 0) - amt
