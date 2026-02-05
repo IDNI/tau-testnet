@@ -356,103 +356,103 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
     tau_force_test = os.environ.get("TAU_FORCE_TEST", "0") == "1"
 
     try:
-        # --- Tau Validation (Deterministic Two-Step) ---
-        
-        # Step 1: Rule Validation (if present)
-        if has_rules:
-            rule_text = operations.get("0", "").strip()
-            if rule_text:
-                if tau_force_test:
-                    logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")
-                else:
-                    logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
-                    tau_output_rules = tau_manager.communicate_with_tau(
-                        rule_text=rule_text,
-                        target_output_stream_index=0,
-                        apply_rules_update=False,
-                    )
-                    if "Error" in tau_output_rules:
-                        return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
-                    logger.info("Tau rule validation successful.")
-
-        # Step 2: Custom Input Validation (if present)
-        if custom_tau_inputs:
-             if tau_force_test:
-                logger.info("TAU_FORCE_TEST=1: skipping Tau custom input validation.")
-             else:
-                logger.info("Validating custom inputs with Tau: %s", custom_tau_inputs.keys())
-                # Send custom inputs targeting o0 (general ack/output)
-                # We send rule_text=None because we already validated usage in Step 1 (or rules aren't changing).
-                # This checks if the CURRENT (or just-updated conceptual) spec accepts these inputs 
-                # (i.e., prompts for them).
-                tau_output_custom = tau_manager.communicate_with_tau(
-                    rule_text=None,
-                    target_output_stream_index=0,
-                    input_stream_values=custom_tau_inputs,
-                    apply_rules_update=False,
-                )
-                if "Error" in tau_output_custom:
-                    return f"FAILURE: Transaction rejected by Tau (custom input validation). Output: {tau_output_custom}"
-                logger.info("Tau custom input validation successful.")
-        
-        # Cleanup: Restore prior Tau state so sendtx does not mutate global state.
-        if has_rules:
-            try:
-                prior_spec = chain_state.get_rules_state()
-                if prior_spec:
-                    tau_manager.reset_tau_state(
-                        prior_spec,
-                        source="sendtx-restore",
-                        apply_rules_update=False,
-                    )
-                else:
-                    logger.warning(
-                        "No prior Tau spec available for restore; skipping sendtx-restore."
-                    )
-            except Exception:
-                logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
-
-
-        if has_transfers and all_validated_transfers:
-            if tau_force_test:
-                logger.info(
-                    "TAU_FORCE_TEST=1: skipping Tau transfer validation for %s transfers.",
-                    len(all_validated_transfers),
-                )
-            else:
-                logger.info("Validating %s transfers with Tau...", len(all_validated_transfers))
-                for i, (tau_input_dict, transfer_details) in enumerate(
-                    zip(transfer_tau_inputs, all_validated_transfers)
-                ):
-                    logger.debug("Validating transfer #%s: %s", i + 1, transfer_details)
-
-                    # Tau program expects inputs on separate streams for the single-pass validation
-                    # i1: amount, i2: balance, i3: from_id, i4: to_id
-                    tau_input_stream_values = {
-                        1: str(tau_input_dict['amount']),
-                        2: str(tau_input_dict['balance']),
-                        3: str(tau_input_dict['from_id']),
-                        4: str(tau_input_dict['to_id']),
-                    }
-
-                    logger.info(
-                        "Sending Tau inputs for transfer #%s validation: %s",
-                        i + 1,
-                        tau_input_stream_values,
-                    )
-                    tau_output_transfer = tau_manager.communicate_with_tau(
-                        target_output_stream_index=1,
-                        input_stream_values=tau_input_stream_values,
-                    apply_rules_update=False,
-                    )
-
-                    expected_amount = transfer_details[2]
-                    if not _decode_single_transfer_output(tau_output_transfer, expected_amount):
-                        return (
-                            f"FAILURE: Transaction rejected by Tau logic for transfer #{i+1} "
-                            f"({transfer_details}). Tau output: {tau_output_transfer}"
+        try:
+            # --- Tau Validation (Deterministic Two-Step) ---
+            
+            # Step 1: Rule Validation (if present)
+            if has_rules:
+                rule_text = operations.get("0", "").strip()
+                if rule_text:
+                    if tau_force_test:
+                        logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")
+                    else:
+                        logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
+                        tau_output_rules = tau_manager.communicate_with_tau(
+                            rule_text=rule_text,
+                            target_output_stream_index=0,
+                            apply_rules_update=False,
                         )
-                logger.info("All Tau transfer validations successful.")
+                        if "Error" in tau_output_rules:
+                            return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
+                        logger.info("Tau rule validation successful.")
+
+            # Step 2: Custom Input Validation (if present)
+            if custom_tau_inputs:
+                 if tau_force_test:
+                    logger.info("TAU_FORCE_TEST=1: skipping Tau custom input validation.")
+                 else:
+                    logger.info("Validating custom inputs with Tau: %s", custom_tau_inputs.keys())
+                    # Send custom inputs targeting o0 (general ack/output)
+                    tau_output_custom = tau_manager.communicate_with_tau(
+                        rule_text=None,
+                        target_output_stream_index=0,
+                        input_stream_values=custom_tau_inputs,
+                        apply_rules_update=False,
+                    )
+                    if "Error" in tau_output_custom:
+                        return f"FAILURE: Transaction rejected by Tau (custom input validation). Output: {tau_output_custom}"
+                    logger.info("Tau custom input validation successful.")
+            
+            # Step 3: Transfer Validation
+            if has_transfers and all_validated_transfers:
+                if tau_force_test:
+                    logger.info(
+                        "TAU_FORCE_TEST=1: skipping Tau transfer validation for %s transfers.",
+                        len(all_validated_transfers),
+                    )
+                else:
+                    logger.info("Validating %s transfers with Tau...", len(all_validated_transfers))
+                    for i, (tau_input_dict, transfer_details) in enumerate(
+                        zip(transfer_tau_inputs, all_validated_transfers)
+                    ):
+                        logger.debug("Validating transfer #%s: %s", i + 1, transfer_details)
+
+                        # Tau program expects inputs on separate streams for the single-pass validation
+                        # i1: amount, i2: balance, i3: from_id, i4: to_id
+                        tau_input_stream_values = {
+                            1: str(tau_input_dict['amount']),
+                            2: str(tau_input_dict['balance']),
+                            3: str(tau_input_dict['from_id']),
+                            4: str(tau_input_dict['to_id']),
+                        }
+
+                        logger.info(
+                            "Sending Tau inputs for transfer #%s validation: %s",
+                            i + 1,
+                            tau_input_stream_values,
+                        )
+                        tau_output_transfer = tau_manager.communicate_with_tau(
+                            target_output_stream_index=1,
+                            input_stream_values=tau_input_stream_values,
+                        apply_rules_update=False,
+                        )
+
+                        expected_amount = transfer_details[2]
+                        if not _decode_single_transfer_output(tau_output_transfer, expected_amount):
+                            return (
+                                f"FAILURE: Transaction rejected by Tau logic for transfer #{i+1} "
+                                f"({transfer_details}). Tau output: {tau_output_transfer}"
+                            )
+                    logger.info("All Tau transfer validations successful.")
+
+        finally:
+            # Cleanup: Restore prior Tau state so sendtx does not mutate global state.
+            if has_rules:
+                try:
+                    prior_spec = chain_state.get_rules_state()
+                    if prior_spec:
+                        logger.info("Restoring prior Tau state after validation...")
+                        tau_manager.reset_tau_state(
+                            prior_spec,
+                            source="sendtx-restore",
+                            apply_rules_update=False,
+                        )
+                    else:
+                        logger.warning(
+                            "No prior Tau spec available for restore; skipping sendtx-restore."
+                        )
+                except Exception:
+                    logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
         
         # --- Post-Tau Processing ---
         # Note: We do NOT increment sequence number or update balances here anymore.

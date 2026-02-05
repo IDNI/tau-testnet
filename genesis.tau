@@ -1,4 +1,4 @@
-tau i0 = console.
+#tau i0 = console.
 
 (
     (!(i0[t] = 0)) # Check if rule proposal data is present

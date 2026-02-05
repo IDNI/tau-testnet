@@ -38,6 +38,7 @@ class TauSettings:
     container_workdir: str = '/data'
     ready_signal: str = "Execution step: 0"
     comm_debug_path: Optional[str] = None
+    use_direct_bindings: bool = False
 
     def validate(self) -> None:
         if not self.program_file:
@@ -285,6 +286,7 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_CONTAINER_WORKDIR": ("tau", "container_workdir", str),
     "TAU_READY_SIGNAL": ("tau", "ready_signal", str),
     "TAU_COMM_DEBUG_PATH": ("tau", "comm_debug_path", str),
+    "TAU_USE_DIRECT_BINDINGS": ("tau", "use_direct_bindings", lambda v: v.lower() in ("true", "1", "yes")),
     "TAU_PROCESS_TIMEOUT": ("timeouts", "process_timeout", int),
     "TAU_COMM_TIMEOUT": ("timeouts", "comm_timeout", int),
     "TAU_CLIENT_WAIT_TIMEOUT": ("timeouts", "client_wait_timeout", int),

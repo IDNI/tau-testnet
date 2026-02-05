@@ -21,6 +21,8 @@ import config
 import tau_defs
 import utils
 from errors import TauCommunicationError, TauProcessError
+import tau_native  # New module for direct bindings
+
 
 
 logger = logging.getLogger(__name__)
@@ -45,7 +47,7 @@ TAU_ANY_PROMPT_RE = re.compile(r"^(?:i|o)\d+\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s
 #
 # We intentionally scope this to type annotations (":bv") rather than replacing
 # every "bv" substring in the rule text.
-DEFAULT_RULE_BV_WIDTH = 64
+DEFAULT_RULE_BV_WIDTH = 16
 _BV_TYPE_RE = re.compile(r":\s*bv(?:\s*\[\s*\d+\s*\])?")
 
 
@@ -86,6 +88,8 @@ _rules_handler = None  # Callback for saving rules state
 _state_restore_callback = None # Callback for restoring state on restart
 current_cidfile_path: str | None = None # Path to current Docker CID file
 last_known_tau_spec: str | None = None # Tracks the last valid spec seen from Tau
+tau_direct_interface: tau_native.TauInterface | None = None # Instance of the direct binding interface
+
 
 def set_rules_handler(handler):
     """Sets the callback function for handling rules state updates."""
@@ -166,6 +170,42 @@ def start_and_manage_tau_process():
             time.sleep(0.05)
         logger.info("Server shutdown requested, Tau manager exiting.")
         return
+
+    # Direct Bindings Mode
+    if config.settings.tau.use_direct_bindings:
+        logger.info("Direct Bindings Mode Enabled. Initializing Tau Native Interface...")
+        global tau_direct_interface
+        try:
+             tau_direct_interface = tau_native.TauInterface(config.TAU_PROGRAM_FILE)
+             logger.info("Tau Native Interface initialized successfully.")
+             tau_process_ready.set() # Signal that "process" (interface) is up
+
+             # Invoke State Restore Callback (loads rules from DB or Disk)
+             if _state_restore_callback:
+                 try:
+                     logger.info("Invoking state restore callback (Direct Mode)...")
+                     _state_restore_callback()
+                     logger.info("State restore callback completed successfully.")
+                 except Exception as e:
+                     logger.error("State restore callback failed in Direct Mode: %s", e)
+                     # We proceed even if it fails? Or fail the init?
+                     # In Docker mode we kill/retry. Here we probably just log error and proceed or exit.
+                     # Let's retry/exit to be safe, but for now just logging as the user can restart.
+                     pass
+
+             tau_ready.set()
+
+             
+             # Loop until shutdown
+             while not server_should_stop.is_set():
+                 time.sleep(1)
+             logger.info("Server shutdown requested, Tau manager exiting (Direct Mode).")
+             return
+        except Exception as e:
+            logger.critical(f"Failed to initialize Tau Native Interface: {e}")
+            # Ensure we don't block indefinitely if init fails, maybe retry or exit?
+            # For now, let's treat it as a fatal error for the manager thread
+            return
 
     failure_count = 0
     import tempfile 
@@ -515,6 +555,77 @@ def communicate_with_tau(
         _this_call_triggered_kill = False
 
         try:
+            # DIRECT BINDINGS PATH
+            if config.settings.tau.use_direct_bindings:
+                if not tau_direct_interface:
+                     raise TauProcessError("Direct Tau Interface used but not initialized.")
+                
+                # Sanitize inputs: remove newlines (enforce single line)
+                if rule_text:
+                    rule_text = rule_text.replace('\n', ' ')
+
+                # Normalize inputs (rule_text) similarly to _send_value_to_tau
+                if rule_text and rule_text.lstrip().startswith("always"):
+                    rule_text = normalize_rule_bitvector_sizes(rule_text)
+
+                # Normalize values in input_stream_values
+                normalized_inputs = None
+                if input_stream_values:
+                    normalized_inputs = {}
+                    for k, v in input_stream_values.items():
+                        if isinstance(v, (list, tuple)):
+                            parts = []
+                            for p in v:
+                                p_str = str(p).replace('\n', ' ')
+                                if p_str.lstrip().startswith("always"):
+                                    p_str = normalize_rule_bitvector_sizes(p_str)
+                                parts.append(p_str)
+                            normalized_inputs[k] = parts
+                        else:
+                            v_str = str(v).replace('\n', ' ')
+                            if v_str.lstrip().startswith("always"):
+                                v_str = normalize_rule_bitvector_sizes(v_str)
+                            normalized_inputs[k] = v_str
+                
+                try:
+                    output_val = tau_direct_interface.communicate(
+                        rule_text=rule_text,
+                        target_output_stream_index=target_output_stream_index,
+                        input_stream_values=normalized_inputs or input_stream_values,
+                        source=source,
+                        apply_rules_update=apply_rules_update
+                    )
+                except Exception as ex:
+                    logger.error(f"Direct Tau communication failed: {ex}")
+                    raise TauCommunicationError(f"Direct Tau communication failed: {ex}")
+
+                # Emulate spec update tracking if we just sent rules (stream 0 is typically rules)
+                # We use the accumulated spec from the interface if available
+                global last_known_tau_spec
+                if rule_text is not None and target_output_stream_index == 0 and apply_rules_update:
+                    current_full_spec = None
+                    if hasattr(tau_direct_interface, "get_current_spec"):
+                         current_full_spec = tau_direct_interface.get_current_spec()
+                    
+                    if current_full_spec:
+                         last_known_tau_spec = current_full_spec
+                    else:
+                         # Fallback if interface doesn't support it (should not happen with updated native module)
+                         last_known_tau_spec = rule_text
+
+                    if _rules_handler and last_known_tau_spec:
+                        try:
+                            _rules_handler(last_known_tau_spec)
+                        except Exception as e:
+                            logger.error("Failed to save updated spec: %s", e)
+
+                try:
+                    output_val = utils.normalize_tau_atoms(output_val)
+                except Exception:
+                    pass
+                return output_val
+
+
             # Check if a restart is needed or in progress
             # Check if a restart is needed or in progress
             if restart_in_progress.is_set():

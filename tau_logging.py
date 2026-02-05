@@ -79,6 +79,7 @@ def configure(logging_settings: Optional[Any] = None, *, force: bool = True) -> 
         "server",
         "app",
         "miner",
+        "tau_native",
     ]
 
     for pattern in tau_logger_patterns:

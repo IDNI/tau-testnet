@@ -456,6 +456,9 @@ def _run_server(container: ServiceContainer):
 
     # Register the callback BEFORE starting the manager
     tau_module.set_state_restore_callback(_restore_callback)
+    
+    # Register Rules Handler to persist updates from Tau to DB
+    tau_module.set_rules_handler(chain_state_module.save_rules_state)
 
     logger.info("Starting Tau Process Manager Thread...")
     manager_thread = threading.Thread(target=tau_module.start_and_manage_tau_process, daemon=True)
