@@ -1,8 +1,9 @@
-
-import sys
-import os
+import ctypes
 import logging
-import importlib.util
+import os
+import re
+import sys
+from collections import deque
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -16,6 +17,8 @@ COLOR_YELLOW = "\033[93m"
 COLOR_GREEN = "\033[92m"
 COLOR_MAGENTA = "\033[95m"
 COLOR_RESET = "\033[0m"
+_INPUT_STREAM_NAME_RE = re.compile(r"^i\d+$")
+_UPDATED_SPEC_LINE_RE = re.compile(r"^Updated\s*specification\:\s*(.*)$")
 
 
 def load_tau_module():
@@ -69,6 +72,54 @@ def load_tau_module():
             logger.error("Could not find native tau module in candidates or PYTHONPATH")
             raise ImportError("Native tau module not found. Ensure tau-lang is built and accessible.")
 
+class StdOutCapture:
+    """
+    Context manager to capture C-level stdout/stderr output.
+    Required because nanobind/C++ prints directly to file descriptors, 
+    bypassing sys.stdout.
+    """
+    def __init__(self):
+        self._stdout_fd = sys.stdout.fileno()
+        self._saved_stdout_fd = os.dup(self._stdout_fd)
+        self._r, self._w = os.pipe()
+        self.output = ""
+        
+        # Load C standard library for flushing
+        try:
+            self.libc = ctypes.CDLL(None)
+        except Exception:
+            self.libc = None
+
+    def __enter__(self):
+        # Flush Python's stdout buffer before redirecting
+        sys.stdout.flush()
+        if self.libc:
+            self.libc.fflush(None)
+            
+        # Redirect stdout to the write end of the pipe
+        os.dup2(self._w, self._stdout_fd)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Flush Python's stdout
+        sys.stdout.flush()
+        
+        # Flush C-level stdout to ensure buffered content goes to pipe
+        if self.libc:
+            self.libc.fflush(None)
+            
+        # Closing the write end signals EOF to the reader
+        os.close(self._w)
+        
+        # Restore original stdout
+        os.dup2(self._saved_stdout_fd, self._stdout_fd)
+        os.close(self._saved_stdout_fd)
+        
+        # Read from the read end of the pipe
+        with os.fdopen(self._r, 'r') as f:
+            self.output = f.read()
+
+
 
 class TauInterface:
     def __init__(self, program_file):
@@ -98,12 +149,8 @@ class TauInterface:
                     continue
                 clean_lines.append(line)
                 
-            self.rule_text = "".join(clean_lines).strip()
-            
-            if self.rule_text and not self.rule_text.endswith("."):
-                logger.debug("Appending missing '.' to spec for native interpreter compatibility.")
-                self.rule_text += "."
-            
+            self.rule_text = self._ensure_trailing_period("".join(clean_lines).strip())
+
             # Initialize accumulated spec with the genesis content
             self.accumulated_spec = self.rule_text
                 
@@ -113,15 +160,103 @@ class TauInterface:
 
         # Create interpreter
         logger.info(f"Initializing direct Tau interpreter with spec from {program_file}")
-        self.interpreter = self.tau.get_interpreter(self.rule_text)
-        if self.interpreter is None:
-             raise RuntimeError(f"Failed to create Tau interpreter from {program_file}")
+        self.interpreter = self._build_interpreter_from_spec(
+            self.rule_text,
+            reason=f"initial spec from {program_file}",
+        )
              
         # Initial step might be needed to prime it?
         # In example, they loop: get_inputs -> step. 
         # State is maintained in the interpreter object.
 
-    def communicate(self, 
+    @staticmethod
+    def _ensure_trailing_period(spec_text: str) -> str:
+        text = (spec_text or "").strip()
+        if text and not text.endswith("."):
+            logger.debug("Appending missing '.' to spec for native interpreter compatibility.")
+            text += "."
+        return text
+
+    @staticmethod
+    def _normalize_assignment_value(value) -> str:
+        return str(value).replace("\n", " ")
+
+    @staticmethod
+    def _fallback_value_for_stream(stream_name: str) -> str:
+        # Docker mode sends "F" for i0 (rule stream), and 0 for all other inputs.
+        return "F" if stream_name == "i0" else "0"
+
+    def _build_interpreter_from_spec(self, spec_text: str, *, reason: str):
+        prepared = self._ensure_trailing_period(spec_text)
+        interpreter = self.tau.get_interpreter(prepared)
+        if interpreter is None:
+            raise RuntimeError(f"Failed to create Tau interpreter ({reason}).")
+        self.accumulated_spec = prepared
+        return interpreter
+
+    def _rebuild_interpreter_from_spec(self, spec_text: str, *, reason: str):
+        self.interpreter = self._build_interpreter_from_spec(spec_text, reason=reason)
+        logger.debug("Rebuilt native Tau interpreter (%s).", reason)
+
+    def _extract_latest_updated_spec(self, captured_output: str) -> str | None:
+        if not captured_output:
+            return None
+
+        latest_spec = None
+        lines = captured_output.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            match = _UPDATED_SPEC_LINE_RE.match(line)
+            if not match:
+                i += 1
+                continue
+
+            block_lines = []
+            inline_spec = (match.group(1) or "").strip()
+            if inline_spec:
+                block_lines.append(inline_spec)
+
+            i += 1
+            while i < len(lines):
+                candidate = lines[i].strip()
+                if not candidate:
+                    if block_lines:
+                        break
+                    i += 1
+                    continue
+                if candidate.startswith("Execution step:"):
+                    break
+                if _UPDATED_SPEC_LINE_RE.match(candidate):
+                    # Let the outer loop process a newer marker if present.
+                    i -= 1
+                    break
+                block_lines.append(candidate)
+                i += 1
+
+            if block_lines:
+                latest_spec = " ".join(block_lines)
+            i += 1
+
+        if not latest_spec:
+            return None
+        return self._ensure_trailing_period(latest_spec)
+
+    @staticmethod
+    def _coerce_stream_name(raw_key) -> str | None:
+        if isinstance(raw_key, str):
+            key = raw_key.strip()
+            if _INPUT_STREAM_NAME_RE.match(key):
+                return key
+            if key.isdigit():
+                return f"i{int(key)}"
+            return None
+        try:
+            return f"i{int(raw_key)}"
+        except (TypeError, ValueError):
+            return None
+
+    def communicate(self,
                    rule_text=None,
                    target_output_stream_index=0,
                    input_stream_values=None,
@@ -143,43 +278,68 @@ class TauInterface:
         4. Extract the target output.
         """
         
+        # Keep signature parity with docker path.
+        _ = source
+        _ = apply_rules_update
+
         # 1. Get required inputs
         required_inputs = self.tau.get_inputs_for_step(self.interpreter)
-        # required_inputs is a list of input objects (presumably with .name)
-        
         input_assignments = {}
-        
-        # Helper to map our 0, 1, 2 indices to i0, i1, i2 names
-        # We assume the spec uses 'i0', 'i1' etc.
-        
-        # Prepare available values
-        available_values = {}
-        
-        # Map legacy rule_text argument to i0 if it's typically the rule stream
-        if rule_text is not None:
-            available_values['i0'] = rule_text
-            
-        if input_stream_values:
-            for k, v in input_stream_values.items():
-                if isinstance(v, (list, tuple)):
-                    # If multiple values provided, take the first one? 
-                    # Real usage usually sends one value per prompt.
-                    val = str(v[0]) if v else "0" 
-                else:
-                    val = str(v)
-                available_values[f"i{k}"] = val
 
-        # Fill inputs
+        # Prepare per-stream queues to mimic prompt-driven Docker behavior.
+        stream_input_queues: dict[str, deque[str]] = {}
+        if input_stream_values:
+            for raw_stream_idx, raw_value in input_stream_values.items():
+                stream_name = self._coerce_stream_name(raw_stream_idx)
+                if not stream_name:
+                    logger.debug(
+                        "Ignoring non-input stream key for native assignment: %r",
+                        raw_stream_idx,
+                    )
+                    continue
+
+                if isinstance(raw_value, (list, tuple)):
+                    values = [
+                        self._normalize_assignment_value(v)
+                        for v in raw_value
+                        if v is not None
+                    ]
+                else:
+                    values = [self._normalize_assignment_value(raw_value)]
+
+                if values:
+                    stream_input_queues[stream_name] = deque(values)
+
+        normalized_rule_text = None
+        if rule_text is not None:
+            normalized_rule_text = self._normalize_assignment_value(rule_text)
+
+        # Fill every required input, including fallbacks, like Docker prompt flow.
         for input_obj in required_inputs:
-            name = input_obj.name # e.g. "i0"
-            if name in available_values:
-                input_assignments[input_obj] = available_values[name]
+            name = input_obj.name
+            stream_queue = stream_input_queues.get(name)
+
+            if stream_queue:
+                value_to_assign = stream_queue.popleft()
+                if not stream_queue:
+                    del stream_input_queues[name]
+                reason = "Sending queued input"
+            elif name == "i0" and normalized_rule_text is not None:
+                value_to_assign = normalized_rule_text
+                reason = "Sending rule text"
             else:
-                # Default/Fallback
-                # In IPC we send "0" or "F" if not specified but prompted
-                # Here we must provide something
-                input_assignments[input_obj] = "0" 
-        
+                value_to_assign = self._fallback_value_for_stream(name)
+                reason = "Sending fallback"
+
+            input_assignments[input_obj] = value_to_assign
+            logger.debug(
+                "Input Key: %r (name=%s) -> Value: %s (%s)",
+                input_obj,
+                name,
+                value_to_assign,
+                reason,
+            )
+
         # 2. Perform Step
         # Log Inputs
         if input_assignments:
@@ -196,8 +356,26 @@ class TauInterface:
         else:
              logger.info(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Inputs: (None){COLOR_RESET}")
 
-        outputs = self.tau.step(self.interpreter, input_assignments)
         
+        # Capture stdout to catch "Updated specification:" output
+        captured_output = ""
+        try:
+            with StdOutCapture() as capture:
+                outputs = self.tau.step(self.interpreter, input_assignments)
+            captured_output = capture.output
+        except Exception as e:
+            # If capture fails, we might still have outputs from step?
+            # But likely we need to propagate error.
+            # Also, we should probably print captured output to real stdout so user sees logs
+            # if we suppressed them.
+            # For now, just re-raise.
+            raise e
+            
+        # Re-print captured output to real stdout so logs are visible
+        # (Since we redirected stdout, the logs printed by C++ engine were trapped in pipe)
+        if captured_output:
+            print(captured_output, end='')
+
         if outputs is None:
             raise RuntimeError("Tau step failed (returned None)")
 
@@ -221,26 +399,26 @@ class TauInterface:
         result_value = "0" # Default
         found = False
         
-        # Check for update stream 'u' to track spec changes
-        update_val = None
-        
         for output_obj, value in outputs.items():
              if output_obj.name == target_name:
-                 result_value = value
+                 result_value = str(value)
                  found = True
-             if output_obj.name == 'u':
-                 update_val = value
         
-        if update_val:
-            # Append normalized update to our accumulated spec
-            # Ensure it ends with a dot for validity
-            cleaned_update = update_val.strip()
-            if not cleaned_update.endswith("."):
-                cleaned_update += "."
-            
-            logger.info(f"{COLOR_YELLOW}[TAU_DIRECT] Spec Update Detected: {cleaned_update[:50]}...{COLOR_RESET}")
-            # Append 
-            self.accumulated_spec += "\n" + cleaned_update
+        # 4. Process Spec Updates from STDOUT (not 'u' stream)
+        try:
+            updated_spec = self._extract_latest_updated_spec(captured_output)
+            if updated_spec:
+                logger.info(
+                    f"{COLOR_YELLOW}[TAU_DIRECT] Spec Replaced from STDOUT: {updated_spec}{COLOR_RESET}"
+                )
+                self._rebuild_interpreter_from_spec(
+                    updated_spec,
+                    reason="updated specification from step output",
+                )
+        except Exception as e:
+            logger.error("Failed to process updated specification from stdout: %s", e)
+            raise
+
         
         if not found:
             logger.debug(f"Warning: Target output {target_name} not found in step outputs: {[k.name for k in outputs.keys()]}")
@@ -252,6 +430,7 @@ class TauInterface:
         return self.accumulated_spec
 
     def update_spec(self, new_spec):
-         # If we need to force update spec logic
-         pass
-
+        self._rebuild_interpreter_from_spec(
+            new_spec,
+            reason="explicit update_spec request",
+        )

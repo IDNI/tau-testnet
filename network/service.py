@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 import trio
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 
@@ -275,6 +276,15 @@ class NetworkService:
         # Add dht peers/providers if available
         if self._dht_manager.dht:
             try:
+                # If records expired from the local value store, republish current head state
+                # before building provider advertisements for this handshake.
+                cs = sys.modules.get("chain_state")
+                if cs and hasattr(cs, "rehydrate_dht_state"):
+                    try:
+                        cs.rehydrate_dht_state()
+                    except Exception:
+                        logger.debug("Failed to rehydrate DHT state before handshake", exc_info=True)
+
                 # Peers from routing table
                 peers = []
                 rt = self._dht_manager.routing_table

@@ -4,6 +4,8 @@ import logging
 import os
 import time
 
+
+import config
 import chain_state
 import db
 import tau_defs
@@ -409,12 +411,12 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
 
                         # Tau program expects inputs on separate streams for the single-pass validation
                         # i1: amount, i2: balance, i3: from_id, i4: to_id
-                        tau_input_stream_values = {
-                            1: str(tau_input_dict['amount']),
-                            2: str(tau_input_dict['balance']),
-                            3: str(tau_input_dict['from_id']),
-                            4: str(tau_input_dict['to_id']),
-                        }
+                        
+                        tau_input_stream_values = {}
+                        tau_input_stream_values[1] = str(tau_input_dict['amount'])
+                        tau_input_stream_values[2] = str(tau_input_dict['balance'])
+                        tau_input_stream_values[3] = str(tau_input_dict['from_id'])
+                        tau_input_stream_values[4] = str(tau_input_dict['to_id'])
 
                         logger.info(
                             "Sending Tau inputs for transfer #%s validation: %s",

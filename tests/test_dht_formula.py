@@ -1,6 +1,7 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import hashlib
+import json
 from typing import Dict, Optional
 
 
@@ -97,6 +98,28 @@ class TestDHTFormula(unittest.TestCase):
             self.dht_manager._dht_validators["state"],
             self.dht_manager._validate_state_record,
         )
+
+    def test_put_record_sync_registers_provider_after_network_publish_failure(self):
+        """
+        Even if network publish fails, state/tau_state records should still register
+        local provider metadata so peers can discover us during handshake.
+        """
+        self.dht_manager._trio_token = object()
+        self.dht_manager._host = MagicMock()
+        self.dht_manager._host.get_addrs.return_value = []
+        self.dht_manager._host.get_id.return_value = "self-peer"
+        self.dht_manager._dht.peer_id = "self-peer"
+
+        state_hash = "fallback-head"
+        key = f"state:{state_hash}".encode("ascii")
+        payload = json.dumps({"block_hash": state_hash, "accounts": {}}).encode("utf-8")
+
+        with patch("trio.from_thread.run", side_effect=ValueError("simulated network failure")):
+            ok = self.dht_manager.put_record_sync(key, payload)
+
+        self.assertTrue(ok)
+        # `_dht_provider_add` holds the original provider_store.add_provider callable.
+        self.assertTrue(self.dht_manager._dht_provider_add.called)
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,11 @@ The architecture is designed around the principle of extralogical processing. Th
 Tau logic is fully integrated into the blockchain pipeline, but runtime evaluation is currently disabled by default through the TAU_FORCE_TEST switch. When this flag is enabled, the node bypasses real Tau logic execution and uses a deterministic "test" validator path instead. This allows development and debugging without requiring a running Tau Docker instance.
 To enable true Tau-driven validation, unset TAU_FORCE_TEST in your environment or configuration.
 
+## Tau Direct Bindings (Native Mode)
+For improved performance and simplified deployment, you can bypass the Docker container and interact directly with the local native Tau library (`libtau` via `tau_native.py`).
+To enable this mode, set `TAU_USE_DIRECT_BINDINGS=1` in your environment or `.env` file. This mode requires the `tau` native python extension to be available in your `PYTHONPATH` or properly installed.
+When enabled, the system maintains a single `tau::interpreter` instance and captures state updates directly from the engine's stdout.
+
 ## Features
 
 *   **TCP Server**: Handles client connections and commands.

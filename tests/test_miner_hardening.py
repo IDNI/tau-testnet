@@ -210,16 +210,22 @@ class TestMinerHardening(unittest.TestCase):
         mock_sig.return_value = True
         
         # User is NEW (not in balances)
-        if "UserNew" in chain_state._balances:
-            del chain_state._balances["UserNew"]
+        user_addr = "UserNew"
+        if user_addr in chain_state._balances:
+            del chain_state._balances[user_addr]
+
+        # Use the configured faucet behavior instead of hardcoding 100000.
+        # This test verifies "no negative balance" and correct initialization.
+        faucet_start = chain_state.get_balance(user_addr)
+        transfer_amount = max(1, faucet_start // 2)
             
-        # Send 10,000 (valid if faucet gives 100,000)
+        # Send a valid amount within faucet balance.
         payload = json.dumps({
-            "sender_pubkey": "UserNew",
+            "sender_pubkey": user_addr,
             "sequence_number": 0,
             "expiration_time": int(time.time() + 3600),
             "operations": {
-                "1": [["UserNew", "Bob", "10000"]]
+                "1": [[user_addr, "Bob", str(transfer_amount)]]
             }
         })
         db.add_mempool_tx(payload, "hash_faucet", 1000)
@@ -238,10 +244,16 @@ class TestMinerHardening(unittest.TestCase):
              
         self.assertEqual(len(res.get("transactions", [])), 1)
         
-        # VERIFY STATE: Balance should be 100,000 - 10,000 = 90,000
-        # If bug exists (commit uses 0), balance would be -10,000
-        final_bal = chain_state._balances.get("UserNew")
-        self.assertEqual(final_bal, 90000, f"Faucet balance incorrect. Got {final_bal}, expected 90000")
+        # VERIFY STATE: Balance should be faucet_start - transfer_amount
+        # If bug exists (commit uses 0), balance could become negative.
+        final_bal = chain_state._balances.get(user_addr)
+        expected_final = faucet_start - transfer_amount
+        self.assertEqual(
+            final_bal,
+            expected_final,
+            f"Faucet balance incorrect. Got {final_bal}, expected {expected_final}",
+        )
+        self.assertGreaterEqual(final_bal, 0, "Faucet safety regression: negative balance")
         
         print("[TEST] Faucet safety passed (Balance initialized correctly).")
 

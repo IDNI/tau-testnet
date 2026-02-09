@@ -586,6 +586,7 @@ def communicate_with_tau(
                             if v_str.lstrip().startswith("always"):
                                 v_str = normalize_rule_bitvector_sizes(v_str)
                             normalized_inputs[k] = v_str
+
                 
                 try:
                     output_val = tau_direct_interface.communicate(
@@ -597,30 +598,38 @@ def communicate_with_tau(
                     )
                 except Exception as ex:
                     logger.error(f"Direct Tau communication failed: {ex}")
-                    raise TauCommunicationError(f"Direct Tau communication failed: {ex}")
+                    raise TauCommunicationError(
+                        f"Direct Tau communication failed: {ex}",
+                        last_state=last_known_tau_spec,
+                    )
 
-                # Emulate spec update tracking if we just sent rules (stream 0 is typically rules)
-                # We use the accumulated spec from the interface if available
-                global last_known_tau_spec
-                if rule_text is not None and target_output_stream_index == 0 and apply_rules_update:
-                    current_full_spec = None
-                    if hasattr(tau_direct_interface, "get_current_spec"):
-                         current_full_spec = tau_direct_interface.get_current_spec()
-                    
-                    if current_full_spec:
-                         last_known_tau_spec = current_full_spec
-                    else:
-                         # Fallback if interface doesn't support it (should not happen with updated native module)
-                         last_known_tau_spec = rule_text
+                current_full_spec = None
+                if hasattr(tau_direct_interface, "get_current_spec"):
+                    try:
+                        current_full_spec = tau_direct_interface.get_current_spec()
+                    except Exception:
+                        current_full_spec = None
 
-                    if _rules_handler and last_known_tau_spec:
-                        try:
-                            _rules_handler(last_known_tau_spec)
-                        except Exception as e:
-                            logger.error("Failed to save updated spec: %s", e)
+                if current_full_spec:
+                    last_known_tau_spec = current_full_spec
+                elif rule_text is not None and target_output_stream_index == 0:
+                    # Fallback for diagnostics if direct interface didn't expose spec.
+                    last_known_tau_spec = rule_text
+
+                if (
+                    apply_rules_update
+                    and rule_text is not None
+                    and target_output_stream_index == 0
+                    and _rules_handler
+                    and last_known_tau_spec
+                ):
+                    try:
+                        _rules_handler(last_known_tau_spec)
+                    except Exception as e:
+                        logger.error("Failed to save updated spec: %s", e)
 
                 try:
-                    output_val = utils.normalize_tau_atoms(output_val)
+                    output_val = utils.normalize_tau_atoms(str(output_val))
                 except Exception:
                     pass
                 return output_val
@@ -955,7 +964,14 @@ def reset_tau_state(rule_text: str, *, source: str = "unknown", apply_rules_upda
 
 def get_tau_process_status():
     """Returns the status of the Tau process."""
-    global tau_process, tau_ready, tau_process_lock
+    global tau_process, tau_ready, tau_process_lock, tau_direct_interface
+    if config.settings.tau.use_direct_bindings:
+        if tau_direct_interface:
+            if tau_ready.is_set():
+                return "Running and Ready"
+            return "Running, Not Ready (Initializing)"
+        return "Not Running"
+
     with tau_process_lock:
         if tau_process and tau_process.poll() is None:
             if tau_ready.is_set():
@@ -977,8 +993,16 @@ def request_shutdown():
     """
     Signals all background threads and the main server loop to shut down.
     """
+    global tau_direct_interface
     logger.info("Shutdown requested.")
     server_should_stop.set()
+    if config.settings.tau.use_direct_bindings:
+        with tau_process_lock:
+            tau_direct_interface = None
+            tau_ready.clear()
+            tau_process_ready.clear()
+        return
+
     # Also attempt to terminate the process directly
     with tau_process_lock:
         if tau_process and tau_process.poll() is None:
@@ -992,6 +1016,28 @@ def kill_tau_process():
     This is a fallback for unclean shutdowns.
     """
     global tau_process, tau_ready, tau_process_ready, current_cidfile_path
+    global tau_direct_interface, restart_in_progress
+
+    if config.settings.tau.use_direct_bindings:
+         logger.warning("Resetting direct Tau interface after failure.")
+         tau_ready.clear()
+         tau_process_ready.clear()
+         with tau_process_lock:
+             tau_direct_interface = None
+         try:
+             recovered_interface = tau_native.TauInterface(config.TAU_PROGRAM_FILE)
+             with tau_process_lock:
+                 tau_direct_interface = recovered_interface
+             tau_process_ready.set()
+             if _state_restore_callback:
+                 _state_restore_callback()
+             tau_ready.set()
+             restart_in_progress.clear()
+         except Exception as e:
+             logger.error("Failed to recover direct Tau interface: %s", e)
+             with tau_process_lock:
+                 tau_direct_interface = None
+         return
     
     cid_to_kill = None
     

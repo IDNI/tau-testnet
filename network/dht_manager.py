@@ -388,10 +388,12 @@ class DHTManager:
                     trio_token=self._trio_token,
                 )
             except (trio.RunFinishedError, trio.Cancelled, RuntimeError):
-                return True 
+                # Loop may be stopped; keep local store + provider registration.
+                pass
             except Exception as exc:
                 logger.debug("DHT put_record_sync network publish failed: %s", exc)
-                return True
+                # Keep local store + provider registration even if network publish failed.
+                pass
                 
         # Register as provider for important namespaces
         # This ensures we advertise this key during handshake/provider queries
@@ -475,4 +477,3 @@ class DHTManager:
         
         logger.debug("No validator for namespace %s, allowing", namespace)
         return True
-

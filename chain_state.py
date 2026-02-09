@@ -84,6 +84,21 @@ def set_dht_client(client):
         logger.error("Failed to hydrate DHT with persisted state: %s", e)
 
 
+def rehydrate_dht_state() -> bool:
+    """
+    Republish the currently loaded chain/tau snapshot into DHT.
+    Returns True when the republish attempt completed without exceptions.
+    """
+    if not _dht_client:
+        return False
+    try:
+        _republish_state_to_dht()
+        return True
+    except Exception as e:
+        logger.error("rehydrate_dht_state failed: %s", e)
+        return False
+
+
 def _republish_state_to_dht():
     """
     Publishes the currently loaded state (rules and accounts) to the local DHT value store.
@@ -393,6 +408,7 @@ def process_new_block(block: Block) -> bool:
     sequences_snapshot: Optional[Dict[str, int]] = None
     rules_from_dht: Optional[str] = None
     remote_accounts_hash: Optional[str] = None
+    fallback_used = False
 
     while time.time() < deadline:
         # 1) Fetch accounts snapshot for this block
@@ -487,6 +503,42 @@ def process_new_block(block: Block) -> bool:
 
         time.sleep(0.2)
 
+    missing_accounts_snapshot = balances_snapshot is None or sequences_snapshot is None
+    missing_tau_snapshot = (
+        expected_state_hash
+        and expected_state_hash != ("0" * 64)
+        and rules_from_dht is None
+    )
+
+    if missing_accounts_snapshot or missing_tau_snapshot:
+        logger.warning(
+            "[chain_state] DHT snapshot missing for block %s (accounts=%s tau=%s). "
+            "Falling back to local replay.",
+            block.block_hash[:12],
+            missing_accounts_snapshot,
+            bool(missing_tau_snapshot),
+        )
+        try:
+            with _rules_lock:
+                current_rules_bytes = (_current_rules_state or "").encode("utf-8")
+            replay_snapshot = TauStateSnapshot(
+                state_hash=compute_state_hash(current_rules_bytes),
+                tau_bytes=current_rules_bytes,
+                metadata={"source": "fallback-replay"},
+            )
+            replay_result = engine.apply(replay_snapshot, block.transactions)
+            rules_from_dht = replay_result.snapshot.tau_bytes.decode("utf-8")
+            save_rules_state(rules_from_dht)
+
+            with _balance_lock, _sequence_lock:
+                balances_snapshot = dict(_balances)
+                sequences_snapshot = dict(_sequence_numbers)
+            remote_accounts_hash = compute_accounts_hash(balances_snapshot, sequences_snapshot).hex()
+            fallback_used = True
+        except Exception as exc:
+            print(f"[ERROR][chain_state] Fallback replay failed for block {block.block_hash[:12]}...: {exc}")
+            return False
+
     if balances_snapshot is None or sequences_snapshot is None:
         print(f"[ERROR][chain_state] Missing accounts snapshot in DHT for block {block.block_hash[:12]}...")
         return False
@@ -495,26 +547,27 @@ def process_new_block(block: Block) -> bool:
         print(f"[ERROR][chain_state] Missing Tau snapshot in DHT for state_hash {expected_state_hash[:12]}...")
         return False
 
-    # Apply Tau rules snapshot to the running Tau engine via i0.
-    if not tau_manager.tau_ready.is_set():
-        tau_manager.tau_ready.wait(timeout=5)
-    if not tau_manager.tau_ready.is_set():
-        print("[ERROR][chain_state] Tau is not ready; cannot apply state snapshot")
-        return False
+    # Apply Tau rules snapshot to the running Tau engine via i0 only when using DHT snapshots.
+    if not fallback_used:
+        if not tau_manager.tau_ready.is_set():
+            tau_manager.tau_ready.wait(timeout=5)
+        if not tau_manager.tau_ready.is_set():
+            print("[ERROR][chain_state] Tau is not ready; cannot apply state snapshot")
+            return False
 
-    try:
-        # Always reset Tau state even if empty. Do not let Tau recompute/override
-        # the snapshot; we trust the DHT-provided state.
-        rule_text = rules_from_dht if rules_from_dht else ""
-        tau_manager.communicate_with_tau(
-            rule_text=rule_text,
-            target_output_stream_index=0,
-            apply_rules_update=False,
-            source="snapshot-restore",
-        )
-    except Exception as exc:
-        print(f"[ERROR][chain_state] Failed to apply Tau state snapshot via i0: {exc}")
-        return False
+        try:
+            # Always reset Tau state even if empty. Do not let Tau recompute/override
+            # the snapshot; we trust the DHT-provided state.
+            rule_text = rules_from_dht if rules_from_dht else ""
+            tau_manager.communicate_with_tau(
+                rule_text=rule_text,
+                target_output_stream_index=0,
+                apply_rules_update=False,
+                source="snapshot-restore",
+            )
+        except Exception as exc:
+            print(f"[ERROR][chain_state] Failed to apply Tau state snapshot via i0: {exc}")
+            return False
 
     # Consensus State Verification
     # Confirm the applied rules AND accounts match the block commitment.
@@ -557,7 +610,7 @@ def process_new_block(block: Block) -> bool:
 
     with _rules_lock:
         global _tau_engine_state_hash
-        _tau_engine_state_hash = expected_state_hash
+        _tau_engine_state_hash = expected_state_hash or applied_hash
 
     # Replace local account state with the snapshot.
     with _balance_lock, _sequence_lock:
@@ -578,6 +631,15 @@ def process_new_block(block: Block) -> bool:
         rules=applied_rules,
         last_block_hash=block.block_hash,
     )
+
+    if fallback_used:
+        # Best-effort: repopulate DHT so subsequent peers can use snapshot fast-path.
+        try:
+            publish_accounts_snapshot(block.block_hash)
+            publish_tau_state_snapshot(applied_hash, rules_bytes, accounts_hash)
+        except Exception:
+            logger.debug("Failed to republish fallback snapshot to DHT", exc_info=True)
+
     # Drop transactions that are now confirmed in this block.
     try:
         tx_hashes = [h for h in (block.tx_ids or []) if isinstance(h, str)]
@@ -590,7 +652,10 @@ def process_new_block(block: Block) -> bool:
                 print(f"[INFO][chain_state] Removed {removed} mempool txs included in block #{block_number}.")
     except Exception as exc:
         logger.warning("Failed to remove block transactions from mempool: %s", exc)
-    print(f"[INFO][chain_state] Block #{block_number} persisted via DHT snapshots.")
+    if fallback_used:
+        print(f"[INFO][chain_state] Block #{block_number} persisted via replay fallback.")
+    else:
+        print(f"[INFO][chain_state] Block #{block_number} persisted via DHT snapshots.")
     return True
 
 def rebuild_state_from_blockchain(start_block=0):
@@ -774,6 +839,7 @@ def save_rules_state(rules_content: str):
     This represents the current rules state that should be persisted for chain state reconstruction.
     """
     global _current_rules_state, _tau_engine_state_hash
+    logger.debug("save_rules_state called with rules_content: %s", rules_content)
     with _rules_lock:
         # Do not strip()! We must preserve exact bytes for hash consistency.
         candidate = rules_content or ""
