@@ -18,7 +18,7 @@ DEFAULT_PROD_DB_PATH = "node.db"
 
 @dataclass
 class ServerSettings:
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"
     port: int = 65432
     buffer_size: int = 1024
 
@@ -77,7 +77,7 @@ class DatabaseSettings:
 class NetworkSettings:
     network_id: str = "tau-local"
     genesis_hash: str = "GENESIS"
-    listen: List[str] = field(default_factory=lambda: ["/ip4/127.0.0.1/tcp/0"])
+    listen: List[str] = field(default_factory=lambda: ["/ip4/0.0.0.0/tcp/0"])
     bootstrap_peers: List[Dict[str, Any]] = field(default_factory=list)
     peerstore_path: Optional[str] = None
     # Optional path to a private key file for persistent libp2p identity
@@ -223,7 +223,7 @@ BASE_DEFAULTS: Dict[str, Any] = {
     "network": {
         "network_id": "tau-local",
         "genesis_hash": "GENESIS",
-        "listen": ["/ip4/127.0.0.1/tcp/0"], 
+        "listen": ["/ip4/0.0.0.0/tcp/0"], 
         "bootstrap_peers": [
             {
                 "peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC", #MAIN NODE
@@ -263,7 +263,7 @@ ENVIRONMENT_OVERRIDES: Dict[str, Dict[str, Any]] = {
             "bootstrap_peers": [
                 {
                     "peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC",
-                    "addrs": ["/ip4/127.0.0.1/tcp/4001"],
+                    "addrs": ["/ip4/0.0.0.0/tcp/4001"],
                 },
             ],
         },
