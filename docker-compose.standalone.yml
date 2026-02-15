@@ -1,0 +1,27 @@
+services:
+  tau-node:
+    build:
+      context: .
+      dockerfile: Dockerfile.standalone
+      args:
+        TAU_LANG_REF: main
+        TAU_BUILD_JOBS: 4
+    image: tau-testnet-standalone:latest
+    container_name: tau-testnet-standalone
+    environment:
+      TAU_USE_DIRECT_BINDINGS: "1"
+      TAU_FORCE_TEST: "0"
+      TAU_ENV: "development"
+      TAU_HOST: "0.0.0.0"
+      TAU_PORT: "65432"
+      TAU_NETWORK_LISTEN: "/ip4/0.0.0.0/tcp/4001"
+      TAU_BOOTSTRAP_PEERS: "[]"
+      TAU_MINING_ENABLED: "false"
+      TAU_LOG_LEVEL: "INFO"
+    volumes:
+      - ./data:/data
+    ports:
+      - "65432:65432"
+      - "65433:65433"
+      - "4001:4001"
+    restart: unless-stopped

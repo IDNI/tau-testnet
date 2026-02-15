@@ -3,7 +3,7 @@
 # Tau Testnet Alpha Blockchain
 
 This project is the codebase for the Tau Testnet Alpha Blockchain. Its primary goal is to provide a live, working demonstration of a blockchain where core state transitions and rules are governed by Tau's formal logic.
-The architecture is designed around the principle of extralogical processing. The core engine, written in Python, handles networking, storage, and any operations not yet implemented in pure Tau logic, such as cryptographic signature verification. This engine prepares transactions and validates them against a separate Tau logic program (executed via Docker), which serves as the ultimate arbiter of the chain's rules. This hybrid model allows us to build a robust and feature-complete testnet today, showcasing the power of Tau's logical core while providing all the necessary functions for a working blockchain.
+The architecture is designed around the principle of extralogical processing. The core engine, written in Python, handles networking, storage, and any operations not yet implemented in pure Tau logic, such as cryptographic signature verification. This engine prepares transactions and validates them against a separate Tau logic program (executed either via Docker or direct native bindings), which serves as the ultimate arbiter of the chain's rules. This hybrid model allows us to build a robust and feature-complete testnet today, showcasing the power of Tau's logical core while providing all the necessary functions for a working blockchain.
 
 ## Tau Execution Mode
 Tau logic is fully integrated into the blockchain pipeline, but runtime evaluation is currently disabled by default through the TAU_FORCE_TEST switch. When this flag is enabled, the node bypasses real Tau logic execution and uses a deterministic "test" validator path instead. This allows development and debugging without requiring a running Tau Docker instance.
@@ -113,6 +113,73 @@ Call `NetworkService.get_metrics_snapshot()` (or read the periodic `[metrics]` l
     ```
     The server will initialize the database and manage the Tau Docker process.
 
+### Standalone Docker Node (tau-testnet + tau-lang in one container)
+
+This repository now includes a standalone container build that embeds both:
+- the Tau Testnet node (`server.py`)
+- the Tau language engine (compiled from `tau-lang` with Python nanobind bindings)
+
+The container defaults to native bindings mode (`TAU_USE_DIRECT_BINDINGS=1`), so it does **not** require Docker-in-Docker.
+
+1. Build the standalone image:
+   ```bash
+   docker build -f Dockerfile.standalone -t tau-testnet-standalone .
+   ```
+
+2. Run a single standalone node:
+   ```bash
+   docker run --rm -it \
+     -p 65432:65432 -p 65433:65433 -p 4001:4001 \
+     -v "$(pwd)/data:/data" \
+     tau-testnet-standalone
+   ```
+   Important: without the `-p` mappings, the node will only be reachable from inside the container network.
+
+   Or use the helper script (publishes required ports by default):
+   ```bash
+   ./scripts/run_standalone_node.sh
+   ```
+
+3. Or run with Compose:
+   ```bash
+   docker compose -f docker-compose.standalone.yml up --build
+   ```
+
+Useful runtime toggles:
+- `TAU_MINING_ENABLED=true` to enable local PoA mining.
+- `TAU_BOOTSTRAP_PEERS='[]'` to keep the node isolated.
+- `TAU_BOOTSTRAP_PEERS='[{"peer_id":"...","addrs":["/ip4/X.X.X.X/tcp/4001"]}]'` to connect to peers.
+
+#### Updating and rebuilding the standalone image
+
+Use this routine when you want the latest `tau-testnet` code and a fresh `tau-lang` build:
+
+1. Update `tau-testnet`:
+   ```bash
+   git fetch origin
+   git checkout main
+   git pull --ff-only
+   ```
+
+2. Resolve the latest `tau-lang` main commit (or replace with `main` / a tag):
+   ```bash
+   TAU_LANG_REF=$(git ls-remote https://github.com/IDNI/tau-lang.git refs/heads/main | awk '{print $1}')
+   ```
+
+3. Rebuild:
+   ```bash
+   docker build --pull \
+     -f Dockerfile.standalone \
+     --build-arg TAU_LANG_REF="$TAU_LANG_REF" \
+     --build-arg TAU_BUILD_JOBS=4 \
+     -t tau-testnet-standalone:latest .
+   ```
+
+Notes:
+- `TAU_LANG_REF` supports branch, tag, or commit SHA.
+- Keep `TAU_BUILD_JOBS` positive (do not use `0` for dependency build steps).
+- Mount only persistent node data to `/data` (for example `-v "$(pwd)/data:/data"`), not the whole repository.
+
 6.  **Optional: Configure Bootstrap Peers**
     Edit `config.py` to point at one or more peers to sync from:
     ```py
@@ -125,30 +192,36 @@ Call `NetworkService.get_metrics_snapshot()` (or read the periodic `[metrics]` l
     ```
     On start, the node will connect, handshake, sync headers, request missing block bodies, and rebuild its state.
 
-### Running a local test miner (no testnet connection)
+### Running a local test miner (standalone container, no testnet connection)
 
-This runs an isolated PoA miner against a local DB without connecting to `testnet.tau.net`.
+This runs an isolated PoA miner in the standalone container and persists state in `./data`.
 
-1. **Generate a local test PoA keypair**:
+1. **Build image (if needed):**
    ```bash
-   python scripts/generate_miner_keys.py
-   ```
-   This will create `test_miner.key` and `test_miner.pub`.
-
-2. **Move keys to data directory**:
-   ```bash
-   mkdir -p data
-   mv test_miner.key test_miner.pub data/
+   docker build -f Dockerfile.standalone -t tau-testnet-standalone .
    ```
 
-3. **Start in test env with no bootstrap peers:**
+2. **Start miner with test networking (no bootstrap peers):**
    ```bash
-   TAU_ENV=test \
-   TAU_BOOTSTRAP_PEERS='[]' \
-   TAU_NETWORK_LISTEN='/ip4/127.0.0.1/tcp/4001' \
-   python server.py
+   docker run --rm -it \
+     -p 65432:65432 -p 65433:65433 -p 4001:4001 \
+     -v "$(pwd)/data:/data" \
+     -e TAU_ENV=test \
+     -e TAU_BOOTSTRAP_PEERS='[]' \
+     -e TAU_NETWORK_LISTEN='/ip4/0.0.0.0/tcp/4001' \
+     -e TAU_MINING_ENABLED=true \
+     tau-testnet-standalone
    ```
-   The `test` env defaults look for `data/test_miner.key` and `data/test_miner.pub`, so mining will start locally.
+
+3. **Miner keys behavior:**
+   - If `/data/test_miner.key` and `/data/test_miner.pub` are missing, the container entrypoint generates them automatically on first start.
+   - Because `/data` is mounted from `./data`, keys and DB persist across restarts.
+   - Optional manual key generation on host:
+     ```bash
+     python scripts/generate_miner_keys.py
+     mkdir -p data
+     mv test_miner.key test_miner.pub data/
+     ```
 
 ### Running as a node in the testnet (default)
 
@@ -302,7 +375,7 @@ The `block.py` module provides the `Block` and `BlockHeader` classes, along with
 
 ## Submitting issues
 
-Please submit issues at the following link: [Tau Testnet issues](https://github.com/IDNI/tau-lang/issues)
+Please submit issues at the following link: [Tau Testnet issues](https://github.com/IDNI/tau-testnet/issues)
 
 ## Project Status
 

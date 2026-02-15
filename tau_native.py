@@ -134,22 +134,35 @@ class TauInterface:
         
         # Read the spec
         try:
-            with open(program_file, 'r') as f:
+            with open(program_file, "r", encoding="utf-8", errors="replace") as f:
                 raw_lines = f.readlines()
-                
-            # Preprocess to be compatible with native interpreter
-            # 1. Remove `tau ... = ...` binding lines
-            # 2. Add trailing period if missing and not empty
-            
+
+            # Preprocess to be compatible with native interpreter:
+            # 1. Remove tau stream directive lines (e.g. "#tau i0 = console.").
+            # 2. Remove inline comments while preserving bitvector literals (#b..., #x...).
+            # 3. Normalize to a single line (space-separated) to avoid parser EOL edge cases.
+            # 4. Add trailing period if missing and non-empty.
             clean_lines = []
-            for line in raw_lines:
+            for raw_line in raw_lines:
+                line = raw_line.replace("\ufeff", "").replace("\x00", "")
                 sline = line.strip()
-                if sline.startswith("tau ") and "=" in sline:
-                    logger.info(f"Ignored tau binding line in spec: {sline}")
+
+                if not sline:
                     continue
-                clean_lines.append(line)
-                
-            self.rule_text = self._ensure_trailing_period("".join(clean_lines).strip())
+
+                lowered = sline.lower()
+                if lowered.startswith("tau ") and "=" in sline:
+                    logger.info("Ignored tau binding line in spec: %s", sline)
+                    continue
+                if lowered.startswith("#tau "):
+                    logger.info("Ignored tau directive line in spec: %s", sline)
+                    continue
+
+                cleaned = self._strip_nonliteral_hash_comments(line)
+                if cleaned.strip():
+                    clean_lines.append(cleaned.strip())
+
+            self.rule_text = self._ensure_trailing_period(" ".join(clean_lines).strip())
 
             # Initialize accumulated spec with the genesis content
             self.accumulated_spec = self.rule_text
@@ -176,6 +189,33 @@ class TauInterface:
             logger.debug("Appending missing '.' to spec for native interpreter compatibility.")
             text += "."
         return text
+
+    @staticmethod
+    def _strip_nonliteral_hash_comments(line: str) -> str:
+        """
+        Strip hash comments while preserving Tau bitvector literals.
+
+        Tau formulas use '#b...' and '#x...' literals; those hashes must remain.
+        Any other '#' sequence is treated as a comment start until end-of-line.
+        """
+        out = []
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if ch != "#":
+                out.append(ch)
+                i += 1
+                continue
+
+            nxt = line[i + 1] if i + 1 < len(line) else ""
+            if nxt.lower() in ("b", "x"):
+                out.append(ch)
+                i += 1
+                continue
+
+            # Regular comment marker: ignore the remainder of this line.
+            break
+        return "".join(out)
 
     @staticmethod
     def _normalize_assignment_value(value) -> str:

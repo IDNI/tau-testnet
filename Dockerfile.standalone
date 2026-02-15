@@ -1,0 +1,122 @@
+# syntax=docker/dockerfile:1.7
+
+FROM ubuntu:24.04 AS tau-builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG TAU_LANG_REPO=https://github.com/IDNI/tau-lang.git
+ARG TAU_LANG_REF=main
+ARG TAU_BUILD_JOBS=4
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    bison \
+    build-essential \
+    ca-certificates \
+    clang \
+    cmake \
+    git \
+    libboost-all-dev \
+    ninja-build \
+    pkg-config \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/tau-build-venv
+ENV PATH=/opt/tau-build-venv/bin:$PATH
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir nanobind
+
+WORKDIR /app
+RUN set -eux; \
+    git clone --filter=blob:none "${TAU_LANG_REPO}" tau-lang; \
+    cd tau-lang; \
+    git checkout "${TAU_LANG_REF}" || { \
+      git fetch origin "${TAU_LANG_REF}"; \
+      git checkout --detach FETCH_HEAD; \
+    }
+
+WORKDIR /app/tau-lang
+RUN set -eux; \
+    TAU_JOBS="${TAU_BUILD_JOBS}"; \
+    if [ "${TAU_JOBS}" -le 0 ]; then TAU_JOBS=4; fi; \
+    ./dev dep-cvc5 -DTAU_BUILD_JOBS="${TAU_JOBS}"
+RUN set -eux; \
+    TAU_JOBS="${TAU_BUILD_JOBS}"; \
+    if [ "${TAU_JOBS}" -le 0 ]; then TAU_JOBS=4; fi; \
+    ./dev dep-boost -DTAU_BUILD_JOBS="${TAU_JOBS}"
+RUN set -eux; \
+    TAU_JOBS="${TAU_BUILD_JOBS}"; \
+    if [ "${TAU_JOBS}" -le 0 ]; then TAU_JOBS=4; fi; \
+    ./dev build Release \
+      -DTAU_BUILD_JOBS="${TAU_JOBS}" \
+      -DTAU_BUILD_EXECUTABLE=ON \
+      -DTAU_BUILD_BINDING_PYTHON=ON \
+      -DTAU_BUILD_TESTS=OFF
+
+
+FROM ubuntu:24.04 AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    build-essential \
+    ca-certificates \
+    libffi-dev \
+    libboost-all-dev \
+    libgmp-dev \
+    libsodium-dev \
+    pkg-config \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
+WORKDIR /app/tau-testnet
+COPY requirements.txt /app/tau-testnet/requirements.txt
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir nanobind
+
+COPY . /app/tau-testnet
+COPY docker/entrypoint.sh /usr/local/bin/tau-node-entrypoint
+
+COPY --from=tau-builder /app/tau-lang /app/tau-lang
+COPY --from=tau-builder /root/.tau /root/.tau
+
+RUN chmod +x /usr/local/bin/tau-node-entrypoint && \
+    mkdir -p /data
+
+ENV PYTHONUNBUFFERED=1 \
+    TAU_USE_DIRECT_BINDINGS=1 \
+    TAU_FORCE_TEST=0 \
+    TAU_ENV=development \
+    TAU_HOST=0.0.0.0 \
+    TAU_PORT=65432 \
+    TAU_NETWORK_LISTEN=/ip4/0.0.0.0/tcp/4001 \
+    TAU_BOOTSTRAP_PEERS=[] \
+    TAU_PROGRAM_FILE=/app/tau-testnet/genesis.tau \
+    TAU_DB_PATH=/data/node.db \
+    TAU_DATA_DIR=/data \
+    TAU_IDENTITY_KEY_PATH=/data/identity.key \
+    TAU_MINING_ENABLED=false \
+    TAU_MINER_PRIVKEY_PATH=/data/test_miner.key \
+    TAU_MINER_PUBKEY_PATH=/data/test_miner.pub \
+    LD_LIBRARY_PATH=/root/.tau/cvc5/dist/lib:/root/.tau/cvc5/dist/lib64:/root/.tau/boost/dist/lib:/root/.tau/boost/dist/lib64:/app/tau-lang/build-Release
+
+EXPOSE 65432 65433 4001
+VOLUME ["/data"]
+
+WORKDIR /app/tau-testnet
+ENTRYPOINT ["/usr/local/bin/tau-node-entrypoint"]
+CMD ["python", "server.py"]

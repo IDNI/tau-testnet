@@ -32,6 +32,7 @@ node_modules/
 docs/*.md
 *.txt
 *.md
+*.key
 .env*
 MagicMock
 !README.md
