@@ -1,0 +1,183 @@
+name: Bug report
+description: Report a bug in the Tau Testnet Alpha node.
+title: "[bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        Please include **logs** and the exact **run command / env vars** when possible. This project supports multiple Tau execution modes (Docker vs direct native bindings), so that detail matters.
+
+        **Security note**: Do **not** paste private keys (miner keys, identity keys) or any sensitive material. Redact or replace with `REDACTED`.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Where does the bug seem to be?
+      options:
+        - Server (TCP/WebSocket) / command handling
+        - Tau execution (Docker mode via tau_manager)
+        - Tau execution (direct native bindings via tau_native)
+        - Transaction processing / signatures / validation
+        - Mempool / block creation / chain state
+        - Database / persistence / state rebuild
+        - P2P networking / sync / gossip
+        - Docker / standalone container
+        - Docs / examples
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: execution_mode
+    attributes:
+      label: Execution mode
+      description: How are you running Tau logic?
+      options:
+        - Direct native bindings (TAU_USE_DIRECT_BINDINGS=1)
+        - Docker mode (TAU_USE_DIRECT_BINDINGS=0)
+        - Test validator (TAU_FORCE_TEST=1)
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version_commit
+    attributes:
+      label: tau-testnet version / commit
+      description: Paste the output of `git rev-parse --short HEAD` (or a release tag if applicable).
+      placeholder: e.g. 06af7a4
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: The runtime environment where the bug occurs.
+      value: |
+        - OS:
+        - CPU/arch (optional):
+        - Python: (output of `python --version`)
+        - Docker: (output of `docker --version`, if used)
+    validations:
+      required: true
+
+  - type: textarea
+    id: run_command
+    attributes:
+      label: How you started the node
+      description: Include the exact command(s) you used to start the node / container.
+      placeholder: |
+        e.g.
+        ./venv/bin/python3 server.py
+
+        or
+        docker run ... tau-testnet-standalone:latest
+        docker compose -f docker-compose.standalone.yml up
+    validations:
+      required: true
+
+  - type: textarea
+    id: config_env
+    attributes:
+      label: Relevant configuration / env vars
+      description: Paste the relevant `TAU_*` environment variables and any config overrides. Redact secrets.
+      placeholder: |
+        TAU_ENV=development
+        TAU_USE_DIRECT_BINDINGS=1
+        TAU_FORCE_TEST=0
+        TAU_PROGRAM_FILE=...
+        TAU_DB_PATH=...
+        TAU_NETWORK_LISTEN=/ip4/0.0.0.0/tcp/4001
+        TAU_BOOTSTRAP_PEERS='[...]'
+        TAU_IDENTITY_KEY_PATH=REDACTED
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Be as specific as possible (include client commands, RPC payloads, etc.).
+      placeholder: |
+        1. Start the node with ...
+        2. Run client command ...
+        3. Submit tx ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / error output
+      description: Paste relevant logs (server output, stack traces, Tau output). Include timestamps if available.
+      render: shell
+      placeholder: |
+        (paste logs here)
+    validations:
+      required: false
+
+  - type: textarea
+    id: network_context
+    attributes:
+      label: Network context (if applicable)
+      description: Helpful for P2P sync/gossip issues.
+      placeholder: |
+        - bootstrap peers:
+        - behind NAT? (yes/no)
+        - can peer connect/handshake? (yes/no)
+        - head number/hash (if known):
+    validations:
+      required: false
+
+  - type: textarea
+    id: data_context
+    attributes:
+      label: Data / state context (if applicable)
+      description: Helpful for DB/state/mempool issues.
+      placeholder: |
+        - fresh data dir or existing:
+        - did you delete /data or node.db:
+        - any migrations or previous versions:
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have removed/redacted any private keys or sensitive data from this issue.
+          required: true
+        - label: I can reproduce this on the latest `main` branch (or I included the exact commit above).
+          required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else that may help (screenshots, links, minimal repro repo, etc.).
+    validations:
+      required: false
+
