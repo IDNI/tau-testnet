@@ -263,7 +263,7 @@ ENVIRONMENT_OVERRIDES: Dict[str, Dict[str, Any]] = {
             "bootstrap_peers": [
                 {
                     "peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC",
-                    "addrs": ["/ip4/0.0.0.0/tcp/4001"],
+                    "addrs": ["/ip4/127.0.0.1/tcp/4001"],
                 },
             ],
         },

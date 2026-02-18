@@ -1,8 +1,1 @@
-#tau i0 = console.
-
-((!(i0[t] = 0)) # Check if rule proposal data is present
-    ? ( # --- Process Rule Proposal from i0[t] ---
-        u[t] = i0[t] && o0[t] = 0
-        & { u[t] = i0[t] & { u[t] = i0[t] } }
-    ) : o0[t] = 1
-) 
+((!(i0[t]=0))? (u[t] = i0[t] && o0[t] = 0 & { u[t] = i0[t] & { u[t] = i0[t] } }) : o0[t] = 1) 

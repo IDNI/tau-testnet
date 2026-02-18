@@ -298,12 +298,12 @@ def _start_websocket_server(container: ServiceContainer) -> None:
             for i in range(10):
                 try:
                     p = actual_ws_port + i
-                    logger.info("Attempting to bind %s to 127.0.0.1:%s", scheme, p)
+                    logger.info("Attempting to bind %s to 0.0.0.0:%s", scheme, p)
                     # serve_websocket blocks until cancelled.
                     # We need to run it.
                     await trio_websocket.serve_websocket(
                         handler_with_container, 
-                        "127.0.0.1", 
+                        "0.0.0.0", 
                         p, 
                         ssl_context=ssl_context
                     )
