@@ -675,6 +675,11 @@ def communicate_with_tau(
                 if target_output_stream_index == 0:
                     return tau_defs.ACK_RULE_PROCESSED
                 elif target_output_stream_index == 1:
+                    # Emulate built-in transfer rule semantics: on success, o1 echoes i1.
+                    # Fall back to generic success when no transfer amount was provided.
+                    amount_q = stream_input_queues.get(1)
+                    if amount_q:
+                        return amount_q[0]
                     return tau_defs.TRANSACTION_VALIDATION_SUCCESS
                 return tau_defs.TAU_VALUE_ZERO
 

@@ -40,6 +40,27 @@ def _validate_transfer_amount(amount: int) -> None:
         )
 
 
+def _normalize_sk_material(sk) -> tuple[int, bytes]:
+    """
+    Normalize py_ecc KeyGen output to (int, 32-byte big-endian bytes).
+    Some py_ecc versions return int, others may return bytes-like values.
+    """
+    if isinstance(sk, int):
+        if sk < 0 or sk >= (1 << 256):
+            raise ValueError("Generated private key integer is out of 32-byte range.")
+        sk_int = sk
+        return sk_int, sk_int.to_bytes(32, "big")
+
+    if isinstance(sk, (bytes, bytearray)):
+        raw = bytes(sk)
+        if len(raw) > 32:
+            raise ValueError(f"Generated private key length too large: {len(raw)} bytes.")
+        sk_int = int.from_bytes(raw, "big")
+        return sk_int, sk_int.to_bytes(32, "big")
+
+    raise TypeError(f"Unsupported private key material type: {type(sk).__name__}")
+
+
 def _parse_privkey(sk_str: str) -> bytes:
     """
     Parse a private key string in decimal or hex format into raw private key bytes (32 bytes).
@@ -64,11 +85,10 @@ def _parse_privkey(sk_str: str) -> bytes:
 
 def cmd_new(args):
     ikm = secrets.token_bytes(32)
-    sk = G2Basic.KeyGen(ikm)
-    pk = G2Basic.SkToPk(sk)
-    sk_int = int.from_bytes(sk, 'big')
+    sk_int, sk_bytes = _normalize_sk_material(G2Basic.KeyGen(ikm))
+    pk = G2Basic.SkToPk(sk_int)
     print(f"Private Key (int): {sk_int}")
-    print(f"Private Key (hex): {sk.hex()}")
+    print(f"Private Key (hex): {sk_bytes.hex()}")
     print(f"Public Key (hex): {pk.hex()}")
 
 

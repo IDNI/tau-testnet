@@ -277,4 +277,20 @@ def test_tau_ready_refuses_on_callback_failure(reset_tau_manager_globals):
                               assert not tau_manager.tau_ready.is_set(), "tau_ready should NOT be set on restore failure"
 
 
+def test_tau_test_mode_transfer_output_echoes_amount(reset_tau_manager_globals):
+    """
+    In Tau test mode, stream o1 should emulate transfer success semantics by echoing i1.
+    """
+    tau_manager.tau_test_mode = True
+    tau_manager.tau_ready.set()
+    tau_manager.tau_process_ready.set()
+
+    response = tau_manager.communicate_with_tau(
+        target_output_stream_index=1,
+        input_stream_values={1: "100", 2: "1000", 3: "1", 4: "4"},
+        wait_for_ready=True,
+    )
+
+    assert response == "100"
+
 
