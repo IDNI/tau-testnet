@@ -5,9 +5,9 @@
 # Streams (Input):
 # i1[t]: Amount to transfer (bitvector).
 # Streams (Output):
-# o4[t]: Validity flag. #b1 (true) if check passes, #b0 (false) if it fails.
+# o4[t]: Validity flag. 1 (true) if check passes, 0 (false) if it fails.
 #
 # Logic:
-# If amount == 0, the check fails (output #b0).
-# Otherwise, the check passes (output #b1).
-always (((i1[t] = { #b0 }:bv) ? o4[t] = { #b0 }:bv : o4[t] = { #b1 }:bv)).
+# If amount == 0, the check fails (output 0).
+# Otherwise, the check passes (output 1).
+always (((i1[t] = { 0 }:bv) ? o4[t] = { 0 }:bv : o4[t] = { 1 }:bv)).

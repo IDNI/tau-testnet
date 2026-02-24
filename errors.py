@@ -14,8 +14,16 @@ class DatabaseError(TauTestnetError):
     """Raised for database related issues (initialization, queries, etc.)."""
 
 
-class TauProcessError(TauTestnetError):
-    """Raised when the Tau process fails to start or stops unexpectedly."""
+class TauEngineCrash(TauTestnetError):
+    """Raised for catastrophic failures of the Tau environment (e.g. process exits unexpectedly, pipes closed)."""
+
+
+class TauEngineBug(TauTestnetError):
+    """Raised for errors reported by the Tau interpreter (e.g. `(Error)` output, evaluation failures)."""
+
+
+class BlockchainBug(TauTestnetError):
+    """Raised for internal errors, invalid states, or unhandled exceptions in the Python blockchain routing/logic."""
 
 
 class TauCommunicationError(TauTestnetError):

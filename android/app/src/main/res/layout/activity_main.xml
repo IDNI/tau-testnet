@@ -222,6 +222,14 @@
                         android:text="@string/btn_history" />
                 </LinearLayout>
 
+                <Button
+                    android:id="@+id/btnTauState"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Get Tau State" />
+
                 <TextView
                     android:id="@+id/tvBalance"
                     android:layout_width="match_parent"

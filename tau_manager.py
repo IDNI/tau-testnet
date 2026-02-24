@@ -20,8 +20,9 @@ COLOR_RESET = "\033[0m"
 import config
 import tau_defs
 import utils
-from errors import TauCommunicationError, TauProcessError
+from errors import TauCommunicationError, TauEngineCrash, TauEngineBug
 import tau_native  # New module for direct bindings
+import tau_io_logger
 
 
 
@@ -132,6 +133,8 @@ def read_stderr():
                     logger.info(f"{COLOR_YELLOW}[TAU_STDERR] %s{COLOR_RESET}", line_strip)
                     # Store in deque
                     tau_stderr_lines.append(line_strip)
+                    # Log to io crash buffer
+                    tau_io_logger.log_stderr(line_strip)
                 # Add a small sleep if Tau is very chatty on stderr to prevent high CPU
                 # time.sleep(0.001)
         else:
@@ -158,6 +161,8 @@ def start_and_manage_tau_process():
     tau_ready.clear()
     tau_process_ready.clear()
     restart_in_progress.clear()
+    tau_test_mode = False
+    last_known_tau_spec = None
 
     # Fast path: allow forcing TEST MODE via environment (default disabled for tests)
     if os.environ.get("TAU_FORCE_TEST", "0") == "1":
@@ -511,7 +516,7 @@ def communicate_with_tau(
         str: The parsed Tau output line from Tau's stdout from the target output stream.
 
     Raises:
-        TauProcessError: If Tau process is not running/ready (and wait_for_ready=False).
+        TauEngineCrash: If Tau process is not running/ready (and wait_for_ready=False).
         TauCommunicationError: If communication fails or times out (and wait_for_ready=False).
     """
     global tau_process, tau_process_lock, tau_ready, tau_process_ready, tau_comm_lock, restart_in_progress, last_known_tau_spec
@@ -536,11 +541,20 @@ def communicate_with_tau(
                 total_wait_time += wait_step
                 logger.warning("communicate_with_tau: Timeout waiting for Tau readiness (total wait: %.1fs). Retrying...", total_wait_time)
                 
+                
                 if total_wait_time > config.PROCESS_TIMEOUT + 60:
-                     raise TauProcessError(f"Timed out ({total_wait_time}s) waiting for Tau to become ready.")
+                     msg = f"Timed out ({total_wait_time}s) waiting for Tau to become ready."
+                     filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
+                     if filepath:
+                         logger.error(f"Dumped Tau crash log to {filepath}")
+                     raise TauEngineCrash(msg)
 
                 if server_should_stop.is_set():
-                    raise TauProcessError("Server is stopping.")
+                    msg = "Server is stopping."
+                    filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
+                    if filepath:
+                         logger.error(f"Dumped Tau crash log to {filepath}")
+                    raise TauEngineCrash(msg)
                 # Loop back to check readiness again
                 continue
 
@@ -556,9 +570,13 @@ def communicate_with_tau(
 
         try:
             # DIRECT BINDINGS PATH
-            if config.settings.tau.use_direct_bindings:
+            if config.settings.tau.use_direct_bindings and not tau_test_mode:
                 if not tau_direct_interface:
-                     raise TauProcessError("Direct Tau Interface used but not initialized.")
+                     msg = "Direct Tau Interface used but not initialized."
+                     filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
+                     if filepath:
+                         logger.error(f"Dumped Tau crash log to {filepath}")
+                     raise TauEngineCrash(msg)
                 
                 # Sanitize inputs: remove newlines (enforce single line)
                 if rule_text:
@@ -640,10 +658,18 @@ def communicate_with_tau(
             if restart_in_progress.is_set():
                  # If we are not waiting (internal call like restore) AND the process is physically up, proceed.
                  if not (not wait_for_ready and tau_process_ready.is_set()):
-                     raise TauProcessError("Tau process is restarting. Please retry later.")
+                     msg = "Tau process is restarting. Please retry later."
+                     filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
+                     if filepath:
+                         logger.error(f"Dumped Tau crash log to {filepath}")
+                     raise TauEngineCrash(msg)
                  
             if not tau_process and not tau_test_mode:
-                 raise TauProcessError("Tau process is not initialized.")
+                 msg = "Tau process is not initialized."
+                 filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
+                 if filepath:
+                     logger.error(f"Dumped Tau crash log to {filepath}")
+                 raise TauEngineCrash(msg)
 
             # Prepare input queues (Rebuild every attempt as deque is consumed)
             stream_input_queues: dict[int, deque[str]] = {}
@@ -668,7 +694,11 @@ def communicate_with_tau(
 
             # 2. Check Process Readiness (Check internal process-up signal)
             if not tau_process_ready.is_set() and not tau_test_mode:
-                raise TauProcessError("Tau process is not running (not signaled ready).")
+                msg = "Tau process is not running (not signaled ready)."
+                filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
+                if filepath:
+                     logger.error(f"Dumped Tau crash log to {filepath}")
+                raise TauEngineCrash(msg)
 
             # If in fake mode, synthesize minimal responses
             if tau_test_mode:
@@ -693,14 +723,22 @@ def communicate_with_tau(
                 if not tau_process or tau_process.poll() is not None:
                     tau_ready.clear() 
                     tau_process_ready.clear()
-                    raise TauProcessError("Tau process is not running.")
+                    msg = "Tau process is not running."
+                    filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
+                    if filepath:
+                         logger.error(f"Dumped Tau crash log to {filepath}")
+                    raise TauEngineCrash(msg)
 
                 current_stdin = tau_process.stdin
                 current_stdout = tau_process.stdout
                 if not current_stdin or not current_stdout or current_stdin.closed or current_stdout.closed:
                     tau_ready.clear()
                     tau_process_ready.clear()
-                    raise TauProcessError("Tau process stdin/stdout pipes not available or closed.")
+                    msg = "Tau process stdin/stdout pipes not available or closed."
+                    filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
+                    if filepath:
+                         logger.error(f"Dumped Tau crash log to {filepath}")
+                    raise TauEngineCrash(msg)
 
                 def _send_value_to_tau(stream_idx: int, value, reason: str):
                     """Helper that logs and writes a value to Tau's stdin."""
@@ -762,7 +800,11 @@ def communicate_with_tau(
                         )
                         tau_ready.clear()
                         tau_process_ready.clear()
-                        raise TauProcessError(f"Tau process exited unexpectedly (code {exit_code}).")
+                        msg = f"Tau process exited unexpectedly (code {exit_code})."
+                        filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
+                        if filepath:
+                             logger.error(f"Dumped Tau crash log to {filepath}")
+                        raise TauEngineCrash(msg)
 
                     # Read Loop
                     buf = bytearray()
@@ -813,9 +855,14 @@ def communicate_with_tau(
 
                     output_lines_read.append(line_strip)
                     logger.info(f"{COLOR_BLUE}[TAU_STDOUT] %s{COLOR_RESET}", line_strip)
+                    tau_io_logger.log_stdout(line_strip)
 
                     if "(Error)" in line_strip:
-                        raise TauCommunicationError(f"Tau failed: {line_strip}")
+                        msg = f"Tau failed: {line_strip}"
+                        filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
+                        if filepath:
+                             logger.error(f"Dumped Tau crash log to {filepath}")
+                        raise TauEngineBug(msg)
 
                     # oN Prompt/Value Handling
                     if expect_stream_value_for is not None:
@@ -911,7 +958,7 @@ def communicate_with_tau(
                 pass
             return tau_output_line
 
-        except (TauProcessError, TauCommunicationError) as e:
+        except (TauEngineCrash, TauCommunicationError) as e:
             if not wait_for_ready:
                 # If caller doesn't want to wait (e.g. initial restore), we fail fast.
                 if isinstance(e, TauCommunicationError):
@@ -998,9 +1045,11 @@ def request_shutdown():
     """
     Signals all background threads and the main server loop to shut down.
     """
-    global tau_direct_interface
+    global tau_direct_interface, last_known_tau_spec, tau_test_mode
     logger.info("Shutdown requested.")
     server_should_stop.set()
+    last_known_tau_spec = None
+    tau_direct_interface = None
     if config.settings.tau.use_direct_bindings:
         with tau_process_lock:
             tau_direct_interface = None

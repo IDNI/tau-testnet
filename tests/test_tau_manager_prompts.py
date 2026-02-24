@@ -21,9 +21,9 @@ def test_tau_prompt_regexes_distinguish_input_vs_output() -> None:
 
 def test_normalize_rule_bitvector_sizes_rewrites_unsized_bv() -> None:
     rule = (
-        "always (((((i1[t] | i2[t]) & i3[t]) | { #b0 }:bv) = { #b0 }:bv) ? "
-        "o12[t] = (((i1[t] | i2[t]) & i3[t]) | { #b0 }:bv) : "
-        "o12[t] = ((((i1[t] | i2[t]) & i3[t]) | { #b0 }:bv))')."
+        "always (((((i1[t] | i2[t]) & i3[t]) | { 0 }:bv) = { 0 }:bv) ? "
+        "o12[t] = (((i1[t] | i2[t]) & i3[t]) | { 0 }:bv) : "
+        "o12[t] = ((((i1[t] | i2[t]) & i3[t]) | { 0 }:bv))')."
     )
     normalized = tau_manager.normalize_rule_bitvector_sizes(rule)
     assert f":bv[{tau_manager.DEFAULT_RULE_BV_WIDTH}]" in normalized

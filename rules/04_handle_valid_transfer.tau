@@ -1,4 +1,4 @@
 # --- All Validations Pass for transfer: Echo the original amount from i1[t] ---
 # This rule uses bitvector arithmetic.
 # o1[t]: The original transfer amount (bitvector)
-always (o1[t] = ((i1[t] + { #b0 }:bv) & ((i1[t] + { #b0 }:bv) | { #b0 }:bv))).
+always (o1[t] = ((i1[t] + { 0 }:bv) & ((i1[t] + { 0 }:bv) | { 0 }:bv))).

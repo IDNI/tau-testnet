@@ -5,6 +5,9 @@ import re
 import sys
 from collections import deque
 
+from errors import TauEngineBug, TauEngineCrash
+import tau_io_logger
+
 # Setup logging
 logger = logging.getLogger(__name__)
 
@@ -224,13 +227,20 @@ class TauInterface:
     @staticmethod
     def _fallback_value_for_stream(stream_name: str) -> str:
         # Docker mode sends "F" for i0 (rule stream), and 0 for all other inputs.
-        return "F" if stream_name == "i0" else "0"
+        # return "F" if stream_name == "i0" else "0"
+        if stream_name == "i0":
+            return "F"
+        return "0"
 
     def _build_interpreter_from_spec(self, spec_text: str, *, reason: str):
         prepared = self._ensure_trailing_period(spec_text)
         interpreter = self.tau.get_interpreter(prepared)
         if interpreter is None:
-            raise RuntimeError(f"Failed to create Tau interpreter ({reason}).")
+            msg = f"Failed to create Tau interpreter ({reason})."
+            filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
+            if filepath:
+                 logger.error(f"Dumped Tau crash log to {filepath}")
+            raise TauEngineCrash(msg)
         self.accumulated_spec = prepared
         return interpreter
 
@@ -354,76 +364,92 @@ class TauInterface:
         if rule_text is not None:
             normalized_rule_text = self._normalize_assignment_value(rule_text)
 
-        # Fill every required input, including fallbacks, like Docker prompt flow.
-        for input_obj in required_inputs:
-            name = input_obj.name
-            stream_queue = stream_input_queues.get(name)
-
-            if stream_queue:
-                value_to_assign = stream_queue.popleft()
-                if not stream_queue:
-                    del stream_input_queues[name]
-                reason = "Sending queued input"
-            elif name == "i0" and normalized_rule_text is not None:
-                value_to_assign = normalized_rule_text
-                reason = "Sending rule text"
-            else:
-                value_to_assign = self._fallback_value_for_stream(name)
-                reason = "Sending fallback"
-
-            input_assignments[input_obj] = value_to_assign
-            logger.debug(
-                "Input Key: %r (name=%s) -> Value: %s (%s)",
-                input_obj,
-                name,
-                value_to_assign,
-                reason,
-            )
-
-        # 2. Perform Step
-        # Log Inputs
-        if input_assignments:
-             logger.info(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Inputs:{COLOR_RESET}")
-             for k, v in input_assignments.items():
-                 # Handle multi-line inputs for cleaner logging
-                 val_str = str(v)
-                 if "\n" in val_str:
-                     logger.info(f"  {k.name}:")
-                     for line in val_str.splitlines():
-                         logger.info(f"{COLOR_GREEN}    >>> {line}{COLOR_RESET}")
-                 else:
-                     logger.info(f"  {k.name}: {COLOR_GREEN}{val_str}{COLOR_RESET}")
-        else:
-             logger.info(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Inputs: (None){COLOR_RESET}")
-
-        
-        # Capture stdout to catch "Updated specification:" output
+        # We must loop to provide inputs since Tau asks for them lazily.
         captured_output = ""
-        try:
-            with StdOutCapture() as capture:
-                outputs = self.tau.step(self.interpreter, input_assignments)
-            captured_output = capture.output
-        except Exception as e:
-            # If capture fails, we might still have outputs from step?
-            # But likely we need to propagate error.
-            # Also, we should probably print captured output to real stdout so user sees logs
-            # if we suppressed them.
-            # For now, just re-raise.
-            raise e
-            
-        # Re-print captured output to real stdout so logs are visible
-        # (Since we redirected stdout, the logs printed by C++ engine were trapped in pipe)
+        outputs = None
+        
+        for _ in range(100):
+            required_inputs = self.tau.get_inputs_for_step(self.interpreter)
+            input_assignments = {}
+
+            # Fill every newly required input
+            for input_obj in required_inputs:
+                name = input_obj.name
+                stream_queue = stream_input_queues.get(name)
+
+                if stream_queue:
+                    value_to_assign = stream_queue.popleft()
+                    if not stream_queue:
+                        del stream_input_queues[name]
+                    reason = "Sending queued input"
+                elif name == "i0" and normalized_rule_text is not None:
+                    value_to_assign = normalized_rule_text
+                    reason = "Sending rule text"
+                else:
+                    value_to_assign = self._fallback_value_for_stream(name)
+                    reason = "Sending fallback"
+
+                input_assignments[input_obj] = value_to_assign
+                tau_io_logger.log_native_input(name, value_to_assign)
+                logger.debug(
+                    "Input Key: %r (name=%s) -> Value: %s (%s)",
+                    input_obj,
+                    name,
+                    value_to_assign,
+                    reason,
+                )
+
+            # Log Inputs
+            if input_assignments:
+                 logger.info(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Inputs:{COLOR_RESET}")
+                 for k, v in input_assignments.items():
+                     val_str = str(v)
+                     if "\n" in val_str:
+                         logger.info(f"  {k.name}:")
+                         for line in val_str.splitlines():
+                             logger.info(f"{COLOR_GREEN}    >>> {line}{COLOR_RESET}")
+                     else:
+                         logger.info(f"  {k.name}: {COLOR_GREEN}{val_str}{COLOR_RESET}")
+
+            try:
+                with StdOutCapture() as capture:
+                    outputs = self.tau.step(self.interpreter, input_assignments)
+                captured_output += capture.output
+            except Exception as e:
+                raise e
+
+            if outputs is not None:
+                break # We have outputs, step is fully finished
+                
+            if "(Error)" in capture.output:
+                break # Native engine reported a parsing/logic error, don't loop forever
+
+        # Re-print accumulated captured output to real stdout so logs are visible
         if captured_output:
             print(captured_output, end='')
+            tau_io_logger.log_native_stdout(captured_output)
+            
+            if "(Error)" in captured_output:
+                msg = f"Tau native step reported an error: {captured_output.strip()}"
+                filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
+                if filepath:
+                     logger.error(f"Dumped Tau crash log to {filepath}")
+                raise TauEngineBug(msg)
 
         if outputs is None:
-            raise RuntimeError("Tau step failed (returned None)")
+            msg = "Tau step failed (returned None after 100 iterations)"
+            filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
+            if filepath:
+                 logger.error(f"Dumped Tau crash log to {filepath}")
+            raise TauEngineBug(msg)
+
 
         # Log Outputs
         if outputs:
              logger.info(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs:{COLOR_RESET}")
              for k, v in outputs.items():
                  val_str = str(v)
+                 tau_io_logger.log_native_output(k.name, val_str)
                  if "\n" in val_str:
                      logger.info(f"  {k.name}:")
                      for line in val_str.splitlines():

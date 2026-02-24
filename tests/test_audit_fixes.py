@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import db
 import chain_state
 import config
-from errors import TauTestnetError, TauProcessError, TauCommunicationError
+from errors import TauTestnetError, TauEngineCrash, TauCommunicationError
 
 # --- Fixtures ---
 

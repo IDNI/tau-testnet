@@ -117,6 +117,10 @@ def cmd_createblock(args):
     resp = rpc_command("createblock\r\n", args.host, args.port)
     print(resp.strip())
 
+def cmd_gettaustate(args):
+    resp = rpc_command("gettaustate\r\n", args.host, args.port)
+    print(resp.strip())
+
 
 def cmd_send(args):
     raw_bytes = _parse_privkey(args.privkey)
@@ -258,6 +262,9 @@ def main():
     # Create block command
     p_createblock = sub.add_parser("createblock", help="Create a new block from mempool", parents=[common])
     p_createblock.set_defaults(func=cmd_createblock)
+
+    p_taustate = sub.add_parser("gettaustate", help="Get current Tau state formula", parents=[common])
+    p_taustate.set_defaults(func=cmd_gettaustate)
     
     args = parser.parse_args()
     args.func(args)

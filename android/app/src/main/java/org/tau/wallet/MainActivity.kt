@@ -103,6 +103,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnGenKey).setOnClickListener { generateKeypair() }
         findViewById<Button>(R.id.btnBalance).setOnClickListener { queryBalance() }
         findViewById<Button>(R.id.btnHistory).setOnClickListener { queryHistory() }
+        findViewById<Button>(R.id.btnTauState).setOnClickListener { queryTauState() }
         findViewById<Button>(R.id.btnSend).setOnClickListener { sendTx() }
         findViewById<Button>(R.id.btnSaveWallet).setOnClickListener { showSaveWalletDialog() }
         findViewById<Button>(R.id.btnDeleteWallet).setOnClickListener { deleteSelectedWallet() }
@@ -494,6 +495,21 @@ class MainActivity : AppCompatActivity() {
                 if (peers.isNotEmpty()) {
                     val adapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, peers.toList())
                     actTo.setAdapter(adapter)
+                }
+            }
+        }
+    }
+
+    private fun queryTauState() {
+        val host = actHost.text.toString()
+        val port = etPort.text.toString().toIntOrNull() ?: return
+        thread {
+            val resp = rpc("gettaustate\r\n", host, port).trim()
+            runOnUiThread {
+                tvResult.text = resp
+                if (resp.startsWith("TAUSTATE:")) {
+                    val state = resp.substring(9).trim()
+                    etRule.setText(state)
                 }
             }
         }

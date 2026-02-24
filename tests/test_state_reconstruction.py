@@ -23,8 +23,13 @@ import chain_state
 
 class TestStateReconstruction(unittest.TestCase):
     
-    def start_tau(self):
+    def start_tau(self, force_native=False):
         """Start Tau process via tau_manager in a background thread and wait until it's ready."""
+        self._prev_tau_force_test = os.environ.get("TAU_FORCE_TEST", "1")
+        if force_native:
+            os.environ["TAU_FORCE_TEST"] = "0"
+        tau_manager.server_should_stop.clear()
+        tau_manager.tau_ready.clear()
         self.tau_thread = threading.Thread(target=tau_manager.start_and_manage_tau_process, daemon=True)
         self.tau_thread.start()
         ready = tau_manager.tau_ready.wait(timeout=60)
@@ -36,6 +41,7 @@ class TestStateReconstruction(unittest.TestCase):
         tau_manager.request_shutdown()
         if hasattr(self, 'tau_thread'):
             self.tau_thread.join(timeout=10)
+        os.environ["TAU_FORCE_TEST"] = getattr(self, "_prev_tau_force_test", "1")
     def setUp(self):
         """Set up a temporary database for testing state reconstruction."""
         # Create a temporary database file
@@ -165,12 +171,10 @@ class TestStateReconstruction(unittest.TestCase):
         # --- Start Tau once for the whole test ---
         self.start_tau()
         try:
-            # Use locally defined patterns and pick one at random each time
             BASE_PATTERNS = [
-                "(x3 & x7')",
-                # "(((x3 & x7) | (x3' & x7')) & x2 & x6')",
-                # "(((x3 & x7) | (x3' & x7')) & ((x2 & x6) | (x2' & x6')) & x1 & x5')",
-                # "(((x3 & x7) | (x3' & x7')) & ((x2 & x6) | (x2' & x6')) & ((x1 & x5) | (x1' & x5')) & x0 & x4')",
+                "{ 3 }:bv[64]",
+                "{ 7 }:bv[64]",
+                "{ 15 }:bv[64]",
             ]
             random.seed(42)
 
@@ -182,7 +186,7 @@ class TestStateReconstruction(unittest.TestCase):
             # Simple helper to build a unique rule for index i
             def rule_for(i: int) -> str:
                 pat = random_pattern()
-                return f"always ((i1[t] <= {{{pat}}}:sbf)? o1[t] ={{x0}}:sbf:o1[t] = i1[t])."
+                return f"always ((i1[t]:bv[64] = {pat})? o1[t]:bv[64] = {{ 0 }}:bv[64] : o1[t]:bv[64] = i1[t]:bv[64])."
 
             # -------- Block 0  (sender = addr1) --------
             tx1 = self.create_test_transaction(
@@ -385,7 +389,7 @@ class TestStateReconstruction(unittest.TestCase):
         # --- Start Tau ---
         self.start_tau()
         try:
-            rule_text = "o1[t] = {x1}:sbf"
+            rule_text = "o1[t] = i1[t]."
 
             # Create a transaction containing both the rule and a transfer
             tx1 = self.create_test_transaction(
@@ -457,32 +461,36 @@ class TestStateReconstruction(unittest.TestCase):
         """Test state reconstruction handles unknown operation types gracefully."""
         print("\n=== Testing state reconstruction with unknown operations ===")
         
-        # Create a transaction with unknown operation types
-        tx1 = self.create_test_transaction(
-            sender_pubkey=self.addr1,
-            sequence_number=0,
-            transfers=[
-                [self.addr1, self.addr2, "3"]
-            ]
-        )
-        # Add unknown operations manually
-        tx1["operations"]["99"] = "unknown_operation_data"
-        tx1["operations"]["custom"] = {"some": "data"}
-        
-        block_0 = Block.create(
-            block_number=0,
-            previous_hash="0" * 64,
-            transactions=[tx1]
-        )
-        add_block(block_0)
-        
-        # Rebuild state (should process known operations and skip unknown ones)
-        rebuild_state_from_blockchain()
-        
-        # Verify that known operations (transfers) were still processed
-        self.assertEqual(get_balance(self.addr1), GENESIS_BALANCE - 3)  # 12
-        self.assertEqual(get_balance(self.addr2), 3)
-        self.assertEqual(get_sequence_number(self.addr1), 1)
+        self.start_tau(force_native=True)
+        try:
+            # Create a transaction with unknown operation types
+            tx1 = self.create_test_transaction(
+                sender_pubkey=self.addr1,
+                sequence_number=0,
+                transfers=[
+                    [self.addr1, self.addr2, "3"]
+                ]
+            )
+            # Add unknown operations manually
+            tx1["operations"]["99"] = "123" # Must be valid Tau syntax or entire tx is rejected
+            tx1["operations"]["custom"] = {"some": "data"}
+            
+            block_0 = Block.create(
+                block_number=0,
+                previous_hash="0" * 64,
+                transactions=[tx1]
+            )
+            add_block(block_0)
+            
+            # Rebuild state (should process known operations and skip unknown ones)
+            rebuild_state_from_blockchain()
+            
+            # Verify that known operations (transfers) were still processed
+            self.assertEqual(get_balance(self.addr1), GENESIS_BALANCE - 3)  # 12
+            self.assertEqual(get_balance(self.addr2), 3)
+            self.assertEqual(get_sequence_number(self.addr1), 1)
+        finally:
+            self.stop_tau()
     
     def test_reconstruction_empty_operations(self):
         """Test state reconstruction with transactions that have empty operations."""

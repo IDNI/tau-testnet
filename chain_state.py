@@ -358,7 +358,7 @@ def fetch_accounts_snapshot(block_hash: str) -> Optional[tuple[Dict[str, int], D
 GENESIS_ADDRESS = "a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b"
 GENESIS_BALANCE = 10000
 
-def process_new_block(block: Block) -> bool:
+def _process_new_block_internal(block: Block) -> bool:
     """
     Verify and persist a new block.
 
@@ -658,7 +658,17 @@ def process_new_block(block: Block) -> bool:
         print(f"[INFO][chain_state] Block #{block_number} persisted via DHT snapshots.")
     return True
 
-def rebuild_state_from_blockchain(start_block=0):
+def process_new_block(block: Block) -> bool:
+    try:
+        return _process_new_block_internal(block)
+    except Exception as e:
+        from errors import TauTestnetError, BlockchainBug
+        if isinstance(e, TauTestnetError):
+            raise
+        logger.error(f"[BLOCKCHAIN_BUG] Unhandled exception in process_new_block: {e}", exc_info=True)
+        raise BlockchainBug(f"Unhandled exception in process_new_block: {e}") from e
+
+def _rebuild_state_from_blockchain_internal(start_block=0):
     """
     Rebuilds or updates the chain state by replaying transactions from the database.
     If start_block is 0, it clears existing state.
@@ -765,6 +775,16 @@ def rebuild_state_from_blockchain(start_block=0):
         print(f"[INFO][chain_state] - Final state: {len(active_sequences)} accounts with sequence numbers")
         for addr, seq in active_sequences.items():
             print(f"[INFO][chain_state]   {addr[:10]}... seq = {seq}")
+
+def rebuild_state_from_blockchain(start_block=0):
+    try:
+        _rebuild_state_from_blockchain_internal(start_block)
+    except Exception as e:
+        from errors import TauTestnetError, BlockchainBug
+        if isinstance(e, TauTestnetError):
+            raise
+        logger.error(f"[BLOCKCHAIN_BUG] Unhandled exception in rebuild_state_from_blockchain: {e}", exc_info=True)
+        raise BlockchainBug(f"Unhandled exception in rebuild_state_from_blockchain: {e}") from e
 
 def init_chain_state():
     """Initializes the chain state with genesis balance."""

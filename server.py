@@ -17,7 +17,7 @@ import config
 import re
 import json
 from commands import createblock, sendtx  # Import command handlers
-from errors import ConfigurationError, TauProcessError, TauTestnetError
+from errors import ConfigurationError, TauEngineCrash, TauTestnetError
 import tau_logging
 
 
@@ -195,17 +195,26 @@ async def websocket_handler(request):
     headers = dict(request.headers)
     origin = headers.get("Origin") or headers.get("origin")
     
+    # Parse allowed origins from environment (comma-separated, e.g. "https://domain1.com,https://domain2.com,*")
+    allowed_env = os.environ.get("TAU_WS_ALLOWED_ORIGINS", "")
+    allowed_domains = [d.strip() for d in allowed_env.split(",") if d.strip()]
+
     # Allow missing origin (localhost tools) or localhost/file
     allowed = False
-    if not origin:
-        allowed = True
-    elif origin == "null":
+    if not origin or origin == "null":
         allowed = True
     elif "localhost" in origin or "127.0.0.1" in origin:
         allowed = True
+    elif "*" in allowed_domains:
+        allowed = True
+    else:
+        for domain in allowed_domains:
+            if domain in origin:
+                allowed = True
+                break
         
     if not allowed:
-        logger.warning("Rejected WS connection from disallowed origin: %s", origin)
+        logger.warning("Rejected WS connection from disallowed origin: %s. Use TAU_WS_ALLOWED_ORIGINS to allow it.", origin)
         await ws.send_message("error disallowed_origin")
         await ws.aclose()
         return
@@ -401,8 +410,6 @@ def _run_server(container: ServiceContainer):
     def _restore_callback():
         restore_flag = os.environ.get("TAU_RESTORE_RULES_ON_STARTUP", "").strip().lower()
         restore_enabled = restore_flag not in {"0", "false", "no", "off"}
-        if container.settings.env == "test" and restore_flag == "":
-            restore_enabled = False
         
         saved_rules = chain_state_module.get_rules_state()
         
@@ -425,17 +432,17 @@ def _run_server(container: ServiceContainer):
                 logger.info("Tau restore result (o0): %s", out)
             except Exception:
                 logger.exception("Failed to restore persisted Tau rules/state during callback")
-        elif saved_rules:
-             logger.info("Persisted rules found but restore is disabled (set TAU_RESTORE_RULES_ON_STARTUP=1).")
         else:
-            # No persisted rules yet (fresh DB / genesis). Load built-in rule files after Tau is up.
+            if saved_rules:
+                logger.info("Persisted rules found but restore is disabled. Injecting built-in rules instead.")
+            # No persisted rules (or restore disabled). Load built-in rule files after Tau is up.
             try:
                 builtin_rules = []
                 if hasattr(chain_state_module, "load_builtin_rules_from_disk"):
                     builtin_rules = chain_state_module.load_builtin_rules_from_disk()
 
                 if builtin_rules:
-                    logger.info("No persisted Tau rules found; injecting %s built-in rules from disk...", len(builtin_rules))
+                    logger.info("Injecting %s built-in rules from disk...", len(builtin_rules))
                     for rule_text in builtin_rules:
                         logger.info("Injecting built-in rule: %s", rule_text)
                         tau_module.communicate_with_tau(
@@ -450,7 +457,7 @@ def _run_server(container: ServiceContainer):
                     chain_state_module.commit_state_to_db(latest_hash)
                     logger.info("Built-in rules injected and persisted (last_block_hash=%s).", latest_hash[:16] if latest_hash else "")
                 else:
-                    logger.info("No persisted Tau rules found and no built-in rules on disk; leaving Tau spec as-is.")
+                    logger.info("No built-in rules on disk; leaving Tau spec as-is.")
             except Exception:
                 logger.exception("Failed to inject built-in rules during Tau restore callback")
 
@@ -468,7 +475,7 @@ def _run_server(container: ServiceContainer):
     # This waits for 'tau_ready', which is set AFTER the callback completes
     if not tau_module.tau_ready.wait(timeout=config.CLIENT_WAIT_TIMEOUT):
         tau_module.request_shutdown()
-        raise TauProcessError("Tau did not signal readiness within the expected timeout.")
+        raise TauEngineCrash("Tau did not signal readiness within the expected timeout.")
 
     logger.info("Tau is ready.")
     
@@ -507,7 +514,7 @@ def _run_server(container: ServiceContainer):
                     raise
                 logger.warning("Port %s:%s is busy, trying next port...", config.HOST, test_port)
         else:
-            raise TauProcessError("Failed to bind to any configured port.")
+            raise TauEngineCrash("Failed to bind to any configured port.")
 
         server_socket.listen()
         logger.info("Listening on %s:%s", config.HOST, actual_port)
@@ -588,7 +595,7 @@ def main():
         logger.critical("Configuration error during startup: %s", exc)
         tau_module.request_shutdown()
         sys.exit(1)
-    except TauProcessError as exc:
+    except TauEngineCrash as exc:
         logger.critical("Tau process error: %s", exc)
         tau_module.request_shutdown()
         sys.exit(1)

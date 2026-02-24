@@ -8,6 +8,7 @@ let socket = null;
 let currentKeyPair = null;
 let isConnected = false;
 let savedWallets = {}; // name -> {priv: hex, pub: hex}
+let pendingSequence = null; // Track local sequence to prevent 'expected 1 got 0' on rapid sends
 
 const DEFAULT_RULE_BV_WIDTH = 16;
 const MAX_TAU_TRANSFER_AMOUNT = (1 << DEFAULT_RULE_BV_WIDTH) - 1;
@@ -38,11 +39,12 @@ const btnRevealSk = document.getElementById('btn-reveal-sk');
 const statBalance = document.getElementById('stat-balance');
 const statSequence = document.getElementById('stat-sequence');
 const btnRefresh = document.getElementById('btn-refresh');
+const btnGetState = document.getElementById('btn-get-state');
 
 const btnSend = document.getElementById('btn-send');
 const txRecipient = document.getElementById('tx-recipient');
 const btnRefreshAccounts = document.getElementById('btn-refresh-accounts');
-const knownAccountsList = document.getElementById('known-accounts');
+const knownAccountsList = document.getElementById('known-accounts-menu'); // UPDATED for Dropdown
 
 const txAmount = document.getElementById('tx-amount');
 const txRule = document.getElementById('tx-rule');
@@ -61,13 +63,48 @@ const btnShowSave = document.getElementById('btn-show-save');
 
 const logsDiv = document.getElementById('logs');
 const btnClearLogs = document.getElementById('btn-clear-logs');
+const btnCopyLogs = document.getElementById('btn-copy-logs');
 
 const tabBtns = document.querySelectorAll('.tab-btn');
 const tabContents = document.querySelectorAll('.tab-content');
 
+// --- CodeMirror Editors ---
+let ruleEditor = null;
+let customEditor = null;
+
 // --- Initialization ---
 function init() {
     log("Web Wallet initialized.");
+
+    // Initialize CodeMirror Editors
+    if (txRule) {
+        ruleEditor = CodeMirror.fromTextArea(txRule, {
+            mode: "simple",
+            theme: "material-ocean",
+            lineNumbers: true,
+            lineWrapping: true,
+            indentUnit: 4,
+            viewportMargin: Infinity
+        });
+        // Make sure it sizes correctly when unhidden
+        document.querySelectorAll('button[data-bs-toggle="tab"]').forEach(tabBtn => {
+            tabBtn.addEventListener('shown.bs.tab', function (e) {
+                if (ruleEditor) ruleEditor.refresh();
+                if (customEditor) customEditor.refresh();
+            });
+        });
+    }
+
+    if (txCustom) {
+        customEditor = CodeMirror.fromTextArea(txCustom, {
+            mode: "simple",
+            theme: "material-ocean",
+            lineNumbers: true,
+            lineWrapping: true,
+            indentUnit: 4,
+            viewportMargin: Infinity
+        });
+    }
 
     // Event Listeners
     btnConnect.addEventListener('click', toggleConnection);
@@ -101,8 +138,17 @@ function init() {
     });
 
     btnRefresh.addEventListener('click', refreshInfo);
+    if (btnGetState) btnGetState.addEventListener('click', () => sendRpc('gettaustate'));
     btnSend.addEventListener('click', onSendTransaction);
     btnClearLogs.addEventListener('click', () => logsDiv.innerHTML = '');
+    if (btnCopyLogs) {
+        btnCopyLogs.addEventListener('click', () => {
+            if (logsDiv.innerText.trim()) {
+                navigator.clipboard.writeText(logsDiv.innerText);
+                log("Copied logs to clipboard.", "success");
+            }
+        });
+    }
     if (btnRefreshAccounts) btnRefreshAccounts.addEventListener('click', refreshKnownAccounts);
 
     if (txAmount) {
@@ -112,10 +158,10 @@ function init() {
     }
 
     // Rule Logic
-    txRule.addEventListener('input', () => validateRuleSyntax(txRule.value));
+    ruleEditor.on('change', () => validateRuleSyntax(ruleEditor.getValue()));
     btnRandomRule.addEventListener('click', () => {
         const rule = generateRandomTauRule();
-        txRule.value = rule;
+        ruleEditor.setValue(rule);
         validateRuleSyntax(rule);
     });
 
@@ -230,9 +276,19 @@ function handleServerResponse(msg) {
     if (msg.startsWith("BALANCE: ")) {
         const bal = msg.split(":")[1].trim();
         statBalance.textContent = bal;
+    } else if (msg.startsWith("TAUSTATE:")) {
+        const state = msg.substring(9).trim();
+        log(`Tau State:\n${state}`, 'success');
+        if (ruleEditor && state) {
+            ruleEditor.setValue(state);
+        }
     } else if (msg.startsWith("SEQUENCE: ")) {
-        const seq = msg.split(":")[1].trim();
+        const seq = parseInt(msg.split(":")[1].trim());
         statSequence.textContent = seq;
+        // Only update pending if it's null (initial load) or the confirmed sequence has caught up/surpassed our local tracking
+        if (pendingSequence === null || seq > pendingSequence) {
+            pendingSequence = seq;
+        }
     } else if (msg.startsWith("ACCOUNTS: ")) {
         try {
             const jsonStr = msg.substring(10);
@@ -249,6 +305,12 @@ function handleServerResponse(msg) {
         } catch (e) {
             log("Error parsing raw accounts list: " + e.message, "error");
         }
+    } else if (msg.startsWith("FAILURE:")) {
+        log(msg, "error");
+        // Reset our optimistic sequence if a transaction failed
+        pendingSequence = null;
+    } else if (msg.startsWith("SUCCESS:")) {
+        log(msg, "success");
     }
 }
 
@@ -257,13 +319,28 @@ function refreshKnownAccounts() {
 }
 
 function updateKnownAccounts(accounts) {
-    knownAccountsList.innerHTML = ''; // Clear
+    const listEl = document.getElementById('known-accounts-menu');
+    if (!listEl) {
+        log("Error: could not find known accounts menu element.", "error");
+        return;
+    }
+
+    listEl.innerHTML = '<li><h6 class="dropdown-header">Known Accounts (Refresh to fetch)</h6></li>'; // Clear
     if (!accounts || !Array.isArray(accounts)) return;
 
     accounts.forEach(acc => {
-        const opt = document.createElement('option');
-        opt.value = acc;
-        knownAccountsList.appendChild(opt);
+        const li = document.createElement('li');
+        const a = document.createElement('a');
+        a.className = 'dropdown-item';
+        a.style.fontFamily = 'monospace';
+        a.href = '#';
+        a.textContent = acc;
+        a.addEventListener('click', (e) => {
+            e.preventDefault();
+            txRecipient.value = acc;
+        });
+        li.appendChild(a);
+        listEl.appendChild(li);
     });
     log(`Refreshed ${accounts.length} known accounts.`);
 }
@@ -355,7 +432,7 @@ async function onSendTransaction() {
     const amountVal = txAmount.value;
 
     // Check for rule existence again (hoisted from below)
-    const ruleInputPreCheck = txRule.value.trim();
+    const ruleInputPreCheck = ruleEditor ? ruleEditor.getValue().trim() : txRule.value.trim();
 
     // Relax validation:
     // If Rule is present, Recipient and Amount are NOT strictly required (unless logic below enforces transfer).
@@ -376,8 +453,9 @@ async function onSendTransaction() {
         // But logic below handles that: `if (recipient && amountVal && ...)`
         // So we can skip strict checks here.
     }
-    // Get sequence
-    let seq = parseInt(statSequence.textContent);
+    // Get sequence: Use pendingSequence if available, otherwise fallback to UI stat.
+    let seq = pendingSequence !== null ? pendingSequence : parseInt(statSequence.textContent);
+
     if (isNaN(seq)) {
         seq = 0; // Default or maybe we should fail?
         // Ideally we should have fetched it.
@@ -416,11 +494,15 @@ async function onSendTransaction() {
             log("Invalid Rule Syntax. Correct it before sending.", "error");
             return;
         }
-        ops["0"] = ruleInputPreCheck.split('\n').map(l => l.trim()).join(' ');
+        // Allow comments in the UI, but strip them before sending to the node.
+        // This is IMPORTANT because the current code joins lines with spaces,
+        // and a '#' would comment out everything after it on the same line.
+        const noComments = stripTauComments(ruleInputPreCheck);
+        ops["0"] = noComments.split('\n').map(l => l.trim()).filter(Boolean).join(' ');
     }
 
     // 3. Custom Ops Logic
-    const customInput = txCustom.value.trim();
+    const customInput = customEditor ? customEditor.getValue().trim() : txCustom.value.trim();
     if (customInput) {
         const lines = customInput.split('\n');
         for (let line of lines) {
@@ -479,6 +561,15 @@ async function onSendTransaction() {
         sendRpc(cmd);
         log("Transaction sent.", "sent");
 
+        // Optimistically increment sequence for subsequent rapid sends
+        pendingSequence = seq + 1;
+
+        // Auto-clear inputs
+        txRecipient.value = '';
+        txAmount.value = '';
+        if (ruleEditor) ruleEditor.setValue('');
+        if (customEditor) customEditor.setValue('');
+
     } catch (e) {
         log("Error signing/sending tx: " + e.message, "error");
         console.error(e);
@@ -501,13 +592,36 @@ function canonicalize(obj) {
     return str;
 }
 
+// Strip Tau comments while preserving #b and #x literals.
+function stripTauComments(ruleText) {
+    if (!ruleText) return "";
+    return ruleText.split('\n').map(line => {
+        let out = "";
+        for (let i = 0; i < line.length; i++) {
+            if (line[i] === '#') {
+                const next = i + 1 < line.length ? line[i + 1].toLowerCase() : '';
+                if (next === 'b' || next === 'x') {
+                    out += '#';
+                } else {
+                    break; // Start of a real comment
+                }
+            } else {
+                out += line[i];
+            }
+        }
+        return out;
+    }).join('\n');
+}
+
 function validateRuleSyntax(rule) {
     if (!rule || !rule.trim()) {
         ruleValidationStatus.textContent = "";
         return true;
     }
     const errors = [];
-    const trimmed = rule.trim();
+    // Validate the semantic rule text, not comments.
+    const withoutComments = stripTauComments(rule);
+    const trimmed = withoutComments.trim();
 
     // 1. Check: Must end with '.'
     if (!trimmed.endsWith('.')) {
@@ -517,7 +631,7 @@ function validateRuleSyntax(rule) {
     // 2. Check brackets
     const stack = [];
     const pairs = { ')': '(', ']': '[', '}': '{' };
-    for (let char of rule) {
+    for (let char of withoutComments) {
         if (['(', '[', '{'].includes(char)) {
             stack.push(char);
         } else if ([')', ']', '}'].includes(char)) {
@@ -530,7 +644,7 @@ function validateRuleSyntax(rule) {
 
     // 3. Check invalid chars
     const allowedChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_[]()='&|!<>+-*/%^: \t\n\r{}#?,.";
-    for (let char of rule) {
+    for (let char of withoutComments) {
         if (!allowedChars.includes(char)) {
             errors.push(`Invalid character '${char}'.`);
         }
@@ -546,11 +660,11 @@ function validateRuleSyntax(rule) {
 
     // 5. Check for consecutive operands (garbage words)
     // Identify words/identifiers and check if two appear without an operator between them (unless first is keyword).
-    const keywords = new Set(["always", "eventually", "next", "future", "tau", "forall", "exists", "release", "until"]);
+    const keywords = new Set(["always", "eventually", "next", "future", "tau", "forall", "exists", "release", "until", "ex"]);
     const reWord = /[a-zA-Z0-9_#]+/g;
     let match;
     const words = [];
-    while ((match = reWord.exec(rule)) !== null) {
+    while ((match = reWord.exec(withoutComments)) !== null) {
         words.push({ text: match[0], index: match.index, end: match.index + match[0].length });
     }
 
@@ -559,11 +673,11 @@ function validateRuleSyntax(rule) {
         const next = words[i + 1];
 
         // Check text between them
-        const substring = rule.slice(curr.end, next.index);
+        const substring = withoutComments.slice(curr.end, next.index);
 
-        // If there is ONLY whitespace between two identifiers, it's suspicious unless the first is a keyword.
+        // If there is ONLY whitespace between two identifiers, it's suspicious unless one of them is a keyword.
         if (!substring.trim()) {
-            if (!keywords.has(curr.text)) {
+            if (!keywords.has(curr.text) && !keywords.has(next.text)) {
                 errors.push(`Unexpected sequence: '${curr.text} ${next.text}'. Missing operator?`);
                 break; // One error is enough
             }
@@ -572,7 +686,7 @@ function validateRuleSyntax(rule) {
 
     // 6. Heuristic for meaningful content (Backup check)
     if (errors.length === 0) {
-        const hasOperator = ['=', ':=', '->', '<-', '<->'].some(op => rule.includes(op));
+        const hasOperator = ['=', ':=', '->', '<-', '<->'].some(op => withoutComments.includes(op));
         const firstWord = tokens[0] ? tokens[0].split(/[^\w]/)[0] : "";
         const startsWithKeyword = keywords.has(firstWord);
         if (!hasOperator && !startsWithKeyword) {
@@ -592,14 +706,69 @@ function validateRuleSyntax(rule) {
 }
 
 function generateRandomTauRule() {
-    // Generate using stream indices beyond the pre-defined rules.
     const RESERVED_MAX_IDX = 4;
-    const outIdx = (RESERVED_MAX_IDX + 1) + Math.floor(Math.random() * 10); // o5..o14
+
+    const randOut = () => (RESERVED_MAX_IDX + 1) + Math.floor(Math.random() * 10); // o5..o14
+    const randIn = () => 1 + Math.floor(Math.random() * 4); // i1..i4
+    const outA = randOut();
+    const outB = randOut();
+    const inA = randIn();
+    const inB = randIn();
+    const inC = randIn();
+    const sh1 = 1 + Math.floor(Math.random() * 7);
+    const sh2 = 1 + Math.floor(Math.random() * 7);
     const bit = Math.floor(Math.random() * 2);
 
-    // Keep this intentionally simple: constant boolean on an unused output stream.
-    const rule = `always (o${outIdx}[t] = { #b${bit} }:bv[1]).`;
-    return rule;
+    const hx = (n) => `{ #x${n.toString(16).padStart(2, '0')} }:bv[16]`;
+
+    const templates = [
+        () => [
+            `# Example 1 - Constant flag output (sanity test)`,
+            `# Writes a stable 0/1 into an unused output stream every step.`,
+            `always (o${outA}[t] = ${hx(bit)}).`
+        ].join('\n'),
+
+        () => [
+            `# Example 2 - Threshold gate (classifier-like)`,
+            `# If i${inA}+i${inB} >= 0x80 then output 1 else 0 (bv[16]).`,
+            `always ( ((i${inA}[t]:bv[16] + i${inB}[t]:bv[16]) >= ${hx(0x80)} && o${outA}[t] = ${hx(1)}) || ((i${inA}[t]:bv[16] + i${inB}[t]:bv[16]) < ${hx(0x80)} && o${outA}[t] = ${hx(0)}) ).`
+        ].join('\n'),
+
+        () => [
+            `# Example 3 - Feature extraction (bit shifts + combine)`,
+            `# Produces an 8-bit feature deterministically from two inputs.`,
+            `always ( o${outA}[t]:bv[16] = (i${inA}[t]:bv[16] >> ${hx(sh1)}) + (i${inB}[t]:bv[16] << ${hx(sh2)}) ).`
+        ].join('\n'),
+
+        () => [
+            `# Example 4 - Temporal check`,
+            `# If i${inA} increased vs previous step, set a flag (bv[16]).`,
+            `always ( ((i${inA}[t]:bv[16] > i${inA}[t-1]:bv[16]) && o${outA}[t] = ${hx(1)}) || ((i${inA}[t]:bv[16] <= i${inA}[t-1]:bv[16]) && o${outA}[t] = ${hx(0)}) ).`
+        ].join('\n'),
+
+        () => [
+            `# Example 5 - Multiple outputs`,
+            `# Two deterministic arithmetic relations in one rule.`,
+            `always ( (o${outA}[t]:bv[16] = i${inA}[t]:bv[16] + i${inB}[t]:bv[16]) && (o${outB}[t]:bv[16] = i${inC}[t]:bv[16] - i${inB}[t]:bv[16]) ).`
+        ].join('\n'),
+
+        () => [
+            `# Example 6 - "Network" style rule with local variables`,
+            `# Computes two hidden gates and outputs:`,
+            `# - o${outA}[t] allow flag (bv[16])`,
+            `# - o${outB}[t] risk-ish score (bv[16])`,
+            `always ( ex s1 ex s2 ex h1 ex h2 (`,
+            `  (s1 = (i${inA}[t]:bv[16] * ${hx(0x03)}) + (i${inB}[t]:bv[16] * ${hx(0x02)}))`,
+            `  && ((s1 >= ${hx(0x80)} && h1 = ${hx(1)}) || (s1 < ${hx(0x80)} && h1 = ${hx(0)}))`,
+            `  && (s2 = (i${inC}[t]:bv[16] * ${hx(0x05)}) + (${hx(0x00)} - i${inA}[t]:bv[16]))`,
+            `  && ((s2 >= ${hx(0x40)} && h2 = ${hx(1)}) || (s2 < ${hx(0x40)} && h2 = ${hx(0)}))`,
+            `  && (o${outB}[t]:bv[16] = (h2:bv[16] * ${hx(0xC8)}) + ((${hx(0x01)} - h1:bv[16]) * ${hx(0x32)}))`,
+            `  && ( (h2 = ${hx(0)} && o${outA}[t] = ${hx(1)}) || (h2 = ${hx(1)} && o${outA}[t] = ${hx(0)}) )`,
+            `) ).`
+        ].join('\n'),
+    ];
+
+    return templates[Math.floor(Math.random() * templates.length)]();
 }
 
 // --- Wallet Management Functions ---

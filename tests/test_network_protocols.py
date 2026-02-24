@@ -397,7 +397,7 @@ async def test_dht_value_validators(two_nodes):
     # New mode: raw Tau/rules snapshot bytes stored under state:<blake3>.
     from poa.state import compute_state_hash
 
-    tau_snapshot = b"always (o5[t] = { #b1 }:bv)."
+    tau_snapshot = b"always (o5[t] = { 1 }:bv)."
     tau_hash = compute_state_hash(tau_snapshot)
     dht.value_store.put(f"state:{tau_hash}".encode(), tau_snapshot)
     with pytest.raises(ValueError):

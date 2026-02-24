@@ -11,7 +11,7 @@ TAU_VALUE_ONE = "1"     # Represents logical true, success, or one.
 
 # --- Failure/Success Codes from Tau ---
 # The new bitvector-based transaction validation returns a single boolean on o1.
-# #b0 for any failure, #b1 for success.
+# 0 for any failure, 1 for success.
 TRANSACTION_VALIDATION_FAIL = TAU_VALUE_ZERO
 TRANSACTION_VALIDATION_SUCCESS = TAU_VALUE_ONE
 
@@ -20,7 +20,7 @@ TRANSACTION_VALIDATION_SUCCESS = TAU_VALUE_ONE
 ACK_RULE_PROCESSED = TAU_VALUE_ONE
 ACK_RULE_PROCESSED_SBF = TAU_VALUE_ONE
 
-# --- Legacy Error Codes (Mapped to Generic Failure #b0) ---
+# --- Legacy Error Codes (Mapped to Generic Failure 0) ---
 FAIL_INSUFFICIENT_FUNDS_SBF = TAU_VALUE_ZERO
 FAIL_SRC_EQ_DEST_SBF = TAU_VALUE_ZERO
 FAIL_ZERO_AMOUNT_SBF = TAU_VALUE_ZERO

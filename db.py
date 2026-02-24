@@ -189,6 +189,33 @@ def count_mempool_txs() -> int:
         row = cur.fetchone()
         return row[0] if row else 0
 
+def get_pending_sequence(sender_pubkey: str) -> Optional[int]:
+    """
+    Returns the highest sequence_number for a given sender currently in the mempool.
+    Returns None if the sender has no pending transactions.
+    """
+    if _db_conn is None:
+        init_db()
+    
+    max_seq = None
+    with _db_lock:
+        cur = _db_conn.cursor()
+        # Only check 'pending' or 'reserved' (not yet mined) transactions
+        cur.execute('SELECT payload FROM mempool')
+        
+        for (payload,) in cur.fetchall():
+            try:
+                data = json.loads(payload)
+                if data.get('sender_pubkey') == sender_pubkey:
+                    seq = data.get('sequence_number')
+                    if seq is not None and isinstance(seq, int):
+                        if max_seq is None or seq > max_seq:
+                            max_seq = seq
+            except Exception:
+                continue
+                
+    return max_seq
+
 def get_mempool_txs() -> list:
     """
     Deprecated: Use reserve_mempool_txs for mining.

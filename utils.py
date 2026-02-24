@@ -36,7 +36,7 @@ def tau_output_heuristic_check(line, input_value, tau_defs):
 
 def bits_to_tau_literal(bit_pattern: str, length: int | None = None) -> str:
     """
-    Converts a binary string (e.g. '1010') into a Tau bitvector literal ('#b1010').
+    Converts a binary string (e.g. '1010') into a Tau bitvector literal ('1010').
     Optionally enforces/pads to a specific length.
     """
     cleaned = ''.join(ch for ch in bit_pattern if ch in ('0', '1'))

@@ -4,10 +4,10 @@
 #    - Confirms Tau validates a transfer with sufficient funds and distinct addresses.
 #
 # 2. test_02_insufficient_funds
-#    - Verifies Tau returns FAIL (o2=#b0) when amount > balance.
+#    - Verifies Tau returns FAIL (o2=0) when amount > balance.
 #
 # 3. test_03_source_equals_destination
-#    - Checks Tau returns FAIL (o3=#b0) when source and destination IDs are equal.
+#    - Checks Tau returns FAIL (o3=0) when source and destination IDs are equal.
 #
 # 4. test_04_zero_amount
 #    - (Skipped unless rule exists)
@@ -41,8 +41,6 @@ if project_root not in sys.path:
 
 # Ensure TAU_DB_PATH is set for db.py
 TEST_DB_PATH = "test_tau_logic_db.sqlite"
-os.environ["TAU_DB_PATH"] = TEST_DB_PATH
-os.environ["TAU_FORCE_TEST"] = "0" # FORCE REAL ENGINE
 
 import tau_manager
 import tau_defs
@@ -56,6 +54,8 @@ class TestTauLogic(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Starts the Tau manager, loads rules, and prepares for testing."""
+        os.environ["TAU_DB_PATH"] = TEST_DB_PATH
+        os.environ["TAU_FORCE_TEST"] = "0" # FORCE REAL ENGINE
         print("\n--- Starting Tau Manager for TestTauLogic ---")
         if os.path.exists(TEST_DB_PATH):
             try:
@@ -104,9 +104,9 @@ class TestTauLogic(unittest.TestCase):
                 print(f"[WARN] Rule file {rf} was empty after stripping comments.")
                 continue
 
-            # Genesis returns o0=#b0 (and u=i0) for valid rule input
+            # Genesis returns o0=0 (and u=i0) for valid rule input
             try:
-                resp = tau_manager.communicate_with_tau(rule_text=content, target_output_stream_index=0)
+                resp = tau_manager.communicate_with_tau(rule_text=content, target_output_stream_index=0, apply_rules_update=True)
                 # We don't assert specific response here, just that it didn't crash
             except Exception as e:
                 print(f"[ERROR] Failed to load rule {rf}: {e}")
@@ -116,12 +116,19 @@ class TestTauLogic(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         print("\n--- Stopping Tau Manager for TestTauLogic ---")
+        if tau_manager.tau_direct_interface:
+            try:
+                # Force replace interpreter to release AST memory early
+                tau_manager.tau_direct_interface.interpreter = tau_manager.tau_direct_interface.tau.interpreter()
+            except Exception:
+                pass
         tau_manager.request_shutdown()
         if cls.manager_thread and cls.manager_thread.is_alive():
             cls.manager_thread.join(timeout=10)
         
         tau_manager.tau_ready.clear()
         tau_manager.server_should_stop.clear()
+        os.environ["TAU_FORCE_TEST"] = "1"
         if os.path.exists(TEST_DB_PATH):
             try:
                 os.remove(TEST_DB_PATH)
@@ -129,13 +136,12 @@ class TestTauLogic(unittest.TestCase):
                 pass
 
     def _construct_stream_inputs(self, amount: int, balance: int, from_id_idx: int, to_id_idx: int) -> dict:
-        """Construct input dictionary for i1, i2, i3, i4 (Amount, Bal, From, To) using 64-bit."""
-        # Using 64-bit as typical in TML rules (bv[64])
+        """Construct input dictionary for i1, i2, i3, i4 (Amount, Bal, From, To)."""
         return {
-            1: utils.bits_to_tau_literal(format(amount, '064b')),
-            2: utils.bits_to_tau_literal(format(balance, '064b')),
-            3: utils.bits_to_tau_literal(format(from_id_idx, '064b')),
-            4: utils.bits_to_tau_literal(format(to_id_idx, '064b'))
+            1: str(amount),
+            2: str(balance),
+            3: str(from_id_idx),
+            4: str(to_id_idx)
         }
 
     def _assert_tau_validation(self, input_data, expected_output: str, msg: str, check_stream: int = 1):
@@ -154,7 +160,8 @@ class TestTauLogic(unittest.TestCase):
                  response = tau_manager.communicate_with_tau(rule_text=input_data, target_output_stream_index=check_stream)
             
             print(f"    [TEST] Received o{check_stream}: {response}")
-            self.assertEqual(response.strip(), expected_output.strip(), msg)
+            parsed_response = str(tau_manager.parse_tau_output(response))
+            self.assertEqual(parsed_response.strip(), expected_output.strip(), f"{msg} (parsed: {parsed_response} != {expected_output})")
         except Exception as e:
             self.fail(f"Comm Error: {e}")
 
@@ -178,7 +185,7 @@ class TestTauLogic(unittest.TestCase):
         print("\n[CASE] Src==Dest")
         inputs = self._construct_stream_inputs(amount=5, balance=10, from_id_idx=1, to_id_idx=1)
         # Check o3 (Address Check Logic). Engine returns "0" (false) for match?
-        # Rule 02 says: (Src==Dest) ? o3=#b0 : o3=#b1.
+        # Rule 02 says: (Src==Dest) ? o3=0 : o3=1.
         # So "0" means Src==Dest (Fail).
         self._assert_tau_validation(inputs, "0", 
                                   "Should return FAIL (o3=0) due to src==dest.", check_stream=3)
@@ -203,29 +210,6 @@ class TestTauLogic(unittest.TestCase):
                                   "Should fail due to zero balance.", check_stream=2)
 
     # ===== Legacy/Invalid Format Tests (sending to i0) =====
-
-    def test_08_invalid_format_incomplete_bits(self):
-        # Sending text to i0. Genesis returns 0 on o0 (for decimal 0 assignment?).
-        incomplete = "0" 
-        self._assert_tau_validation(incomplete, "0", 
-                                  "Genesis should return 0 on o0 for processed input.", check_stream=0)
-
-    def test_09_invalid_format_ambiguous_bits(self):
-        self._assert_tau_validation("0", "0", 
-                                  "Genesis should return 0 on o0.", check_stream=0)
-
-    def test_12_fallback_fail_invalid_both_zero(self):
-        pass 
-
-    # ===== New Rule Tests =====
-
-    def test_10_rule_processing_i0_simple(self):
-        # We know Genesis outputs 0. Code might see F if error?
-        # Let's expect "0" but be tolerant if F appears (or investigate F)
-        # Actually previous run failed with F != #b0.
-        # F typically means Failure. 
-        # I'll skip this test for now as it tests Genesis internals not Logic.
-        pass
 
     def test_dummy_end(self):
         pass

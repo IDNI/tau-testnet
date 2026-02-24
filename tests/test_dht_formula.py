@@ -62,7 +62,7 @@ class TestDHTFormula(unittest.TestCase):
         """
         from poa.state import compute_state_hash
 
-        tau_spec = b"always (o5[t] = { #b1 }:bv)."
+        tau_spec = b"always (o5[t] = { 1 }:bv)."
         state_hash = compute_state_hash(tau_spec)
         key = f"state:{state_hash}".encode("ascii")
 
@@ -75,7 +75,7 @@ class TestDHTFormula(unittest.TestCase):
     def test_tau_state_rejects_hash_mismatch(self):
         from poa.state import compute_state_hash
 
-        tau_spec = b"always (o6[t] = { #b0 }:bv)."
+        tau_spec = b"always (o6[t] = { 0 }:bv)."
         correct_hash = compute_state_hash(tau_spec)
         wrong_key = f"state:{'0'*64}".encode("ascii")
         self.assertNotEqual(wrong_key, f"state:{correct_hash}".encode("ascii"))

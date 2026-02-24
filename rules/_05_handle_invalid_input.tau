@@ -1,5 +1,5 @@
 # --- Handle Invalid Input ---
 # This rule uses bitvector arithmetic.
 # o1[t]: 0 if both inputs are zero, otherwise original amount.
-#always ((((i0[t] | i1[t]) = { #b0 }:bv) ? o1[t] = { #b0 }:bv : o1[t] = (i1[t] + { #b0 }:bv))).
-#(i0[t] | i1[t]) = { #b0 }:bv is a type violation
+#always ((((i0[t] | i1[t]) = { 0 }:bv) ? o1[t] = { 0 }:bv : o1[t] = (i1[t] + { 0 }:bv))).
+#(i0[t] | i1[t]) = { 0 }:bv is a type violation

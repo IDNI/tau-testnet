@@ -81,7 +81,7 @@ def test_preprocess_strips_directives_and_comments_preserves_bv_literals(tmp_pat
     genesis = tmp_path / "genesis_with_comments.tau"
     genesis.write_text(
         "#tau i0 = console.\n"
-        "(i0[t] = 0 ? o0[t] = { #b1 }:bv[16] : o0[t] = { #b0 }:bv[16]). # trailing comment\n"
+        "(i0[t] = 0 ? o0[t] = { 1 }:bv[16] : o0[t] = { 0 }:bv[16]). # trailing comment\n"
     )
 
     iface = tau_native.TauInterface(str(genesis))
@@ -89,8 +89,8 @@ def test_preprocess_strips_directives_and_comments_preserves_bv_literals(tmp_pat
 
     assert "#tau" not in loaded
     assert "trailing comment" not in loaded
-    assert "#b1" in loaded
-    assert "#b0" in loaded
+    assert "1" in loaded
+    assert "0" in loaded
 
 
 def test_preprocess_multiline_conditional_with_comments_keeps_expression(tmp_path, monkeypatch):

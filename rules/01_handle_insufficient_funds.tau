@@ -7,9 +7,9 @@
 # i1[t]: Amount to transfer (bitvector).
 # i2[t]: Sender's balance (bitvector).
 # Streams (Output):
-# o2[t]: Validity flag. #b1 (true) if check passes, #b0 (false) if it fails.
+# o2[t]: Validity flag. 1 (true) if check passes, 0 (false) if it fails.
 #
 # Logic:
-# If amount > balance, the check fails (output #b0).
-# Otherwise, the check passes (output #b1).
-always ((i1[t] : bv > i2[t]) ? o2[t] = { #b0 }:bv : o2[t] = { #b1 }:bv).
+# If amount > balance, the check fails (output 0).
+# Otherwise, the check passes (output 1).
+always ((i1[t] : bv > i2[t]) ? o2[t] = { 0 }:bv : o2[t] = { 1 }:bv).

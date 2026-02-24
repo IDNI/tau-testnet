@@ -55,3 +55,10 @@ def temp_database(tmp_path) -> Iterator[str]:
         db._db_conn.close()
         db._db_conn = None
     config.set_database_path(original_path)
+
+def pytest_sessionfinish(session, exitstatus):
+    """
+    Bypass standard Python exit to avoid native segfaults caused by 
+    upstream tau-lang destructors when tearing down global test state.
+    """
+    os._exit(exitstatus)

@@ -26,9 +26,13 @@ class TestCustomInputs(unittest.TestCase):
         self.mock_tau_ready = self.ready_patcher.start()
         self.mock_tau_ready.is_set.return_value = True
 
+        self.env_patcher = patch.dict('os.environ', {'TAU_FORCE_TEST': '0'})
+        self.env_patcher.start()
+        
         # Ensure we clean up patches
         self.addCleanup(self.comm_patcher.stop)
         self.addCleanup(self.ready_patcher.stop)
+        self.addCleanup(self.env_patcher.stop)
         
         # Patch other dependencies safely
         self.crypto_patcher = patch('commands.sendtx._PY_ECC_AVAILABLE', False)

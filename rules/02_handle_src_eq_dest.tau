@@ -7,9 +7,9 @@
 # i3[t]: Source address (bitvector).
 # i4[t]: Destination address (bitvector).
 # Streams (Output):
-# o3[t]: Validity flag. #b1 (true) if check passes, #b0 (false) if it fails.
+# o3[t]: Validity flag. 1 (true) if check passes, 0 (false) if it fails.
 #
 # Logic:
-# If source == destination, the check fails (output #b0).
-# Otherwise, the check passes (output #b1).
-always (((i3[t] = i4[t]:bv) ? o3[t] = { #b0 }:bv : o3[t] = { #b1 }:bv)).
+# If source == destination, the check fails (output 0).
+# Otherwise, the check passes (output 1).
+always (((i3[t] = i4[t]:bv) ? o3[t] = { 0 }:bv : o3[t] = { 1 }:bv)).

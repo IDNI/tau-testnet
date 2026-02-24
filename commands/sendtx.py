@@ -304,6 +304,12 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
             return f"FAILURE: Invalid signature format or cryptographic error: {e}"
         
         expected_seq = chain_state.get_sequence_number(sender_pubkey)
+        
+        # Adjust expected sequence if the sender has pending transactions in the mempool
+        pending_seq = db.get_pending_sequence(sender_pubkey)
+        if pending_seq is not None and pending_seq >= expected_seq:
+            expected_seq = pending_seq + 1
+
         if sequence_number != expected_seq:
             return f"FAILURE: Invalid sequence number: expected {expected_seq}, got {sequence_number}."
     else:
