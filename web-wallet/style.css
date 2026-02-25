@@ -257,19 +257,16 @@ button:disabled {
 
 /* Tabs Redesign */
 .nav-tabs {
-    border-bottom: none;
-    background: rgba(0, 0, 0, 0.2);
-    border-radius: 8px;
-    padding: 5px;
+    border-bottom: 2px solid var(--border);
     margin-bottom: 20px;
-    display: inline-flex;
 }
 
 .nav-tabs .nav-link {
-    color: var(--text-muted);
+    background-color: transparent !important;
+    color: #C0C9D9 !important;
     border: none;
-    background: transparent;
-    padding: 8px 25px;
+    border-bottom: 2px solid transparent;
+    padding: 10px 20px;
     font-weight: 500;
     transition: all 0.2s;
     border-radius: 6px;
@@ -379,4 +376,70 @@ button:disabled {
     font-size: 0.8rem;
     color: var(--text-muted);
     margin-top: 5px;
+}
+
+/* Mobile Responsiveness */
+@media (max-width: 600px) {
+    body {
+        padding: 15px 10px;
+    }
+
+    header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 10px;
+    }
+
+    header h1 {
+        font-size: 1.5rem;
+    }
+
+    .status {
+        align-self: flex-start;
+        font-size: 0.8rem;
+    }
+
+    .input-group {
+        display: block !important;
+    }
+
+    .input-group label {
+        margin-bottom: 5px;
+        display: inline-block;
+    }
+
+    .input-group input,
+    .input-group select,
+    .input-group .form-control {
+        width: 100% !important;
+        max-width: 100%;
+        margin-bottom: 8px;
+        border-radius: 6px !important;
+        /* Override standard input-group rounding */
+    }
+
+    .input-group .btn {
+        width: 100%;
+        border-radius: 6px !important;
+        margin-left: 0 !important;
+    }
+
+    .wallet-actions {
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    .wallet-actions .btn {
+        width: 100%;
+    }
+
+    .nav-tabs {
+        flex-wrap: wrap;
+        /* Ensure tabs wrap if they get too squished */
+    }
+
+    .nav-link {
+        padding: 8px 10px;
+        font-size: 0.85rem;
+    }
 }

@@ -16,7 +16,7 @@
     <link rel="stylesheet"
         href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/theme/material-ocean.min.css">
 
-    <link rel="stylesheet" href="style.css?v=3">
+    <link rel="stylesheet" href="style.css?v=4">
 
     <!-- Load BLS library -->
     <!-- Import Map for Noble Crypto -->
@@ -42,10 +42,10 @@
             <h2>Connection</h2>
             <div class="input-group">
                 <label for="host">Host:</label>
-                <input type="text" id="host" value="localhost">
+                <input type="text" id="host" value="testnet.tau.net">
             </div>
             <div class="input-group">
-                <label for="port">Port (WS):</label>
+                <label for="port">Port (WS/WSS):</label>
                 <input type="number" id="port" value="65433">
             </div>
             <button id="btn-connect">Connect</button>
@@ -133,7 +133,7 @@
                 <div class="input-group">
                     <input type="text" class="form-control" id="tx-recipient"
                         placeholder="96-char hex (Or select from dropdown ->)">
-                    <button class="btn btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown"
+                    <button class="btn btn-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown"
                         aria-expanded="false" id="btn-refresh-accounts" title="Fetch known accounts from node">
                         &#x21bb; Known
                     </button>

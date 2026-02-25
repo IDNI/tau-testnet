@@ -177,6 +177,9 @@ function init() {
 }
 
 // --- WebSocket Logic ---
+let connectionAttempts = [];
+let connectionIndex = 0;
+
 function toggleConnection() {
     if (isConnected) {
         if (socket) socket.close();
@@ -185,16 +188,39 @@ function toggleConnection() {
 
     const host = hostInput.value;
     const port = portInput.value;
-    const url = `ws://${host}:${port}`;
 
-    log(`Connecting to ${url}...`);
+    // Determine the URLs to attempt
+    if (window.location.protocol === 'https:') {
+        // If served over HTTPS, WS will be blocked by mixed content policy, so only try WSS
+        connectionAttempts = [`wss://${host}:${port}`];
+    } else {
+        // If local/HTTP, try WSS first, then fallback to WS
+        connectionAttempts = [`wss://${host}:${port}`, `ws://${host}:${port}`];
+    }
+
+    connectionIndex = 0;
     btnConnect.disabled = true;
+    statusDiv.textContent = "Connecting...";
+
+    attemptConnection();
+}
+
+function attemptConnection() {
+    if (connectionIndex >= connectionAttempts.length) {
+        log(`All connection attempts failed.`, "error");
+        btnConnect.disabled = false;
+        statusDiv.textContent = "Disconnected";
+        return;
+    }
+
+    const url = connectionAttempts[connectionIndex];
+    log(`Connecting to ${url}...`);
 
     try {
         socket = new WebSocket(url);
 
         socket.onopen = () => {
-            log("WebSocket Open. Sending Handshake...");
+            log(`WebSocket Open on ${url}. Sending Handshake...`);
             // Handshake
             socket.send("hello version=1");
         };
@@ -232,25 +258,40 @@ function toggleConnection() {
         };
 
         socket.onclose = () => {
-            log("Disconnected.");
-            isConnected = false;
-            statusDiv.textContent = "Disconnected";
-            statusDiv.classList.replace("connected", "disconnected");
-            btnConnect.textContent = "Connect";
-            btnConnect.disabled = false;
-            enablePanels(false);
-            connectionInfo.textContent = "";
-            socket = null;
+            if (!isConnected) {
+                log(`Connection to ${url} closed/failed.`);
+                connectionIndex++;
+                attemptConnection();
+            } else {
+                log("Disconnected.");
+                isConnected = false;
+                statusDiv.textContent = "Disconnected";
+                statusDiv.classList.replace("connected", "disconnected");
+                btnConnect.textContent = "Connect";
+                btnConnect.disabled = false;
+                enablePanels(false);
+                connectionInfo.textContent = "";
+                socket = null;
+            }
         };
 
         socket.onerror = (err) => {
-            log("WebSocket Error", "error");
-            console.error(err);
+            if (!isConnected) {
+                log(`WebSocket Error on ${url}`, "warn");
+            } else {
+                log("WebSocket Error", "error");
+                console.error(err);
+            }
         };
 
     } catch (e) {
-        log(`Connection failed: ${e.message}`, "error");
-        btnConnect.disabled = false;
+        log(`Connection failed for ${url}: ${e.message}`, "error");
+        if (!isConnected) {
+            connectionIndex++;
+            attemptConnection();
+        } else {
+            btnConnect.disabled = false;
+        }
     }
 }
 

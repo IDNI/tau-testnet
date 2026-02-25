@@ -62,7 +62,16 @@ def load_tau_module():
             tau = tau_module
             return tau
         except ImportError as e:
+            import glob
+            so_files = glob.glob(os.path.join(found_path, "tau*.so"))
+            
             logger.error(f"Failed to import native tau module from {found_path}: {e}")
+            if so_files:
+                logger.error(f"Found extension modules in directory: {[os.path.basename(f) for f in so_files]}")
+                logger.error(f"Current Python version running server: {sys.version_info.major}.{sys.version_info.minor}")
+                logger.error(f"Current Python executable: {sys.executable}")
+                logger.error("Hint: There may be a Python version mismatch between the compiled module and your runtime. "
+                             "Try activating your virtual environment before running CMake in tau-lang.")
             raise
     else:
         # Fallback: check if it's already in pythonpath
