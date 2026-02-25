@@ -848,6 +848,7 @@ def communicate_with_tau(
                                     _rules_handler(updated_spec)
                                 except Exception as e:
                                     logger.error("Failed to save updated spec: %s", e)
+                                
                         break 
 
                     if line_strip == "":
@@ -943,7 +944,7 @@ def communicate_with_tau(
                     if match:
                         tau_output_line = match.group(1).strip()
                         found_target_output = True
-                        break
+                        continue
 
                 if not found_target_output and time.monotonic() - start_comm_time >= config.COMM_TIMEOUT:
                      if not restart_in_progress.is_set():

@@ -91,7 +91,9 @@ class StdOutCapture:
     bypassing sys.stdout.
     """
     def __init__(self):
-        self._stdout_fd = sys.stdout.fileno()
+        # Always use FD 1 (STDOUT_FILENO) because C++ std::cout writes directly to it
+        # regardless of whether sys.stdout has been redirected by pytest/CaptureIO.
+        self._stdout_fd = 1
         self._saved_stdout_fd = os.dup(self._stdout_fd)
         self._r, self._w = os.pipe()
         self.output = ""
