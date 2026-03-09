@@ -338,13 +338,12 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
     for key, value in operations.items():
         if key.isdigit():
             idx = int(key)
-            # Reserved streams: 0=Rules, 1=Transfers (logic), 2=Balance, 3=From, 4=To
-            # We handle 0 and 1 explicitly above/below.
-            # But keys 2, 3, 4 provided by the user must be rejected to prevent conflict.
+            # Reserved streams are handled exclusively by the node logic
+            # (0=Rules, 1=Transfers logic, 2=Balance, 3=From, 4=To, 5=Consensus Clock)
             if idx in (0, 1):
                 continue
-            if idx in (2, 3, 4):
-                 return f"FAILURE: Invalid operation key '{key}'. Stream {idx} is reserved (0-4)."
+            if idx in tau_defs.RESERVED_STREAMS:
+                 return f"FAILURE: Invalid operation key '{key}'. Stream {idx} is reserved for system consensus."
             
             # Normalize value to list of strings
             normalized_val = []

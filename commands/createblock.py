@@ -16,6 +16,7 @@ from poa.state import compute_state_hash
 
 import tau_manager
 from tau_manager import parse_tau_output
+import tau_defs
 import logging
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ def import_hashlib():
     import hashlib
     return hashlib
 
-def execute_batch(transactions: List[Dict], tx_ids: List[int]):
+def execute_batch(transactions: List[Dict], tx_ids: List[int], block_timestamp: int):
     """
     Executes a batch of transactions against a SNAPSHOT of the chain state.
     Returns (final_txs, final_reserved_ids, final_rules, final_balances, final_sequences)
@@ -121,7 +122,7 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
             continue
             
         # B. Expiry
-        if tx.get('expiration_time') and int(tx.get('expiration_time', 0)) < int(time.time()):
+        if tx.get('expiration_time') and int(tx.get('expiration_time', 0)) < block_timestamp:
             print(f"[WARN][miner] TX {i} rejected: Expired")
             continue
             
@@ -140,6 +141,15 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
         ops = tx.get('operations', {})
         rule_op = ops.get("0")
         transfer_op = ops.get("1")
+        
+        # Extract custom inputs (keys >= 5, excluding reserved streams)
+        custom_tau_inputs = {}
+        for k, v in ops.items():
+            if k.isdigit():
+                idx = int(k)
+                if idx >= 5 and idx not in tau_defs.RESERVED_STREAMS:
+                    # Normalize scalar or list
+                    custom_tau_inputs[idx] = [str(x) for x in v] if isinstance(v, list) else [str(v)]
         
         # D. Rule Injection
         if rule_op:
@@ -232,10 +242,15 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
                      
                      tau_input_stream_values = {
                         1: str(amt),
-                        2: str(remaining), 
+                        2: str(remaining),
                         3: str(s_id),
                         4: str(r_id),
                      }
+                     # Inject custom inputs and i5 (Consensus Block Time)
+                     for k, v in custom_tau_inputs.items():
+                         tau_input_stream_values[k] = v
+                     tau_input_stream_values[5] = str(block_timestamp)
+
                      # Communicate with Tau stream 1 (validator)
                      tau_output_transfer = tau_manager.communicate_with_tau(
                         target_output_stream_index=1,
@@ -252,8 +267,8 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
                          tx_success = False; break
                      
                 except Exception as e:
-                     logger.warning("TX %s rejected: Tau validation error: %s", i, e)
-                     tx_success = False; break
+                    logger.warning("TX %s rejected: Tau validation error: %s", i, e)
+                    tx_success = False; break
 
                 # Track deduction
                 pending_balance_deductions[f_addr] = deducted + amt
@@ -261,6 +276,26 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int]):
                 # Validated! Add to pending list for commit
                 pending_transfers_list.append((f_addr, t_addr, amt))
 
+        # F. Unified Custom Execution (if NO transfers but we have custom ops or just want to tick time)
+        if tx_success and not transfer_op and (custom_tau_inputs or rule_op or True):
+            # If no transfers exist, we evaluate custom ops + i5 on o0
+            try:
+                 unified_inputs = {}
+                 for k, v in custom_tau_inputs.items():
+                     unified_inputs[k] = v
+                 unified_inputs[5] = str(block_timestamp)
+                 
+                 res_eval = tau_manager.communicate_with_tau(
+                     target_output_stream_index=0,
+                     input_stream_values=unified_inputs,
+                     apply_rules_update=False
+                 )
+                 if "error" in res_eval.lower():
+                     print(f"[WARN][miner] TX {i} rejected: Custom logic evaluation error: {res_eval}")
+                     tx_success = False
+            except Exception as e:
+                 logger.warning("TX %s rejected: Custom logic exception: %s", i, e)
+                 tx_success = False
         if tx_success:
             # Apply changes to temp state (Commit)
 
@@ -366,8 +401,9 @@ def create_block_from_mempool() -> Dict:
     
     print(f"[INFO][createblock] Validating and Executing Batch...")
     # Use filtered IDs so index matches
+    block_timestamp = int(time.time())
     try:
-        final_txs, final_reserved_ids, final_rules, final_balances, final_sequences = execute_batch(transactions, filtered_reserved_ids)
+        final_txs, final_reserved_ids, final_rules, final_balances, final_sequences = execute_batch(transactions, filtered_reserved_ids, block_timestamp)
     except Exception as e:
         print(f"[ERROR][createblock] Block creation failed during batch execution: {e}")
         # Liveness Fix - Unreserve so they can be retried immediately
@@ -419,6 +455,7 @@ def create_block_from_mempool() -> Dict:
         state_hash=state_hash,
         state_locator=state_locator,
         signing_key_hex=config.MINER_PRIVKEY,
+        timestamp=block_timestamp
     )
     
     print(f"[INFO][createblock] Block created successfully!")

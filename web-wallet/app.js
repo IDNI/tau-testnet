@@ -22,9 +22,17 @@ const connectionInfo = document.getElementById('connection-info');
 
 const panels = {
     wallet: document.getElementById('wallet-panel'),
+    addressBook: document.getElementById('address-book-panel'),
     info: document.getElementById('info-panel'),
     tx: document.getElementById('tx-panel')
 };
+
+// Address Book DOM
+const contactNameInput = document.getElementById('contact-name');
+const contactPubkeyInput = document.getElementById('contact-pubkey');
+const btnSaveContact = document.getElementById('btn-save-contact');
+const contactsListDiv = document.getElementById('contacts-list');
+let addressBook = {}; // name -> pubkey hex
 
 const btnGenerate = document.getElementById('btn-generate');
 const btnImport = document.getElementById('btn-import');
@@ -72,6 +80,39 @@ const tabContents = document.querySelectorAll('.tab-content');
 let ruleEditor = null;
 let customEditor = null;
 
+// --- Custom Confirm Modal ---
+let confirmModalInstance = null;
+let confirmPromiseResolve = null;
+
+function customConfirm(message) {
+    if (!confirmModalInstance) {
+        const el = document.getElementById('confirmModal');
+        if (el) {
+            confirmModalInstance = new bootstrap.Modal(el);
+            document.getElementById('btn-confirm-action').addEventListener('click', () => {
+                if (confirmPromiseResolve) confirmPromiseResolve(true);
+                confirmPromiseResolve = null;
+                confirmModalInstance.hide();
+            });
+            el.addEventListener('hidden.bs.modal', () => {
+                if (confirmPromiseResolve) {
+                    confirmPromiseResolve(false);
+                    confirmPromiseResolve = null;
+                }
+            });
+        } else {
+            // Fallback
+            return Promise.resolve(window.confirm(message));
+        }
+    }
+
+    return new Promise(resolve => {
+        document.getElementById('confirmModalBody').textContent = message;
+        confirmPromiseResolve = resolve;
+        confirmModalInstance.show();
+    });
+}
+
 // --- Initialization ---
 function init() {
     log("Web Wallet initialized.");
@@ -115,10 +156,14 @@ function init() {
         // walletDisplay.style.display = 'none'; // Keep display visible if we have one
     });
     btnConfirmImport.addEventListener('click', importKey);
-    btnRevealSk.addEventListener('click', () => {
+    btnRevealSk.addEventListener('click', async (e) => {
+        e.preventDefault();
         if (privKeyInput.type === 'password') {
-            privKeyInput.type = 'text';
-            btnRevealSk.textContent = 'Hide';
+            const confirmed = await customConfirm("Warning: Anyone with access to your screen can see your private key. Are you sure you want to reveal it?");
+            if (confirmed) {
+                privKeyInput.type = 'text';
+                btnRevealSk.textContent = 'Hide';
+            }
         } else {
             privKeyInput.type = 'password';
             btnRevealSk.textContent = 'Reveal';
@@ -165,12 +210,14 @@ function init() {
         validateRuleSyntax(rule);
     });
 
-    // Wallet Mangement Listeners
+    // Wallet and Address Book Management Listeners
     loadSavedWallets();
+    loadAddressBook();
     walletSelect.addEventListener('change', onWalletSelect);
     btnShowSave.addEventListener('click', () => saveWalletArea.style.display = 'block');
     btnSaveWallet.addEventListener('click', saveCurrentWallet);
     btnDeleteWallet.addEventListener('click', deleteSelectedWallet);
+    btnSaveContact.addEventListener('click', saveContact);
 
     // Tabs
     // Tabs - Handled by Bootstrap data-bs-toggle attributes
@@ -359,31 +406,62 @@ function refreshKnownAccounts() {
     sendRpc("getallaccounts");
 }
 
-function updateKnownAccounts(accounts) {
+let lastKnownServerAccounts = [];
+
+function updateKnownAccounts(accounts = null) {
+    if (accounts !== null) lastKnownServerAccounts = accounts;
+
     const listEl = document.getElementById('known-accounts-menu');
     if (!listEl) {
         log("Error: could not find known accounts menu element.", "error");
         return;
     }
 
-    listEl.innerHTML = '<li><h6 class="dropdown-header">Known Accounts (Refresh to fetch)</h6></li>'; // Clear
-    if (!accounts || !Array.isArray(accounts)) return;
+    listEl.innerHTML = '<li><h6 class="dropdown-header">Contacts & Known Accounts</h6></li>'; // Clear
 
-    accounts.forEach(acc => {
+    // 1. Add Contacts from Address Book 
+    const contactKeys = Object.keys(addressBook).sort();
+    if (contactKeys.length > 0) {
+        contactKeys.forEach(name => {
+            const pubkey = addressBook[name];
+            const li = document.createElement('li');
+            const a = document.createElement('a');
+            a.className = 'dropdown-item';
+            a.style.fontFamily = 'monospace';
+            a.href = '#';
+            a.textContent = `👤 ${name} (${pubkey.substring(0, 12)}...)`;
+            a.title = pubkey;
+            a.addEventListener('click', (e) => {
+                e.preventDefault();
+                txRecipient.value = pubkey;
+            });
+            li.appendChild(a);
+            listEl.appendChild(li);
+        });
+
+        listEl.appendChild(document.createElement('li')).innerHTML = '<hr class="dropdown-divider">';
+    }
+
+    if (!Array.isArray(lastKnownServerAccounts) || lastKnownServerAccounts.length === 0) return;
+
+    lastKnownServerAccounts.forEach(acc => {
+        // Skip adding it again if it's already in the users address book (exact match)
+        if (Object.values(addressBook).includes(acc)) return;
+
         const li = document.createElement('li');
         const a = document.createElement('a');
         a.className = 'dropdown-item';
         a.style.fontFamily = 'monospace';
         a.href = '#';
-        a.textContent = acc;
+        a.textContent = `🌐 ${acc}`;
         a.addEventListener('click', (e) => {
             e.preventDefault();
             txRecipient.value = acc;
         });
         li.appendChild(a);
-        listEl.appendChild(li);
+        listEl.appendChild(a);
     });
-    log(`Refreshed ${accounts.length} known accounts.`);
+    log(`Refreshed ${lastKnownServerAccounts.length} known accounts.`);
 }
 
 // Expose for debugging
@@ -438,6 +516,9 @@ function setWallet(privKey, pubKey) {
     pubKeyInput.value = bytesToHex(pubBytes);
 
     walletDisplay.style.display = 'block';
+
+    // Reset pending sequence when switching wallets
+    pendingSequence = null;
 
     if (isConnected) refreshInfo();
 }
@@ -564,8 +645,8 @@ async function onSendTransaction() {
                 log(`Custom key must be an integer: "${keyStr}"`, "error");
                 return;
             }
-            if (kInt < 5) {
-                log(`Custom key must be >= 5 (reserved): "${keyStr}"`, "error");
+            if (kInt < 4) {
+                log(`Custom key must be >= 4 (reserved): "${keyStr}"`, "error");
                 return;
             }
             ops[keyStr] = valStr;
@@ -577,6 +658,38 @@ async function onSendTransaction() {
         return;
     }
 
+    // --- Build Confirmation Summary ---
+    let summaryText = `Please confirm your transaction:\n\n`;
+
+    if (shouldSendTransfer) {
+        // Try to find recipient name from address book if saved
+        const recName = Object.keys(addressBook).find(name => addressBook[name] === recipient);
+        summaryText += `🔹 Transfer:\n  Amount: ${amountVal}\n  To: ${recName ? `${recName} (${recipient.substring(0, 16)}...)` : recipient.substring(0, 24) + '...'}\n\n`;
+    }
+
+    if (ruleInputPreCheck) {
+        summaryText += `📜 Rule attached:\n  ${ops["0"]}\n\n`;
+    }
+
+    if (customInput) {
+        let count = 0;
+        let customOpsText = '';
+        for (const [k, v] of Object.entries(ops)) {
+            // Skip rule (0) and transfer ops (1-4 if transfer is sent)
+            if (k === "0") continue;
+            if (shouldSendTransfer && ["1", "2", "3", "4"].includes(k)) continue;
+            count++;
+            customOpsText += `  ${k}: ${v}\n`;
+        }
+        summaryText += `⚙️ Custom Operations: ${count} defined.\n${customOpsText}\n`;
+    }
+
+    summaryText += `Sign and send this to the network?`;
+
+    if (!await customConfirm(summaryText)) {
+        log("Transaction cancelled by user.", "warn");
+        return;
+    }
 
     // Payload for signing
     const payload = {
@@ -747,9 +860,9 @@ function validateRuleSyntax(rule) {
 }
 
 function generateRandomTauRule() {
-    const RESERVED_MAX_IDX = 4;
+    const RESERVED_MAX_IDX = 5;
 
-    const randOut = () => (RESERVED_MAX_IDX + 1) + Math.floor(Math.random() * 10); // o5..o14
+    const randOut = () => (RESERVED_MAX_IDX + 1) + Math.floor(Math.random() * 10); // o6..o15
     const randIn = () => 1 + Math.floor(Math.random() * 4); // i1..i4
     const outA = randOut();
     const outB = randOut();
@@ -863,7 +976,7 @@ function onWalletSelect() {
     }
 }
 
-function saveCurrentWallet() {
+async function saveCurrentWallet() {
     if (!currentKeyPair) {
         log("No wallet to save.", "error");
         return;
@@ -874,13 +987,21 @@ function saveCurrentWallet() {
         return;
     }
 
-    if (savedWallets[name] && !confirm(`Overwrite wallet "${name}"?`)) {
-        return;
+    if (savedWallets[name]) {
+        if (!await customConfirm(`Overwrite wallet "${name}"?`)) return;
+    }
+
+    const pubhex = bytesToHex(currentKeyPair.pub);
+    const existingName = Object.keys(savedWallets).find(k => savedWallets[k].pub === pubhex && k !== name);
+    if (existingName) {
+        if (!await customConfirm(`Warning: This wallet is already saved as "${existingName}". Save it again as "${name}"?`)) {
+            return;
+        }
     }
 
     savedWallets[name] = {
         priv: bytesToHex(currentKeyPair.priv),
-        pub: bytesToHex(currentKeyPair.pub)
+        pub: pubhex
     };
 
     localStorage.setItem('tau_saved_wallets', JSON.stringify(savedWallets));
@@ -894,11 +1015,11 @@ function saveCurrentWallet() {
     log(`Wallet "${name}" saved.`);
 }
 
-function deleteSelectedWallet() {
+async function deleteSelectedWallet() {
     const name = walletSelect.value;
     if (!name || !savedWallets[name]) return;
 
-    if (confirm(`Delete wallet "${name}"?`)) {
+    if (await customConfirm(`Delete wallet "${name}"?`)) {
         delete savedWallets[name];
         localStorage.setItem('tau_saved_wallets', JSON.stringify(savedWallets));
         updateWalletList();
@@ -906,6 +1027,123 @@ function deleteSelectedWallet() {
         btnDeleteWallet.disabled = true;
         log(`Wallet "${name}" deleted.`);
     }
+}
+
+// --- Address Book Functions ---
+
+function loadAddressBook() {
+    try {
+        const stored = localStorage.getItem('tau_address_book');
+        if (stored) {
+            addressBook = JSON.parse(stored);
+        }
+    } catch (e) {
+        console.error("Failed to load address book", e);
+    }
+    renderAddressBook();
+}
+
+async function saveContact() {
+    const name = contactNameInput.value.trim();
+    const pubkey = contactPubkeyInput.value.trim();
+
+    if (!name || !pubkey) {
+        log("Contact name and public key are required.", "error");
+        return;
+    }
+
+    // Quick hex validation
+    if (!/^[0-9a-fA-F]+$/.test(pubkey) || pubkey.length < 64) {
+        log("Public key must be a valid hex string of at least 64 chars.", "error");
+        return;
+    }
+
+    if (addressBook[name]) {
+        if (!await customConfirm(`Overwrite contact "${name}"?`)) return;
+    }
+
+    // Check for duplicate pubkey under a different name
+    const existingName = Object.keys(addressBook).find(k => addressBook[k] === pubkey && k !== name);
+    if (existingName) {
+        if (!await customConfirm(`Warning: This public key is already saved as "${existingName}". Save it again as "${name}"?`)) {
+            return;
+        }
+    }
+
+    addressBook[name] = pubkey;
+    localStorage.setItem('tau_address_book', JSON.stringify(addressBook));
+
+    contactNameInput.value = "";
+    contactPubkeyInput.value = "";
+    log(`Contact "${name}" saved.`);
+
+    renderAddressBook();
+}
+
+async function deleteContact(name) {
+    if (await customConfirm(`Delete contact "${name}"?`)) {
+        delete addressBook[name];
+        localStorage.setItem('tau_address_book', JSON.stringify(addressBook));
+        log(`Contact "${name}" deleted.`);
+        renderAddressBook();
+    }
+}
+
+function renderAddressBook() {
+    contactsListDiv.innerHTML = '';
+    const keys = Object.keys(addressBook);
+
+    if (keys.length === 0) {
+        contactsListDiv.innerHTML = '<p style="color: #aaa; margin: 0; font-style: italic;">No contacts saved.</p>';
+        return;
+    }
+
+    keys.sort().forEach(name => {
+        const pubkey = addressBook[name];
+
+        const item = document.createElement('div');
+        item.style.display = 'flex';
+        item.style.justifyContent = 'space-between';
+        item.style.alignItems = 'center';
+        item.style.borderBottom = '1px solid #444';
+        item.style.padding = '8px 4px';
+
+        const info = document.createElement('div');
+        info.style.overflow = 'hidden';
+        info.style.textOverflow = 'ellipsis';
+        info.style.whiteSpace = 'nowrap';
+        info.style.marginRight = '10px';
+        info.innerHTML = `<strong>${name}</strong> <span style="color:#888; font-size: 0.85em; margin-left:10px;" title="${pubkey}">${pubkey.substring(0, 16)}...</span>`;
+
+        const actions = document.createElement('div');
+
+        const btnFill = document.createElement('button');
+        btnFill.className = 'btn-sm btn-outline-primary';
+        btnFill.style.marginRight = '5px';
+        btnFill.textContent = 'Use';
+        btnFill.title = 'Fill in Recipient field';
+        btnFill.onclick = () => {
+            txRecipient.value = pubkey;
+            // Scroll to TX panel assuming they want to send now
+            document.getElementById('tx-panel').scrollIntoView({ behavior: 'smooth' });
+            log(`Recipient set to ${name}.`);
+        };
+
+        const btnDel = document.createElement('button');
+        btnDel.className = 'btn-sm danger-btn';
+        btnDel.textContent = 'Del';
+        btnDel.onclick = () => deleteContact(name);
+
+        actions.appendChild(btnFill);
+        actions.appendChild(btnDel);
+
+        item.appendChild(info);
+        item.appendChild(actions);
+        contactsListDiv.appendChild(item);
+    });
+
+    // Update the dropdown any time the address book is re-rendered
+    updateKnownAccounts();
 }
 
 // --- Utils ---
@@ -925,3 +1163,230 @@ function log(msg, type = 'info') {
 }
 
 init();
+
+// --- Rule Templates ---
+const ruleTemplates = {
+    "Block all transfers": `# ---------------------------------------------------------
+# BLOCK ALL TRANSFERS FROM MY ACCOUNT
+# ---------------------------------------------------------
+# This rule unconditionally blocks all outgoing transfers from 
+# your specific account. Because Tau rules become part of the 
+# global state, we must scope this rule strictly to your own 
+# public key (i3) so we don't accidentally block the entire network!
+#
+# i3[t] : The sender's public key (represented as a 384-bit vector)
+# o5[t] : Output signal (0 = block, 1 = allow)
+# ---------------------------------------------------------
+# Replace '#x1111...1111' with your own 96-character public key hex.
+always (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] -> o5[t] = {0}:bv[16]).`,
+
+    "Limit transfers to max 5000": `# ---------------------------------------------------------
+# LIMIT TRANSFERS FROM MY ACCOUNT TO MAX 5000
+# ---------------------------------------------------------
+# This rule ensures that any outgoing transfer from this account
+# cannot exceed a maximum value of 5000. It is scoped to your
+# public key, so it only restricts your own transactions globally.
+#
+# i1[t] : The amount being transferred in the current transaction.
+# i3[t] : The sender's public key (represented as a 384-bit vector)
+# o5[t] : Output signal (0 = block if limit exceeded)
+# ---------------------------------------------------------
+# Replace '#x1111...1111' with your own 96-character public key hex.
+always ((i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && i1[t] > {5000}:bv[64]) -> o5[t] = {0}:bv[16]).`,
+
+    "Only allow transfers to a specific address": `# ---------------------------------------------------------
+# WHITELIST SPECIFIC RECIPIENT FOR MY ACCOUNT
+# ---------------------------------------------------------
+# This rule restricts outgoing transfers from your account so they 
+# can only be sent to one specific, verified address. Any attempt 
+# to send funds to a different address will be blocked.
+#
+# i3[t] : The sender's public key
+# i4[t] : The recipient's public key
+# o5[t] : Output signal (0 = block, 1 = allow)
+# ---------------------------------------------------------
+# Replace the placeholders with your public key and the allowed recipient's key.
+always ((i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && !(i4[t] = {#x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222}:bv[384])) ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]).`,
+
+    "Require a specific custom input": `# ---------------------------------------------------------
+# REQUIRE TWO-FACTOR / CUSTOM DATA
+# ---------------------------------------------------------
+# This rule requires a specific custom data payload to be attached 
+# to any transaction originating from your account. This acts like 
+# a secret password that must be present.
+#
+# i3[t] : The sender's public key
+# i6[t] : The custom input data provided in the transaction
+#         (In this example, we expect #x4142 which is 'AB')
+# o5[t] : Output signal (0 = block, 1 = allow)
+# ---------------------------------------------------------
+always ((i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && !(i6[t] = {#x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004142}:bv[384])) ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]).`,
+
+    "Time-locked (Block transfers before time X)": `# ---------------------------------------------------------
+# TIME-LOCKED WALLET
+# ---------------------------------------------------------
+# This rule creates a time-lock, preventing any funds from being
+# transferred out of your wallet until a specific block timestamp
+# has been reached in the future.
+#
+# i3[t] : The sender's public key
+# i5[t] : The current block timestamp (Unix epoch format, injected as integer)
+# o5[t] : Output signal (0 = block, 1 = allow)
+# ---------------------------------------------------------
+# Note: 1700000000 is an example Unix timestamp.
+always ((i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && i5[t] < {1700000000}:bv[64]) ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]).`,
+
+    "Time-Decaying Multi-Signature Vault": `# ---------------------------------------------------------
+# TIME-DECAYING MULTI-SIGNATURE VAULT
+# ---------------------------------------------------------
+# This sophisticated contract requires a Co-Signer to approve
+# transactions, but ONLY before a specific expiration timestamp.
+# After the timestamp passes, the primary wallet owner regains
+# full independent control of the funds.
+#
+# Useful for temporal escrows, trust funds, or security setups
+# where you want backup control to expire after a certain date.
+#
+# i3[t] : The primary sender's public key (The Vault)
+# i5[t] : The current block timestamp (injected as integer)
+# i6[t] : Custom input payload containing the Co-Signer's public key
+# o5[t] : Output signal (0 = block, 1 = allow)
+# ---------------------------------------------------------
+always (
+  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] 
+   && i5[t] < {1800000000}:bv[64] 
+   && !(i6[t] = {#x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222}:bv[384])) 
+  ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
+).`,
+
+    "Temporary Spending Limit": `# ---------------------------------------------------------
+# TEMPORARY SPENDING LIMIT STRATEGY
+# ---------------------------------------------------------
+# This rule enforces different transfer ceilings based on the
+# current time. Before the designated timestamp, the account
+# has a high spending limit (e.g., 5,000). After the timestamp 
+# expires, the spending limit permanently drops to a lower
+# threshold (e.g., 500).
+#
+# i1[t] : The amount being transferred
+# i3[t] : The sender's public key
+# i5[t] : The current block timestamp (injected as integer)
+# o5[t] : Output signal (0 = block transaction, 1 = allow)
+# ---------------------------------------------------------
+always (
+  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]) ->
+  (
+    # Phase 1: High Limit before Timestamp (1800000000)
+    (i5[t] < {1800000000}:bv[64] && i1[t] > {5000}:bv[64] ? o5[t] = {0}:bv[16] : 
+      # Phase 2: Low Limit after Timestamp (1800000000)
+      (!(i5[t] < {1800000000}:bv[64]) && i1[t] > {500}:bv[64] ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]))
+  )
+).`,
+
+    "Escrow Contract": `# ---------------------------------------------------------
+# ESCROW CONTRACT (3rd PARTY ARBITER)
+# ---------------------------------------------------------
+# This rule implements an Escrow mechanism on a specific account. 
+# Funds from the Escrow Account remain locked (o5 = 0) unless a 
+# designated 3rd-party Arbiter approves the release.
+#
+# Input Streams:
+# i3[t] : Sender address of the transaction. We use this to scope the
+#         rule globally so it ONLY affects the Escrow Account.
+# i6[t] : Custom input payload containing the Arbiter's approval signal.
+#         (In this example, the Arbiter must provide {#x01}:bv[8] to release)
+#
+# Output Stream:
+# o5[t] : Output signal (0 = Keep funds locked, 1 = Release).
+# ---------------------------------------------------------
+# Replace '#x1111...1111' with the Escrow's public key (96-char hex).
+always (
+  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && !(i6[t] = {1}:bv[64])) 
+  ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
+).`,
+
+    "2FA for High Value Transfers": `# ---------------------------------------------------------
+# 2FA FOR HIGH VALUE TRANSFERS (Bank Security Model)
+# ---------------------------------------------------------
+# This rule mimics a real-world bank account security feature.
+# It is extremely clear to non-technical users:
+# 
+# Small, everyday transfers (up to 1,000 coins) process normally.
+# However, any transfer strictly greater than 1,000 coins REQUIRES
+# a 2-Factor Authentication (2FA) token to be included in the
+# transaction's Custom Operations.
+#
+# NOTE ON SECURITY: In a production environment, this constant 
+# would be a cryptographic hash (e.g., SHA-256), and the user
+# would provide the pre-image. For this readable community demo, 
+# we use a simple numeric token '9999'.
+#
+# i1[t] : The amount being transferred in the transaction.
+# i3[t] : The sender's public key (384-bit BLS signature).
+# i6[t] : The 2FA token provided in Custom operations. 
+# o5[t] : Output signal (0 = blocks the transaction, 1 = allows).
+# ---------------------------------------------------------
+# Replace '#x11111111...1111' with your 96-character public key hex.
+always (
+  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] 
+   && i1[t] > {1000}:bv[64] 
+   && !(i6[t] = {9999}:bv[64])) 
+  ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
+).`,
+
+    "Multi-Signature Smart Vault": `# ---------------------------------------------------------
+# MULTI-SIGNATURE SMART VAULT
+# ---------------------------------------------------------
+# This contract uses mathematical logic and bitvector 
+# arithmetic to manage fund security without relying on hidden states.
+#
+# STREAMS:
+# i1[t]   : Current transfer amount
+# i3[t]   : Primary sender's public key (The Vault)
+# i4[t]   : Secondary/Co-signer public key (Authenticated by network)
+# o5[t]   : Output signal (0 = block transaction, 1 = allow)
+# ---------------------------------------------------------
+
+always (
+  # SCOPE: This rule only triggers when the Vault is the sender.
+  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]) 
+  -> 
+  (
+    # 1. MULTI-SIGNATURE FOR LARGE TRANSFERS
+    # If the amount is > 1000, the specified Co-Signer public key MUST be present in Custom operation '4'.
+    ( (i1[t] > {1000}:bv[64] && !(i4[t] = {#x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222}:bv[384])) 
+      ? o5[t] = {0}:bv[16] :
+      
+      # 2. ABSOLUTE CEILING
+      # Even with a co-signer, no single normal transfer can exceed 10,000.
+      ( (i1[t] > {10000}:bv[64]) ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16] )
+    )
+).`
+};
+
+function initRuleTemplates() {
+    const menu = document.getElementById('rule-templates-menu');
+    if (!menu) return;
+
+    for (const [name, ruleText] of Object.entries(ruleTemplates)) {
+        const li = document.createElement('li');
+        const a = document.createElement('a');
+        a.className = 'dropdown-item';
+        a.href = '#';
+        a.textContent = name;
+        a.addEventListener('click', (e) => {
+            e.preventDefault();
+            if (ruleEditor) {
+                ruleEditor.setValue(ruleText);
+            } else if (txRule) {
+                txRule.value = ruleText;
+            }
+            log(`Loaded template: ${name}`);
+        });
+        li.appendChild(a);
+        menu.appendChild(li);
+    }
+}
+
+// Call this function when the window loads
+window.addEventListener('load', initRuleTemplates);

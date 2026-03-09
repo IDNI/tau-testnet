@@ -29,7 +29,7 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
 
         block = SimpleNamespace(
             block_hash="b" * 64,
-            header=SimpleNamespace(block_number=1, state_hash=expected_state_hash),
+            header=SimpleNamespace(block_number=1, state_hash=expected_state_hash, timestamp=1700000000),
             transactions=[{"tx_id": "tx-1", "operations": {}}],
             tx_ids=["tx-1"],
         )
@@ -57,7 +57,7 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
             def verify_block(self, _block):
                 return True
 
-            def apply(self, _snapshot, transactions):
+            def apply(self, _snapshot, transactions, block_timestamp=None):
                 with chain_state._balance_lock, chain_state._sequence_lock:
                     chain_state._balances.clear()
                     chain_state._balances.update(target_balances)

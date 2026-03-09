@@ -74,14 +74,18 @@ class TestPoATauEngine(unittest.TestCase):
             ]
             
             # Apply
-            result = self.engine.apply(self.snapshot, txs)
+            result = self.engine.apply(self.snapshot, txs, 1700000000)
             
             # Verify
             self.assertEqual(len(result.accepted_transactions), 1)
             self.assertEqual(len(result.rejected_transactions), 0)
             
             # Check calls
-            mock_tau_manager.communicate_with_tau.assert_called_with(rule_text="rule1", target_output_stream_index=0, apply_rules_update=True)
+            mock_tau_manager.communicate_with_tau.assert_any_call(
+                rule_text="rule1",
+                target_output_stream_index=0,
+                apply_rules_update=True,
+            )
             mock_chain_state.update_balances_after_transfer.assert_called_with("sender1", "receiver1", 100)
             mock_chain_state.increment_sequence_number.assert_called_with("sender1")
             
@@ -110,7 +114,7 @@ class TestPoATauEngine(unittest.TestCase):
                 }
             ]
             
-            result = self.engine.apply(self.snapshot, txs)
+            result = self.engine.apply(self.snapshot, txs, 1700000000)
             
             self.assertEqual(len(result.accepted_transactions), 1)
             self.assertEqual(len(result.rejected_transactions), 0)

@@ -526,7 +526,7 @@ def _process_new_block_internal(block: Block) -> bool:
                 tau_bytes=current_rules_bytes,
                 metadata={"source": "fallback-replay"},
             )
-            replay_result = engine.apply(replay_snapshot, block.transactions)
+            replay_result = engine.apply(replay_snapshot, block.transactions, block.header.timestamp)
             rules_from_dht = replay_result.snapshot.tau_bytes.decode("utf-8")
             save_rules_state(rules_from_dht)
 
@@ -733,7 +733,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0):
             )
             
             # Apply transactions
-            result = engine.apply(snapshot, block.transactions)
+            result = engine.apply(snapshot, block.transactions, block.header.timestamp)
             
             # Update rules state from result
             # The engine accumulates bytes in snapshot.tau_bytes

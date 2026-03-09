@@ -43,13 +43,22 @@ TAU_OUTPUT_PROMPT_RE = re.compile(r"^o(\d+)\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*
 TAU_ANY_PROMPT_RE = re.compile(r"^(?:i|o)\d+\[[^\]]*\]\s*(?::[^\s]+)?\s*(:=|=)\s*$")
 
 # --- Rule sanitation -----------------------------------------------------------
-# Normalize all bitvector annotations to a default width (64-bit) before sending
-# rules to Tau (e.g. :bv, :bv[1], :bv[16], :bv[128] -> :bv[64]).
+# Normalize bitvector annotations to a default width before sending rules to Tau
+# (e.g. :bv, :bv[1], :bv[16], :bv[128] -> :bv[16]).
+#
+# Exception: Preserve 384-bit address literals of the form
+#   {#x<96-hex>}:bv[384]
+# so wallet/public-key comparisons keep the correct width.
 #
 # We intentionally scope this to type annotations (":bv") rather than replacing
 # every "bv" substring in the rule text.
 DEFAULT_RULE_BV_WIDTH = 16
+# Match :bv and :bv[<n>]
 _BV_TYPE_RE = re.compile(r":\s*bv(?:\s*\[\s*\d+\s*\])?")
+# Match a 384-bit address literal (BLS pubkey hex = 96 hex chars => 384 bits)
+_ADDRESS_LITERAL_BV384_RE = re.compile(
+    r"(\{\s*#x[0-9a-fA-F]{96}\s*\})\s*:\s*bv\s*\[\s*384\s*\]"
+)
 
 
 def normalize_rule_bitvector_sizes(rule_text: str, default_width: int = DEFAULT_RULE_BV_WIDTH) -> str:
@@ -57,21 +66,28 @@ def normalize_rule_bitvector_sizes(rule_text: str, default_width: int = DEFAULT_
     Normalize Tau rule text so that any bitvector type annotation `:bv` or
     `:bv[<n>]` becomes `:bv[<default_width>]`.
 
+    The only exception is 384-bit address literals like `{#x<96-hex>}:bv[384]`,
+    which are preserved to avoid corrupting public-key comparisons.
+
     Examples:
-      - `{ #b0 }:bv` -> `{ #b0 }:bv[64]`
-      - `{ #b0 }:bv[1]` -> `{ #b0 }:bv[64]`
-      - `{ #b0 }:bv[128]` -> `{ #b0 }:bv[64]`
+      - `{ #b0 }:bv` -> `{ #b0 }:bv[16]` (assuming default=16)
+      - `{ #b0 }:bv[1]` -> `{ #b0 }:bv[16]`
+      - `{ #x... }:bv[384]` -> `{ #x... }:bv[384]`
     """
     if not rule_text:
         return rule_text
-    normalized, replacements = _BV_TYPE_RE.subn(f":bv[{int(default_width)}]", rule_text)
+
+    sentinel = ":__TAU_KEEP_BV384_ADDR__"
+    protected = _ADDRESS_LITERAL_BV384_RE.sub(r"\1" + sentinel, rule_text)
+
+    normalized, replacements = _BV_TYPE_RE.subn(f":bv[{int(default_width)}]", protected)
     if replacements:
         logger.debug(
             "normalize_rule_bitvector_sizes: rewrote %s ':bv' annotations to ':bv[%s]'",
             replacements,
             default_width,
         )
-    return normalized
+    return normalized.replace(sentinel, ":bv[384]")
 
 # --- Global State (accessible by this module) ---
 tau_process: subprocess.Popen | None = None

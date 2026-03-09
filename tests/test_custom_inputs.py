@@ -152,7 +152,7 @@ class TestCustomInputs(unittest.TestCase):
         # Mock communicate_with_tau to return distinct outputs
         self.mock_communicate.side_effect = ["output_rule", "output_custom"]
         
-        result = engine.apply(snapshot, [tx])
+        result = engine.apply(snapshot, [tx], 1700000000)
         
         receipt = result.receipts["tx1"]
         logs = receipt["logs"]
@@ -168,10 +168,10 @@ class TestCustomInputs(unittest.TestCase):
         
         # Call 2: Custom
         args2, kwargs2 = self.mock_communicate.call_args_list[1]
-        self.assertIsNone(kwargs2['rule_text'])
+        self.assertNotIn('rule_text', kwargs2)
         self.assertEqual(kwargs2['input_stream_values'][100], ["99"])
-        self.assertEqual(kwargs2['apply_rules_update'], True)
-        self.assertIn("Tau(custom) o0: output_custom", logs)
+        self.assertEqual(kwargs2['apply_rules_update'], False)
+        self.assertIn("Tau(custom_unified) o0: output_custom", logs)
         
         self.assertIn("Rule applied", logs)
         
@@ -192,7 +192,7 @@ class TestCustomInputs(unittest.TestCase):
         # Mock communicate_with_tau to return Error
         self.mock_communicate.return_value = "(Error) Invalid input"
         
-        result = engine.apply(snapshot, [tx])
+        result = engine.apply(snapshot, [tx], 1700000000)
         
         # New behavior: Tx execution fails on Tau Error, but is accepted into block (nonce consumed)
         self.assertEqual(len(result.accepted_transactions), 1)
@@ -200,7 +200,7 @@ class TestCustomInputs(unittest.TestCase):
         
         receipt = result.receipts["tx_fail"]
         self.assertEqual(receipt["status"], "failed")
-        self.assertIn("Tau rejected custom inputs: (Error) Invalid input", receipt["logs"])
+        self.assertIn("Custom logic error: (Error) Invalid input", receipt["logs"])
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.CRITICAL)

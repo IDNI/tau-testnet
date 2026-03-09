@@ -38,3 +38,7 @@ TAU_INPUT_STREAM_TO_ID = "i4"
 # Outputs
 TAU_OUTPUT_STREAM_RULES = "o0"
 TAU_OUTPUT_STREAM_VALIDATION_RESULT = "o1" 
+
+# System Reserved Streams
+# 0..4 are core protocol streams; 5 is consensus timestamp injected by node.
+RESERVED_STREAMS = {0, 1, 2, 3, 4, 5}

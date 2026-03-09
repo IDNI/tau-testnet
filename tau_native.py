@@ -173,6 +173,7 @@ class TauInterface:
                     continue
 
                 cleaned = self._strip_nonliteral_hash_comments(line)
+
                 if cleaned.strip():
                     clean_lines.append(cleaned.strip())
 
