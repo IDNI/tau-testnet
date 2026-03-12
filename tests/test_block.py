@@ -142,6 +142,7 @@ class TestBlockCreation(unittest.TestCase):
         self.mock_tau = self.tau_patcher.start()
         self.mock_tau.tau_ready.is_set.return_value = True
         self.mock_tau.communicate_with_tau.return_value = "100" # Dummy return for validate
+        self.mock_tau.communicate_with_tau_multi.return_value = {1: "100"}  # Multi-output mock
         
         # Mock Signature Validation
         self.sig_patcher = unittest.mock.patch('commands.createblock._validate_signature', return_value=True)

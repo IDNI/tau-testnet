@@ -72,6 +72,11 @@ class TestSendTxBasic(unittest.TestCase):
             return tau_defs.TAU_VALUE_ONE
             
         self.mock_tau = patch('tau_manager.communicate_with_tau', side_effect=mock_tau_response).start()
+        # Multi-output mock wraps the same logic but returns dict[int, str]
+        def mock_tau_multi(input_stream_values=None, **kwargs):
+            o1_val = mock_tau_response(input_stream_values=input_stream_values, target_output_stream_index=1)
+            return {1: o1_val}
+        patch('tau_manager.communicate_with_tau_multi', side_effect=mock_tau_multi).start()
         sendtx._PY_ECC_AVAILABLE = False
         # Patch pubkey validation to bypass format checks for basic tests
         patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()

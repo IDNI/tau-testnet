@@ -428,18 +428,30 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                             i + 1,
                             tau_input_stream_values,
                         )
-                        tau_output_transfer = tau_manager.communicate_with_tau(
-                            target_output_stream_index=1,
+                        tau_outputs = tau_manager.communicate_with_tau_multi(
                             input_stream_values=tau_input_stream_values,
-                        apply_rules_update=False,
+                            apply_rules_update=False,
                         )
 
+                        # --- Built-in Transfer Validation (o1) ---
+                        o1_raw = tau_outputs.get(1)
                         expected_amount = transfer_details[2]
-                        if not _decode_single_transfer_output(tau_output_transfer, expected_amount):
+                        if not _decode_single_transfer_output(o1_raw or "0", expected_amount):
                             return (
                                 f"FAILURE: Transaction rejected by Tau logic for transfer #{i+1} "
-                                f"({transfer_details}). Tau output: {tau_output_transfer}"
+                                f"({transfer_details}). Tau output: {o1_raw}"
                             )
+
+                        # --- User Policy Check (o5) ---
+                        o5_raw = tau_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
+                        if o5_raw is not None:
+                            from tau_manager import parse_tau_output as _parse
+                            policy_val = _parse(o5_raw)
+                            if policy_val == tau_defs.USER_POLICY_BLOCK_VALUE:
+                                return (
+                                    f"FAILURE: Transaction rejected by user policy (o5) for transfer #{i+1} "
+                                    f"({transfer_details}). Policy output: {o5_raw}"
+                                )
                     logger.info("All Tau transfer validations successful.")
 
         finally:

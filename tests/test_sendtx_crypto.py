@@ -69,6 +69,11 @@ class TestSendTxCrypto(unittest.TestCase):
                 return tau_defs.TAU_VALUE_ZERO
             return tau_defs.TAU_VALUE_ONE
         self.mock_tau = patch('commands.sendtx.tau_manager.communicate_with_tau', mock_tau_response).start()
+        # Multi-output mock wraps the same logic but returns dict[int, str]
+        def mock_tau_multi(input_stream_values=None, **kwargs):
+            o1_val = mock_tau_response(input_stream_values=input_stream_values, target_output_stream_index=1)
+            return {1: o1_val}
+        patch('commands.sendtx.tau_manager.communicate_with_tau_multi', side_effect=mock_tau_multi).start()
 
     def tearDown(self):
         patch.stopall()

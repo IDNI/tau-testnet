@@ -1361,7 +1361,96 @@ always (
       # Even with a co-signer, no single normal transfer can exceed 10,000.
       ( (i1[t] > {10000}:bv[64]) ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16] )
     )
-).`
+).`,
+
+    "Adaptive Treasury Vault (Pointwise Revision Demo)": `# =============================================================
+# ADAPTIVE TREASURY VAULT — Layered Policy with Pointwise Revision
+# =============================================================
+#
+# ARCHITECTURE:
+#   Both layers write to the SAME policy output stream o5.
+#   Tau logically composes multiple always(...) clauses via &&,
+#   so a transfer is allowed ONLY if ALL clauses output o5 = 1.
+#
+#   Layer 1 — Immutable hard safety controls (time-lock, abs cap,
+#             approved counterparty). Cannot be revised.
+#   Layer 2 — Revisable per-transfer spending cap.
+#             Pointwise revision replaces ONLY this clause.
+#
+# ENGINE ENFORCEMENT:
+#   The engine reads o5 after each transfer validation step:
+#     o5 = 0       → block   (user policy rejects transfer)
+#     o5 = 1       → allow   (user policy approves transfer)
+#     o5 absent    → allow   (no user policy triggered)
+#
+# SCOPE:
+#   This contract only constrains the treasury account (i3 match).
+#   All other senders pass through (vacuous truth from '->').
+#
+# STREAM TYPES:
+#   i1[t] : transfer amount           (bv[64])
+#   i3[t] : sender public key         (bv[384])
+#   i4[t] : recipient/counterparty    (bv[384])
+#   i5[t] : block timestamp           (bv[64])
+#   o5[t] : policy guard signal       (bv[16]: 0=block, 1=allow)
+#
+# ----- POINTWISE REVISION INSTRUCTIONS -----
+# To revise ONLY the spending cap (Layer 2), send a SEPARATE
+# transaction with a new rule that redefines the spending cap
+# clause on o5. Layer 1 remains untouched because Tau's
+# pointwise revision targets the specific clause being replaced.
+#
+# REVISION EXAMPLE A — Raise cap to 10000:
+#   always (
+#     (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
+#       && i1[t] > {10000}:bv[64])
+#     ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
+#   ).
+#
+# REVISION EXAMPLE B — Time-dependent cap using 'ex':
+#   always (
+#     ex c (
+#       (i5[t] >= {1800000000}:bv[64] && c = {20000}:bv[64])
+#       || (i5[t] < {1800000000}:bv[64] && c = {10000}:bv[64])
+#     ) && (
+#       (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
+#         && i1[t] > c:bv[64])
+#       ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
+#     )
+#   ).
+# =============================================================
+
+# --- LAYER 1: IMMUTABLE CORE GUARD (o5) ---
+(always (
+  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384])
+  -> (
+    # 1. TIME-LOCK: Block all transfers before this timestamp.
+    (i5[t] < {1750000000}:bv[64]
+      ? o5[t] = {0}:bv[16]
+      : (
+        # 2. ABSOLUTE CAP: No single transfer may exceed 50000.
+        (i1[t] > {50000}:bv[64]
+          ? o5[t] = {0}:bv[16]
+          : (
+            # 3. APPROVED-COUNTERPARTY: Transfers above 1000 require
+            #    the recipient to be a specific approved counterparty.
+            (i1[t] > {1000}:bv[64]
+              && !(i4[t] = {#x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222}:bv[384]))
+            ? o5[t] = {0}:bv[16]
+            : o5[t] = {1}:bv[16]
+          ))
+      ))
+  )
+)) &&
+# --- LAYER 2: REVISABLE PER-TRANSFER SPENDING CAP (o5) ---
+# This clause is the TARGET for pointwise revision.
+# Tau composes it with Layer 1: transfer allowed only if
+# BOTH clauses output o5 = 1.
+(always (
+  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
+    && i1[t] > {5000}:bv[64])
+  ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
+)).`
 };
 
 function initRuleTemplates() {

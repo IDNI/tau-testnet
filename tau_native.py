@@ -503,6 +503,140 @@ class TauInterface:
             
         return result_value
 
+    def communicate_multi(self,
+                          rule_text=None,
+                          input_stream_values=None,
+                          source="unknown",
+                          apply_rules_update=True) -> dict[int, str]:
+        """
+        Run one Tau step and return ALL actually-emitted output streams.
+
+        Returns:
+            dict[int, str]: Mapping of output stream index to its string value.
+            Only outputs actually produced by Tau are included.
+            Missing outputs are NOT synthesized — this is consensus-critical
+            (missing o5 = no policy emitted vs o5 = "0" = explicit block).
+        """
+        # Keep signature parity with docker path.
+        _ = source
+        _ = apply_rules_update
+
+        # 1. Get required inputs
+        required_inputs = self.tau.get_inputs_for_step(self.interpreter)
+        input_assignments = {}
+
+        # Prepare per-stream queues to mimic prompt-driven Docker behavior.
+        stream_input_queues: dict[str, deque[str]] = {}
+        if input_stream_values:
+            for raw_stream_idx, raw_value in input_stream_values.items():
+                stream_name = self._coerce_stream_name(raw_stream_idx)
+                if not stream_name:
+                    continue
+
+                if isinstance(raw_value, (list, tuple)):
+                    values = [
+                        self._normalize_assignment_value(v)
+                        for v in raw_value
+                        if v is not None
+                    ]
+                else:
+                    values = [self._normalize_assignment_value(raw_value)]
+
+                if values:
+                    stream_input_queues[stream_name] = deque(values)
+
+        normalized_rule_text = None
+        if rule_text is not None:
+            normalized_rule_text = self._normalize_assignment_value(rule_text)
+
+        captured_output = ""
+        outputs = None
+
+        for _ in range(100):
+            required_inputs = self.tau.get_inputs_for_step(self.interpreter)
+            input_assignments = {}
+
+            for input_obj in required_inputs:
+                name = input_obj.name
+                stream_queue = stream_input_queues.get(name)
+
+                if stream_queue:
+                    value_to_assign = stream_queue.popleft()
+                    if not stream_queue:
+                        del stream_input_queues[name]
+                elif name == "i0" and normalized_rule_text is not None:
+                    value_to_assign = normalized_rule_text
+                else:
+                    value_to_assign = self._fallback_value_for_stream(name)
+
+                input_assignments[input_obj] = value_to_assign
+                tau_io_logger.log_native_input(name, value_to_assign)
+
+            try:
+                with StdOutCapture() as capture:
+                    outputs = self.tau.step(self.interpreter, input_assignments)
+                captured_output += capture.output
+            except Exception as e:
+                raise e
+
+            if outputs is not None:
+                break
+
+            if "(Error)" in capture.output:
+                break
+
+        # Re-print captured output for log visibility
+        if captured_output:
+            print(captured_output, end='')
+            tau_io_logger.log_native_stdout(captured_output)
+
+            if "(Error)" in captured_output:
+                msg = f"Tau native step reported an error: {captured_output.strip()}"
+                filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
+                if filepath:
+                    logger.error(f"Dumped Tau crash log to {filepath}")
+                raise TauEngineBug(msg)
+
+        if outputs is None:
+            msg = "Tau step failed (returned None after 100 iterations)"
+            filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
+            if filepath:
+                logger.error(f"Dumped Tau crash log to {filepath}")
+            raise TauEngineBug(msg)
+
+        # Log Outputs
+        if outputs:
+            logger.info(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs (multi):{COLOR_RESET}")
+            for k, v in outputs.items():
+                val_str = str(v)
+                tau_io_logger.log_native_output(k.name, val_str)
+                logger.info(f"  {k.name}: {COLOR_BLUE}{val_str}{COLOR_RESET}")
+
+        # Process Spec Updates from STDOUT
+        try:
+            updated_spec = self._extract_latest_updated_spec(captured_output)
+            if updated_spec:
+                logger.info(
+                    f"{COLOR_YELLOW}[TAU_DIRECT] Spec Replaced from STDOUT: {updated_spec}{COLOR_RESET}"
+                )
+                self._rebuild_interpreter_from_spec(
+                    updated_spec,
+                    reason="updated specification from step output",
+                )
+        except Exception as e:
+            logger.error("Failed to process updated specification from stdout: %s", e)
+            raise
+
+        # Build result: only actually emitted outputs, keyed by stream index
+        result: dict[int, str] = {}
+        if outputs:
+            for output_obj, value in outputs.items():
+                name = output_obj.name
+                if name.startswith("o") and name[1:].isdigit():
+                    result[int(name[1:])] = str(value)
+
+        return result
+
     def get_current_spec(self):
         """Returns the full accumulated specification."""
         return self.accumulated_spec
@@ -512,3 +646,4 @@ class TauInterface:
             new_spec,
             reason="explicit update_spec request",
         )
+

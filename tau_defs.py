@@ -37,8 +37,29 @@ TAU_INPUT_STREAM_TO_ID = "i4"
 
 # Outputs
 TAU_OUTPUT_STREAM_RULES = "o0"
-TAU_OUTPUT_STREAM_VALIDATION_RESULT = "o1" 
+TAU_OUTPUT_STREAM_VALIDATION_RESULT = "o1"
+
+# --- User Policy Stream ---
+# o5 is the shared user-policy output stream.
+# Multiple users can write sender-scoped rules to o5; Tau composes them
+# into a single logical constraint. Each user rule must be guarded by
+# that user's sender identity (i3) to avoid affecting other users.
+#
+# Semantics:
+#   o5 = 0       -> explicit block (user policy rejects transfer)
+#   o5 = 1       -> explicit allow  (user policy approves transfer)
+#   o5 missing   -> no user policy triggered -> allow
+#
+# The engine enforces: allow only if o1 passes AND (o5 is absent OR o5 != 0).
+USER_POLICY_STREAM_INDEX = 5
+USER_POLICY_BLOCK_VALUE = 0
+USER_POLICY_ALLOW_VALUE = 1
+
+# Input Streams (additional)
+TAU_INPUT_STREAM_TIMESTAMP = "i5"
 
 # System Reserved Streams
-# 0..4 are core protocol streams; 5 is consensus timestamp injected by node.
+# 0..4 are core protocol streams; 5 is consensus timestamp injected by node (i5).
+# Note: i5 is a reserved INPUT stream (consensus clock). o5 is the user policy
+# OUTPUT stream — these are separate namespaces and do not conflict.
 RESERVED_STREAMS = {0, 1, 2, 3, 4, 5}

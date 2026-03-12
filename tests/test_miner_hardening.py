@@ -130,6 +130,11 @@ class TestMinerHardening(unittest.TestCase):
                 return vals.get(1, "0") 
             return "Success"
         mock_tau.communicate_with_tau.side_effect = tau_side_effect
+        # Multi-output mock returns dict[int, str]
+        def tau_multi_side_effect(**kwargs):
+            val = tau_side_effect(**{**kwargs, 'target_output_stream_index': 1})
+            return {1: val}
+        mock_tau.communicate_with_tau_multi.side_effect = tau_multi_side_effect
         
         mock_sig.return_value = True
         
@@ -205,6 +210,11 @@ class TestMinerHardening(unittest.TestCase):
             return "Success"
             
         mock_tau.communicate_with_tau.side_effect = tau_side_effect
+        # Multi-output mock returns dict[int, str]
+        def tau_multi_side_effect(**kwargs):
+            val = tau_side_effect(**{**kwargs, 'target_output_stream_index': 1})
+            return {1: val}
+        mock_tau.communicate_with_tau_multi.side_effect = tau_multi_side_effect
         mock_tau.tau_ready.is_set.return_value = True
         
         mock_sig.return_value = True

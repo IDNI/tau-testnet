@@ -57,13 +57,15 @@ class TestConsensusTime(unittest.TestCase):
         self.assertTrue(res.startswith("FAILURE: Invalid operation key '5'"), f"Got: {res}")
         self.assertEqual(len(db.get_mempool_txs()), 0)
 
+    @patch('tau_manager.communicate_with_tau_multi')
     @patch('tau_manager.communicate_with_tau')
     @patch('tau_manager.tau_ready')
     @patch('chain_state.get_rules_state', return_value="rules")
-    def test_createblock_injects_timestamp(self, mock_get_rules, mock_ready, mock_tau):
+    def test_createblock_injects_timestamp(self, mock_get_rules, mock_ready, mock_tau, mock_tau_multi):
         """Test that createblock.execute_batch dynamically injects the block_timestamp into the Tau evaluation maps."""
         mock_ready.is_set.return_value = True
         mock_tau.return_value = "1" # Success output for transfers
+        mock_tau_multi.return_value = {1: "1"} # Success output for transfers multi
         
         tx = {
             "sender_pubkey": chain_state.GENESIS_ADDRESS,
@@ -84,10 +86,10 @@ class TestConsensusTime(unittest.TestCase):
         final_txs, final_reserved_ids, final_rules, final_balances, final_sequences = createblock.execute_batch([tx], [1], block_timestamp)
         
         self.assertEqual(len(final_txs), 1)
-        # Verify the call to tau_manager.communicate_with_tau
+        # Verify the call to tau_manager.communicate_with_tau_multi
         # It should have been called with input_stream_values containing i5
-        mock_tau.assert_called()
-        call_kwargs = mock_tau.call_args.kwargs
+        mock_tau_multi.assert_called()
+        call_kwargs = mock_tau_multi.call_args.kwargs
         input_args = call_kwargs.get("input_stream_values", {})
         
         # Verify custom payload (stream 7) was injected

@@ -1016,6 +1016,117 @@ def communicate_with_tau(
                  kill_tau_process()
 
 
+def communicate_with_tau_multi(
+    input_stream_values: dict[int | str, str | list[str]] | None = None,
+    source: str = "unknown",
+    apply_rules_update: bool = True,
+    wait_for_ready: bool = True,
+) -> dict[int, str]:
+    """
+    Run one Tau step and return ALL actually-emitted output streams.
+
+    Returns:
+        dict[int, str]: Mapping of output stream index to its string value.
+        Only outputs actually produced by Tau are included.
+        Missing outputs are NOT synthesized — this is consensus-critical:
+            missing o5 = no policy emitted (allow)
+            o5 = "0"  = explicit block
+
+    Notes:
+        - Direct bindings path: delegates to tau_direct_interface.communicate_multi()
+          which returns all outputs from a single tau step (efficient, single step).
+        - Docker path: falls back to single-output call (o1 only).
+        - Test mode: returns test defaults for o1 only.
+    """
+    global tau_direct_interface, tau_test_mode
+
+    # --- DIRECT BINDINGS PATH (production) ---
+    if config.settings.tau.use_direct_bindings and not tau_test_mode:
+        if not tau_direct_interface:
+            msg = "Direct Tau Interface used but not initialized."
+            filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
+            if filepath:
+                logger.error(f"Dumped Tau crash log to {filepath}")
+            raise TauEngineCrash(msg)
+
+        # Sanitize / normalize inputs
+        normalized_inputs = None
+        if input_stream_values:
+            normalized_inputs = {}
+            for k, v in input_stream_values.items():
+                if isinstance(v, (list, tuple)):
+                    parts = [str(p).replace('\n', ' ') for p in v]
+                    normalized_inputs[k] = parts
+                else:
+                    v_str = str(v).replace('\n', ' ')
+                    if v_str.lstrip().startswith("always"):
+                        v_str = normalize_rule_bitvector_sizes(v_str)
+                    normalized_inputs[k] = v_str
+
+        try:
+            result = tau_direct_interface.communicate_multi(
+                rule_text=None,
+                input_stream_values=normalized_inputs or input_stream_values,
+                source=source,
+                apply_rules_update=apply_rules_update,
+            )
+        except Exception as ex:
+            logger.error(f"Direct Tau multi-output communication failed: {ex}")
+            raise TauCommunicationError(
+                f"Direct Tau multi-output communication failed: {ex}",
+                last_state=last_known_tau_spec,
+            )
+
+        # Normalize atom values
+        normalized_result = {}
+        for idx, val in result.items():
+            try:
+                normalized_result[idx] = utils.normalize_tau_atoms(str(val))
+            except Exception:
+                normalized_result[idx] = str(val)
+        return normalized_result
+
+    # --- TEST MODE ---
+    if tau_test_mode:
+        result = {}
+        if input_stream_values:
+            stream_queues = {}
+            for raw_idx, raw_value in input_stream_values.items():
+                try:
+                    idx = int(raw_idx)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(raw_value, (list, tuple)):
+                    stream_queues[idx] = raw_value[0] if raw_value else "0"
+                else:
+                    stream_queues[idx] = str(raw_value)
+            # o1 = transfer amount (from i1)
+            if 1 in stream_queues:
+                result[1] = stream_queues[1]
+            else:
+                result[1] = tau_defs.TRANSACTION_VALIDATION_SUCCESS
+        else:
+            result[1] = tau_defs.TRANSACTION_VALIDATION_SUCCESS
+        # Test mode does not emit o5 — correct: no policy in test mode
+        return result
+
+    # --- DOCKER FALLBACK ---
+    # Docker mode cannot return multi-output from a single step without
+    # modifying the interaction loop. Fall back to single-stream o1 call.
+    logger.warning(
+        "communicate_with_tau_multi: Docker mode only returns o1. "
+        "Use direct bindings for full o5 policy enforcement."
+    )
+    o1_val = communicate_with_tau(
+        target_output_stream_index=1,
+        input_stream_values=input_stream_values,
+        source=source,
+        apply_rules_update=apply_rules_update,
+        wait_for_ready=wait_for_ready,
+    )
+    return {1: o1_val}
+
+
 def reset_tau_state(rule_text: str, *, source: str = "unknown", apply_rules_update: bool = True) -> None:
     """
     Reset Tau state by sending a clear token followed by the provided spec.

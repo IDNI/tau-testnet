@@ -251,20 +251,32 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int], block_timestamp: 
                          tau_input_stream_values[k] = v
                      tau_input_stream_values[5] = str(block_timestamp)
 
-                     # Communicate with Tau stream 1 (validator)
-                     tau_output_transfer = tau_manager.communicate_with_tau(
-                        target_output_stream_index=1,
+                     # Communicate with Tau — get all output streams in one step
+                     tau_outputs = tau_manager.communicate_with_tau_multi(
                         input_stream_values=tau_input_stream_values,
                         apply_rules_update=False,
                      )
                      
-                     # Output Parsing (Unified)
-                     converted_val = parse_tau_output(tau_output_transfer)
-                         
-                     # Validation: output must equal amount
-                     if converted_val != amt:
-                         logger.warning("TX %s rejected: Tau validation failed. Expected %s, got %s (parsed: %s)", i, amt, tau_output_transfer, converted_val)
+                     # --- Built-in Transfer Validation (o1) ---
+                     o1_raw = tau_outputs.get(1)
+                     if o1_raw is None:
+                         logger.warning("TX %s rejected: Tau did not emit o1 transfer validation output", i)
                          tx_success = False; break
+
+                     converted_val = parse_tau_output(o1_raw)
+                          
+                     # Validation: o1 must equal amount
+                     if converted_val != amt:
+                         logger.warning("TX %s rejected: Tau validation failed. Expected %s, got %s (parsed: %s)", i, amt, o1_raw, converted_val)
+                         tx_success = False; break
+
+                     # --- User Policy Check (o5) ---
+                     o5_raw = tau_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
+                     if o5_raw is not None:
+                         policy_val = parse_tau_output(o5_raw)
+                         if policy_val == tau_defs.USER_POLICY_BLOCK_VALUE:
+                             logger.warning("TX %s rejected: User policy (o5) blocked transfer. o5=%s", i, o5_raw)
+                             tx_success = False; break
                      
                 except Exception as e:
                     logger.warning("TX %s rejected: Tau validation error: %s", i, e)
