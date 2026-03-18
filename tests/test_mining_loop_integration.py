@@ -71,7 +71,7 @@ class TestMiningLoopIntegration(unittest.TestCase):
         self.miner.start()
         
         # Verify initial state
-        self.assertIsNone(db.get_latest_block())
+        self.assertIsNone(db.get_canonical_head_block())
         
         # Add a valid-looking transaction
         sender_pubkey = "a" * 96
@@ -107,12 +107,13 @@ class TestMiningLoopIntegration(unittest.TestCase):
         # Wait for miner loop (loop sleeps 0.1s, plus processing)
         # Give it 2 seconds to be safe
         for _ in range(20):
-            if db.get_latest_block():
+            latest = db.get_canonical_head_block()
+            if latest and latest['header']['block_number'] >= 0:
                 break
             time.sleep(0.1)
             
         # Check result
-        latest = db.get_latest_block()
+        latest = db.get_canonical_head_block()
         self.assertIsNotNone(latest, "Miner failed to produce block automatically")
         self.assertEqual(len(latest['transactions']), 1)
         print("Block created automatically:", latest['block_hash'])
@@ -123,7 +124,7 @@ class TestMiningLoopIntegration(unittest.TestCase):
         self.miner = SoleMiner(threshold=10, max_block_interval=1.0)
         self.miner.start()
         
-        self.assertIsNone(db.get_latest_block())
+        self.assertIsNone(db.get_canonical_head_block())
         
         # Add just 1 transaction (valid structure)
         sender_pubkey = "c" * 96
@@ -140,16 +141,17 @@ class TestMiningLoopIntegration(unittest.TestCase):
         
         # Wait 0.5s - should NOT mine yet
         time.sleep(0.5)
-        self.assertIsNone(db.get_latest_block(), "Mined too early! Should wait for time interval.")
+        self.assertIsNone(db.get_canonical_head_block(), "Mined too early! Should wait for time interval.")
         
         # Wait another 1.0s (total 1.5s > 1.0s interval)
         # Give loop a moment to react
         for _ in range(20):
-            if db.get_latest_block():
+            latest = db.get_canonical_head_block()
+            if latest and latest['header']['block_number'] >= 0:
                 break
             time.sleep(0.1)
             
-        latest = db.get_latest_block()
+        latest = db.get_canonical_head_block()
         self.assertIsNotNone(latest, "Failed to mine after time interval exceeded")
         self.assertEqual(len(latest['transactions']), 1)
         print("Block created by time threshold:", latest['block_hash'])

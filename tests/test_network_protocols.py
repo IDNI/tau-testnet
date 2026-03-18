@@ -12,6 +12,7 @@ from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo
 from libp2p.peer.peerstore import PeerStoreError
 from commands import sendtx
+import config
 
 
 pytestmark = pytest.mark.trio
@@ -35,6 +36,16 @@ def isolate_db(tmp_path):
 
     importlib.reload(config_module)
     importlib.reload(db_module)
+    
+    import chain_state as chain_state_module
+    importlib.reload(chain_state_module)
+    import block as block_module
+    
+    db_module.init_db()
+    chain_state_module.init_chain_state()
+    
+    db_module.save_canonical_state_atomically(config_module.GENESIS_HASH, 0, {}, {}, "")
+    chain_state_module._canonical_head_hash = config_module.GENESIS_HASH
     yield
     
     # Close our test connection before restoring
@@ -76,12 +87,12 @@ async def two_nodes():
 
     cfg1 = NetworkConfig(
         network_id="testnet",
-        genesis_hash="genesis_hash_xyz",
+        genesis_hash=config.GENESIS_HASH,
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
     cfg2 = NetworkConfig(
         network_id="testnet",
-        genesis_hash="genesis_hash_xyz",
+        genesis_hash=config.GENESIS_HASH,
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
 
@@ -154,7 +165,9 @@ async def test_each_protocol_communication(two_nodes):
     finally:
         await stream.close()
     sync = json.loads((data or b"{}").decode())
-    assert sync["headers"] == []
+    assert len(sync["headers"]) == 1
+    assert sync["headers"][0]["block_hash"] == config.GENESIS_HASH
+    assert sync["headers"][0]["block_number"] == 0
     assert sync["tip_number"] == 0
     assert sync["tip_hash"] == svc2._config.genesis_hash
 
@@ -285,17 +298,17 @@ async def test_block_gossip_fallback_to_via(monkeypatch):
 
     cfg_a = NetworkConfig(
         network_id="testnet",
-        genesis_hash="gen",
+        genesis_hash=config.GENESIS_HASH,
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
     cfg_b = NetworkConfig(
         network_id="testnet",
-        genesis_hash="gen",
+        genesis_hash=config.GENESIS_HASH,
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
     cfg_c = NetworkConfig(
         network_id="testnet",
-        genesis_hash="gen",
+        genesis_hash=config.GENESIS_HASH,
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
 
@@ -763,7 +776,7 @@ async def test_handshake_exchanges_peer_snapshot(monkeypatch):
 
     cfg = NetworkConfig(
         network_id="snapshotnet",
-        genesis_hash="genesis",
+        genesis_hash=config.GENESIS_HASH,
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
         dht_handshake_max_peers=8,
         dht_handshake_max_providers=8,
@@ -853,7 +866,7 @@ async def test_peer_advertisement_gossip(monkeypatch):
 
     cfg = NetworkConfig(
         network_id="adnet",
-        genesis_hash="genesis",
+        genesis_hash=config.GENESIS_HASH,
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
         dht_handshake_max_peers=0,
         dht_handshake_max_providers=8,
@@ -944,7 +957,7 @@ async def test_gossip_dht_multi_hop_routing(monkeypatch):
 
     cfg = NetworkConfig(
         network_id="multi-hop-testnet",
-        genesis_hash="genesis_hash_xyz",
+        genesis_hash=config.GENESIS_HASH,
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
 
@@ -1031,7 +1044,7 @@ async def test_dht_bucket_refresh_cycle():
 
     cfg = NetworkConfig(
         network_id="metricsnet",
-        genesis_hash="0000",
+        genesis_hash=config.GENESIS_HASH,
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
         dht_refresh_interval=0.01,
         dht_bucket_refresh_interval=0.01,

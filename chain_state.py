@@ -46,12 +46,22 @@ def compute_accounts_hash(balances: Dict[str, int], sequences: Dict[str, int]) -
 
 logger = logging.getLogger(__name__)
 
+# Lock for thread-safe reorg/fork-choice processing
+_chain_lock = threading.RLock()
+
 # Lock for thread-safe access to balances
 _balance_lock = threading.Lock()
 
 # In-memory balance table
 # Maps full BLS public key hex strings to integer amounts
 _balances = {}
+
+from dataclasses import dataclass
+
+@dataclass
+class IngestResult:
+    status: str
+    message: str
 
 # Lock for thread-safe access to sequence numbers
 _sequence_lock = threading.Lock()
@@ -64,7 +74,7 @@ _rules_lock = threading.Lock()
 
 # In-memory rules state storage
 _current_rules_state = ""
-_last_processed_block_hash = ""
+_canonical_head_hash = ""
 _tau_engine_state_hash = ""  # last known Tau engine snapshot hash (best-effort)
 
 # DHT Client for storing formulas
@@ -105,15 +115,15 @@ def _republish_state_to_dht():
     This ensures that on node startup, the DHT is populated with the state loaded from DB,
     allowing the node to advertise these keys during handshake.
     """
-    global _last_processed_block_hash, _current_rules_state, _tau_engine_state_hash
+    global _canonical_head_hash, _current_rules_state, _tau_engine_state_hash
     
-    if not _last_processed_block_hash:
+    if not _canonical_head_hash:
         return
 
-    logger.info("Hydrating DHT with persisted state for block %s...", _last_processed_block_hash)
+    logger.info("Hydrating DHT with persisted state for block %s...", _canonical_head_hash)
     
     # 1. Publish Accounts
-    publish_accounts_snapshot(_last_processed_block_hash)
+    publish_accounts_snapshot(_canonical_head_hash)
     
     # 2. Publish Tau State / Rules
     # Always RECOMPUTE state_hash to ensure it matches the payload (rules + accounts_hash).
@@ -358,309 +368,18 @@ def fetch_accounts_snapshot(block_hash: str) -> Optional[tuple[Dict[str, int], D
 GENESIS_ADDRESS = "a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b"
 GENESIS_BALANCE = 10000
 
-def _process_new_block_internal(block: Block) -> bool:
-    """
-    Verify and persist a new block.
-
-    Secondary-node fast path:
-    - Do NOT re-execute transactions.
-    - Fetch the resulting `accounts` snapshot from DHT under `state:<block_hash>`.
-    - Fetch the resulting Tau rules snapshot from DHT under `state:<state_hash>` and apply it to Tau via i0.
-
-    Fallback (backwards compatibility):
-    - If snapshots are unavailable, fall back to the previous behavior (re-execute via PoATauEngine).
-
-    Returns True if successful, False otherwise.
-    """
-    global _current_rules_state, _last_processed_block_hash, _tau_engine_state_hash
-    block_number = block.header.block_number
-    # Basic deduplication
-    # NOTE: Even if the block already exists in DB, we may still need to apply its
-    # state snapshot to advance in-memory balances/sequences/rules (especially on
-    # secondary nodes after restart or when blocks are pre-inserted).
-    existing = db.get_block_by_hash(block.block_hash)
-    if existing:
-        with _rules_lock:
-            already_applied = (_last_processed_block_hash == block.block_hash)
-        if already_applied:
-            return True
-        logger.info(
-            "[chain_state] Block %s already exists in DB but state is not applied yet; applying snapshot.",
-            block.block_hash[:12],
-        )
-
-
-    print(f"[INFO][chain_state] Processing new block #{block_number} ({block.block_hash[:8]}...)")
-    
-    engine = PoATauEngine()
-    if not engine.verify_block(block):
-        print(f"[WARN][chain_state] Block #{block_number} verification failed")
-        return False
-
-    expected_state_hash = getattr(block.header, "state_hash", "") or ""
-
-    # --- Snapshot fast path (secondary nodes) ---------------------------------
-    # Do not replay block transactions. Instead, pull the resulting state from DHT.
-    import time
-
-    deadline = time.time() + 8.0  # allow brief propagation delay
-    balances_snapshot: Optional[Dict[str, int]] = None
-    sequences_snapshot: Optional[Dict[str, int]] = None
-    rules_from_dht: Optional[str] = None
-    remote_accounts_hash: Optional[str] = None
-    fallback_used = False
-
-    while time.time() < deadline:
-        # 1) Fetch accounts snapshot for this block
-        accounts_result = fetch_accounts_snapshot(block.block_hash)
-        if accounts_result:
-            balances_snapshot, sequences_snapshot = accounts_result
-
-        # 2) Fetch tau_state snapshot for the expected consensus state hash
-        if expected_state_hash and expected_state_hash != ("0" * 64):
-            snapshot_result = fetch_tau_state_snapshot(expected_state_hash)
-            if snapshot_result and isinstance(snapshot_result, tuple):
-                rules_from_dht, remote_accounts_hash = snapshot_result
-            else:
-                # Back-compat / safeguard
-                rules_from_dht = snapshot_result  # type: ignore
-                remote_accounts_hash = None
-        else:
-            # Genesis / empty rules are allowed
-            rules_from_dht = ""
-            remote_accounts_hash = None
-
-        # 3) If we have both pieces, verify that they refer to the SAME accounts hash
-        if balances_snapshot is not None and sequences_snapshot is not None and rules_from_dht is not None:
-            try:
-                if remote_accounts_hash:
-                    local_accounts_hash_hex = compute_accounts_hash(balances_snapshot, sequences_snapshot).hex()
-                    if local_accounts_hash_hex != remote_accounts_hash:
-                        logger.warning(
-                            "[chain_state] DHT snapshot mismatch for block %s: accounts_hash(local)=%s != accounts_hash(remote)=%s; retrying...",
-                            block.block_hash[:12],
-                            local_accounts_hash_hex[:12],
-                            remote_accounts_hash[:12],
-                        )
-                        # Retry - either accounts snapshot or tau_state snapshot is from a different moment
-                        balances_snapshot = None
-                        sequences_snapshot = None
-                        # Keep rules_from_dht / remote_accounts_hash as-is; next loop may fetch newer accounts
-                        time.sleep(0.2)
-                        continue
-
-                # 4) Cache fetched snapshots to local DHT store to assist network propagation
-                if _dht_client and _dht_client.dht:
-                    accounts_payload = json.dumps(
-                        {
-                            "block_hash": block.block_hash,
-                            "accounts": {
-                                addr: {"balance": bal, "sequence": sequences_snapshot.get(addr, 0)}
-                                for addr, bal in balances_snapshot.items()
-                            },
-                        },
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-
-                    # Cache accounts snapshot
-                    acc_key_raw = f"{config.STATE_LOCATOR_NAMESPACE}:{block.block_hash}".encode("ascii")
-
-                    # Cache rules snapshot (always preserve the remote accounts_hash when available)
-                    if remote_accounts_hash:
-                        acc_hash_hex = remote_accounts_hash
-                    else:
-                        acc_hash_hex = compute_accounts_hash(balances_snapshot, sequences_snapshot).hex()
-
-                    rules_payload_cache = json.dumps(
-                        {"rules": rules_from_dht, "accounts_hash": acc_hash_hex},
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-
-                    rules_key_raw = f"tau_state:{expected_state_hash}".encode("ascii")
-
-                    if hasattr(_dht_client, "put_record_sync"):
-                        if not _dht_client.put_record_sync(acc_key_raw, accounts_payload):
-                            logger.warning(
-                                "[chain_state] Failed to cache accounts snapshot for %s via put_record_sync",
-                                block.block_hash,
-                            )
-                        if expected_state_hash and expected_state_hash != ("0" * 64):
-                            if not _dht_client.put_record_sync(rules_key_raw, rules_payload_cache):
-                                logger.warning(
-                                    "[chain_state] Failed to cache rules snapshot for %s via put_record_sync",
-                                    expected_state_hash,
-                                )
-                    else:
-                        _dht_client.dht.value_store.put(acc_key_raw, accounts_payload)
-                        if expected_state_hash and expected_state_hash != ("0" * 64):
-                            _dht_client.dht.value_store.put(rules_key_raw, rules_payload_cache)
-
-            except Exception as e:
-                print(f"[WARN][chain_state] Failed to cache/verify snapshots from DHT: {e}")
-
-            break
-
-        time.sleep(0.2)
-
-    missing_accounts_snapshot = balances_snapshot is None or sequences_snapshot is None
-    missing_tau_snapshot = (
-        expected_state_hash
-        and expected_state_hash != ("0" * 64)
-        and rules_from_dht is None
-    )
-
-    if missing_accounts_snapshot or missing_tau_snapshot:
-        logger.warning(
-            "[chain_state] DHT snapshot missing for block %s (accounts=%s tau=%s). "
-            "Falling back to local replay.",
-            block.block_hash[:12],
-            missing_accounts_snapshot,
-            bool(missing_tau_snapshot),
-        )
-        try:
-            with _rules_lock:
-                current_rules_bytes = (_current_rules_state or "").encode("utf-8")
-            replay_snapshot = TauStateSnapshot(
-                state_hash=compute_state_hash(current_rules_bytes),
-                tau_bytes=current_rules_bytes,
-                metadata={"source": "fallback-replay"},
-            )
-            replay_result = engine.apply(replay_snapshot, block.transactions, block.header.timestamp)
-            rules_from_dht = replay_result.snapshot.tau_bytes.decode("utf-8")
-            save_rules_state(rules_from_dht)
-
-            with _balance_lock, _sequence_lock:
-                balances_snapshot = dict(_balances)
-                sequences_snapshot = dict(_sequence_numbers)
-            remote_accounts_hash = compute_accounts_hash(balances_snapshot, sequences_snapshot).hex()
-            fallback_used = True
-        except Exception as exc:
-            print(f"[ERROR][chain_state] Fallback replay failed for block {block.block_hash[:12]}...: {exc}")
-            return False
-
-    if balances_snapshot is None or sequences_snapshot is None:
-        print(f"[ERROR][chain_state] Missing accounts snapshot in DHT for block {block.block_hash[:12]}...")
-        return False
-    # If expected_state_hash is present/non-empty, we demand rules
-    if expected_state_hash and expected_state_hash != ("0" * 64) and rules_from_dht is None:
-        print(f"[ERROR][chain_state] Missing Tau snapshot in DHT for state_hash {expected_state_hash[:12]}...")
-        return False
-
-    # Apply Tau rules snapshot to the running Tau engine via i0 only when using DHT snapshots.
-    if not fallback_used:
-        if not tau_manager.tau_ready.is_set():
-            tau_manager.tau_ready.wait(timeout=5)
-        if not tau_manager.tau_ready.is_set():
-            print("[ERROR][chain_state] Tau is not ready; cannot apply state snapshot")
-            return False
-
-        try:
-            # Always reset Tau state even if empty. Do not let Tau recompute/override
-            # the snapshot; we trust the DHT-provided state.
-            rule_text = rules_from_dht if rules_from_dht else ""
-            tau_manager.communicate_with_tau(
-                rule_text=rule_text,
-                target_output_stream_index=0,
-                apply_rules_update=False,
-                source="snapshot-restore",
-            )
-        except Exception as exc:
-            print(f"[ERROR][chain_state] Failed to apply Tau state snapshot via i0: {exc}")
-            return False
-
-    # Consensus State Verification
-    # Confirm the applied rules AND accounts match the block commitment.
-    
-    # 1. Compute Accounts Hash
-    accounts_hash = compute_accounts_hash(balances_snapshot, sequences_snapshot)
-    
-    # 2. Compute Consensus Hash
-    applied_rules = rules_from_dht or ""
-    rules_bytes = applied_rules.encode("utf-8")
-    
-    applied_hash = compute_consensus_state_hash(rules_bytes, accounts_hash)
-
-    if expected_state_hash and expected_state_hash != ("0" * 64) and applied_hash != expected_state_hash:
-        print(
-            f"[ERROR][chain_state] Consensus state hash mismatch. "
-            f"expected={expected_state_hash[:12]} got={applied_hash[:12]}"
-        )
-        if logger.isEnabledFor(logging.DEBUG) or True: # Force log for now
-            logger.error("\n--- HASH MISMATCH DEBUG INFO ---")
-            logger.error(f"Expected: {expected_state_hash}")
-            logger.error(f"Got:      {applied_hash}")
-            logger.error(f"Rules Len: {len(rules_bytes)}")
-            logger.error(f"Rules Hash (SHA256): {hashlib.sha256(rules_bytes).hexdigest()}")
-            logger.error(f"Fetched Rules Sample: {rules_bytes[:100]!r}...")
-            
-            logger.error(f"Accounts Hash (SHA256): {accounts_hash.hex()}")
-            logger.error(f"Remote Accts Hash:      {remote_accounts_hash if remote_accounts_hash else 'N/A'}")
-            logger.error(f"Balances Count: {len(balances_snapshot)}")
-            logger.error(f"Sequences Count: {len(sequences_snapshot)}")
-            
-            # Dump accounts for offline verification if needed
-            # Sample first 5 sorted
-            sorted_accs = sorted(balances_snapshot.keys())[:5]
-            for addr in sorted_accs:
-                 logger.error(f"Addr: {addr} Bal: {balances_snapshot[addr]} Seq: {sequences_snapshot.get(addr, 0)}")
-            logger.error("--------------------------------\n")
-
-        return False
-
-    with _rules_lock:
-        global _tau_engine_state_hash
-        _tau_engine_state_hash = expected_state_hash or applied_hash
-
-    # Replace local account state with the snapshot.
-    with _balance_lock, _sequence_lock:
-        _balances.clear()
-        _balances.update(balances_snapshot)
-        _sequence_numbers.clear()
-        _sequence_numbers.update(sequences_snapshot)
-
-    with _rules_lock:
-        _current_rules_state = applied_rules
-        _last_processed_block_hash = block.block_hash
-
-    if not existing:
-        db.add_block(block)
-    db.save_chain_state(
-        balances=_balances,
-        sequences=_sequence_numbers,
-        rules=applied_rules,
-        last_block_hash=block.block_hash,
-    )
-
-    if fallback_used:
-        # Best-effort: repopulate DHT so subsequent peers can use snapshot fast-path.
-        try:
-            publish_accounts_snapshot(block.block_hash)
-            publish_tau_state_snapshot(applied_hash, rules_bytes, accounts_hash)
-        except Exception:
-            logger.debug("Failed to republish fallback snapshot to DHT", exc_info=True)
-
-    # Drop transactions that are now confirmed in this block.
-    try:
-        tx_hashes = [h for h in (block.tx_ids or []) if isinstance(h, str)]
-        if not tx_hashes:
-            from block import compute_tx_hash
-            tx_hashes = [compute_tx_hash(tx) for tx in (block.transactions or []) if isinstance(tx, dict)]
-        if tx_hashes:
-            removed = db.remove_mempool_by_hashes(tx_hashes)
-            if removed:
-                print(f"[INFO][chain_state] Removed {removed} mempool txs included in block #{block_number}.")
-    except Exception as exc:
-        logger.warning("Failed to remove block transactions from mempool: %s", exc)
-    if fallback_used:
-        print(f"[INFO][chain_state] Block #{block_number} persisted via replay fallback.")
-    else:
-        print(f"[INFO][chain_state] Block #{block_number} persisted via DHT snapshots.")
-    return True
-
 def process_new_block(block: Block) -> bool:
+    """
+    Ingests a block into the database, updates the canonical head if this block
+    forms a better chain, and executes a reorg if necessary.
+    Returns True if the block is new and successfully ingested (even if not canonical).
+    """
     try:
-        return _process_new_block_internal(block)
+        res = ingest_block(block)
+        if res.status == "added":
+            maybe_update_canonical_head()
+            return True
+        return False
     except Exception as e:
         from errors import TauTestnetError, BlockchainBug
         if isinstance(e, TauTestnetError):
@@ -668,7 +387,7 @@ def process_new_block(block: Block) -> bool:
         logger.error(f"[BLOCKCHAIN_BUG] Unhandled exception in process_new_block: {e}", exc_info=True)
         raise BlockchainBug(f"Unhandled exception in process_new_block: {e}") from e
 
-def _rebuild_state_from_blockchain_internal(start_block=0):
+def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
     """
     Rebuilds or updates the chain state by replaying transactions from the database.
     If start_block is 0, it clears existing state.
@@ -676,7 +395,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0):
     
     
     print(f"[INFO][chain_state] Starting blockchain state reconstruction from block {start_block}...")
-    global _last_processed_block_hash
+    global _canonical_head_hash, _tau_engine_state_hash, _current_rules_state
     
     if start_block == 0:
         # Clear current state for a full rebuild
@@ -684,18 +403,21 @@ def _rebuild_state_from_blockchain_internal(start_block=0):
             _balances.clear()
             _sequence_numbers.clear()
             _current_rules_state = ""
-            global _tau_engine_state_hash
             _tau_engine_state_hash = ""
-            _last_processed_block_hash = ''
+            _canonical_head_hash = ''
         print("[INFO][chain_state] Cleared existing in-memory state for full rebuild.")
         # Initialize genesis state
         with _balance_lock:
             _balances[GENESIS_ADDRESS] = GENESIS_BALANCE
         print(f"[INFO][chain_state] Initialized genesis balance: {GENESIS_ADDRESS[:10]}... = {GENESIS_BALANCE}")
     
-    # Get all blocks from database, ordered by block number
-    # Get all blocks from database, ordered by block number
-    block_rows = db.get_blocks_after(start_block)
+    import db
+    if path_hashes is not None:
+        block_rows = [db.get_block_by_hash(h) for h in path_hashes]
+        block_rows = [b for b in block_rows if b is not None]
+    else:
+        # Get all blocks from database, ordered by block number
+        block_rows = db.get_canonical_blocks_at_or_after_height(start_block)
     
     if not block_rows:
         print(f"[INFO][chain_state] No new blocks found since block {start_block -1}. State is up to date.")
@@ -709,7 +431,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0):
     # Process each block in chronological order
     for block_idx, block_data in enumerate(block_rows):
         try:
-            # block_data is already a dict from db.get_blocks_after
+            # block_data is already a dict from db.get_canonical_blocks_at_or_after_height
             block_number = block_data['header']['block_number']
             block_hash = block_data['block_hash'][:16] + "..."
             transactions = block_data.get('transactions', [])
@@ -757,7 +479,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0):
             print(f"[ERROR][chain_state] Unexpected error processing block #{block_idx}: {e}")
         
         # Update the last processed block hash after successfully processing a block
-        _last_processed_block_hash = block_data['block_hash']
+        _canonical_head_hash = block_data['block_hash']
     
     # Print final state summary
     print(f"[INFO][chain_state] Blockchain state reconstruction completed!")
@@ -982,8 +704,8 @@ def load_state_from_db() -> bool:
         global _tau_engine_state_hash
         _tau_engine_state_hash = ""
         
-        global _last_processed_block_hash
-        _last_processed_block_hash = last_processed_block_hash
+        global _canonical_head_hash
+        _canonical_head_hash = last_processed_block_hash
         
     return True
 
@@ -1012,12 +734,12 @@ def initialize_persistent_state():
     print("[DEBUG][chain_state] Attempting to load state from database...")
     loaded = load_state_from_db()
     if loaded:
-        print(f"[DEBUG][chain_state] State loaded successfully. Last known block hash: '{_last_processed_block_hash[:16]}...'")
+        print(f"[DEBUG][chain_state] State loaded successfully. Last known block hash: '{_canonical_head_hash[:16]}...'")
     else:
         print("[DEBUG][chain_state] No persistent state found in database.")
 
     print("[DEBUG][chain_state] Fetching latest block from database...")
-    latest = db.get_latest_block()
+    latest = db.get_canonical_head_block()
     latest_hash = latest['block_hash'] if latest else ''
     if latest_hash:
          print(f"[DEBUG][chain_state] Latest block hash from DB: '{latest_hash[:16]}...'")
@@ -1033,8 +755,8 @@ def initialize_persistent_state():
     else:
         # Verify consistency with blockchain head
         print("[DEBUG][chain_state] Verifying consistency between loaded state and blockchain head...")
-        if _last_processed_block_hash != latest_hash:
-            print(f"[WARN][chain_state] State-DB mismatch! State hash: '{_last_processed_block_hash[:16]}...', DB hash: '{latest_hash[:16]}...'.")
+        if _canonical_head_hash != latest_hash:
+            print(f"[WARN][chain_state] State-DB mismatch! State hash: '{_canonical_head_hash[:16]}...', DB hash: '{latest_hash[:16]}...'.")
             print("[INFO][chain_state] Triggering full state rebuild due to mismatch.")
             rebuild_state_from_blockchain(start_block=0)
             print(f"[DEBUG][chain_state] Rebuild complete. Committing state with latest block hash: '{latest_hash[:16]}...'")
@@ -1070,3 +792,148 @@ def load_builtin_rules_from_disk() -> list[str]:
         if rule_text:
             rules.append(rule_text)
     return rules
+
+
+def _is_reachable_from_genesis(b_hash: str) -> bool:
+    import config, db
+    try:
+        path = db.get_chain_path(b_hash, config.GENESIS_HASH)
+        return True
+    except ValueError:
+        return False
+
+def select_best_head(candidates: list[tuple[str, int]]) -> str | None:
+    if not candidates:
+        return None
+        
+    def score(cand):
+        block_hash, height = cand
+        return (-height, bytes.fromhex(block_hash))
+        
+    best = min(candidates, key=score)
+    return best[0]
+
+def ingest_block(block: Block) -> IngestResult:
+    import db, config
+    engine = PoATauEngine()
+    if not engine.verify_block(block):
+        return IngestResult('invalid', "Block verification failed")
+    
+    existing = db.get_block_by_hash(block.block_hash)
+    if existing:
+        return IngestResult('known', "Block already exists")
+    
+    # Enforce parent linkage rules for non-genesis
+    parent = db.get_block_by_hash(block.header.previous_hash)
+    if parent:
+        parent_num = int(parent['header'].get('block_number', -1))
+        if block.header.block_number != parent_num + 1:
+            return IngestResult('invalid', f"Block number {block.header.block_number} is not +1 of parent {parent_num}")
+    elif block.header.previous_hash != config.GENESIS_HASH and block.block_hash != config.GENESIS_HASH:
+        # Parent missing, store as orphan
+        db.add_block(block)
+        return IngestResult('orphan', f"Block stored as orphan (missing parent {block.header.previous_hash})")
+        
+    db.add_block(block)
+    return IngestResult('added', "Block ingested to DB")
+
+def maybe_update_canonical_head():
+    import db
+    candidates = db.get_candidate_heads()
+    if not candidates:
+        return
+        
+    valid_cands = []
+    for cand_hash, cand_height in candidates:
+        if _is_reachable_from_genesis(cand_hash):
+            valid_cands.append((cand_hash, cand_height))
+            
+    best_hash = select_best_head(valid_cands)
+    if not best_hash:
+        return
+        
+    with _chain_lock:
+        current_head = db.get_canonical_head()
+        current_hash = current_head.get('block_hash') if current_head else ''
+        if best_hash != current_hash:
+            reorg_to(best_hash)
+
+def reorg_to(new_head_hash: str):
+    import db, config
+    
+    current_head = db.get_canonical_head()
+    old_head_hash = current_head.get('block_hash') if current_head else config.GENESIS_HASH
+    
+    if old_head_hash == new_head_hash:
+        return
+        
+    try:
+        new_path = db.get_chain_path(new_head_hash, config.GENESIS_HASH)
+    except ValueError:
+        return
+        
+    old_path = []
+    if old_head_hash != config.GENESIS_HASH:
+        try:
+            old_path = db.get_chain_path(old_head_hash, config.GENESIS_HASH)
+        except ValueError:
+            pass
+            
+    common_prefix_len = 0
+    for n_h, o_h in zip(new_path, old_path):
+        if n_h == o_h:
+            common_prefix_len += 1
+        else:
+            break
+            
+    new_suffix = new_path[common_prefix_len:]
+    old_suffix = old_path[common_prefix_len:]
+    
+    # Phase 2: Mempool Diffs
+    old_txs = {}
+    from block import compute_tx_hash
+    for shash in old_suffix:
+        b = db.get_block_by_hash(shash)
+        if b:
+            for tx in b.get('transactions', []):
+                tx_id = compute_tx_hash(tx) if isinstance(tx, dict) else tx
+                old_txs[tx_id] = tx
+                
+    new_txs = set()
+    for shash in new_suffix:
+        b = db.get_block_by_hash(shash)
+        if b:
+            for tx in b.get('transactions', []):
+                tx_id = compute_tx_hash(tx) if isinstance(tx, dict) else tx
+                new_txs.add(tx_id)
+                
+    # Phase 3: Apply State Rebuild
+    db.reset_mempool_reservations()
+    _rebuild_state_from_blockchain_internal(0, path_hashes=new_path)
+    
+    # Phase 4: Atomic Commit of Rebuilt State
+    with _balance_lock, _sequence_lock, _rules_lock:
+        b = dict(_balances)
+        s = dict(_sequence_numbers)
+        r = _current_rules_state
+        head_num = db.get_block_by_hash(new_head_hash)['header']['block_number']
+        db.save_canonical_state_atomically(
+            head_hash=new_head_hash,
+            head_num=head_num,
+            balances=b,
+            sequences=s,
+            rules=r
+        )
+    
+    # Phase 5: Mempool Restore
+    if new_txs:
+        db.remove_mempool_by_hashes(list(new_txs))
+        
+    import time, json
+    for tx_id, tx in old_txs.items():
+        if tx_id not in new_txs:
+            try:
+                db.add_mempool_tx(json.dumps(tx, separators=(",", ":")), tx_id, int(time.time()))
+            except Exception as e:
+                logger.error(f"[chain_state] Failed to restore tx {tx_id} to mempool: {e}")
+    

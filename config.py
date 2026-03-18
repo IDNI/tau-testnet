@@ -76,7 +76,7 @@ class DatabaseSettings:
 @dataclass
 class NetworkSettings:
     network_id: str = "tau-local"
-    genesis_hash: str = "GENESIS"
+    genesis_hash: str = "0000000000000000000000000000000000000000000000000000000000000000"
     listen: List[str] = field(default_factory=lambda: ["/ip4/0.0.0.0/tcp/0"])
     bootstrap_peers: List[Dict[str, Any]] = field(default_factory=list)
     peerstore_path: Optional[str] = None
@@ -222,7 +222,7 @@ BASE_DEFAULTS: Dict[str, Any] = {
     "database": asdict(DatabaseSettings()),
     "network": {
         "network_id": "tau-local",
-        "genesis_hash": "GENESIS",
+        "genesis_hash": "0000000000000000000000000000000000000000000000000000000000000000",
         "listen": ["/ip4/0.0.0.0/tcp/0"], 
         "bootstrap_peers": [
             {

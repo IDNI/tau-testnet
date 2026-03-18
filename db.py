@@ -4,6 +4,7 @@ import os
 import sqlite3
 import threading
 from typing import Dict, List, Optional
+from contextlib import contextmanager
 
 import config
 import block as block_module
@@ -22,11 +23,21 @@ def init_db():
     data_dir = os.path.dirname(config.STRING_DB_PATH)
     try:
         if data_dir and not os.path.exists(data_dir):
-            os.makedirs(data_dir, exist_ok=True)
+            os.makedirs(str(data_dir), exist_ok=True)
 
         conn = sqlite3.connect(config.STRING_DB_PATH, check_same_thread=False)
         conn.execute('PRAGMA foreign_keys = ON;')
         with conn:
+            # Migration to Fork Choice schema: Check if block_hash is PK (or is missing)
+            cur = conn.execute("PRAGMA table_info(blocks);")
+            blocks_cols = {row[1]: row for row in cur.fetchall()}
+            if blocks_cols and ("block_hash" not in blocks_cols or blocks_cols["block_hash"][5] != 1):
+                logger.info("Migrating to Fork Choice schema (dropping old tables)...")
+                conn.execute("DROP TABLE IF EXISTS blocks;")
+                conn.execute("DROP TABLE IF EXISTS accounts;")
+                conn.execute("DROP TABLE IF EXISTS chain_state;")
+                conn.execute("DROP TABLE IF EXISTS mempool;")
+
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS tau_strings (
                     id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,13 +57,16 @@ def init_db():
             ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS blocks (
-                    block_number  INTEGER PRIMARY KEY,
-                    block_hash    TEXT NOT NULL UNIQUE,
+                    block_hash    TEXT PRIMARY KEY,
+                    block_number  INTEGER NOT NULL,
                     previous_hash TEXT NOT NULL,
                     timestamp     INTEGER NOT NULL,
                     block_data    TEXT NOT NULL
                 );
             ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_blocks_number ON blocks(block_number);')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_blocks_prev_hash ON blocks(previous_hash);')
+            
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS accounts (
                     address         TEXT PRIMARY KEY,
@@ -78,8 +92,21 @@ def init_db():
                     last_seen    INTEGER
                 );
             ''')
-            # Migration to new schema: if old columns exist or table structure is wrong, drop and recreate.
-            # Since mempool is transient, we can safely drop it.
+            
+            # Ensure Genesis block row exists
+            genesis_data = json.dumps({
+                "block_hash": config.GENESIS_HASH,
+                "header": {
+                    "block_number": 0,
+                    "previous_hash": "0" * 64,
+                    "timestamp": 0
+                }
+            })
+            conn.execute('''
+                INSERT OR IGNORE INTO blocks (block_hash, block_number, previous_hash, timestamp, block_data)
+                VALUES (?, 0, ?, 0, ?)
+            ''', (config.GENESIS_HASH, "0"*64, genesis_data))
+
             # Migration: Check schema against requirements
             cur = conn.execute("PRAGMA table_info(mempool);")
             cols_info = {row[1]: row for row in cur.fetchall()}
@@ -111,6 +138,27 @@ def init_db():
 
     _db_conn = conn
     logger.info("Database initialized at %s", config.STRING_DB_PATH)
+
+@contextmanager
+def get_db_connection():
+    """Provides thread-safe access to the global SQLite connection."""
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    # Provide the connection inside the global db lock
+    with _db_lock:
+        yield _db_conn
+
+def reset_mempool_reservations():
+    """Unreserves all mempool transactions, returning them to the pending pool."""
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        assert _db_conn is not None
+        cur = _db_conn.cursor()
+        cur.execute("UPDATE mempool SET status = 'pending', reserved_at = 0, batch_id = NULL")
+        _db_conn.commit()
 
 def get_string_id(text: str) -> str:
     """
@@ -371,10 +419,10 @@ def add_block(new_block: block_module.Block):
     with _db_lock:
         cur = _db_conn.cursor()
         cur.execute(
-            'INSERT INTO blocks (block_number, block_hash, previous_hash, timestamp, block_data) VALUES (?, ?, ?, ?, ?)',
+            'INSERT INTO blocks (block_hash, block_number, previous_hash, timestamp, block_data) VALUES (?, ?, ?, ?, ?)',
             (
-                new_block.header.block_number,
                 new_block.block_hash,
+                new_block.header.block_number,
                 new_block.header.previous_hash,
                 new_block.header.timestamp,
                 block_data_json,
@@ -383,18 +431,9 @@ def add_block(new_block: block_module.Block):
         _db_conn.commit()
         logger.info("Added block #%s to database", new_block.header.block_number)
 
-def get_latest_block() -> Optional[Dict]:
-    """Retrieves the latest block (highest block_number) from the database."""
-    if _db_conn is None:
-        init_db()
-    with _db_lock:
-        cur = _db_conn.cursor()
-        cur.execute('SELECT block_data FROM blocks ORDER BY block_number DESC LIMIT 1')
-        row = cur.fetchone()
-        if row:
-            return json.loads(row[0])
-        else:
-            return None
+def get_canonical_head_block() -> Optional[Dict]:
+    """Retrieves the canonical head block from the database."""
+    return get_canonical_head()
 
 def get_block_by_hash(block_hash: str) -> Optional[Dict]:
     """Return the block with the given hash as a parsed dict, or None if missing."""
@@ -428,28 +467,43 @@ def get_all_blocks() -> List[Dict]:
                 continue
     return out
 
-def get_blocks_after(block_number: int) -> List[Dict]:
+def get_canonical_blocks_at_or_after_height(block_number: int) -> List[Dict]:
     """
-    Returns all blocks with block_number >= the given number, ordered by block_number ASC.
+    Returns canonical blocks with block_number >= the given number, ordered by block_number ASC.
     """
+    head = get_canonical_head()
+    if not head:
+        return []
+    head_hash = head.get('block_hash')
+    if not head_hash:
+        return []
+        
+    import config
+    path = get_chain_path(head_hash, config.GENESIS_HASH)
+    path_hashes = set(path)
+    path_hashes.add(config.GENESIS_HASH)
+    if not path_hashes:
+        return []
+        
+    out: List[Dict] = []
     if _db_conn is None:
         init_db()
-    out: List[Dict] = []
     with _db_lock:
         cur = _db_conn.cursor()
-        cur.execute('SELECT block_data FROM blocks WHERE block_number >= ? ORDER BY block_number ASC', (block_number,))
+        cur.execute('SELECT block_data, block_hash FROM blocks WHERE block_number >= ? ORDER BY block_number ASC', (block_number,))
         rows = cur.fetchall()
-        for (block_json,) in rows:
-            try:
-                out.append(json.loads(block_json))
-            except Exception:
-                continue
+        for block_json, b_hash in rows:
+            if b_hash in path_hashes:
+                try:
+                    out.append(json.loads(block_json))
+                except Exception:
+                    continue
     return out
 
 def load_chain_state() -> tuple[Dict[str, int], Dict[str, int], str, str]:
     """
-    Loads the persisted chain state (balances, sequences, rules, last_block_hash).
-    Returns: (balances, sequence_numbers, current_rules, last_processed_block_hash)
+    Loads the persisted chain state (balances, sequences, rules, canonical_head_hash).
+    Returns: (balances, sequence_numbers, current_rules, canonical_head_hash)
     """
     if _db_conn is None:
         init_db()
@@ -457,7 +511,7 @@ def load_chain_state() -> tuple[Dict[str, int], Dict[str, int], str, str]:
     balances: Dict[str, int] = {}
     sequences: Dict[str, int] = {}
     current_rules = ""
-    last_processed_block_hash = ""
+    canonical_head_hash = ""
 
     with _db_lock:
         # Load accounts
@@ -469,17 +523,17 @@ def load_chain_state() -> tuple[Dict[str, int], Dict[str, int], str, str]:
         # Load state
         cur = _db_conn.execute(
             'SELECT key, value FROM chain_state WHERE key IN (?, ?)',
-            ('current_rules', 'last_processed_block_hash')
+            ('current_rules', 'canonical_head_hash')
         )
         entries = dict(cur.fetchall())
         current_rules = entries.get('current_rules', '')
-        last_processed_block_hash = entries.get('last_processed_block_hash', '')
+        canonical_head_hash = entries.get('canonical_head_hash', '')
         
-    return balances, sequences, current_rules, last_processed_block_hash
+    return balances, sequences, current_rules, canonical_head_hash
 
-def save_chain_state(balances: Dict[str, int], sequences: Dict[str, int], rules: str, last_block_hash: str):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], rules: str):
     """
-    Saves the chain state to the database atomically.
+    Saves the chain state to the database atomically with Full Replace semantics for accounts.
     """
     if _db_conn is None:
         init_db()
@@ -492,14 +546,153 @@ def save_chain_state(balances: Dict[str, int], sequences: Dict[str, int], rules:
             )
             _db_conn.execute(
                 'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                ('last_processed_block_hash', last_block_hash)
+                ('canonical_head_hash', head_hash)
             )
+            _db_conn.execute(
+                'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+                ('canonical_head_number', str(head_num))
+            )
+
+            # Full replace for accounts to prevent stale balances
+            _db_conn.execute('DELETE FROM accounts')
             for address, balance in balances.items():
                 seq = sequences.get(address, 0)
                 _db_conn.execute(
-                    'INSERT OR REPLACE INTO accounts (address, balance, sequence_number) VALUES (?, ?, ?)',
+                    'INSERT INTO accounts (address, balance, sequence_number) VALUES (?, ?, ?)',
                     (address, balance, seq)
                 )
+
+def get_candidate_heads() -> List[tuple[str, int]]:
+    """
+    Returns a list of (block_hash, block_number) for all blocks that do not have any known children.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('''
+            SELECT block_hash, block_number 
+            FROM blocks 
+            WHERE block_hash NOT IN (
+                SELECT previous_hash FROM blocks
+            )
+        ''')
+        return cur.fetchall()
+
+def get_canonical_head() -> Optional[Dict]:
+    """
+    Returns the block pointed to by canonical_head_hash, or None if not set.
+    """
+    if _db_conn is None:
+        init_db()
+    
+    canonical_hash = None
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT value FROM chain_state WHERE key = ?', ('canonical_head_hash',))
+        row = cur.fetchone()
+        if row:
+            canonical_hash = row[0]
+            
+    if not canonical_hash:
+        return None
+        
+    return get_block_by_hash(canonical_hash)
+
+def get_canonical_locator(max_entries: int = 32) -> List[str]:
+    """
+    Returns a list of block hashes representing the canonical chain, starting from
+    the canonical head, with exponential backoff steps, ending at Genesis.
+    """
+    if _db_conn is None:
+        init_db()
+        
+    canonical_hash = None
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT value FROM chain_state WHERE key = ?', ('canonical_head_hash',))
+        row = cur.fetchone()
+        if row:
+            canonical_hash = row[0]
+            
+    import config
+    if not canonical_hash:
+        return [config.GENESIS_HASH]
+
+    locator = []
+    step = 1
+    current_hash = canonical_hash
+    
+    visited = set()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        while current_hash and len(locator) < max_entries:
+            if current_hash in visited:
+                break
+            visited.add(current_hash)
+            locator.append(current_hash)
+            
+            for _ in range(step):
+                cur.execute('SELECT previous_hash FROM blocks WHERE block_hash = ?', (current_hash,))
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    # Check if genesis config hash
+                    if current_hash != config.GENESIS_HASH:
+                        current_hash = None
+                    break
+                current_hash = row[0]
+                if current_hash in visited:
+                    break
+                if current_hash == config.GENESIS_HASH:
+                    break
+            
+            if len(locator) > 10:
+                step *= 2
+                
+    if config.GENESIS_HASH not in locator and len(locator) < max_entries:
+        locator.append(config.GENESIS_HASH)
+        
+    return locator
+
+def get_chain_path(start_hash: str, target_ancestor: str, max_depth: int = 2000) -> List[str]:
+    """
+    Walks backwards from start_hash to target_ancestor. Returns the path in chronological order
+    (target_ancestor+1 ... start_hash). 
+    Raises ValueError if target_ancestor is not found or path exceeds max_depth.
+    """
+    if _db_conn is None:
+        init_db()
+        
+    path = []
+    current_hash = start_hash
+    visited = set()
+    
+    with _db_lock:
+        cur = _db_conn.cursor()
+        while current_hash != target_ancestor:
+            if current_hash in visited:
+                raise ValueError(f"Cycle detected in blockchain graph at {current_hash}")
+            visited.add(current_hash)
+            
+            if len(path) > max_depth:
+                raise ValueError(f"Ancestry search exceeded max_depth of {max_depth}")
+                
+            path.append(current_hash)
+            
+            cur.execute('SELECT previous_hash FROM blocks WHERE block_hash = ?', (current_hash,))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(f"Block not found during ancestry walk: {current_hash} (searching for {target_ancestor})")
+            
+            if not row[0]:
+                raise ValueError(f"Target ancestor {target_ancestor} not found in path from {start_hash}")
+                
+            current_hash = row[0]
+            
+    path.reverse()
+    return path
+
+
 
 # --- Peerstore DB-backed functions ---
 from typing import Optional, Dict, List

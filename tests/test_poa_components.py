@@ -58,7 +58,7 @@ def test_sole_miner_mines_block_when_threshold_met(temp_database):
         miner.try_mine()
         
         # Verify via DB side effects
-        latest = db.get_latest_block()
+        latest = db.get_canonical_head_block()
         assert latest is not None
         assert latest["header"]["state_hash"]
         assert db.count_mempool_txs() == 0

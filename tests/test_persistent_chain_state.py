@@ -69,7 +69,7 @@ def test_commit_and_load_roundtrip(isolate_db):
 def test_initialize_persistent_state_empty_db_creates_genesis(isolate_db):
     db, cs, _, _ = isolate_db
     # Ensure blocks table empty
-    assert db.get_latest_block() is None
+    assert db.get_canonical_head_block() is None
     # Initialize persistent state
     cs.initialize_persistent_state()
     # Genesis balance should be present

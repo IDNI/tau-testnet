@@ -95,6 +95,16 @@ class TestStateReconstruction(unittest.TestCase):
         if os.path.exists(self.temp_db_path):
             os.remove(self.temp_db_path)
     
+    def add_block_and_set_head(self, block):
+        """Adds a block and sets it as the canonical head in the DB, allowing rebuild state to find it."""
+        from db import _db_conn, _db_lock
+        add_block(block)
+        with _db_lock:
+            _db_conn.execute('INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)', ('canonical_head_hash', block.block_hash))
+            _db_conn.execute('INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)', ('canonical_head_number', str(block.header.block_number)))
+            _db_conn.commit()
+        chain_state._canonical_head_hash = block.block_hash
+    
     def create_test_transaction(self, sender_pubkey, sequence_number, transfers=None, rules=None):
         """Helper to create a test transaction."""
         operations = {}
@@ -141,14 +151,14 @@ class TestStateReconstruction(unittest.TestCase):
             ]
         )
         
-        block_0 = Block.create(
-            block_number=0,
-            previous_hash="0" * 64,
+        block_1 = Block.create(
+            block_number=1,
+            previous_hash=config.GENESIS_HASH,
             transactions=[tx1]
         )
         
         # Add block to database
-        add_block(block_0)
+        self.add_block_and_set_head(block_1)
         
         # Rebuild state
         rebuild_state_from_blockchain()
@@ -207,12 +217,12 @@ class TestStateReconstruction(unittest.TestCase):
                 transfers=[[self.addr1, self.addr2, "3"]],
                 rules=rule_for(2)
             ); all_rules.append(tx3["operations"]["0"])
-            block_0 = Block.create(
-                block_number=0,
-                previous_hash="0" * 64,
+            block_1 = Block.create(
+                block_number=1,
+                previous_hash=config.GENESIS_HASH,
                 transactions=[tx1, tx2, tx3]
             )
-            add_block(block_0)
+            self.add_block_and_set_head(block_1)
 
             # -------- Block 1  (sender = addr2) --------
             tx4 = self.create_test_transaction(
@@ -233,12 +243,12 @@ class TestStateReconstruction(unittest.TestCase):
                 transfers=[[self.addr2, self.addr3, "3"]],
                 rules=rule_for(5)
             ); all_rules.append(tx6["operations"]["0"])
-            block_1 = Block.create(
-                block_number=1,
-                previous_hash=block_0.block_hash,
+            block_2 = Block.create(
+                block_number=2,
+                previous_hash=block_1.block_hash,
                 transactions=[tx4, tx5, tx6]
             )
-            add_block(block_1)
+            self.add_block_and_set_head(block_2)
 
             # -------- Block 2  (sender = addr3) --------
             tx7 = self.create_test_transaction(
@@ -259,12 +269,12 @@ class TestStateReconstruction(unittest.TestCase):
                 transfers=[[self.addr3, self.addr1, "1"]],
                 rules=rule_for(8)
             ); all_rules.append(tx9["operations"]["0"])
-            block_2 = Block.create(
-                block_number=2,
-                previous_hash=block_1.block_hash,
+            block_3 = Block.create(
+                block_number=3,
+                previous_hash=block_2.block_hash,
                 transactions=[tx7, tx8, tx9]
             )
-            add_block(block_2)
+            self.add_block_and_set_head(block_3)
 
             # --- Send EVERY rule to Tau and expect non‑zero confirmations ---
             for idx, rule in enumerate(all_rules, start=1):
@@ -315,12 +325,12 @@ class TestStateReconstruction(unittest.TestCase):
             transfers=[[self.addr1, self.addr3, "invalid_amount"]]
         )
         
-        block_0 = Block.create(
-            block_number=0,
-            previous_hash="0" * 64,
+        block_1 = Block.create(
+            block_number=1,
+            previous_hash=config.GENESIS_HASH,
             transactions=[valid_tx, invalid_tx, invalid_amount_tx]
         )
-        add_block(block_0)
+        self.add_block_and_set_head(block_1)
         
         # Rebuild state
         rebuild_state_from_blockchain()
@@ -365,12 +375,12 @@ class TestStateReconstruction(unittest.TestCase):
             transfers=[]  # Empty transfer list
         )
         
-        block_0 = Block.create(
-            block_number=0,
-            previous_hash="0" * 64,
+        block_1 = Block.create(
+            block_number=1,
+            previous_hash=config.GENESIS_HASH,
             transactions=[tx1, tx2, tx3]
         )
-        add_block(block_0)
+        self.add_block_and_set_head(block_1)
         
         # Rebuild state from blockchain
         rebuild_state_from_blockchain()
@@ -400,12 +410,12 @@ class TestStateReconstruction(unittest.TestCase):
             )
 
             # Build and add the block to the chain DB
-            block_0 = Block.create(
-                block_number=0,
-                previous_hash="0" * 64,
+            block_1 = Block.create(
+                block_number=1,
+                previous_hash=config.GENESIS_HASH,
                 transactions=[tx1]
             )
-            add_block(block_0)
+            self.add_block_and_set_head(block_1)
 
             # --- Send rule to Tau and expect a non‑zero confirmation ---
             confirmation = tau_manager.communicate_with_tau(rule_text, target_output_stream_index=0)
@@ -438,12 +448,12 @@ class TestStateReconstruction(unittest.TestCase):
             rules="test_rule_for_tau_processing"
         )
         
-        block_0 = Block.create(
-            block_number=0,
-            previous_hash="0" * 64,
+        block_1 = Block.create(
+            block_number=1,
+            previous_hash=config.GENESIS_HASH,
             transactions=[tx1]
         )
-        add_block(block_0)
+        self.add_block_and_set_head(block_1)
         
         # Rebuild state - this should handle Tau not being available gracefully
         try:
@@ -461,7 +471,7 @@ class TestStateReconstruction(unittest.TestCase):
         """Test state reconstruction handles unknown operation types gracefully."""
         print("\n=== Testing state reconstruction with unknown operations ===")
         
-        self.start_tau(force_native=True)
+        self.start_tau()
         try:
             # Create a transaction with unknown operation types
             tx1 = self.create_test_transaction(
@@ -475,12 +485,12 @@ class TestStateReconstruction(unittest.TestCase):
             tx1["operations"]["99"] = "123" # Must be valid Tau syntax or entire tx is rejected
             tx1["operations"]["custom"] = {"some": "data"}
             
-            block_0 = Block.create(
-                block_number=0,
-                previous_hash="0" * 64,
+            block_1 = Block.create(
+                block_number=1,
+                previous_hash=config.GENESIS_HASH,
                 transactions=[tx1]
             )
-            add_block(block_0)
+            self.add_block_and_set_head(block_1)
             
             # Rebuild state (should process known operations and skip unknown ones)
             rebuild_state_from_blockchain()
@@ -510,12 +520,12 @@ class TestStateReconstruction(unittest.TestCase):
             # No operations at all
         )
         
-        block_0 = Block.create(
-            block_number=0,
-            previous_hash="0" * 64,
+        block_1 = Block.create(
+            block_number=1,
+            previous_hash=config.GENESIS_HASH,
             transactions=[tx1, tx2]
         )
-        add_block(block_0)
+        self.add_block_and_set_head(block_1)
         
         # Rebuild state
         rebuild_state_from_blockchain()

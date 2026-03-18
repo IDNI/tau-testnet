@@ -82,9 +82,9 @@ def test_outbound_handshake_capping(service):
     service._dht_manager._encode_dht_key.side_effect = lambda ns, sfx: f"/{ns}/{sfx}".encode("utf-8")
     
     service._config.genesis_hash = "genesis123"
-    # Mock db.get_latest_block in sys.modules
+    # Mock db.get_canonical_head_block in sys.modules
     mock_db = MagicMock()
-    mock_db.get_latest_block.return_value = {
+    mock_db.get_canonical_head.return_value = {
         "header": {"block_number": 10},
         "block_hash": "head123"
     }

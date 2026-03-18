@@ -1388,10 +1388,10 @@ always (
 #   All other senders pass through (vacuous truth from '->').
 #
 # STREAM TYPES:
-#   i1[t] : transfer amount           (bv[64])
+#   i1[t] : transfer amount           (bv[16])
 #   i3[t] : sender public key         (bv[384])
 #   i4[t] : recipient/counterparty    (bv[384])
-#   i5[t] : block timestamp           (bv[64])
+#   i5[t] : block timestamp           (bv[16])
 #   o5[t] : policy guard signal       (bv[16]: 0=block, 1=allow)
 #
 # ----- POINTWISE REVISION INSTRUCTIONS -----
@@ -1403,18 +1403,18 @@ always (
 # REVISION EXAMPLE A — Raise cap to 10000:
 #   always (
 #     (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
-#       && i1[t] > {10000}:bv[64])
+#       && i1[t] > {10000}:bv[16])
 #     ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
 #   ).
 #
 # REVISION EXAMPLE B — Time-dependent cap using 'ex':
 #   always (
 #     ex c (
-#       (i5[t] >= {1800000000}:bv[64] && c = {20000}:bv[64])
-#       || (i5[t] < {1800000000}:bv[64] && c = {10000}:bv[64])
+#       (i5[t] >= {1800000000}:bv[16] && c = {20000}:bv[16])
+#       || (i5[t] < {1800000000}:bv[16] && c = {10000}:bv[16])
 #     ) && (
 #       (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
-#         && i1[t] > c:bv[64])
+#         && i1[t] > c:bv[16])
 #       ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
 #     )
 #   ).
@@ -1425,16 +1425,16 @@ always (
   (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384])
   -> (
     # 1. TIME-LOCK: Block all transfers before this timestamp.
-    (i5[t] < {1750000000}:bv[64]
+    (i5[t] < {1750000000}:bv[16]
       ? o5[t] = {0}:bv[16]
       : (
         # 2. ABSOLUTE CAP: No single transfer may exceed 50000.
-        (i1[t] > {50000}:bv[64]
+        (i1[t] > {50000}:bv[16]
           ? o5[t] = {0}:bv[16]
           : (
             # 3. APPROVED-COUNTERPARTY: Transfers above 1000 require
             #    the recipient to be a specific approved counterparty.
-            (i1[t] > {1000}:bv[64]
+            (i1[t] > {1000}:bv[16]
               && !(i4[t] = {#x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222}:bv[384]))
             ? o5[t] = {0}:bv[16]
             : o5[t] = {1}:bv[16]
@@ -1448,9 +1448,324 @@ always (
 # BOTH clauses output o5 = 1.
 (always (
   (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
-    && i1[t] > {5000}:bv[64])
+    && i1[t] > {5000}:bv[16])
   ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
-)).`
+)).`,
+
+    "Programmable Finance Protocol (Aspirational Features)": `# ================================================================
+# PROGRAMMABLE FINANCE PROTOCOL — Forward-Looking Tau Contract
+# ================================================================
+#
+# PURPOSE:
+#   This contract demonstrates features that the Tau language NEEDS
+#   to support for real-world blockchain finance. Each section is
+#   annotated with its implementation status:
+#
+#     [AVAILABLE]    — works in Tau v0.7-alpha today
+#     [ASPIRATIONAL] — requires language extensions
+#
+# This serves as a development roadmap for Tau language features
+# needed to make on-chain programmable finance practical.
+#
+# ================================================================
+# STREAM LAYOUT:
+#   INPUTS:
+#     i1[t] : transfer amount         (bv[16])
+#     i3[t] : sender address           (bv[384])
+#     i4[t] : recipient address        (bv[384])
+#     i5[t] : block timestamp          (bv[16])
+#     i6[t] : operation type           (bv[16])
+#             0=transfer, 1=governance_vote, 2=vesting_claim
+#     i7[t] : governance proposal id   (bv[16])
+#     i8[t] : vote weight / approval   (bv[16])
+#
+#   OUTPUTS:
+#     o5[t] : policy decision          (bv[16]: 0=block, 1=allow)
+#     o7[t] : governance tally         (bv[16]: accumulated votes)
+#     o8[t] : vesting release amount   (bv[16]: claimable tokens)
+#     o9[t] : audit log / reason code  (bv[16])
+#             0=ok, 1=rate_limit, 2=governance_denied,
+#             3=vesting_locked, 4=fee_too_low
+# ================================================================
+
+
+# ================================================================
+# SECTION 1: BASIC SENDER-SCOPED TRANSFER GUARD
+# [AVAILABLE] — standard sender match + amount cap
+# ================================================================
+# This part works today. It guards the treasury address with
+# a hard spending cap and time-lock.
+
+(always (
+  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384])
+  -> (
+    (i1[t] > {50000}:bv[16]
+      ? o5[t] = {0}:bv[16]
+      : o5[t] = {1}:bv[16])
+  )
+))
+
+
+# ================================================================
+# SECTION 2: TEMPORAL RATE LIMITING (Sliding Window)
+# [ASPIRATIONAL] — requires: o5[t-1] temporal back-references
+#                             on OUTPUT streams, and bv addition
+#                             across time steps
+# ================================================================
+# GOAL: Block transfers if total spending in the last N steps
+#       exceeds a threshold. This requires:
+#   1. Referencing past OUTPUT values (o[t-1], o[t-2], ...)
+#   2. Accumulating sums across a time window
+#   3. Comparing accumulated totals against a budget
+#
+# PSEUDOCODE (not valid Tau today):
+#
+#   # Track cumulative spending in a rolling window
+#   # spent_window[t] accumulates the last 10 transfers
+#   spent_window[0](amt) := amt
+#   spent_window[n](amt) := spent_window[n-1](amt) + i1[t-n]
+#
+#   always (
+#     i3[t] = TREASURY
+#     -> ex total (
+#       total = spent_window[10](i1[t])
+#       && (total > {100000}:bv[16]
+#         ? (o5[t] = {0}:bv[16] && o9[t] = {1}:bv[16])
+#         : o5[t] = {1}:bv[16])
+#     )
+#   ).
+#
+# WHY THIS MATTERS:
+#   Rate limiting is the #1 requested DeFi safety feature.
+#   Without temporal accumulation, contracts cannot express
+#   "no more than X tokens per day" — a basic requirement
+#   for treasury management, anti-whale, and compliance.
+#
+# REQUIRED TAU EXTENSIONS:
+#   - Output stream temporal back-references: o5[t-1]
+#   - Bitvector addition across time-indexed terms
+#   - Recurrence relations over stream values (not just variables)
+
+
+# ================================================================
+# SECTION 3: DYNAMIC FEE CALCULATION
+# [ASPIRATIONAL] — requires: bv multiplication, division,
+#                             percentage arithmetic
+# ================================================================
+# GOAL: Compute a fee as a percentage of transfer amount and
+#       reject transfers that don't include sufficient fee.
+#
+# PSEUDOCODE:
+#
+#   # Fee = 0.5% of amount = amount * 5 / 1000
+#   # Requires: bv multiplication and division operators
+#   always (
+#     i6[t] = {0}:bv[16]    # operation type = transfer
+#     -> ex fee (
+#       fee = (i1[t] * {5}:bv[16]) / {1000}:bv[16]
+#       && (i9[t] < fee      # i9 = fee provided by sender
+#         ? (o5[t] = {0}:bv[16] && o9[t] = {4}:bv[16])
+#         : o5[t] = {1}:bv[16])
+#     )
+#   ).
+#
+# WHY THIS MATTERS:
+#   Every blockchain needs fee models. Percentage-based fees,
+#   tiered pricing, and dynamic fee markets all require
+#   multiplication and division — operations that bitvector
+#   theory supports but Tau doesn't expose yet.
+#
+# REQUIRED TAU EXTENSIONS:
+#   - Bitvector multiplication: a * b
+#   - Bitvector division: a / b
+#   - Bitvector modulo: a % b (useful for remainder checks)
+
+
+# ================================================================
+# SECTION 4: MULTI-PARTY GOVERNANCE (Weighted Voting)
+# [ASPIRATIONAL] — requires: persistent state, aggregate
+#                             functions, cross-step accumulation
+# ================================================================
+# GOAL: Allow a set of governance addresses to vote on proposals.
+#       A proposal passes when accumulated vote weight exceeds
+#       a threshold. The transfer is allowed only if the relevant
+#       proposal has passed.
+#
+# PSEUDOCODE:
+#
+#   # Governance predicate using recurrence for vote tally
+#   # Each step where i6=1 (vote), accumulate weight from i8
+#   tally[0](proposal) := {0}:bv[16]
+#   tally[n](proposal) := (
+#     (i6[t-n] = {1}:bv[16] && i7[t-n] = proposal)
+#     ? tally[n-1](proposal) + i8[t-n]
+#     : tally[n-1](proposal)
+#   )
+#
+#   # Governance quorum check
+#   governance_approved(proposal) :=
+#     ex total (
+#       total = tally[100](proposal)
+#       && total >= {500}:bv[16]   # quorum = 500 weight
+#     )
+#
+#   # Large transfers (>10000) require governance approval
+#   always (
+#     (i3[t] = TREASURY && i1[t] > {10000}:bv[16])
+#     -> (governance_approved({1}:bv[16])
+#       ? o5[t] = {1}:bv[16]
+#       : (o5[t] = {0}:bv[16] && o9[t] = {2}:bv[16]))
+#   ).
+#
+# WHY THIS MATTERS:
+#   DAOs, multisig wallets, and on-chain governance all need
+#   the ability to tally votes and enforce quorum. This
+#   requires Tau to support:
+#   - Recurrence relations that reference input streams at
+#     past time steps (i6[t-n], i7[t-n], i8[t-n])
+#   - Addition within recurrence bodies
+#   - Cross-step state that persists across execution steps
+#
+# REQUIRED TAU EXTENSIONS:
+#   - Stream-indexed recurrence relations: f[n] referencing i[t-n]
+#   - Bitvector addition in recurrence bodies
+#   - Persistent state semantics (values that survive across steps)
+
+
+# ================================================================
+# SECTION 5: TOKEN VESTING SCHEDULE
+# [ASPIRATIONAL] — requires: bv multiplication, temporal
+#                             arithmetic (timestamp differences),
+#                             min/max functions
+# ================================================================
+# GOAL: Release tokens linearly over time. A beneficiary can
+#       claim tokens proportional to elapsed time since a start
+#       date, up to a total grant amount.
+#
+# PSEUDOCODE:
+#
+#   # Constants
+#   VESTING_START   = {1750000000}:bv[16]
+#   VESTING_END     = {1800000000}:bv[16]
+#   TOTAL_GRANT     = {100000}:bv[16]
+#   BENEFICIARY     = {#x333...333}:bv[384]
+#
+#   # Linear vesting: released = total * (now - start) / (end - start)
+#   # Clamped to [0, TOTAL_GRANT]
+#   vested_amount(now) := ex elapsed ex duration ex released (
+#     elapsed = max({0}:bv[16], now - VESTING_START)
+#     && duration = VESTING_END - VESTING_START
+#     && released = min(TOTAL_GRANT, (TOTAL_GRANT * elapsed) / duration)
+#     && released   # return value
+#   )
+#
+#   # On vesting claim (i6=2):
+#   always (
+#     (i6[t] = {2}:bv[16] && i3[t] = BENEFICIARY)
+#     -> ex claimable (
+#       claimable = vested_amount(i5[t])
+#       && o8[t] = claimable
+#       && (i1[t] > claimable
+#         ? (o5[t] = {0}:bv[16] && o9[t] = {3}:bv[16])
+#         : o5[t] = {1}:bv[16])
+#     )
+#   ).
+#
+# WHY THIS MATTERS:
+#   Token vesting is fundamental to crypto projects — team
+#   allocations, investor lockups, community grants. It requires:
+#   - Timestamp subtraction and comparison
+#   - Multiplication and division for proportional calculation
+#   - min/max clamping functions
+#   - Output streams that emit computed values (o8 = claimable)
+#
+# REQUIRED TAU EXTENSIONS:
+#   - min(a, b), max(a, b) as built-in or definable functions
+#   - Bitvector multiplication / division
+#   - Subtraction that handles underflow gracefully
+
+
+# ================================================================
+# SECTION 6: CROSS-STREAM COMPUTED DEPENDENCY
+# [ASPIRATIONAL] — requires: multiple output streams computed
+#                             from shared intermediate values
+# ================================================================
+# GOAL: Compute an intermediate decision once and use it to
+#       drive multiple output streams (policy + audit log).
+#
+# PSEUDOCODE:
+#
+#   always (
+#     i3[t] = TREASURY
+#     -> ex decision ex reason (
+#       # Compute decision once
+#       (i1[t] > {50000}:bv[16]
+#         ? (decision = {0}:bv[16] && reason = {1}:bv[16])    # blocked: rate limit
+#         : (i1[t] > {10000}:bv[16] && !governance_approved()
+#           ? (decision = {0}:bv[16] && reason = {2}:bv[16])  # blocked: no governance
+#           : (decision = {1}:bv[16] && reason = {0}:bv[16])  # allowed
+#         ))
+#       # Fan out to multiple outputs
+#       && o5[t] = decision
+#       && o9[t] = reason
+#     )
+#   ).
+#
+# WHY THIS MATTERS:
+#   Real contracts need audit trails. The ability to compute
+#   a decision and simultaneously write it to a policy stream
+#   AND a reason-code stream enables on-chain compliance logging.
+#   Current Tau can write to multiple outputs, but computing
+#   intermediate values via 'ex' and fanning them out to several
+#   streams is untested at scale and may need optimization.
+#
+# WHAT'S NEEDED:
+#   - Verification that 'ex' variables can drive multiple output
+#     stream assignments within the same always(...) clause
+#   - Performance optimization for multi-output resolution
+#   - Engine support for reading o9 as an audit/receipt stream
+
+
+# ================================================================
+# SECTION 7: POINTWISE REVISION FOR GOVERNANCE UPGRADES
+# [AVAILABLE] — pointwise revision works today
+# ================================================================
+# The governance section above can be upgraded via pointwise
+# revision. For example, to change the quorum from 500 to 750:
+#
+#   always (
+#     (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
+#       && i1[t] > {10000}:bv[16])
+#     -> (governance_approved_v2({1}:bv[16])
+#       ? o5[t] = {1}:bv[16]
+#       : (o5[t] = {0}:bv[16] && o9[t] = {2}:bv[16]))
+#   ).
+#
+# Where governance_approved_v2 uses a threshold of 750 instead
+# of 500. The old clause is replaced, new one takes effect.
+
+
+# ================================================================
+# SUMMARY: REQUIRED TAU LANGUAGE EXTENSIONS
+# ================================================================
+#
+# Priority 1 (Unlocks basic DeFi):
+#   - Bitvector multiplication:  a * b
+#   - Bitvector division:        a / b
+#   - Output temporal references: o5[t-1] in specifications
+#
+# Priority 2 (Unlocks governance & compliance):
+#   - Stream-indexed recurrence: f[n] referencing i[t-n]
+#   - Aggregate temporal functions: sum over window
+#   - Cross-step persistent state semantics
+#
+# Priority 3 (Unlocks advanced finance):
+#   - min/max built-in functions
+#   - Modulo operator: a % b
+#   - Multiple output stream fan-out optimization
+#   - Engine support for audit/receipt streams (o9)
+#
+# ================================================================`
 };
 
 function initRuleTemplates() {

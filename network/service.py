@@ -198,7 +198,7 @@ class NetworkService:
                     if remote_head:
                         import db
 
-                        local_latest = db.get_latest_block()
+                        local_latest = db.get_canonical_head()
                         local_head_number = 0
                         local_head_hash = self._config.genesis_hash
                         local_has_blocks = bool(local_latest and isinstance(local_latest, dict) and local_latest.get("block_hash"))
@@ -265,7 +265,7 @@ class NetworkService:
         # Prefer the persisted chain tip if available.
         try:
             import db
-            latest = db.get_latest_block()
+            latest = db.get_canonical_head()
             if latest and "header" in latest:
                 payload["head_number"] = int(latest["header"].get("block_number", payload["head_number"]))
                 payload["head_hash"] = str(latest.get("block_hash") or payload["head_hash"])
@@ -388,10 +388,9 @@ class NetworkService:
         try:
             import db
 
-            blocks = db.get_all_blocks()
-            hashes = [b.get("block_hash") for b in blocks if isinstance(b, dict) and b.get("block_hash")]
+            hashes = db.get_canonical_locator(max_entries)
             if hashes:
-                locator.extend(list(reversed(hashes[-max_entries:])))
+                locator.extend(hashes)
         except Exception:
             logger.debug("Failed to build locator from db", exc_info=True)
 
@@ -576,7 +575,7 @@ class NetworkService:
         # Prefer the persisted chain tip if available.
         try:
             import db
-            latest = db.get_latest_block()
+            latest = db.get_canonical_head_block()
             if latest and "header" in latest:
                 resp["head_number"] = int(latest["header"].get("block_number", resp["head_number"]))
                 resp["head_hash"] = str(latest.get("block_hash") or resp["head_hash"])
@@ -744,7 +743,7 @@ class NetworkService:
             logger.debug("SYNC request parsed: %s", req if req else "<empty>")
 
             # Compute local tip
-            latest = db.get_latest_block()
+            latest = db.get_canonical_head()
             if latest and isinstance(latest, dict) and latest.get("header"):
                 tip_number = int(latest["header"].get("block_number", 0))
                 tip_hash = str(latest.get("block_hash") or self._config.genesis_hash)
@@ -762,20 +761,25 @@ class NetworkService:
 
             # Find the first locator hash we recognize and start after it.
             start_block = 0
+            print("DEBUG: locator =", locator)
             for h in locator:
                 try:
                     blk = db.get_block_by_hash(str(h))
+                    print("DEBUG: h =", str(h), "blk =", blk)
                 except Exception:
                     blk = None
+                    print("DEBUG: Exception finding", h)
                 if blk and isinstance(blk, dict) and blk.get("header"):
                     try:
                         start_block = int(blk["header"].get("block_number", 0)) + 1
+                        print("DEBUG: Evaluated start_block =", start_block)
                     except Exception:
                         start_block = 0
+                        print("DEBUG: Exception evaluating start_block!")
                     break
 
             headers: List[Dict[str, Any]] = []
-            for blk in db.get_blocks_after(start_block):
+            for blk in db.get_canonical_blocks_at_or_after_height(start_block):
                 if not isinstance(blk, dict):
                     continue
                 bh = blk.get("block_hash")
@@ -867,7 +871,7 @@ class NetworkService:
                     except Exception:
                         start_number = 0
 
-                for blk in db.get_blocks_after(start_number):
+                for blk in db.get_canonical_blocks_at_or_after_height(start_number):
                     blocks.append(blk)
                     if len(blocks) >= limit:
                         break
@@ -887,7 +891,7 @@ class NetworkService:
                     limit = 1
                 limit = max(1, min(limit, 2000))
 
-                for blk in db.get_blocks_after(start_number):
+                for blk in db.get_canonical_blocks_at_or_after_height(start_number):
                     blocks.append(blk)
                     if len(blocks) >= limit:
                         break
@@ -1474,15 +1478,25 @@ class NetworkService:
         def _ingest(sorted_blocks: List[Dict[str, Any]]) -> int:
             import chain_state
             from block import Block
+            import logging
+            logger = logging.getLogger(__name__)
 
             ingested = 0
             for b in sorted_blocks:
                 try:
                     blk = Block.from_dict(b)
-                    if chain_state.process_new_block(blk):
+                    res = chain_state.ingest_block(blk)
+                    if res.status in ('added', 'orphan', 'known'):
                         ingested += 1
-                except Exception:
+                except Exception as e:
+                    logger.debug("Ingest error for block: %s", e)
                     continue
+                    
+            try:
+                chain_state.maybe_update_canonical_head()
+            except Exception as e:
+                logger.error("Failed to update canonical head after sync: %s", e)
+                
             return ingested
 
         try:

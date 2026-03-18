@@ -62,6 +62,8 @@ class PoATauEngine(TauEngine):
         snapshot: TauStateSnapshot,
         transactions: Sequence[Dict[str, Any]],
         block_timestamp: int | None = None,
+        target_balances: Optional[Dict[str, int]] = None,
+        target_sequences: Optional[Dict[str, int]] = None,
     ) -> TauExecutionResult:
         """
         Apply transactions to the current state.
@@ -107,7 +109,11 @@ class PoATauEngine(TauEngine):
             sequence_number = tx.get('sequence_number')
             should_increment_seq = False
             if sequence_number is not None and sender:
-                current_seq = chain_state.get_sequence_number(sender)
+                if target_sequences is not None:
+                    current_seq = target_sequences.get(sender, 0)
+                else:
+                    current_seq = chain_state.get_sequence_number(sender)
+                    
                 if sequence_number == current_seq:
                     should_increment_seq = True
                 else:
@@ -251,10 +257,26 @@ class PoATauEngine(TauEngine):
                                         )
                                         tx_receipt["logs"].append(f"Tau(transfer) o1: {tau_output_transfer}")
                                     
-                                    if not chain_state.update_balances_after_transfer(from_addr, to_addr, amount):
-                                        execution_success = False
-                                        tx_receipt["logs"].append("Transfer balance state failed")
-                                        break
+                                    if target_balances is not None:
+                                        # Use isolated balance tracking
+                                        current_from = target_balances.get(from_addr, 0)
+                                        if from_addr not in target_balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
+                                            current_from = 1000
+                                            
+                                        if current_from < amount:
+                                            logger.error("Insufficient funds for %s to send %s. Has: %s.", from_addr[:10], amount, current_from)
+                                            execution_success = False
+                                            tx_receipt["logs"].append("Transfer balance state failed (insufficient)")
+                                            break
+                                            
+                                        current_to = target_balances.get(to_addr, 0)
+                                        target_balances[from_addr] = current_from - amount
+                                        target_balances[to_addr] = current_to + amount
+                                    else:
+                                        if not chain_state.update_balances_after_transfer(from_addr, to_addr, amount):
+                                            execution_success = False
+                                            tx_receipt["logs"].append("Transfer balance state failed")
+                                            break
                                 except Exception as e:
                                     logger.error("Error applying transfer: %s", e)
                                     execution_success = False
@@ -265,7 +287,7 @@ class PoATauEngine(TauEngine):
                         pass
                 
                 # --- Step 4: Unified Custom Execution (if no transfers were present) ---
-                if execution_success and not transfers_op_data and (custom_tau_inputs or rule_op_data is not None or True):
+                if execution_success and not transfers_op_data and (custom_tau_inputs or rule_op_data is not None):
                     try:
                          unified_inputs = {}
                          for k, v in custom_tau_inputs.items():
@@ -290,7 +312,10 @@ class PoATauEngine(TauEngine):
             if accepted_in_block:
                 if should_increment_seq and sender:
                     try:
-                        chain_state.increment_sequence_number(sender)
+                        if target_sequences is not None:
+                            target_sequences[sender] = target_sequences.get(sender, 0) + 1
+                        else:
+                            chain_state.increment_sequence_number(sender)
                     except Exception:
                         logger.error("Failed to increment sequence number for %s", sender, exc_info=True)
                         tx_receipt["logs"].append("Error: failed to increment sequence number")

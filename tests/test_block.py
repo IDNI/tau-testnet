@@ -18,7 +18,7 @@ from block import (
     EMPTY_STATE_HASH,
 )
 from commands import createblock
-from db import init_db, add_mempool_tx, get_latest_block, clear_mempool
+from db import init_db, add_mempool_tx, get_canonical_head_block, clear_mempool
 import config
 
 TEST_MINER_PRIVKEY = "11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09"
@@ -176,11 +176,11 @@ class TestBlockCreation(unittest.TestCase):
         self.assertIsNotNone(created_block_data)
         
         # Verify from DB
-        latest_block = get_latest_block()
+        latest_block = get_canonical_head_block()
         self.assertIsNotNone(latest_block)
         
         self.assertEqual(latest_block['header']['block_number'], 0)
-        self.assertEqual(latest_block['header']['previous_hash'], "0" * 64)
+        self.assertEqual(latest_block['header']['previous_hash'], "0000000000000000000000000000000000000000000000000000000000000000")
         self.assertEqual(len(latest_block['transactions']), 1)
         self.assertEqual(latest_block['transactions'][0], json.loads(self.tx1_json))
         self.assertEqual(latest_block['block_hash'], created_block_data['block_hash'])
@@ -197,7 +197,7 @@ class TestBlockCreation(unittest.TestCase):
         next_block_data = createblock.create_block_from_mempool()
 
         # 3. Verify the new block from DB
-        latest_block = get_latest_block()
+        latest_block = get_canonical_head_block()
         self.assertIsNotNone(latest_block)
         
         self.assertEqual(latest_block['header']['block_number'], 1)
@@ -217,8 +217,8 @@ class TestBlockCreation(unittest.TestCase):
         # Verify no block was created
         self.assertIn("Mempool is empty", result.get("message", ""))
         
-        # Verify database has no blocks
-        latest_block = get_latest_block()
+        # Verify database has no extra blocks (still completely empty)
+        latest_block = get_canonical_head_block()
         self.assertIsNone(latest_block)
 
     def test_create_block_requires_miner_key(self):

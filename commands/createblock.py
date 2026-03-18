@@ -363,15 +363,18 @@ def create_block_from_mempool() -> Dict:
         print("[ERROR][createblock] BLS signing not available; cannot sign PoA block.")
         return {"error": "BLS signing is required for PoA blocks."}
     
-    # Get batch of reserved transactions from mempool
-    reserved_txs = db.reserve_mempool_txs(limit=1000)
-    print(f"[INFO][createblock] Reserved {len(reserved_txs)} entries from mempool")
+    from chain_state import _chain_lock
+    import time
+    with _chain_lock:
+        # Get batch of reserved transactions from mempool
+        reserved_txs = db.reserve_mempool_txs(limit=1000)
+        print(f"[INFO][createblock] Reserved {len(reserved_txs)} entries from mempool")
 
-    if not reserved_txs:
-        # Check if there were any pending at all (for logging purposes)
-        # But we are done if no reserved txs
-        print("[INFO][createblock] Mempool is empty (no pending txs). No block created.")
-        return {"message": "Mempool is empty. No block created."}
+        if not reserved_txs:
+            # Check if there were any pending at all (for logging purposes)
+            # But we are done if no reserved txs
+            print("[INFO][createblock] Mempool is empty (no pending txs). No block created.")
+            return {"message": "Mempool is empty. No block created."}
     
     # Extract data
     mempool_txs = [rtx['payload'] for rtx in reserved_txs]
@@ -437,7 +440,7 @@ def create_block_from_mempool() -> Dict:
     transactions = final_txs
     
     # Get latest block to determine new block number and previous hash
-    latest_block = db.get_latest_block()
+    latest_block = db.get_canonical_head_block()
     if latest_block:
         block_number = latest_block['header']['block_number'] + 1
         previous_hash = latest_block['block_hash']
@@ -517,7 +520,7 @@ def create_block_from_mempool() -> Dict:
         )
         conn.execute(
             'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-            ('last_processed_block_hash', new_block.block_hash)
+            ('canonical_head_hash', new_block.block_hash)
         )
         for addr, bal in final_balances.items():
             seq = final_sequences.get(addr, 0)
@@ -544,7 +547,7 @@ def create_block_from_mempool() -> Dict:
             
             chain_state._current_rules_state = final_rules
             chain_state._tau_engine_state_hash = state_hash
-            chain_state._last_processed_block_hash = new_block.block_hash
+            chain_state._canonical_head_hash = new_block.block_hash
     except Exception as e:
         print(f"[CRITICAL][createblock] Failed to update in-memory state after DB commit: {e}. Node restart recommended.")
             

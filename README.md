@@ -32,10 +32,12 @@ When enabled, the system maintains a single `tau::interpreter` instance and capt
     *   Bootstrapping connects to peers, performs handshake + sync, fetches missing blocks, rebuilds state, and replays gossip subscriptions so the node immediately participates in block/transaction mesh traffic.
     *   **Tip semantics**: Block numbers are **0-indexed**. A node with no persisted blocks may still report `head_number: 0` with `head_hash` set to the `genesis_hash` sentinel. A node with exactly one block (block `#0`) will also report `head_number: 0`, but with `head_hash` equal to that block hash. Sync decisions must consider `head_hash` (not just `head_number`).
     *   Verbose debug logging traces requests/responses and bootstrap progress for easier development.
-*   **Persistent Blockchain**:
+*   **Persistent Blockchain & Fork Choice**:
     *   Creates blocks from transactions stored in the mempool.
     *   Links blocks together in a chain by referencing the previous block's hash.
-    *   Persists the entire chain of blocks to a SQLite database.
+    *   Persists the entire chain of blocks to a SQLite database, tracking multiple competing tips and forks.
+    *   Evaluates the heaviest valid branch using a robust, fork-choice algorithm based on highest-block-height with deterministic tie-breaking.
+    *   Performs chain reorganizations ("reorgs") seamlessly, reverting and re-applying transactions and state when the main chain tips to a different path log.
 *   **Proof-of-Authority (PoA) Blocks (BLS signatures)**:
     *   Blocks can be signed by the configured authority key (`TAU_MINER_PRIVKEY`) and verified against `TAU_MINER_PUBKEY` (when `py_ecc` is available).
     *   The PoA execution path integrates with the Tau rule/state snapshot (`state_hash`) to keep block ↔ state linkage explicit.
@@ -383,7 +385,6 @@ Please submit issues at the following link: [Tau Testnet issues](https://github.
 
 ## Future Work
 
-*   Fork choice mechanism.
 *   Expansion of Tau logic.
 *   Multi-authority PoA (validator set, rotation) and stronger fork-choice/finality rules.
 *   More robust error handling and reporting.

@@ -33,7 +33,7 @@ def mock_chain_state(mock_db_path):
     chain_state._balances.clear()
     chain_state._sequence_numbers.clear()
     chain_state._current_rules_state = ""
-    chain_state._last_processed_block_hash = ""
+    chain_state._canonical_head_hash = ""
     return chain_state
 
 # --- Tests for db.py ---
@@ -41,13 +41,13 @@ def mock_chain_state(mock_db_path):
 def test_db_public_methods(mock_db_path):
     db.init_db()
     
-    # 1. Test save_chain_state
+    # 1. Test save_canonical_state_atomically
     balances = {"addr1": 100, "addr2": 200}
     sequences = {"addr1": 1, "addr2": 2}
     rules = "some rules"
     last_hash = "hash123"
     
-    db.save_chain_state(balances, sequences, rules, last_hash)
+    db.save_canonical_state_atomically(last_hash, 10, balances, sequences, rules)
     
     # 2. Test load_chain_state
     loaded_balances, loaded_seqs, loaded_rules, loaded_hash = db.load_chain_state()
@@ -57,26 +57,29 @@ def test_db_public_methods(mock_db_path):
     assert loaded_rules == rules
     assert loaded_hash == last_hash
     
-    # 3. Test get_blocks_after
+    # 3. Test get_canonical_blocks_at_or_after_height
     # Insert some blocks manually or via add_block
     class MockBlock:
-        def __init__(self, num, hash_val):
+        def __init__(self, num, hash_val, prev_hash):
             self.header = MagicMock()
             self.header.block_number = num
-            self.header.previous_hash = "prev"
+            self.header.previous_hash = prev_hash
             self.header.timestamp = 123
             self.block_hash = hash_val
         def to_dict(self):
             return {
-                "header": {"block_number": self.header.block_number},
+                "header": {"block_number": self.header.block_number, "previous_hash": self.header.previous_hash},
                 "block_hash": self.block_hash
             }
             
-    db.add_block(MockBlock(1, "hash1"))
-    db.add_block(MockBlock(2, "hash2"))
-    db.add_block(MockBlock(3, "hash3"))
+    db.add_block(MockBlock(1, "hash1", config.GENESIS_HASH))
+    db.add_block(MockBlock(2, "hash2", "hash1"))
+    db.add_block(MockBlock(3, "hash3", "hash2"))
     
-    blocks = db.get_blocks_after(2)
+    # Must explicitly set canonical_head_hash via actual save path for locator
+    db.save_canonical_state_atomically("hash3", 3, balances, sequences, rules)
+    
+    blocks = db.get_canonical_blocks_at_or_after_height(2)
     assert len(blocks) == 2 # 2 and 3
     assert blocks[0]["header"]["block_number"] == 2
     assert blocks[1]["header"]["block_number"] == 3
@@ -92,14 +95,14 @@ def test_chain_state_persistence(mock_chain_state):
     with chain_state._rules_lock:
         chain_state._current_rules_state = "rules v1"
         
-    # Commit
-    chain_state.commit_state_to_db("block_hash_1")
+    # Commit directly through the DB persistence flow since commit_state_to_db was migrated!
+    db.save_canonical_state_atomically("block_hash_1", 1, {"alice": 500}, {"alice": 5}, "rules v1")
     
     # Clear memory
     chain_state._balances.clear()
     chain_state._sequence_numbers.clear()
     chain_state._current_rules_state = ""
-    chain_state._last_processed_block_hash = ""
+    chain_state._canonical_head_hash = ""
     
     # Load
     loaded = chain_state.load_state_from_db()
@@ -108,7 +111,7 @@ def test_chain_state_persistence(mock_chain_state):
     assert chain_state.get_balance("alice") == 500
     assert chain_state.get_sequence_number("alice") == 5
     assert chain_state.get_rules_state() == "rules v1"
-    assert chain_state._last_processed_block_hash == "block_hash_1"
+    assert chain_state._canonical_head_hash == "block_hash_1"
 
 # --- Tests for server.py error handling ---
 

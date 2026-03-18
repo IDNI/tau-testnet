@@ -452,7 +452,7 @@ def _run_server(container: ServiceContainer):
                         )
 
                     # Persist the resulting rules snapshot so restarts don't re-inject.
-                    latest = db_module.get_latest_block()
+                    latest = db_module.get_canonical_head_block()
                     latest_hash = latest["block_hash"] if latest else ""
                     chain_state_module.commit_state_to_db(latest_hash)
                     logger.info("Built-in rules injected and persisted (last_block_hash=%s).", latest_hash[:16] if latest_hash else "")
