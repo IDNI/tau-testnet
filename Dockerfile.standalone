@@ -98,7 +98,6 @@ RUN chmod +x /usr/local/bin/tau-node-entrypoint && \
     mkdir -p /data
 
 ENV PYTHONUNBUFFERED=1 \
-    TAU_USE_DIRECT_BINDINGS=1 \
     TAU_FORCE_TEST=0 \
     TAU_ENV=development \
     TAU_HOST=0.0.0.0 \

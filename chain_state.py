@@ -709,7 +709,7 @@ def load_state_from_db() -> bool:
         
     return True
 
-def commit_state_to_db(block_hash: str):
+def commit_state_to_db(block_hash: str, block_number: int):
     """
     Commits the in-memory state (balances, sequence numbers, rules) to the database atomically,
     associating it with the provided block_hash.
@@ -720,7 +720,7 @@ def commit_state_to_db(block_hash: str):
         sequences_snapshot = _sequence_numbers.copy()
         rules_snapshot = _current_rules_state
         
-    db.save_chain_state(balances_snapshot, sequences_snapshot, rules_snapshot, block_hash)
+    db.save_canonical_state_atomically(block_hash, block_number, balances_snapshot, sequences_snapshot, rules_snapshot)
 
 def initialize_persistent_state():
     """
@@ -741,6 +741,7 @@ def initialize_persistent_state():
     print("[DEBUG][chain_state] Fetching latest block from database...")
     latest = db.get_canonical_head_block()
     latest_hash = latest['block_hash'] if latest else ''
+    latest_num = latest['block_number'] if latest else 0
     if latest_hash:
          print(f"[DEBUG][chain_state] Latest block hash from DB: '{latest_hash[:16]}...'")
     else:
@@ -751,7 +752,7 @@ def initialize_persistent_state():
         print("[INFO][chain_state] Triggering full state rebuild because no persistent state was found.")
         rebuild_state_from_blockchain(start_block=0)
         print(f"[DEBUG][chain_state] Rebuild complete. Committing state with latest block hash: '{latest_hash[:16]}...'")
-        commit_state_to_db(latest_hash)
+        commit_state_to_db(latest_hash, latest_num)
     else:
         # Verify consistency with blockchain head
         print("[DEBUG][chain_state] Verifying consistency between loaded state and blockchain head...")
@@ -760,7 +761,7 @@ def initialize_persistent_state():
             print("[INFO][chain_state] Triggering full state rebuild due to mismatch.")
             rebuild_state_from_blockchain(start_block=0)
             print(f"[DEBUG][chain_state] Rebuild complete. Committing state with latest block hash: '{latest_hash[:16]}...'")
-            commit_state_to_db(latest_hash)
+            commit_state_to_db(latest_hash, latest_num)
         else:
             print(f"[INFO][chain_state] Persistent state is consistent and up-to-date with the blockchain.")
 

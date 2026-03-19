@@ -9,7 +9,6 @@ services:
     image: tau-testnet-standalone:latest
     container_name: tau-testnet-standalone
     environment:
-      TAU_USE_DIRECT_BINDINGS: "1"
       TAU_FORCE_TEST: "0"
       TAU_ENV: "development"
       TAU_HOST: "0.0.0.0"

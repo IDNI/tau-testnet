@@ -454,7 +454,8 @@ def _run_server(container: ServiceContainer):
                     # Persist the resulting rules snapshot so restarts don't re-inject.
                     latest = db_module.get_canonical_head_block()
                     latest_hash = latest["block_hash"] if latest else ""
-                    chain_state_module.commit_state_to_db(latest_hash)
+                    latest_num = latest["block_number"] if latest else 0
+                    chain_state_module.commit_state_to_db(latest_hash, latest_num)
                     logger.info("Built-in rules injected and persisted (last_block_hash=%s).", latest_hash[:16] if latest_hash else "")
                 else:
                     logger.info("No built-in rules on disk; leaving Tau spec as-is.")
