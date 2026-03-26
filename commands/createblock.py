@@ -363,6 +363,27 @@ def create_block_from_mempool() -> Dict:
         print("[ERROR][createblock] BLS signing not available; cannot sign PoA block.")
         return {"error": "BLS signing is required for PoA blocks."}
     
+    # Ensure early turn-check and block number logic happens BEFORE reserving mempool
+    latest_block = db.get_canonical_head_block()
+    if latest_block:
+        block_number = latest_block['header']['block_number'] + 1
+        previous_hash = latest_block['block_hash']
+    else:
+        # Genesis block
+        block_number = 0
+        previous_hash = "0" * 64
+
+    validators = getattr(config, "MINER_PUBKEYS", [])
+    if not validators and config.MINER_PUBKEY:
+        validators = [config.MINER_PUBKEY]
+    
+    if validators:
+        expected_miner = validators[block_number % len(validators)]
+        if config.MINER_PUBKEY and expected_miner != config.MINER_PUBKEY:
+            msg = f"Not our turn to mine block #{block_number}. Expected: {expected_miner[:10]}..."
+            print(f"[INFO][createblock] {msg}")
+            return {"message": msg}
+
     from chain_state import _chain_lock
     import time
     with _chain_lock:
@@ -440,15 +461,10 @@ def create_block_from_mempool() -> Dict:
     transactions = final_txs
     
     # Get latest block to determine new block number and previous hash
-    latest_block = db.get_canonical_head_block()
+    # (Already computed early to enforce turn, just logging now)
     if latest_block:
-        block_number = latest_block['header']['block_number'] + 1
-        previous_hash = latest_block['block_hash']
         print(f"[INFO][createblock] Latest block is #{latest_block['header']['block_number']}. New block will be #{block_number}.")
     else:
-        # Genesis block
-        block_number = 0
-        previous_hash = "0" * 64
         print(f"[INFO][createblock] No existing blocks. Creating Genesis Block #{block_number}.")
     
     print(f"[INFO][createblock] Creating block #{block_number} with previous hash: {previous_hash[:16]}...")

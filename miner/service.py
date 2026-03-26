@@ -34,11 +34,27 @@ class SoleMiner:
         self._last_mine_time = time.time()  # Initialize to avoid immediate mine on startup
 
     def _should_mine(self) -> bool:
+        # 1. Turn check logic first (fast path)
+        latest_block = db.get_canonical_head_block()
+        next_block_number = latest_block['header']['block_number'] + 1 if latest_block else 0
+        
+        validators = getattr(config, "MINER_PUBKEYS", [])
+        if not validators and config.MINER_PUBKEY:
+            validators = [config.MINER_PUBKEY]
+            
+        if validators:
+            expected_miner = validators[next_block_number % len(validators)]
+            if config.MINER_PUBKEY and expected_miner != config.MINER_PUBKEY:
+                return False # Not our turn
+
+        # 2. Check mempool threshold
         pending = db.count_mempool_txs()
         if pending == 0:
             return False
         if pending >= self._threshold:
             return True
+            
+        # 3. Check time interval
         return (time.time() - self._last_mine_time) >= self._max_block_interval
 
     def try_mine(self) -> None:

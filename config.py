@@ -137,6 +137,7 @@ class AuthoritySettings:
     miner_pubkey: str = (
         "a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b"
     )
+    miner_pubkeys: List[str] = field(default_factory=list)
     miner_pubkey_path: Optional[str] = None
     miner_privkey: Optional[str] = None
     miner_privkey_path: Optional[str] = field(
@@ -147,12 +148,38 @@ class AuthoritySettings:
     mining_enabled: bool = True
 
     def validate(self) -> None:
-        if not (isinstance(self.miner_pubkey, str) and len(self.miner_pubkey) == 96):
-            raise ConfigurationError("Authority miner_pubkey must be a 96-character hex string.")
-        try:
-            bytes.fromhex(self.miner_pubkey)
-        except ValueError as exc:
-            raise ConfigurationError("Authority miner_pubkey must be valid hexadecimal.") from exc
+        if self.mining_enabled:
+            # Local miner identity is required when mining
+            if not (isinstance(self.miner_pubkey, str) and len(self.miner_pubkey) == 96):
+                raise ConfigurationError("Authority miner_pubkey must be a 96-character hex string.")
+            try:
+                bytes.fromhex(self.miner_pubkey)
+            except ValueError as exc:
+                raise ConfigurationError("Authority miner_pubkey must be valid hexadecimal.") from exc
+
+            # Multi-miner validation
+            if not self.miner_pubkeys:
+                if self.miner_pubkey:
+                     self.miner_pubkeys = [self.miner_pubkey]
+                else:
+                     raise ConfigurationError("Authority miner_pubkeys must not be empty if mining is enabled.")
+            
+            # Check for duplicates
+            if len(self.miner_pubkeys) != len(set(self.miner_pubkeys)):
+                raise ConfigurationError("Authority miner_pubkeys contains duplicates. Validators must be unique.")
+                
+            # Check if local miner is in the validator set
+            if self.miner_pubkey and self.miner_pubkey not in self.miner_pubkeys:
+                raise ConfigurationError(f"Local miner_pubkey ({self.miner_pubkey[:10]}...) is not in the validator schedule (miner_pubkeys).")
+            
+            # Validate format of all keys in schedule
+            for idx, pk in enumerate(self.miner_pubkeys):
+                if not (isinstance(pk, str) and len(pk) == 96):
+                    raise ConfigurationError(f"Authority miner_pubkeys index {idx} must be a 96-character hex string.")
+                try:
+                    bytes.fromhex(pk)
+                except ValueError as exc:
+                    raise ConfigurationError(f"Authority miner_pubkeys index {idx} must be valid hexadecimal.") from exc
         if self.miner_privkey:
             if not (isinstance(self.miner_privkey, str) and len(self.miner_privkey) == 64):
                 raise ConfigurationError("Authority miner_privkey must be a 64-character hex string.")
@@ -305,6 +332,11 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_LOG_FORMAT": ("logging", "format", str),
     "TAU_LOG_DATEFMT": ("logging", "datefmt", str),
     "TAU_MINER_PUBKEY": ("authority", "miner_pubkey", str),
+    "TAU_MINER_PUBKEYS": (
+        "authority", 
+        "miner_pubkeys", 
+        lambda value: [pk.strip() for pk in value.split(',') if pk.strip()]
+    ),
     "TAU_MINER_PUBKEY_PATH": ("authority", "miner_pubkey_path", str),
     "TAU_MINER_PRIVKEY": ("authority", "miner_privkey", str),
     "TAU_MINER_PRIVKEY_PATH": ("authority", "miner_privkey_path", str),
@@ -460,7 +492,25 @@ def load_settings(env: Optional[str] = None, overrides: Optional[Dict[str, Any]]
                     "Overriding miner_pubkey with value from %s", settings_obj.authority.miner_pubkey_path
                 )
             settings_obj.authority.miner_pubkey = pub_from_file
+
     settings_obj.validate()
+    
+    # Log the validator schedule on startup with a fingerprint for cross-node mismatch detection
+    if settings_obj.authority.mining_enabled and settings_obj.authority.miner_pubkeys:
+        import hashlib as _hl
+        schedule_fingerprint = _hl.sha256(",".join(settings_obj.authority.miner_pubkeys).encode()).hexdigest()[:16]
+        local_index = (
+            settings_obj.authority.miner_pubkeys.index(settings_obj.authority.miner_pubkey)
+            if settings_obj.authority.miner_pubkey in settings_obj.authority.miner_pubkeys
+            else "NOT INCLUDED"
+        )
+        logging.getLogger(__name__).info(
+            "Validator schedule: count=%d local_index=%s fingerprint=%s",
+            len(settings_obj.authority.miner_pubkeys),
+            local_index,
+            schedule_fingerprint,
+        )
+        
     return settings_obj
 
 
@@ -472,7 +522,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     global BOOTSTRAP_PEERS, NETWORK_ID, GENESIS_HASH, NETWORK_LISTEN, PEERSTORE_PATH, peerstore_path
     global DHT_RECORD_TTL, DHT_VALIDATOR_NAMESPACES, DHT_BOOTSTRAP_PEERS
     global LOGGING
-    global MINER_PUBKEY, MINER_PRIVKEY, BLOCK_SIGNATURE_SCHEME, STATE_LOCATOR_NAMESPACE
+    global MINER_PUBKEY, MINER_PRIVKEY, BLOCK_SIGNATURE_SCHEME, STATE_LOCATOR_NAMESPACE, MINER_PUBKEYS
 
     HOST = current.server.host
     PORT = current.server.port
@@ -502,6 +552,7 @@ def _sync_legacy_exports(current: Settings) -> None:
 
     LOGGING = current.logging
     MINER_PUBKEY = current.authority.miner_pubkey
+    MINER_PUBKEYS = current.authority.miner_pubkeys
     MINER_PRIVKEY = current.authority.miner_privkey
     BLOCK_SIGNATURE_SCHEME = current.authority.block_signature_scheme
     STATE_LOCATOR_NAMESPACE = current.authority.state_locator_namespace
@@ -562,6 +613,7 @@ __all__ = [
     "DHT_BOOTSTRAP_PEERS",
     "LOGGING",
     "MINER_PUBKEY",
+    "MINER_PUBKEYS",
     "MINER_PRIVKEY",
     "BLOCK_SIGNATURE_SCHEME",
     "STATE_LOCATOR_NAMESPACE",

@@ -25,8 +25,10 @@ class PoATauEngine(TauEngine):
 
     def __init__(self, state_store: Optional[StateStore] = None) -> None:
         self._state_store = state_store or StateStore()
-        # Validator set: currently just the configured miner public key
-        self._validators: Set[str] = {config.MINER_PUBKEY} if config.MINER_PUBKEY else set()
+        # Validator set: strictly ordered list of public keys representing the round robin schedule
+        self._validators: List[str] = list(getattr(config, "MINER_PUBKEYS", []) or [])
+        if not self._validators and config.MINER_PUBKEY:
+             self._validators = [config.MINER_PUBKEY]
 
     def is_validator(self, pubkey: str) -> bool:
         """Check if a public key belongs to an authorized validator."""
@@ -43,17 +45,18 @@ class PoATauEngine(TauEngine):
             logger.warning("PoA: Block #%s has no signature", block.header.block_number)
             return False
 
-        # Verify the signature itself
-        # Block.verify_signature() checks against config.MINER_PUBKEY by default.
-        # If we had multiple validators, we would need to recover the signer or check against each.
-        # For now, we assume the block class handles the crypto check against the configured miner.
-        if not block.verify_signature():
-            logger.warning("PoA: Block #%s signature verification failed", block.header.block_number)
+        # Determine expected miner for this block height (Round Robin)
+        if not self._validators:
+            logger.warning("PoA: No validators configured.")
             return False
+            
+        expected_miner_index = block.header.block_number % len(self._validators)
+        expected_miner = self._validators[expected_miner_index]
 
-        # If we had dynamic validators, we would check if the signer is in self._validators here.
-        # Since verify_signature uses MINER_PUBKEY and self._validators contains MINER_PUBKEY,
-        # it is implicitly checked.
+        # Verify the signature against the expected round-robin miner
+        if not block.verify_signature(miner_pubkey=expected_miner):
+            logger.warning("PoA: Block #%s signature verification failed. Expected miner: %s", block.header.block_number, expected_miner[:10])
+            return False
 
         return True
 
