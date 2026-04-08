@@ -200,11 +200,13 @@ def _get_signing_message_bytes(payload: dict) -> bytes:
     }
     if tx_type == "user_tx":
         signing_dict["operations"] = payload.get("operations", {})
-    elif tx_type == "consensus_proposal":
-        signing_dict["bundle"] = payload.get("bundle", {})
+    elif tx_type == "consensus_rule_update":
+        signing_dict["rule_revisions"] = payload.get("rule_revisions", [])
         signing_dict["activate_at_height"] = payload.get("activate_at_height")
-    elif tx_type == "consensus_vote":
-        signing_dict["proposal_id"] = payload.get("proposal_id")
+        if "host_contract_patch" in payload:
+            signing_dict["host_contract_patch"] = payload["host_contract_patch"]
+    elif tx_type == "consensus_rule_vote":
+        signing_dict["update_id"] = payload.get("update_id")
         signing_dict["approve"] = payload.get("approve", True)
         
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
@@ -293,23 +295,12 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
         raise ValueError("Missing 'fee_limit' in transaction.")
         
     tx_type = payload.get("tx_type", "user_tx")
-    if tx_type not in ("user_tx", "consensus_proposal", "consensus_vote"):
-        raise ValueError(f"Invalid 'tx_type' {tx_type}")
+    if tx_type not in ("user_tx", "consensus_rule_update", "consensus_rule_vote"):
+        return f"FAILURE: Unknown or legacy tx_type explicitly rejected natively: {tx_type}"
 
     if tx_type == "user_tx":
         if 'operations' not in payload or not isinstance(payload['operations'], dict):
             raise ValueError("Missing or invalid 'operations' in user_tx.")
-        operations = payload['operations']
-    elif tx_type == "consensus_proposal":
-        if 'bundle' not in payload or not isinstance(payload['bundle'], dict):
-            raise ValueError("Missing or invalid 'bundle' in consensus_proposal.")
-        if 'activate_at_height' not in payload or not isinstance(payload['activate_at_height'], int):
-            raise ValueError("Missing or invalid 'activate_at_height' in consensus_proposal.")
-    elif tx_type == "consensus_vote":
-        if 'proposal_id' not in payload or not isinstance(payload['proposal_id'], str):
-            raise ValueError("Missing or invalid 'proposal_id' in consensus_vote.")
-        if 'approve' not in payload or not isinstance(payload['approve'], bool):
-            raise ValueError("Missing or invalid 'approve' in consensus_vote.")
 
     if 'signature' not in payload:
         raise ValueError("Missing 'signature' in transaction.")
@@ -344,15 +335,19 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
     transfer_tau_inputs = []
     empty_transfer_list = False
     
+    # 1. Structural Dispatch & Thin Admission Validations
+    from consensus.admission import validate_mempool_admission
+    from consensus.facade import TipAdmissionView
+    tip_view = TipAdmissionView()
+    
+    admission_eval = validate_mempool_admission(payload, tip_view)
+    if not admission_eval.is_valid:
+        return f"FAILURE: {admission_eval.error}"
+
     if tx_type == "user_tx":
         operations = payload.get("operations", {})
         has_transfers = "1" in operations
         has_rules = "0" in operations
-        
-        # Prevent users from using reserved streams i6..i11
-        for key in operations.keys():
-            if key.isdigit() and 6 <= int(key) <= 11:
-                return f"FAILURE: Invalid operation key '{key}'. Streams 6-11 are reserved for consensus ABI."
     else:
         has_transfers = False
         has_rules = False
@@ -508,38 +503,9 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                     except Exception:
                         logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
 
-        elif tx_type == "consensus_proposal":
-            # Early validation before mempool insertion
-            validators = getattr(config, "MINER_PUBKEYS", [])
-            if not validators and config.MINER_PUBKEY:
-                validators = [config.MINER_PUBKEY]
-                
-            if sender_pubkey not in validators:
-                return f"FAILURE: Proposer {sender_pubkey[:10]} is not an active validator."
-                
-            bundle = payload["bundle"]
-            for field in ('consensus_id', 'proof_scheme', 'fork_choice_scheme', 'input_contract_version', 'tau_source'):
-                if field not in bundle:
-                    return f"FAILURE: Bundle missing required field: {field}"
-            if bundle['proof_scheme'] != 'bls_header_sig':
-                return f"FAILURE: Unsupported proof_scheme: {bundle['proof_scheme']}"
-            if bundle['fork_choice_scheme'] != 'height_then_hash':
-                return f"FAILURE: Unsupported fork_choice_scheme: {bundle['fork_choice_scheme']}"
-                
-            latest_block = db.get_canonical_head_block()
-            curr_height = latest_block['header']['block_number'] if latest_block else 0
-            min_height = curr_height + len(validators)
-            if payload['activate_at_height'] < min_height:
-                return f"FAILURE: Activation height {payload['activate_at_height']} must be >= {min_height}."
+                    except Exception:
+                        logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
 
-        elif tx_type == "consensus_vote":
-            validators = getattr(config, "MINER_PUBKEYS", [])
-            if not validators and config.MINER_PUBKEY:
-                validators = [config.MINER_PUBKEY]
-                
-            if sender_pubkey not in validators:
-                return f"FAILURE: Voter {sender_pubkey[:10]} is not an active validator."
-        
         # --- Post-Tau Processing ---
         # Note: We do NOT increment sequence number or update balances here anymore.
         # This is now an ingestion-only phase. State mutation happens during mining.
