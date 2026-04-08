@@ -167,6 +167,16 @@ class NetworkService:
             # Process response
             if data:
                 resp = json.loads(data.decode())
+                
+                # Protocol / Version Gate
+                if resp.get("network_id") != self._config.network_id:
+                    logger.warning("Disconnecting %s: incompatible network_id '%s'", peer_id, resp.get("network_id"))
+                    try:
+                        await self.host.disconnect(peer_id)
+                    except Exception:
+                        pass
+                    return
+                
                 # Persist basic peer metadata so later routing/sync has context.
                 try:
                     import time
@@ -261,6 +271,7 @@ class NetworkService:
             "head_number": 0,
             "head_hash": self._config.genesis_hash,
             "head_state_hash": "",
+            "peer_pubkey": getattr(self._config, "MINER_PUBKEY", ""),
         }
         # Prefer the persisted chain tip if available.
         try:
@@ -403,28 +414,67 @@ class NetworkService:
     async def _send_mempool_snapshot(self, peer_id: Any) -> None:
         import db
         import json
-        from .protocols import TAU_GOSSIP_TOPIC_TRANSACTIONS
-        
+        from .protocols import (
+            TAU_GOSSIP_TOPIC_TRANSACTIONS, 
+            TAU_GOSSIP_TOPIC_GOVERNANCE,
+            TAU_MEMPOOL_SNAPSHOT_MAX_TOTAL,
+            TAU_MEMPOOL_SNAPSHOT_MAX_UPDATES,
+            TAU_MEMPOOL_SNAPSHOT_MAX_VOTES,
+            TAU_GOSSIP_MAX_RAW_TX_BYTES
+        )
         try:
-            # Get all txs from mempool
-            # This is expensive but fine for testnet/tests
             txs = db.get_mempool_txs()
+            
+            # The mempool is already ordered implicitly by received_at ASC inside db.get_mempool_txs()
+            updates_count = 0
+            votes_count = 0
+            total_count = 0
+            
             for tx in txs:
+                if total_count >= TAU_MEMPOOL_SNAPSHOT_MAX_TOTAL:
+                    break
+                    
                 if tx.startswith("json:"):
                     tx = tx[5:]
-                payload = json.loads(tx) # tx is JSON string in DB?
-                # db.get_mempool_txs returns list of strings or dicts?
-                # db.py: return [row[0] for row in cursor.fetchall()] -> strings (json)
+                    
+                # 1. Size constraint
+                if len(tx.encode('utf-8')) > TAU_GOSSIP_MAX_RAW_TX_BYTES:
+                    continue
                 
-                # Construct envelope
-                # We can use _gossip_manager.publish but we want to force direct send to this peer only.
-                # Let's use _gossip_manager._send_gossip directly if possible, or update publish.
+                # 2. Extract tx_type bounds first
+                import re
+                m = re.search(r'"tx_type"\s*:\s*"([^"]+)"', tx)
+                tx_type = m.group(1) if m else "user_tx"
                 
-                # For now, let's use a helper in GossipManager or just manually send.
-                # But we need to wrap it in gossip RPC.
+                # Legacy / Invalid drops
+                if tx_type in ("consensus_proposal", "consensus_vote") or tx_type not in ("user_tx", "consensus_rule_update", "consensus_rule_vote"):
+                    continue
+                    
+                # 3. Typified restrictions
+                if tx_type == "consensus_rule_update":
+                    if updates_count >= TAU_MEMPOOL_SNAPSHOT_MAX_UPDATES:
+                        continue
+                    updates_count += 1
+                    topic = TAU_GOSSIP_TOPIC_GOVERNANCE
+                elif tx_type == "consensus_rule_vote":
+                    if votes_count >= TAU_MEMPOOL_SNAPSHOT_MAX_VOTES:
+                        continue
+                    votes_count += 1
+                    topic = TAU_GOSSIP_TOPIC_GOVERNANCE
+                else:
+                    topic = TAU_GOSSIP_TOPIC_TRANSACTIONS
+                    
+                # 4. Optional partial decode
+                try:
+                    payload = json.loads(tx)
+                except Exception:
+                    continue
+                    
+                total_count += 1
                 
-                # Let's use self.publish_gossip with target_peers and update GossipManager to respect it.
-                await self.publish_gossip(TAU_GOSSIP_TOPIC_TRANSACTIONS, payload, target_peers=[peer_id])
+                # Dispatch explicitly over correct topic path
+                await self.publish_gossip(topic, payload, target_peers=[peer_id])
+                
         except Exception:
             logger.warning("Failed to send mempool snapshot to %s", peer_id, exc_info=True)
 
@@ -435,11 +485,13 @@ class NetworkService:
         # Subscribe to core topics
         from .protocols import (
             TAU_GOSSIP_TOPIC_TRANSACTIONS,
+            TAU_GOSSIP_TOPIC_GOVERNANCE,
             TAU_GOSSIP_TOPIC_BLOCKS,
             TAU_GOSSIP_TOPIC_PEERS,
         )
         # Track our interests so we can forward them on connect.
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_TRANSACTIONS, self._on_transaction_gossip)
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_GOVERNANCE, self._on_governance_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PEERS, self._on_peer_advertisement)
 
@@ -522,20 +574,93 @@ class NetworkService:
             logger.debug("Failed to connect to bootstrap peer", exc_info=True)
         
     async def _on_transaction_gossip(self, envelope: Dict[str, Any]) -> None:
+        from .protocols import TAU_MAX_USER_TX_BYTES
+        await self._process_gossip_payload(
+            envelope, 
+            allowed_types={"user_tx"},
+            type_limits={
+                "user_tx": TAU_MAX_USER_TX_BYTES
+            }
+        )
+
+    async def _on_governance_gossip(self, envelope: Dict[str, Any]) -> None:
+        from .protocols import TAU_MAX_GOVERNANCE_UPDATE_BYTES, TAU_MAX_GOVERNANCE_VOTE_BYTES
+        await self._process_gossip_payload(
+            envelope, 
+            allowed_types={"consensus_rule_update", "consensus_rule_vote"},
+            type_limits={
+                "consensus_rule_update": TAU_MAX_GOVERNANCE_UPDATE_BYTES,
+                "consensus_rule_vote": TAU_MAX_GOVERNANCE_VOTE_BYTES
+            }
+        )
+
+    async def _process_gossip_payload(self, envelope: Dict[str, Any], allowed_types: set, type_limits: dict) -> None:
+        import json
+        from .protocols import TAU_GOSSIP_MAX_RAW_TX_BYTES
+        
         payload = envelope.get("payload")
-        if payload:
-            # Ingest transaction
-            # We assume payload is the transaction dict
-            import json
-            try:
-                # queue_transaction expects JSON string
-                if isinstance(payload, dict):
-                    payload_str = json.dumps(payload)
-                else:
-                    payload_str = str(payload)
-                self._queue_tx(payload_str, propagate=False)
-            except Exception:
-                logger.warning("Failed to process transaction gossip", exc_info=True)
+        if not payload:
+            return
+            
+        if isinstance(payload, dict):
+            payload_str = json.dumps(payload)
+            payload_bytes = payload_str.encode('utf-8')
+        else:
+            payload_str = str(payload)
+            if payload_str.startswith("json:"):
+                payload_str = payload_str[5:]
+            payload_bytes = payload_str.encode('utf-8')
+
+        # Stage 1: Absolute raw limit
+        if len(payload_bytes) > TAU_GOSSIP_MAX_RAW_TX_BYTES:
+            logger.warning("Gossip payload rejected: exceeds max bounds (%s > %s)", len(payload_bytes), TAU_GOSSIP_MAX_RAW_TX_BYTES)
+            return
+            
+        # Lightweight tx_type extraction
+        import re
+        tx_type = "user_tx"
+        m = re.search(r'"tx_type"\s*:\s*"([^"]+)"', payload_str)
+        if m:
+            tx_type = m.group(1)
+            
+        # Network Edge: explicit drop of legacy/unknown objects globally 
+        if tx_type in ("consensus_proposal", "consensus_vote") or tx_type not in ("user_tx", "consensus_rule_update", "consensus_rule_vote"):
+            logger.debug("Gossip payload rejected: legacy or unknown tx_type '%s'", tx_type)
+            return
+            
+        # Topic Mismatch Isolation
+        if tx_type not in allowed_types:
+            logger.debug("Gossip payload rejected: tx_type '%s' not permitted on this topic.", tx_type)
+            return
+            
+        # Stage 2: Typified Bounds limits
+        limit = type_limits.get(tx_type)
+        if limit and len(payload_bytes) > limit:
+            logger.warning("Gossip payload rejected: tx_type '%s' exceeds limit %s (length=%s)", tx_type, limit, len(payload_bytes))
+            return
+            
+        # Stage 3: Lightweight Structural Check
+        try:
+            p_dict = json.loads(payload_str)
+        except Exception:
+            return
+            
+        if tx_type == "consensus_rule_update":
+            if "rule_revisions" not in p_dict or "activate_at_height" not in p_dict:
+                logger.debug("Gossip rejected: consensus_rule_update missing required structural fields")
+                return
+        elif tx_type == "consensus_rule_vote":
+            if "update_id" not in p_dict or "approve" not in p_dict:
+                logger.debug("Gossip rejected: consensus_rule_vote missing required structural fields")
+                return
+            if p_dict.get("approve") is False:
+                logger.debug("Gossip rejected: consensus_rule_vote approve attribute must be true")
+                return
+                
+        try:
+            self._queue_tx(payload_str, propagate=False)
+        except Exception:
+            logger.warning("Failed to process gossip tx_type %s", tx_type, exc_info=True)
 
     def _setup_stream_handlers(self) -> None:
         from .protocols import (
@@ -571,6 +696,7 @@ class NetworkService:
             "node_id": str(self.get_id()),
             "head_number": 0,
             "head_hash": self._config.genesis_hash,
+            "peer_pubkey": getattr(self._config, "MINER_PUBKEY", ""),
         }
         # Prefer the persisted chain tip if available.
         try:
@@ -595,6 +721,22 @@ class NetworkService:
             if data:
                 try:
                     payload = json.loads(data.decode())
+                    
+                    if payload.get("network_id") != self._config.network_id:
+                        logger.warning("Rejecting handshake from %s: incompatible network_id '%s'", getattr(stream.muxed_conn, "peer_id", "Unknown"), payload.get("network_id"))
+                        await stream.close()
+                        return
+                    
+                    remote_pubkey = payload.get("peer_pubkey", "")
+                    if remote_pubkey:
+                        from consensus.facade import TipAdmissionView
+                        view = TipAdmissionView()
+                        if remote_pubkey in view.active_validators:
+                            logger.info("Handshake received from active validator: %s", remote_pubkey[:10])
+                        else:
+                            logger.info("Handshake received from peer (pubkey provided, not active validator)")
+                    else:
+                        logger.info("Handshake received from peer (no pubkey provided)")
                     
                     # Process dht_peers (truncated)
                     dht_peers = payload.get("dht_peers", []) or []
@@ -1111,10 +1253,19 @@ class NetworkService:
 
     def broadcast_transaction(self, payload: str, message_id: str) -> None:
         """Thread-safe helper to broadcast a transaction envelope over gossip."""
-        from .protocols import TAU_GOSSIP_TOPIC_TRANSACTIONS
+        from .protocols import TAU_GOSSIP_TOPIC_TRANSACTIONS, TAU_GOSSIP_TOPIC_GOVERNANCE
+        import json
 
         if not self._nursery:
             return
+
+        topic = TAU_GOSSIP_TOPIC_TRANSACTIONS
+        try:
+            p_dict = json.loads(payload)
+            if p_dict.get("tx_type") == "consensus_rule_update":
+                topic = TAU_GOSSIP_TOPIC_GOVERNANCE
+        except Exception:
+            pass
 
         token = getattr(self, "_trio_token", None)
         if token is not None:
@@ -1122,7 +1273,7 @@ class NetworkService:
                 token.run_sync_soon(
                     self._nursery.start_soon,
                     self._gossip_manager.publish,
-                    TAU_GOSSIP_TOPIC_TRANSACTIONS,
+                    topic,
                     payload,
                     message_id,
                 )
