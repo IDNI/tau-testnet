@@ -67,285 +67,7 @@ def import_hashlib():
     import hashlib
     return hashlib
 
-def execute_batch(transactions: List[Dict], tx_ids: List[int], block_timestamp: int):
-    """
-    Executes a batch of transactions against a SNAPSHOT of the chain state.
-    Returns (final_txs, final_reserved_ids, final_rules, final_balances, final_sequences)
-    """
-    # 1. Capture Consistent State Snapshot
-    with chain_state.get_all_state_locks():
-        temp_balances = chain_state._balances.copy()
-        temp_sequences = chain_state._sequence_numbers.copy()
-        temp_rules = chain_state._application_rules_state
-        
-    final_txs = []
-    final_reserved_ids = []
-    
-    # Ensure Tau is ready
-    if not tau_manager.tau_ready.is_set():
-        tau_manager.tau_ready.wait(timeout=5)
-        
-    # Tau Baseline Reset
-    # Ensure local Tau process state matches our snapshot before we begin.
-    # Even if temp_rules is empty, we must reset Tau to "clean".
-    try:
-        if logger.isEnabledFor(logging.DEBUG):
-            try:
-                logger.debug(
-                    "Mining with Tau state len=%s hash=%s preview=%r",
-                    len(temp_rules or ""),
-                    import_hashlib().sha256((temp_rules or "").encode("utf-8")).hexdigest(),
-                    (temp_rules or "")[:200],
-                )
-            except Exception:
-                logger.debug("Mining with Tau state (debug logging failed)")
-        tau_manager.reset_tau_state(temp_rules or "", source="createblock-reset")
-    except Exception as e:
-        logger.error("Failed to reset Tau baseline: %s", e)
-        # Fail batch so we can unreserve
-        raise RuntimeError(f"Failed to reset Tau baseline: {e}")
 
-    for i, tx in enumerate(transactions):
-        tx_id_db = tx_ids[i]
-        sender = tx.get('sender_pubkey')
-        seq = tx.get('sequence_number')
-        
-        # --- 1. Validation ---
-        
-        # A. Signature
-        if not _BLS_AVAILABLE:
-            print(f"[ERROR][miner] BLS library missing. Cannot validate signature.")
-            continue
-
-        if not _validate_signature(tx):
-            print(f"[WARN][miner] TX {i} rejected: Invalid signature")
-            continue
-            
-        # B. Expiry
-        if tx.get('expiration_time') and int(tx.get('expiration_time', 0)) < block_timestamp:
-            print(f"[WARN][miner] TX {i} rejected: Expired")
-            continue
-            
-        # C. Sequence Number
-        expected_seq = temp_sequences.get(sender, 0)
-        if seq != expected_seq:
-            print(f"[WARN][miner] TX {i} rejected: Sequence mismatch (got {seq}, expected {expected_seq})")
-            continue
-            
-        # --- 2. Execution & Rollback Prep ---
-        checkpoint_rules = temp_rules
-        # We don't rollback balances/sequences explicitly; we just don't apply changes to `temp_*` until success.
-        
-        tx_success = True
-        
-        ops = tx.get('operations', {})
-        rule_op = ops.get("0")
-        transfer_op = ops.get("1")
-        
-        # Extract custom inputs (keys >= 5, excluding reserved streams)
-        custom_tau_inputs = {}
-        for k, v in ops.items():
-            if k.isdigit():
-                idx = int(k)
-                if idx >= 5 and idx not in tau_defs.RESERVED_STREAMS:
-                    # Normalize scalar or list
-                    custom_tau_inputs[idx] = [str(x) for x in v] if isinstance(v, list) else [str(v)]
-        
-        # D. Rule Injection
-        if rule_op:
-            try:
-                res = tau_manager.communicate_with_tau(rule_text=rule_op, target_output_stream_index=0)
-                if "error" in res.lower():
-                    print(f"[WARN][miner] TX {i} rejected: Tau rule error: {res}")
-                    tx_success = False
-                else:
-                    # Tentatively accepted
-                    try:
-                        # Capture the updated specification emitted by Tau.
-                        temp_rules = chain_state.get_rules_state()
-                    except Exception:
-                        # If we can't read it, keep the prior snapshot.
-                        pass
-            except Exception as e:
-                print(f"[WARN][miner] TX {i} rejected: Tau rule exception: {e}")
-                tx_success = False
-
-        # Intra-Transaction Balance Tracking & Tau Validation
-        pending_balance_deductions = {} # local tracking for this tx
-        
-        if tx_success and transfer_op:
-            # E. Transfers
-            pending_transfers_list = [] # Store validated transfers for commit: (f_addr, t_addr, amt)
-            
-            for t_entry in transfer_op:
-                # Safe Validation (Structure)
-                if not isinstance(t_entry, list) or len(t_entry) < 3:
-                    print(f"[WARN][miner] TX {i} rejected: Invalid transfer entry format")
-                    tx_success = False; break
-                    
-                try:
-                    f_addr, t_addr, amt_str = t_entry[:3] # take first 3 if more
-                except ValueError:
-                    tx_success = False; break
-                
-                # Enforce Anti-Theft
-                if f_addr != sender:
-                    print(f"[WARN][miner] TX {i} rejected: Theft attempt (From {f_addr} != Sender {sender})")
-                    tx_success = False; break
-
-                try:
-                    amt = int(amt_str)
-                    if amt <= 0: raise ValueError
-                except:
-                    logger.warning("TX %s rejected: Invalid amount %s", i, amt_str)
-                    tx_success = False; break
-            
-                # Faucet Logic Check (Pre-calculation)
-                if f_addr not in temp_balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                     current_bal = 1000
-                else:
-                     current_bal = temp_balances.get(f_addr, 0)
-                
-                deducted = pending_balance_deductions.get(f_addr, 0)
-                remaining = current_bal - deducted
-                
-                if remaining < amt:
-                     logger.warning("TX %s rejected: Insufficient funds (Intra-TX overspend)", i)
-                     tx_success = False; break
-                
-                # Tau Validation (Transfer)
-                try:
-                     # Fix ID Conversion (expect int, strip 'y')
-                     sender_id_str = db.get_string_id(f_addr)
-                     receiver_id_str = db.get_string_id(t_addr)
-                     
-                     # Strict Tau ID (No 0 fallback)
-                     if not sender_id_str:
-                        logger.warning("TX %s rejected: Sender Tau ID missing", i)
-                        tx_success = False; break
-                        
-                     try: 
-                        s_id = int(sender_id_str[1:])
-                     except: 
-                        logger.warning("TX %s rejected: Invalid sender Tau ID '%s'", i, sender_id_str)
-                        tx_success = False; break
-                        
-                     if not receiver_id_str:
-                        logger.warning("TX %s rejected: Receiver Tau ID missing", i)
-                        tx_success = False; break
-
-                     try: 
-                        r_id = int(receiver_id_str[1:])
-                     except: 
-                        logger.warning("TX %s rejected: Invalid receiver Tau ID '%s'", i, receiver_id_str)
-                        tx_success = False; break
-                     
-                     tau_input_stream_values = {
-                        1: str(amt),
-                        2: str(remaining),
-                        3: str(s_id),
-                        4: str(r_id),
-                     }
-                     # Inject custom inputs and i5 (Consensus Block Time)
-                     for k, v in custom_tau_inputs.items():
-                         tau_input_stream_values[k] = v
-                     tau_input_stream_values[5] = str(block_timestamp)
-
-                     # Communicate with Tau — get all output streams in one step
-                     tau_outputs = tau_manager.communicate_with_tau_multi(
-                        input_stream_values=tau_input_stream_values,
-                        apply_rules_update=False,
-                     )
-                     
-                     # --- Built-in Transfer Validation (o1) ---
-                     o1_raw = tau_outputs.get(1)
-                     if o1_raw is None:
-                         logger.warning("TX %s rejected: Tau did not emit o1 transfer validation output", i)
-                         tx_success = False; break
-
-                     converted_val = parse_tau_output(o1_raw)
-                          
-                     # Validation: o1 must equal amount
-                     if converted_val != amt:
-                         logger.warning("TX %s rejected: Tau validation failed. Expected %s, got %s (parsed: %s)", i, amt, o1_raw, converted_val)
-                         tx_success = False; break
-
-                     # --- User Policy Check (o5) ---
-                     o5_raw = tau_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
-                     if o5_raw is not None:
-                         policy_val = parse_tau_output(o5_raw)
-                         if policy_val == tau_defs.USER_POLICY_BLOCK_VALUE:
-                             logger.warning("TX %s rejected: User policy (o5) blocked transfer. o5=%s", i, o5_raw)
-                             tx_success = False; break
-                     
-                except Exception as e:
-                    logger.warning("TX %s rejected: Tau validation error: %s", i, e)
-                    tx_success = False; break
-
-                # Track deduction
-                pending_balance_deductions[f_addr] = deducted + amt
-                
-                # Validated! Add to pending list for commit
-                pending_transfers_list.append((f_addr, t_addr, amt))
-
-        # F. Unified Custom Execution (if NO transfers but we have custom ops or just want to tick time)
-        if tx_success and not transfer_op and (custom_tau_inputs or rule_op or True):
-            # If no transfers exist, we evaluate custom ops + i5 on o0
-            try:
-                 unified_inputs = {}
-                 for k, v in custom_tau_inputs.items():
-                     unified_inputs[k] = v
-                 unified_inputs[5] = str(block_timestamp)
-                 
-                 res_eval = tau_manager.communicate_with_tau(
-                     target_output_stream_index=0,
-                     input_stream_values=unified_inputs,
-                     apply_rules_update=False
-                 )
-                 if "error" in res_eval.lower():
-                     print(f"[WARN][miner] TX {i} rejected: Custom logic evaluation error: {res_eval}")
-                     tx_success = False
-            except Exception as e:
-                 logger.warning("TX %s rejected: Custom logic exception: %s", i, e)
-                 tx_success = False
-        if tx_success:
-            # Apply changes to temp state (Commit)
-
-            if transfer_op:
-                for f_addr, t_addr, amt in pending_transfers_list:
-                    # Safe Commit (Apply validated transfers)
-                    
-                    # Faucet Logic Safety (Commit)
-                    if f_addr not in temp_balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                        temp_balances[f_addr] = 1000
-                    
-                    # Deduct from temp_balances
-                    temp_balances[f_addr] = temp_balances.get(f_addr, 0) - amt
-                    # Credit to temp_balances
-                    temp_balances[t_addr] = temp_balances.get(t_addr, 0) + amt
-            
-            # Increment sequence
-            temp_sequences[sender] = expected_seq + 1
-            
-            final_txs.append(tx)
-            final_reserved_ids.append(tx_id_db)
-            print(f"[INFO][miner] TX {i} accepted.")
-            
-        else:
-            # ROLLBACK
-            # 1. Restore Tau State (if rule was applied)
-            if rule_op:
-                try:
-                    tau_manager.communicate_with_tau(rule_text=checkpoint_rules, target_output_stream_index=0)
-                    print(f"[INFO][miner] Rolled back Tau state for TX {i}")
-                except Exception as e:
-                    print(f"[CRITICAL][miner] Failed to rollback Tau state: {e}. State may be corrupt.")
-            
-            # temp_rules is reset
-            temp_rules = checkpoint_rules
-            # temp_balances/sequences not touched
-            
-    return final_txs, final_reserved_ids, temp_rules, temp_balances, temp_sequences
 
 
 def create_block_from_mempool() -> Dict:
@@ -359,7 +81,7 @@ def create_block_from_mempool() -> Dict:
         print("[ERROR][createblock] PoA mining requires MINER_PRIVKEY to be configured.")
         return {"error": "PoA mining requires a configured miner key."}
 
-    if not block.bls_signing_available():
+    if not _BLS_AVAILABLE:
         print("[ERROR][createblock] BLS signing not available; cannot sign PoA block.")
         return {"error": "BLS signing is required for PoA blocks."}
     
@@ -432,202 +154,121 @@ def create_block_from_mempool() -> Dict:
              _db.remove_transactions(reserved_ids)
         return {"message": "No valid transactions parsed."}
     
-    print(f"[INFO][createblock] Validating and Executing Batch...")
-    # Use filtered IDs so index matches
+    print(f"[INFO][createblock] Validating and Executing Batch Natively...")
     block_timestamp = int(time.time())
+    
     try:
-        final_txs, final_reserved_ids, final_rules, final_balances, final_sequences = execute_batch(transactions, filtered_reserved_ids, block_timestamp)
+        from consensus.engine import TauConsensusEngine
+        from consensus.state import TauStateSnapshot, compute_consensus_meta_hash, compute_consensus_state_hash
+        from chain_state import compute_accounts_hash
+        
+        # 1. Load canonical parent snapshot
+        app_rules = (chain_state._application_rules_state or "").encode('utf-8')
+        cons_rules = (chain_state._consensus_rules_state or "").encode('utf-8')
+        acc_hash = compute_accounts_hash(chain_state._balances, chain_state._sequence_numbers)
+        vote_records = [(k, pub) for k, v in chain_state._lifecycle_manager.votes.items() for pub in v]
+        meta_hash = compute_consensus_meta_hash(
+            host_contract={}, active_validators=list(chain_state._lifecycle_manager.active_validators),
+            pending_updates=list(chain_state._lifecycle_manager.pending_updates),
+            vote_records=vote_records, activation_schedule=chain_state._lifecycle_manager.scheduled_updates,
+            checkpoint_references=[]
+        )
+        state_hash = compute_consensus_state_hash(cons_rules, app_rules, acc_hash, meta_hash)
+        
+        parent_snapshot = TauStateSnapshot(
+            state_hash=state_hash,
+            tau_bytes=app_rules,
+            metadata={
+                "source": "chain_state",
+                "balances": chain_state._balances,
+                "sequence_numbers": chain_state._sequence_numbers,
+                "lifecycle_manager": chain_state._lifecycle_manager
+            }
+        )
+        
+        engine = TauConsensusEngine()
+        
+        # 2. Derive active_view for next height
+        active_view = engine.derive_active_consensus(parent_snapshot, block_number)
+        
+        # 3. Simulate Candidate using apply_block() natively
+        # We need a candidate block body structure.
+        candidate_block = block.Block.create(
+            block_number=block_number,
+            previous_hash=previous_hash,
+            transactions=transactions,
+            proposer_pubkey=config.MINER_PUBKEY,
+            timestamp=block_timestamp,
+            state_hash=''
+        )
+        
+        # Call the unified path
+        apply_result = engine.apply_block(active_view, candidate_block, parent_snapshot)
+        
+        # Extract accepted/skipped outcomes
+        final_txs = []
+        final_reserved_ids = []
+        
+        for i, tx in enumerate(transactions):
+             tx_id = tx.get('tx_id')
+             if tx_id in apply_result.accepted_tx_ids or tx_id in apply_result.skipped_tx_ids:
+                 final_txs.append(tx)
+             # Whether applied, skipped, or structurally invalid, we dispose of them from mempool!
+             if tx_id in apply_result.accepted_tx_ids or tx_id in apply_result.skipped_tx_ids or tx_id in apply_result.invalid_tx_ids:
+                 final_reserved_ids.append(filtered_reserved_ids[i])
+                 
+        print(f"[INFO][createblock] Execution Result: {len(final_txs)}/{len(transactions)} logically valid")
+        if not final_txs:
+            print("[INFO][createblock] All transactions rejected structurally. No block created.")
+            import db as _db
+            _db.remove_transactions(final_reserved_ids)
+            return {"message": "All transactions rejected. Mempool cleared."}
+
+        # 4. Form Complete Valid Block Header
+        candidate_block.transactions = final_txs
+        # Update IDs
+        candidate_block.tx_ids = [block.compute_tx_hash(tx) for tx in final_txs]
+        candidate_block.header.merkle_root = block.compute_merkle_root(candidate_block.tx_ids)
+        candidate_block.header.state_hash = apply_result.next_snapshot.state_hash
+        candidate_block.header.state_locator = f"{config.STATE_LOCATOR_NAMESPACE}:{apply_result.next_snapshot.state_hash}"
+        candidate_block.block_hash = block.sha256_hex(candidate_block.header.canonical_bytes())
+        
+        # Generate Consensus Proof (PoA)
+        try:
+            from py_ecc.bls import G2Basic
+            import hashlib
+            msg_hash = hashlib.sha256(candidate_block.header.canonical_bytes()).digest()
+            if not getattr(config, "MINER_PRIVKEY", None):
+                raise ValueError("MINER_PRIVKEY not configured")
+            sig_bytes = G2Basic.Sign(int(config.MINER_PRIVKEY, 16), msg_hash)
+            candidate_block.consensus_proof = sig_bytes.hex()
+        except Exception as e:
+            print(f"[ERROR][createblock] Failed to generate consensus proof: {e}")
+            import db as _db
+            _db.unreserve_mempool_txs(reserved_ids)
+            return {"error": f"Failed to sign block: {e}"}
+
+        # 5. Full Final Acceptance Path
+        # The node runs standard process_new_block ingestion as if we imported it over network.
+        # This guarantees path equivalence.
+        if not chain_state.process_new_block(candidate_block):
+             import db as _db
+             _db.unreserve_mempool_txs(reserved_ids)
+             return {"error": "Failed to persist new canonical block"}
+             
+        # 6. Mempool Disposition
+        if final_reserved_ids:
+             import db as _db
+             _db.remove_transactions(final_reserved_ids)
+             
+        new_block = candidate_block # map for existing return variable
     except Exception as e:
-        print(f"[ERROR][createblock] Block creation failed during batch execution: {e}")
-        # Liveness Fix - Unreserve so they can be retried immediately
+        print(f"[ERROR][createblock] Block creation failed during native simulation: {e}")
         import db as _db
         _db.unreserve_mempool_txs(reserved_ids)
         return {"error": str(e)}
-    
-    print(f"[INFO][createblock] Execution Result: {len(final_txs)}/{len(transactions)} accepted")
-    
-    if not final_txs:
-        print("[INFO][createblock] All transactions rejected. No block created.")
-        # We should still delete the rejected txs!
-        if reserved_ids:
-            import db as _db
-            _db.remove_transactions(reserved_ids)
-        return {"message": "All transactions rejected. Mempool cleared."}
-
-    # Use final_txs for the block
-    transactions = final_txs
-    
-    # Get latest block to determine new block number and previous hash
-    # (Already computed early to enforce turn, just logging now)
-    if latest_block:
-        print(f"[INFO][createblock] Latest block is #{latest_block['header']['block_number']}. New block will be #{block_number}.")
-    else:
-        print(f"[INFO][createblock] No existing blocks. Creating Genesis Block #{block_number}.")
-    
-    print(f"[INFO][createblock] Creating block #{block_number} with previous hash: {previous_hash[:16]}...")
-    
-    # Create the block
-    print(f"[INFO][createblock] Computing transaction hashes and Merkle root...")
-    # Use FINAL RULES from execution, not global state
-    rules_blob = final_rules.encode("utf-8")
-    
-    # Consensus State Commitment (Rules + Accounts + Governance)
-    accounts_hash = chain_state.compute_accounts_hash(final_balances, final_sequences)
-    meta_hash = chain_state.compute_consensus_meta_hash(
-        host_contract={}, active_validators=list(chain_state._lifecycle_manager.active_validators),
-        pending_updates=list(chain_state._lifecycle_manager.pending_updates),
-        vote_records=[(k, pub) for k, v in chain_state._lifecycle_manager.votes.items() for pub in v],
-        activation_schedule=chain_state._lifecycle_manager.scheduled_updates,
-        checkpoint_references=[]
-    )
-    cons_rules_bytes = (chain_state._consensus_rules_state or "").encode("utf-8")
-    
-    state_hash = chain_state.compute_consensus_state_hash(cons_rules_bytes, rules_blob, accounts_hash, meta_hash)
-    
-    state_locator = f"{config.STATE_LOCATOR_NAMESPACE}:{state_hash}"
-    new_block = block.Block.create(
-        block_number=block_number,
-        previous_hash=previous_hash,
-        transactions=transactions,
-        proposer_pubkey=config.MINER_PUBKEY,
-        state_hash=state_hash,
-        state_locator=state_locator,
-        timestamp=block_timestamp
-    )
-    
-    # Generate Consensus Proof (PoA)
-    try:
-        from py_ecc.bls import G2Basic
-        msg_hash = import_hashlib().sha256(new_block.header.canonical_bytes()).digest()
-        sig_bytes = G2Basic.Sign(int(config.MINER_PRIVKEY, 16), msg_hash)
-        new_block.consensus_proof = sig_bytes.hex()
-    except Exception as e:
-        print(f"[ERROR][createblock] Failed to generate consensus proof: {e}")
-        return {"error": "Consensus PoA proof generation failed."}
-    
-    print(f"[INFO][createblock] Block created successfully!")
-    print(f"[INFO][createblock] Block Details:")
-    print(f"[INFO][createblock]   - Block Number: {new_block.header.block_number}")
-    print(f"[INFO][createblock]   - Timestamp: {new_block.header.timestamp}")
-    print(f"[INFO][createblock]   - Transaction Count: {len(transactions)}")
-    print(f"[INFO][createblock]   - Merkle Root: {new_block.header.merkle_root}")
-    print(f"[INFO][createblock]   - State Hash: {new_block.header.state_hash}")
-    print(f"[INFO][createblock]   - Block Hash: {new_block.block_hash}")
-    
-    # Show transaction summary
-    if transactions:
-        print(f"[INFO][createblock] Transaction Summary:")
-        for i, tx in enumerate(transactions):
-            sender = tx.get("sender_pubkey", "unknown")[:10] + "..."
-            seq = tx.get("sequence_number", "?")
-            ops = tx.get("operations", {})
-            transfers = ops.get("1", [])
-            transfer_count = len(transfers) if isinstance(transfers, list) else 0
-            rule = "Yes" if ops.get("0") else "No"
-            print(f"[INFO][createblock]   TX #{i+1}: {sender} (seq:{seq}) - {transfer_count} transfers, rule:{rule}")
-    
-    # Atomically save the new block, commit state, and clear mempool
-    print(f"[INFO][createblock] Committing block #{new_block.header.block_number}, state, and clearing mempool in a single transaction...")
-    import chain_state as _cs, db as _db
-    # Inline block insertion and state commit to ensure atomicity
-    with _db._db_lock, _db._db_conn:
-        conn = _db._db_conn
-        # Insert block
-        block_dict = new_block.to_dict()
-        block_data_json = json.dumps(block_dict)
-        conn.execute(
-            'INSERT INTO blocks (block_number, block_hash, previous_hash, timestamp, block_data) VALUES (?, ?, ?, ?, ?)',
-            (
-                new_block.header.block_number,
-                new_block.block_hash,
-                new_block.header.previous_hash,
-                new_block.header.timestamp,
-                block_data_json,
-            )
-        )
-        # Commit in-memory application rules to database
-        conn.execute(
-            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-            ('application_rules', final_rules)
-        )
-        conn.execute(
-            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-            ('canonical_head_hash', new_block.block_hash)
-        )
-        for addr, bal in final_balances.items():
-            seq = final_sequences.get(addr, 0)
-            conn.execute(
-                'INSERT OR REPLACE INTO accounts (address, balance, sequence_number) VALUES (?, ?, ?)',
-                (addr, bal, seq)
-            )
-        # Clear ONLY the reserved transactions from mempool (safe cleanup)
-        # We delete ALL reserved IDs (both accepted and rejected)
-        if reserved_ids:
-            placeholders = ','.join(['?'] * len(reserved_ids))
-            conn.execute(f'DELETE FROM mempool WHERE id IN ({placeholders})', tuple(reserved_ids))
         
-    # In-Memory Swap Correctness
-    # We acquire ALL locks to ensure no readers see partial state during update
-    print(f"[INFO][createblock] Block committed. Updating in-memory state...")
-    try:
-        with chain_state.get_all_state_locks():
-            chain_state._balances.clear()
-            chain_state._balances.update(final_balances)
-            
-            chain_state._sequence_numbers.clear()
-            chain_state._sequence_numbers.update(final_sequences)
-            
-            chain_state._application_rules_state = final_rules
-            chain_state._tau_engine_state_hash = state_hash
-            chain_state._canonical_head_hash = new_block.block_hash
-    except Exception as e:
-        print(f"[CRITICAL][createblock] Failed to update in-memory state after DB commit: {e}. Node restart recommended.")
-            
-    print(f"[INFO][createblock] Block, state committed; {len(reserved_ids)} mempool txs cleared.")
-
-    # Publish the Tau/rules snapshot tied to this block so peers can fetch it by
-    # (state_hash/state_locator) and apply it to their Tau engine.
-    try:
-        published = False
-        if hasattr(chain_state, "publish_tau_state_snapshot"):
-            # Compute accounts hash for consensus integrity
-            accounts_hash = chain_state.compute_accounts_hash(final_balances, final_sequences)
-            if logger.isEnabledFor(logging.DEBUG):
-                try:
-                    rules_text = rules_blob.decode("utf-8")
-                    logger.debug(
-                        "Publishing Tau state snapshot: state_hash=%s accounts_hash=%s rules_len=%s rules_hash=%s preview=%r",
-                        state_hash,
-                        accounts_hash.hex(),
-                        len(rules_text),
-                        import_hashlib().sha256(rules_text.encode("utf-8")).hexdigest(),
-                        rules_text[:200],
-                    )
-                except Exception:
-                    logger.debug("Publishing Tau state snapshot (debug logging failed)")
-            published = bool(chain_state.publish_tau_state_snapshot(state_hash, rules_blob, accounts_hash))
-        if published:
-            print(f"[INFO][createblock] Published Tau state snapshot to DHT: {state_locator}")
-        else:
-            print(f"[DEBUG][createblock] Tau state snapshot not published to DHT (no DHT client?)")
-    except Exception as e:
-        print(f"[WARN][createblock] Failed to publish Tau state snapshot to DHT: {e}")
-
-    # Publish the resulting accounts table so secondary nodes can update balances
-    # without re-executing transactions.
-    try:
-        published_accounts = False
-        if hasattr(chain_state, "publish_accounts_snapshot"):
-            published_accounts = bool(chain_state.publish_accounts_snapshot(new_block.block_hash))
-        if published_accounts:
-            print(f"[INFO][createblock] Published accounts snapshot to DHT: {config.STATE_LOCATOR_NAMESPACE}:{new_block.block_hash}")
-        else:
-            print(f"[DEBUG][createblock] Accounts snapshot not published to DHT (no DHT client?)")
-    except Exception as e:
-        print(f"[WARN][createblock] Failed to publish accounts snapshot to DHT: {e}")
-    
     print(f"[INFO][createblock] Block creation process completed!")
-    
     return new_block.to_dict()
 
 

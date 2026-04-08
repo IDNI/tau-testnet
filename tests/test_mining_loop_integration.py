@@ -33,7 +33,7 @@ class TestMiningLoopIntegration(unittest.TestCase):
         import tau_manager
         tau_manager.tau_ready.set()
         self.original_communicate = tau_manager.communicate_with_tau
-        tau_manager.communicate_with_tau = lambda **kwargs: ""
+        tau_manager.communicate_with_tau = lambda **kwargs: "require_bls_sig"
         
         # Mock validation to accept dummy signature
         from commands import createblock
@@ -45,6 +45,10 @@ class TestMiningLoopIntegration(unittest.TestCase):
         # Or just patch the check in execute_batch?
         # createblock.py imports _BLS_AVAILABLE. We can patch it.
         createblock._BLS_AVAILABLE = True
+
+        from py_ecc.bls import G2Basic
+        self.original_verify = G2Basic.Verify
+        G2Basic.Verify = lambda *args, **kwargs: True
 
         from consensus.engine import TauConsensusEngine
         self.original_query = TauConsensusEngine.query_eligibility
@@ -65,6 +69,9 @@ class TestMiningLoopIntegration(unittest.TestCase):
         
         from consensus.engine import TauConsensusEngine
         TauConsensusEngine.query_eligibility = self.original_query
+
+        from py_ecc.bls import G2Basic
+        G2Basic.Verify = self.original_verify
 
         if os.path.exists(self.db_path):
             os.remove(self.db_path)

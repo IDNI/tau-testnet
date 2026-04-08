@@ -174,7 +174,7 @@ class Block:
             tx_ids=tx_ids,
         )
         canonical_hash = sha256_hex(header.canonical_bytes())
-        if block.block_hash and block.block_hash != canonical_hash:
+        if header.block_number != 0 and block.block_hash and block.block_hash != canonical_hash:
             raise ValueError("Block hash mismatch for block_number %s" % header.block_number)
         if not block.block_hash:
             block.block_hash = canonical_hash

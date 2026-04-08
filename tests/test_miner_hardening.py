@@ -118,7 +118,7 @@ class TestMinerHardening(unittest.TestCase):
         print("[TEST] Stale reservation released and re-reserved.")
 
     @patch('commands.createblock._validate_signature')
-    @patch('commands.createblock.tau_manager')
+    @patch('consensus.engine.tau_manager')
     def test_intra_transaction_overspend(self, mock_tau, mock_sig):
         print("\n[TEST] Verifying Intra-Transaction Overspend Rejection...")
         mock_tau.tau_ready.is_set.return_value = True
@@ -128,7 +128,9 @@ class TestMinerHardening(unittest.TestCase):
             if kwargs.get('target_output_stream_index') == 1:
                 vals = kwargs.get('input_stream_values', {})
                 return vals.get(1, "0") 
-            return "Success"
+            if kwargs.get('target_output_stream_index') == 7:
+                return "require_bls_sig"
+            return "T"
         mock_tau.communicate_with_tau.side_effect = tau_side_effect
         # Multi-output mock returns dict[int, str]
         def tau_multi_side_effect(**kwargs):
@@ -138,24 +140,25 @@ class TestMinerHardening(unittest.TestCase):
         
         mock_sig.return_value = True
         
-        # Setup: Account with 100 coins (done in setUp)
-        
-        # Create TX with 2 transfers: 60 + 50 = 110 (> 100)
-        payload = json.dumps({
-            "sender_pubkey": "UserOverspend",
-            "sequence_number": 0,
-            "expiration_time": int(time.time() + 3600),
-            "operations": {
-                "1": [
-                    ["UserOverspend", "Alice", "60"],
-                    ["UserOverspend", "Bob", "50"]
-                ]
-            }
-        })
-        db.add_mempool_tx(payload, "hash_overspend", 1000)
-        
-        # Run CreateBlock
-        res = createblock.create_block_from_mempool()
+        with patch('py_ecc.bls.G2Basic.Verify', return_value=True):
+            # Setup: Account with 100 coins (done in setUp)
+            
+            # Create TX with 2 transfers: 60 + 50 = 110 (> 100)
+            payload = json.dumps({
+                "sender_pubkey": "UserOverspend",
+                "sequence_number": 0,
+                "expiration_time": int(time.time() + 3600),
+                "operations": {
+                    "1": [
+                        ["UserOverspend", "Alice", "60"],
+                        ["UserOverspend", "Bob", "50"]
+                    ]
+                }
+            })
+            db.add_mempool_tx(payload, "hash_overspend", 1000)
+            
+            # Run CreateBlock
+            res = createblock.create_block_from_mempool()
         
         # Verify Rejection
         if "transactions" in res:
@@ -168,7 +171,7 @@ class TestMinerHardening(unittest.TestCase):
         
         print("[TEST] Intra-TX overspend rejected.")
 
-    @patch('commands.createblock.tau_manager')
+    @patch('consensus.engine.tau_manager')
     def test_strict_bls_enforcement(self, mock_tau):
         print("\n[TEST] Verifying Strict BLS Enforcement...")
         mock_tau.tau_ready.is_set.return_value = True
@@ -192,7 +195,7 @@ class TestMinerHardening(unittest.TestCase):
         print("[TEST] Strict BLS passed (refused to mine).")
 
     @patch('commands.createblock._validate_signature')
-    @patch('commands.createblock.tau_manager')
+    @patch('consensus.engine.tau_manager')
     def test_faucet_safety_no_negative_balance(self, mock_tau, mock_sig):
         print("\n[TEST] Verifying Faucet Safety (No Negative Balance)...")
         # Ensure auto-faucet is ON for this test
@@ -207,7 +210,9 @@ class TestMinerHardening(unittest.TestCase):
                 # Input args usually in input_stream_values
                 vals = kwargs.get('input_stream_values', {})
                 return vals.get(1, "10000") 
-            return "Success"
+            if kwargs.get('target_output_stream_index') == 7:
+                return "require_bls_sig"
+            return "T"
             
         mock_tau.communicate_with_tau.side_effect = tau_side_effect
         # Multi-output mock returns dict[int, str]
@@ -242,7 +247,8 @@ class TestMinerHardening(unittest.TestCase):
         
         # Run Mining
         try:
-            res = createblock.create_block_from_mempool()
+            with patch('py_ecc.bls.G2Basic.Verify', return_value=True):
+                res = createblock.create_block_from_mempool()
         except Exception as e:
             import traceback
             traceback.print_exc()

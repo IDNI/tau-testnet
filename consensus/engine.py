@@ -28,6 +28,24 @@ class ActiveConsensusView:
     active_validators: List[bytes]
     mechanism_specific_metadata: Optional[Dict[str, Any]] = None
 
+@dataclass
+class TransactionOutcome:
+    tx_id: str
+    status: str # "applied", "skipped", "invalid"
+    reason: Optional[str] = None
+    receipt_logs: List[str] = None
+
+@dataclass
+class ApplyBlockResult:
+    next_snapshot: TauStateSnapshot
+    outcomes: List[TransactionOutcome]
+    accepted_tx_ids: List[str]
+    skipped_tx_ids: List[str]
+    invalid_tx_ids: List[str]
+    governance_changes: Dict[str, Any]
+    mempool_hints: Dict[str, Any]
+
+
 class ConsensusEngine(ABC):
     """
     Defines the contract for the Tau-driven consensus processing paths.
@@ -52,7 +70,7 @@ class ConsensusEngine(ABC):
         pass
         
     @abstractmethod
-    def apply_block(self, active_view: ActiveConsensusView, block: Any) -> TauStateSnapshot:
+    def apply_block(self, active_view: ActiveConsensusView, block: Any, parent_snapshot: TauStateSnapshot) -> ApplyBlockResult:
         """
         Apply the valid block payload over the active view to produce the next 
         committed snapshot. This includes archival transitions.
@@ -132,8 +150,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 apply_rules_update=False
             )
             if "require_bls_sig" in output:
-                if not block.verify_consensus_proof():
-                    logger.warning("Consensus: Block #%s cryptographic proof failed", block.header.block_number)
+                try:
+                    from py_ecc.bls import G2Basic
+                    import hashlib
+                    block_sig = block.consensus_proof
+                    if isinstance(block_sig, dict):
+                        block_sig = block_sig.get("signature")
+                    if not block_sig:
+                        logger.warning("Consensus: Block #%s missing cryptographic proof", block.header.block_number)
+                        return False
+                    msg_hash = hashlib.sha256(block.header.canonical_bytes()).digest()
+                    pubkey_bytes = bytes.fromhex(block.header.proposer_pubkey)
+                    sig_bytes = bytes.fromhex(block_sig)
+                    if not G2Basic.Verify(pubkey_bytes, msg_hash, sig_bytes):
+                        logger.warning("Consensus: Block #%s cryptographic proof failed", block.header.block_number)
+                        return False
+                except Exception as e:
+                    logger.warning("Consensus: Block #%s cryptographic proof error: %s", block.header.block_number, e)
                     return False
                 return True
             
@@ -143,10 +176,108 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             logger.error("Header verification failed: %s", e)
             return False
 
-    def apply_block(self, active_view: ActiveConsensusView, block: Any) -> TauStateSnapshot:
-        # Phase 1 skeleton, full tx hydration and archival logic deferred to Phase 2/3.
-        # This will eventually call the internal `apply` transaction handler.
-        raise NotImplementedError("apply_block implementation requires Phase 2 structures")
+    def apply_block(self, active_view: ActiveConsensusView, block: Any, parent_snapshot: TauStateSnapshot) -> ApplyBlockResult:
+        """
+        Executes a full block over the consensus boundaries.
+        Unifies Rebuild, Process Block, and Mining paths.
+        Pure Implementation: Operates on state passed implicitly through parent_snapshot.metadata and returns ApplyBlockResult.
+        """
+        import copy
+        from consensus.state import compute_consensus_meta_hash, compute_consensus_state_hash
+        from chain_state import compute_accounts_hash
+        import chain_state
+
+        # 1. State Extraction
+        metadata = parent_snapshot.metadata
+        t_bals = copy.deepcopy(metadata.get('balances', {}))
+        t_seqs = copy.deepcopy(metadata.get('sequence_numbers', {}))
+        
+        # Make a deep copy of the lifecycle manager or instantiate a snapshot equivalent
+        parent_lm = metadata.get('lifecycle_manager')
+        if parent_lm:
+            # Reconstruct an isolated instance 
+            lm = copy.deepcopy(parent_lm)
+        else:
+            # Fallback if somehow not provided (tests, legacy)
+            from consensus.governance import ConsensusLifecycleManager
+            lm = ConsensusLifecycleManager(active_validators=[bytes.fromhex(v) for v in self._validators])
+        
+        # 2. Pure Transaction Simulation (Internal Layer)
+        # We pass target_balances and target_sequences to self.apply which mutates them internally.
+        # This acts as our pure executor since t_bals/t_seqs are local copies.
+        exec_result = self.apply(parent_snapshot, block.transactions, block.header.timestamp, target_balances=t_bals, target_sequences=t_seqs, target_lifecycle=lm)
+        
+        # Convert internal apply result into structural outcomes
+        outcomes = []
+        accepted_ids = []
+        skipped_ids = []
+        
+        for tx in block.transactions:
+            tx_id = tx.get('tx_id')
+            if tx in exec_result.accepted_transactions:
+                # We consider all accepted ones as "applied" or "skipped/no-op"
+                # Internal execution logs tell us if it was essentially a no-op 
+                status = "applied"
+                receipt = exec_result.receipts.get(tx_id, {})
+                logs = receipt.get("logs", [])
+                if any("valid no-op" in log.lower() or "ignored" in log.lower() for log in logs):
+                    status = "skipped/no-op"
+                    skipped_ids.append(tx_id)
+                else:
+                    accepted_ids.append(tx_id)
+                    
+                outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, receipt_logs=logs))
+            elif tx in exec_result.rejected_transactions:
+                status = "invalid"
+                receipt = exec_result.receipts.get(tx_id, {})
+                outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, reason=receipt.get("error"), receipt_logs=receipt.get("logs", [])))
+
+        # 3. Post-State Materialization Layer
+        
+        # The rules are updated by self.apply (it returns a generic snapshot with tau_bytes).
+        next_app_rules = exec_result.snapshot.tau_bytes.decode('utf-8', errors='ignore')
+        
+        # Governance Height Transitions
+        newly_active = lm.process_height_transitions(block.header.block_number)
+        next_cons_rules = active_view.consensus_rules
+        if newly_active:
+             last_update = newly_active[-1]
+             # Update consensus rules string based on combined revisions
+             next_cons_rules = "\\n".join(last_update.rule_revisions)
+        
+        # Finalize Hashes
+        acc_hash = compute_accounts_hash(t_bals, t_seqs)
+        vote_records = [(k, pub) for k, v in lm.votes.items() for pub in v]
+        meta_hash = compute_consensus_meta_hash(
+            host_contract={}, active_validators=list(lm.active_validators),
+            pending_updates=list(lm.pending_updates),
+            vote_records=vote_records, activation_schedule=lm.scheduled_updates,
+            checkpoint_references=[]
+        )
+        state_hash = compute_consensus_state_hash(next_cons_rules.encode('utf-8'), next_app_rules.encode('utf-8'), acc_hash, meta_hash)
+        
+        # 4. Construct Next Snapshot
+        next_snapshot = TauStateSnapshot(
+            state_hash=state_hash,
+            tau_bytes=next_app_rules.encode('utf-8'),
+            metadata={
+                "source": "engine_apply_block",
+                "balances": t_bals,
+                "sequence_numbers": t_seqs,
+                "lifecycle_manager": lm,
+                "consensus_rules_state": next_cons_rules
+            }
+        )
+        
+        return ApplyBlockResult(
+            next_snapshot=next_snapshot,
+            outcomes=outcomes,
+            accepted_tx_ids=accepted_ids,
+            skipped_tx_ids=skipped_ids,
+            invalid_tx_ids=[tx.get('tx_id') for tx in exec_result.rejected_transactions],
+            governance_changes={"activated_updates": [u.update_id_hex for u in newly_active]},
+            mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
+        )
 
     def query_eligibility(self, *args, **kwargs) -> bool:
         """
@@ -190,6 +321,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         block_timestamp: int | None = None,
         target_balances: Optional[Dict[str, int]] = None,
         target_sequences: Optional[Dict[str, int]] = None,
+        target_lifecycle: Optional[Any] = None,
     ) -> TauExecutionResult:
         """
         Apply transactions to the current state.
@@ -202,6 +334,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
         if block_timestamp is None:
             block_timestamp = 0
+            
+        lifecycle_mgr = target_lifecycle if target_lifecycle is not None else chain_state._lifecycle_manager
 
         accepted_txs = []
         rejected_txs = []
@@ -269,8 +403,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if tx_type == 'consensus_rule_update':
                 update = parse_consensus_rule_update(tx)
                 if update:
-                    if chain_state._lifecycle_manager.can_admit_update(update, is_mempool=False):
-                        if chain_state._lifecycle_manager.submit_update(update):
+                    if lifecycle_mgr.can_admit_update(update, is_mempool=False):
+                        if lifecycle_mgr.submit_update(update):
                             tx_receipt["logs"].append("Update submitted: " + update.update_id_hex)
                         else:
                             tx_receipt["logs"].append("Duplicate update ignored: " + update.update_id_hex)
@@ -284,8 +418,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
-                    if chain_state._lifecycle_manager.can_admit_vote(vote, sender, is_mempool=False):
-                        if chain_state._lifecycle_manager.submit_vote(vote, sender):
+                    if lifecycle_mgr.can_admit_vote(vote, sender, is_mempool=False):
+                        if lifecycle_mgr.submit_vote(vote, sender):
                             tx_receipt["logs"].append(f"Vote accepted for update {vote.update_id.hex()}")
                         else:
                             tx_receipt["logs"].append("Vote ignored (valid no-op)")
@@ -496,6 +630,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             else:
                 rejected_txs.append(tx)
                 receipts[tx_id] = {"status": "failed", "logs": tx_receipt["logs"]}
+                logger.error("TX REJECTED during apply: %s", tx_receipt["logs"])
 
         # Create new snapshot
         new_snapshot = TauStateSnapshot(

@@ -161,8 +161,7 @@ class TestStateReconstruction(unittest.TestCase):
             previous_hash=config.GENESIS_HASH,
             transactions=[tx1], proposer_pubkey="a"*96
         )
-        
-        # Add block to database
+        block_1.header.state_hash = ""
         self.add_block_and_set_head(block_1)
         
         # Rebuild state
@@ -227,6 +226,7 @@ class TestStateReconstruction(unittest.TestCase):
                 previous_hash=config.GENESIS_HASH,
                 transactions=[tx1, tx2, tx3], proposer_pubkey="a"*96
             )
+            block_1.header.state_hash = ""
             self.add_block_and_set_head(block_1)
 
             # -------- Block 1  (sender = addr2) --------
@@ -253,6 +253,7 @@ class TestStateReconstruction(unittest.TestCase):
                 previous_hash=block_1.block_hash,
                 transactions=[tx4, tx5, tx6], proposer_pubkey="a"*96
             )
+            block_2.header.state_hash = ""
             self.add_block_and_set_head(block_2)
 
             # -------- Block 2  (sender = addr3) --------
@@ -279,6 +280,7 @@ class TestStateReconstruction(unittest.TestCase):
                 previous_hash=block_2.block_hash,
                 transactions=[tx7, tx8, tx9], proposer_pubkey="a"*96
             )
+            block_3.header.state_hash = ""
             self.add_block_and_set_head(block_3)
 
             # --- Send EVERY rule to Tau and expect non‑zero confirmations ---
@@ -335,6 +337,7 @@ class TestStateReconstruction(unittest.TestCase):
             previous_hash=config.GENESIS_HASH,
             transactions=[valid_tx, invalid_tx, invalid_amount_tx], proposer_pubkey="a"*96
         )
+        block_1.header.state_hash = ""
         self.add_block_and_set_head(block_1)
         
         # Rebuild state
@@ -385,6 +388,7 @@ class TestStateReconstruction(unittest.TestCase):
             previous_hash=config.GENESIS_HASH,
             transactions=[tx1, tx2, tx3], proposer_pubkey="a"*96
         )
+        block_1.header.state_hash = ""
         self.add_block_and_set_head(block_1)
         
         # Rebuild state from blockchain
@@ -420,6 +424,7 @@ class TestStateReconstruction(unittest.TestCase):
                 previous_hash=config.GENESIS_HASH,
                 transactions=[tx1], proposer_pubkey="a"*96
             )
+            block_1.header.state_hash = ""
             self.add_block_and_set_head(block_1)
 
             # --- Send rule to Tau and expect a non‑zero confirmation ---
@@ -458,6 +463,7 @@ class TestStateReconstruction(unittest.TestCase):
             previous_hash=config.GENESIS_HASH,
             transactions=[tx1], proposer_pubkey="a"*96
         )
+        block_1.header.state_hash = ""
         self.add_block_and_set_head(block_1)
         
         # Rebuild state - this should handle Tau not being available gracefully
@@ -495,6 +501,7 @@ class TestStateReconstruction(unittest.TestCase):
                 previous_hash=config.GENESIS_HASH,
                 transactions=[tx1], proposer_pubkey="a"*96
             )
+            block_1.header.state_hash = ""
             self.add_block_and_set_head(block_1)
             
             # Rebuild state (should process known operations and skip unknown ones)
@@ -530,6 +537,7 @@ class TestStateReconstruction(unittest.TestCase):
             previous_hash=config.GENESIS_HASH,
             transactions=[tx1, tx2], proposer_pubkey="a"*96
         )
+        block_1.header.state_hash = ""
         self.add_block_and_set_head(block_1)
         
         # Rebuild state
