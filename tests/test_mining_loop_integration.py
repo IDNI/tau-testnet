@@ -17,7 +17,7 @@ class TestMiningLoopIntegration(unittest.TestCase):
         self.original_db_path = config.STRING_DB_PATH
         config.set_database_path(self.db_path)
         db.init_db()
-        chain_state.init_chain_state()
+        chain_state.load_genesis("data/genesis.json")
         
         # Explicit state cleanup
         chain_state._balances.clear()
@@ -83,7 +83,9 @@ class TestMiningLoopIntegration(unittest.TestCase):
         # Setup miner with low threshold for testing
         self.miner = SoleMiner(threshold=1, max_block_interval=10.0)
         # Verify initial state
-        self.assertIsNone(db.get_canonical_head_block())
+        initial = db.get_canonical_head_block()
+        self.assertIsNotNone(initial)
+        self.assertEqual(initial['header']['block_number'], 0)
         
         # Add a valid-looking transaction
         sender_pubkey = "a" * 96
@@ -122,13 +124,14 @@ class TestMiningLoopIntegration(unittest.TestCase):
         # Give it 2 seconds to be safe
         for _ in range(20):
             latest = db.get_canonical_head_block()
-            if latest and latest['header']['block_number'] >= 0:
+            if latest and latest['header']['block_number'] >= 1:
                 break
             time.sleep(0.1)
             
         # Check result
         latest = db.get_canonical_head_block()
         self.assertIsNotNone(latest, "Miner failed to produce block automatically")
+        self.assertEqual(latest['header']['block_number'], 1)
         self.assertEqual(len(latest['transactions']), 1)
         print("Block created automatically:", latest['block_hash'])
 
@@ -138,7 +141,9 @@ class TestMiningLoopIntegration(unittest.TestCase):
         self.miner = SoleMiner(threshold=10, max_block_interval=1.0)
         self.miner.start()
         
-        self.assertIsNone(db.get_canonical_head_block())
+        initial = db.get_canonical_head_block()
+        self.assertIsNotNone(initial)
+        self.assertEqual(initial['header']['block_number'], 0)
         
         # Add just 1 transaction (valid structure)
         sender_pubkey = "c" * 96
@@ -155,18 +160,21 @@ class TestMiningLoopIntegration(unittest.TestCase):
         
         # Wait 0.5s - should NOT mine yet
         time.sleep(0.5)
-        self.assertIsNone(db.get_canonical_head_block(), "Mined too early! Should wait for time interval.")
+        current = db.get_canonical_head_block()
+        self.assertIsNotNone(current)
+        self.assertEqual(current['header']['block_number'], 0, "Mined too early! Should wait for time interval.")
         
         # Wait another 1.0s (total 1.5s > 1.0s interval)
         # Give loop a moment to react
         for _ in range(20):
             latest = db.get_canonical_head_block()
-            if latest and latest['header']['block_number'] >= 0:
+            if latest and latest['header']['block_number'] >= 1:
                 break
             time.sleep(0.1)
             
         latest = db.get_canonical_head_block()
         self.assertIsNotNone(latest, "Failed to mine after time interval exceeded")
+        self.assertEqual(latest['header']['block_number'], 1)
         self.assertEqual(len(latest['transactions']), 1)
         print("Block created by time threshold:", latest['block_hash'])
 

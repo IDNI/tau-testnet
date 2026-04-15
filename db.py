@@ -119,19 +119,7 @@ def init_db():
                 );
             ''')
             
-            # Ensure Genesis block row exists
-            genesis_data = json.dumps({
-                "block_hash": config.GENESIS_HASH,
-                "header": {
-                    "block_number": 0,
-                    "previous_hash": "0" * 64,
-                    "timestamp": 0
-                }
-            })
-            conn.execute('''
-                INSERT OR IGNORE INTO blocks (block_hash, block_number, previous_hash, timestamp, block_data)
-                VALUES (?, 0, ?, 0, ?)
-            ''', (config.GENESIS_HASH, "0"*64, genesis_data))
+
 
             # Migration: Check schema against requirements
             cur = conn.execute("PRAGMA table_info(mempool);")
@@ -477,6 +465,18 @@ def get_block_by_hash(block_hash: str) -> Optional[Dict]:
         logger.debug("Stored block hash %s contains invalid JSON", block_hash, exc_info=True)
         return None
 
+def get_genesis_hash() -> str:
+    """Return the hash of block 0 if it exists, otherwise empty string."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT block_hash FROM blocks WHERE block_number = 0 LIMIT 1')
+        row = cur.fetchone()
+    if row:
+        return row[0]
+    return ""
+
 def get_all_blocks() -> List[Dict]:
     """Returns all blocks ordered by block_number ascending as parsed dicts."""
     if _db_conn is None:
@@ -505,9 +505,9 @@ def get_canonical_blocks_at_or_after_height(block_number: int) -> List[Dict]:
         return []
         
     import config
-    path = get_chain_path(head_hash, config.GENESIS_HASH)
+    path = get_chain_path(head_hash, get_genesis_hash())
     path_hashes = set(path)
-    path_hashes.add(config.GENESIS_HASH)
+    path_hashes.add(get_genesis_hash())
     if not path_hashes:
         return []
         
@@ -702,7 +702,8 @@ def get_canonical_locator(max_entries: int = 32) -> List[str]:
     """
     if _db_conn is None:
         init_db()
-        
+
+    genesis_hash = get_genesis_hash()
     canonical_hash = None
     with _db_lock:
         cur = _db_conn.cursor()
@@ -710,10 +711,10 @@ def get_canonical_locator(max_entries: int = 32) -> List[str]:
         row = cur.fetchone()
         if row:
             canonical_hash = row[0]
-            
+
     import config
     if not canonical_hash:
-        return [config.GENESIS_HASH]
+        return [genesis_hash]
 
     locator = []
     step = 1
@@ -733,20 +734,20 @@ def get_canonical_locator(max_entries: int = 32) -> List[str]:
                 row = cur.fetchone()
                 if not row or not row[0]:
                     # Check if genesis config hash
-                    if current_hash != config.GENESIS_HASH:
+                    if current_hash != genesis_hash:
                         current_hash = None
                     break
                 current_hash = row[0]
                 if current_hash in visited:
                     break
-                if current_hash == config.GENESIS_HASH:
+                if current_hash == genesis_hash:
                     break
             
             if len(locator) > 10:
                 step *= 2
                 
-    if config.GENESIS_HASH not in locator and len(locator) < max_entries:
-        locator.append(config.GENESIS_HASH)
+    if genesis_hash not in locator and len(locator) < max_entries:
+        locator.append(genesis_hash)
         
     return locator
 

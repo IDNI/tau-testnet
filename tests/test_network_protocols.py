@@ -42,10 +42,11 @@ def isolate_db(tmp_path):
     import block as block_module
     
     db_module.init_db()
-    chain_state_module.init_chain_state()
+    chain_state_module.load_genesis("data/genesis.json")
     
-    db_module.save_canonical_state_atomically(config_module.GENESIS_HASH, 0, {}, {}, "", "", "", [], [], [], [])
-    chain_state_module._canonical_head_hash = config_module.GENESIS_HASH
+    genesis_hash = db_module.get_genesis_hash()
+    db_module.save_canonical_state_atomically(genesis_hash, 0, {}, {}, "", "", "", [], [], [], [])
+    chain_state_module._canonical_head_hash = genesis_hash
     yield
     
     # Close our test connection before restoring
@@ -87,12 +88,12 @@ async def two_nodes():
 
     cfg1 = NetworkConfig(
         network_id="testnet",
-        genesis_hash=config.GENESIS_HASH,
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
     cfg2 = NetworkConfig(
         network_id="testnet",
-        genesis_hash=config.GENESIS_HASH,
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
 
@@ -143,7 +144,7 @@ async def test_each_protocol_communication(two_nodes):
     hs = json.loads((data or b"{}").decode())
     assert hs["network_id"] == "testnet"
     assert hs["agent"] == svc2._config.agent
-    assert hs["genesis_hash"] == svc2._config.genesis_hash
+    assert hs["genesis_hash"] == svc2._genesis_hash
     assert hs["node_id"] == str(svc2.host.get_id())
 
     # Ping
@@ -166,10 +167,10 @@ async def test_each_protocol_communication(two_nodes):
         await stream.close()
     sync = json.loads((data or b"{}").decode())
     assert len(sync["headers"]) == 1
-    assert sync["headers"][0]["block_hash"] == config.GENESIS_HASH
+    assert sync["headers"][0]["block_hash"] == svc2._genesis_hash
     assert sync["headers"][0]["block_number"] == 0
     assert sync["tip_number"] == 0
-    assert sync["tip_hash"] == svc2._config.genesis_hash
+    assert sync["tip_hash"] == svc2._genesis_hash
 
     # Blocks
     stream = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_BLOCKS])
@@ -298,17 +299,17 @@ async def test_block_gossip_fallback_to_via(monkeypatch):
 
     cfg_a = NetworkConfig(
         network_id="testnet",
-        genesis_hash=config.GENESIS_HASH,
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
     cfg_b = NetworkConfig(
         network_id="testnet",
-        genesis_hash=config.GENESIS_HASH,
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
     cfg_c = NetworkConfig(
         network_id="testnet",
-        genesis_hash=config.GENESIS_HASH,
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
 
@@ -487,10 +488,10 @@ async def test_sync_protocol_typical_flow(two_nodes):
     hs = json.loads((hs_raw or b"{}").decode())
     assert hs["network_id"] == "testnet"
     assert hs["agent"] == svc2._config.agent
-    assert hs["genesis_hash"] == svc2._config.genesis_hash
+    assert hs["genesis_hash"] == svc2._genesis_hash
     assert hs["node_id"] == str(svc2.host.get_id())
     assert hs["head_number"] == 0
-    assert hs["head_hash"] == svc2._config.genesis_hash
+    assert hs["head_hash"] == svc2._genesis_hash
 
     req1 = {"type": "get_headers", "locator": ["h3", "h2", "h1"], "stop": "h_stop", "limit": 2000}
     s1 = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_SYNC])
@@ -500,7 +501,7 @@ async def test_sync_protocol_typical_flow(two_nodes):
     resp = json.loads((resp_raw or b"{}").decode())
     assert isinstance(resp.get("headers"), list)
     assert resp.get("tip_number") == 0
-    assert resp.get("tip_hash") == svc2._config.genesis_hash
+    assert resp.get("tip_hash") == svc2._genesis_hash
 
     req2 = {"type": "get_headers", "locator": ["h2", "h1"], "limit": 1}
     s2 = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_SYNC])
@@ -510,7 +511,7 @@ async def test_sync_protocol_typical_flow(two_nodes):
     resp2 = json.loads((resp2_raw or b"{}").decode())
     assert isinstance(resp2.get("headers"), list)
     assert resp2.get("tip_number") == 0
-    assert resp2.get("tip_hash") == svc2._config.genesis_hash
+    assert resp2.get("tip_hash") == svc2._genesis_hash
 
     s3 = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_SYNC])
     await s3.write(b"")
@@ -518,7 +519,7 @@ async def test_sync_protocol_typical_flow(two_nodes):
     await s3.close()
     resp3 = json.loads((resp3_raw or b"{}").decode())
     assert isinstance(resp3.get("headers"), list)
-    assert resp3.get("tip_hash") == svc2._config.genesis_hash
+    assert resp3.get("tip_hash") == svc2._genesis_hash
 
     bs = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_BLOCKS])
     await bs.write(json.dumps({"type": "get_blocks", "from": resp["tip_hash"], "limit": 5}).encode())
@@ -777,7 +778,7 @@ async def test_handshake_exchanges_peer_snapshot(monkeypatch):
 
     cfg = NetworkConfig(
         network_id="snapshotnet",
-        genesis_hash=config.GENESIS_HASH,
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
         dht_handshake_max_peers=8,
         dht_handshake_max_providers=8,
@@ -867,7 +868,7 @@ async def test_peer_advertisement_gossip(monkeypatch):
 
     cfg = NetworkConfig(
         network_id="adnet",
-        genesis_hash=config.GENESIS_HASH,
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
         dht_handshake_max_peers=0,
         dht_handshake_max_providers=8,
@@ -958,7 +959,7 @@ async def test_gossip_dht_multi_hop_routing(monkeypatch):
 
     cfg = NetworkConfig(
         network_id="multi-hop-testnet",
-        genesis_hash=config.GENESIS_HASH,
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
 
@@ -1045,7 +1046,7 @@ async def test_dht_bucket_refresh_cycle():
 
     cfg = NetworkConfig(
         network_id="metricsnet",
-        genesis_hash=config.GENESIS_HASH,
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
         dht_refresh_interval=0.01,
         dht_bucket_refresh_interval=0.01,

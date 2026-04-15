@@ -165,7 +165,7 @@ def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> Adm
     Primary Orchestrator Endpoint for Network Admission logic.
     Delegates dynamic logic independently based cleanly on `tx_type` exclusively.
     """
-    tx_type = payload.get("tx_type")
+    tx_type = payload.get("tx_type", "user_tx")
     
     if "consensus_proposal" == tx_type or "bundle" in payload:
         return format_error("Legacy transaction types (consensus_proposal/bundle) explicitly deprecated and rejected natively.")

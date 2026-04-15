@@ -19,6 +19,7 @@ from block import Block
 from db import init_db, add_block, clear_mempool
 import config
 import chain_state
+import db
 
 
 class TestStateReconstruction(unittest.TestCase):
@@ -59,8 +60,11 @@ class TestStateReconstruction(unittest.TestCase):
             chain_state._sequence_numbers.clear()
         
         # Initialize fresh database
+        import db
+        db._db_conn = None  # Force reconnect
         init_db()
         clear_mempool()
+        chain_state.load_genesis("data/genesis.json")
         
         # Sample addresses for testing
         self.addr1 = GENESIS_ADDRESS
@@ -158,7 +162,7 @@ class TestStateReconstruction(unittest.TestCase):
         
         block_1 = Block.create(
             block_number=1,
-            previous_hash=config.GENESIS_HASH,
+            previous_hash=db.get_genesis_hash(),
             transactions=[tx1], proposer_pubkey="a"*96
         )
         block_1.header.state_hash = ""
@@ -223,7 +227,7 @@ class TestStateReconstruction(unittest.TestCase):
             ); all_rules.append(tx3["operations"]["0"])
             block_1 = Block.create(
                 block_number=1,
-                previous_hash=config.GENESIS_HASH,
+                previous_hash=db.get_genesis_hash(),
                 transactions=[tx1, tx2, tx3], proposer_pubkey="a"*96
             )
             block_1.header.state_hash = ""
@@ -334,7 +338,7 @@ class TestStateReconstruction(unittest.TestCase):
         
         block_1 = Block.create(
             block_number=1,
-            previous_hash=config.GENESIS_HASH,
+            previous_hash=db.get_genesis_hash(),
             transactions=[valid_tx, invalid_tx, invalid_amount_tx], proposer_pubkey="a"*96
         )
         block_1.header.state_hash = ""
@@ -385,7 +389,7 @@ class TestStateReconstruction(unittest.TestCase):
         
         block_1 = Block.create(
             block_number=1,
-            previous_hash=config.GENESIS_HASH,
+            previous_hash=db.get_genesis_hash(),
             transactions=[tx1, tx2, tx3], proposer_pubkey="a"*96
         )
         block_1.header.state_hash = ""
@@ -421,7 +425,7 @@ class TestStateReconstruction(unittest.TestCase):
             # Build and add the block to the chain DB
             block_1 = Block.create(
                 block_number=1,
-                previous_hash=config.GENESIS_HASH,
+                previous_hash=db.get_genesis_hash(),
                 transactions=[tx1], proposer_pubkey="a"*96
             )
             block_1.header.state_hash = ""
@@ -460,7 +464,7 @@ class TestStateReconstruction(unittest.TestCase):
         
         block_1 = Block.create(
             block_number=1,
-            previous_hash=config.GENESIS_HASH,
+            previous_hash=db.get_genesis_hash(),
             transactions=[tx1], proposer_pubkey="a"*96
         )
         block_1.header.state_hash = ""
@@ -498,7 +502,7 @@ class TestStateReconstruction(unittest.TestCase):
             
             block_1 = Block.create(
                 block_number=1,
-                previous_hash=config.GENESIS_HASH,
+                previous_hash=db.get_genesis_hash(),
                 transactions=[tx1], proposer_pubkey="a"*96
             )
             block_1.header.state_hash = ""
@@ -534,7 +538,7 @@ class TestStateReconstruction(unittest.TestCase):
         
         block_1 = Block.create(
             block_number=1,
-            previous_hash=config.GENESIS_HASH,
+            previous_hash=db.get_genesis_hash(),
             transactions=[tx1, tx2], proposer_pubkey="a"*96
         )
         block_1.header.state_hash = ""

@@ -189,7 +189,6 @@ class ServiceContainer:
 
         return NetworkConfig(
             network_id=self.settings.network.network_id,
-            genesis_hash=self.settings.network.genesis_hash,
             listen_addrs=listen_addrs,
             bootstrap_peers=bootstrap_peers,
             peerstore_path=self.settings.network.peerstore_path,

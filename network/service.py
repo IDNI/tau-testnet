@@ -210,7 +210,7 @@ class NetworkService:
 
                         local_latest = db.get_canonical_head()
                         local_head_number = 0
-                        local_head_hash = self._config.genesis_hash
+                        local_head_hash = self._genesis_hash
                         local_has_blocks = bool(local_latest and isinstance(local_latest, dict) and local_latest.get("block_hash"))
                         try:
                             if local_latest and isinstance(local_latest, dict) and local_latest.get("header"):
@@ -225,7 +225,7 @@ class NetworkService:
                             if remote_head_number is not None:
                                 remote_n = int(remote_head_number)
                                 remote_h = str(remote_head)
-                                remote_has_blocks = bool(remote_h and remote_h != self._config.genesis_hash)
+                                remote_has_blocks = bool(remote_h and remote_h != self._genesis_hash)
                                 # If we have no blocks but the remote has a real head hash (e.g. block #0),
                                 # we must sync even though head_number == 0 on both sides.
                                 if (not local_has_blocks) and remote_has_blocks:
@@ -238,7 +238,7 @@ class NetworkService:
                             else:
                                 # Fallback: only consider syncing if the remote tip differs from ours.
                                 remote_h = str(remote_head)
-                                remote_has_blocks = bool(remote_h and remote_h != self._config.genesis_hash)
+                                remote_has_blocks = bool(remote_h and remote_h != self._genesis_hash)
                                 if remote_has_blocks and (not local_has_blocks):
                                     need_sync = True
                                 elif remote_has_blocks and remote_h != str(local_head_hash):
@@ -266,10 +266,10 @@ class NetworkService:
         payload = {
             "network_id": self._config.network_id,
             "agent": self._config.agent,
-            "genesis_hash": self._config.genesis_hash,
+            "genesis_hash": self._genesis_hash,
             "node_id": str(self.get_id()),
             "head_number": 0,
-            "head_hash": self._config.genesis_hash,
+            "head_hash": self._genesis_hash,
             "head_state_hash": "",
             "peer_pubkey": getattr(self._config, "MINER_PUBKEY", ""),
         }
@@ -327,8 +327,8 @@ class NetworkService:
                 # Only advertise specific, high-value keys to prevent handshake bloat/DoS.
                 # We advertise ourselves as a provider for the head and genesis state.
                 
-                head_hash = str(payload.get("head_hash") or self._config.genesis_hash)
-                genesis_hash = str(payload.get("genesis_hash") or self._config.genesis_hash)
+                head_hash = str(payload.get("head_hash") or self._genesis_hash)
+                genesis_hash = str(payload.get("genesis_hash") or self._genesis_hash)
                 head_state_hash = str(payload.get("head_state_hash") or "")
 
                 # Slash-prefixed keys matching internal storage/validation
@@ -406,9 +406,9 @@ class NetworkService:
             logger.debug("Failed to build locator from db", exc_info=True)
 
         if not locator:
-            locator = [self._config.genesis_hash]
-        elif self._config.genesis_hash not in locator:
-            locator.append(self._config.genesis_hash)
+            locator = [self._genesis_hash]
+        elif self._genesis_hash not in locator:
+            locator.append(self._genesis_hash)
         return locator
 
     async def _send_mempool_snapshot(self, peer_id: Any) -> None:
@@ -687,20 +687,20 @@ class NetworkService:
     async def _handle_handshake(self, stream) -> None:
         import json
         import multiaddr
+        import db
         
         # Prepare response (default)
         resp = {
             "network_id": self._config.network_id,
             "agent": self._config.agent,
-            "genesis_hash": self._config.genesis_hash,
+            "genesis_hash": self._genesis_hash,
             "node_id": str(self.get_id()),
             "head_number": 0,
-            "head_hash": self._config.genesis_hash,
+            "head_hash": self._genesis_hash,
             "peer_pubkey": getattr(self._config, "MINER_PUBKEY", ""),
         }
         # Prefer the persisted chain tip if available.
         try:
-            import db
             latest = db.get_canonical_head_block()
             if latest and "header" in latest:
                 resp["head_number"] = int(latest["header"].get("block_number", resp["head_number"]))
@@ -888,10 +888,10 @@ class NetworkService:
             latest = db.get_canonical_head()
             if latest and isinstance(latest, dict) and latest.get("header"):
                 tip_number = int(latest["header"].get("block_number", 0))
-                tip_hash = str(latest.get("block_hash") or self._config.genesis_hash)
+                tip_hash = str(latest.get("block_hash") or self._genesis_hash)
             else:
                 tip_number = 0
-                tip_hash = self._config.genesis_hash
+                tip_hash = self._genesis_hash
 
             locator = req.get("locator") if isinstance(req.get("locator"), list) else []
             stop = req.get("stop")
@@ -1360,6 +1360,17 @@ class NetworkService:
     def host(self):
         return self._host_manager.host
 
+    @property
+    def _genesis_hash(self) -> str:
+        override = getattr(self, "__genesis_hash", None)
+        if isinstance(override, str) and override:
+            return override
+        cfg_hash = getattr(self._config, "genesis_hash", None)
+        if isinstance(cfg_hash, str) and cfg_hash:
+            return cfg_hash
+        import db
+        return db.get_genesis_hash()
+
     def get_id(self):
         return self._host_manager.get_id()
 
@@ -1530,7 +1541,7 @@ class NetworkService:
     async def _try_block_sync(self, peer_id: Any, locator: Iterable[str], stop: Optional[str] = None, limit: int = 2000) -> Any:
         locator_list = list(locator) if locator else []
         if not locator_list:
-            locator_list = [self._config.genesis_hash]
+            locator_list = [self._genesis_hash]
         return await self._sync_and_ingest_from_peer(peer_id, locator_list, stop=stop, limit=limit)
 
     async def _sync_and_ingest_from_peer(self, peer_id: Any, locator: List[str], stop: Optional[str] = None, limit: int = 2000) -> int:
@@ -1549,7 +1560,7 @@ class NetworkService:
         limit = max(1, min(limit, 2000))
 
         if not locator:
-            locator = [self._config.genesis_hash]
+            locator = [self._genesis_hash]
 
         pid_obj = peer_id
         try:

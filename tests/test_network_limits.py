@@ -18,7 +18,7 @@ async def check_network_limits():
     # Setup Config
     config = NetworkConfig(
         network_id="test-limits",
-        genesis_hash="genesis",
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")], # Ephemeral port
         conn_low_water=10,
         conn_high_water=20,

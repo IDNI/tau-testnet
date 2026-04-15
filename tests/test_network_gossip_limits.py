@@ -19,7 +19,7 @@ def network_service():
     import multiaddr
     config = NetworkConfig(
         network_id="test", 
-        genesis_hash="genesis",
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")]
     )
     svc = NetworkService(config)

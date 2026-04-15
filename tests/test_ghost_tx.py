@@ -149,7 +149,11 @@ class TestGhostTxIntegration(unittest.TestCase):
         # So we need to patch chain_state.get_rules_state to return "rule X" when called inside execution.
         # However, chain_state is imported both in test and in createblock.
         
-        with patch('chain_state.get_rules_state', return_value="rule X"):
+        with patch('chain_state.get_rules_state', return_value="rule X"), \
+             patch('consensus.engine.TauConsensusEngine.query_eligibility', return_value=True), \
+             patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True), \
+             patch('consensus.engine.tau_manager.tau_ready.is_set', return_value=True), \
+             patch('consensus.engine.tau_manager.communicate_with_tau', side_effect=tau_side_effect):
              # Mock Sig Validation (Always valid for this test)
              mock_sig.return_value = True
              

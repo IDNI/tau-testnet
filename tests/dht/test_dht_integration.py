@@ -26,7 +26,7 @@ async def _wait_for_listen_addrs(host, timeout: float = 5.0) -> List[multiaddr.M
 async def dht_two_nodes(temp_database):
     cfg_kwargs = {
         "network_id": "dht-testnet",
-        "genesis_hash": "genesis",
+
         "listen_addrs": [multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
         "bootstrap_peers": [],
         "peerstore_path": None,

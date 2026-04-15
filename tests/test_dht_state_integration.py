@@ -89,12 +89,12 @@ async def two_connected_nodes():
     # Configure two nodes
     cfg1 = NetworkConfig(
         network_id="testnet",
-        genesis_hash="genesis_hash_val",
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
     cfg2 = NetworkConfig(
         network_id="testnet",
-        genesis_hash="genesis_hash_val",
+        
         listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
     )
 

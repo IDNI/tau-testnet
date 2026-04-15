@@ -35,7 +35,7 @@ class TestSendTxValidation(unittest.TestCase):
         if db._db_conn:
             db._db_conn.close(); db._db_conn = None
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
-        db.init_db(); chain_state.init_chain_state()
+        db.init_db(); chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()  # Clear mempool for test isolation
         def mock_tau_response(rule_text, target_output_stream_index=1, input_stream_values=None, **kwargs):
             # New bitvector model: return boolean on o1
@@ -94,6 +94,7 @@ class TestSendTxValidation(unittest.TestCase):
         ops = {"1": transfers}
         pk_hex = sender_pubkey or GENESIS
         tx_dict = {
+            "tx_type": "user_tx",
             "sender_pubkey": pk_hex,
             "sequence_number": chain_state.get_sequence_number(pk_hex),
             "expiration_time": int(time.time()) + 1000,
@@ -119,6 +120,7 @@ class TestSendTxValidation(unittest.TestCase):
 
     def test_fail_invalid_from_address_format_python(self):
         tx = {
+            "tx_type": "user_tx",
             "sender_pubkey": INVALID_ADDR_SHORT,
             "sequence_number": 0,
             "expiration_time": int(time.time()) + 1000,
@@ -137,6 +139,7 @@ class TestSendTxValidation(unittest.TestCase):
 
     def test_no_transfers_key_success(self):
         tx = {
+            "tx_type": "user_tx",
             "sender_pubkey": GENESIS,
             "sequence_number": chain_state.get_sequence_number(GENESIS),
             "expiration_time": int(time.time()) + 1000,

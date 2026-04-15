@@ -70,6 +70,101 @@ def import_hashlib():
 
 
 
+def execute_batch(transactions: List[Dict], reserved_ids: List[int], block_timestamp: int):
+    """
+    Compatibility helper used by tests to simulate a batch over the current
+    in-memory chain state without persisting a block.
+    """
+    from copy import deepcopy
+    from consensus.engine import TauConsensusEngine
+    from consensus.state import TauStateSnapshot, compute_consensus_meta_hash, compute_consensus_state_hash
+    from chain_state import compute_accounts_hash
+
+    latest_block = db.get_canonical_head_block()
+    block_number = (latest_block['header']['block_number'] + 1) if latest_block else 0
+
+    app_rules = (chain_state._application_rules_state or "").encode('utf-8')
+    cons_rules = (chain_state._consensus_rules_state or "").encode('utf-8')
+    acc_hash = compute_accounts_hash(chain_state._balances, chain_state._sequence_numbers)
+    vote_records = [(k, pub) for k, v in chain_state._lifecycle_manager.votes.items() for pub in v]
+    meta_hash = compute_consensus_meta_hash(
+        host_contract={}, active_validators=list(chain_state._lifecycle_manager.active_validators),
+        pending_updates=list(chain_state._lifecycle_manager.pending_updates),
+        vote_records=vote_records, activation_schedule=chain_state._lifecycle_manager.scheduled_updates,
+        checkpoint_references=[]
+    )
+    state_hash = compute_consensus_state_hash(cons_rules, app_rules, acc_hash, meta_hash)
+
+    parent_snapshot = TauStateSnapshot(
+        state_hash=state_hash,
+        tau_bytes=app_rules,
+        metadata={
+            "source": "chain_state",
+            "balances": chain_state._balances,
+            "sequence_numbers": chain_state._sequence_numbers,
+            "lifecycle_manager": chain_state._lifecycle_manager,
+        }
+    )
+
+    working_balances = deepcopy(chain_state._balances)
+    working_sequences = deepcopy(chain_state._sequence_numbers)
+    working_lifecycle = deepcopy(chain_state._lifecycle_manager)
+
+    for tx in transactions:
+        operations = tx.get("operations", {}) if isinstance(tx, dict) else {}
+        transfers = operations.get("1") if isinstance(operations, dict) else None
+        if not isinstance(transfers, list) or not transfers:
+            continue
+        custom_inputs: dict[int, list[str]] = {}
+        for key, value in operations.items():
+            if not isinstance(key, str) or not key.isdigit():
+                continue
+            idx = int(key)
+            if idx in (0, 1):
+                continue
+            if isinstance(value, (str, int)):
+                custom_inputs[idx] = [str(value)]
+            elif isinstance(value, (list, tuple)):
+                custom_inputs[idx] = [str(item) for item in value]
+        try:
+            from_addr, to_addr, amount = transfers[0]
+            tau_input_stream_values = {
+                1: str(amount),
+                2: str(working_balances.get(str(from_addr), chain_state.get_balance(str(from_addr)))),
+                3: "0",
+                4: "0",
+                5: str(block_timestamp),
+            }
+            tau_input_stream_values.update(custom_inputs)
+            tau_manager.communicate_with_tau_multi(
+                input_stream_values=tau_input_stream_values,
+                apply_rules_update=False,
+            )
+        except Exception:
+            pass
+
+    engine = TauConsensusEngine()
+    exec_result = engine.apply(
+        parent_snapshot,
+        transactions,
+        block_timestamp,
+        target_balances=working_balances,
+        target_sequences=working_sequences,
+        target_lifecycle=working_lifecycle,
+    )
+
+    accepted = {id(tx) for tx in exec_result.accepted_transactions}
+    final_txs = []
+    final_reserved_ids = []
+    for tx, reserved_id in zip(transactions, reserved_ids):
+        if id(tx) in accepted:
+            final_txs.append(tx)
+            final_reserved_ids.append(reserved_id)
+
+    final_rules = exec_result.snapshot.tau_bytes.decode('utf-8', errors='ignore')
+    return final_txs, final_reserved_ids, final_rules, working_balances, working_sequences
+
+
 def create_block_from_mempool() -> Dict:
     """
     Creates a new block from all transactions currently in the mempool,

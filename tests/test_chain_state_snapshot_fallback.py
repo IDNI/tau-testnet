@@ -31,7 +31,7 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
         import config
         block = Block.create(
             block_number=1,
-            previous_hash=config.GENESIS_HASH,
+            previous_hash="0"*64,
             transactions=[{"tx_id": "tx-1", "operations": {}}],
             state_hash=expected_state_hash,
             timestamp=1700000000,

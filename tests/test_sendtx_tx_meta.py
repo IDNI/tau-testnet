@@ -32,10 +32,10 @@ class TestSendTxTxMeta(unittest.TestCase):
             os.remove(self.test_db)
             
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
-        db.init_db(); chain_state.init_chain_state()
+        db.init_db(); chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()  # Clear mempool for test isolation
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
-        db.init_db(); chain_state.init_chain_state()
+        db.init_db(); chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()  # Clear mempool for test isolation
         def mock_tau_response(rule_text, target_output_stream_index=1, input_stream_values=None):
             # New bitvector model: return boolean on o1
@@ -96,6 +96,7 @@ class TestSendTxTxMeta(unittest.TestCase):
         pk_hex = sender_pubkey or GENESIS
         seq = sequence if sequence is not None else chain_state.get_sequence_number(pk_hex)
         tx_dict = {
+            "tx_type": "user_tx",
             "sender_pubkey": pk_hex,
             "sequence_number": seq,
             "expiration_time": exp_time,

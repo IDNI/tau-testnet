@@ -33,7 +33,7 @@ class TestSendTxCrypto(unittest.TestCase):
         config.set_database_path(self.db_path)
         
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
-        db.init_db(); chain_state.init_chain_state()
+        db.init_db(); chain_state.load_genesis("data/genesis.json")
         def mock_tau_response(rule_text=None, target_output_stream_index=1, input_stream_values=None, **kwargs):
             # New bitvector model: return boolean on o1
             if target_output_stream_index == 0:
@@ -101,6 +101,7 @@ class TestSendTxCrypto(unittest.TestCase):
         pk_hex = sender_pubkey or (bls.SkToPk(sender_privkey).hex() if sender_privkey else GENESIS)
         seq = sequence if sequence is not None else chain_state.get_sequence_number(pk_hex)
         tx_dict = {
+            "tx_type": "user_tx",
             "sender_pubkey": pk_hex,
             "sequence_number": seq,
             "expiration_time": exp_time,

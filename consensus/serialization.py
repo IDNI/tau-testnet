@@ -28,17 +28,28 @@ def encode_string(val: str) -> bytes:
     encoded = val.encode("utf-8")
     return encode_uint32(len(encoded)) + encoded
 
+def _coerce_fixed_bytes(val: Any, expected_len: int, label: str) -> bytes:
+    if isinstance(val, (bytes, bytearray)):
+        out = bytes(val)
+    elif isinstance(val, str):
+        try:
+            out = bytes.fromhex(val)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be valid hex") from exc
+    else:
+        raise ValueError(f"Value must be exactly {expected_len} bytes, got {type(val)}")
+    if len(out) != expected_len:
+        raise ValueError(f"Value must be exactly {expected_len} bytes, got {len(out)}")
+    return out
+
+
 def encode_hash32(val: bytes) -> bytes:
-    """Encode a 32-byte fixed-width hash. Requires exactly 32 bytes."""
-    if not isinstance(val, (bytes, bytearray)) or len(val) != 32:
-        raise ValueError(f"Value must be exactly 32 bytes, got {len(val) if isinstance(val, (bytes, bytearray)) else type(val)}")
-    return bytes(val)
+    """Encode a 32-byte fixed-width hash. Accepts raw bytes or a 64-char hex string."""
+    return _coerce_fixed_bytes(val, 32, "hash32")
 
 def encode_pubkey48(val: bytes) -> bytes:
-    """Encode a 48-byte BLS12-381 public key. Requires exactly 48 bytes."""
-    if not isinstance(val, (bytes, bytearray)) or len(val) != 48:
-        raise ValueError(f"Value must be exactly 48 bytes, got {len(val) if isinstance(val, (bytes, bytearray)) else type(val)}")
-    return bytes(val)
+    """Encode a 48-byte BLS12-381 public key. Accepts raw bytes or a 96-char hex string."""
+    return _coerce_fixed_bytes(val, 48, "pubkey48")
 
 
 # --- Canonical JSON ---

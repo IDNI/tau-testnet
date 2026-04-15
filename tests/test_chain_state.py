@@ -43,7 +43,7 @@ class TestChainState(unittest.TestCase):
         # Reset chain state before each test for isolation
         chain_state._balances = {}
         chain_state._sequence_numbers = {}
-        chain_state.init_chain_state() # Re-initialize with Genesis
+        chain_state.load_genesis("data/genesis.json") # Re-initialize with Genesis
 
     def test_initial_genesis_balance(self):
         print("\n[TEST_CASE] Initial Genesis Balance")

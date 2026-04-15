@@ -24,7 +24,7 @@ class TestConsensusTime(unittest.TestCase):
         chain_state._balances.clear()
         chain_state._sequence_numbers.clear()
         db.init_db()
-        chain_state.init_chain_state()
+        chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
         sendtx._PY_ECC_AVAILABLE = False
         patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()

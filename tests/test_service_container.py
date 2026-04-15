@@ -7,7 +7,6 @@ def test_container_uses_settings_env():
     assert container.settings is config.settings
     network_cfg = container.build_network_config()
     assert network_cfg.network_id == config.settings.network.network_id
-    assert network_cfg.genesis_hash == config.settings.network.genesis_hash
 
 
 class DummyLogger:

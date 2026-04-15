@@ -11,7 +11,7 @@ def mock_config():
     config = MagicMock(spec=NetworkConfig)
     config.network_id = "test-net"
     config.agent = "test-agent"
-    config.genesis_hash = "genesis123"
+    _genesis_hash = "genesis123"
     config.bootstrap_peers = []
     config.dht_bootstrap_peers = []
     config.peer_advertisement_interval = 0
@@ -81,7 +81,7 @@ def test_outbound_handshake_capping(service):
     # So we need to ensure _encode_dht_key works.
     service._dht_manager._encode_dht_key.side_effect = lambda ns, sfx: f"/{ns}/{sfx}".encode("utf-8")
     
-    service._config.genesis_hash = "genesis123"
+    service.__genesis_hash = "genesis123"
     # Mock db.get_canonical_head_block in sys.modules
     mock_db = MagicMock()
     mock_db.get_canonical_head.return_value = {

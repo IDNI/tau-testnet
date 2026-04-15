@@ -40,6 +40,7 @@ def mock_chain_state(mock_db_path):
 
 def test_db_public_methods(mock_db_path):
     db.init_db()
+    chain_state.load_genesis("data/genesis.json")
     
     # 1. Test save_canonical_state_atomically
     balances = {"addr1": 100, "addr2": 200}
@@ -72,7 +73,8 @@ def test_db_public_methods(mock_db_path):
                 "block_hash": self.block_hash
             }
             
-    db.add_block(MockBlock(1, "hash1", config.GENESIS_HASH))
+    genesis_hash = db.get_genesis_hash()
+    db.add_block(MockBlock(1, "hash1", genesis_hash))
     db.add_block(MockBlock(2, "hash2", "hash1"))
     db.add_block(MockBlock(3, "hash3", "hash2"))
     

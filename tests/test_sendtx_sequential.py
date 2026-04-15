@@ -71,7 +71,7 @@ def run_test_sequential_ops():
     if os.path.exists("test_sequential_sendtx.sqlite"): os.remove("test_sequential_sendtx.sqlite")
     db.STRING_DB_PATH = "test_sequential_sendtx.sqlite"
     db.init_db()
-    chain_state.init_chain_state()
+    chain_state.load_genesis("data/genesis.json")
     sendtx_module._PY_ECC_AVAILABLE = True # Enable crypto for these tests
     
     mock_tau_manager = MockTauManagerSequential()

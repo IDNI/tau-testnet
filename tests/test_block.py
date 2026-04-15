@@ -124,6 +124,8 @@ class TestBlockCreation(unittest.TestCase):
         # Mock Signature Validation
         self.sig_patcher = unittest.mock.patch('commands.createblock._validate_signature', return_value=True)
         self.sig_patcher.start()
+        self.verify_patcher = unittest.mock.patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
+        self.verify_patcher.start()
         
         # Mock Pubkey Validation (if createblock calls it, or if it's in sendtx but createblock assumes valid?)
         # createblock does basic checks.
@@ -132,6 +134,7 @@ class TestBlockCreation(unittest.TestCase):
         """Clean up the temporary database."""
         self.tau_patcher.stop()
         self.sig_patcher.stop()
+        self.verify_patcher.stop()
         clear_mempool()
         # Close the connection if it's open, to release file lock on Windows
         if hasattr(createblock.db, '_db_conn') and createblock.db._db_conn is not None:

@@ -70,7 +70,14 @@ class ConsensusEngine(ABC):
         pass
         
     @abstractmethod
-    def apply_block(self, active_view: ActiveConsensusView, block: Any, parent_snapshot: TauStateSnapshot) -> ApplyBlockResult:
+    def apply_block(
+        self,
+        active_view: ActiveConsensusView,
+        block: Any,
+        parent_snapshot: TauStateSnapshot,
+        *,
+        replay_mode: bool = False,
+    ) -> ApplyBlockResult:
         """
         Apply the valid block payload over the active view to produce the next 
         committed snapshot. This includes archival transitions.
@@ -176,7 +183,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             logger.error("Header verification failed: %s", e)
             return False
 
-    def apply_block(self, active_view: ActiveConsensusView, block: Any, parent_snapshot: TauStateSnapshot) -> ApplyBlockResult:
+    def apply_block(
+        self,
+        active_view: ActiveConsensusView,
+        block: Any,
+        parent_snapshot: TauStateSnapshot,
+        *,
+        replay_mode: bool = False,
+    ) -> ApplyBlockResult:
         """
         Executes a full block over the consensus boundaries.
         Unifies Rebuild, Process Block, and Mining paths.
@@ -205,7 +219,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # 2. Pure Transaction Simulation (Internal Layer)
         # We pass target_balances and target_sequences to self.apply which mutates them internally.
         # This acts as our pure executor since t_bals/t_seqs are local copies.
-        exec_result = self.apply(parent_snapshot, block.transactions, block.header.timestamp, target_balances=t_bals, target_sequences=t_seqs, target_lifecycle=lm)
+        exec_result = self.apply(
+            parent_snapshot,
+            block.transactions,
+            block.header.timestamp,
+            target_balances=t_bals,
+            target_sequences=t_seqs,
+            target_lifecycle=lm,
+            replay_mode=replay_mode,
+        )
         
         # Convert internal apply result into structural outcomes
         outcomes = []
@@ -322,6 +344,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         target_balances: Optional[Dict[str, int]] = None,
         target_sequences: Optional[Dict[str, int]] = None,
         target_lifecycle: Optional[Any] = None,
+        replay_mode: bool = False,
     ) -> TauExecutionResult:
         """
         Apply transactions to the current state.
@@ -362,6 +385,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # - execution_success: True/False
             
             accepted_in_block = True
+            hard_reject = False
             execution_success = True
             tx_receipt = {"logs": []}
 
@@ -383,7 +407,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         current_seq,
                         sequence_number,
                     )
-                    # Keep legacy behavior: do not hard-fail here, but also do not increment.
+                    accepted_in_block = False
+                    hard_reject = True
+                    execution_success = False
+                    tx_receipt["logs"].append(
+                        f"Invalid sequence number: expected {current_seq}, got {sequence_number}"
+                    )
 
             # Process operations
             # Parse operations first to establish deterministic order:
@@ -410,6 +439,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["logs"].append("Duplicate update ignored: " + update.update_id_hex)
                     else:
                         tx_receipt["logs"].append("Update rejected by strict admission")
+                        accepted_in_block = False
+                        hard_reject = True
                         execution_success = False
                 else:
                     tx_receipt["logs"].append("Invalid update format")
@@ -425,6 +456,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["logs"].append("Vote ignored (valid no-op)")
                     else:
                         tx_receipt["logs"].append("Vote rejected by strict admission")
+                        accepted_in_block = False
+                        hard_reject = True
                         execution_success = False
                 else:
                     tx_receipt["logs"].append("Invalid vote format")
@@ -467,6 +500,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             if reserved_error:
                 logger.error("Transaction invalid: %s", reserved_error)
+                accepted_in_block = False
+                hard_reject = True
                 execution_success = False
                 tx_receipt["logs"].append(f"Error: {reserved_error}")
             else:
@@ -566,6 +601,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                             
                                         if current_from < amount:
                                             logger.error("Insufficient funds for %s to send %s. Has: %s.", from_addr[:10], amount, current_from)
+                                            if not replay_mode:
+                                                accepted_in_block = False
+                                                hard_reject = True
                                             execution_success = False
                                             tx_receipt["logs"].append("Transfer balance state failed (insufficient)")
                                             break
@@ -575,11 +613,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         target_balances[to_addr] = current_to + amount
                                     else:
                                         if not chain_state.update_balances_after_transfer(from_addr, to_addr, amount):
+                                            if not replay_mode:
+                                                accepted_in_block = False
+                                                hard_reject = True
                                             execution_success = False
                                             tx_receipt["logs"].append("Transfer balance state failed")
                                             break
                                 except Exception as e:
                                     logger.error("Error applying transfer: %s", e)
+                                    if not replay_mode:
+                                        accepted_in_block = False
+                                        hard_reject = True
                                     execution_success = False
                                     break
                         # Loop finishes, check if we broke out
@@ -610,7 +654,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                          execution_success = False
                          tx_receipt["logs"].append(f"Error (unified custom): {e}")
 
-            if accepted_in_block:
+            if accepted_in_block and not hard_reject:
                 if should_increment_seq and sender:
                     try:
                         if target_sequences is not None:
@@ -622,10 +666,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         tx_receipt["logs"].append("Error: failed to increment sequence number")
                         # execution_success = False ? No, sequence failure is bad but processed.
 
-            if accepted_in_block:
+            if accepted_in_block and not hard_reject:
                 accepted_txs.append(tx)
-                status = "success" if execution_success else "failed"
-                tx_receipt["status"] = status
+                tx_receipt["status"] = "success" if execution_success else "failed"
                 receipts[tx_id] = tx_receipt
             else:
                 rejected_txs.append(tx)

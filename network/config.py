@@ -15,10 +15,10 @@ class BootstrapPeer:
 @dataclass
 class NetworkConfig:
     network_id: str
-    genesis_hash: str
     listen_addrs: List[multiaddr.Multiaddr]
     bootstrap_peers: List[BootstrapPeer] = field(default_factory=list)
     agent: str = "tau-testnet/0.1"
+    genesis_hash: str = ""
     peerstore_path: Optional[str] = None
     # Optional raw private key bytes for persistent identity (implementation-specific)
     identity_key: Optional[bytes] = None
@@ -45,3 +45,12 @@ class NetworkConfig:
     peer_advertisement_interval: float = 180.0
     peer_advertisement_max_peers: int = 16
     peer_advertisement_recent_window: float = 600.0
+
+    def __post_init__(self) -> None:
+        if self.genesis_hash:
+            return
+        try:
+            import db
+            self.genesis_hash = db.get_genesis_hash()
+        except Exception:
+            self.genesis_hash = ""

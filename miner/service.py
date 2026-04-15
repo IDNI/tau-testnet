@@ -37,7 +37,7 @@ class SoleMiner:
         # 1. Turn check logic first (fast path)
         latest_block = db.get_canonical_head_block()
         next_block_number = latest_block['header']['block_number'] + 1 if latest_block else 0
-        prev_hash = latest_block['block_hash'] if latest_block else config.GENESIS_HASH
+        prev_hash = latest_block['block_hash'] if latest_block else db.get_genesis_hash()
         
         from consensus.engine import TauConsensusEngine
         engine = TauConsensusEngine()
