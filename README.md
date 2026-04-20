@@ -38,9 +38,10 @@ When enabled, the system maintains a single `tau::interpreter` instance and capt
     *   Persists the entire chain of blocks to a SQLite database, tracking multiple competing tips and forks.
     *   Evaluates the heaviest valid branch using a robust, fork-choice algorithm based on highest-block-height with deterministic tie-breaking.
     *   Performs chain reorganizations ("reorgs") seamlessly, reverting and re-applying transactions and state when the main chain tips to a different path log.
-*   **Proof-of-Authority (PoA) Blocks (BLS signatures)**:
-    *   Blocks can be signed by the configured authority key (`TAU_MINER_PRIVKEY`) and verified against `TAU_MINER_PUBKEY` (when `py_ecc` is available).
-    *   The PoA execution path integrates with the Tau rule/state snapshot (`state_hash`) to keep block ↔ state linkage explicit.
+*   **Tau-Driven Pluggable Consensus Architecture**:
+    *   The node's consensus policy (who can propose blocks, what makes a block valid) is governed entirely by living Tau rules (`consensus_rules`).
+    *   The Python host orchestrates state storage and cryptographic checks, while Tau evaluates the block against the active rules to emit `o6 = 1` for validity.
+    *   Governance is fully on-chain. Active validators can submit `consensus_rule_update` and `consensus_rule_vote` transactions to dynamically mutate the chain's consensus rules with built-in activation delays.
 *   **Authenticated Transactions via BLS Signatures**:
     *   Transactions are cryptographically signed using BLS12-381 signatures.
     *   The server verifies the signature against the `sender_pubkey` and a canonical representation of the transaction data.
@@ -50,15 +51,12 @@ When enabled, the system maintains a single `tau::interpreter` instance and capt
     *   Transactions must include the correct sequence number, which is incremented upon successful validation.
 *   **Transaction Expiration**:
     *   Transactions include an `expiration_time` (Unix timestamp) after which they are considered invalid.
-*   **New JSON Transaction Structure**:
-    *   The `sendtx` command now expects a JSON object with the following top-level fields:
-        *   `sender_pubkey` (string): BLS12-381 public key of the transaction authorizer.
-        *   `sequence_number` (integer): Nonce for replay protection.
-        *   `expiration_time` (integer): Unix timestamp for transaction validity.
-        *   `operations` (object): Contains the actual operations to perform (e.g., `"0": <rules_data>`, `"1": <transfers_list>`).
-            *   For transfers in `operations["1"]`, the `from_pubkey` of each transfer must match the top-level `sender_pubkey`.
-        *   `fee_limit` (string/integer): Placeholder for future fee models.
-        *   `signature` (string): Hex-encoded BLS signature over a canonical form of the other fields.
+*   **Typed JSON Transaction Structure**:
+    *   The `sendtx` command now expects typed JSON transactions parameterized by `tx_type`:
+        *   `tx_type="user_tx"`: Standard application payload supporting custom `operations` and rules.
+        *   `tx_type="consensus_rule_update"`: A governance transaction containing `rule_revisions` and an `activate_at_height` integer.
+        *   `tx_type="consensus_rule_vote"`: A vote referencing a pending `update_id` to approve a rule change.
+    *   Common fields across all types include `sender_pubkey`, `sequence_number`, `expiration_time`, `fee_limit`, and a BLS `signature` securing the payload.
 *   **Tau Integration for Operation Validation**: The `genesis.tau` program validates the logic of operations within a transaction (e.g., coin transfers via Tau bitvectors). This now includes robust structural validation to ensure transfer data is complete and well-formed.
 *   **String-to-ID Mapping**: Dynamically assigns `y<ID>` identifiers for Tau payloads.
 *   **In-Memory Balances & Sequence Numbers**: Tracks account balances and sequence numbers for rapid validation.
@@ -361,12 +359,12 @@ A block is a fundamental data structure that organizes transactions into an atom
   - `state_hash` (string): Hex-encoded hash of the current Tau/rules snapshot (used to bind state to a block).
   - `state_locator` (string): A namespaced lookup key (e.g. `state:<hash>`) for DHT/state distribution.
 - A **block body** containing:
-  - `transactions` (list): Ordered list of transactions (each is the JSON object accepted by `sendtx`).
-- Optional **PoA fields**:
-  - `block_signature` (string): Hex-encoded BLS signature over the canonical header bytes (PoA mode).
+  - `transactions` (list): Ordered list of transactions (`user_tx`, `consensus_rule_update`, or `consensus_rule_vote`).
   - `tx_ids` (list): Transaction hashes used to build the Merkle root.
+- **Consensus fields**:
+  - `consensus_proof` (string): Proof/signature verified against the active rules. Replaces legacy `block_signature`.
 
-Blocks do **not** include proof-of-work. In PoA mode, blocks are **signed** by an authority key and verified against the configured `TAU_MINER_PUBKEY` (when `py_ecc` is available).
+Blocks do **not** include proof-of-work. Block validity and proposer eligibility are governed strictly by the living Tau consensus logic program evaluated dynamically at each height.
 
 The `block.py` module provides the `Block` and `BlockHeader` classes, along with utility functions for computing transaction hashes (`compute_tx_hash`), Merkle roots (`compute_merkle_root`), and block hashes.
 

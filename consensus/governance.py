@@ -38,17 +38,17 @@ def parse_consensus_rule_update(tx: Dict[str, Any]) -> Optional[ConsensusRuleUpd
     if tx.get("tx_type") != "consensus_rule_update":
         return None
         
-    payload = tx.get("payload", {})
-    if not isinstance(payload, dict):
-        # Allow fallback to parsing JSON if payload is stringified
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except Exception:
-                pass
-                
-    if not isinstance(payload, dict):
-         return None
+    # Fields like rule_revisions could be in a nested "payload" dict, or at the root of `tx`.
+    root_val = tx.get("payload")
+    if isinstance(root_val, dict):
+        payload = root_val
+    elif isinstance(root_val, str):
+        try:
+            payload = json.loads(root_val)
+        except Exception:
+            payload = tx
+    else:
+        payload = tx
 
     revisions = payload.get("rule_revisions")
     if not isinstance(revisions, list):
@@ -84,16 +84,16 @@ def parse_consensus_rule_vote(tx: Dict[str, Any]) -> Optional[ConsensusRuleVote]
     if tx.get("tx_type") != "consensus_rule_vote":
         return None
         
-    payload = tx.get("payload", {})
-    if not isinstance(payload, dict):
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except Exception:
-                pass
-
-    if not isinstance(payload, dict):
-         return None
+    root_val = tx.get("payload")
+    if isinstance(root_val, dict):
+        payload = root_val
+    elif isinstance(root_val, str):
+        try:
+            payload = json.loads(root_val)
+        except Exception:
+            payload = tx
+    else:
+        payload = tx
 
     update_id_str = payload.get("update_id")
     if not isinstance(update_id_str, str):

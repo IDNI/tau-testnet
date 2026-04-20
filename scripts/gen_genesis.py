@@ -192,8 +192,7 @@ def main():
     print(f"Block 0 Hash    : {block_0_hash_hex}")
     print(f"State Hash      : {state_hash_hex}")
     print(f"Consensus Meta  : {consensus_meta_hash_bytes.hex()}")
-    import os
-    os._exit(0)
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()

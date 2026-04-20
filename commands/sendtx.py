@@ -544,7 +544,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
         logger.error("Tau rule validation failed: %s", e)
         return f"FAILURE: Transaction rejected by Tau. {e}"
     except Exception as e:
-        logger.critical("An unexpected error occurred in queue_transaction: %s", e)
+        logger.exception("An unexpected error occurred in queue_transaction: %s", e)
         return f"FAILURE: An unexpected server error occurred."
 
 

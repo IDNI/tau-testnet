@@ -206,10 +206,7 @@ def create_block_from_mempool() -> Dict:
         print(f"[INFO][createblock] Reserved {len(reserved_txs)} entries from mempool")
 
         if not reserved_txs:
-            # Check if there were any pending at all (for logging purposes)
-            # But we are done if no reserved txs
-            print("[INFO][createblock] Mempool is empty (no pending txs). No block created.")
-            return {"message": "Mempool is empty. No block created."}
+            print("[INFO][createblock] Mempool is empty (no pending txs). Proceeding to create an empty block.")
     
     # Extract data
     mempool_txs = [rtx['payload'] for rtx in reserved_txs]
@@ -242,12 +239,10 @@ def create_block_from_mempool() -> Dict:
     if skipped_count > 0:
         print(f"[WARN][createblock] Skipped {skipped_count} invalid transactions")
     
-    if not transactions:
+    if reserved_ids and not transactions:
         print("[INFO][createblock] No valid transactions parsed. Cleared reserved.")
-        if reserved_ids:
-             import db as _db
-             _db.remove_transactions(reserved_ids)
-        return {"message": "No valid transactions parsed."}
+        import db as _db
+        _db.remove_transactions(reserved_ids)
     
     print(f"[INFO][createblock] Validating and Executing Batch Natively...")
     block_timestamp = int(time.time())
@@ -277,7 +272,8 @@ def create_block_from_mempool() -> Dict:
                 "source": "chain_state",
                 "balances": chain_state._balances,
                 "sequence_numbers": chain_state._sequence_numbers,
-                "lifecycle_manager": chain_state._lifecycle_manager
+                "lifecycle_manager": chain_state._lifecycle_manager,
+                "active_consensus_id": chain_state._active_consensus_id
             }
         )
         
@@ -313,12 +309,7 @@ def create_block_from_mempool() -> Dict:
                  final_reserved_ids.append(filtered_reserved_ids[i])
                  
         print(f"[INFO][createblock] Execution Result: {len(final_txs)}/{len(transactions)} logically valid")
-        if not final_txs:
-            print("[INFO][createblock] All transactions rejected structurally. No block created.")
-            import db as _db
-            _db.remove_transactions(final_reserved_ids)
-            return {"message": "All transactions rejected. Mempool cleared."}
-
+        # Removed check to allow creation of empty block
         # 4. Form Complete Valid Block Header
         candidate_block.transactions = final_txs
         # Update IDs

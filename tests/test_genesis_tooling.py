@@ -205,6 +205,44 @@ class TestGenesisReplay(unittest.TestCase):
         self.assertEqual(head1["block_hash"], head2["block_hash"])
         self.assertEqual(head1["block_hash"], EXPECTED_BLOCK_HASH)
 
+    def test_legacy_genesis_sentinel_is_normalized(self):
+        """Older DBs that stored block 0 as 'GENESIS' are rewritten to canonical hash."""
+        genesis = _load_genesis()
+        legacy_block = dict(genesis["block_0"])
+        legacy_block["block_hash"] = "GENESIS"
+        if "hash" in legacy_block:
+            legacy_block["hash"] = "GENESIS"
+
+        db.init_db()
+        with db._db_lock:
+            db._db_conn.execute(
+                """
+                INSERT INTO blocks (block_hash, block_number, previous_hash, timestamp, block_data)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    "GENESIS",
+                    0,
+                    legacy_block["header"]["previous_hash"],
+                    legacy_block["header"]["timestamp"],
+                    json.dumps(legacy_block),
+                ),
+            )
+            db._db_conn.execute(
+                "INSERT OR REPLACE INTO chain_state (key, value) VALUES ('canonical_head_hash', ?)",
+                ("GENESIS",),
+            )
+            db._db_conn.commit()
+            db._db_conn.close()
+            db._db_conn = None
+
+        chain_state.load_genesis(GENESIS_PATH)
+
+        self.assertEqual(db.get_genesis_hash(), EXPECTED_BLOCK_HASH)
+        head = db.get_canonical_head_block()
+        self.assertIsNotNone(head)
+        self.assertEqual(head["block_hash"], EXPECTED_BLOCK_HASH)
+
 
 class TestGenesisMismatchFatal(unittest.TestCase):
     """Verify that DB/genesis.json mismatches are fatal startup errors."""

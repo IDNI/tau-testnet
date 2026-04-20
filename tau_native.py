@@ -22,6 +22,7 @@ COLOR_MAGENTA = "\033[95m"
 COLOR_RESET = "\033[0m"
 _INPUT_STREAM_NAME_RE = re.compile(r"^i\d+$")
 _UPDATED_SPEC_LINE_RE = re.compile(r"^Updated\s*specification\:\s*(.*)$")
+_HEX_LITERAL_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 
 def load_tau_module():
@@ -149,35 +150,9 @@ class TauInterface:
         # Read the spec
         try:
             with open(program_file, "r", encoding="utf-8", errors="replace") as f:
-                raw_lines = f.readlines()
+                raw_spec = f.read()
 
-            # Preprocess to be compatible with native interpreter:
-            # 1. Remove tau stream directive lines (e.g. "#tau i0 = console.").
-            # 2. Remove inline comments while preserving bitvector literals (#b..., #x...).
-            # 3. Normalize to a single line (space-separated) to avoid parser EOL edge cases.
-            # 4. Add trailing period if missing and non-empty.
-            clean_lines = []
-            for raw_line in raw_lines:
-                line = raw_line.replace("\ufeff", "").replace("\x00", "")
-                sline = line.strip()
-
-                if not sline:
-                    continue
-
-                lowered = sline.lower()
-                if lowered.startswith("tau ") and "=" in sline:
-                    logger.info("Ignored tau binding line in spec: %s", sline)
-                    continue
-                if lowered.startswith("#tau "):
-                    logger.info("Ignored tau directive line in spec: %s", sline)
-                    continue
-
-                cleaned = self._strip_nonliteral_hash_comments(line)
-
-                if cleaned.strip():
-                    clean_lines.append(cleaned.strip())
-
-            self.rule_text = self._ensure_trailing_period(" ".join(clean_lines).strip())
+            self.rule_text = self.preprocess_spec_text(raw_spec)
 
             # Initialize accumulated spec with the genesis content
             self.accumulated_spec = self.rule_text
@@ -233,8 +208,102 @@ class TauInterface:
         return "".join(out)
 
     @staticmethod
-    def _normalize_assignment_value(value) -> str:
-        return str(value).replace("\n", " ")
+    def _type_untyped_quantifiers(spec_text: str) -> str:
+        """
+        Tau "Updated specification" output may contain untyped quantifiers like:
+            all b1 b1 != 0 || b1 != i10[t]:bv[16]
+        Some Tau builds require explicit types on quantified variables.
+
+        We patch these cases by inferring a bv width from nearby typed terms
+        (e.g. i10[t]:bv[16]) and rewriting to:
+            all b1:bv[16] ...
+        """
+        text = spec_text or ""
+        if "all " not in text:
+            return text
+
+        # Identify candidate "all <var>" occurrences where <var> is not already typed.
+        # This is intentionally conservative: one var per 'all' is the common pattern
+        # in current engine outputs.
+        quant_re = re.compile(r"\ball\s+([A-Za-z_]\w*)\b(?!\s*:)")
+
+        def _infer_width(var_name: str, full_text: str) -> int | None:
+            # Try to infer width from comparisons involving the var and a typed bv[n] term.
+            # Examples:
+            #   b1 != i10[t]:bv[16]
+            #   i10[t]:bv[16] != b1
+            # Also allow equality and (not-)less-than variants used by Tau pretty-printer.
+            op = r"(?:!=|=|<|!<|<=|>=)"
+            typed_term = r"(?:\b[A-Za-z_]\w*\[t\]\s*:\s*bv\[\s*(\d+)\s*\]|\{\s*[^}]+\s*\}\s*:\s*bv\[\s*(\d+)\s*\])"
+            patterns = [
+                re.compile(rf"\b{re.escape(var_name)}\b\s*{op}\s*{typed_term}"),
+                re.compile(rf"{typed_term}\s*{op}\s*\b{re.escape(var_name)}\b"),
+            ]
+            for pat in patterns:
+                m = pat.search(full_text)
+                if not m:
+                    continue
+                # typed_term has two alternative capture groups; pick whichever matched.
+                for g in m.groups():
+                    if g and str(g).isdigit():
+                        return int(g)
+            return None
+
+        def _rewrite(match: re.Match) -> str:
+            var = match.group(1)
+            width = _infer_width(var, text)
+            if width is None:
+                return match.group(0)
+            return f"all {var}:bv[{width}]"
+
+        rewritten = quant_re.sub(_rewrite, text)
+        return rewritten
+
+    @classmethod
+    def preprocess_spec_text(cls, spec_text: str) -> str:
+        """
+        Normalize a full Tau spec for native interpreter consumption.
+
+        - removes `tau ... = ...` binding lines
+        - removes `#tau ...` directive lines
+        - strips hash comments while preserving `#b...` / `#x...` literals
+        - flattens everything to a single line
+        - ensures a trailing period
+        """
+        clean_lines = []
+        for raw_line in (spec_text or "").splitlines():
+            line = raw_line.replace("\ufeff", "").replace("\x00", "")
+            sline = line.strip()
+
+            if not sline:
+                continue
+
+            lowered = sline.lower()
+            if lowered.startswith("tau ") and "=" in sline:
+                logger.info("Ignored tau binding line in spec: %s", sline)
+                continue
+            if lowered.startswith("#tau "):
+                logger.info("Ignored tau directive line in spec: %s", sline)
+                continue
+
+            cleaned = cls._strip_nonliteral_hash_comments(line)
+            if cleaned.strip():
+                clean_lines.append(cleaned.strip())
+
+        flattened = " ".join(clean_lines).strip()
+        flattened = cls._type_untyped_quantifiers(flattened)
+        return cls._ensure_trailing_period(flattened)
+
+    @classmethod
+    def _normalize_assignment_value(cls, value, *, allow_hex_literal: bool = True) -> str:
+        text = str(value).replace("\n", " ").strip()
+        if not allow_hex_literal:
+            return text
+        if not text or text.startswith(("#x", "#b", "{")):
+            return text
+        if _HEX_LITERAL_RE.fullmatch(text) and any(ch in "abcdefABCDEF" for ch in text):
+            return f"#x{text}"
+        return text
 
     @staticmethod
     def _fallback_value_for_stream(stream_name: str) -> str:
@@ -245,7 +314,7 @@ class TauInterface:
         return "0"
 
     def _build_interpreter_from_spec(self, spec_text: str, *, reason: str):
-        prepared = self._ensure_trailing_period(spec_text)
+        prepared = self.preprocess_spec_text(spec_text)
         interpreter = self.tau.get_interpreter(prepared)
         if interpreter is None:
             msg = f"Failed to create Tau interpreter ({reason})."
@@ -374,7 +443,7 @@ class TauInterface:
 
         normalized_rule_text = None
         if rule_text is not None:
-            normalized_rule_text = self._normalize_assignment_value(rule_text)
+            normalized_rule_text = self._normalize_assignment_value(rule_text, allow_hex_literal=False)
 
         # We must loop to provide inputs since Tau asks for them lazily.
         captured_output = ""
@@ -547,7 +616,7 @@ class TauInterface:
 
         normalized_rule_text = None
         if rule_text is not None:
-            normalized_rule_text = self._normalize_assignment_value(rule_text)
+            normalized_rule_text = self._normalize_assignment_value(rule_text, allow_hex_literal=False)
 
         captured_output = ""
         outputs = None
@@ -643,7 +712,7 @@ class TauInterface:
 
     def update_spec(self, new_spec):
         self._rebuild_interpreter_from_spec(
-            new_spec,
+            self.preprocess_spec_text(new_spec),
             reason="explicit update_spec request",
         )
 

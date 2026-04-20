@@ -215,12 +215,7 @@ BASE_DEFAULTS: Dict[str, Any] = {
     "network": {
         "network_id": "tau-local",
         "listen": ["/ip4/0.0.0.0/tcp/0"], 
-        "bootstrap_peers": [
-            {
-                "peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC", #MAIN NODE
-                "addrs": ["/ip4/34.251.82.246/tcp/4001"],
-            },
-        ],
+        "bootstrap_peers": [],
         "peerstore_path": None,
         # Persist the libp2p identity here unless --ephemeral-identity is set.
         "identity_key_path": os.path.join(DATA_DIR, "identity.key"),

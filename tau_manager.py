@@ -12,6 +12,39 @@ import tau_io_logger
 
 logger = logging.getLogger(__name__)
 
+COLOR_CYAN = "\033[96m"
+COLOR_GREEN = "\033[92m"
+COLOR_RESET = "\033[0m"
+
+
+def _print_tau_send(label: str, payload: str) -> None:
+    print(f"{COLOR_CYAN}[TAU SEND] {label}{COLOR_RESET}", flush=True)
+    if payload:
+        for line in str(payload).splitlines():
+            print(f"{COLOR_GREEN}{line}{COLOR_RESET}", flush=True)
+    else:
+        print(f"{COLOR_GREEN}<empty>{COLOR_RESET}", flush=True)
+
+
+def _print_tau_dispatch(
+    *,
+    source: str,
+    rule_text: str | None = None,
+    input_stream_values: dict[int | str, str | list[str]] | None = None,
+    target_output_stream_index: int | None = None,
+) -> None:
+    target_suffix = "" if target_output_stream_index is None else f" -> o{target_output_stream_index}"
+    if rule_text is not None:
+        _print_tau_send(f"source={source}{target_suffix} i0", rule_text)
+    if input_stream_values:
+        for stream_name, raw_value in input_stream_values.items():
+            label = f"source={source}{target_suffix} i{stream_name}" if str(stream_name).isdigit() else f"source={source}{target_suffix} {stream_name}"
+            if isinstance(raw_value, (list, tuple)):
+                for idx, value in enumerate(raw_value):
+                    _print_tau_send(f"{label}[{idx}]", str(value))
+            else:
+                _print_tau_send(label, str(raw_value))
+
 # --- Rule sanitation -----------------------------------------------------------
 DEFAULT_RULE_BV_WIDTH = 16
 import re
@@ -63,6 +96,30 @@ def set_rules_handler(handler):
 def set_state_restore_callback(handler):
     global _state_restore_callback
     _state_restore_callback = handler
+
+
+def _preprocess_rule_for_tau(rule_text: str | None) -> str | None:
+    if rule_text is None:
+        return None
+    if tau_direct_interface and hasattr(tau_direct_interface, "preprocess_spec_text"):
+        return tau_direct_interface.preprocess_spec_text(rule_text)
+    text = str(rule_text).replace('\n', ' ')
+    if text.lstrip().startswith("always"):
+        text = normalize_rule_bitvector_sizes(text)
+    return text
+
+
+def _normalize_tau_input_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if tau_direct_interface and hasattr(tau_direct_interface, "_normalize_assignment_value"):
+        return tau_direct_interface._normalize_assignment_value(value)
+    text = str(value).replace('\n', ' ').strip()
+    if not text or text.startswith(("#x", "#b", "{")):
+        return text
+    if re.fullmatch(r"[0-9a-fA-F]+", text) and any(ch in "abcdefABCDEF" for ch in text):
+        return f"#x{text}"
+    return text
 
 
 def start_and_manage_tau_process():
@@ -162,10 +219,8 @@ def communicate_with_tau(
              filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
              raise TauEngineCrash(msg)
 
-        if rule_text:
-            rule_text = rule_text.replace('\n', ' ')
-            if rule_text.lstrip().startswith("always"):
-                rule_text = normalize_rule_bitvector_sizes(rule_text)
+        if rule_text is not None:
+            rule_text = _preprocess_rule_for_tau(rule_text)
 
         normalized_inputs = None
         if input_stream_values:
@@ -175,17 +230,31 @@ def communicate_with_tau(
                     parts = []
                     for p in v:
                         p_str = str(p).replace('\n', ' ')
-                        if p_str.lstrip().startswith("always"):
+                        if str(k) in {"0", "i0"}:
+                            p_str = _preprocess_rule_for_tau(p_str) or ""
+                        elif p_str.lstrip().startswith("always"):
                             p_str = normalize_rule_bitvector_sizes(p_str)
+                        else:
+                            p_str = _normalize_tau_input_value(p_str) or ""
                         parts.append(p_str)
                     normalized_inputs[k] = parts
                 else:
                     v_str = str(v).replace('\n', ' ')
-                    if v_str.lstrip().startswith("always"):
+                    if str(k) in {"0", "i0"}:
+                        v_str = _preprocess_rule_for_tau(v_str) or ""
+                    elif v_str.lstrip().startswith("always"):
                         v_str = normalize_rule_bitvector_sizes(v_str)
+                    else:
+                        v_str = _normalize_tau_input_value(v_str) or ""
                     normalized_inputs[k] = v_str
 
         try:
+            _print_tau_dispatch(
+                source=source,
+                rule_text=rule_text,
+                input_stream_values=normalized_inputs or input_stream_values,
+                target_output_stream_index=target_output_stream_index,
+            )
             output_val = tau_direct_interface.communicate(
                 rule_text=rule_text,
                 target_output_stream_index=target_output_stream_index,
@@ -262,15 +331,30 @@ def communicate_with_tau_multi(
         normalized_inputs = {}
         for k, v in input_stream_values.items():
             if isinstance(v, (list, tuple)):
-                parts = [str(p).replace('\n', ' ') for p in v]
+                parts = []
+                for p in v:
+                    p_str = str(p).replace('\n', ' ')
+                    if str(k) in {"0", "i0"}:
+                        p_str = _preprocess_rule_for_tau(p_str) or ""
+                    else:
+                        p_str = _normalize_tau_input_value(p_str) or ""
+                    parts.append(p_str)
                 normalized_inputs[k] = parts
             else:
                 v_str = str(v).replace('\n', ' ')
-                if v_str.lstrip().startswith("always"):
+                if str(k) in {"0", "i0"}:
+                    v_str = _preprocess_rule_for_tau(v_str) or ""
+                elif v_str.lstrip().startswith("always"):
                     v_str = normalize_rule_bitvector_sizes(v_str)
+                else:
+                    v_str = _normalize_tau_input_value(v_str) or ""
                 normalized_inputs[k] = v_str
 
     try:
+        _print_tau_dispatch(
+            source=source,
+            input_stream_values=normalized_inputs or input_stream_values,
+        )
         result = tau_direct_interface.communicate_multi(
             rule_text=None,
             input_stream_values=normalized_inputs or input_stream_values,
@@ -297,6 +381,26 @@ def reset_tau_state(rule_text: str, *, source: str = "unknown", apply_rules_upda
         apply_rules_update=apply_rules_update,
         wait_for_ready=True,
     )
+
+
+def restore_full_tau_spec(spec_text: str) -> None:
+    """
+    Replace the direct-mode interpreter with a fully composed persisted spec.
+    This is used at startup/recovery instead of sending the whole spec through i0.
+    """
+    global tau_direct_interface, last_known_tau_spec
+
+    if tau_test_mode:
+        last_known_tau_spec = spec_text or ""
+        return
+
+    if not tau_direct_interface:
+        raise TauEngineCrash("Cannot restore Tau spec before direct interface initialization.")
+
+    prepared_spec = tau_direct_interface.preprocess_spec_text(spec_text or "")
+    _print_tau_send("restore_full_tau_spec update_spec", prepared_spec)
+    tau_direct_interface.update_spec(prepared_spec)
+    last_known_tau_spec = tau_direct_interface.get_current_spec() or prepared_spec
 
 
 def get_tau_process_status():

@@ -309,7 +309,7 @@ class DHTManager:
     def _validate_tau_state_record(self, key: bytes, value: bytes) -> bool:
         """
         Validate a `tau_state:<consensus_hash>` record.
-        Payload MUST be JSON: `{"rules": <str>, "accounts_hash": <hex>}`.
+        Payload MUST be JSON: `{"consensus_rules": <str>, "application_rules": <str>, "meta_hash": <hex>, "accounts_hash": <hex>}`.
         Validator recomputes consensus hash and compares to key suffix.
         """
         import json
@@ -327,26 +327,32 @@ class DHTManager:
             if not isinstance(data, dict):
                 return False
             
-            rules_str = data.get("rules", "")
-            accounts_hash_hex = data.get("accounts_hash", "")
+            # Backwards compatibility check
+            if "rules" in data:
+                # We do not strictly support validating the old un-split format correctly against
+                # split assumptions unless we assume old blocks were signed this way.
+                # However, since nodes are rejecting this anyway, we map to the new format.
+                return False
             
-            if not isinstance(rules_str, str) or not isinstance(accounts_hash_hex, str):
+            cons_rules_str = data.get("consensus_rules", "")
+            app_rules_str = data.get("application_rules", "")
+            accounts_hash_hex = data.get("accounts_hash", "")
+            meta_hash_hex = data.get("meta_hash", "")
+            
+            if not isinstance(cons_rules_str, str) or not isinstance(app_rules_str, str) or \
+               not isinstance(accounts_hash_hex, str) or not isinstance(meta_hash_hex, str):
                 return False
                 
-            # Verify Consensus Hash
-            # state_hash = BLAKE3(rules_bytes + accounts_hash)
-            # Note: chain_state uses accounts_hash as bytes for update.
-            # Logic:
-            #   rules_bytes = rules_str.encode("utf-8")
-            #   accounts_hash_bytes = bytes.fromhex(accounts_hash_hex)
+            cons_rules_bytes = cons_rules_str.encode("utf-8")
+            app_rules_bytes = app_rules_str.encode("utf-8")
             
-            rules_bytes = rules_str.encode("utf-8")
             try:
                 accounts_hash_bytes = bytes.fromhex(accounts_hash_hex)
+                meta_hash_bytes = bytes.fromhex(meta_hash_hex)
             except ValueError:
                 return False
                 
-            computed = compute_consensus_state_hash(rules_bytes, b"", accounts_hash_bytes, b"")
+            computed = compute_consensus_state_hash(cons_rules_bytes, app_rules_bytes, accounts_hash_bytes, meta_hash_bytes)
             return computed == consensus_hash
         except Exception:
             return False

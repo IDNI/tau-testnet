@@ -410,63 +410,69 @@ def _run_server(container: ServiceContainer):
     def _restore_callback():
         restore_flag = os.environ.get("TAU_RESTORE_RULES_ON_STARTUP", "").strip().lower()
         restore_enabled = restore_flag not in {"0", "false", "no", "off"}
-        
-        saved_rules = chain_state_module.get_rules_state()
-        
+        use_persisted_state = restore_enabled
+        latest = db_module.get_canonical_head_block()
+        has_non_genesis_chain = bool(latest and int(latest.get("block_number", 0)) > 0)
+        persisted_full_spec = chain_state_module.get_persisted_full_tau_spec() if has_non_genesis_chain else ""
+
         # Safe Mode Fallback:
         # If TAU_FORCE_FRESH_START is set (e.g. by tau_manager after a crash),
-        # we ignore the persisted (potentially bad) state and force a fresh load of built-in rules.
+        # skip persisted dynamic state and only replay Genesis-derived updates.
         if os.environ.get("TAU_FORCE_FRESH_START") == "1":
-            logger.warning("TAU_FORCE_FRESH_START=1 detected: Ignoring persisted DB state to recover with Safe Mode (Genesis + Built-ins).")
-            saved_rules = None
+            logger.warning("TAU_FORCE_FRESH_START=1 detected: Ignoring persisted DB state and replaying only Genesis-derived Tau updates.")
+            use_persisted_state = False
+        elif not restore_enabled:
+            logger.info("Persisted Tau restore disabled. Replaying only Genesis-derived Tau updates.")
 
-        if saved_rules and restore_enabled:
-            try:
-                logger.info("Restoring persisted Tau rules/state (len=%s)...", len(saved_rules))
-                # Note: communicate_with_tau checks 'tau_process_ready' which is SET before this callback runs.
-                out = tau_module.communicate_with_tau(
-                    rule_text=saved_rules,
-                    target_output_stream_index=0,
-                    wait_for_ready=False,
+        try:
+            if use_persisted_state and has_non_genesis_chain and persisted_full_spec:
+                logger.info(
+                    "Restoring persisted full Tau spec for canonical head #%s (len=%s)...",
+                    latest.get("block_number", 0),
+                    len(persisted_full_spec),
                 )
-                logger.info("Tau restore result (o0): %s", out)
-            except Exception:
-                logger.exception("Failed to restore persisted Tau rules/state during callback")
-        else:
-            if saved_rules:
-                logger.info("Persisted rules found but restore is disabled. Injecting built-in rules instead.")
-            # No persisted rules (or restore disabled). Load built-in rule files after Tau is up.
-            try:
-                builtin_rules = []
-                if hasattr(chain_state_module, "load_builtin_rules_from_disk"):
-                    builtin_rules = chain_state_module.load_builtin_rules_from_disk()
+                tau_module.restore_full_tau_spec(persisted_full_spec)
+                logger.info("Tau restore completed via persisted full spec snapshot.")
+                return
 
-                if builtin_rules:
-                    logger.info("Injecting %s built-in rules from disk...", len(builtin_rules))
-                    for rule_text in builtin_rules:
-                        logger.info("Injecting built-in rule: %s", rule_text)
-                        tau_module.communicate_with_tau(
-                            rule_text=rule_text,
-                            target_output_stream_index=0,
-                            wait_for_ready=False,
-                        )
+            restore_plan = chain_state_module.get_tau_restore_plan(use_persisted_state=use_persisted_state)
+            if restore_plan:
+                logger.info("Replaying %s Tau rule update(s) via i0 after bootstrap from %s...", len(restore_plan), config.TAU_PROGRAM_FILE)
+                persist_needed = False
+                for idx, entry in enumerate(restore_plan, start=1):
+                    rule_text = str(entry.get("text") or "")
+                    label = str(entry.get("label") or f"rule_{idx}")
+                    should_persist = bool(entry.get("persist"))
+                    logger.info("Replaying Tau update %s/%s: %s (len=%s)", idx, len(restore_plan), label, len(rule_text))
+                    tau_module.communicate_with_tau(
+                        rule_text=rule_text,
+                        target_output_stream_index=0,
+                        source=f"startup:{label}",
+                        apply_rules_update=should_persist,
+                        wait_for_ready=False,
+                    )
+                    persist_needed = persist_needed or should_persist
 
-                    # Persist the resulting rules snapshot so restarts don't re-inject.
+                if persist_needed:
                     latest = db_module.get_canonical_head_block()
-                    latest_hash = latest["block_hash"] if latest else ""
-                    latest_num = latest["block_number"] if latest else 0
+                    latest_hash = ""
+                    latest_num = 0
+                    if latest:
+                        latest_hash = latest.get("block_hash") or latest.get("hash") or ""
+                        header = latest.get("header") or {}
+                        latest_num = int(latest.get("block_number", header.get("block_number", 0)) or 0)
                     chain_state_module.commit_state_to_db(latest_hash, latest_num)
-                    logger.info("Built-in rules injected and persisted (last_block_hash=%s).", latest_hash[:16] if latest_hash else "")
-                else:
-                    logger.info("No built-in rules on disk; leaving Tau spec as-is.")
-            except Exception:
-                logger.exception("Failed to inject built-in rules during Tau restore callback")
+                    logger.info("Persisted replayed Tau application rules (last_block_hash=%s).", latest_hash[:16] if latest_hash else "")
+            else:
+                logger.info("No Tau rule updates to replay after bootstrap.")
+        except Exception:
+            logger.exception("Failed to replay Tau rule updates during startup callback")
 
     # Register the callback BEFORE starting the manager
     tau_module.set_state_restore_callback(_restore_callback)
     
     # Register Rules Handler to persist updates from Tau to DB
-    tau_module.set_rules_handler(chain_state_module.save_application_rules_state)
+    tau_module.set_rules_handler(chain_state_module.save_effective_tau_spec)
 
     logger.info("Starting Tau Process Manager Thread...")
     manager_thread = threading.Thread(target=tau_module.start_and_manage_tau_process, daemon=True)

@@ -92,8 +92,9 @@ class TestChainDHTIntegration(unittest.TestCase):
         
         # 4. Manually publish (new workflow)
         empty_acc_hash = b"\x00" * 32
+        empty_meta_hash = b"\x00" * 32
         expected_state_key = f"tau_state:deadbeef".encode("ascii")
-        self.chain_state.publish_tau_state_snapshot("deadbeef", formula_content.encode("utf-8"), empty_acc_hash)
+        self.chain_state.publish_tau_state_snapshot("deadbeef", b"cons_rules", formula_content.encode("utf-8"), empty_meta_hash, empty_acc_hash)
         
         # Verify put_record_sync was called
         calls = self.mock_dht_client.put_record_sync.call_args_list
@@ -105,7 +106,7 @@ class TestChainDHTIntegration(unittest.TestCase):
         # Verify payload contains rules
         import json
         payload = json.loads(calls[0].args[1])
-        self.assertEqual(payload.get("rules"), formula_content)
+        self.assertEqual(payload.get("application_rules"), formula_content)
         
         # 5. Verify retrieval (Mocking get_record_sync to return what we put)
         # Update mock to return our payload for the key
@@ -115,7 +116,7 @@ class TestChainDHTIntegration(unittest.TestCase):
         # Check tuple return
         self.assertIsNotNone(retrieved)
         self.assertTrue(isinstance(retrieved, tuple))
-        self.assertEqual(retrieved[0], formula_content)
+        self.assertEqual(retrieved[1], formula_content)
         
     def test_retrieve_missing_formula(self):
         self.chain_state.set_dht_client(self.mock_dht_client)

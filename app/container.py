@@ -14,7 +14,7 @@ import chain_state
 import config
 import db
 import tau_manager
-from commands import createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks, getallaccounts, gettaustate
+from commands import createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks, getallaccounts, gettaustate, getgovernance
 from errors import DependencyError
 from network import BootstrapPeer, NetworkConfig
 from network.identity import IDENTITY_SEED_SIZE
@@ -57,6 +57,7 @@ class ServiceContainer:
             "getblocks": getblocks,
             "getallaccounts": getallaccounts,
             "gettaustate": gettaustate,
+            "getgovernance": getgovernance,
         }
 
         mempool = override_map.get("mempool") or []
@@ -72,8 +73,8 @@ class ServiceContainer:
         tau_manager_module = override_map.get("tau_manager", tau_manager)
 
         # Wire up circular dependencies via callbacks
-        if hasattr(tau_manager_module, "set_rules_handler") and hasattr(chain_state_module, "save_application_rules_state"):
-            tau_manager_module.set_rules_handler(chain_state_module.save_application_rules_state)
+        if hasattr(tau_manager_module, "set_rules_handler") and hasattr(chain_state_module, "save_effective_tau_spec"):
+            tau_manager_module.set_rules_handler(chain_state_module.save_effective_tau_spec)
 
         # Instantiate Miner if configured
         miner_instance = None

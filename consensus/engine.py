@@ -4,7 +4,10 @@ import logging
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import config
+import db
+import tau_defs
 from .tau_engine import TauEngine, TauExecutionResult, TauStateSnapshot
+from .serialization import canonical_json, canonicalize_parent_hash_yid, canonicalize_proposer_yid
 from .state import StateStore, compute_state_hash
 
 # We need to import chain_state and tau_manager, but we must be careful about circular imports.
@@ -108,6 +111,40 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         if not self._validators and config.MINER_PUBKEY:
              self._validators = [config.MINER_PUBKEY]
 
+    @staticmethod
+    def _encode_bv_uint(value: Any, *, width_bits: int, field_name: str) -> str:
+        parsed = int(value)
+        if parsed < 0 or parsed >= (1 << width_bits):
+            raise ValueError(f"{field_name} must fit within bv[{width_bits}]")
+        return str(parsed)
+
+    @staticmethod
+    def _encode_yid(text: str) -> str:
+        return db.get_string_id(text)
+
+    def _build_consensus_input_streams(
+        self,
+        *,
+        proposer_pubkey: str,
+        block_number: Any,
+        timestamp: Any,
+        previous_hash: str,
+        proof_ok: bool,
+        claims: Any = None,
+    ) -> Dict[int, str]:
+        canonical_proposer = canonicalize_proposer_yid(proposer_pubkey)
+        canonical_parent_hash = canonicalize_parent_hash_yid(previous_hash)
+        claims_json = canonical_json(claims if claims is not None else {}).decode("utf-8")
+
+        return {
+            6: self._encode_bv_uint(block_number, width_bits=64, field_name="block_number"),
+            7: self._encode_bv_uint(timestamp, width_bits=64, field_name="timestamp"),
+            8: self._encode_yid(canonical_proposer),
+            9: self._encode_yid(canonical_parent_hash),
+            10: self._encode_bv_uint(1 if proof_ok else 0, width_bits=16, field_name="proof_ok"),
+            11: self._encode_yid(claims_json),
+        }
+
     # --- ConsensusEngine Interface Implementation ---
 
     def derive_active_consensus(self, parent_snapshot: TauStateSnapshot, target_height: int) -> ActiveConsensusView:
@@ -135,6 +172,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         else:
             # Phase 1 Legacy Signature: (block)
             block = args[0] if len(args) > 0 else kwargs.get("block")
+            proof_result = args[1] if len(args) > 1 and isinstance(args[1], dict) else kwargs.get("proof_result", {"proof_ok": True})
 
         if block and not block.consensus_proof:
             logger.warning("Consensus: Block #%s has no consensus proof", block.header.block_number)
@@ -144,18 +182,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             logger.error("Consensus: Tau not ready for block verification.")
             return False
             
-        i2_inputs = [
-            block.header.proposer_pubkey,
-            str(block.header.block_number),
-            str(block.header.timestamp),
-            block.header.previous_hash
-        ]
         try:
+            tau_inputs = self._build_consensus_input_streams(
+                proposer_pubkey=block.header.proposer_pubkey,
+                block_number=block.header.block_number,
+                timestamp=block.header.timestamp,
+                previous_hash=block.header.previous_hash,
+                proof_ok=bool(proof_result.get("proof_ok", False)),
+                claims=proof_result.get("claims"),
+            )
             output = tau_manager.communicate_with_tau(
-                target_output_stream_index=7,
-                input_stream_values={2: i2_inputs},
+                target_output_stream_index=6,
+                input_stream_values=tau_inputs,
                 apply_rules_update=False
             )
+            verdict = tau_manager.parse_tau_output(str(output))
+            if verdict != 0:
+                return True
             if "require_bls_sig" in output:
                 try:
                     from py_ecc.bls import G2Basic
@@ -177,7 +220,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return False
                 return True
             
-            logger.warning("Consensus: Block #%s rejected by Tau rules (o7: %s)", block.header.block_number, output)
+            logger.warning("Consensus: Block #%s rejected by Tau rules (o6: %s)", block.header.block_number, output)
             return False
         except Exception as e:
             logger.error("Header verification failed: %s", e)
@@ -262,10 +305,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # Governance Height Transitions
         newly_active = lm.process_height_transitions(block.header.block_number)
         next_cons_rules = active_view.consensus_rules
+        next_active_consensus_id = parent_snapshot.metadata.get("active_consensus_id", "")
         if newly_active:
              last_update = newly_active[-1]
              # Update consensus rules string based on combined revisions
              next_cons_rules = "\\n".join(last_update.rule_revisions)
+             next_active_consensus_id = last_update.update_id_hex[:16]
         
         # Finalize Hashes
         acc_hash = compute_accounts_hash(t_bals, t_seqs)
@@ -287,7 +332,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "balances": t_bals,
                 "sequence_numbers": t_seqs,
                 "lifecycle_manager": lm,
-                "consensus_rules_state": next_cons_rules
+                "consensus_rules_state": next_cons_rules,
+                "active_consensus_id": next_active_consensus_id
             }
         )
         
@@ -322,13 +368,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         if not tau_manager.tau_ready.is_set():
             return False
             
-        i2_inputs = [my_pubkey, str(block_number), str(timestamp), previous_hash]
         try:
+            tau_inputs = self._build_consensus_input_streams(
+                proposer_pubkey=my_pubkey,
+                block_number=block_number,
+                timestamp=timestamp,
+                previous_hash=previous_hash,
+                proof_ok=True,
+                claims={},
+            )
             output = tau_manager.communicate_with_tau(
                 target_output_stream_index=7,
-                input_stream_values={2: i2_inputs},
+                input_stream_values=tau_inputs,
                 apply_rules_update=False
             )
+            verdict = tau_manager.parse_tau_output(str(output))
+            if verdict != 0:
+                return True
             if "require_bls_sig" in output:
                 return True
             return False

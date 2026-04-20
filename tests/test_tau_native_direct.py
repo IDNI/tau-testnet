@@ -151,3 +151,24 @@ def test_missing_direct_inputs_use_docker_style_fallback(tmp_path, monkeypatch):
     )
     assert fake_tau.last_assigned_inputs["i0"] == "F"
     assert fake_tau.last_assigned_inputs["i1"] == "9"
+
+
+def test_preprocess_types_untyped_all_quantifier_from_updated_spec(tmp_path, monkeypatch):
+    fake_tau = _FakeTauModule()
+    monkeypatch.setattr(tau_native, "tau", fake_tau)
+
+    # Minimal genesis with a typed input so we have a typed term to infer from.
+    genesis = tmp_path / "genesis_quant.tau"
+    genesis.write_text("#tau i0 = console.\n(always (o6[t]:bv[16] = i10[t]:bv[16])).")
+
+    iface = tau_native.TauInterface(str(genesis))
+
+    # Simulate an updated spec fragment similar to what the native engine can emit,
+    # containing an untyped quantifier var compared against a typed bv[16] term.
+    updated = (
+        "always (o6[t]:bv[16] = i10[t]:bv[16] && "
+        "(all b1 b1 != 0 || b1 != i10[t]:bv[16])"
+        ")."
+    )
+    fixed = iface.preprocess_spec_text(updated)
+    assert "all b1:bv[16]" in fixed

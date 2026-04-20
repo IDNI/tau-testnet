@@ -146,7 +146,7 @@ def sync_test_logic(node_a_dht_manager, node_b_dht_manager):
     # Compute the expected State Hash (Rules + local accounts)
     # Since isolate_db yields empty DBs, balances/sequences are empty.
     empty_acc_hash = compute_accounts_hash({}, {})
-    expected_state_hash = compute_consensus_state_hash(formula_content.encode('utf-8'), b"", empty_acc_hash, b"")
+    expected_state_hash = compute_consensus_state_hash(b"some_cons_rules", formula_content.encode('utf-8'), empty_acc_hash, b"")
     
     # 2. Save on Node A
     # This should store it in Node A's local store AND network (provider record)
@@ -158,7 +158,9 @@ def sync_test_logic(node_a_dht_manager, node_b_dht_manager):
     print(f"[SyncWorker] Manually publishing snapshot to simulate block finalization")
     chain_state.publish_tau_state_snapshot(
         expected_state_hash, 
+        b"some_cons_rules",
         formula_content.encode('utf-8'), 
+        b"",
         empty_acc_hash
     )
     
@@ -167,12 +169,12 @@ def sync_test_logic(node_a_dht_manager, node_b_dht_manager):
     # chain_state uses _encode_dht_key now.
     encoded_key = node_a_dht_manager._encode_dht_key("tau_state", expected_state_hash)
     local_val = node_a_dht_manager.dht.value_store.get(encoded_key)
-    # The value is a JSON of {"rules":..., "accounts_hash":...}
+    # The value is a JSON of {"consensus_rules":..., "application_rules":..., "meta_hash":..., "accounts_hash":...}
     # We verify it exists and contains our rules
     assert local_val is not None, "Failed to store locally on Node A"
     val_bytes = getattr(local_val, "value", local_val)
     val_json = json.loads(val_bytes.decode('utf-8'))
-    assert val_json['rules'] == formula_content, "Stored content mismatch Node A"
+    assert val_json['application_rules'] == formula_content, "Stored content mismatch Node A"
     
     # 3. State: Node B
     print("[SyncWorker] Switching chain_state to Node B")
@@ -197,9 +199,9 @@ def sync_test_logic(node_a_dht_manager, node_b_dht_manager):
     while time.time() - start_time < 5.0:
         retrieved_result = chain_state.fetch_tau_state_snapshot(expected_state_hash)
         if retrieved_result:
-            # retrieved_result is (rules, remote_accounts_hash) or rules (back-compat, but code is updated)
+            # retrieved_result is (consensus_rules, app_rules, meta_hash, remote_accounts_hash)
             if isinstance(retrieved_result, tuple):
-                retrieved = retrieved_result[0]
+                retrieved = retrieved_result[1] # index 1 is application_rules
             else:
                 retrieved = retrieved_result
             break

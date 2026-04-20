@@ -60,7 +60,7 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
         monkeypatch.setattr(
             chain_state,
             "publish_tau_state_snapshot",
-            lambda _state_hash, _tau_bytes, _accounts_hash: True,
+            lambda _state_hash, _cons_rules, _app_rules, _meta, _accounts_hash: True,
         )
         monkeypatch.setattr(
             chain_state,

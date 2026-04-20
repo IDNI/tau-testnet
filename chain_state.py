@@ -1,10 +1,12 @@
 import threading
 import json
 import logging
+import os
 from typing import Dict, List, Optional
 import db
 import tau_manager
 import config
+import tau_native
 from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
 from block import Block
 import hashlib
@@ -149,34 +151,30 @@ def _republish_state_to_dht():
         logger.info("Updating stale _tau_engine_state_hash during hydration: %s -> %s", _tau_engine_state_hash, state_hash)
         _tau_engine_state_hash = state_hash
 
-    # We publish the combined rules to DHT for backwards compatibility of block explorers, 
-    # but actual verification uses split parts.
-    combined_rules = cons_rules_bytes + b"\n" + app_rules_bytes
     if state_hash:
-        publish_tau_state_snapshot(state_hash, combined_rules, acc_hash)
+        publish_tau_state_snapshot(state_hash, cons_rules_bytes, app_rules_bytes, meta_hash, acc_hash)
 
 
 
-def publish_tau_state_snapshot(state_hash: str, tau_bytes: bytes, accounts_hash: bytes) -> bool:
+def publish_tau_state_snapshot(state_hash: str, consensus_rules: bytes, application_rules: bytes, meta_hash: bytes, accounts_hash: bytes) -> bool:
     """
     Publish the serialized Tau/rules snapshot into the DHT under `tau_state:<hash>`.
-    Payload is JSON: `{"rules": <str>, "accounts_hash": <hex>}`.
+    Payload is JSON: `{"consensus_rules": <str>, "application_rules": <str>, "meta_hash": <hex>, "accounts_hash": <hex>}`.
     """
     if not state_hash or not isinstance(state_hash, str):
         return False
-    if tau_bytes is None:
+    if consensus_rules is None or application_rules is None:
         return False
     if not _dht_client or not getattr(_dht_client, "dht", None):
         return False
         
     try:
         # Construct JSON payload
-        rules_str = tau_bytes.decode("utf-8")
-        accounts_hash_hex = accounts_hash.hex()
-        
         payload = json.dumps({
-            "rules": rules_str,
-            "accounts_hash": accounts_hash_hex
+            "consensus_rules": consensus_rules.decode("utf-8"),
+            "application_rules": application_rules.decode("utf-8"),
+            "meta_hash": meta_hash.hex(),
+            "accounts_hash": accounts_hash.hex()
         }).encode("utf-8")
         
         key = f"tau_state:{state_hash}".encode("ascii")
@@ -204,10 +202,10 @@ def publish_tau_state_snapshot(state_hash: str, tau_bytes: bytes, accounts_hash:
         return False
 
 
-def fetch_tau_state_snapshot(state_hash: str) -> Optional[tuple[str, Optional[str]]]:
+def fetch_tau_state_snapshot(state_hash: str) -> Optional[tuple[str, str, str, str]]:
     """
     Fetch a serialized Tau rules snapshot from the DHT `tau_state:<hash>`.
-    Returns (rules_str, accounts_hash_hex_or_None).
+    Returns (consensus_rules, application_rules, meta_hash_hex, accounts_hash_hex).
     """
     if not state_hash or not isinstance(state_hash, str):
         return None
@@ -235,21 +233,32 @@ def fetch_tau_state_snapshot(state_hash: str) -> Optional[tuple[str, Optional[st
         decoded = val_bytes.decode("utf-8")
         data = json.loads(decoded)
         if isinstance(data, dict):
-            rules = data.get("rules")
+            # Backwards compatibility check
+            if "rules" in data:
+                # Old format
+                rules = data.get("rules", "")
+                accounts_hash = data.get("accounts_hash", "")
+                # We can't safely return valid tuple for strict new format unless caller handles or we shim it.
+                # Since tests/nodes were broken, they aren't using old format actively, but we return parts.
+                return ("", rules, "", accounts_hash)
+
+            consensus_rules = data.get("consensus_rules")
+            application_rules = data.get("application_rules")
+            meta_hash = data.get("meta_hash")
             accounts_hash = data.get("accounts_hash")
-            if logger.isEnabledFor(logging.DEBUG) and isinstance(rules, str):
+            
+            if logger.isEnabledFor(logging.DEBUG) and isinstance(consensus_rules, str):
                 try:
                     logger.debug(
-                        "Fetched Tau state snapshot source=%s len=%s hash=%s has_newline=%s preview=%r",
+                        "Fetched Tau state snapshot source=%s len=%s has_newline=%s preview=%r",
                         source,
-                        len(rules),
-                        hashlib.sha256(rules.encode("utf-8")).hexdigest(),
-                        "\n" in rules,
-                        rules[:200],
+                        len(application_rules or ""),
+                        "\n" in (application_rules or ""),
+                        (application_rules or "")[:200],
                     )
                 except Exception:
                     logger.debug("Fetched Tau state snapshot (debug logging failed)")
-            return rules, accounts_hash
+            return consensus_rules, application_rules, meta_hash, accounts_hash
         return None
     except Exception as exc:
         print(f"[WARN][chain_state] Failed to fetch tau state snapshot from DHT: {exc}")
@@ -383,7 +392,7 @@ def process_new_block(block: Block) -> bool:
     Standard network/import block ingestion path.
     Enforces strict derivation, verification, and pure simulation before persistence.
     """
-    global _lifecycle_manager, _application_rules_state, _consensus_rules_state, _tau_engine_state_hash, _canonical_head_hash
+    global _lifecycle_manager, _application_rules_state, _consensus_rules_state, _tau_engine_state_hash, _canonical_head_hash, _active_consensus_id
     from errors import TauTestnetError, BlockchainBug
     import db
     
@@ -416,7 +425,8 @@ def process_new_block(block: Block) -> bool:
                     "source": "chain_state",
                     "balances": _balances,
                     "sequence_numbers": _sequence_numbers,
-                    "lifecycle_manager": _lifecycle_manager
+                    "lifecycle_manager": _lifecycle_manager,
+                    "active_consensus_id": _active_consensus_id
                 }
             )
             
@@ -503,6 +513,11 @@ def process_new_block(block: Block) -> bool:
                     _application_rules_state = new_app_rules
                     
                 _consensus_rules_state = next_snapshot.metadata["consensus_rules_state"]
+                
+                # Fetch active_consensus_id if it's updated in the consensus component natively
+                if "active_consensus_id" in next_snapshot.metadata:
+                    _active_consensus_id = next_snapshot.metadata["active_consensus_id"]
+                
                 _tau_engine_state_hash = next_snapshot.state_hash
                 _canonical_head_hash = block.block_hash
                 
@@ -513,11 +528,16 @@ def process_new_block(block: Block) -> bool:
                 sequences=_sequence_numbers,
                 application_rules=_application_rules_state,
                 consensus_rules=_consensus_rules_state,
-                active_consensus_id=_tau_engine_state_hash,
-                pending_updates=[u.to_dict() for u in _lifecycle_manager.pending_updates],
-                votes=[{"update_id": uid, "validator_pubkey": p} for uid, ps in _lifecycle_manager.votes.items() for p in ps],
-                scheduled=_lifecycle_manager.scheduled_updates,
-                archival=[]
+                active_consensus_id=_active_consensus_id,
+                pending_updates=[{
+                    "update_id": uid.hex() if isinstance(uid, bytes) else uid,
+                    "rule_revisions": _lifecycle_manager.update_payloads[uid].rule_revisions,
+                    "activate_at_height": _lifecycle_manager.update_payloads[uid].activate_at_height,
+                    "host_contract_patch": _lifecycle_manager.update_payloads[uid].host_contract_patch
+                } for uid in _lifecycle_manager.pending_updates],
+                votes=[{"update_id": uid.hex() if isinstance(uid, bytes) else uid, "voter_pubkey": p.hex() if isinstance(p, bytes) else p} for uid, ps in _lifecycle_manager.votes.items() for p in ps],
+                scheduled=[(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates],
+                archival=[uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
             )
             
             # Optional: mempool eviction triggers could be mapped here using `apply_result.mempool_hints`
@@ -615,7 +635,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                     "source": "chain_state",
                     "balances": _balances,
                     "sequence_numbers": _sequence_numbers,
-                    "lifecycle_manager": _lifecycle_manager
+                    "lifecycle_manager": _lifecycle_manager,
+                    "active_consensus_id": _active_consensus_id
                 }
             )
             
@@ -889,14 +910,122 @@ def fetch_formula_from_dht(formula_hash: str) -> Optional[str]:
         return None
         
 
-def get_rules_state() -> str:
-    """Returns the composed effective rules state."""
+def _normalize_spec_fragment(spec_text: str) -> str:
+    text = (spec_text or "").strip()
+    if text and not text.endswith("."):
+        text += "."
+    return text
+
+def _preprocess_tau_spec_text(spec_text: str) -> str:
+    return tau_native.TauInterface.preprocess_spec_text(spec_text or "")
+
+
+def _load_tau_bootstrap_spec() -> str:
+    try:
+        with open(config.TAU_PROGRAM_FILE, "r", encoding="utf-8", errors="replace") as f:
+            return _preprocess_tau_spec_text(f.read())
+    except Exception:
+        logger.exception("Failed to load Tau bootstrap program from %s", config.TAU_PROGRAM_FILE)
+        return ""
+
+
+def _derive_application_rules_fragment(spec_text: str, consensus_text: str = "") -> str:
+    remainder = _preprocess_tau_spec_text(spec_text)
+    bootstrap_spec = _load_tau_bootstrap_spec()
+    consensus_spec = _preprocess_tau_spec_text(consensus_text)
+
+    if bootstrap_spec and remainder.startswith(bootstrap_spec):
+        remainder = remainder[len(bootstrap_spec):].lstrip()
+    if consensus_spec and remainder.startswith(consensus_spec):
+        remainder = remainder[len(consensus_spec):].lstrip()
+    return remainder
+
+
+def get_tau_restore_state() -> str:
+    """
+    Returns a Tau-native restoreable spec. The application rules natively encode the
+    entire spec (due to u state retention). No concatenation needed.
+    """
     with _rules_lock:
-        app = _application_rules_state or ""
-        cons = _consensus_rules_state or ""
-        if cons and app:
-            return cons + "\n" + app
-        return cons + app
+        app = (_application_rules_state or "").strip()
+        cons = (_consensus_rules_state or "").strip()
+
+    return app if app else cons
+
+
+def get_rules_state() -> str:
+    """
+    Returns a Tau-native restoreable spec. The application rules natively encode the
+    entire spec (due to u state retention). No concatenation needed.
+    """
+    with _rules_lock:
+        app = (_application_rules_state or "").strip()
+        cons = (_consensus_rules_state or "").strip()
+
+    return app if app else cons
+
+
+def get_persisted_full_tau_spec() -> str:
+    try:
+        return db.get_chain_state_value("full_tau_spec", "")
+    except Exception:
+        logger.exception("Failed to load persisted full Tau spec from DB")
+        return ""
+
+
+def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, object]]:
+    """
+    Returns an ordered replay plan for i0 updates after the native interpreter has been
+    initialized with `config.TAU_PROGRAM_FILE` (normally `genesis.tau`).
+    """
+    if use_persisted_state:
+        with _rules_lock:
+            consensus_snapshot = _consensus_rules_state or ""
+            application_snapshot = _application_rules_state or ""
+    else:
+        genesis_path = os.path.join(os.path.dirname(__file__), "data", "genesis.json")
+        try:
+            with open(genesis_path, "r", encoding="utf-8") as f:
+                genesis_data = json.load(f)
+        except Exception:
+            logger.exception("Failed to load genesis data from %s", genesis_path)
+            return []
+        consensus_snapshot = genesis_data.get("consensus_rules", "")
+        application_snapshot = ""
+
+    normalized_consensus = _preprocess_tau_spec_text(consensus_snapshot)
+    normalized_application = _derive_application_rules_fragment(
+        application_snapshot,
+        consensus_text=consensus_snapshot,
+    )
+
+    plan: List[Dict[str, object]] = []
+    if normalized_consensus:
+        plan.append({
+            "label": "consensus_rules",
+            "text": normalized_consensus,
+            "persist": False,
+        })
+    if normalized_application:
+        plan.append({
+            "label": "application_rules",
+            "text": normalized_application,
+            "persist": False,
+        })
+
+    for idx, rule_text in enumerate(load_builtin_rules_from_disk(), start=1):
+        normalized_rule = _preprocess_tau_spec_text(rule_text)
+        if not normalized_rule:
+            continue
+        if normalized_application and normalized_rule in normalized_application:
+            continue
+        plan.append({
+            "label": f"builtin_rule_{idx}",
+            "text": normalized_rule,
+            "persist": True,
+        })
+
+    return plan
 
 def get_application_rules_state() -> str:
     with _rules_lock:
@@ -910,6 +1039,24 @@ def save_application_rules_state(rules_content: str):
     global _application_rules_state
     with _rules_lock:
         _application_rules_state = rules_content or ""
+
+
+def save_effective_tau_spec(spec_text: str):
+    """
+    Persist a full Tau interpreter spec by stripping any currently-known consensus
+    prefix before storing the application-rules fragment.
+    """
+    global _application_rules_state
+    normalized_full_spec = _preprocess_tau_spec_text(spec_text)
+    with _rules_lock:
+        _application_rules_state = _derive_application_rules_fragment(
+            normalized_full_spec,
+            consensus_text=_consensus_rules_state,
+        )
+    try:
+        db.set_chain_state_value("full_tau_spec", normalized_full_spec)
+    except Exception:
+        logger.exception("Failed to persist full Tau spec snapshot")
         
 def save_consensus_rules_state(rules_content: str):
     global _consensus_rules_state
@@ -972,10 +1119,10 @@ def commit_state_to_db(block_hash: str, block_number: int):
         app_rules_snapshot = _application_rules_state
         cons_rules_snapshot = _consensus_rules_state
         cons_id_snapshot = _active_consensus_id
-        pending_updates_list = [{"update_id": k, "rule_revisions": v.rule_revisions, "activate_at_height": v.activate_at_height, "host_contract_patch": v.host_contract_patch} for k, v in _lifecycle_manager.update_payloads.items() if k in _lifecycle_manager.pending_updates]
-        votes_list = [{"update_id": k, "voter_pubkey": pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
-        scheduled_list = _lifecycle_manager.scheduled_updates[:]
-        archival_list = list(_lifecycle_manager.archival_updates)
+        pending_updates_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "rule_revisions": v.rule_revisions, "activate_at_height": v.activate_at_height, "host_contract_patch": v.host_contract_patch} for k, v in _lifecycle_manager.update_payloads.items() if k in _lifecycle_manager.pending_updates]
+        votes_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "voter_pubkey": pub.hex() if isinstance(pub, bytes) else pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
+        scheduled_list = [(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates]
+        archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
         
     db.save_canonical_state_atomically(
         block_hash, block_number, 
@@ -1031,7 +1178,7 @@ def initialize_persistent_state(genesis_json_path: str = "data/genesis.json"):
     print("[DEBUG][chain_state] Verifying consistency between loaded state and blockchain head...")
     latest = db.get_canonical_head_block()
     latest_hash = latest['block_hash'] if latest else ''
-    latest_num = latest['block_number'] if latest else 0
+    latest_num = latest['header']['block_number'] if latest else 0
     
     if _canonical_head_hash != latest_hash:
         print(f"[WARN][chain_state] State-DB mismatch! State hash: '{_canonical_head_hash[:16]}...', DB hash: '{latest_hash[:16]}...'.")

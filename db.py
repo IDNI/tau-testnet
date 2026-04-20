@@ -17,6 +17,108 @@ logger = logging.getLogger(__name__)
 _db_conn = None
 _db_lock = threading.Lock()
 
+
+def _normalize_legacy_genesis_row(conn: sqlite3.Connection) -> None:
+    """
+    Upgrade older databases that stored block 0 under the sentinel hash "GENESIS".
+    Rewrites the row and all local references to the canonical header-derived hash.
+    """
+    try:
+        cur = conn.execute(
+            "SELECT block_hash, block_data FROM blocks WHERE block_number = 0 LIMIT 1"
+        )
+        row = cur.fetchone()
+    except sqlite3.Error:
+        return
+
+    if not row:
+        return
+
+    stored_hash, block_data_json = row
+    if stored_hash != "GENESIS":
+        return
+
+    try:
+        payload = json.loads(block_data_json)
+    except Exception:
+        logger.warning("Legacy genesis row found but block_data is invalid JSON; leaving untouched.")
+        return
+
+    try:
+        header_payload = payload.get("header", {}) if isinstance(payload, dict) else {}
+        header = block_module.BlockHeader(
+            block_number=int(header_payload.get("block_number") or 0),
+            previous_hash=str(header_payload.get("previous_hash") or "0" * 64),
+            timestamp=int(header_payload.get("timestamp") or 0),
+            merkle_root=str(header_payload.get("merkle_root") or "0" * 64),
+            proposer_pubkey=str(header_payload.get("proposer_pubkey") or ""),
+            state_hash=str(header_payload.get("state_hash") or block_module.EMPTY_STATE_HASH),
+            state_locator=str(header_payload.get("state_locator") or ""),
+        )
+        canonical_hash = block_module.sha256_hex(header.canonical_bytes())
+    except Exception:
+        logger.warning("Legacy genesis row found but canonical hash derivation failed.", exc_info=True)
+        return
+
+    if not canonical_hash or canonical_hash == "GENESIS":
+        logger.warning("Legacy genesis row normalization produced invalid hash %r; leaving untouched.", canonical_hash)
+        return
+
+    payload["block_hash"] = canonical_hash
+    if "hash" in payload:
+        payload["hash"] = canonical_hash
+    normalized_block_data = json.dumps(payload)
+
+    try:
+        existing = conn.execute(
+            "SELECT 1 FROM blocks WHERE block_hash = ? LIMIT 1",
+            (canonical_hash,),
+        ).fetchone()
+
+        if existing:
+            conn.execute(
+                "UPDATE blocks SET block_data = ? WHERE block_hash = ?",
+                (normalized_block_data, canonical_hash),
+            )
+            conn.execute(
+                "DELETE FROM blocks WHERE block_hash = ? AND block_number = 0",
+                ("GENESIS",),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE blocks
+                SET block_hash = ?, previous_hash = ?, block_data = ?
+                WHERE block_hash = ? AND block_number = 0
+                """,
+                (
+                    canonical_hash,
+                    header.previous_hash,
+                    normalized_block_data,
+                    "GENESIS",
+                ),
+            )
+
+        conn.execute(
+            "UPDATE blocks SET previous_hash = ? WHERE previous_hash = ?",
+            (canonical_hash, "GENESIS"),
+        )
+        conn.execute(
+            "UPDATE chain_state SET value = ? WHERE key = 'canonical_head_hash' AND value = ?",
+            (canonical_hash, "GENESIS"),
+        )
+        conn.execute(
+            "UPDATE peers SET genesis_hash = ? WHERE genesis_hash = ?",
+            (canonical_hash, "GENESIS"),
+        )
+        conn.execute(
+            "UPDATE peers SET head_hash = ? WHERE head_hash = ?",
+            (canonical_hash, "GENESIS"),
+        )
+        logger.info("Normalized legacy genesis sentinel hash to %s", canonical_hash)
+    except sqlite3.Error:
+        logger.warning("Failed to normalize legacy genesis row", exc_info=True)
+
 def init_db():
     """Initializes the SQLite database, creating necessary tables."""
     global _db_conn
@@ -146,6 +248,8 @@ def init_db():
                         batch_id    TEXT
                     );
                 ''')
+
+            _normalize_legacy_genesis_row(conn)
 
     except (sqlite3.Error, OSError) as exc:
         raise DatabaseError(f"Failed to initialize database at {config.STRING_DB_PATH}: {exc}") from exc
@@ -589,6 +693,33 @@ def load_chain_state() -> tuple[Dict[str, int], Dict[str, int], str, str, str, s
             pass # Pre-migration fallback ignored, we just clear legacy proposals
             
     return balances, sequences, application_rules, consensus_rules, active_consensus_id, canonical_head_hash, pending_updates, votes, scheduled, archival
+
+
+def get_chain_state_value(key: str, default: str = "") -> str:
+    if _db_conn is None:
+        init_db()
+
+    with _db_lock:
+        cur = _db_conn.execute(
+            "SELECT value FROM chain_state WHERE key = ? LIMIT 1",
+            (key,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return default
+    return row[0] if row[0] is not None else default
+
+
+def set_chain_state_value(key: str, value: str) -> None:
+    if _db_conn is None:
+        init_db()
+
+    with _db_lock:
+        with _db_conn:
+            _db_conn.execute(
+                "INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)",
+                (key, value),
+            )
 
 
 def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str]):

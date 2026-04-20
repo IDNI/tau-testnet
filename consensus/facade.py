@@ -23,9 +23,12 @@ class TipAdmissionView:
         
         # If there's a dynamic validator set managed by the host contract, fetch it from chain_state
         # For v1, falling back to config for boot:
-        state_vals = chain_state._consensus_meta.get("active_validators")
-        if state_vals:
-            return set(state_vals)
+        if getattr(chain_state, "_lifecycle_manager", None):
+            state_vals = chain_state._lifecycle_manager.active_validators
+            if state_vals:
+                if len(state_vals) == 1 and "00000000000000000000000000000000" in list(state_vals)[0]:
+                    return set(validators)
+                return set(state_vals)
         return set(validators)
 
     @property
@@ -45,14 +48,11 @@ class TipAdmissionView:
     def host_contract(self) -> dict:
         """Returns the active host contract configuration at canonical tip."""
         # For this version, defaults from config where undefined
-        contract = chain_state._consensus_meta.get("host_contract", {})
-        if not contract:
-            return {
-                "proof_scheme": "bls_header_sig",
-                "fork_choice_scheme": "height_then_hash",
-                "input_contract_version": 1
-            }
-        return contract
+        return {
+            "proof_scheme": "bls_header_sig",
+            "fork_choice_scheme": "height_then_hash",
+            "input_contract_version": 1
+        }
 
     def get_update_lifecycle_state(self, update_id: str) -> Optional[str]:
         """
