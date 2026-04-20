@@ -72,8 +72,8 @@ class ServiceContainer:
         tau_manager_module = override_map.get("tau_manager", tau_manager)
 
         # Wire up circular dependencies via callbacks
-        if hasattr(tau_manager_module, "set_rules_handler") and hasattr(chain_state_module, "save_rules_state"):
-            tau_manager_module.set_rules_handler(chain_state_module.save_rules_state)
+        if hasattr(tau_manager_module, "set_rules_handler") and hasattr(chain_state_module, "save_application_rules_state"):
+            tau_manager_module.set_rules_handler(chain_state_module.save_application_rules_state)
 
         # Instantiate Miner if configured
         miner_instance = None

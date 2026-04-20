@@ -60,7 +60,7 @@ class TestDHTFormula(unittest.TestCase):
         """
         Tau/rules snapshots are stored under `state:<blake3>` with the raw spec bytes as value.
         """
-        from poa.state import compute_state_hash
+        from consensus.state import compute_state_hash
 
         tau_spec = b"always (o5[t] = { 1 }:bv)."
         state_hash = compute_state_hash(tau_spec)
@@ -73,7 +73,7 @@ class TestDHTFormula(unittest.TestCase):
         self.assertEqual(retrieved, tau_spec)
 
     def test_tau_state_rejects_hash_mismatch(self):
-        from poa.state import compute_state_hash
+        from consensus.state import compute_state_hash
 
         tau_spec = b"always (o6[t] = { 0 }:bv)."
         correct_hash = compute_state_hash(tau_spec)

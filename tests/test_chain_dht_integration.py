@@ -14,7 +14,7 @@ class TestChainDHTIntegration(unittest.TestCase):
             "db": MagicMock(),
             "tau_manager": MagicMock(),
             "poa": MagicMock(),
-            "poa.state": MagicMock(),
+            "consensus.state": MagicMock(),
             "block": MagicMock(),
         })
         self.modules_patcher.start()
@@ -27,17 +27,17 @@ class TestChainDHTIntegration(unittest.TestCase):
         self.chain_state = chain_state
 
         # Ensure state hash computation is deterministic for assertions.
-        # chain_state imports compute_state_hash from poa.state; with our patched sys.modules,
+        # chain_state imports compute_state_hash from consensus.state; with our patched sys.modules,
         # it's a MagicMock unless we give it a return value.
         try:
             self.chain_state.compute_state_hash.return_value = "deadbeef"
-            # NEW: also patch compute_consensus_state_hash because save_rules_state uses it now
+            # NEW: also patch compute_consensus_state_hash because save_application_rules_state uses it now
             self.chain_state.compute_consensus_state_hash.return_value = "deadbeef"
         except Exception:
             pass
         
         # Reset chain state
-        self.chain_state._current_rules_state = ""
+        self.chain_state._application_rules_state = ""
         self.chain_state._dht_client = None
         
         # Mock DHT Client
@@ -84,7 +84,7 @@ class TestChainDHTIntegration(unittest.TestCase):
         
         # 2. Save rules state (simulates receiving new rules from Tau)
         formula_content = "test formula content"
-        self.chain_state.save_rules_state(formula_content)
+        self.chain_state.save_application_rules_state(formula_content)
         
         # 3. Verify it was NOT stored in DHT automatically (refactor)
         calls = self.mock_dht_client.put_record_sync.call_args_list

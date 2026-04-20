@@ -70,11 +70,16 @@ class TestStateReconstruction(unittest.TestCase):
         # Disable auto-faucet for these tests to ensure strict balance checks
         self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
         config.TESTNET_AUTO_FAUCET = False
+        
+        from unittest.mock import patch
+        self.verify_patch = patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
+        self.verify_patch.start()
     
     def tearDown(self):
         """Clean up the temporary database."""
         # Restore auto-faucet setting
         config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
+        self.verify_patch.stop()
 
         # Ensure Tau process is stopped between tests
         if tau_manager.tau_ready.is_set():
@@ -154,7 +159,7 @@ class TestStateReconstruction(unittest.TestCase):
         block_1 = Block.create(
             block_number=1,
             previous_hash=config.GENESIS_HASH,
-            transactions=[tx1]
+            transactions=[tx1], proposer_pubkey="a"*96
         )
         
         # Add block to database
@@ -220,7 +225,7 @@ class TestStateReconstruction(unittest.TestCase):
             block_1 = Block.create(
                 block_number=1,
                 previous_hash=config.GENESIS_HASH,
-                transactions=[tx1, tx2, tx3]
+                transactions=[tx1, tx2, tx3], proposer_pubkey="a"*96
             )
             self.add_block_and_set_head(block_1)
 
@@ -246,7 +251,7 @@ class TestStateReconstruction(unittest.TestCase):
             block_2 = Block.create(
                 block_number=2,
                 previous_hash=block_1.block_hash,
-                transactions=[tx4, tx5, tx6]
+                transactions=[tx4, tx5, tx6], proposer_pubkey="a"*96
             )
             self.add_block_and_set_head(block_2)
 
@@ -272,7 +277,7 @@ class TestStateReconstruction(unittest.TestCase):
             block_3 = Block.create(
                 block_number=3,
                 previous_hash=block_2.block_hash,
-                transactions=[tx7, tx8, tx9]
+                transactions=[tx7, tx8, tx9], proposer_pubkey="a"*96
             )
             self.add_block_and_set_head(block_3)
 
@@ -328,7 +333,7 @@ class TestStateReconstruction(unittest.TestCase):
         block_1 = Block.create(
             block_number=1,
             previous_hash=config.GENESIS_HASH,
-            transactions=[valid_tx, invalid_tx, invalid_amount_tx]
+            transactions=[valid_tx, invalid_tx, invalid_amount_tx], proposer_pubkey="a"*96
         )
         self.add_block_and_set_head(block_1)
         
@@ -378,7 +383,7 @@ class TestStateReconstruction(unittest.TestCase):
         block_1 = Block.create(
             block_number=1,
             previous_hash=config.GENESIS_HASH,
-            transactions=[tx1, tx2, tx3]
+            transactions=[tx1, tx2, tx3], proposer_pubkey="a"*96
         )
         self.add_block_and_set_head(block_1)
         
@@ -413,7 +418,7 @@ class TestStateReconstruction(unittest.TestCase):
             block_1 = Block.create(
                 block_number=1,
                 previous_hash=config.GENESIS_HASH,
-                transactions=[tx1]
+                transactions=[tx1], proposer_pubkey="a"*96
             )
             self.add_block_and_set_head(block_1)
 
@@ -451,7 +456,7 @@ class TestStateReconstruction(unittest.TestCase):
         block_1 = Block.create(
             block_number=1,
             previous_hash=config.GENESIS_HASH,
-            transactions=[tx1]
+            transactions=[tx1], proposer_pubkey="a"*96
         )
         self.add_block_and_set_head(block_1)
         
@@ -488,7 +493,7 @@ class TestStateReconstruction(unittest.TestCase):
             block_1 = Block.create(
                 block_number=1,
                 previous_hash=config.GENESIS_HASH,
-                transactions=[tx1]
+                transactions=[tx1], proposer_pubkey="a"*96
             )
             self.add_block_and_set_head(block_1)
             
@@ -523,7 +528,7 @@ class TestStateReconstruction(unittest.TestCase):
         block_1 = Block.create(
             block_number=1,
             previous_hash=config.GENESIS_HASH,
-            transactions=[tx1, tx2]
+            transactions=[tx1, tx2], proposer_pubkey="a"*96
         )
         self.add_block_and_set_head(block_1)
         

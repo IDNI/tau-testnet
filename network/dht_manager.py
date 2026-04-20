@@ -301,7 +301,7 @@ class DHTManager:
 
         # 2) Raw Tau state bytes (Legacy fallback)
         try:
-            from poa.state import compute_state_hash
+            from consensus.state import compute_state_hash
             return compute_state_hash(value) == suffix
         except Exception:
             return False
@@ -313,7 +313,7 @@ class DHTManager:
         Validator recomputes consensus hash and compares to key suffix.
         """
         import json
-        from poa.state import compute_consensus_state_hash
+        from consensus.state import compute_consensus_state_hash
         
         decoded = self._decode_dht_key(key)
         if not decoded:
@@ -346,7 +346,7 @@ class DHTManager:
             except ValueError:
                 return False
                 
-            computed = compute_consensus_state_hash(rules_bytes, accounts_hash_bytes)
+            computed = compute_consensus_state_hash(rules_bytes, b"", accounts_hash_bytes, b"")
             return computed == consensus_hash
         except Exception:
             return False

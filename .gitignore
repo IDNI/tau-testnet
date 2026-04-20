@@ -39,6 +39,7 @@ MagicMock
 !NOTICE.txt
 !LICENSE.md
 !WALLET_USAGE.md
+!docs/CONSENSUS_ARCHITECTURE.md
 
 # Python
 __pycache__/

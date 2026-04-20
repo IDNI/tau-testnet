@@ -14,9 +14,62 @@ import tau_manager
 
 logger = logging.getLogger(__name__)
 
-class PoATauEngine(TauEngine):
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
+
+@dataclass
+class ActiveConsensusView:
     """
-    Proof-of-Authority implementation of the Tau Engine.
+    Represents the active consensus policy to be used for block validation.
+    Derived purely from a parent snapshot state.
+    """
+    target_height: int
+    consensus_rules: str
+    active_validators: List[bytes]
+    mechanism_specific_metadata: Optional[Dict[str, Any]] = None
+
+class ConsensusEngine(ABC):
+    """
+    Defines the contract for the Tau-driven consensus processing paths.
+    Unifies mining, import, replay, and reorg behind a single interface.
+    """
+    
+    @abstractmethod
+    def derive_active_consensus(self, parent_snapshot: TauStateSnapshot, target_height: int) -> ActiveConsensusView:
+        """
+        Pure, read-only derivation of the active consensus view for the target height.
+        MUST NOT mutate any state objects or perform archival transitions.
+        """
+        pass
+        
+    @abstractmethod
+    def verify_block_header(self, active_view: ActiveConsensusView, block: Any, proof_result: Dict[str, Any]) -> bool:
+        """
+        Complete consensus-verdict step. Encompasses proof result consumption and 
+        Tau policy evaluation yielding the final block validity (o6).
+        Returns True if the block is accepted.
+        """
+        pass
+        
+    @abstractmethod
+    def apply_block(self, active_view: ActiveConsensusView, block: Any) -> TauStateSnapshot:
+        """
+        Apply the valid block payload over the active view to produce the next 
+        committed snapshot. This includes archival transitions.
+        """
+        pass
+        
+    @abstractmethod
+    def query_eligibility(self, active_view: ActiveConsensusView, local_pubkey: str, target_height: int, now_ts: int) -> bool:
+        """
+        Query whether the given identity is eligible to propose the block at the target height 
+        and time, according to Tau policy (o7).
+        """
+        pass
+
+class TauConsensusEngine(TauEngine, ConsensusEngine):
+    """
+    Legacy and transition implementation of the Tau Engine and new Consensus Engine contract.
     
     Handles:
     1. Block signature verification (PoA consensus).
@@ -30,35 +83,105 @@ class PoATauEngine(TauEngine):
         if not self._validators and config.MINER_PUBKEY:
              self._validators = [config.MINER_PUBKEY]
 
-    def is_validator(self, pubkey: str) -> bool:
-        """Check if a public key belongs to an authorized validator."""
-        return pubkey in self._validators
+    # --- ConsensusEngine Interface Implementation ---
 
-    def verify_block(self, block: Any) -> bool:
+    def derive_active_consensus(self, parent_snapshot: TauStateSnapshot, target_height: int) -> ActiveConsensusView:
+        # Skeleton implementation for Phase 1
+        # In Phase 2, this will traverse the consensus_meta to build the view. 
+        # For now, it delegates to PoA parameters.
+        return ActiveConsensusView(
+            target_height=target_height,
+            consensus_rules=parent_snapshot.tau_bytes.decode('utf-8', errors='ignore'),
+            active_validators=[bytes.fromhex(v) for v in self._validators],
+            mechanism_specific_metadata={"poa": True}
+        )
+
+    def verify_block_header(self, *args, **kwargs) -> bool:
         """
-        Verify that the block is signed by a valid validator.
-        
-        Args:
-            block: A Block object (duck-typed, expected to have verify_signature and block_signature).
+        Verify that the block header meets the consensus proof requirements.
+        Supports both Phase 1 legacy signature and new ConsensusEngine signature.
         """
-        if not block.block_signature:
-            logger.warning("PoA: Block #%s has no signature", block.header.block_number)
+        if len(args) > 0 and isinstance(args[0], ActiveConsensusView) or "active_view" in kwargs:
+            # Phase 2+ new signature: (active_view, block, proof_result)
+            proof_result = kwargs.get("proof_result") if "proof_result" in kwargs else (args[2] if len(args) > 2 else {})
+            if proof_result.get("proof_ok", False) is False:
+                return False
+            block = kwargs.get("block") if "block" in kwargs else (args[1] if len(args) > 1 else None)
+        else:
+            # Phase 1 Legacy Signature: (block)
+            block = args[0] if len(args) > 0 else kwargs.get("block")
+
+        if block and not block.consensus_proof:
+            logger.warning("Consensus: Block #%s has no consensus proof", block.header.block_number)
             return False
 
-        # Determine expected miner for this block height (Round Robin)
-        if not self._validators:
-            logger.warning("PoA: No validators configured.")
+        if not tau_manager.tau_ready.is_set():
+            logger.error("Consensus: Tau not ready for block verification.")
             return False
             
-        expected_miner_index = block.header.block_number % len(self._validators)
-        expected_miner = self._validators[expected_miner_index]
-
-        # Verify the signature against the expected round-robin miner
-        if not block.verify_signature(miner_pubkey=expected_miner):
-            logger.warning("PoA: Block #%s signature verification failed. Expected miner: %s", block.header.block_number, expected_miner[:10])
+        i2_inputs = [
+            block.header.proposer_pubkey,
+            str(block.header.block_number),
+            str(block.header.timestamp),
+            block.header.previous_hash
+        ]
+        try:
+            output = tau_manager.communicate_with_tau(
+                target_output_stream_index=7,
+                input_stream_values={2: i2_inputs},
+                apply_rules_update=False
+            )
+            if "require_bls_sig" in output:
+                if not block.verify_consensus_proof():
+                    logger.warning("Consensus: Block #%s cryptographic proof failed", block.header.block_number)
+                    return False
+                return True
+            
+            logger.warning("Consensus: Block #%s rejected by Tau rules (o7: %s)", block.header.block_number, output)
+            return False
+        except Exception as e:
+            logger.error("Header verification failed: %s", e)
             return False
 
-        return True
+    def apply_block(self, active_view: ActiveConsensusView, block: Any) -> TauStateSnapshot:
+        # Phase 1 skeleton, full tx hydration and archival logic deferred to Phase 2/3.
+        # This will eventually call the internal `apply` transaction handler.
+        raise NotImplementedError("apply_block implementation requires Phase 2 structures")
+
+    def query_eligibility(self, *args, **kwargs) -> bool:
+        """
+        Check if we are eligible to propose the next block by dry-running consensus logic.
+        Supports both Phase 1 legacy signature and new ConsensusEngine signature.
+        """
+        if len(args) > 0 and isinstance(args[0], ActiveConsensusView) or "active_view" in kwargs:
+            # new signature: (active_view, local_pubkey, target_height, now_ts)
+            my_pubkey = kwargs.get("local_pubkey") if "local_pubkey" in kwargs else (args[1] if len(args) > 1 else "")
+            block_number = kwargs.get("target_height") if "target_height" in kwargs else (args[2] if len(args) > 2 else 0)
+            timestamp = kwargs.get("now_ts") if "now_ts" in kwargs else (args[3] if len(args) > 3 else 0)
+            previous_hash = "0" * 64
+        else:
+            # legacy signature: (my_pubkey, block_number, timestamp, previous_hash)
+            my_pubkey = args[0] if len(args) > 0 else kwargs.get("my_pubkey")
+            block_number = args[1] if len(args) > 1 else kwargs.get("block_number")
+            timestamp = args[2] if len(args) > 2 else kwargs.get("timestamp")
+            previous_hash = args[3] if len(args) > 3 else kwargs.get("previous_hash")
+
+        if not tau_manager.tau_ready.is_set():
+            return False
+            
+        i2_inputs = [my_pubkey, str(block_number), str(timestamp), previous_hash]
+        try:
+            output = tau_manager.communicate_with_tau(
+                target_output_stream_index=7,
+                input_stream_values={2: i2_inputs},
+                apply_rules_update=False
+            )
+            if "require_bls_sig" in output:
+                return True
+            return False
+        except Exception as e:
+            logger.error("Eligibility query failed: %s", e)
+            return False
 
     def apply(
         self,
@@ -134,12 +257,49 @@ class PoATauEngine(TauEngine):
             # 2. Custom inputs (keys >= 5)
             # 3. Transfers (key "1") - applied last to state, though input validation happened upstream
 
-            rule_op_data = operations.get("0")
-            transfers_op_data = operations.get("1")
+            tx_type = tx.get('tx_type', 'user_tx')
             
+            rule_op_data = None
+            transfers_op_data = None
             custom_tau_inputs: dict[int, list[str]] = {}
             reserved_error = None
+
+            from consensus.governance import parse_consensus_rule_update, parse_consensus_rule_vote
             
+            if tx_type == 'consensus_rule_update':
+                update = parse_consensus_rule_update(tx)
+                if update:
+                    if chain_state._lifecycle_manager.can_admit_update(update, is_mempool=False):
+                        if chain_state._lifecycle_manager.submit_update(update):
+                            tx_receipt["logs"].append("Update submitted: " + update.update_id_hex)
+                        else:
+                            tx_receipt["logs"].append("Duplicate update ignored: " + update.update_id_hex)
+                    else:
+                        tx_receipt["logs"].append("Update rejected by strict admission")
+                        execution_success = False
+                else:
+                    tx_receipt["logs"].append("Invalid update format")
+                    accepted_in_block = False # Structural invalidity rejects entirely in most chains
+
+            elif tx_type == 'consensus_rule_vote':
+                vote = parse_consensus_rule_vote(tx)
+                if vote and sender:
+                    if chain_state._lifecycle_manager.can_admit_vote(vote, sender, is_mempool=False):
+                        if chain_state._lifecycle_manager.submit_vote(vote, sender):
+                            tx_receipt["logs"].append(f"Vote accepted for update {vote.update_id.hex()}")
+                        else:
+                            tx_receipt["logs"].append("Vote ignored (valid no-op)")
+                    else:
+                        tx_receipt["logs"].append("Vote rejected by strict admission")
+                        execution_success = False
+                else:
+                    tx_receipt["logs"].append("Invalid vote format")
+                    accepted_in_block = False
+            else:
+                # user_tx
+                rule_op_data = operations.get("0")
+                transfers_op_data = operations.get("1")
+                
             for k, v in operations.items():
                 if k.isdigit():
                     idx = int(k)
@@ -262,8 +422,12 @@ class PoATauEngine(TauEngine):
                                     
                                     if target_balances is not None:
                                         # Use isolated balance tracking
-                                        current_from = target_balances.get(from_addr, 0)
-                                        if from_addr not in target_balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
+                                        if from_addr in target_balances:
+                                            current_from = target_balances[from_addr]
+                                        else:
+                                            current_from = chain_state.get_balance(from_addr)
+                                        
+                                        if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
                                             current_from = 1000
                                             
                                         if current_from < amount:
@@ -272,7 +436,7 @@ class PoATauEngine(TauEngine):
                                             tx_receipt["logs"].append("Transfer balance state failed (insufficient)")
                                             break
                                             
-                                        current_to = target_balances.get(to_addr, 0)
+                                        current_to = target_balances.get(to_addr, chain_state.get_balance(to_addr))
                                         target_balances[from_addr] = current_from - amount
                                         target_balances[to_addr] = current_to + amount
                                     else:

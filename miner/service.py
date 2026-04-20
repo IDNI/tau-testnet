@@ -37,25 +37,25 @@ class SoleMiner:
         # 1. Turn check logic first (fast path)
         latest_block = db.get_canonical_head_block()
         next_block_number = latest_block['header']['block_number'] + 1 if latest_block else 0
+        prev_hash = latest_block['block_hash'] if latest_block else config.GENESIS_HASH
         
-        validators = getattr(config, "MINER_PUBKEYS", [])
-        if not validators and config.MINER_PUBKEY:
-            validators = [config.MINER_PUBKEY]
-            
-        if validators:
-            expected_miner = validators[next_block_number % len(validators)]
-            if config.MINER_PUBKEY and expected_miner != config.MINER_PUBKEY:
-                return False # Not our turn
+        from consensus.engine import TauConsensusEngine
+        engine = TauConsensusEngine()
+        if not engine.query_eligibility(config.MINER_PUBKEY, next_block_number, int(time.time()), prev_hash):
+            return False # Not our turn according to Tau consensus
 
         # 2. Check mempool threshold
         pending = db.count_mempool_txs()
         if pending == 0:
             return False
+            
         if pending >= self._threshold:
             return True
             
-        # 3. Check time interval
-        return (time.time() - self._last_mine_time) >= self._max_block_interval
+        if (time.time() - self._last_mine_time) >= self._max_block_interval:
+            return True
+            
+        return False
 
     def try_mine(self) -> None:
         with self._lock:

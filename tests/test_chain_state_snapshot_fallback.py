@@ -3,20 +3,20 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import chain_state
-from poa.state import compute_consensus_state_hash
+from consensus.state import compute_consensus_state_hash
 
 
 def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkeypatch):
     old_balances = dict(chain_state._balances)
     old_sequences = dict(chain_state._sequence_numbers)
-    old_rules = chain_state._current_rules_state
+    old_rules = chain_state._application_rules_state
     old_last_hash = chain_state._canonical_head_hash
     old_tau_hash = chain_state._tau_engine_state_hash
 
     try:
         chain_state._balances.clear()
         chain_state._sequence_numbers.clear()
-        chain_state._current_rules_state = ""
+        chain_state._application_rules_state = ""
         chain_state._canonical_head_hash = ""
         chain_state._tau_engine_state_hash = ""
 
@@ -25,7 +25,7 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
         target_rules = "always (o1[t]:bv[16] = i1[t]:bv[16])."
 
         accounts_hash = chain_state.compute_accounts_hash(target_balances, target_sequences)
-        expected_state_hash = compute_consensus_state_hash(target_rules.encode("utf-8"), accounts_hash)
+        expected_state_hash = compute_consensus_state_hash(target_rules.encode("utf-8"), b"", accounts_hash, b"")
 
         from block import Block
         import config
@@ -34,7 +34,8 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
             previous_hash=config.GENESIS_HASH,
             transactions=[{"tx_id": "tx-1", "operations": {}}],
             state_hash=expected_state_hash,
-            timestamp=1700000000
+            timestamp=1700000000,
+            proposer_pubkey="a"*96
         )
         block.tx_ids = ["tx-1"]
 
@@ -63,8 +64,8 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
         )
         monkeypatch.setattr(
             chain_state,
-            "save_rules_state",
-            lambda rules: setattr(chain_state, "_current_rules_state", rules),
+            "save_application_rules_state",
+            lambda rules: setattr(chain_state, "_application_rules_state", rules),
         )
 
         # Mock tau_manager
@@ -72,7 +73,7 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
         monkeypatch.setattr(chain_state.tau_manager, "communicate_with_tau", lambda *args, **kwargs: None)
 
         class _FakeEngine:
-            def verify_block(self, _block):
+            def verify_block_header(self, _block):
                 return True
 
             def apply(self, _snapshot, transactions, block_timestamp=None, target_balances=None, target_sequences=None):
@@ -94,7 +95,7 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
                     rejected_transactions=[],
                 )
 
-        monkeypatch.setattr(chain_state, "PoATauEngine", lambda: _FakeEngine())
+        monkeypatch.setattr(chain_state, "TauConsensusEngine", lambda: _FakeEngine())
 
         # Avoid the real 8-second DHT wait loop by advancing time immediately.
         time_state = {"tick": 0.0}
@@ -108,7 +109,7 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
 
         assert chain_state.process_new_block(block) is True
         assert chain_state._canonical_head_hash == block.block_hash
-        assert chain_state._current_rules_state == target_rules
+        assert chain_state._application_rules_state == target_rules
         assert chain_state._balances == target_balances
         assert chain_state._sequence_numbers == target_sequences
     finally:
@@ -116,6 +117,6 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
         chain_state._balances.update(old_balances)
         chain_state._sequence_numbers.clear()
         chain_state._sequence_numbers.update(old_sequences)
-        chain_state._current_rules_state = old_rules
+        chain_state._application_rules_state = old_rules
         chain_state._canonical_head_hash = old_last_hash
         chain_state._tau_engine_state_hash = old_tau_hash

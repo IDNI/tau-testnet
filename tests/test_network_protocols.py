@@ -44,7 +44,7 @@ def isolate_db(tmp_path):
     db_module.init_db()
     chain_state_module.init_chain_state()
     
-    db_module.save_canonical_state_atomically(config_module.GENESIS_HASH, 0, {}, {}, "")
+    db_module.save_canonical_state_atomically(config_module.GENESIS_HASH, 0, {}, {}, "", "", "", [], [], [], [])
     chain_state_module._canonical_head_hash = config_module.GENESIS_HASH
     yield
     
@@ -408,7 +408,7 @@ async def test_dht_value_validators(two_nodes):
         )
 
     # New mode: raw Tau/rules snapshot bytes stored under state:<blake3>.
-    from poa.state import compute_state_hash
+    from consensus.state import compute_state_hash
 
     tau_snapshot = b"always (o5[t] = { 1 }:bv)."
     tau_hash = compute_state_hash(tau_snapshot)
@@ -436,7 +436,8 @@ async def test_state_protocol_accounts(two_nodes):
         block_number=0,
         previous_hash="0" * 64,
         transactions=[],
-    )
+            proposer_pubkey="a"*96,
+)
     db_module.add_block(test_block)
 
     addrs2 = await _wait_for_addrs(svc2.host)

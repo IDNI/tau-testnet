@@ -81,6 +81,32 @@ def init_db():
                 );
             ''')
             conn.execute('''
+                CREATE TABLE IF NOT EXISTS consensus_updates_v2 (
+                    update_id TEXT PRIMARY KEY,
+                    rule_revisions TEXT NOT NULL,
+                    activate_at_height INTEGER NOT NULL,
+                    host_contract_patch TEXT
+                );
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS consensus_votes_v2 (
+                    update_id TEXT NOT NULL,
+                    voter_pubkey TEXT NOT NULL,
+                    PRIMARY KEY (update_id, voter_pubkey)
+                );
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS consensus_scheduled (
+                    activation_height INTEGER NOT NULL,
+                    update_id TEXT NOT NULL
+                );
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS consensus_archival (
+                    update_id TEXT PRIMARY KEY
+                );
+            ''')
+            conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
                     addrs_json   TEXT NOT NULL,
@@ -500,40 +526,74 @@ def get_canonical_blocks_at_or_after_height(block_number: int) -> List[Dict]:
                     continue
     return out
 
-def load_chain_state() -> tuple[Dict[str, int], Dict[str, int], str, str]:
+def load_chain_state() -> tuple[Dict[str, int], Dict[str, int], str, str, str, str, List[Dict], List[Dict], List[tuple[int, str]], List[str]]:
     """
-    Loads the persisted chain state (balances, sequences, rules, canonical_head_hash).
-    Returns: (balances, sequence_numbers, current_rules, canonical_head_hash)
+    Loads the persisted chain state.
+    Returns: (balances, sequence_numbers, application_rules, consensus_rules, active_consensus_id, canonical_head_hash, pending_updates, votes, scheduled, archival)
     """
     if _db_conn is None:
         init_db()
     
     balances: Dict[str, int] = {}
     sequences: Dict[str, int] = {}
-    current_rules = ""
+    application_rules = ""
+    consensus_rules = ""
+    active_consensus_id = ""
     canonical_head_hash = ""
+    pending_updates: List[Dict] = []
+    votes: List[Dict] = []
+    scheduled: List[tuple[int, str]] = []
+    archival: List[str] = []
 
     with _db_lock:
-        # Load accounts
         cur = _db_conn.execute('SELECT address, balance, sequence_number FROM accounts')
         for address, balance, seq in cur.fetchall():
             balances[address] = balance
             sequences[address] = seq
         
-        # Load state
         cur = _db_conn.execute(
-            'SELECT key, value FROM chain_state WHERE key IN (?, ?)',
-            ('current_rules', 'canonical_head_hash')
+            'SELECT key, value FROM chain_state WHERE key IN (?, ?, ?, ?, ?)',
+            ('current_rules', 'application_rules', 'consensus_rules', 'active_consensus_id', 'canonical_head_hash')
         )
         entries = dict(cur.fetchall())
-        current_rules = entries.get('current_rules', '')
+        application_rules = entries.get('application_rules', entries.get('current_rules', ''))
+        consensus_rules = entries.get('consensus_rules', '')
+        active_consensus_id = entries.get('active_consensus_id', 'tau_poa_v1')
         canonical_head_hash = entries.get('canonical_head_hash', '')
         
-    return balances, sequences, current_rules, canonical_head_hash
+        try:
+            cur = _db_conn.execute('SELECT update_id, rule_revisions, activate_at_height, host_contract_patch FROM consensus_updates_v2')
+            for row in cur.fetchall():
+                pending_updates.append({
+                    'update_id': row[0],
+                    'rule_revisions': json.loads(row[1]),
+                    'activate_at_height': row[2],
+                    'host_contract_patch': json.loads(row[3]) if row[3] else None
+                })
+                
+            cur = _db_conn.execute('SELECT update_id, voter_pubkey FROM consensus_votes_v2')
+            for row in cur.fetchall():
+                votes.append({
+                    'update_id': row[0],
+                    'voter_pubkey': row[1]
+                })
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], rules: str):
+            cur = _db_conn.execute('SELECT activation_height, update_id FROM consensus_scheduled')
+            for row in cur.fetchall():
+                scheduled.append((row[0], row[1]))
+
+            cur = _db_conn.execute('SELECT update_id FROM consensus_archival')
+            for row in cur.fetchall():
+                archival.append(row[0])
+        except sqlite3.OperationalError:
+            pass # Pre-migration fallback ignored, we just clear legacy proposals
+            
+    return balances, sequences, application_rules, consensus_rules, active_consensus_id, canonical_head_hash, pending_updates, votes, scheduled, archival
+
+
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str]):
     """
-    Saves the chain state to the database atomically with Full Replace semantics for accounts.
+    Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
     """
     if _db_conn is None:
         init_db()
@@ -542,7 +602,15 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
         with _db_conn: # Transaction
             _db_conn.execute(
                 'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                ('current_rules', rules)
+                ('application_rules', application_rules)
+            )
+            _db_conn.execute(
+                'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+                ('consensus_rules', consensus_rules)
+            )
+            _db_conn.execute(
+                'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+                ('active_consensus_id', active_consensus_id)
             )
             _db_conn.execute(
                 'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
@@ -553,13 +621,41 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 ('canonical_head_number', str(head_num))
             )
 
-            # Full replace for accounts to prevent stale balances
             _db_conn.execute('DELETE FROM accounts')
             for address, balance in balances.items():
                 seq = sequences.get(address, 0)
                 _db_conn.execute(
                     'INSERT INTO accounts (address, balance, sequence_number) VALUES (?, ?, ?)',
                     (address, balance, seq)
+                )
+                
+            # Full Replace v2 arrays
+            _db_conn.execute('DELETE FROM consensus_updates_v2')
+            for p in pending_updates:
+                _db_conn.execute(
+                    'INSERT INTO consensus_updates_v2 (update_id, rule_revisions, activate_at_height, host_contract_patch) VALUES (?, ?, ?, ?)',
+                    (p['update_id'], json.dumps(p['rule_revisions']), p['activate_at_height'], json.dumps(p['host_contract_patch']) if p['host_contract_patch'] else None)
+                )
+                
+            _db_conn.execute('DELETE FROM consensus_votes_v2')
+            for v in votes:
+                _db_conn.execute(
+                    'INSERT INTO consensus_votes_v2 (update_id, voter_pubkey) VALUES (?, ?)',
+                    (v['update_id'], v['voter_pubkey'])
+                )
+                
+            _db_conn.execute('DELETE FROM consensus_scheduled')
+            for activation_height, update_id in scheduled:
+                _db_conn.execute(
+                    'INSERT INTO consensus_scheduled (activation_height, update_id) VALUES (?, ?)',
+                    (activation_height, update_id)
+                )
+                
+            _db_conn.execute('DELETE FROM consensus_archival')
+            for uid in archival:
+                _db_conn.execute(
+                    'INSERT INTO consensus_archival (update_id) VALUES (?)',
+                    (uid,)
                 )
 
 def get_candidate_heads() -> List[tuple[str, int]]:

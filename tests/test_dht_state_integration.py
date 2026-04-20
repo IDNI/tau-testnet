@@ -16,7 +16,7 @@ from libp2p.peer.peerinfo import PeerInfo
 import config as config_module
 import config as config_module
 import chain_state
-from poa.state import compute_consensus_state_hash
+from consensus.state import compute_consensus_state_hash
 from chain_state import compute_accounts_hash
 import base64
 
@@ -43,7 +43,7 @@ def isolate_db(tmp_path):
     # Clear internal chain state memory to prevent leaks from previous tests
     chain_state._balances.clear()
     chain_state._sequence_numbers.clear()
-    chain_state._current_rules_state = ""
+    chain_state._application_rules_state = ""
     chain_state._tau_engine_state_hash = ""
     yield
     
@@ -62,7 +62,7 @@ def isolate_db(tmp_path):
     importlib.reload(db_module)
     chain_state._balances.clear()
     chain_state._sequence_numbers.clear()
-    chain_state._current_rules_state = ""
+    chain_state._application_rules_state = ""
     chain_state._tau_engine_state_hash = ""
 
 # Helper for waiting for addresses
@@ -146,15 +146,15 @@ def sync_test_logic(node_a_dht_manager, node_b_dht_manager):
     # Compute the expected State Hash (Rules + local accounts)
     # Since isolate_db yields empty DBs, balances/sequences are empty.
     empty_acc_hash = compute_accounts_hash({}, {})
-    expected_state_hash = compute_consensus_state_hash(formula_content.encode('utf-8'), empty_acc_hash)
+    expected_state_hash = compute_consensus_state_hash(formula_content.encode('utf-8'), b"", empty_acc_hash, b"")
     
     # 2. Save on Node A
     # This should store it in Node A's local store AND network (provider record)
     # It now stores as tau_state:<expected_state_hash>
     print(f"[SyncWorker] Saving formula (state_hash={expected_state_hash[:8]}) on Node A")
-    chain_state.save_rules_state(formula_content)
+    chain_state.save_application_rules_state(formula_content)
     
-    # NEW MANUAL PUBLISH STEP (since save_rules_state no longer auto-publishes)
+    # NEW MANUAL PUBLISH STEP (since save_application_rules_state no longer auto-publishes)
     print(f"[SyncWorker] Manually publishing snapshot to simulate block finalization")
     chain_state.publish_tau_state_snapshot(
         expected_state_hash, 

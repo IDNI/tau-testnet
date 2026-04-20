@@ -113,7 +113,7 @@ class TestGhostTxIntegration(unittest.TestCase):
         import chain_state
         chain_state._balances = {}
         chain_state._sequence_numbers = {}
-        chain_state._current_rules_state = ""
+        chain_state._application_rules_state = ""
         
     def tearDown(self):
         if db._db_conn:
@@ -174,7 +174,7 @@ class TestGhostTxIntegration(unittest.TestCase):
         
         # Verify Global State (simulating next block effect)
         import chain_state
-        self.assertEqual(chain_state._current_rules_state, "rule X")
+        self.assertEqual(chain_state._application_rules_state, "rule X")
         
         print("[TEST] Rule correctly applied and state hash updated.")
         

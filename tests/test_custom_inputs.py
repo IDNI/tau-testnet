@@ -10,8 +10,8 @@ import os
 # If not, we should install them, but mocking sys.modules globally is dangerous.
 
 from commands import sendtx
-from poa.engine import PoATauEngine
-from poa.state import TauStateSnapshot
+from consensus.engine import TauConsensusEngine
+from consensus.state import TauStateSnapshot
 import chain_state
 import tau_manager
 
@@ -134,11 +134,11 @@ class TestCustomInputs(unittest.TestCase):
         self.assertEqual(kwargs2['input_stream_values'][100], ["42"])
 
     def test_engine_apply_execution_order(self):
-        """Test PoATauEngine.apply executes Rule then Custom Inputs and captures receipts."""
+        """Test TauConsensusEngine.apply executes Rule then Custom Inputs and captures receipts."""
         
         mock_store = MagicMock()
         mock_store.commit.return_value = TauStateSnapshot(b"", b"", {}) 
-        engine = PoATauEngine(state_store=mock_store)
+        engine = TauConsensusEngine(state_store=mock_store)
         
         snapshot = TauStateSnapshot(b"hash", b"rules", {})
         tx = {
@@ -176,10 +176,10 @@ class TestCustomInputs(unittest.TestCase):
         self.assertIn("Rule applied", logs)
         
     def test_engine_apply_tau_error_on_custom_input(self):
-        """Test PoATauEngine.apply fails transaction if Tau returns explicit Error on custom input."""
+        """Test TauConsensusEngine.apply fails transaction if Tau returns explicit Error on custom input."""
         mock_store = MagicMock()
         mock_store.commit.return_value = TauStateSnapshot(b"", b"", {}) 
-        engine = PoATauEngine(state_store=mock_store)
+        engine = TauConsensusEngine(state_store=mock_store)
         
         snapshot = TauStateSnapshot(b"hash", b"rules", {})
         tx = {

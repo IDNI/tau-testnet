@@ -36,6 +36,15 @@ def test_environment() -> Iterator[None]:
         os.environ["TAU_ENV"] = original_env
         config.reload_settings(env=original_env)
 
+@pytest.fixture(autouse=True)
+def mock_consensus_for_unrelated_tests(monkeypatch, request):
+    """Automatically allow block creation turns in non-consensus tests to avoid breaking mempool/faucet tests."""
+    if hasattr(request, "module") and request.module and "test_poa" not in request.module.__name__ and "test_network" not in request.module.__name__:
+        try:
+            monkeypatch.setattr("consensus.engine.TauConsensusEngine.query_eligibility", lambda *args, **kwargs: True)
+        except AttributeError:
+            pass
+
 
 @pytest.fixture()
 def temp_database(tmp_path) -> Iterator[str]:

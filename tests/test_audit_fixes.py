@@ -32,7 +32,7 @@ def mock_chain_state(mock_db_path):
     # Reset chain state globals
     chain_state._balances.clear()
     chain_state._sequence_numbers.clear()
-    chain_state._current_rules_state = ""
+    chain_state._application_rules_state = ""
     chain_state._canonical_head_hash = ""
     return chain_state
 
@@ -47,10 +47,10 @@ def test_db_public_methods(mock_db_path):
     rules = "some rules"
     last_hash = "hash123"
     
-    db.save_canonical_state_atomically(last_hash, 10, balances, sequences, rules)
+    db.save_canonical_state_atomically(last_hash, 10, balances, sequences, rules, "", "", [], [], [], [])
     
     # 2. Test load_chain_state
-    loaded_balances, loaded_seqs, loaded_rules, loaded_hash = db.load_chain_state()
+    loaded_balances, loaded_seqs, loaded_rules, _, _, loaded_hash, _, _, _, _ = db.load_chain_state()
     
     assert loaded_balances == balances
     assert loaded_seqs == sequences
@@ -77,7 +77,7 @@ def test_db_public_methods(mock_db_path):
     db.add_block(MockBlock(3, "hash3", "hash2"))
     
     # Must explicitly set canonical_head_hash via actual save path for locator
-    db.save_canonical_state_atomically("hash3", 3, balances, sequences, rules)
+    db.save_canonical_state_atomically("hash3", 3, balances, sequences, rules, "", "", [], [], [], [])
     
     blocks = db.get_canonical_blocks_at_or_after_height(2)
     assert len(blocks) == 2 # 2 and 3
@@ -93,15 +93,15 @@ def test_chain_state_persistence(mock_chain_state):
     with chain_state._sequence_lock:
         chain_state._sequence_numbers["alice"] = 5
     with chain_state._rules_lock:
-        chain_state._current_rules_state = "rules v1"
+        chain_state._application_rules_state = "rules v1"
         
     # Commit directly through the DB persistence flow since commit_state_to_db was migrated!
-    db.save_canonical_state_atomically("block_hash_1", 1, {"alice": 500}, {"alice": 5}, "rules v1")
+    db.save_canonical_state_atomically("block_hash_1", 1, {"alice": 500}, {"alice": 5}, "rules v1", "", "", [], [], [], [])
     
     # Clear memory
     chain_state._balances.clear()
     chain_state._sequence_numbers.clear()
-    chain_state._current_rules_state = ""
+    chain_state._application_rules_state = ""
     chain_state._canonical_head_hash = ""
     
     # Load

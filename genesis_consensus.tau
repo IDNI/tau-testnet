@@ -1,0 +1,19 @@
+# Tau-Driven Consensus v1 Interface
+#
+# i6: Block height
+# i7: Block timestamp
+# i8: Proposer identity (yid)
+# i9: Previous block hash (yid)
+# i10: Host proof validity (1 for valid, 0 for invalid)
+# i11: Claims summary (yid)
+#
+# o6: Block validity
+# o7: Proposer eligibility
+
+# Initial V1 Rule:
+# All authorized proposals handled by host PoA are considered eligible (o7 = 1)
+# Blocks are valid strictly if the host cryptographically verifies the proof (o6 = i10)
+always (
+    o6[t]:bv[16] = i10[t]:bv[16] &&
+    o7[t]:bv[16] = { 1 }:bv[16]
+)

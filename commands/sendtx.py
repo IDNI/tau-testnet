@@ -190,13 +190,23 @@ def _get_signing_message_bytes(payload: dict) -> bytes:
     """
     Construct canonical bytes over transaction fields for BLS signing/verifying.
     """
+    tx_type = payload.get("tx_type", "user_tx")
     signing_dict = {
         "sender_pubkey": payload["sender_pubkey"],
         "sequence_number": payload["sequence_number"],
         "expiration_time": payload["expiration_time"],
-        "operations": payload["operations"],
         "fee_limit": payload["fee_limit"],
+        "tx_type": tx_type
     }
+    if tx_type == "user_tx":
+        signing_dict["operations"] = payload.get("operations", {})
+    elif tx_type == "consensus_proposal":
+        signing_dict["bundle"] = payload.get("bundle", {})
+        signing_dict["activate_at_height"] = payload.get("activate_at_height")
+    elif tx_type == "consensus_vote":
+        signing_dict["proposal_id"] = payload.get("proposal_id")
+        signing_dict["approve"] = payload.get("approve", True)
+        
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 
 
@@ -279,12 +289,27 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
     if current_time > expiration_time:
         return f"FAILURE: Transaction expired at {expiration_time}. Current time is {current_time}."
 
-    if 'operations' not in payload or not isinstance(payload['operations'], dict):
-        raise ValueError("Missing or invalid 'operations' in transaction.")
-    operations = payload['operations']
-    
     if 'fee_limit' not in payload:
         raise ValueError("Missing 'fee_limit' in transaction.")
+        
+    tx_type = payload.get("tx_type", "user_tx")
+    if tx_type not in ("user_tx", "consensus_proposal", "consensus_vote"):
+        raise ValueError(f"Invalid 'tx_type' {tx_type}")
+
+    if tx_type == "user_tx":
+        if 'operations' not in payload or not isinstance(payload['operations'], dict):
+            raise ValueError("Missing or invalid 'operations' in user_tx.")
+        operations = payload['operations']
+    elif tx_type == "consensus_proposal":
+        if 'bundle' not in payload or not isinstance(payload['bundle'], dict):
+            raise ValueError("Missing or invalid 'bundle' in consensus_proposal.")
+        if 'activate_at_height' not in payload or not isinstance(payload['activate_at_height'], int):
+            raise ValueError("Missing or invalid 'activate_at_height' in consensus_proposal.")
+    elif tx_type == "consensus_vote":
+        if 'proposal_id' not in payload or not isinstance(payload['proposal_id'], str):
+            raise ValueError("Missing or invalid 'proposal_id' in consensus_vote.")
+        if 'approve' not in payload or not isinstance(payload['approve'], bool):
+            raise ValueError("Missing or invalid 'approve' in consensus_vote.")
 
     if 'signature' not in payload:
         raise ValueError("Missing 'signature' in transaction.")
@@ -317,9 +342,20 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
 
     all_validated_transfers = []
     transfer_tau_inputs = []
-    has_transfers = "1" in operations
-    has_rules = "0" in operations
     empty_transfer_list = False
+    
+    if tx_type == "user_tx":
+        operations = payload.get("operations", {})
+        has_transfers = "1" in operations
+        has_rules = "0" in operations
+        
+        # Prevent users from using reserved streams i6..i11
+        for key in operations.keys():
+            if key.isdigit() and 6 <= int(key) <= 11:
+                return f"FAILURE: Invalid operation key '{key}'. Streams 6-11 are reserved for consensus ABI."
+    else:
+        has_transfers = False
+        has_rules = False
 
     if has_transfers:
         transfers_list = operations["1"]
@@ -335,143 +371,174 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
 
     # --- Custom Input Parsing ---
     custom_tau_inputs: dict[int, list[str]] = {}
-    for key, value in operations.items():
-        if key.isdigit():
-            idx = int(key)
-            # Reserved streams are handled exclusively by the node logic
-            # (0=Rules, 1=Transfers logic, 2=Balance, 3=From, 4=To, 5=Consensus Clock)
-            if idx in (0, 1):
-                continue
-            if idx in tau_defs.RESERVED_STREAMS:
-                 return f"FAILURE: Invalid operation key '{key}'. Stream {idx} is reserved for system consensus."
-            
-            # Normalize value to list of strings
-            normalized_val = []
-            if isinstance(value, (str, int)):
-                normalized_val.append(str(value))
-            elif isinstance(value, (list, tuple)):
-                for v in value:
-                     if isinstance(v, (str, int)):
-                         normalized_val.append(str(v))
-                     else:
-                         return f"FAILURE: Invalid value type for stream {idx}. List items must be str or int."
-            else:
-                 return f"FAILURE: Invalid value type for stream {idx}. Must be str, int, or list thereof."
-            
-            custom_tau_inputs[idx] = normalized_val
+    if tx_type == "user_tx":
+        for key, value in operations.items():
+            if key.isdigit():
+                idx = int(key)
+                if idx in (0, 1):
+                    continue
+                if idx in tau_defs.RESERVED_STREAMS and not (6 <= idx <= 11):
+                     return f"FAILURE: Invalid operation key '{key}'. Stream {idx} is reserved."
+                
+                normalized_val = []
+                if isinstance(value, (str, int)):
+                    normalized_val.append(str(value))
+                elif isinstance(value, (list, tuple)):
+                    for v in value:
+                         if isinstance(v, (str, int)):
+                             normalized_val.append(str(v))
+                         else:
+                             return f"FAILURE: Invalid value type for stream {idx}. List items must be str or int."
+                else:
+                     return f"FAILURE: Invalid value type for stream {idx}. Must be str, int."
+                
+                custom_tau_inputs[idx] = normalized_val
 
     tau_force_test = os.environ.get("TAU_FORCE_TEST", "0") == "1"
 
     try:
-        try:
-            # --- Tau Validation (Deterministic Two-Step) ---
-            
-            # Step 1: Rule Validation (if present)
-            if has_rules:
-                rule_text = operations.get("0", "").strip()
-                if rule_text:
-                    if tau_force_test:
-                        logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")
-                    else:
-                        logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
-                        tau_output_rules = tau_manager.communicate_with_tau(
-                            rule_text=rule_text,
+        if tx_type == "user_tx":
+            try:
+                # --- Tau Validation (Deterministic Two-Step) ---
+
+                # Step 1: Rule Validation (if present)
+                if has_rules:
+                    rule_text = operations.get("0", "").strip()
+                    if rule_text:
+                        if tau_force_test:
+                            logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")
+                        else:
+                            logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
+                            tau_output_rules = tau_manager.communicate_with_tau(
+                                rule_text=rule_text,
+                                target_output_stream_index=0,
+                                apply_rules_update=False,
+                            )
+                            if "Error" in tau_output_rules:
+                                return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
+                            logger.info("Tau rule validation successful.")
+
+                # Step 2: Custom Input Validation (if present)
+                if custom_tau_inputs:
+                     if tau_force_test:
+                        logger.info("TAU_FORCE_TEST=1: skipping Tau custom input validation.")
+                     else:
+                        logger.info("Validating custom inputs with Tau: %s", custom_tau_inputs.keys())
+                        # Send custom inputs targeting o0 (general ack/output)
+                        tau_output_custom = tau_manager.communicate_with_tau(
+                            rule_text=None,
                             target_output_stream_index=0,
+                            input_stream_values=custom_tau_inputs,
                             apply_rules_update=False,
                         )
-                        if "Error" in tau_output_rules:
-                            return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
-                        logger.info("Tau rule validation successful.")
+                        if "Error" in tau_output_custom:
+                            return f"FAILURE: Transaction rejected by Tau (custom input validation). Output: {tau_output_custom}"
+                        logger.info("Tau custom input validation successful.")
 
-            # Step 2: Custom Input Validation (if present)
-            if custom_tau_inputs:
-                 if tau_force_test:
-                    logger.info("TAU_FORCE_TEST=1: skipping Tau custom input validation.")
-                 else:
-                    logger.info("Validating custom inputs with Tau: %s", custom_tau_inputs.keys())
-                    # Send custom inputs targeting o0 (general ack/output)
-                    tau_output_custom = tau_manager.communicate_with_tau(
-                        rule_text=None,
-                        target_output_stream_index=0,
-                        input_stream_values=custom_tau_inputs,
-                        apply_rules_update=False,
-                    )
-                    if "Error" in tau_output_custom:
-                        return f"FAILURE: Transaction rejected by Tau (custom input validation). Output: {tau_output_custom}"
-                    logger.info("Tau custom input validation successful.")
-            
-            # Step 3: Transfer Validation
-            if has_transfers and all_validated_transfers:
-                if tau_force_test:
-                    logger.info(
-                        "TAU_FORCE_TEST=1: skipping Tau transfer validation for %s transfers.",
-                        len(all_validated_transfers),
-                    )
-                else:
-                    logger.info("Validating %s transfers with Tau...", len(all_validated_transfers))
-                    for i, (tau_input_dict, transfer_details) in enumerate(
-                        zip(transfer_tau_inputs, all_validated_transfers)
-                    ):
-                        logger.debug("Validating transfer #%s: %s", i + 1, transfer_details)
-
-                        # Tau program expects inputs on separate streams for the single-pass validation
-                        # i1: amount, i2: balance, i3: from_id, i4: to_id
-                        
-                        tau_input_stream_values = {}
-                        tau_input_stream_values[1] = str(tau_input_dict['amount'])
-                        tau_input_stream_values[2] = str(tau_input_dict['balance'])
-                        tau_input_stream_values[3] = str(tau_input_dict['from_id'])
-                        tau_input_stream_values[4] = str(tau_input_dict['to_id'])
-
+                # Step 3: Transfer Validation
+                if has_transfers and all_validated_transfers:
+                    if tau_force_test:
                         logger.info(
-                            "Sending Tau inputs for transfer #%s validation: %s",
-                            i + 1,
-                            tau_input_stream_values,
+                            "TAU_FORCE_TEST=1: skipping Tau transfer validation for %s transfers.",
+                            len(all_validated_transfers),
                         )
-                        tau_outputs = tau_manager.communicate_with_tau_multi(
-                            input_stream_values=tau_input_stream_values,
-                            apply_rules_update=False,
-                        )
+                    else:
+                        logger.info("Validating %s transfers with Tau...", len(all_validated_transfers))
+                        for i, (tau_input_dict, transfer_details) in enumerate(
+                            zip(transfer_tau_inputs, all_validated_transfers)
+                        ):
+                            logger.debug("Validating transfer #%s: %s", i + 1, transfer_details)
 
-                        # --- Built-in Transfer Validation (o1) ---
-                        o1_raw = tau_outputs.get(1)
-                        expected_amount = transfer_details[2]
-                        if not _decode_single_transfer_output(o1_raw or "0", expected_amount):
-                            return (
-                                f"FAILURE: Transaction rejected by Tau logic for transfer #{i+1} "
-                                f"({transfer_details}). Tau output: {o1_raw}"
+                            # Tau program expects inputs on separate streams for the single-pass validation
+                            # i1: amount, i2: balance, i3: from_id, i4: to_id
+
+                            tau_input_stream_values = {}
+                            tau_input_stream_values[1] = str(tau_input_dict['amount'])
+                            tau_input_stream_values[2] = str(tau_input_dict['balance'])
+                            tau_input_stream_values[3] = str(tau_input_dict['from_id'])
+                            tau_input_stream_values[4] = str(tau_input_dict['to_id'])
+
+                            logger.info(
+                                "Sending Tau inputs for transfer #%s validation: %s",
+                                i + 1,
+                                tau_input_stream_values,
+                            )
+                            tau_outputs = tau_manager.communicate_with_tau_multi(
+                                input_stream_values=tau_input_stream_values,
+                                apply_rules_update=False,
                             )
 
-                        # --- User Policy Check (o5) ---
-                        o5_raw = tau_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
-                        if o5_raw is not None:
-                            from tau_manager import parse_tau_output as _parse
-                            policy_val = _parse(o5_raw)
-                            if policy_val == tau_defs.USER_POLICY_BLOCK_VALUE:
+                            # --- Built-in Transfer Validation (o1) ---
+                            o1_raw = tau_outputs.get(1)
+                            expected_amount = transfer_details[2]
+                            if not _decode_single_transfer_output(o1_raw or "0", expected_amount):
                                 return (
-                                    f"FAILURE: Transaction rejected by user policy (o5) for transfer #{i+1} "
-                                    f"({transfer_details}). Policy output: {o5_raw}"
+                                    f"FAILURE: Transaction rejected by Tau logic for transfer #{i+1} "
+                                    f"({transfer_details}). Tau output: {o1_raw}"
                                 )
-                    logger.info("All Tau transfer validations successful.")
 
-        finally:
-            # Cleanup: Restore prior Tau state so sendtx does not mutate global state.
-            if has_rules:
-                try:
-                    prior_spec = chain_state.get_rules_state()
-                    if prior_spec:
-                        logger.info("Restoring prior Tau state after validation...")
-                        tau_manager.reset_tau_state(
-                            prior_spec,
-                            source="sendtx-restore",
-                            apply_rules_update=False,
-                        )
-                    else:
-                        logger.warning(
-                            "No prior Tau spec available for restore; skipping sendtx-restore."
-                        )
-                except Exception:
-                    logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
+                            # --- User Policy Check (o5) ---
+                            o5_raw = tau_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
+                            if o5_raw is not None:
+                                from tau_manager import parse_tau_output as _parse
+                                policy_val = _parse(o5_raw)
+                                if policy_val == tau_defs.USER_POLICY_BLOCK_VALUE:
+                                    return (
+                                        f"FAILURE: Transaction rejected by user policy (o5) for transfer #{i+1} "
+                                        f"({transfer_details}). Policy output: {o5_raw}"
+                                    )
+                        logger.info("All Tau transfer validations successful.")
+
+            finally:
+                # Cleanup: Restore prior Tau state so sendtx does not mutate global state.
+                if has_rules:
+                    try:
+                        prior_spec = chain_state.get_rules_state()
+                        if prior_spec:
+                            logger.info("Restoring prior Tau state after validation...")
+                            tau_manager.reset_tau_state(
+                                prior_spec,
+                                source="sendtx-restore",
+                                apply_rules_update=False,
+                            )
+                        else:
+                            logger.warning(
+                                "No prior Tau spec available for restore; skipping sendtx-restore."
+                            )
+                    except Exception:
+                        logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
+
+        elif tx_type == "consensus_proposal":
+            # Early validation before mempool insertion
+            validators = getattr(config, "MINER_PUBKEYS", [])
+            if not validators and config.MINER_PUBKEY:
+                validators = [config.MINER_PUBKEY]
+                
+            if sender_pubkey not in validators:
+                return f"FAILURE: Proposer {sender_pubkey[:10]} is not an active validator."
+                
+            bundle = payload["bundle"]
+            for field in ('consensus_id', 'proof_scheme', 'fork_choice_scheme', 'input_contract_version', 'tau_source'):
+                if field not in bundle:
+                    return f"FAILURE: Bundle missing required field: {field}"
+            if bundle['proof_scheme'] != 'bls_header_sig':
+                return f"FAILURE: Unsupported proof_scheme: {bundle['proof_scheme']}"
+            if bundle['fork_choice_scheme'] != 'height_then_hash':
+                return f"FAILURE: Unsupported fork_choice_scheme: {bundle['fork_choice_scheme']}"
+                
+            latest_block = db.get_canonical_head_block()
+            curr_height = latest_block['header']['block_number'] if latest_block else 0
+            min_height = curr_height + len(validators)
+            if payload['activate_at_height'] < min_height:
+                return f"FAILURE: Activation height {payload['activate_at_height']} must be >= {min_height}."
+
+        elif tx_type == "consensus_vote":
+            validators = getattr(config, "MINER_PUBKEYS", [])
+            if not validators and config.MINER_PUBKEY:
+                validators = [config.MINER_PUBKEY]
+                
+            if sender_pubkey not in validators:
+                return f"FAILURE: Voter {sender_pubkey[:10]} is not an active validator."
         
         # --- Post-Tau Processing ---
         # Note: We do NOT increment sequence number or update balances here anymore.

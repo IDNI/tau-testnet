@@ -49,7 +49,7 @@ def test_commit_and_load_roundtrip(isolate_db):
     cs._sequence_numbers.clear()
     cs._balances['addr'] = 123
     cs._sequence_numbers['addr'] = 5
-    cs.save_rules_state('rules-xyz')
+    cs.save_application_rules_state('rules-xyz')
     # Commit state with block hash
     cs.commit_state_to_db('blockhash1', 1)
     # Clear in-memory
@@ -88,13 +88,13 @@ def test_initialize_persistent_state_with_block_and_mismatch(isolate_db):
     cs._sequence_numbers.clear()
     cs._balances['addrX'] = 50
     cs._sequence_numbers['addrX'] = 2
-    cs.save_rules_state('oldrules')
+    cs.save_application_rules_state('oldrules')
     cs.commit_state_to_db('wrong_hash', 1)
     # Insert a block with no transactions
     genesis = block_module.Block.create(
         block_number=0,
         previous_hash='0'*64,
-        transactions=[]
+        transactions=[], proposer_pubkey="a"*96
     )
     db.add_block(genesis)
     # Now initialize, should detect mismatch and rebuild
@@ -114,10 +114,10 @@ def test_load_rules_state_only(isolate_db):
     cs._balances['addr'] = 1
     cs._sequence_numbers['addr'] = 0
     # Save initial rules and commit to DB
-    cs.save_rules_state('rules-xyz')
+    cs.save_application_rules_state('rules-xyz')
     cs.commit_state_to_db('blockhash1', 1)
     # Change in-memory rules to a different value
-    cs.save_rules_state('rules-bad')
+    cs.save_application_rules_state('rules-bad')
     assert cs.get_rules_state() == 'rules-bad'
     # Load state from DB and verify rules are restored
     loaded = cs.load_state_from_db()

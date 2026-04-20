@@ -9,7 +9,7 @@ import config
 import db
 import chain_state
 from miner.service import SoleMiner
-from poa.mempool import load_transactions
+from consensus.mempool import load_transactions
 
 class TestMiningLoopIntegration(unittest.TestCase):
     def setUp(self):
@@ -22,7 +22,7 @@ class TestMiningLoopIntegration(unittest.TestCase):
         # Explicit state cleanup
         chain_state._balances.clear()
         chain_state._sequence_numbers.clear()
-        chain_state._current_rules_state = ""
+        chain_state._application_rules_state = ""
         chain_state._tau_engine_state_hash = ""
         
         # Ensure we have a valid miner key
@@ -46,6 +46,10 @@ class TestMiningLoopIntegration(unittest.TestCase):
         # createblock.py imports _BLS_AVAILABLE. We can patch it.
         createblock._BLS_AVAILABLE = True
 
+        from consensus.engine import TauConsensusEngine
+        self.original_query = TauConsensusEngine.query_eligibility
+        TauConsensusEngine.query_eligibility = lambda self, *args, **kwargs: True
+
     def tearDown(self):
         if hasattr(self, 'miner'):
             self.miner.stop()
@@ -58,6 +62,9 @@ class TestMiningLoopIntegration(unittest.TestCase):
         import tau_manager
         tau_manager.communicate_with_tau = self.original_communicate
         tau_manager.tau_ready.clear()
+        
+        from consensus.engine import TauConsensusEngine
+        TauConsensusEngine.query_eligibility = self.original_query
 
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
@@ -68,8 +75,6 @@ class TestMiningLoopIntegration(unittest.TestCase):
         """Verify that the background thread mines a block when threshold is met."""
         # Setup miner with low threshold for testing
         self.miner = SoleMiner(threshold=1, max_block_interval=10.0)
-        self.miner.start()
-        
         # Verify initial state
         self.assertIsNone(db.get_canonical_head_block())
         
@@ -103,6 +108,8 @@ class TestMiningLoopIntegration(unittest.TestCase):
         
         tx_blob = json.dumps(tx)
         db.add_mempool_tx(tx_blob, "msg_id_1", int(time.time()*1000))
+        
+        self.miner.start()
         
         # Wait for miner loop (loop sleeps 0.1s, plus processing)
         # Give it 2 seconds to be safe

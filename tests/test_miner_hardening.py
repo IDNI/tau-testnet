@@ -67,7 +67,7 @@ class TestMinerHardening(unittest.TestCase):
         # Reset Chain State
         chain_state._balances = {}
         chain_state._sequence_numbers = {}
-        chain_state._current_rules_state = ""
+        chain_state._application_rules_state = ""
         
         # Disable auto-faucet for strict balance testing
         self.original_faucet = config.TESTNET_AUTO_FAUCET

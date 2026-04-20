@@ -5,10 +5,10 @@ from typing import Dict, List, Optional
 import db
 import tau_manager
 import config
-from poa import PoATauEngine, TauStateSnapshot, compute_state_hash
+from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
 from block import Block
 import hashlib
-from poa.state import compute_state_hash as compute_rules_hash, compute_consensus_state_hash
+from consensus.state import compute_state_hash as compute_rules_hash, compute_consensus_state_hash, compute_consensus_meta_hash
 
 def compute_accounts_hash(balances: Dict[str, int], sequences: Dict[str, int]) -> bytes:
     """
@@ -73,7 +73,13 @@ _sequence_numbers = {}
 _rules_lock = threading.Lock()
 
 # In-memory rules state storage
-_current_rules_state = ""
+# In-memory rules state storage
+_application_rules_state = ""
+_consensus_rules_state = ""
+_active_consensus_id = "tau_poa_v1"
+from consensus.governance import ConsensusLifecycleManager
+_lifecycle_manager = ConsensusLifecycleManager()
+
 _canonical_head_hash = ""
 _tau_engine_state_hash = ""  # last known Tau engine snapshot hash (best-effort)
 
@@ -112,10 +118,9 @@ def rehydrate_dht_state() -> bool:
 def _republish_state_to_dht():
     """
     Publishes the currently loaded state (rules and accounts) to the local DHT value store.
-    This ensures that on node startup, the DHT is populated with the state loaded from DB,
-    allowing the node to advertise these keys during handshake.
     """
-    global _canonical_head_hash, _current_rules_state, _tau_engine_state_hash
+    global _canonical_head_hash, _application_rules_state, _consensus_rules_state, _tau_engine_state_hash
+    global _active_consensus_id
     
     if not _canonical_head_hash:
         return
@@ -126,24 +131,29 @@ def _republish_state_to_dht():
     publish_accounts_snapshot(_canonical_head_hash)
     
     # 2. Publish Tau State / Rules
-    # Always RECOMPUTE state_hash to ensure it matches the payload (rules + accounts_hash).
-    # This avoids publishing with a stale or rules-only hash which would fail validation.
-    
     with _balance_lock, _sequence_lock, _rules_lock:
          acc_hash = compute_accounts_hash(_balances, _sequence_numbers)
-         rules_bytes = (_current_rules_state or "").encode("utf-8")
+         app_rules_bytes = (_application_rules_state or "").encode("utf-8")
+         cons_rules_bytes = (_consensus_rules_state or "").encode("utf-8")
+         vote_records = [(k, pub) for k, v in _lifecycle_manager.votes.items() for pub in v]
+         meta_hash = compute_consensus_meta_hash(
+             host_contract={}, active_validators=list(_lifecycle_manager.active_validators),
+             pending_updates=list(_lifecycle_manager.pending_updates),
+             vote_records=vote_records, activation_schedule=_lifecycle_manager.scheduled_updates,
+             checkpoint_references=[]
+         )
     
-    state_hash = compute_consensus_state_hash(rules_bytes, acc_hash)
+    state_hash = compute_consensus_state_hash(cons_rules_bytes, app_rules_bytes, acc_hash, meta_hash)
     
-    # Update global reference if it differs (though strictly we just want to publish valid data here)
     if state_hash != _tau_engine_state_hash:
         logger.info("Updating stale _tau_engine_state_hash during hydration: %s -> %s", _tau_engine_state_hash, state_hash)
         _tau_engine_state_hash = state_hash
 
-    # Check if we have rules (even empty string is valid state now)
-    # Ensure we publish if state_hash is valid.
-    if state_hash and _current_rules_state is not None:
-        publish_tau_state_snapshot(state_hash, rules_bytes, acc_hash)
+    # We publish the combined rules to DHT for backwards compatibility of block explorers, 
+    # but actual verification uses split parts.
+    combined_rules = cons_rules_bytes + b"\n" + app_rules_bytes
+    if state_hash:
+        publish_tau_state_snapshot(state_hash, combined_rules, acc_hash)
 
 
 
@@ -395,14 +405,18 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
     
     
     print(f"[INFO][chain_state] Starting blockchain state reconstruction from block {start_block}...")
-    global _canonical_head_hash, _tau_engine_state_hash, _current_rules_state
+    global _canonical_head_hash, _tau_engine_state_hash, _application_rules_state, _consensus_rules_state
+    global _active_consensus_id
     
     if start_block == 0:
         # Clear current state for a full rebuild
         with _balance_lock, _sequence_lock, _rules_lock:
             _balances.clear()
             _sequence_numbers.clear()
-            _current_rules_state = ""
+            _application_rules_state = ""
+            _consensus_rules_state = ""
+            _active_consensus_id = "tau_poa_v1"
+            _lifecycle_manager = ConsensusLifecycleManager()
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
         print("[INFO][chain_state] Cleared existing in-memory state for full rebuild.")
@@ -438,19 +452,30 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             
             print(f"[INFO][chain_state] Processing block #{block_number} ({block_hash}) with {len(transactions)} transactions")
             
-            # Verify and process block using PoATauEngine
+            # Verify and process block using TauConsensusEngine
             block = Block.from_dict(block_data)
-            engine = PoATauEngine()
+            engine = TauConsensusEngine()
             
-            if not engine.verify_block(block):
+            if not engine.verify_block_header(block):
                 print(f"[WARN][chain_state] Block #{block_number} verification failed (signature/validator)")
                 # We continue for reconstruction but log it
             
             # Prepare snapshot from current rules state
-            current_rules_bytes = _current_rules_state.encode('utf-8')
+            app_rules = (_application_rules_state or "").encode('utf-8')
+            cons_rules = (_consensus_rules_state or "").encode('utf-8')
+            acc_hash = compute_accounts_hash(_balances, _sequence_numbers)
+            vote_records = [(k, pub) for k, v in _lifecycle_manager.votes.items() for pub in v]
+            meta_hash = compute_consensus_meta_hash(
+                host_contract={}, active_validators=list(_lifecycle_manager.active_validators),
+                pending_updates=list(_lifecycle_manager.pending_updates),
+                vote_records=vote_records, activation_schedule=_lifecycle_manager.scheduled_updates,
+                checkpoint_references=[]
+            )
+            state_hash = compute_consensus_state_hash(cons_rules, app_rules, acc_hash, meta_hash)
+            
             snapshot = TauStateSnapshot(
-                state_hash=compute_state_hash(current_rules_bytes),
-                tau_bytes=current_rules_bytes,
+                state_hash=state_hash,
+                tau_bytes=app_rules,
                 metadata={"source": "chain_state"}
             )
             
@@ -460,8 +485,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             # Update rules state from result
             # The engine accumulates bytes in snapshot.tau_bytes
             new_rules = result.snapshot.tau_bytes.decode('utf-8')
-            if new_rules != _current_rules_state:
-                save_rules_state(new_rules)
+            if new_rules != _application_rules_state:
+                save_application_rules_state(new_rules)
             
             total_transactions_processed += len(result.accepted_transactions)
             
@@ -575,55 +600,6 @@ def increment_sequence_number(address_hex: str):
     with _sequence_lock:
         _sequence_numbers[address_hex] = _sequence_numbers.get(address_hex, 0) + 1
 
-def save_rules_state(rules_content: str):
-    """
-    Saves the rules state from Tau's o000 output stream.
-    This represents the current rules state that should be persisted for chain state reconstruction.
-    """
-    global _current_rules_state, _tau_engine_state_hash
-    logger.debug("save_rules_state called with rules_content: %s", rules_content)
-    with _rules_lock:
-        # Do not strip()! We must preserve exact bytes for hash consistency.
-        candidate = rules_content or ""
-        if not candidate:
-            logger.warning("Saving empty Tau rules state.")
-            # return
-        _current_rules_state = candidate
-
-        # Detailed debug of saved Tau state (size, hash, snippet) to trace drift.
-        if logger.isEnabledFor(logging.DEBUG):
-            try:
-                preview = _current_rules_state[:200]
-                logger.debug(
-                    "Saved Tau state snapshot len=%s hash=%s preview=%r",
-                    len(_current_rules_state),
-                    hashlib.sha256(_current_rules_state.encode("utf-8")).hexdigest(),
-                    preview,
-                )
-            except Exception:
-                logger.debug("Saved Tau state snapshot (debug logging failed)")
-        
-        # NOTE: We do NOT set _tau_engine_state_hash to the rules-only hash here.
-        # We wait until we compute the consensus hash (rules + accounts_hash) below.
-        
-        print(f"[INFO][chain_state] Rules state updated. Length: {len(_current_rules_state)} characters")
-        logger.debug(
-            "Rules state saved (len=%s).",
-            len(_current_rules_state)
-        )
-
-        # NOTE:
-        # Do NOT publish tau_state:<consensus_hash> from here.
-        # At this point we might be mid-block (accounts not final yet), so embedding accounts_hash here
-        # can create inconsistencies between `tau_state:<state_hash>` and `state:<block_hash>` snapshots.
-        # The authoritative publishing of (rules + accounts_hash) MUST happen at block-finalization time.
-        if _dht_client:
-            try:
-                # Keep a best-effort local marker only (optional)
-                _tau_engine_state_hash = ""
-            except Exception:
-                pass
-        
 
 def fetch_formula_from_dht(formula_hash: str) -> Optional[str]:
     """
@@ -672,10 +648,31 @@ def fetch_formula_from_dht(formula_hash: str) -> Optional[str]:
         
 
 def get_rules_state() -> str:
-    """Returns the current rules state."""
+    """Returns the composed effective rules state."""
     with _rules_lock:
-        return _current_rules_state
+        app = _application_rules_state or ""
+        cons = _consensus_rules_state or ""
+        if cons and app:
+            return cons + "\n" + app
+        return cons + app
 
+def get_application_rules_state() -> str:
+    with _rules_lock:
+        return _application_rules_state
+
+def get_consensus_rules_state() -> str:
+    with _rules_lock:
+        return _consensus_rules_state
+
+def save_application_rules_state(rules_content: str):
+    global _application_rules_state
+    with _rules_lock:
+        _application_rules_state = rules_content or ""
+        
+def save_consensus_rules_state(rules_content: str):
+    global _consensus_rules_state
+    with _rules_lock:
+        _consensus_rules_state = rules_content or ""
 
 def load_state_from_db() -> bool:
     """
@@ -684,9 +681,13 @@ def load_state_from_db() -> bool:
     """
     import db
     
-    balances, sequences, current_rules, last_processed_block_hash = db.load_chain_state()
+    balances, sequences, app_rules, cons_rules, cons_id, last_processed_block_hash, pending_updates, votes, scheduled, archival = db.load_chain_state()
     
-    if not balances:
+    votes_map = {}
+    for v in votes:
+        votes_map.setdefault(v['update_id'], []).append(v['voter_pubkey'])
+    
+    if not balances and not last_processed_block_hash:
         return False
         
     with _balance_lock, _sequence_lock, _rules_lock:
@@ -695,12 +696,20 @@ def load_state_from_db() -> bool:
         _balances.update(balances)
         _sequence_numbers.update(sequences)
         
-        global _current_rules_state
-        _current_rules_state = current_rules
+        global _application_rules_state, _consensus_rules_state, _active_consensus_id
+        
+        _application_rules_state = app_rules
+        _consensus_rules_state = cons_rules
+        _active_consensus_id = cons_id
+        _lifecycle_manager = ConsensusLifecycleManager(
+            pending_updates=[p['update_id'] for p in pending_updates],
+            scheduled_updates=scheduled,
+            archival_updates=archival,
+            votes=votes_map
+        )
+        for p in pending_updates:
+            _lifecycle_manager.update_payloads[p['update_id']] = p
 
-        # We loaded rules state from persistence, but Tau engine has not necessarily
-        # been updated yet (it restarts fresh). Treat engine state as unknown until
-        # we explicitly apply a snapshot to Tau.
         global _tau_engine_state_hash
         _tau_engine_state_hash = ""
         
@@ -711,16 +720,61 @@ def load_state_from_db() -> bool:
 
 def commit_state_to_db(block_hash: str, block_number: int):
     """
-    Commits the in-memory state (balances, sequence numbers, rules) to the database atomically,
+    Commits the in-memory state (balances, sequence numbers, rules, proposals, votes) to the database atomically,
     associating it with the provided block_hash.
     """
     # Snapshot state under locks
     with _balance_lock, _sequence_lock, _rules_lock:
         balances_snapshot = _balances.copy()
         sequences_snapshot = _sequence_numbers.copy()
-        rules_snapshot = _current_rules_state
+        app_rules_snapshot = _application_rules_state
+        cons_rules_snapshot = _consensus_rules_state
+        cons_id_snapshot = _active_consensus_id
+        pending_updates_list = [{"update_id": k, "rule_revisions": v.rule_revisions, "activate_at_height": v.activate_at_height, "host_contract_patch": v.host_contract_patch} for k, v in _lifecycle_manager.update_payloads.items() if k in _lifecycle_manager.pending_updates]
+        votes_list = [{"update_id": k, "voter_pubkey": pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
+        scheduled_list = _lifecycle_manager.scheduled_updates[:]
+        archival_list = list(_lifecycle_manager.archival_updates)
         
-    db.save_canonical_state_atomically(block_hash, block_number, balances_snapshot, sequences_snapshot, rules_snapshot)
+    db.save_canonical_state_atomically(
+        block_hash, block_number, 
+        balances_snapshot, sequences_snapshot, 
+        app_rules_snapshot, cons_rules_snapshot, cons_id_snapshot,
+        pending_updates_list, votes_list, scheduled_list, archival_list
+    )
+
+def tick_governance(height: int):
+    """
+    Called when a block is accepted at the given height. Let the ConsensusLifecycleManager
+    execute precise transitions, and if any updates activate, apply them here.
+    """
+    global _active_consensus_id, _consensus_rules_state
+    with _rules_lock:
+        import config
+        validators = getattr(config, "MINER_PUBKEYS", [])
+        if not validators and config.MINER_PUBKEY:
+            validators = [config.MINER_PUBKEY]
+            
+        # Ensure the lifecycle manager uses the active validators to set its threshold
+        _lifecycle_manager.active_validators = set(validators)
+        n_validators = len(validators)
+        _lifecycle_manager.approval_threshold = (2 * n_validators + 2) // 3 # Mock Phase 2 configurable threshold
+        
+        # Drive lifecycle transitions
+        newly_active = _lifecycle_manager.process_height_transitions(height)
+        
+        # If any activated, the last one deterministically takes effect as active state
+        # In a real V1 chain there's rarely >1 scheduled for the exact same block,
+        # but if there is, we apply the last one sequentially.
+        if newly_active:
+            for update in newly_active:
+                logger.info("Governance activated consensus update: %s", update.update_id_hex)
+                # Combine revisions if multiple 
+                combined_revisions = "\n".join(update.rule_revisions)
+                _consensus_rules_state = combined_revisions
+                
+                # In Phase 2, `_active_consensus_id` isn't used much as an ID, but we keep it tracking the hash.
+                _active_consensus_id = update.update_id_hex[:16] 
+
 
 def initialize_persistent_state():
     """
@@ -816,8 +870,8 @@ def select_best_head(candidates: list[tuple[str, int]]) -> str | None:
 
 def ingest_block(block: Block) -> IngestResult:
     import db, config
-    engine = PoATauEngine()
-    if not engine.verify_block(block):
+    engine = TauConsensusEngine()
+    if not engine.verify_block_header(block):
         return IngestResult('invalid', "Block verification failed")
     
     existing = db.get_block_by_hash(block.block_hash)
@@ -916,14 +970,26 @@ def reorg_to(new_head_hash: str):
     with _balance_lock, _sequence_lock, _rules_lock:
         b = dict(_balances)
         s = dict(_sequence_numbers)
-        r = _current_rules_state
+        app_r = _application_rules_state
+        cons_r = _consensus_rules_state
+        cons_id = _active_consensus_id
+        pending_updates_list = [{"update_id": k, "rule_revisions": v.rule_revisions, "activate_at_height": v.activate_at_height, "host_contract_patch": v.host_contract_patch} for k, v in _lifecycle_manager.update_payloads.items() if k in _lifecycle_manager.pending_updates]
+        votes_list = [{"update_id": k, "voter_pubkey": pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
+        scheduled_list = _lifecycle_manager.scheduled_updates[:]
+        archival_list = list(_lifecycle_manager.archival_updates)
         head_num = db.get_block_by_hash(new_head_hash)['header']['block_number']
         db.save_canonical_state_atomically(
-            head_hash=new_head_hash,
-            head_num=head_num,
-            balances=b,
-            sequences=s,
-            rules=r
+            new_head_hash,
+            head_num,
+            b,
+            s,
+            app_r,
+            cons_r,
+            cons_id,
+            pending_updates_list,
+            votes_list,
+            scheduled_list,
+            archival_list
         )
     
     # Phase 5: Mempool Restore

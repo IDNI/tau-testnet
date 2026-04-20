@@ -8,7 +8,7 @@ if project_root not in sys.path:
 
 import config
 from commands import sendtx, createblock
-from poa.engine import PoATauEngine
+from consensus.engine import TauConsensusEngine
 import chain_state, db, block, tau_defs
 
 class TestConsensusTime(unittest.TestCase):
@@ -31,7 +31,7 @@ class TestConsensusTime(unittest.TestCase):
         patch('commands.createblock._BLS_AVAILABLE', True).start()
         patch('commands.createblock._validate_signature', return_value=True).start()
         patch('block.bls_signing_available', return_value=True).start()
-        patch('block.Block.verify_signature', return_value=True).start()
+        patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True).start()
 
     def tearDown(self):
         patch.stopall()
@@ -73,7 +73,7 @@ class TestConsensusTime(unittest.TestCase):
             "expiration_time": int(time.time()) + 1000,
             "operations": {
                 "1": [[chain_state.GENESIS_ADDRESS, "some_addr", "1"]],
-                "7": "custom_data"
+                "20": "custom_data"
             },
             "fee_limit": "0",
             "signature": "SIG"
@@ -93,8 +93,8 @@ class TestConsensusTime(unittest.TestCase):
         input_args = call_kwargs.get("input_stream_values", {})
         
         # Verify custom payload (stream 7) was injected
-        self.assertIn(7, input_args)
-        self.assertEqual(input_args[7], ["custom_data"])
+        self.assertIn(20, input_args)
+        self.assertEqual(input_args[20], ["custom_data"])
         
         # Verify unified injection of block timestamp (stream 5)
         self.assertIn(5, input_args)
@@ -103,11 +103,11 @@ class TestConsensusTime(unittest.TestCase):
     @patch('tau_manager.communicate_with_tau')
     @patch('tau_manager.tau_ready')
     def test_poa_engine_injects_timestamp(self, mock_ready, mock_tau):
-        """Test that poa.engine.apply dynamically injects the block.header.timestamp exactly like mining."""
+        """Test that consensus.engine.apply dynamically injects the block.header.timestamp exactly like mining."""
         mock_ready.is_set.return_value = True
         mock_tau.return_value = "1"
         
-        engine = PoATauEngine()
+        engine = TauConsensusEngine()
         timestamp = 1700000000
         
         tx = {
@@ -115,7 +115,7 @@ class TestConsensusTime(unittest.TestCase):
             "sequence_number": chain_state.get_sequence_number(chain_state.GENESIS_ADDRESS),
             "operations": {
                 "1": [[chain_state.GENESIS_ADDRESS, "some_addr", "1"]],
-                "7": "custom_data"
+                "20": "custom_data"
             },
             "signature": "SIG"
         }
@@ -137,8 +137,8 @@ class TestConsensusTime(unittest.TestCase):
         call_kwargs = mock_tau.call_args.kwargs
         input_args = call_kwargs.get("input_stream_values", {})
         
-        self.assertIn(7, input_args)
-        self.assertEqual(input_args[7], ["custom_data"])
+        self.assertIn(20, input_args)
+        self.assertEqual(input_args[20], ["custom_data"])
         
         # Replay must exactly use the passed-in block timestamp
         self.assertIn(5, input_args)

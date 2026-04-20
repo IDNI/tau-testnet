@@ -11,7 +11,7 @@ import db
 import block
 import chain_state
 import config
-from poa.state import compute_state_hash
+from consensus.state import compute_state_hash
 
 
 import tau_manager
@@ -76,7 +76,7 @@ def execute_batch(transactions: List[Dict], tx_ids: List[int], block_timestamp: 
     with chain_state.get_all_state_locks():
         temp_balances = chain_state._balances.copy()
         temp_sequences = chain_state._sequence_numbers.copy()
-        temp_rules = chain_state._current_rules_state
+        temp_rules = chain_state._application_rules_state
         
     final_txs = []
     final_reserved_ids = []
@@ -373,19 +373,16 @@ def create_block_from_mempool() -> Dict:
         block_number = 0
         previous_hash = "0" * 64
 
-    validators = getattr(config, "MINER_PUBKEYS", [])
-    if not validators and config.MINER_PUBKEY:
-        validators = [config.MINER_PUBKEY]
+    from consensus.engine import TauConsensusEngine
+    engine = TauConsensusEngine()
     
-    if validators:
-        expected_miner = validators[block_number % len(validators)]
-        if config.MINER_PUBKEY and expected_miner != config.MINER_PUBKEY:
-            msg = f"Not our turn to mine block #{block_number}. Expected: {expected_miner[:10]}..."
-            print(f"[INFO][createblock] {msg}")
-            return {"message": msg}
+    current_time = int(time.time())
+    if not engine.query_eligibility(config.MINER_PUBKEY, block_number, current_time, previous_hash):
+        msg = f"Not our turn to mine block #{block_number} according to Tau consensus."
+        print(f"[INFO][createblock] {msg}")
+        return {"message": msg}
 
     from chain_state import _chain_lock
-    import time
     with _chain_lock:
         # Get batch of reserved transactions from mempool
         reserved_txs = db.reserve_mempool_txs(limit=1000)
@@ -474,20 +471,39 @@ def create_block_from_mempool() -> Dict:
     # Use FINAL RULES from execution, not global state
     rules_blob = final_rules.encode("utf-8")
     
-    # Consensus State Commitment (Rules + Accounts)
+    # Consensus State Commitment (Rules + Accounts + Governance)
     accounts_hash = chain_state.compute_accounts_hash(final_balances, final_sequences)
-    state_hash = chain_state.compute_consensus_state_hash(rules_blob, accounts_hash)
+    meta_hash = chain_state.compute_consensus_meta_hash(
+        host_contract={}, active_validators=list(chain_state._lifecycle_manager.active_validators),
+        pending_updates=list(chain_state._lifecycle_manager.pending_updates),
+        vote_records=[(k, pub) for k, v in chain_state._lifecycle_manager.votes.items() for pub in v],
+        activation_schedule=chain_state._lifecycle_manager.scheduled_updates,
+        checkpoint_references=[]
+    )
+    cons_rules_bytes = (chain_state._consensus_rules_state or "").encode("utf-8")
+    
+    state_hash = chain_state.compute_consensus_state_hash(cons_rules_bytes, rules_blob, accounts_hash, meta_hash)
     
     state_locator = f"{config.STATE_LOCATOR_NAMESPACE}:{state_hash}"
     new_block = block.Block.create(
         block_number=block_number,
         previous_hash=previous_hash,
         transactions=transactions,
+        proposer_pubkey=config.MINER_PUBKEY,
         state_hash=state_hash,
         state_locator=state_locator,
-        signing_key_hex=config.MINER_PRIVKEY,
         timestamp=block_timestamp
     )
+    
+    # Generate Consensus Proof (PoA)
+    try:
+        from py_ecc.bls import G2Basic
+        msg_hash = import_hashlib().sha256(new_block.header.canonical_bytes()).digest()
+        sig_bytes = G2Basic.Sign(int(config.MINER_PRIVKEY, 16), msg_hash)
+        new_block.consensus_proof = sig_bytes.hex()
+    except Exception as e:
+        print(f"[ERROR][createblock] Failed to generate consensus proof: {e}")
+        return {"error": "Consensus PoA proof generation failed."}
     
     print(f"[INFO][createblock] Block created successfully!")
     print(f"[INFO][createblock] Block Details:")
@@ -529,10 +545,10 @@ def create_block_from_mempool() -> Dict:
                 block_data_json,
             )
         )
-        # Commit in-memory state to database
+        # Commit in-memory application rules to database
         conn.execute(
             'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-            ('current_rules', final_rules)
+            ('application_rules', final_rules)
         )
         conn.execute(
             'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
@@ -561,7 +577,7 @@ def create_block_from_mempool() -> Dict:
             chain_state._sequence_numbers.clear()
             chain_state._sequence_numbers.update(final_sequences)
             
-            chain_state._current_rules_state = final_rules
+            chain_state._application_rules_state = final_rules
             chain_state._tau_engine_state_hash = state_hash
             chain_state._canonical_head_hash = new_block.block_hash
     except Exception as e:

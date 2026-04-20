@@ -77,6 +77,7 @@ class BlockHeader:
     previous_hash: str
     timestamp: int
     merkle_root: str
+    proposer_pubkey: str
     state_hash: str = EMPTY_STATE_HASH
     state_locator: str = ""
 
@@ -86,6 +87,7 @@ class BlockHeader:
             + _hex_bytes(self.previous_hash, "previous_hash")
             + self.timestamp.to_bytes(8, byteorder="big", signed=False)
             + _hex_bytes(self.merkle_root, "merkle_root")
+            + (_hex_bytes(self.proposer_pubkey, "proposer_pubkey") if self.proposer_pubkey else b"")
             + _hex_bytes(self.state_hash, "state_hash")
         )
 
@@ -95,6 +97,7 @@ class BlockHeader:
             "previous_hash": self.previous_hash,
             "timestamp": self.timestamp,
             "merkle_root": self.merkle_root,
+            "proposer_pubkey": self.proposer_pubkey,
             "state_hash": self.state_hash,
             "state_locator": self.state_locator,
         }
@@ -105,7 +108,7 @@ class Block:
     header: BlockHeader
     transactions: List[Dict]
     block_hash: str
-    block_signature: Optional[str] = None
+    consensus_proof: Optional[str] = None
     tx_ids: List[str] = field(default_factory=list)
 
     @classmethod
@@ -114,10 +117,11 @@ class Block:
         block_number: int,
         previous_hash: str,
         transactions: List[Dict],
+        proposer_pubkey: str,
         *,
         state_hash: Optional[str] = None,
         state_locator: Optional[str] = None,
-        signing_key_hex: Optional[str] = None,
+        consensus_proof: Optional[str] = None,
         timestamp: Optional[int] = None,
     ) -> "Block":
         timestamp = timestamp or int(time.time())
@@ -128,26 +132,18 @@ class Block:
             previous_hash=previous_hash,
             timestamp=timestamp,
             merkle_root=merkle_root,
+            proposer_pubkey=proposer_pubkey,
             state_hash=(state_hash or EMPTY_STATE_HASH),
             state_locator=state_locator or "",
         )
         header_bytes = header.canonical_bytes()
         block_hash = sha256_hex(header_bytes)
-        signature_hex: Optional[str] = None
-        if signing_key_hex:
-            if not _BLS_AVAILABLE:
-                logger.warning("py_ecc.bls unavailable; emitting unsigned block.")
-            else:
-                sk_int = int.from_bytes(bytes.fromhex(signing_key_hex), byteorder="big", signed=False)
-                signature_hex = G2Basic.Sign(sk_int, header_bytes).hex()
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug("Block #%s signed with scheme=%s", block_number, config.BLOCK_SIGNATURE_SCHEME)
 
         return cls(
             header=header,
             transactions=transactions,
             block_hash=block_hash,
-            block_signature=signature_hex,
+            consensus_proof=consensus_proof,
             tx_ids=tx_hashes,
         )
 
@@ -159,6 +155,7 @@ class Block:
             previous_hash=str(header_payload.get("previous_hash") or "0" * 64),
             timestamp=int(header_payload.get("timestamp") or 0),
             merkle_root=str(header_payload.get("merkle_root") or "0" * 64),
+            proposer_pubkey=str(header_payload.get("proposer_pubkey") or ""),
             state_hash=str(header_payload.get("state_hash") or EMPTY_STATE_HASH),
             state_locator=str(header_payload.get("state_locator") or ""),
         )
@@ -173,20 +170,11 @@ class Block:
             header=header,
             transactions=transactions,
             block_hash=block_hash or sha256_hex(header.canonical_bytes()),
-            block_signature=payload.get("block_signature"),
+            consensus_proof=payload.get("consensus_proof"),
             tx_ids=tx_ids,
         )
-        expected_hashes = {sha256_hex(header.canonical_bytes())}
-        if not header_payload.get("state_hash"):
-            legacy_bytes = (
-                header.block_number.to_bytes(8, byteorder="big", signed=False)
-                + _hex_bytes(header.previous_hash, "previous_hash")
-                + header.timestamp.to_bytes(8, byteorder="big", signed=False)
-                + _hex_bytes(header.merkle_root, "merkle_root")
-            )
-            expected_hashes.add(sha256_hex(legacy_bytes))
         canonical_hash = sha256_hex(header.canonical_bytes())
-        if block.block_hash and block.block_hash not in expected_hashes:
+        if block.block_hash and block.block_hash != canonical_hash:
             raise ValueError("Block hash mismatch for block_number %s" % header.block_number)
         if not block.block_hash:
             block.block_hash = canonical_hash
@@ -197,25 +185,9 @@ class Block:
             "header": self.header.to_dict(),
             "transactions": self.transactions,
             "block_hash": self.block_hash,
-            "block_signature": self.block_signature,
+            "consensus_proof": self.consensus_proof,
             "tx_ids": self.tx_ids,
         }
-
-    def verify_signature(self, miner_pubkey: Optional[str] = None) -> bool:
-        if not self.block_signature or not _BLS_AVAILABLE:
-            return False
-        pubkey_hex = miner_pubkey or getattr(config, "MINER_PUBKEY", None)
-        if not pubkey_hex:
-            return False
-        try:
-            pubkey = bytes.fromhex(pubkey_hex)
-            signature = bytes.fromhex(self.block_signature)
-        except ValueError:
-            return False
-        try:
-            return bool(G2Basic.Verify(pubkey, self.header.canonical_bytes(), signature))
-        except Exception:  # pragma: no cover - defensive
-            return False
 
 
 def bls_signing_available() -> bool:

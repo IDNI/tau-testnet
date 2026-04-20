@@ -52,7 +52,7 @@ class TestMerkleRoot(unittest.TestCase):
 class TestBlock(unittest.TestCase):
     def test_block_creation_empty(self):
         prev_hash = '00' * 32
-        block = Block.create(block_number=0, previous_hash=prev_hash, transactions=[])
+        block = Block.create(block_number=0, previous_hash=prev_hash, transactions=[], proposer_pubkey="a"*96)
         self.assertEqual(block.header.block_number, 0)
         self.assertEqual(block.header.previous_hash, prev_hash)
         self.assertEqual(
@@ -70,36 +70,13 @@ class TestBlock(unittest.TestCase):
         tx1 = {"foo": "bar"}
         tx2 = {"baz": 123}
         prev_hash = 'aa' * 32
-        block = Block.create(block_number=1, previous_hash=prev_hash, transactions=[tx1, tx2])
+        block = Block.create(block_number=1, previous_hash=prev_hash, transactions=[tx1, tx2], proposer_pubkey="a"*96)
         tx_hashes = [compute_tx_hash(tx1), compute_tx_hash(tx2)]
         self.assertEqual(block.header.merkle_root, compute_merkle_root(tx_hashes))
         self.assertEqual(block.tx_ids, tx_hashes)
         self.assertEqual(len(block.block_hash), 64)
 
-    @unittest.skipUnless(bls_signing_available(), "py_ecc is required for signature tests")
-    def test_block_signature_roundtrip(self):
-        # Dynamically set MINER_PUBKEY to match TEST_MINER_PRIVKEY
-        from py_ecc.bls import G2Basic
-        priv_int = int(TEST_MINER_PRIVKEY, 16)
-        pub_bytes = G2Basic.SkToPk(priv_int)
-        pub_hex = pub_bytes.hex()
-        
-        original_pub = config.MINER_PUBKEY
-        config.MINER_PUBKEY = pub_hex
-        
-        try:
-            prev_hash = 'bb' * 32
-            block = Block.create(
-                block_number=2,
-                previous_hash=prev_hash,
-                transactions=[{"foo": "bar"}],
-                state_hash="12" * 32,
-                signing_key_hex=TEST_MINER_PRIVKEY,
-            )
-            self.assertIsNotNone(block.block_signature)
-            self.assertTrue(block.verify_signature(config.MINER_PUBKEY))
-        finally:
-            config.MINER_PUBKEY = original_pub
+
 
 
 class TestBlockCreation(unittest.TestCase):

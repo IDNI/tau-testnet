@@ -62,4 +62,19 @@ TAU_INPUT_STREAM_TIMESTAMP = "i5"
 # 0..4 are core protocol streams; 5 is consensus timestamp injected by node (i5).
 # Note: i5 is a reserved INPUT stream (consensus clock). o5 is the user policy
 # OUTPUT stream — these are separate namespaces and do not conflict.
-RESERVED_STREAMS = {0, 1, 2, 3, 4, 5}
+RESERVED_STREAMS = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+
+# --- Tau Consensus ABI v1 ---
+# Blocks and consensus metadata injected for policy evaluation.
+
+# Inputs
+TAU_INPUT_STREAM_HEIGHT = "i6"          # Block height (uint64 string)
+TAU_INPUT_STREAM_CONSENSUS_TS = "i7"    # Block timestamp (uint64 string)
+TAU_INPUT_STREAM_PROPOSER = "i8"        # Proposer identity (proposer_yid, lowercase hex string)
+TAU_INPUT_STREAM_PARENT_HASH = "i9"     # Previous block hash (parent_hash_yid, lowercase hex string)
+TAU_INPUT_STREAM_PROOF_OK = "i10"       # Proof validation result from host (1 for valid, 0 for invalid)
+TAU_INPUT_STREAM_CLAIMS = "i11"         # Endorsed claims summary (claims_yid, lowercase hex string)
+
+# Outputs
+TAU_OUTPUT_STREAM_BLOCK_VALID = "o6"    # Block validity verdict (1 for accept, 0 for reject)
+TAU_OUTPUT_STREAM_ELIGIBLE = "o7"       # Proposer eligibility verdict (1 for eligible, 0 for ineligible)
