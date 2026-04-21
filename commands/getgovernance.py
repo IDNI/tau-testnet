@@ -78,6 +78,7 @@ def execute(raw_command: str, container):
             "head_number": head_number,
             "next_block_height": next_block_height,
             "active_validator_count": validator_count,
+            "approval_threshold": chain_state._lifecycle_manager.approval_threshold,
             "active_validators": active_validators,
             "min_activation_height_for_next_update": min_activation_height,
             "active_consensus_id": active_consensus_id,

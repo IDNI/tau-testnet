@@ -42,7 +42,7 @@
             <h2>Connection</h2>
             <div class="input-group">
                 <label for="host">Host:</label>
-                <input type="text" id="host" value="127.0.0.1">
+                <input type="text" id="host" value="testnet.tau.net">
             </div>
             <div class="input-group">
                 <label for="port">Port (WS/WSS):</label>
@@ -248,7 +248,165 @@
             <button id="btn-send" class="w-100 mt-4 btn-lg btn-primary">Sign & Send Transaction</button>
         </section>
 
-        <section id="log-panel">
+        <section id="gov-panel" class="disabled mt-3">
+            <h2>Consensus Governance</h2>
+            <!-- Tab navigation -->
+            <ul class="nav nav-tabs" id="govTabs" role="tablist">
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link active" id="tab-gov-update-btn" data-bs-toggle="tab"
+                        data-bs-target="#tab-gov-update" type="button" role="tab">Gov: Update</button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="tab-gov-vote-btn" data-bs-toggle="tab" data-bs-target="#tab-gov-vote"
+                        type="button" role="tab">Gov: Vote</button>
+                </li>
+            </ul>
+            <div class="tab-content mt-3" id="govTabContent">
+                <!-- Gov: Update tab -->
+                <div class="tab-pane fade show active" id="tab-gov-update" role="tabpanel">
+                    <div class="mb-3">
+                        <label for="gov-activate-height" class="form-label">Activation Height</label>
+                        <input type="text" class="form-control" id="gov-activate-height"
+                            placeholder="Block height (e.g. 500)">
+                        <span id="gov-height-advisory" class="form-text mt-1 text-warning"></span>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label mb-0">Rule Revisions</label>
+                        <div class="form-text mt-0 mb-2">Each revision is a complete Tau program replacing the previous
+                            one. Order matters.</div>
+                        <div id="gov-revisions-container">
+                            <!-- Injected by JS -->
+                        </div>
+                        <button class="btn btn-sm btn-outline-primary mt-2" type="button" id="btn-add-revision">Add
+                            Revision</button>
+                        <span class="form-text ms-2">Advisory max: 10 revisions, 100KB per revision, 500KB total.</span>
+                    </div>
+
+                    <div class="tau-warning-banner p-2 mb-3 bg-secondary text-light rounded text-center small">
+                        This wallet does not compile or semantically validate Tau revisions. Only payload-shape
+                        validation and preview-id derivation happen here.
+                    </div>
+
+                    <div id="gov-patch-section" class="mb-3 p-3 border rounded">
+                        <label class="form-check-label fw-bold">
+                            <input type="checkbox" id="gov-patch-enable" class="form-check-input me-2"> Include Host
+                            Contract Patch
+                        </label>
+                        <div id="gov-patch-fields" class="mt-3" style="display:none">
+                            <div class="mb-2">
+                                <label class="form-label mb-1">proof_scheme</label>
+                                <input type="text" id="gov-patch-proof" class="form-control bg-light"
+                                    value="bls_header_sig" readonly>
+                            </div>
+                            <div class="mb-2">
+                                <label class="form-label mb-1">fork_choice_scheme</label>
+                                <input type="text" id="gov-patch-fork" class="form-control bg-light"
+                                    value="height_then_hash" readonly>
+                            </div>
+                            <div class="mb-2">
+                                <label class="form-label mb-1">input_contract_version</label>
+                                <input type="text" id="gov-patch-icv" class="form-control bg-light" value="1" readonly>
+                            </div>
+                        </div>
+
+                        <details id="gov-patch-advanced" class="mt-3" style="display:none">
+                            <summary class="text-muted small" style="cursor:pointer">Advanced: Raw JSON</summary>
+                            <textarea id="gov-patch-raw" class="form-control mt-2 font-monospace" rows="3"></textarea>
+                        </details>
+                    </div>
+
+                    <div class="mb-3 p-3 border rounded bg-light">
+                        <label for="gov-preview-id" class="form-label fw-bold">Computed Update ID Preview</label>
+                        <div class="input-group">
+                            <input type="text" id="gov-preview-id"
+                                class="form-control gov-readonly-field font-monospace" readonly
+                                placeholder="Waiting for valid draft...">
+                            <button class="btn btn-outline-secondary" type="button" id="btn-copy-preview-id"
+                                title="Copy to clipboard">📋</button>
+                            <button class="btn btn-primary" type="button" id="btn-use-preview-id">Use in Vote</button>
+                        </div>
+                        <div id="gov-preview-status" class="form-text mt-2 fw-bold invalid">invalid draft</div>
+                    </div>
+                </div>
+
+                <!-- Gov: Vote tab -->
+                <div class="tab-pane fade" id="tab-gov-vote" role="tabpanel">
+                    <!-- Pending Proposals Section -->
+                    <div id="gov-proposals-section" class="mb-3">
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <label class="form-label fw-bold mb-0">Pending Proposals</label>
+                            <div class="d-flex align-items-center gap-2">
+                                <span id="gov-proposals-timestamp" class="form-text mb-0"></span>
+                                <button class="btn btn-sm btn-outline-primary" type="button" id="btn-refresh-proposals">↻ Refresh</button>
+                            </div>
+                        </div>
+                        
+                        <!-- Validator banner (shown when user is not a validator) -->
+                        <div id="gov-validator-banner" class="alert alert-warning py-1 px-2 small mb-2" style="display:none">
+                            ⚠ Your public key is not in the active validator set. Votes will likely be rejected.
+                        </div>
+                        
+                        <!-- Proposals container with different states -->
+                        <div id="gov-proposals-container" class="border rounded">
+                            <div id="gov-proposals-not-loaded" class="p-3 text-center text-muted">
+                                Proposals not loaded. Click <strong>Refresh</strong> or switch to this tab.
+                            </div>
+                            <div id="gov-proposals-loading" class="p-3 text-center text-muted" style="display:none">
+                                <span class="spinner-border spinner-border-sm me-1"></span> Loading proposals…
+                            </div>
+                            <div id="gov-proposals-empty" class="p-3 text-center text-muted" style="display:none">
+                                No pending proposals available for voting.
+                            </div>
+                            <div id="gov-proposals-error" class="p-3 text-center text-danger" style="display:none">
+                                <span id="gov-proposals-error-msg"></span>
+                            </div>
+                            <div id="gov-proposals-list" style="display:none">
+                                <!-- Proposal rows injected by JS -->
+                            </div>
+                        </div>
+                        
+                        <!-- Stale indicator -->
+                        <div id="gov-proposals-stale" class="form-text text-warning mt-1" style="display:none">
+                            ⚠ Data may be stale. Last successful refresh shown above.
+                        </div>
+                    </div>
+                    
+                    <!-- Selection summary (visible when a proposal is selected from list) -->
+                    <div id="gov-selection-summary" class="mb-2 p-2 border rounded bg-light small" style="display:none">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <span>📌 Selected from proposals list: <code id="gov-selected-display-id" class="fw-bold text-primary"></code></span>
+                            <button class="btn btn-sm btn-outline-secondary" type="button" id="btn-clear-selection">✕ Clear</button>
+                        </div>
+                        <div id="gov-selection-advisory" class="text-warning mt-1 fw-bold" style="display:none"></div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="gov-vote-update-id" class="form-label">Update ID (Target Proposal)</label>
+                        <div class="input-group">
+                            <input type="text" class="form-control font-monospace" id="gov-vote-update-id"
+                                placeholder="64-character hex ID">
+                            <button class="btn btn-outline-primary" type="button" id="btn-paste-draft-id" disabled>Paste
+                                from Draft</button>
+                        </div>
+                        <span id="gov-vote-id-status" class="form-text mt-1"></span>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label">Vote Action</label>
+                        <div class="p-2 border rounded bg-light text-center fw-bold">
+                            <span>Approval vote (true)</span>
+                        </div>
+                        <div class="form-text text-center mt-1">Disapproval is not supported in v1 consensus governance.
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <button id="btn-gov-send" class="w-100 mt-4 btn-lg btn-success">Sign & Submit Update</button>
+        </section>
+
+        <section id="log-panel" class="mt-3">
             <h2>Logs</h2>
             <div id="logs"></div>
             <div class="d-flex gap-2">

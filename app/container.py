@@ -14,7 +14,7 @@ import chain_state
 import config
 import db
 import tau_manager
-from commands import createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks, getallaccounts, gettaustate, getgovernance
+from commands import createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks, getallaccounts, gettaustate, getgovernance, getupdateid
 from errors import DependencyError
 from network import BootstrapPeer, NetworkConfig
 from network.identity import IDENTITY_SEED_SIZE
@@ -58,6 +58,7 @@ class ServiceContainer:
             "getallaccounts": getallaccounts,
             "gettaustate": gettaustate,
             "getgovernance": getgovernance,
+            "getupdateid": getupdateid,
         }
 
         mempool = override_map.get("mempool") or []

@@ -9,6 +9,33 @@ let currentKeyPair = null;
 let isConnected = false;
 let savedWallets = {}; // name -> {priv: hex, pub: hex}
 let pendingSequence = null; // Track local sequence to prevent 'expected 1 got 0' on rapid sends
+let _pendingGovTx = null; // { seq, activeTab } — set during gov tx send, consumed on SUCCESS/FAILURE
+let _pendingPreview = null; // { nonce, sentFingerprint } — tracks in-flight preview request
+
+let _proposalsState = {
+    status: 'not_loaded',  // 'not_loaded' | 'loading' | 'loaded' | 'error'
+    proposals: [],         // Array of normalized ProposalViewModel
+    lastRefreshedAt: null, // Date or null
+    stale: false,          // true if a subsequent fetch failed after a successful one
+    requestNonce: 0,       // stale-response protection
+    errorMessage: null,    // string if status==='error'
+};
+let _selectedProposal = {
+    updateId: null,        // full 64-char hex or null
+    sourcedFromList: false, // true if selected from proposals list (not manual paste)
+};
+let _govRefreshThrottleUntil = 0; // timestamp, minimum 5s between requests
+// Governance state (must run before init() → initGovernance() → addRevisionEditor / restoreGovDraft)
+const GOV_LIMITS = {
+    MAX_REVISIONS: 10,
+    MAX_REVISION_BYTES: 102400,
+    MAX_TOTAL_PAYLOAD_BYTES: 512000,
+};
+let previewNonce = 0;
+let latestPreview = { fingerprint: null, updateId: null, status: 'idle' };
+let governanceAdvisory = null;
+const GOV_DEBUG = false;
+let revisionEditors = [];
 
 const DEFAULT_RULE_BV_WIDTH = 16;
 const MAX_TAU_TRANSFER_AMOUNT = (1 << DEFAULT_RULE_BV_WIDTH) - 1;
@@ -75,6 +102,39 @@ const btnCopyLogs = document.getElementById('btn-copy-logs');
 
 const tabBtns = document.querySelectorAll('.tab-btn');
 const tabContents = document.querySelectorAll('.tab-content');
+
+// Governance DOM (must exist before init() → initGovernance())
+const govActivateHeight = document.getElementById('gov-activate-height');
+const govHeightAdvisory = document.getElementById('gov-height-advisory');
+const govRevisionsContainer = document.getElementById('gov-revisions-container');
+const btnAddRevision = document.getElementById('btn-add-revision');
+const govPatchEnable = document.getElementById('gov-patch-enable');
+const govPatchFields = document.getElementById('gov-patch-fields');
+const govPatchAdvanced = document.getElementById('gov-patch-advanced');
+const govPatchRaw = document.getElementById('gov-patch-raw');
+const govPreviewId = document.getElementById('gov-preview-id');
+const btnCopyPreviewId = document.getElementById('btn-copy-preview-id');
+const btnUsePreviewId = document.getElementById('btn-use-preview-id');
+const govPreviewStatus = document.getElementById('gov-preview-status');
+const govVoteUpdateId = document.getElementById('gov-vote-update-id');
+const btnPasteDraftId = document.getElementById('btn-paste-draft-id');
+const govVoteIdStatus = document.getElementById('gov-vote-id-status');
+const btnGovSend = document.getElementById('btn-gov-send');
+
+const btnRefreshProposals = document.getElementById('btn-refresh-proposals');
+const govProposalsTimestamp = document.getElementById('gov-proposals-timestamp');
+const govValidatorBanner = document.getElementById('gov-validator-banner');
+const pNotLoaded = document.getElementById('gov-proposals-not-loaded');
+const pLoading = document.getElementById('gov-proposals-loading');
+const pEmpty = document.getElementById('gov-proposals-empty');
+const pError = document.getElementById('gov-proposals-error');
+const pErrorMsg = document.getElementById('gov-proposals-error-msg');
+const pList = document.getElementById('gov-proposals-list');
+const pStale = document.getElementById('gov-proposals-stale');
+const govSelectionSummary = document.getElementById('gov-selection-summary');
+const govSelectedDisplayId = document.getElementById('gov-selected-display-id');
+const btnClearSelection = document.getElementById('btn-clear-selection');
+const govSelectionAdvisory = document.getElementById('gov-selection-advisory');
 
 // --- CodeMirror Editors ---
 let ruleEditor = null;
@@ -221,6 +281,8 @@ function init() {
 
     // Tabs
     // Tabs - Handled by Bootstrap data-bs-toggle attributes
+
+    initGovernance();
 }
 
 // --- WebSocket Logic ---
@@ -347,6 +409,7 @@ function enablePanels(enabled) {
         if (enabled) p.classList.remove('disabled');
         else p.classList.add('disabled');
     });
+    checkGovPanelState();
 }
 
 async function sendRpc(command) {
@@ -377,6 +440,7 @@ function handleServerResponse(msg) {
         if (pendingSequence === null || seq > pendingSequence) {
             pendingSequence = seq;
         }
+        checkGovPanelState();
     } else if (msg.startsWith("ACCOUNTS: ")) {
         try {
             const jsonStr = msg.substring(10);
@@ -393,12 +457,43 @@ function handleServerResponse(msg) {
         } catch (e) {
             log("Error parsing raw accounts list: " + e.message, "error");
         }
+    } else if (msg.trim().startsWith("{")) {
+        try {
+            const data = JSON.parse(msg);
+            // getupdateid response: explicit shape check
+            if (data.status === 'ok' && typeof data.update_id === 'string' && data.update_id.length === 64) {
+                window.dispatchEvent(new CustomEvent('govPreviewResponse', { detail: data }));
+            } else if (data.status === 'error' && typeof data.error === 'string' && data.input_echo !== undefined) {
+                window.dispatchEvent(new CustomEvent('govPreviewResponse', { detail: data }));
+            } else if (data.pending_updates !== undefined && data.next_block_height !== undefined) {
+                // getgovernance response
+                window.dispatchEvent(new CustomEvent('govStatusResponse', { detail: data }));
+            }
+        } catch(e) {
+            // not json
+        }
     } else if (msg.startsWith("FAILURE:")) {
         log(msg, "error");
-        // Reset our optimistic sequence if a transaction failed
-        pendingSequence = null;
+        if (_pendingGovTx) {
+            // Governance tx failed — leave sequence unchanged, clear pending state
+            _pendingGovTx = null;
+        } else {
+            // user_tx failed — reset optimistic sequence
+            pendingSequence = null;
+        }
     } else if (msg.startsWith("SUCCESS:")) {
         log(msg, "success");
+        if (_pendingGovTx) {
+            const govSeq = _pendingGovTx.seq;
+            const govTab = _pendingGovTx.activeTab;
+            _pendingGovTx = null;
+            if (pendingSequence === null || govSeq >= pendingSequence) {
+                pendingSequence = govSeq + 1;
+                statSequence.textContent = `(Pending) ${govSeq + 1}`;
+            }
+            log("Governance transaction accepted by node.", "success");
+            clearGovInputs(govTab);
+        }
     }
 }
 
@@ -520,6 +615,7 @@ function setWallet(privKey, pubKey) {
     // Reset pending sequence when switching wallets
     pendingSequence = null;
 
+    checkGovPanelState();
     if (isConnected) refreshInfo();
 }
 
@@ -1155,6 +1251,9 @@ function renderAddressBook() {
         item.appendChild(actions);
         contactsListDiv.appendChild(item);
     });
+
+
+
 
     // Update the dropdown any time the address book is re-rendered
     updateKnownAccounts();
@@ -1806,5 +1905,1156 @@ function initRuleTemplates() {
     }
 }
 
+
+// ==========================================
+// --- Governance Logic ---
+// ==========================================
+
+function getGovPanel() {
+    return document.getElementById('gov-panel');
+}
+
+function debounce(func, wait) {
+    let timeout;
+    return function(...args) {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => func.apply(this, args), wait);
+    };
+}
+
+function initGovernance() {
+    if (!getGovPanel()) return;
+
+    // 1. Initial editor
+    addRevisionEditor();
+    
+    // 2. Event listeners
+    if (btnAddRevision) btnAddRevision.addEventListener('click', addRevisionEditor);
+    
+    if (govPatchEnable) {
+        govPatchEnable.addEventListener('change', () => {
+            govPatchFields.style.display = govPatchEnable.checked ? 'block' : 'none';
+            govPatchAdvanced.style.display = govPatchEnable.checked ? 'block' : 'none';
+            triggerPreviewUpdate();
+        });
+    }
+    
+    if (govActivateHeight) govActivateHeight.addEventListener('input', debounce(triggerPreviewUpdate, 500));
+    if (govPatchRaw) govPatchRaw.addEventListener('input', debounce(triggerPreviewUpdate, 500));
+    
+    if (btnCopyPreviewId) {
+        btnCopyPreviewId.addEventListener('click', () => {
+            if (govPreviewId.value && latestPreview.updateId) {
+                navigator.clipboard.writeText(govPreviewId.value).then(() => {
+                    log("Copied Update ID to clipboard.", "success");
+                });
+            }
+        });
+    }
+    
+    if (btnUsePreviewId) btnUsePreviewId.addEventListener('click', usePreviewIdInVote);
+    if (btnPasteDraftId) btnPasteDraftId.addEventListener('click', usePreviewIdInVote);
+    
+    if (govVoteUpdateId) {
+        const validateVoteIdUI = () => {
+            const res = normalizeUpdateIdInput(govVoteUpdateId.value);
+            if (res.valid) {
+                govVoteUpdateId.value = res.normalized;
+                govVoteIdStatus.className = 'form-text text-success';
+                govVoteIdStatus.textContent = 'Valid ID format';
+            } else {
+                govVoteIdStatus.className = 'form-text text-danger';
+                govVoteIdStatus.textContent = 'Invalid ID format';
+            }
+            saveGovVoteDraft();
+        };
+        govVoteUpdateId.addEventListener('blur', validateVoteIdUI);
+        govVoteUpdateId.addEventListener('input', debounce(validateVoteIdUI, 300));
+    }
+
+    if (btnGovSend) btnGovSend.addEventListener('click', onSendGovernanceTransaction);
+
+    document.querySelectorAll('button[data-bs-toggle="tab"]').forEach(tabBtn => {
+        if (tabBtn.id === 'tab-gov-update-btn' || tabBtn.id === 'tab-gov-vote-btn') {
+            tabBtn.addEventListener('shown.bs.tab', function (e) {
+                const isUpdate = e.target.id === 'tab-gov-update-btn';
+                if (btnGovSend) {
+                    btnGovSend.textContent = isUpdate ? 'Sign & Submit Update' : 'Sign & Submit Vote';
+                }
+                if (!isUpdate) {
+                    refreshGovernanceAdvisory();
+                }
+            });
+        }
+    });
+
+    window.addEventListener('govPreviewResponse', (e) => {
+        const data = e.detail;
+        if (data.status === 'ok' && data.update_id) {
+            handlePreviewSuccess(data.update_id);
+        } else if (data.status === 'error') {
+            handlePreviewError(data.error);
+        }
+    });
+
+    window.addEventListener('govStatusResponse', (e) => {
+        const raw = e.detail;
+        const result = normalizeGovernanceAdvisory(raw);
+        if (result.error) {
+            _proposalsState.status = 'error';
+            _proposalsState.errorMessage = result.error;
+            _proposalsState.stale = _proposalsState.proposals.length > 0;
+        } else {
+            governanceAdvisory = raw;
+            _proposalsState.status = 'loaded';
+            _proposalsState.proposals = result.proposals;
+            _proposalsState.lastRefreshedAt = new Date();
+            _proposalsState.stale = false;
+            _proposalsState.errorMessage = null;
+        }
+        
+        updateGovAdvisories();
+        renderProposals();
+        checkSelectedProposalStillPending();
+    });
+
+    // Initial panel state check (event-driven updates happen via enablePanels/setWallet/SEQUENCE handler)
+    checkGovPanelState();
+
+    restoreGovDraft();
+}
+
+function checkGovPanelState() {
+    const panel = getGovPanel();
+    if (!panel) return;
+    const hasSeq = pendingSequence !== null || !isNaN(parseInt(statSequence.textContent));
+    const isReady = isConnected && currentKeyPair && hasSeq;
+    if (isReady) {
+        panel.classList.remove('disabled');
+    } else {
+        panel.classList.add('disabled');
+    }
+}
+
+function normalizeGovernanceAdvisory(raw) {
+    if (!raw || typeof raw !== 'object') return { error: "Invalid response format" };
+    if (!Array.isArray(raw.pending_updates)) return { error: "Missing pending_updates array" };
+    if (!Array.isArray(raw.votes)) return { error: "Missing votes array" };
+    
+    const votesByUid = {};
+    raw.votes.forEach(v => {
+        if (!votesByUid[v.update_id]) Object.defineProperty(votesByUid, v.update_id, {value: new Set(), enumerable: true});
+        votesByUid[v.update_id].add(v.voter_pubkey);
+    });
+    
+    // Explicitly fallback if approval_threshold was not added by node
+    let threshold = raw.approval_threshold;
+    if (typeof threshold !== 'number') {
+        const nValidators = Array.isArray(raw.active_validators) ? raw.active_validators.length : 1;
+        threshold = Math.floor(nValidators / 2) + 1;
+    }
+
+    const proposals = [];
+    raw.pending_updates.forEach(pu => {
+        const revisionCount = Array.isArray(pu.rule_revisions) ? pu.rule_revisions.length : 0;
+        let revPreview = "";
+        if (revisionCount > 0 && typeof pu.rule_revisions[0] === 'string') {
+            const firstLine = pu.rule_revisions[0].split('\n')[0].trim();
+            revPreview = firstLine.substring(0, 60) + (firstLine.length > 60 ? '...' : '');
+        }
+        
+        let patchSummary = null;
+        if (pu.host_contract_patch) {
+            patchSummary = Object.entries(pu.host_contract_patch)
+                .map(([k,v]) => {
+                    if (k === 'input_contract_version') return `icv=${v}`;
+                    return `${k}=${v}`;
+                }).join(', ');
+        }
+        
+        const count = votesByUid[pu.update_id] ? votesByUid[pu.update_id].size : 0;
+        const status = (raw.lifecycle && raw.lifecycle[pu.update_id]) ? raw.lifecycle[pu.update_id] : 'pending';
+        
+        proposals.push({
+            updateId: pu.update_id,
+            displayId: pu.update_id.substring(0, 10) + "…" + pu.update_id.substring(56),
+            activateAtHeight: pu.activate_at_height,
+            revisionCount: revisionCount,
+            revisions: pu.rule_revisions || [],
+            revisionPreview: revPreview,
+            hostContractPatch: pu.host_contract_patch || null,
+            patchSummary: patchSummary,
+            approvalCount: count,
+            approvalThreshold: threshold,
+            status: status,
+            isSelectable: status === 'pending'
+        });
+    });
+    
+    // Sort: primary activateAtHeight asc, secondary updateId asc
+    proposals.sort((a, b) => {
+        if (a.activateAtHeight !== b.activateAtHeight) return a.activateAtHeight - b.activateAtHeight;
+        if (a.updateId < b.updateId) return -1;
+        if (a.updateId > b.updateId) return 1;
+        return 0;
+    });
+    
+    return { error: null, proposals };
+}
+
+function refreshGovernanceAdvisory() {
+    if (!isConnected) return;
+    const now = Date.now();
+    if (now < _govRefreshThrottleUntil) return;
+    _govRefreshThrottleUntil = now + 5000; // 5s throttle
+    
+    _proposalsState.status = 'loading';
+    _proposalsState.requestNonce++;
+    renderProposals();
+    sendRpc("getgovernance");
+}
+
+function fetchGovernanceAdvisory() {
+    refreshGovernanceAdvisory();
+}
+
+function updateGovAdvisories() {
+    if (!governanceAdvisory || !govHeightAdvisory) return;
+    const heightRes = validateUint64DecimalString(govActivateHeight.value);
+    if (heightRes.valid) {
+        const minH = governanceAdvisory.min_activation_height_for_next_update || 0;
+        if (heightRes.value < minH) {
+            govHeightAdvisory.textContent = `Warning: height is below minimum ${minH} for current chain tip.`;
+        } else {
+            govHeightAdvisory.textContent = '';
+        }
+    } else {
+        govHeightAdvisory.textContent = '';
+    }
+}
+
+function addRevisionEditor(content = "") {
+    if (revisionEditors.length >= GOV_LIMITS.MAX_REVISIONS) return;
+    
+    const idx = revisionEditors.length;
+    const block = document.createElement('div');
+    block.className = 'revision-block mb-2';
+    block.innerHTML = `
+        <div class="d-flex justify-content-between mb-1">
+            <span class="fw-bold">Revision [${idx}]</span>
+            ${idx > 0 ? `<button type="button" class="btn btn-sm btn-outline-danger btn-remove-revision">Remove</button>` : ''}
+        </div>
+        <textarea class="gov-revision"></textarea>
+        <span class="revision-status"></span>
+    `;
+    
+    govRevisionsContainer.appendChild(block);
+    
+    const ta = block.querySelector('.gov-revision');
+    ta.value = content;
+    const cm = CodeMirror.fromTextArea(ta, {
+        mode: "simple",
+        theme: "material-ocean",
+        lineNumbers: true,
+        lineWrapping: true,
+        indentUnit: 4,
+        viewportMargin: Infinity
+    });
+    
+    revisionEditors.push(cm);
+    
+    if (idx > 0) {
+        block.querySelector('.btn-remove-revision').addEventListener('click', () => {
+            block.remove();
+            revisionEditors = revisionEditors.filter(e => e !== cm);
+            triggerPreviewUpdate();
+            // Need to re-index labels
+            const blocks = govRevisionsContainer.querySelectorAll('.revision-block');
+            blocks.forEach((b, i) => {
+                b.querySelector('.fw-bold').textContent = `Revision [${i}]`;
+            });
+        });
+    }
+
+    cm.on('change', () => {
+        validateRevisionBlock(cm, block);
+        triggerPreviewUpdate();
+    });
+    
+    validateRevisionBlock(cm, block);
+}
+
+function validateRevisionBlock(cm, block) {
+    const status = block.querySelector('.revision-status');
+    const val = cm.getValue().trim();
+    if (!val) {
+        status.className = 'revision-status text-danger fw-bold';
+        status.textContent = 'Empty revision';
+    } else {
+        const blen = new Blob([val]).size;
+        const kbStr = (blen / 1024).toFixed(1);
+        if (blen > GOV_LIMITS.MAX_REVISION_BYTES) {
+            status.className = 'revision-status text-danger fw-bold';
+            status.textContent = `Too large (${kbStr}KB > ${Math.round(GOV_LIMITS.MAX_REVISION_BYTES/1024)}KB)`;
+        } else {
+            status.className = 'revision-status text-success';
+            status.textContent = `✓ (${kbStr}KB)`;
+        }
+    }
+}
+
+function usePreviewIdInVote() {
+    if (!latestPreview.updateId) return;
+    // Verify that the preview matches the current draft fingerprint
+    const draft = createDraftFromUI();
+    const logicalPayload = normalizeConsensusRuleUpdatePayloadForId(draft);
+    if (logicalPayload) {
+        const fp = computeDraftFingerprint(logicalPayload);
+        if (latestPreview.fingerprint !== fp) return;
+    }
+    const voteTabBtn = document.getElementById('tab-gov-vote-btn');
+    if (voteTabBtn) {
+        const bsTab = new bootstrap.Tab(voteTabBtn);
+        bsTab.show();
+    }
+    if (govVoteUpdateId) {
+        govVoteUpdateId.value = latestPreview.updateId;
+        govVoteUpdateId.dispatchEvent(new Event('blur'));
+    }
+}
+
+// Strict Validators
+
+// Validates a decimal string as a safe-integer subset of uint64 range.
+// Rejects whitespace, decimals, signs. Caps at Number.MAX_SAFE_INTEGER.
+function validateUint64DecimalString(str) {
+    if (typeof str !== 'string' && typeof str !== 'number') return { valid: false, error: 'Must be a string or number' };
+    const raw = String(str);
+    // Reject if raw input has leading/trailing whitespace
+    if (raw !== raw.trim()) {
+        return { valid: false, error: 'Must not contain leading or trailing whitespace.' };
+    }
+    if (!/^[0-9]+$/.test(raw)) {
+        return { valid: false, error: 'Must contain only digits (no spaces, decimals, or signs).' };
+    }
+    const val = Number(raw);
+    if (!Number.isFinite(val) || val < 1) {
+        return { valid: false, error: 'Must be >= 1.' };
+    }
+    if (val > Number.MAX_SAFE_INTEGER) {
+        return { valid: false, value: null, error: 'Value exceeds MAX_SAFE_INTEGER; unsupported by this wallet.' };
+    }
+    return { valid: true, value: val, error: null };
+}
+
+function normalizeUpdateIdInput(raw) {
+    if (!raw || typeof raw !== 'string') return { valid: false, error: 'Empty ID' };
+    let norm = raw.trim();
+    if (norm.startsWith('0x') || norm.startsWith('0X')) {
+        norm = norm.substring(2);
+    }
+    norm = norm.toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(norm)) {
+        return { valid: false, error: 'Must be 64 valid hex characters' };
+    }
+    return { valid: true, normalized: norm };
+}
+
+function buildHostContractPatchFromForm() {
+    if (!govPatchEnable || !govPatchEnable.checked) return null;
+    return {
+        proof_scheme: "bls_header_sig",
+        fork_choice_scheme: "height_then_hash",
+        input_contract_version: 1
+    };
+}
+
+function parseHostContractPatchRaw(raw) {
+    raw = raw.trim();
+    if (!raw) return { valid: true, patch: null };
+    try {
+        const obj = JSON.parse(raw);
+        if (typeof obj !== 'object' || Array.isArray(obj) || obj === null) {
+            return { valid: false, error: 'Must be a JSON object.' };
+        }
+        if (Object.keys(obj).length === 0) {
+            return { valid: false, error: 'Empty object not allowed. Omit patch or provide at least one key.' };
+        }
+        
+        const allowedKeys = ['proof_scheme', 'fork_choice_scheme', 'input_contract_version'];
+        for (const k of Object.keys(obj)) {
+            if (!allowedKeys.includes(k)) return { valid: false, error: `Key ${k} not allowed in host_contract_patch MVP.` };
+        }
+        if (obj.proof_scheme && obj.proof_scheme !== "bls_header_sig") return { valid: false, error: 'proof_scheme must be bls_header_sig' };
+        if (obj.fork_choice_scheme && obj.fork_choice_scheme !== "height_then_hash") return { valid: false, error: 'fork_choice_scheme must be height_then_hash' };
+        if (obj.input_contract_version !== undefined && (!Number.isInteger(obj.input_contract_version) || obj.input_contract_version !== 1)) {
+            return { valid: false, error: 'input_contract_version must be integer 1' };
+        }
+        
+        return { valid: true, patch: obj };
+    } catch (e) {
+        return { valid: false, error: `Invalid JSON: ${e.message}` };
+    }
+}
+
+function validateConsensusRuleUpdateDraft(draft) {
+    const errors = [];
+    if (!Array.isArray(draft.rule_revisions) || draft.rule_revisions.length === 0) {
+        errors.push("Missing rule revisions");
+    } else {
+        if (draft.rule_revisions.length > GOV_LIMITS.MAX_REVISIONS) errors.push(`Max ${GOV_LIMITS.MAX_REVISIONS} revisions exceeded.`);
+        let totalBytes = 0;
+        draft.rule_revisions.forEach((r, idx) => {
+            if (typeof r !== 'string' || r.trim().length === 0) {
+                errors.push(`Revision [${idx}] cannot be empty.`);
+            } else {
+                const blen = new Blob([r]).size;
+                totalBytes += blen;
+                if (blen > GOV_LIMITS.MAX_REVISION_BYTES) errors.push(`Revision [${idx}] is too large (>${Math.round(GOV_LIMITS.MAX_REVISION_BYTES/1024)}KB).`);
+            }
+        });
+        if (totalBytes > GOV_LIMITS.MAX_TOTAL_PAYLOAD_BYTES) errors.push("Total payload exceeds 500KB.");
+    }
+    
+    const heightRes = validateUint64DecimalString(draft.activate_at_height);
+    if (!heightRes.valid) {
+        errors.push("Activation Height error: " + heightRes.error);
+    }
+    
+    // Self-contained patch validation
+    if (draft.host_contract_patch !== undefined && draft.host_contract_patch !== null) {
+        const p = draft.host_contract_patch;
+        if (typeof p !== 'object' || Array.isArray(p)) {
+            errors.push("host_contract_patch must be an object.");
+        } else {
+            const allowedKeys = ['proof_scheme', 'fork_choice_scheme', 'input_contract_version'];
+            for (const k of Object.keys(p)) {
+                if (!allowedKeys.includes(k)) errors.push(`Patch key '${k}' not allowed in MVP.`);
+            }
+            if (p.proof_scheme && p.proof_scheme !== 'bls_header_sig') errors.push('proof_scheme must be bls_header_sig');
+            if (p.fork_choice_scheme && p.fork_choice_scheme !== 'height_then_hash') errors.push('fork_choice_scheme must be height_then_hash');
+            if (p.input_contract_version !== undefined && (!Number.isInteger(p.input_contract_version) || p.input_contract_version !== 1)) {
+                errors.push('input_contract_version must be integer 1');
+            }
+        }
+    }
+    
+    return { valid: errors.length === 0, errors };
+}
+
+function validateConsensusRuleVoteDraft(draft) {
+    const res = normalizeUpdateIdInput(draft.update_id);
+    if (!res.valid) return { valid: false, errors: [res.error] };
+    return { valid: true, errors: [] };
+}
+
+function getRevisionsFromEditors() {
+    return revisionEditors.map(ed => ed.getValue().trim());
+}
+
+function createDraftFromUI() {
+    let patch = null;
+    // Gate on toggle: patch only participates if enabled
+    if (!govPatchEnable || !govPatchEnable.checked) {
+        patch = null;
+    } else if (govPatchAdvanced && govPatchAdvanced.open && govPatchRaw) {
+        const patchRes = parseHostContractPatchRaw(govPatchRaw.value);
+        if (patchRes.valid) patch = patchRes.patch;
+    } else {
+        patch = buildHostContractPatchFromForm();
+    }
+    
+    return {
+        rule_revisions: getRevisionsFromEditors(),
+        activate_at_height: govActivateHeight ? govActivateHeight.value : "",
+        ...(patch ? { host_contract_patch: patch } : {})
+    };
+}
+
+function computeDraftFingerprint(logicalPayload) {
+    return canonicalize(logicalPayload);
+}
+
+function normalizeConsensusRuleUpdatePayloadForId(draft) {
+    const heightRes = validateUint64DecimalString(draft.activate_at_height);
+    if (!heightRes.valid) return null;
+    
+    const payload = {
+        rule_revisions: draft.rule_revisions,
+        activate_at_height: heightRes.value,
+    };
+    if (draft.host_contract_patch) {
+        payload.host_contract_patch = draft.host_contract_patch;
+    }
+    return payload;
+}
+
+// Preview caching / fetching
+
+let fetchPreviewTimeout = null;
+function triggerPreviewUpdate() {
+    saveGovDraft();
+    updateGovAdvisories();
+    clearTimeout(fetchPreviewTimeout);
+    fetchPreviewTimeout = setTimeout(() => {
+        const draft = createDraftFromUI();
+        const valRes = validateConsensusRuleUpdateDraft(draft);
+        if (!valRes.valid) {
+            setPreviewStatus('invalid draft', 'invalid', '');
+            latestPreview.status = 'invalid';
+            if (btnPasteDraftId) btnPasteDraftId.disabled = true;
+            if (btnUsePreviewId) btnUsePreviewId.disabled = true;
+            return;
+        }
+        
+        const payload = normalizeConsensusRuleUpdatePayloadForId(draft);
+        if (payload) {
+            fetchUpdateIdPreview(payload);
+        }
+    }, 300);
+}
+
+function setPreviewStatus(text, stateClass, updateIdHex) {
+    if (!govPreviewStatus) return;
+    govPreviewStatus.textContent = text;
+    govPreviewStatus.className = `form-text mt-2 fw-bold ${stateClass}`;
+    
+    if (govPreviewId) {
+        govPreviewId.value = updateIdHex;
+    }
+}
+
+function fetchUpdateIdPreview(logicalPayload) {
+    const fingerprint = computeDraftFingerprint(logicalPayload);
+    
+    // Quick cache return
+    if (latestPreview.fingerprint === fingerprint && latestPreview.status === 'ok') {
+        setPreviewStatus('ready', 'ready', latestPreview.updateId);
+        if (btnPasteDraftId) btnPasteDraftId.disabled = false;
+        if (btnUsePreviewId) btnUsePreviewId.disabled = false;
+        return;
+    }
+    
+    previewNonce++;
+    const currentNonce = previewNonce;
+    
+    setPreviewStatus('computing...', 'computing', '');
+    if (btnPasteDraftId) btnPasteDraftId.disabled = true;
+    if (btnUsePreviewId) btnUsePreviewId.disabled = true;
+
+    if (!isConnected) {
+        setPreviewStatus('preview unavailable', 'invalid', '');
+        return;
+    }
+    
+    fetchGovernanceAdvisory();
+    
+    // Store sent fingerprint so response handler uses our payload, not echoed data
+    _pendingPreview = { nonce: currentNonce, sentFingerprint: fingerprint };
+    
+    try {
+        sendRpc("getupdateid " + JSON.stringify(logicalPayload));
+    } catch(e) {
+        _pendingPreview = null;
+        setPreviewStatus('preview unavailable', 'error', '');    
+    }
+}
+
+function handlePreviewSuccess(updateId) {
+    // Use the sent fingerprint, not the echoed payload
+    if (!_pendingPreview || _pendingPreview.nonce !== previewNonce) {
+        return; // stale
+    }
+    
+    latestPreview = {
+        fingerprint: _pendingPreview.sentFingerprint,
+        updateId: updateId,
+        status: 'ok'
+    };
+    _pendingPreview = null;
+    
+    setPreviewStatus('ready', 'ready', updateId);
+    if (btnPasteDraftId) btnPasteDraftId.disabled = false;
+    if (btnUsePreviewId) btnUsePreviewId.disabled = false;
+    saveGovDraft();
+}
+
+function handlePreviewError(errorStr) {
+    _pendingPreview = null;
+    setPreviewStatus(`rpc error: ${errorStr}`, 'error', '');
+    latestPreview.status = 'error';
+    if (btnPasteDraftId) btnPasteDraftId.disabled = true;
+    if (btnUsePreviewId) btnUsePreviewId.disabled = true;
+}
+
+// Transaction Builders
+
+function buildConsensusRuleUpdateTx(draft) {
+    // Run full validation defensively — prevents signing malformed payloads
+    const valRes = validateConsensusRuleUpdateDraft(draft);
+    if (!valRes.valid) throw new Error("Draft validation failed: " + valRes.errors.join('; '));
+    
+    const heightRes = validateUint64DecimalString(draft.activate_at_height);
+    if (!heightRes.valid) throw new Error("Invalid activate_at_height: " + heightRes.error);
+    
+    const body = {
+        tx_type: "consensus_rule_update",
+        rule_revisions: draft.rule_revisions,
+        activate_at_height: heightRes.value
+    };
+    
+    if (draft.host_contract_patch) {
+        body.host_contract_patch = draft.host_contract_patch;
+    }
+    return body;
+}
+
+function buildConsensusRuleVoteTx(draft) {
+    const idRes = normalizeUpdateIdInput(draft.update_id);
+    if (!idRes.valid) throw new Error("Invalid update_id: " + idRes.error);
+    // Defensive: reject approve!==true even though the UI never sets it
+    if (draft.approve !== undefined && draft.approve !== true) {
+        throw new Error("approve=false is not supported in v1 governance");
+    }
+    
+    return {
+        tx_type: "consensus_rule_vote",
+        update_id: idRes.normalized,
+        approve: true
+    };
+}
+
+// Accepts privKeyBytes as Uint8Array (in-memory key material, never from DOM).
+function buildSignedEnvelope(txBody, senderPub, seq, expiration, privKeyBytes) {
+    if (typeof seq !== 'number' || !Number.isInteger(seq)) throw new Error("sequence_number must be an integer");
+    if (typeof expiration !== 'number' || !Number.isInteger(expiration)) throw new Error("expiration_time must be an integer");
+    if (typeof senderPub !== 'string' || senderPub.length !== 96 || !/^[0-9a-f]{96}$/.test(senderPub)) {
+        throw new Error("sender_pubkey must be 96-char lowercase hex");
+    }
+    if (senderPub !== bytesToHex(currentKeyPair.pub)) throw new Error("sender_pubkey does not match connected wallet");
+    if (!(privKeyBytes instanceof Uint8Array) || privKeyBytes.length !== 32) {
+        throw new Error("privKeyBytes must be a 32-byte Uint8Array");
+    }
+
+    if (txBody.tx_type === 'consensus_rule_update') {
+        if (!Array.isArray(txBody.rule_revisions) || txBody.rule_revisions.length === 0) throw new Error("rule_revisions array must be non-empty");
+        txBody.rule_revisions.forEach((r) => { 
+            if (typeof r !== 'string' || r.length === 0) throw new Error("rule_revisions must contain non-empty strings"); 
+        });
+        if (typeof txBody.activate_at_height !== 'number' || txBody.activate_at_height < 1) throw new Error("activate_at_height must be integer >= 1");
+        if (txBody.host_contract_patch !== undefined && typeof txBody.host_contract_patch !== 'object') throw new Error("host_contract_patch must be object or absent");
+    } else if (txBody.tx_type === 'consensus_rule_vote') {
+        if (!/^[0-9a-f]{64}$/.test(txBody.update_id)) throw new Error("update_id must be 64-char lowercase hex");
+        if (txBody.approve !== true) throw new Error("approve must be true");
+    }
+    
+    const signingDict = {
+        sender_pubkey: senderPub,
+        sequence_number: seq,
+        expiration_time: expiration,
+        fee_limit: "0",
+        ...txBody
+    };
+    
+    const canonicalPayload = canonicalize(signingDict);
+    const msgHashBytes = sha256(new TextEncoder().encode(canonicalPayload));
+    const signatureBytes = bls.sign(msgHashBytes, privKeyBytes);
+    
+    return {
+        ...signingDict,
+        signature: bytesToHex(signatureBytes)
+    };
+}
+
+function formatConsensusRuleUpdateSummary(txBody, previewId) {
+    const patchInfo = txBody.host_contract_patch 
+        ? Object.entries(txBody.host_contract_patch).map(([k,v]) => `${k}=${v}`).join(', ')
+        : 'Absent';
+    
+    let revSummary = '';
+    txBody.rule_revisions.forEach((r, i) => {
+        const snippet = r.substring(0, 80) + (r.length > 80 ? '...' : '');
+        revSummary += `  [${i}]: ${snippet}\n`;
+    });
+    
+    return `Transaction Type: consensus_rule_update\n`
+         + `Activation Height: ${txBody.activate_at_height}\n`
+         + `Revision Count: ${txBody.rule_revisions.length}\n`
+         + `Revisions:\n${revSummary}`
+         + `Host Contract Patch: ${patchInfo}\n`
+         + `Derived update_id: ${previewId || "preview unavailable"}`;
+}
+
+function formatConsensusRuleVoteSummary(txBody) {
+    return `Transaction Type: consensus_rule_vote\n`
+         + `Target update_id: ${txBody.update_id}\n`
+         + `Vote: Approval (true)`;
+}
+
+// Send Governance Transaction
+
+async function onSendGovernanceTransaction() {
+    if (!isConnected || !currentKeyPair) {
+        log("Not connected or no wallet generated.", "error");
+        return;
+    }
+    
+    const activeTab = document.querySelector('#govTabs .nav-link.active').id === 'tab-gov-update-btn' ? 'update' : 'vote';
+    
+    let draft, txBody, confirmationText;
+    
+    if (activeTab === 'update') {
+        draft = createDraftFromUI();
+        const valRes = validateConsensusRuleUpdateDraft(draft);
+        if (!valRes.valid) {
+            log("Draft is invalid:\n" + valRes.errors.join('\n'), "error");
+            return;
+        }
+        
+        const logicalPayloadForPreview = normalizeConsensusRuleUpdatePayloadForId(draft);
+        const fp = computeDraftFingerprint(logicalPayloadForPreview);
+        
+        let usablePreviewId = (latestPreview.status === 'ok' && latestPreview.fingerprint === fp) ? latestPreview.updateId : null;
+        
+        if (!usablePreviewId && fp) {
+             log("Fetching fresh preview before confirm...", "warn");
+             fetchUpdateIdPreview(logicalPayloadForPreview);
+             // Wait for preview response or timeout (replaces fixed 600ms)
+             usablePreviewId = await new Promise(resolve => {
+                 const onPreview = (e) => {
+                     if (e.detail.status === 'ok' && e.detail.update_id) {
+                         resolve(e.detail.update_id);
+                     } else {
+                         resolve(null);
+                     }
+                     window.removeEventListener('govPreviewResponse', onPreview);
+                 };
+                 window.addEventListener('govPreviewResponse', onPreview);
+                 setTimeout(() => {
+                     window.removeEventListener('govPreviewResponse', onPreview);
+                     resolve(null);
+                 }, 2000);
+             });
+        }
+        
+        txBody = buildConsensusRuleUpdateTx(draft);
+        confirmationText = formatConsensusRuleUpdateSummary(txBody, usablePreviewId);
+        
+        if (!usablePreviewId) {
+             const confirmed = await customConfirm("Update ID preview is unavailable. The transaction can still be submitted, but you will not see the derived update_id until it appears on-chain. Continue?");
+             if (!confirmed) return;
+        }
+        
+        // Assert logical payload fingerprint from txBody matches
+        const txLogicalPayload = {
+             rule_revisions: txBody.rule_revisions,
+             activate_at_height: txBody.activate_at_height,
+             ...(txBody.host_contract_patch ? {host_contract_patch: txBody.host_contract_patch} : {})
+        };
+        if (computeDraftFingerprint(txLogicalPayload) !== fp) {
+             throw new Error("Logical payload fingerprint mismatch before signing");
+        }
+        
+    } else {
+        draft = { update_id: govVoteUpdateId.value };
+        const valRes = validateConsensusRuleVoteDraft(draft);
+        if (!valRes.valid) {
+             log("Invalid update ID:\n" + valRes.errors.join('\n'), "error");
+             return;
+        }
+        txBody = buildConsensusRuleVoteTx(draft);
+        confirmationText = formatConsensusRuleVoteSummary(txBody);
+    }
+    
+    const confirmed = await customConfirm("Please review the transaction details:\n\n" + confirmationText + "\n\nSign and submit?");
+    if (!confirmed) return;
+    
+    let seq = pendingSequence !== null ? pendingSequence : parseInt(statSequence.textContent);
+    if (isNaN(seq)) seq = 0;
+    
+    const expiration = Math.floor(Date.now() / 1000) + (10 * 60);
+    const senderPub = bytesToHex(currentKeyPair.pub);
+    
+    try {
+        const signedEnvelope = buildSignedEnvelope(txBody, senderPub, seq, expiration, currentKeyPair.priv);
+        if (GOV_DEBUG) {
+            console.log("GOV_DEBUG: signing envelope => ", signedEnvelope);
+        }
+        
+        // Set pending state BEFORE sending so the global handler can track it
+        _pendingGovTx = { seq, activeTab };
+        
+        const fullTxJson = JSON.stringify(signedEnvelope);
+        sendRpc("sendtx " + fullTxJson);
+        log(`Sending governance transaction...`, "warn");
+        
+    } catch (e) {
+        _pendingGovTx = null;
+        log(`[SIGNING ERROR] ${e.message}`, "error");
+    }
+}
+
+function clearGovInputs(tab) {
+    if (tab === 'update') {
+        govActivateHeight.value = "";
+        govPatchEnable.checked = false;
+        govPatchFields.style.display = 'none';
+        govPatchAdvanced.style.display = 'none';
+        govPatchRaw.value = "";
+        
+        govRevisionsContainer.innerHTML = '';
+        revisionEditors = [];
+        addRevisionEditor("");
+        latestPreview = { fingerprint: null, updateId: null, status: 'idle' };
+        setPreviewStatus('Waiting for valid draft...', 'idle', '');
+        saveGovDraft();
+    } else {
+        govVoteUpdateId.value = "";
+        govVoteIdStatus.textContent = "";
+        localStorage.removeItem('tau_gov_vote_draft_v1');
+    }
+}
+
+// Saves update-tab draft only. Vote is saved separately.
+function saveGovDraft() {
+    const draft = createDraftFromUI();
+    const saveObj = {
+        rule_revisions: draft.rule_revisions,
+        activate_at_height: draft.activate_at_height,
+        host_contract_patch_enabled: govPatchEnable ? govPatchEnable.checked : false,
+        host_contract_patch_raw: govPatchRaw ? govPatchRaw.value : "",
+    };
+    localStorage.setItem('tau_gov_update_draft_v1', JSON.stringify(saveObj));
+}
+
+function saveGovVoteDraft() {
+    localStorage.setItem('tau_gov_vote_draft_v1', govVoteUpdateId ? govVoteUpdateId.value : "");
+}
+
+function restoreGovDraft() {
+    try {
+        const uvStr = localStorage.getItem('tau_gov_vote_draft_v1');
+        if (uvStr && govVoteUpdateId) {
+            govVoteUpdateId.value = uvStr;
+            govVoteUpdateId.dispatchEvent(new Event('blur'));
+        }
+        
+        const upStr = localStorage.getItem('tau_gov_update_draft_v1');
+        if (upStr) {
+            const obj = JSON.parse(upStr);
+            if (govActivateHeight) govActivateHeight.value = obj.activate_at_height || "";
+            if (govPatchEnable) {
+                govPatchEnable.checked = obj.host_contract_patch_enabled || false;
+                govPatchFields.style.display = govPatchEnable.checked ? 'block' : 'none';
+                govPatchAdvanced.style.display = govPatchEnable.checked ? 'block' : 'none';
+            }
+            if (govPatchRaw) govPatchRaw.value = obj.host_contract_patch_raw || "";
+            
+            // Restore editors — handle zero revisions with fallback
+            govRevisionsContainer.innerHTML = '';
+            revisionEditors = [];
+            if (Array.isArray(obj.rule_revisions) && obj.rule_revisions.length > 0) {
+                obj.rule_revisions.forEach(rev => addRevisionEditor(rev));
+            } else {
+                addRevisionEditor("");
+            }
+            
+            // Re-run preview, never trust persisted preview status
+            latestPreview = { fingerprint: null, updateId: null, status: 'idle' };
+            triggerPreviewUpdate();
+        }
+    } catch(e) {
+        console.warn("Failed to restore governance draft", e);
+    }
+}
+
+function renderProposals() {
+    if (!isConnected) {
+         pNotLoaded.style.display = 'block';
+         pLoading.style.display = 'none';
+         pEmpty.style.display = 'none';
+         pError.style.display = 'none';
+         pList.style.display = 'none';
+         pStale.style.display = 'none';
+         if (btnRefreshProposals) btnRefreshProposals.disabled = true;
+         if (govValidatorBanner) govValidatorBanner.style.display = 'none';
+         return;
+    }
+    
+    if (btnRefreshProposals) btnRefreshProposals.disabled = false;
+    
+    // Validator Banner
+    if (govValidatorBanner) {
+         if (currentKeyPair && governanceAdvisory && Array.isArray(governanceAdvisory.active_validators)) {
+             const myPub = bytesToHex(currentKeyPair.pub);
+             if (governanceAdvisory.active_validators.includes(myPub)) {
+                 govValidatorBanner.style.display = 'none';
+             } else {
+                 govValidatorBanner.style.display = 'block';
+             }
+         } else {
+             govValidatorBanner.style.display = 'none';
+         }
+    }
+    
+    if (_proposalsState.status === 'not_loaded') {
+         pNotLoaded.style.display = 'block';
+         pLoading.style.display = 'none';
+         pEmpty.style.display = 'none';
+         pError.style.display = 'none';
+         pList.style.display = 'none';
+         pStale.style.display = 'none';
+         return;
+    }
+    
+    if (_proposalsState.status === 'loading') {
+         pNotLoaded.style.display = 'none';
+         pLoading.style.display = 'block';
+         pEmpty.style.display = 'none';
+         pError.style.display = 'none';
+         pList.style.display = 'none';
+         pStale.style.display = 'none';
+         return;
+    }
+    
+    if (_proposalsState.status === 'error' && !_proposalsState.stale) {
+         pNotLoaded.style.display = 'none';
+         pLoading.style.display = 'none';
+         pEmpty.style.display = 'none';
+         pError.style.display = 'block';
+         pList.style.display = 'none';
+         pErrorMsg.textContent = _proposalsState.errorMessage || "Unknown RPC error mapping governance data.";
+         pStale.style.display = 'none';
+         return;
+    }
+    
+    // Render loaded (or stale) list
+    pNotLoaded.style.display = 'none';
+    pLoading.style.display = 'none';
+    pError.style.display = 'none';
+    
+    if (_proposalsState.stale) {
+         pStale.style.display = 'block';
+    } else {
+         pStale.style.display = 'none';
+    }
+    
+    if (_proposalsState.lastRefreshedAt) {
+         const t = _proposalsState.lastRefreshedAt;
+         govProposalsTimestamp.textContent = `Last refreshed at ${t.toLocaleTimeString()}`;
+    }
+    
+    const selectableProposals = _proposalsState.proposals.filter(p => p.isSelectable);
+    
+    if (selectableProposals.length === 0) {
+         pEmpty.style.display = 'block';
+         pList.style.display = 'none';
+         return;
+    }
+    
+    pEmpty.style.display = 'none';
+    pList.style.display = 'block';
+    pList.innerHTML = '';
+    
+    selectableProposals.forEach(p => {
+         const row = document.createElement('div');
+         row.className = 'proposal-row';
+         if (_selectedProposal.updateId === p.updateId && _selectedProposal.sourcedFromList) {
+             row.classList.add('proposal-selected');
+         }
+         
+         let badges = '';
+         if (p.patchSummary) {
+              badges += `<span class="badge bg-secondary proposal-patch-badge" title="Patch: ${p.patchSummary}">patch</span>`;
+         }
+         if (p.revisionCount > 1) {
+              badges += `<span class="badge bg-info proposal-patch-badge">+${p.revisionCount - 1} rev.</span>`;
+         }
+         
+         const thrish = `<span class="proposal-approvals">${p.approvalCount} / ${p.approvalThreshold}</span>`;
+         
+         row.innerHTML = `
+             <div class="d-flex justify-content-between align-items-center mb-1">
+                 <span class="fw-bold font-monospace text-primary">${p.displayId}</span>
+                 <div class="d-flex align-items-center gap-2">
+                     <span class="small text-muted">Height: ${p.activateAtHeight}</span>
+                     ${thrish}
+                 </div>
+             </div>
+             <div class="small">
+                 ${badges}
+                 <span class="text-muted fst-italic">${escapeHtml(p.revisionPreview)}</span>
+             </div>
+         `;
+         
+         row.addEventListener('click', () => {
+             const nextSibling = row.nextElementSibling;
+             if (nextSibling && nextSibling.classList.contains('proposal-detail-drawer')) {
+                 nextSibling.remove();
+             } else {
+                 renderProposalDetail(p, row);
+             }
+         });
+         
+         pList.appendChild(row);
+    });
+}
+
+function escapeHtml(unsafe) {
+    if (!unsafe) return "";
+    return unsafe
+         .replace(/&/g, "&amp;")
+         .replace(/</g, "&lt;")
+         .replace(/>/g, "&gt;")
+         .replace(/"/g, "&quot;")
+         .replace(/'/g, "&#039;");
+}
+
+function renderProposalDetail(proposal, rowElement) {
+    // Close other drawers
+    document.querySelectorAll('.proposal-detail-drawer').forEach(el => el.remove());
+
+    const drawer = document.createElement('div');
+    drawer.className = 'proposal-detail-drawer';
+    
+    let revisionsHtml = '';
+    proposal.revisions.forEach((r, idx) => {
+         revisionsHtml += `
+             <div class="mb-1"><span class="badge bg-dark">Revision [${idx}]</span></div>
+             <pre class="proposal-revision-pre mb-2">${escapeHtml(r)}</pre>
+         `;
+    });
+    
+    const pct = Math.min(100, (proposal.approvalCount / proposal.approvalThreshold) * 100);
+
+    drawer.innerHTML = `
+        <div class="proposal-detail-header">
+            <span class="fw-bold">Proposal Detail</span>
+            <span class="badge bg-info">${proposal.status}</span>
+        </div>
+        <div class="mb-2">
+            <label class="small text-muted">Full Update ID</label>
+            <div class="input-group input-group-sm">
+                <input type="text" class="form-control font-monospace" readonly value="${proposal.updateId}">
+                <button class="btn btn-outline-secondary btn-sm btn-copy-prop" title="Copy">📋</button>
+                <button class="btn btn-primary btn-sm btn-vote-prop">Vote for this proposal</button>
+            </div>
+        </div>
+        <div class="mb-2">
+            <label class="small text-muted">Activation Height</label>
+            <div>${proposal.activateAtHeight}</div>
+        </div>
+        <div class="mb-2">
+            <label class="small text-muted">Recorded Approvals</label>
+            <div>${proposal.approvalCount} / ${proposal.approvalThreshold} (threshold for approval)</div>
+            <div class="progress mt-1" style="height:6px">
+                 <div class="progress-bar bg-success" role="progressbar" style="width: ${pct}%"></div>
+            </div>
+        </div>
+        <div class="mb-2">
+            <label class="small text-muted">Host Contract Patch</label>
+            <div class="font-monospace small bg-white p-1 border rounded">${proposal.patchSummary ? escapeHtml(proposal.patchSummary) : 'None'}</div>
+        </div>
+        <div class="mb-2">
+            <label class="small text-muted">Rule Revisions (${proposal.revisionCount})</label>
+            <div class="small fst-italic mb-1">Only pending proposals can receive approval votes in v1.</div>
+            ${revisionsHtml}
+        </div>
+    `;
+
+    drawer.querySelector('.btn-copy-prop').addEventListener('click', (e) => {
+        e.stopPropagation();
+        navigator.clipboard.writeText(proposal.updateId).then(() => {
+            log("Copied proposal ID to clipboard.", "success");
+        });
+    });
+
+    drawer.querySelector('.btn-vote-prop').addEventListener('click', (e) => {
+        e.stopPropagation();
+        selectProposalForVote(proposal.updateId);
+    });
+
+    rowElement.parentNode.insertBefore(drawer, rowElement.nextSibling);
+}
+
+function selectProposalForVote(updateId) {
+    const proposal = _proposalsState.proposals.find(p => p.updateId === updateId);
+    if (!proposal) return;
+
+    _selectedProposal = { updateId, sourcedFromList: true };
+    if (govVoteUpdateId) {
+        govVoteUpdateId.value = updateId;
+        govVoteUpdateId.dispatchEvent(new Event('blur')); // validate
+    }
+
+    if (govSelectionSummary && govSelectedDisplayId) {
+        govSelectionSummary.style.display = 'block';
+        govSelectedDisplayId.textContent = proposal.displayId;
+        govSelectionAdvisory.style.display = 'none';
+    }
+
+    renderProposals(); // update row selection styles
+    
+    // scroll to form
+    if (govVoteUpdateId) {
+         govVoteUpdateId.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+}
+
+function clearProposalSelection() {
+    _selectedProposal = { updateId: null, sourcedFromList: false };
+    if (govSelectionSummary) {
+        govSelectionSummary.style.display = 'none';
+        govSelectionAdvisory.style.display = 'none';
+    }
+    renderProposals();
+}
+
+function checkSelectedProposalStillPending() {
+    if (!_selectedProposal.sourcedFromList || !_selectedProposal.updateId) return;
+
+    const stillExists = _proposalsState.proposals.find(p => p.updateId === _selectedProposal.updateId && p.isSelectable);
+    
+    if (govSelectionSummary && govSelectionAdvisory) {
+        if (!stillExists) {
+            govSelectionAdvisory.textContent = "This proposal is no longer pending.";
+            govSelectionAdvisory.style.display = 'block';
+            _selectedProposal.sourcedFromList = false;
+        } else {
+            govSelectionAdvisory.style.display = 'none';
+            // update selection summary id in case
+            govSelectedDisplayId.textContent = stillExists.displayId;
+        }
+    }
+    
+    // Live update the drawer if open
+    const openDrawer = document.querySelector('.proposal-detail-drawer');
+    if (openDrawer && stillExists) {
+         const openedId = openDrawer.querySelector('input').value;
+         if (openedId === stillExists.updateId) {
+             const rowE = openDrawer.previousElementSibling;
+             if (rowE) {
+                  openDrawer.remove();
+                  renderProposalDetail(stillExists, rowE);
+             }
+         }
+    }
+}
+
+// ==========================================
+
 // Call this function when the window loads
-window.addEventListener('load', initRuleTemplates);
+window.addEventListener('load', () => {
+    initRuleTemplates();
+    if (btnRefreshProposals) btnRefreshProposals.addEventListener('click', refreshGovernanceAdvisory);
+    if (btnClearSelection) btnClearSelection.addEventListener('click', clearProposalSelection);
+    
+    if (govVoteUpdateId) {
+        govVoteUpdateId.addEventListener('input', () => {
+             if (_selectedProposal.sourcedFromList && govVoteUpdateId.value !== _selectedProposal.updateId) {
+                  // User manually edited the parsed selected input
+                  clearProposalSelection();
+             }
+        });
+    }
+});

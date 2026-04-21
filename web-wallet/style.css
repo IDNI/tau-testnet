@@ -378,6 +378,111 @@ button:disabled {
     margin-top: 5px;
 }
 
+/* Governance Panel Styles */
+.gov-preview-status {
+    font-size: 0.9rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+.gov-preview-status.computing {
+    color: var(--primary);
+    animation: pulse 1.5s infinite ease-in-out;
+}
+@keyframes pulse {
+    0% { opacity: 0.6; }
+    50% { opacity: 1; }
+    100% { opacity: 0.6; }
+}
+.gov-preview-status.ready { color: var(--success); }
+.gov-preview-status.error, .gov-preview-status.invalid { color: var(--error); }
+.gov-preview-status.idle { color: var(--text-muted, #888); }
+
+.gov-readonly-field {
+    background-color: rgba(0, 0, 0, 0.2) !important;
+    color: var(--primary-light) !important;
+    border: 1px solid var(--border) !important;
+}
+
+.revision-block {
+    margin-bottom: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    background: rgba(0,0,0,0.1);
+}
+
+.revision-status {
+    font-size: 0.8rem;
+    margin-top: 5px;
+    display: inline-block;
+}
+.revision-status.valid { color: var(--success); }
+.revision-status.invalid { color: var(--error); }
+
+.tau-warning-banner {
+    border: 1px solid var(--warning);
+}
+
+.proposal-row {
+    border-bottom: 1px solid var(--border);
+    padding: 10px;
+    transition: background-color 0.2s ease;
+    cursor: pointer;
+}
+.proposal-row:last-child {
+    border-bottom: none;
+}
+.proposal-row:hover {
+    background-color: rgba(0, 123, 255, 0.05); /* very light blue */
+}
+.proposal-row.proposal-selected {
+    background-color: rgba(0, 123, 255, 0.1);
+    border-left: 4px solid var(--primary);
+}
+.proposal-detail-drawer {
+    background-color: rgba(0,0,0,0.03);
+    padding: 15px;
+    border-bottom: 1px solid var(--border);
+}
+.proposal-detail-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+    padding-bottom: 10px;
+    border-bottom: 1px dashed var(--border);
+}
+.proposal-revision-pre {
+    background-color: rgba(0,0,0,0.8);
+    color: #0f0;
+    padding: 10px;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    border: 1px solid var(--border);
+}
+.proposal-patch-badge {
+    font-size: 0.75rem;
+    margin-right: 5px;
+}
+#gov-proposals-container {
+    max-height: 400px;
+    overflow-y: auto;
+    background-color: var(--card-bg, #fff);
+}
+.proposal-approvals {
+    font-weight: bold;
+    color: var(--success);
+}
+
+#gov-revisions-container .CodeMirror {
+    height: auto;
+    min-height: 80px;
+    resize: vertical;
+}
+
 /* Mobile Responsiveness */
 @media (max-width: 600px) {
     body {
