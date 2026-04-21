@@ -91,6 +91,7 @@ class TestCustomInputs(unittest.TestCase):
         # rule_text=None, target_output_stream_index=0, input_stream_values=custom_tau_inputs
         self.assertIsNone(kwargs['rule_text'])
         self.assertEqual(kwargs['target_output_stream_index'], 0)
+        self.assertEqual(kwargs['source'], payload['sender_pubkey'])
         inputs = kwargs['input_stream_values']
         self.assertIn(100, inputs)
         self.assertEqual(inputs[100], ["42"]) # Normalized to list of str
@@ -127,11 +128,13 @@ class TestCustomInputs(unittest.TestCase):
         args1, kwargs1 = self.mock_communicate.call_args_list[0]
         self.assertEqual(kwargs1['rule_text'], "some rule")
         self.assertNotIn('input_stream_values', kwargs1) # Ensure input values NOT sent with rule in step 1 if separated
+        self.assertEqual(kwargs1['source'], payload['sender_pubkey'])
         
         # Check second call (Custom)
         args2, kwargs2 = self.mock_communicate.call_args_list[1]
         self.assertIsNone(kwargs2['rule_text'])
         self.assertEqual(kwargs2['input_stream_values'][100], ["42"])
+        self.assertEqual(kwargs2['source'], payload['sender_pubkey'])
 
     def test_engine_apply_execution_order(self):
         """Test TauConsensusEngine.apply executes Rule then Custom Inputs and captures receipts."""

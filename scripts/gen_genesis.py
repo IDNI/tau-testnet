@@ -21,7 +21,9 @@ from block import BlockHeader, sha256_hex
 def get_args():
     import argparse
     parser = argparse.ArgumentParser(description="Generate canonical genesis.json artifact.")
-    parser.add_argument("--validator-key", type=str, required=True, help="96-character hex BLS public key, no 0x prefix")
+    key_group = parser.add_mutually_exclusive_group(required=True)
+    key_group.add_argument("--validator-key", type=str, help="96-character hex BLS public key (48 bytes, no 0x prefix)")
+    key_group.add_argument("--validator-privkey", type=str, help="64-character hex BLS private key (32 bytes). Public key will be derived automatically.")
     parser.add_argument("--genesis-rules-path", type=str, default="genesis.tau", help="Path to genesis.tau")
     parser.add_argument("--genesis-consensus-path", type=str, default="genesis_consensus.tau", help="Path to genesis_consensus.tau")
     parser.add_argument("--genesis-address", type=str, default="f427fbf4cb8cc5ebcfc50add98ba574b94c03b1e32626e2e50cf60ba5e0a6d0c42d3ed702c2e0eeef7fae29bc4f3d2f9", help="Genesis address")
@@ -30,21 +32,39 @@ def get_args():
     parser.add_argument("--out", type=str, default="data/genesis.json", help="Output path for genesis.json")
     return parser.parse_args()
 
+def derive_pubkey_from_privkey(privkey_hex: str) -> str:
+    """Derive a BLS12-381 public key hex from a 32-byte private key hex string."""
+    try:
+        from py_ecc.bls import G2Basic
+    except ImportError:
+        raise ImportError("py_ecc is required to derive a public key. Run: pip install py_ecc")
+    s = privkey_hex.strip().lstrip("0x")
+    try:
+        raw = bytes.fromhex(s)
+    except ValueError:
+        raise ValueError("Private key contains non-hex characters")
+    if len(raw) != 32:
+        raise ValueError(f"Private key must be 32 bytes (64 hex chars), got {len(raw)} bytes")
+    sk_int = int.from_bytes(raw, 'big')
+    pubkey_hex = G2Basic.SkToPk(sk_int).hex()
+    print(f"[INFO] Derived public key from private key: {pubkey_hex}")
+    return pubkey_hex
+
+
 def validate_validator_key(key: str) -> bytes:
     if not isinstance(key, str):
         raise ValueError("Validator key must be a string")
     if key.startswith("0x"):
         raise ValueError("Validator key must not have 0x prefix")
     if len(key) != 96:
-        raise ValueError(f"Validator key must be exactly 96 chars, got {len(key)}")
+        hint = " (That looks like a private key — use --validator-privkey instead)" if len(key) == 64 else ""
+        raise ValueError(f"Validator key must be exactly 96 hex chars (48-byte BLS public key), got {len(key)}{hint}")
     try:
         raw_bytes = bytes.fromhex(key)
     except ValueError:
         raise ValueError("Validator key contains non-hex characters")
-    
     if key != key.lower():
         raise ValueError("Validator key must be strictly lowercase")
-        
     return raw_bytes
 
 def validate_consensus_rules(rules: str):
@@ -87,7 +107,12 @@ def validate_consensus_rules(rules: str):
 def main():
     args = get_args()
 
-    active_validator_bytes = validate_validator_key(args.validator_key)
+    # Support --validator-privkey as a convenience: derive the public key
+    if args.validator_privkey:
+        pubkey_hex = derive_pubkey_from_privkey(args.validator_privkey)
+        active_validator_bytes = validate_validator_key(pubkey_hex)
+    else:
+        active_validator_bytes = validate_validator_key(args.validator_key)
     
     with open(args.genesis_rules_path, "r", encoding="utf-8") as f:
         application_rules = f.read()

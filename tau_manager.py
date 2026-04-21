@@ -25,6 +25,14 @@ def _print_tau_send(label: str, payload: str) -> None:
     else:
         print(f"{COLOR_GREEN}<empty>{COLOR_RESET}", flush=True)
 
+    # Optional disk logging (best-effort)
+    try:
+        prefix = f"SEND {label} >>>"
+        if "source=unknown" not in prefix:
+            tau_io_logger.append_to_debug_file(config.COMM_DEBUG_PATH, prefix, str(payload or ""))
+    except Exception:
+        pass
+
 
 def _print_tau_dispatch(
     *,
@@ -265,6 +273,18 @@ def communicate_with_tau(
         except Exception as ex:
             raise TauCommunicationError(f"Direct Tau communication failed: {ex}", last_state=last_known_tau_spec)
 
+        # Optional disk logging of the response (best-effort)
+        try:
+            prefix = f"RECV source={source} <<< o{target_output_stream_index}"
+            if "source=unknown" not in prefix:
+                tau_io_logger.append_to_debug_file(
+                    config.COMM_DEBUG_PATH,
+                    prefix,
+                    str(output_val or ""),
+                )
+        except Exception:
+            pass
+
         current_full_spec = None
         if hasattr(tau_direct_interface, "get_current_spec"):
             try:
@@ -363,6 +383,20 @@ def communicate_with_tau_multi(
         )
     except Exception as ex:
         raise TauCommunicationError(f"Direct Tau multi-output communication failed: {ex}", last_state=last_known_tau_spec)
+
+    # Optional disk logging of the multi-response (best-effort)
+    try:
+        for idx, val in (result or {}).items():
+            prefix = f"RECV source={source} <<< o{idx}"
+            if "source=unknown" in prefix:
+                continue
+            tau_io_logger.append_to_debug_file(
+                config.COMM_DEBUG_PATH,
+                prefix,
+                str(val or ""),
+            )
+    except Exception:
+        pass
 
     normalized_result = {}
     for idx, val in result.items():

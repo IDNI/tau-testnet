@@ -8,13 +8,48 @@ _MAX_IO_LINES = 5000
 _io_buffer = collections.deque(maxlen=_MAX_IO_LINES)
 _io_lock = threading.Lock()
 
+def _format_lines(prefix: str, content: str) -> list[str]:
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    lines: list[str] = []
+    for line in (content or "").splitlines() or ["<empty>"]:
+        lines.append(f"[{timestamp}] {prefix} {line}")
+    return lines
+
 def _append(prefix: str, content: str):
     """Safely append a formatted line to the circular buffer."""
-    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     with _io_lock:
-        # Split by newlines so each line gets its own prefix and timestamp
-        for line in content.splitlines():
-            _io_buffer.append(f"[{timestamp}] {prefix} {line}")
+        for line in _format_lines(prefix, content):
+            _io_buffer.append(line)
+
+
+def append_to_debug_file(debug_path: str | None, prefix: str, content: str) -> None:
+    """
+    Best-effort append of IO lines to `debug_path`.
+
+    - If `debug_path` is falsy, does nothing.
+    - Creates parent directories if needed.
+    - Never raises (logging should not break consensus / networking).
+    """
+    if not debug_path:
+        return
+
+    try:
+        parent = os.path.dirname(os.path.abspath(debug_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    except Exception:
+        # If debug_path has no dirname (e.g. "tau_input.log"), dirname becomes cwd.
+        pass
+
+    try:
+        with _io_lock:
+            lines = _format_lines(prefix, content)
+        with open(debug_path, "a", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
+    except Exception:
+        # Best-effort: never fail the caller.
+        return
 
 def log_stdin(content: str):
     _append("STDIN  >>>", content)

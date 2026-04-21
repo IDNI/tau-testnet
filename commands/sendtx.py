@@ -407,6 +407,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                             tau_output_rules = tau_manager.communicate_with_tau(
                                 rule_text=rule_text,
                                 target_output_stream_index=0,
+                                source=sender_pubkey,
                                 apply_rules_update=False,
                             )
                             if "Error" in tau_output_rules:
@@ -424,6 +425,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                             rule_text=None,
                             target_output_stream_index=0,
                             input_stream_values=custom_tau_inputs,
+                            source=sender_pubkey,
                             apply_rules_update=False,
                         )
                         if "Error" in tau_output_custom:
@@ -460,6 +462,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                             )
                             tau_outputs = tau_manager.communicate_with_tau_multi(
                                 input_stream_values=tau_input_stream_values,
+                                source=sender_pubkey,
                                 apply_rules_update=False,
                             )
 

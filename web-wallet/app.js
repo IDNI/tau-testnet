@@ -691,19 +691,33 @@ async function onSendTransaction() {
         return;
     }
 
-    // Payload for signing
+    // Payload for the wire (what gets sent to the server)
     const payload = {
+        "tx_type": "user_tx",
         "sender_pubkey": senderPub,
-        "sequence_number": seq, // Use current sequence (as expected by backend)
+        "sequence_number": seq,
         "expiration_time": Math.floor(Date.now() / 1000) + 300, // 5 mins
         "operations": ops,
         "fee_limit": "0"
     };
 
     try {
-        const canonicalJson = canonicalize(payload);
+        // Build signing dict that mirrors server-side _get_signing_message_bytes exactly.
+        // For user_tx the server constructs:
+        //   {sender_pubkey, sequence_number, expiration_time, fee_limit, tx_type, operations}
+        // Canonicalized with sorted keys, no whitespace separators.
+        const signingDict = {
+            "sender_pubkey": payload.sender_pubkey,
+            "sequence_number": payload.sequence_number,
+            "expiration_time": payload.expiration_time,
+            "fee_limit": payload.fee_limit,
+            "tx_type": "user_tx",
+            "operations": payload.operations
+        };
+
+        const canonicalJson = canonicalize(signingDict);
         const msgBytes = new TextEncoder().encode(canonicalJson);
-        const msgHash = sha256(msgBytes); // Hash before signing to match valid server approach
+        const msgHash = sha256(msgBytes);
         const sig = bls.sign(msgHash, currentKeyPair.priv);
 
         const fullTx = {
