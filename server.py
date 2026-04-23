@@ -425,15 +425,13 @@ def _run_server(container: ServiceContainer):
             logger.info("Persisted Tau restore disabled. Replaying only Genesis-derived Tau updates.")
 
         try:
-            if use_persisted_state and has_non_genesis_chain and persisted_full_spec:
-                logger.info(
-                    "Restoring persisted full Tau spec for canonical head #%s (len=%s)...",
-                    latest.get("block_number", 0),
-                    len(persisted_full_spec),
-                )
-                tau_module.restore_full_tau_spec(persisted_full_spec)
-                logger.info("Tau restore completed via persisted full spec snapshot.")
-                return
+            if use_persisted_state:
+                full_spec = chain_state_module.get_rules_state()
+                if full_spec:
+                    logger.info("Restoring Tau spec from chain state (len=%s)...", len(full_spec))
+                    tau_module.restore_full_tau_spec(full_spec)
+                    logger.info("Tau restore completed via chain state snapshot.")
+                    return
 
             restore_plan = chain_state_module.get_tau_restore_plan(use_persisted_state=use_persisted_state)
             if restore_plan:

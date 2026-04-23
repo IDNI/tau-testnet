@@ -227,8 +227,8 @@ class ConsensusLifecycleManager:
             # However, the top-level block application normally checks this. We return False to signify no tally change.
             return False
 
-        if voter_pubkey not in self.active_validators:
-            return False # Only validators can vote
+        # if voter_pubkey not in self.active_validators:
+        #     return False # Only validators can vote
             
         if uid not in self.votes:
             self.votes[uid] = set()
