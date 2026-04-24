@@ -46,6 +46,31 @@ def execute(raw_command: str, container):
                     }
                 )
 
+        try:
+            from consensus.governance import parse_consensus_rule_update
+            mempool_tx_payloads = db.get_mempool_txs()
+            for tx_payload_str in mempool_tx_payloads:
+                try:
+                    tx_data = json.loads(tx_payload_str)
+                    update_obj = parse_consensus_rule_update(tx_data)
+                    if update_obj:
+                        uid_hex = _normalize_hexish(update_obj.update_id)
+                        if uid_hex not in lifecycle:
+                            lifecycle[uid_hex] = "mempool"
+                            pending_updates.append(
+                                {
+                                    "update_id": uid_hex,
+                                    "rule_revisions": list(update_obj.rule_revisions),
+                                    "activate_at_height": int(update_obj.activate_at_height),
+                                    "host_contract_patch": update_obj.host_contract_patch,
+                                }
+                            )
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+
         for activation_height, uid in chain_state._lifecycle_manager.scheduled_updates:
             uid_hex = _normalize_hexish(uid)
             lifecycle[uid_hex] = "approved-and-scheduled"

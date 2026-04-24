@@ -24,6 +24,14 @@ _INPUT_STREAM_NAME_RE = re.compile(r"^i\d+$")
 _UPDATED_SPEC_LINE_RE = re.compile(r"^Updated\s*specification\:\s*(.*)$")
 _HEX_LITERAL_RE = re.compile(r"^[0-9a-fA-F]+$")
 
+def get_memory_rss_mb() -> float:
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            return (pages * page_size) / (1024 * 1024)
+    except Exception:
+        return 0.0
 
 def load_tau_module():
     """
@@ -314,8 +322,12 @@ class TauInterface:
         return "0"
 
     def _build_interpreter_from_spec(self, spec_text: str, *, reason: str):
+        mem_before = get_memory_rss_mb()
         prepared = self.preprocess_spec_text(spec_text)
         interpreter = self.tau.get_interpreter(prepared)
+        mem_after = get_memory_rss_mb()
+        logger.debug(f"[MEM] _build_interpreter_from_spec ({reason}): {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
+        
         if interpreter is None:
             msg = f"Failed to create Tau interpreter ({reason})."
             filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
@@ -326,8 +338,13 @@ class TauInterface:
         return interpreter
 
     def _rebuild_interpreter_from_spec(self, spec_text: str, *, reason: str):
-        self.interpreter = self._build_interpreter_from_spec(spec_text, reason=reason)
-        logger.debug("Rebuilt native Tau interpreter (%s).", reason)
+        mem_before = get_memory_rss_mb()
+        new_interpreter = self._build_interpreter_from_spec(spec_text, reason=reason)
+        old_interpreter = self.interpreter
+        self.interpreter = new_interpreter
+        del old_interpreter
+        mem_after = get_memory_rss_mb()
+        logger.debug(f"[MEM] _rebuild_interpreter_from_spec ({reason}): {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
 
     def _extract_latest_updated_spec(self, captured_output: str) -> str | None:
         if not captured_output:
@@ -465,6 +482,7 @@ class TauInterface:
                     reason = "Sending queued input"
                 elif name == "i0" and normalized_rule_text is not None:
                     value_to_assign = normalized_rule_text
+                    normalized_rule_text = None
                     reason = "Sending rule text"
                 else:
                     value_to_assign = self._fallback_value_for_stream(name)
@@ -482,19 +500,22 @@ class TauInterface:
 
             # Log Inputs
             if input_assignments:
-                 logger.info(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Inputs:{COLOR_RESET}")
+                 logger.debug(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Inputs:{COLOR_RESET}")
                  for k, v in input_assignments.items():
                      val_str = str(v)
                      if "\n" in val_str:
-                         logger.info(f"  {k.name}:")
+                         logger.debug(f"  {k.name}:")
                          for line in val_str.splitlines():
-                             logger.info(f"{COLOR_GREEN}    >>> {line}{COLOR_RESET}")
+                             logger.debug(f"{COLOR_GREEN}    >>> {line}{COLOR_RESET}")
                      else:
-                         logger.info(f"  {k.name}: {COLOR_GREEN}{val_str}{COLOR_RESET}")
+                         logger.debug(f"  {k.name}: {COLOR_GREEN}{val_str}{COLOR_RESET}")
 
             try:
+                mem_before = get_memory_rss_mb()
                 with StdOutCapture() as capture:
                     outputs = self.tau.step(self.interpreter, input_assignments)
+                mem_after = get_memory_rss_mb()
+                logger.debug(f"[MEM] tau.step: {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
                 captured_output += capture.output
             except Exception as e:
                 raise e
@@ -527,18 +548,18 @@ class TauInterface:
 
         # Log Outputs
         if outputs:
-             logger.info(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs:{COLOR_RESET}")
+             logger.debug(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs:{COLOR_RESET}")
              for k, v in outputs.items():
                  val_str = str(v)
                  tau_io_logger.log_native_output(k.name, val_str)
                  if "\n" in val_str:
-                     logger.info(f"  {k.name}:")
+                     logger.debug(f"  {k.name}:")
                      for line in val_str.splitlines():
-                         logger.info(f"{COLOR_BLUE}    <<< {line}{COLOR_RESET}")
+                         logger.debug(f"{COLOR_BLUE}    <<< {line}{COLOR_RESET}")
                  else:
-                     logger.info(f"  {k.name}: {COLOR_BLUE}{val_str}{COLOR_RESET}")
+                     logger.debug(f"  {k.name}: {COLOR_BLUE}{val_str}{COLOR_RESET}")
         else:
-             logger.info(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs: (None){COLOR_RESET}")
+             logger.debug(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs: (None){COLOR_RESET}")
             
         # 3. Extract Output
         target_name = f"o{target_output_stream_index}"
@@ -635,6 +656,7 @@ class TauInterface:
                         del stream_input_queues[name]
                 elif name == "i0" and normalized_rule_text is not None:
                     value_to_assign = normalized_rule_text
+                    normalized_rule_text = None
                 else:
                     value_to_assign = self._fallback_value_for_stream(name)
 
@@ -642,8 +664,11 @@ class TauInterface:
                 tau_io_logger.log_native_input(name, value_to_assign)
 
             try:
+                mem_before = get_memory_rss_mb()
                 with StdOutCapture() as capture:
                     outputs = self.tau.step(self.interpreter, input_assignments)
+                mem_after = get_memory_rss_mb()
+                logger.debug(f"[MEM] tau.step (multi): {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
                 captured_output += capture.output
             except Exception as e:
                 raise e
@@ -675,11 +700,11 @@ class TauInterface:
 
         # Log Outputs
         if outputs:
-            logger.info(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs (multi):{COLOR_RESET}")
+            logger.debug(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs (multi):{COLOR_RESET}")
             for k, v in outputs.items():
                 val_str = str(v)
                 tau_io_logger.log_native_output(k.name, val_str)
-                logger.info(f"  {k.name}: {COLOR_BLUE}{val_str}{COLOR_RESET}")
+                logger.debug(f"  {k.name}: {COLOR_BLUE}{val_str}{COLOR_RESET}")
 
         # Process Spec Updates from STDOUT
         try:

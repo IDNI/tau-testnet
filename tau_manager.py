@@ -18,6 +18,8 @@ COLOR_RESET = "\033[0m"
 
 
 def _print_tau_send(label: str, payload: str) -> None:
+    if label and label.startswith("source=unknown"):
+        return
     print(f"{COLOR_CYAN}[TAU SEND] {label}{COLOR_RESET}", flush=True)
     if payload:
         for line in str(payload).splitlines():
@@ -54,7 +56,7 @@ def _print_tau_dispatch(
                 _print_tau_send(label, str(raw_value))
 
 # --- Rule sanitation -----------------------------------------------------------
-DEFAULT_RULE_BV_WIDTH = 16
+DEFAULT_RULE_BV_WIDTH = 64
 import re
 _BV_TYPE_RE = re.compile(r":\s*bv(?:\s*\[\s*\d+\s*\])?")
 _ADDRESS_LITERAL_BV384_RE = re.compile(

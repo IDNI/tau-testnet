@@ -14,6 +14,6 @@
 # All authorized proposals handled by host PoA are considered eligible (o7 = 1)
 # Blocks are valid strictly if the host cryptographically verifies the proof (o6 = i10)
 always (
-    o6[t]:bv[16] = i10[t]:bv[16] &&
-    o7[t]:bv[16] = { 1 }:bv[16]
+    o6[t]:bv[64] = i10[t]:bv[64] &&
+    o7[t]:bv[64] = { 1 }:bv[64]
 )

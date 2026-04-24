@@ -426,10 +426,9 @@ def _run_server(container: ServiceContainer):
 
         try:
             if use_persisted_state:
-                full_spec = chain_state_module.get_rules_state()
-                if full_spec:
-                    logger.info("Restoring Tau spec from chain state (len=%s)...", len(full_spec))
-                    tau_module.restore_full_tau_spec(full_spec)
+                if persisted_full_spec:
+                    logger.info("Restoring Tau spec from chain state (len=%s)...", len(persisted_full_spec))
+                    tau_module.restore_full_tau_spec(persisted_full_spec)
                     logger.info("Tau restore completed via chain state snapshot.")
                     return
 

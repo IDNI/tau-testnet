@@ -37,7 +37,7 @@ let governanceAdvisory = null;
 const GOV_DEBUG = false;
 let revisionEditors = [];
 
-const DEFAULT_RULE_BV_WIDTH = 16;
+const DEFAULT_RULE_BV_WIDTH = 64;
 const MAX_TAU_TRANSFER_AMOUNT = (1 << DEFAULT_RULE_BV_WIDTH) - 1;
 
 // --- DOM Elements ---
@@ -1923,15 +1923,15 @@ always (
     o7[t]:bv[16] = { 1 }:bv[16]
 ).`,
 
-    "Halt Network (Reject all blocks)": `# ---------------------------------------------------------
-# HALT NETWORK EMERGENCY RULE
-# ---------------------------------------------------------
-# This consensus rule rejects all block proposals unconditionally.
-# Useful for freezing the network during critical migrations.
-always (
-    o6[t]:bv[16] = { 0 }:bv[16] &&
-    o7[t]:bv[16] = { 0 }:bv[16]
-).`,
+    //     "Halt Network (Reject all blocks)": `# ---------------------------------------------------------
+    // # HALT NETWORK EMERGENCY RULE
+    // # ---------------------------------------------------------
+    // # This consensus rule rejects all block proposals unconditionally.
+    // # Useful for freezing the network during critical migrations.
+    // always (
+    //     o6[t]:bv[16] = { 0 }:bv[16] &&
+    //     o7[t]:bv[16] = { 0 }:bv[16]
+    // ).`,
 
     "Whitelist Specific Proposer": `# ---------------------------------------------------------
 # WHITELIST PROPOSER
