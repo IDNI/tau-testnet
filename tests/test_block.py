@@ -187,19 +187,20 @@ class TestBlockCreation(unittest.TestCase):
         self.assertEqual(latest_block['block_hash'], next_block_data['block_hash'])
 
     def test_create_block_with_empty_mempool(self):
-        """Test that no block is created if the mempool is empty."""
+        """Test that an empty block is created if the mempool is empty."""
         # Ensure mempool is empty
         clear_mempool()
         
         # Attempt to create a block
         result = createblock.create_block_from_mempool()
         
-        # Verify no block was created
-        self.assertIn("Mempool is empty", result.get("message", ""))
+        # Verify block was created
+        self.assertIn("block_hash", result)
         
-        # Verify database has no extra blocks (still completely empty)
+        # Verify database has the empty block
         latest_block = get_canonical_head_block()
-        self.assertIsNone(latest_block)
+        self.assertIsNotNone(latest_block)
+        self.assertEqual(len(latest_block['transactions']), 0)
 
     def test_create_block_requires_miner_key(self):
         """Blocks should not be created without a configured PoA key."""

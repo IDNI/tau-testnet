@@ -113,6 +113,11 @@ ENV PYTHONUNBUFFERED=1 \
     TAU_MINER_PUBKEY_PATH=/data/test_miner.pub \
     LD_LIBRARY_PATH=/root/.tau/cvc5/dist/lib:/root/.tau/cvc5/dist/lib64:/root/.tau/boost/dist/lib:/root/.tau/boost/dist/lib64:/app/tau-lang/build-Release
 
+LABEL org.opencontainers.image.title="Tau Testnet" \
+      org.opencontainers.image.description="Standalone Tau Testnet node with bundled tau-lang native bindings" \
+      org.opencontainers.image.source="https://github.com/IDNI/tau-testnet" \
+      org.opencontainers.image.licenses="see LICENSE.md"
+
 EXPOSE 65432 65433 4001
 VOLUME ["/data"]
 

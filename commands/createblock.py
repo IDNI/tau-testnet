@@ -174,11 +174,13 @@ def create_block_from_mempool() -> Dict:
 
     if not config.MINER_PRIVKEY:
         print("[ERROR][createblock] PoA mining requires MINER_PRIVKEY to be configured.")
-        return {"error": "PoA mining requires a configured miner key."}
+        msg = "PoA mining requires a configured miner key."
+        return {"error": msg, "message": msg}
 
     if not _BLS_AVAILABLE:
         print("[ERROR][createblock] BLS signing not available; cannot sign PoA block.")
-        return {"error": "BLS signing is required for PoA blocks."}
+        msg = "BLS signing is required for PoA blocks."
+        return {"error": msg, "message": msg}
     
     # Ensure early turn-check and block number logic happens BEFORE reserving mempool
     latest_block = db.get_canonical_head_block()
@@ -211,22 +213,32 @@ def create_block_from_mempool() -> Dict:
     # Extract data
     mempool_txs = [rtx['payload'] for rtx in reserved_txs]
     reserved_ids = [rtx['id'] for rtx in reserved_txs]
+    reserved_hashes = [rtx.get('tx_hash') for rtx in reserved_txs]
     
     # Fix JSON alignment
     # We must filter reserved_ids and transactions in lockstep
     transactions = []
+    execution_transactions = []
     filtered_reserved_ids = []
     skipped_count = 0
     
     for i, tx_data in enumerate(mempool_txs):
         r_id = reserved_ids[i]
+        tx_hash = reserved_hashes[i]
         try:
             clean_data = tx_data
             if clean_data.startswith("json:"):
                 clean_data = clean_data[5:]
             
             tx = json.loads(clean_data)
+            # Ensure every tx has a stable identifier so the consensus engine can
+            # report acceptance/rejection. Keep this synthetic ID out of the
+            # persisted block body so tx_ids remains the canonical ID surface.
+            execution_tx = dict(tx) if isinstance(tx, dict) else tx
+            if isinstance(execution_tx, dict) and not execution_tx.get("tx_id") and tx_hash:
+                execution_tx["tx_id"] = tx_hash
             transactions.append(tx)
+            execution_transactions.append(execution_tx)
             filtered_reserved_ids.append(r_id)
         except json.JSONDecodeError as e:
             print(f"[WARN][createblock] Skipping invalid JSON transaction #{i+1}: {e}")
@@ -287,7 +299,7 @@ def create_block_from_mempool() -> Dict:
         candidate_block = block.Block.create(
             block_number=block_number,
             previous_hash=previous_hash,
-            transactions=transactions,
+            transactions=execution_transactions,
             proposer_pubkey=config.MINER_PUBKEY,
             timestamp=block_timestamp,
             state_hash=''
@@ -300,10 +312,10 @@ def create_block_from_mempool() -> Dict:
         final_txs = []
         final_reserved_ids = []
         
-        for i, tx in enumerate(transactions):
+        for i, tx in enumerate(execution_transactions):
              tx_id = tx.get('tx_id')
              if tx_id in apply_result.accepted_tx_ids or tx_id in apply_result.skipped_tx_ids:
-                 final_txs.append(tx)
+                 final_txs.append(transactions[i])
              # Whether applied, skipped, or structurally invalid, we dispose of them from mempool!
              if tx_id in apply_result.accepted_tx_ids or tx_id in apply_result.skipped_tx_ids or tx_id in apply_result.invalid_tx_ids:
                  final_reserved_ids.append(filtered_reserved_ids[i])
@@ -332,15 +344,22 @@ def create_block_from_mempool() -> Dict:
             print(f"[ERROR][createblock] Failed to generate consensus proof: {e}")
             import db as _db
             _db.unreserve_mempool_txs(reserved_ids)
-            return {"error": f"Failed to sign block: {e}"}
+            msg = f"Failed to sign block: {e}"
+            return {"error": msg, "message": msg}
 
         # 5. Full Final Acceptance Path
         # The node runs standard process_new_block ingestion as if we imported it over network.
         # This guarantees path equivalence.
         if not chain_state.process_new_block(candidate_block):
              import db as _db
+             # Return the full reserved batch to pending first, then drop any txs
+             # we determined are safe to dispose (invalid/skipped/accepted) to avoid
+             # poisoning the mempool with permanently-invalid transactions.
              _db.unreserve_mempool_txs(reserved_ids)
-             return {"error": "Failed to persist new canonical block"}
+             if final_reserved_ids:
+                 _db.remove_transactions(final_reserved_ids)
+             msg = "Failed to persist new canonical block"
+             return {"error": msg, "message": msg}
              
         # 6. Mempool Disposition
         if final_reserved_ids:
@@ -352,7 +371,8 @@ def create_block_from_mempool() -> Dict:
         print(f"[ERROR][createblock] Block creation failed during native simulation: {e}")
         import db as _db
         _db.unreserve_mempool_txs(reserved_ids)
-        return {"error": str(e)}
+        msg = str(e)
+        return {"error": msg, "message": msg}
         
     print(f"[INFO][createblock] Block creation process completed!")
     return new_block.to_dict()

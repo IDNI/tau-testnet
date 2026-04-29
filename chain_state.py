@@ -780,10 +780,28 @@ def load_genesis(genesis_json_path: str):
     if not db_genesis_hash:
         raise ValueError("FATAL: Database initialized but Genesis Block 0 is missing!")
 
-    if db_genesis_hash != genesis_data["block_0"]["hash"]:
-        raise ValueError(f"FATAL: Database initialized but Genesis Block 0 mismatched! Expected: {genesis_data['block_0']['hash']}, Found: {db_genesis_hash}")
-
+    expected_genesis_hash = genesis_data["block_0"]["hash"]
     db_genesis = db.get_block_by_hash(db_genesis_hash)
+    if db_genesis_hash != expected_genesis_hash:
+        header_derived_hash = ""
+        try:
+            expected_block = block_module.Block.from_dict(genesis_data["block_0"])
+            header_derived_hash = block_module.sha256_hex(expected_block.header.canonical_bytes())
+        except Exception:
+            header_derived_hash = ""
+
+        expected_header = genesis_data["block_0"].get("header", {})
+        actual_header = (db_genesis or {}).get("header", {})
+        headers_match = all(actual_header.get(key) == val for key, val in expected_header.items())
+
+        if headers_match and db_genesis_hash in {"GENESIS", header_derived_hash} and db_genesis:
+            if db.normalize_genesis_hash(db_genesis_hash, expected_genesis_hash, db_genesis):
+                db_genesis_hash = expected_genesis_hash
+                db_genesis = db.get_block_by_hash(db_genesis_hash)
+
+    if db_genesis_hash != expected_genesis_hash:
+        raise ValueError(f"FATAL: Database initialized but Genesis Block 0 mismatched! Expected: {expected_genesis_hash}, Found: {db_genesis_hash}")
+
     if not db_genesis:
         raise ValueError("FATAL: Database corrupted! Genesis hash found but block body missing.")
 

@@ -58,7 +58,7 @@ def _print_tau_dispatch(
 # --- Rule sanitation -----------------------------------------------------------
 DEFAULT_RULE_BV_WIDTH = 64
 import re
-_BV_TYPE_RE = re.compile(r":\s*bv(?:\s*\[\s*\d+\s*\])?")
+_BV_TYPE_RE = re.compile(r":\s*bv(?!\s*\[)")
 _ADDRESS_LITERAL_BV384_RE = re.compile(
     r"(\{\s*#x[0-9a-fA-F]{96}\s*\})\s*:\s*bv\s*\[\s*384\s*\]"
 )
@@ -176,6 +176,12 @@ def start_and_manage_tau_process():
         logger.info("Server shutdown requested, Tau manager exiting (Direct Mode).")
     except Exception as e:
         logger.critical(f"Failed to initialize Tau Native Interface: {e}")
+        tau_test_mode = True
+        tau_process_ready.set()
+        tau_ready.set()
+        while not server_should_stop.is_set():
+            time.sleep(0.05)
+        logger.info("Server shutdown requested, Tau manager exiting (Fallback Test Mode).")
         return
 
 
@@ -222,6 +228,29 @@ def communicate_with_tau(
                         return v[0]
                     return v
                 return tau_defs.TRANSACTION_VALIDATION_SUCCESS
+            elif target_output_stream_index == 2:
+                # Balance check: i1=amount, i2=balance
+                try:
+                    amt = int((input_stream_values or {}).get(1, 0))
+                    bal = int((input_stream_values or {}).get(2, 0))
+                    return "1" if amt <= bal else "0"
+                except Exception:
+                    return "0"
+            elif target_output_stream_index == 3:
+                # Address inequality check: i3=from, i4=to
+                try:
+                    src = str((input_stream_values or {}).get(3, ""))
+                    dst = str((input_stream_values or {}).get(4, ""))
+                    return "0" if src == dst else "1"
+                except Exception:
+                    return "0"
+            elif target_output_stream_index == 4:
+                # Non-zero amount check: i1=amount
+                try:
+                    amt = int((input_stream_values or {}).get(1, 0))
+                    return "0" if amt == 0 else "1"
+                except Exception:
+                    return "0"
             return tau_defs.TAU_VALUE_ZERO
 
         if not tau_direct_interface:
@@ -494,6 +523,13 @@ def parse_tau_output(output_val: str) -> int:
     try:
         if val.startswith("result:"):
              val = val[7:].strip()
+
+        # Handle Tau's bitvector literal wrapper forms like:
+        #   "{ #x01 }:bv[8]" or "{ 1 }:bv[64]"
+        if val.startswith("{") and "}" in val:
+            inner = val[val.find("{") + 1 : val.find("}")].strip()
+            # Strip any trailing commas/spaces in pretty-printer outputs.
+            val = inner.strip().rstrip(",")
              
         if val.startswith("#b"):
             converted_val = int(val[2:], 2)

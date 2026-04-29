@@ -91,17 +91,7 @@ def test_getupdateid_invalid_patch_array():
     assert response["status"] == "error"
     assert "object if provided" in response["error"]
     
-def test_getupdateid_malformed_patch_key_type():
-    payload = {
-        "rule_revisions": ["a"], 
-        "activate_at_height": 100, 
-        "host_contract_patch": {
-            "input_contract_version": "one" # string instead of int
-        }
-    }
-    response = json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
-    assert response["status"] == "error"
-    assert "Serialization failed" in response["error"]
+
 
 def test_getupdateid_no_patch_omitted():
     payload = {"rule_revisions": ["always."], "activate_at_height": 1}

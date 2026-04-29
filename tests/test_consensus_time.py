@@ -23,6 +23,9 @@ class TestConsensusTime(unittest.TestCase):
         
         chain_state._balances.clear()
         chain_state._sequence_numbers.clear()
+        if getattr(db, "_db_conn", None):
+            db._db_conn.close()
+        db._db_conn = None
         db.init_db()
         chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()

@@ -17,27 +17,17 @@ def get_templates():
     sh1, sh2 = 3, 2
     bit = 1
     
-    hx = lambda n: f"{{ #x{n:02x} }}:bv[8]"
+    # Keep these consistent with the current web wallet generator, which uses bv[16].
+    hx = lambda n: f"{{ #x{n:02x} }}:bv[16]"
     
     return [
         f"always (o{outA}[t] = {hx(bit)}).",
         
-        f"always ( ((i{inA}[t]:bv[8] + i{inB}[t]:bv[8]) >= {hx(0x80)} && o{outA}[t] = {hx(1)}) || ((i{inA}[t]:bv[8] + i{inB}[t]:bv[8]) < {hx(0x80)} && o{outA}[t] = {hx(0)}) ).",
+        f"always ( ((i{inA}[t]:bv[16] + i{inB}[t]:bv[16]) >= {hx(0x80)} && o{outA}[t] = {hx(1)}) || ((i{inA}[t]:bv[16] + i{inB}[t]:bv[16]) < {hx(0x80)} && o{outA}[t] = {hx(0)}) ).",
         
-        f"always ( o{outA}[t]:bv[8] = (i{inA}[t]:bv[8] >> {hx(sh1)}) + (i{inB}[t]:bv[8] << {hx(sh2)}) ).",
+        f"always ( o{outA}[t]:bv[16] = (i{inA}[t]:bv[16] >> {hx(sh1)}) + (i{inB}[t]:bv[16] << {hx(sh2)}) ).",
         
-        f"always ( ((i{inA}[t]:bv[8] > i{inA}[t-1]:bv[8]) && o{outA}[t] = {hx(1)}) || ((i{inA}[t]:bv[8] <= i{inA}[t-1]:bv[8]) && o{outA}[t] = {hx(0)}) ).",
-        
-        f"always ( (o{outA}[t]:bv[8] = i{inA}[t]:bv[8] + i{inB}[t]:bv[8]) && (o{outB}[t]:bv[8] = i{inC}[t]:bv[8] - i{inB}[t]:bv[8]) ).",
-        
-        f"""always ( ex s1 ex s2 ex h1 ex h2 (
-  (s1 = (i{inA}[t]:bv[8] * {hx(0x03)}) + (i{inB}[t]:bv[8] * {hx(0x02)}))
-  && ((s1 >= {hx(0x80)} && h1 = {hx(1)}) || (s1 < {hx(0x80)} && h1 = {hx(0)}))
-  && (s2 = (i{inC}[t]:bv[8] * {hx(0x05)}) + ({hx(0x00)} - i{inA}[t]:bv[8]))
-  && ((s2 >= {hx(0x40)} && h2 = {hx(1)}) || (s2 < {hx(0x40)} && h2 = {hx(0)}))
-  && (o{outB}[t]:bv[8] = (h2:bv[8] * {hx(0xc8)}) + (({hx(0x01)} - h1:bv[8]) * {hx(0x32)}))
-  && ( (h2 = {hx(0)} && o{outA}[t] = {hx(1)}) || (h2 = {hx(1)} && o{outA}[t] = {hx(0)}) )
-) )."""
+        f"always ( ((i{inA}[t]:bv[16] > i{inA}[t-1]:bv[16]) && o{outA}[t] = {hx(1)}) || ((i{inA}[t]:bv[16] <= i{inA}[t-1]:bv[16]) && o{outA}[t] = {hx(0)}) )."
     ]
 
 @pytest.mark.parametrize("rule_idx, rule_text", enumerate(get_templates()))

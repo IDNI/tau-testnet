@@ -59,8 +59,8 @@ def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView)
     Validate the core fields and parameters of a consensus_rule_update payload.
     """
     sender = tx.get("sender_pubkey")
-    # if sender not in tip_view.active_validators:
-    #     return format_error(f"Proposer {sender[:10]} is not an active validator.")
+    if sender not in tip_view.active_validators:
+        return format_error(f"Proposer {sender[:10]} is not an active validator.")
 
     if "rule_revisions" not in tx or not isinstance(tx["rule_revisions"], list) or len(tx["rule_revisions"]) == 0:
         return format_error("Missing or invalid 'rule_revisions' list. Must be a non-empty list.")
@@ -121,7 +121,9 @@ def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView)
                 logger.warning(f"Revision potentially shadowing {stream_idx}")
     
     # Native dummy execution segfaults when validating isolated revisions due to missing inputs
-    # We instead rely on the syntax pass and static ABI warnings, allowing E2E test to pass
+    # We instead rely on:
+    # - a preprocessing/syntax pass for each revision, and
+    # - a full staged compile via Tau (o0) to catch hard parse/compile failures.
     try:
          for rev in tx["rule_revisions"]:
              import tau_native
@@ -130,6 +132,23 @@ def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView)
     except Exception as e:
          return format_error(f"Internal compiler failure natively: {e}")
 
+    try:
+        # Full staged compile: if Tau rejects the combined spec, admission must fail.
+        # Tests patch `communicate_with_tau` here to simulate compile errors.
+        compile_res = communicate_with_tau(
+            rule_text=current_state,
+            target_output_stream_index=0,
+            source="mempool_admission_compile",
+            wait_for_ready=False,
+        )
+        if isinstance(compile_res, str) and "error" in compile_res.lower():
+            return format_error(f"Consensus update staging compile failed: {compile_res}")
+    except Exception as e:
+        if "Direct Tau Interface used but not initialized" in str(e):
+            logger.warning("Skipping staged Tau compile because the direct interface is not initialized.")
+            return success()
+        return format_error(f"Consensus update staging compile failed: {e}")
+
     return success()
 
 def validate_consensus_rule_vote_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
@@ -137,8 +156,8 @@ def validate_consensus_rule_vote_payload(tx: Dict, tip_view: TipAdmissionView) -
     Validate the core fields and precedence of consensus_rule_vote transactions.
     """
     sender = tx.get("sender_pubkey")
-    # if sender not in tip_view.active_validators:
-    #      return format_error(f"Voter {sender[:10]} is not an active validator.")
+    if sender not in tip_view.active_validators:
+         return format_error(f"Voter {sender[:10]} is not an active validator.")
          
     update_id = tx.get("update_id")
     if not isinstance(update_id, str):

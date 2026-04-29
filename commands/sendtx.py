@@ -534,9 +534,10 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
         db.add_mempool_tx(tx_canonical_blob, tx_message_id, received_at)
         logger.info("Transaction successfully queued in mempool.")
         if propagate:
-            svc = network_bus.get()
-            if svc:
-                svc.broadcast_transaction(tx_canonical_blob, tx_message_id)
+            if network_bus is not None:
+                svc = network_bus.get()
+                if svc:
+                    svc.broadcast_transaction(tx_canonical_blob, tx_message_id)
         if empty_transfer_list:
             return "SUCCESS: Transaction queued (empty transfer list)."
         return "SUCCESS: Transaction queued."

@@ -79,6 +79,47 @@ The libp2p-based DHT layer now exposes several runtime knobs through `NetworkCon
 
 Call `NetworkService.get_metrics_snapshot()` (or read the periodic `[metrics]` log line) to monitor gossip activity, routing table counts, and bucket refresh results.
 
+## Developer CLI (`tau-testnet`)
+
+The repo ships a single installable CLI named `tau-testnet` that wraps node
+RPC, key management, transaction signing, governance, and Docker. The legacy
+entrypoints `python server.py`, `python wallet.py`, and the standalone
+Dockerfile remain fully supported.
+
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -e .
+tau-testnet --help
+```
+
+Common workflows:
+
+```bash
+# Inspect a running node
+tau-testnet ping
+tau-testnet --json governance
+
+# Manage local keys (stored under ~/.tau-testnet/keys, chmod 0600)
+tau-testnet keys save --name alice
+tau-testnet keys list
+
+# Send a transfer
+tau-testnet tx send --key alice --to <recipient_pubkey> --amount 10
+
+# Submit a governance proposal / vote (sender must be an active validator;
+# see docs/developer_cli.md for the validator-setup recipe)
+tau-testnet gov propose --key alice --file consensus_update.json
+tau-testnet gov vote --key alice --update-id <update_id_hex>
+
+# Connect to a remote node
+tau-testnet --host testnet.tau.net --port 65432 status
+```
+
+Full reference, including the validator-setup recipe and the update lifecycle
+(`mempool` → `pending` → `approved-and-scheduled` → `activated`):
+[docs/developer_cli.md](docs/developer_cli.md).
+
 ## Setup and Running
 
 ### Prerequisites

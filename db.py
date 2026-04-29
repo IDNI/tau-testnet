@@ -18,10 +18,97 @@ _db_conn = None
 _db_lock = threading.Lock()
 
 
+def _is_hash_hex(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _rewrite_genesis_hash(
+    conn: sqlite3.Connection,
+    old_hash: str,
+    canonical_hash: str,
+    block_payload: dict,
+) -> bool:
+    if not old_hash or not _is_hash_hex(canonical_hash):
+        return False
+
+    payload = dict(block_payload or {})
+    payload["block_hash"] = canonical_hash
+    if "hash" in payload:
+        payload["hash"] = canonical_hash
+    normalized_block_data = json.dumps(payload)
+
+    existing = conn.execute(
+        "SELECT 1 FROM blocks WHERE block_hash = ? LIMIT 1",
+        (canonical_hash,),
+    ).fetchone()
+
+    if existing and old_hash != canonical_hash:
+        conn.execute(
+            "UPDATE blocks SET block_data = ? WHERE block_hash = ?",
+            (normalized_block_data, canonical_hash),
+        )
+        conn.execute(
+            "DELETE FROM blocks WHERE block_hash = ? AND block_number = 0",
+            (old_hash,),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE blocks
+            SET block_hash = ?, previous_hash = ?, block_data = ?
+            WHERE block_hash = ? AND block_number = 0
+            """,
+            (
+                canonical_hash,
+                payload.get("header", {}).get("previous_hash", "0" * 64),
+                normalized_block_data,
+                old_hash,
+            ),
+        )
+
+    conn.execute(
+        "UPDATE blocks SET previous_hash = ? WHERE previous_hash = ?",
+        (canonical_hash, old_hash),
+    )
+    conn.execute(
+        "UPDATE chain_state SET value = ? WHERE key = 'canonical_head_hash' AND value = ?",
+        (canonical_hash, old_hash),
+    )
+    conn.execute(
+        "UPDATE peers SET genesis_hash = ? WHERE genesis_hash = ?",
+        (canonical_hash, old_hash),
+    )
+    conn.execute(
+        "UPDATE peers SET head_hash = ? WHERE head_hash = ?",
+        (canonical_hash, old_hash),
+    )
+    return True
+
+
+def normalize_genesis_hash(old_hash: str, canonical_hash: str, block_payload: dict) -> bool:
+    """Rewrite a legacy block-0 hash and local references to the canonical artifact hash."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        changed = _rewrite_genesis_hash(_db_conn, old_hash, canonical_hash, block_payload)
+        if changed:
+            _db_conn.commit()
+            logger.info("Normalized legacy genesis hash %s to %s", old_hash, canonical_hash)
+        return changed
+
+
 def _normalize_legacy_genesis_row(conn: sqlite3.Connection) -> None:
     """
     Upgrade older databases that stored block 0 under the sentinel hash "GENESIS".
-    Rewrites the row and all local references to the canonical header-derived hash.
+    Rewrites the row and all local references to the artifact hash when it is
+    embedded in the stored block body. If not, load_genesis will repair it once
+    data/genesis.json is available.
     """
     try:
         cur = conn.execute(
@@ -44,78 +131,14 @@ def _normalize_legacy_genesis_row(conn: sqlite3.Connection) -> None:
         logger.warning("Legacy genesis row found but block_data is invalid JSON; leaving untouched.")
         return
 
-    try:
-        header_payload = payload.get("header", {}) if isinstance(payload, dict) else {}
-        header = block_module.BlockHeader(
-            block_number=int(header_payload.get("block_number") or 0),
-            previous_hash=str(header_payload.get("previous_hash") or "0" * 64),
-            timestamp=int(header_payload.get("timestamp") or 0),
-            merkle_root=str(header_payload.get("merkle_root") or "0" * 64),
-            proposer_pubkey=str(header_payload.get("proposer_pubkey") or ""),
-            state_hash=str(header_payload.get("state_hash") or block_module.EMPTY_STATE_HASH),
-            state_locator=str(header_payload.get("state_locator") or ""),
-        )
-        canonical_hash = block_module.sha256_hex(header.canonical_bytes())
-    except Exception:
-        logger.warning("Legacy genesis row found but canonical hash derivation failed.", exc_info=True)
+    canonical_hash = payload.get("block_hash") or payload.get("hash")
+    if canonical_hash == "GENESIS" or not _is_hash_hex(canonical_hash):
+        logger.info("Legacy genesis sentinel found without embedded artifact hash; deferring normalization.")
         return
 
-    if not canonical_hash or canonical_hash == "GENESIS":
-        logger.warning("Legacy genesis row normalization produced invalid hash %r; leaving untouched.", canonical_hash)
-        return
-
-    payload["block_hash"] = canonical_hash
-    if "hash" in payload:
-        payload["hash"] = canonical_hash
-    normalized_block_data = json.dumps(payload)
-
     try:
-        existing = conn.execute(
-            "SELECT 1 FROM blocks WHERE block_hash = ? LIMIT 1",
-            (canonical_hash,),
-        ).fetchone()
-
-        if existing:
-            conn.execute(
-                "UPDATE blocks SET block_data = ? WHERE block_hash = ?",
-                (normalized_block_data, canonical_hash),
-            )
-            conn.execute(
-                "DELETE FROM blocks WHERE block_hash = ? AND block_number = 0",
-                ("GENESIS",),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE blocks
-                SET block_hash = ?, previous_hash = ?, block_data = ?
-                WHERE block_hash = ? AND block_number = 0
-                """,
-                (
-                    canonical_hash,
-                    header.previous_hash,
-                    normalized_block_data,
-                    "GENESIS",
-                ),
-            )
-
-        conn.execute(
-            "UPDATE blocks SET previous_hash = ? WHERE previous_hash = ?",
-            (canonical_hash, "GENESIS"),
-        )
-        conn.execute(
-            "UPDATE chain_state SET value = ? WHERE key = 'canonical_head_hash' AND value = ?",
-            (canonical_hash, "GENESIS"),
-        )
-        conn.execute(
-            "UPDATE peers SET genesis_hash = ? WHERE genesis_hash = ?",
-            (canonical_hash, "GENESIS"),
-        )
-        conn.execute(
-            "UPDATE peers SET head_hash = ? WHERE head_hash = ?",
-            (canonical_hash, "GENESIS"),
-        )
-        logger.info("Normalized legacy genesis sentinel hash to %s", canonical_hash)
+        if _rewrite_genesis_hash(conn, "GENESIS", canonical_hash, payload):
+            logger.info("Normalized legacy genesis sentinel hash to %s", canonical_hash)
     except sqlite3.Error:
         logger.warning("Failed to normalize legacy genesis row", exc_info=True)
 

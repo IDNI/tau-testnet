@@ -47,6 +47,7 @@ import tau_defs
 import utils
 import config
 import db
+import chain_state
 
 class TestTauLogic(unittest.TestCase):
     manager_thread = None
@@ -57,11 +58,20 @@ class TestTauLogic(unittest.TestCase):
         os.environ["TAU_DB_PATH"] = TEST_DB_PATH
         os.environ["TAU_FORCE_TEST"] = "0" # FORCE REAL ENGINE
         print("\n--- Starting Tau Manager for TestTauLogic ---")
+        chain_state._balances.clear()
+        chain_state._sequence_numbers.clear()
+        chain_state._application_rules_state = ""
+        chain_state._consensus_rules_state = ""
+        chain_state._canonical_head_hash = ""
+        
         if os.path.exists(TEST_DB_PATH):
             try:
                 os.remove(TEST_DB_PATH)
             except OSError:
                 pass
+        if getattr(db, "_db_conn", None):
+            db._db_conn.close()
+        db._db_conn = None
         db.init_db()
 
         if not os.path.exists(config.TAU_PROGRAM_FILE):

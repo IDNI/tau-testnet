@@ -10,4 +10,4 @@
 # Logic:
 # If amount == 0, the check fails (output 0).
 # Otherwise, the check passes (output 1).
-always (((i1[t] = { 0 }:bv) ? o4[t] = { 0 }:bv : o4[t] = { 1 }:bv)).
+always ( ((i1[t]:bv[16] = { #x0000 }:bv[16]) && o4[t] = { #x0000 }:bv[16]) || ((i1[t]:bv[16] != { #x0000 }:bv[16]) && o4[t] = { #x0001 }:bv[16]) ).

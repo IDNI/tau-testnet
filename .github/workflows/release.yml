@@ -1,0 +1,111 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Manual tag to publish (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write   # creating GitHub Releases + uploading wheel/sdist artifacts
+  packages: write   # pushing to ghcr.io/idni/tau-testnet
+
+jobs:
+  python-build:
+    name: Python wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m pip install -e ".[test]"
+
+      - name: Run CLI test suite
+        run: python -m pytest tests/test_cli_parser.py tests/test_cli_rpc.py tests/test_cli_keys.py tests/test_cli_tx.py tests/test_cli_governance.py tests/test_cli_docker.py -p no:asyncio -v
+
+      - name: Build wheel + sdist
+        run: python -m build
+
+      - name: Upload dist/ artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tau-testnet-dist
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  docker-build:
+    name: Build + push standalone Docker image to GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            REF="${{ inputs.tag }}"
+          else
+            REF="${GITHUB_REF_NAME}"
+          fi
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          if [[ "${REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "is_stable=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "is_stable=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/tau-testnet"
+          # Always push the version-specific tag.
+          TAGS="${IMAGE}:${{ steps.tag.outputs.ref }}"
+          # Push :latest only for stable v<MAJOR>.<MINOR>.<PATCH> tags.
+          if [[ "${{ steps.tag.outputs.is_stable }}" == "true" ]]; then
+            TAGS="${TAGS}\n${IMAGE}:latest"
+          fi
+          {
+            echo "tags<<EOF"
+            echo -e "${TAGS}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.standalone
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.ref }}

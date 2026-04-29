@@ -162,7 +162,9 @@ class Block:
         transactions = payload.get("transactions") if isinstance(payload, dict) else None
         if not isinstance(transactions, list):
             transactions = []
-        block_hash = str(payload.get("block_hash") or "")
+        # Historical genesis artifacts used `hash` while the runtime uses `block_hash`.
+        # Accept both so genesis.json remains a stable golden vector.
+        block_hash = str(payload.get("block_hash") or payload.get("hash") or "")
         tx_ids = payload.get("tx_ids")
         if not isinstance(tx_ids, list) or not all(isinstance(x, str) for x in tx_ids):
             tx_ids = [compute_tx_hash(tx) for tx in transactions]

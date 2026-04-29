@@ -22,6 +22,7 @@ node_modules/
 # Editor directories and files
 .idea
 .vscode
+.claude
 *.suo
 *.ntvs*
 *.njsproj
@@ -40,6 +41,8 @@ MagicMock
 !LICENSE.md
 !WALLET_USAGE.md
 !docs/CONSENSUS_ARCHITECTURE.md
+!docs/developer_cli.md
+!docs/packaging.md
 
 # Python
 __pycache__/
@@ -58,6 +61,8 @@ nosetests.xml
 coverage.xml
 *.cover
 .pytest_cache/
+*.egg-info/
+/dist/
 
 # Database files
 *.db
