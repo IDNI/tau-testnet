@@ -398,7 +398,13 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
 
                 # Step 1: Rule Validation (if present)
                 if has_rules:
-                    rule_text = operations.get("0", "").strip()
+                    rule_value = operations.get("0", "")
+                    if not isinstance(rule_value, str):
+                        return (
+                            f"FAILURE: Invalid operation '0' (rule). "
+                            f"Must be a string, got {type(rule_value).__name__}."
+                        )
+                    rule_text = rule_value.strip()
                     if rule_text:
                         if tau_force_test:
                             logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")

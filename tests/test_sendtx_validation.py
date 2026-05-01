@@ -162,3 +162,28 @@ class TestSendTxValidation(unittest.TestCase):
         mempool = db.get_mempool_txs()
         self.assertEqual(len(mempool), 1)
         self.assertEqual(json.loads(mempool[0]), json.loads(tx_json))
+
+    def test_fail_non_string_rule_operation_returns_clean_failure(self):
+        """Regression: a non-string at operations['0'] used to raise
+        AttributeError ('list' object has no attribute 'strip') because the
+        rule branch called .strip() unconditionally. It should now return a
+        FAILURE message identifying the offending key.
+        """
+        tx = {
+            "tx_type": "user_tx",
+            "sender_pubkey": GENESIS,
+            "sequence_number": chain_state.get_sequence_number(GENESIS),
+            "expiration_time": int(time.time()) + 1000,
+            # operations['0'] is a list — invalid; the server must not crash.
+            "operations": {"0": ["always."]},
+            "fee_limit": "0",
+            "signature": "SIG",
+        }
+        tx_json = json.dumps(tx)
+        result = sendtx.queue_transaction(tx_json)
+        self.assertTrue(
+            result.startswith("FAILURE:"),
+            f"expected FAILURE prefix, got {result!r}",
+        )
+        self.assertIn("operation '0'", result)
+        self.assertIn("string", result)
