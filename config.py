@@ -134,6 +134,7 @@ class AuthoritySettings:
     miner_pubkey: str = (
         "a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b"
     )
+    miner_pubkeys: List[str] = field(default_factory=list)
     miner_pubkey_path: Optional[str] = None
     miner_privkey: Optional[str] = None
     miner_privkey_path: Optional[str] = field(
@@ -152,6 +153,15 @@ class AuthoritySettings:
                 bytes.fromhex(self.miner_pubkey)
             except ValueError as exc:
                 raise ConfigurationError("Authority miner_pubkey must be valid hexadecimal.") from exc
+        for index, pubkey in enumerate(self.miner_pubkeys):
+            if not (isinstance(pubkey, str) and len(pubkey) == 96 and pubkey == pubkey.lower()):
+                raise ConfigurationError(
+                    f"Authority miner_pubkeys[{index}] must be a 96-character lowercase hex string."
+                )
+            try:
+                bytes.fromhex(pubkey)
+            except ValueError as exc:
+                raise ConfigurationError(f"Authority miner_pubkeys[{index}] must be valid hexadecimal.") from exc
         if self.miner_privkey:
             if not (isinstance(self.miner_privkey, str) and len(self.miner_privkey) == 64):
                 raise ConfigurationError("Authority miner_privkey must be a 64-character hex string.")
@@ -472,7 +482,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     global BOOTSTRAP_PEERS, NETWORK_ID, NETWORK_LISTEN, PEERSTORE_PATH, peerstore_path
     global DHT_RECORD_TTL, DHT_VALIDATOR_NAMESPACES, DHT_BOOTSTRAP_PEERS
     global LOGGING
-    global MINER_PUBKEY, MINER_PRIVKEY, BLOCK_SIGNATURE_SCHEME, STATE_LOCATOR_NAMESPACE
+    global MINER_PUBKEY, MINER_PUBKEYS, MINER_PRIVKEY, BLOCK_SIGNATURE_SCHEME, STATE_LOCATOR_NAMESPACE
 
     HOST = current.server.host
     PORT = current.server.port
@@ -501,6 +511,7 @@ def _sync_legacy_exports(current: Settings) -> None:
 
     LOGGING = current.logging
     MINER_PUBKEY = current.authority.miner_pubkey
+    MINER_PUBKEYS = list(current.authority.miner_pubkeys)
     MINER_PRIVKEY = current.authority.miner_privkey
     BLOCK_SIGNATURE_SCHEME = current.authority.block_signature_scheme
     STATE_LOCATOR_NAMESPACE = current.authority.state_locator_namespace
@@ -560,6 +571,7 @@ __all__ = [
     "DHT_BOOTSTRAP_PEERS",
     "LOGGING",
     "MINER_PUBKEY",
+    "MINER_PUBKEYS",
     "MINER_PRIVKEY",
     "BLOCK_SIGNATURE_SCHEME",
     "STATE_LOCATOR_NAMESPACE",

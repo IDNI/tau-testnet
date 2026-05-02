@@ -4,6 +4,11 @@ from dataclasses import dataclass
 
 from consensus.governance import ConsensusRuleUpdate, ConsensusLifecycleManager
 
+VALIDATOR_1 = f"{1:096x}"
+VALIDATOR_2 = f"{2:096x}"
+VALIDATOR_3 = f"{3:096x}"
+
+
 class MockChainState:
     def __init__(self):
         self._balance_lock = self.DummyLock()
@@ -15,7 +20,7 @@ class MockChainState:
         self._application_rules_state = "apps"
         
         self._lifecycle_manager = ConsensusLifecycleManager(
-            active_validators=[b"v1", b"v2", b"v3"]
+            active_validators=[VALIDATOR_1, VALIDATOR_2, VALIDATOR_3]
         )
 
     class DummyLock:
@@ -117,8 +122,8 @@ def test_votes_only_counted_for_pending():
     
     from consensus.governance import ConsensusRuleVote
     v1 = ConsensusRuleVote(update1.update_id, True)
-    mgr.submit_vote(v1, b"v1")
-    mgr.submit_vote(v1, b"v2")
+    mgr.submit_vote(v1, VALIDATOR_1)
+    mgr.submit_vote(v1, VALIDATOR_2)
     
     resp_raw = getgov_execute("getgovernance", container)
     resp = json.loads(resp_raw)
@@ -126,5 +131,5 @@ def test_votes_only_counted_for_pending():
     assert len(resp["votes"]) == 2
     for v in resp["votes"]:
         assert v["update_id"] == update1.update_id_hex
-        assert v["voter_pubkey"] in ["7631", "7632"] # b'v1'.hex() is 7631
+        assert v["voter_pubkey"] in [VALIDATOR_1, VALIDATOR_2]
 

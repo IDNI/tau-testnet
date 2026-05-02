@@ -164,6 +164,16 @@ def test_compute_update_id():
     id3 = compute_update_id(revisions, activate_at_height, patch={"a": 1})
     assert id1 != id3
 
+    validator_a = "a" * 96
+    validator_b = "b" * 96
+    patch_one = {"validator_additions": [validator_b, validator_a, validator_a]}
+    patch_two = {"validator_additions": [validator_a, validator_b]}
+    assert compute_update_id(revisions, activate_at_height, patch=patch_one) == compute_update_id(
+        revisions,
+        activate_at_height,
+        patch=patch_two,
+    )
+
 def test_compute_checkpoint_hash():
     from consensus.serialization import compute_checkpoint_hash
     height = 50

@@ -9,6 +9,7 @@ import tau_defs
 from .tau_engine import TauEngine, TauExecutionResult, TauStateSnapshot
 from .serialization import canonical_json, canonicalize_parent_hash_yid, canonicalize_proposer_yid
 from .state import StateStore, compute_state_hash
+from .governance import normalize_validator_set
 
 # We need to import chain_state and tau_manager, but we must be careful about circular imports.
 # We'll import them inside methods or use a lazy import pattern if needed.
@@ -111,6 +112,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         if not self._validators and config.MINER_PUBKEY:
              self._validators = [config.MINER_PUBKEY]
 
+    def _active_validator_hexes_from_snapshot(self, parent_snapshot: TauStateSnapshot) -> List[str]:
+        metadata = parent_snapshot.metadata or {}
+        lifecycle_manager = metadata.get("lifecycle_manager")
+        if lifecycle_manager is not None and getattr(lifecycle_manager, "active_validators", None):
+            return sorted(normalize_validator_set(lifecycle_manager.active_validators))
+        return sorted(normalize_validator_set(self._validators))
+
     @staticmethod
     def _encode_bv_uint(value: Any, *, width_bits: int, field_name: str) -> str:
         parsed = int(value)
@@ -151,10 +159,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # Skeleton implementation for Phase 1
         # In Phase 2, this will traverse the consensus_meta to build the view. 
         # For now, it delegates to PoA parameters.
+        validator_hexes = self._active_validator_hexes_from_snapshot(parent_snapshot)
         return ActiveConsensusView(
             target_height=target_height,
             consensus_rules=parent_snapshot.tau_bytes.decode('utf-8', errors='ignore'),
-            active_validators=[bytes.fromhex(v) for v in self._validators],
+            active_validators=[bytes.fromhex(v) for v in validator_hexes],
             mechanism_specific_metadata={"poa": True}
         )
 

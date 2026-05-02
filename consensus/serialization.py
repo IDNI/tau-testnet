@@ -124,7 +124,23 @@ def encode_rule_revisions(revisions: List[str]) -> bytes:
         out.extend(encode_string(rev))
     return bytes(out)
 
-def encode_host_contract_patch(patch: Dict[str, Union[int, str, bool]]) -> bytes:
+VALIDATOR_DELTA_FIELDS = {"validator_additions", "validator_removals"}
+
+
+def _encode_string_list(values: List[str], *, canonicalize: bool) -> bytes:
+    if not isinstance(values, list):
+        raise ValueError("list value must be a list")
+    if not all(isinstance(item, str) for item in values):
+        raise ValueError("list value must contain only strings")
+    items = sorted(set(values)) if canonicalize else list(values)
+    out = bytearray()
+    out.extend(encode_uint32(len(items)))
+    for item in items:
+        out.extend(encode_string(item))
+    return bytes(out)
+
+
+def encode_host_contract_patch(patch: Dict[str, Union[int, str, bool, List[str]]]) -> bytes:
     """
     Serialize host_contract_patch.
     Fields are ordered by key bytes in ascending lexicographic order.
@@ -147,6 +163,8 @@ def encode_host_contract_patch(patch: Dict[str, Union[int, str, bool]]) -> bytes
             v_bytes = b"\x02" + encode_uint32(v) # Type tag 2 for uint32
         elif isinstance(v, str):
             v_bytes = b"\x03" + encode_string(v) # Type tag 3 for string
+        elif isinstance(v, list):
+            v_bytes = b"\x04" + _encode_string_list(v, canonicalize=k in VALIDATOR_DELTA_FIELDS)
         else:
             raise ValueError(f"Unsupported property type for key {k}: {type(v)}")
         encoded_pairs.append((k, k_bytes, v_bytes))
@@ -162,7 +180,7 @@ def encode_host_contract_patch(patch: Dict[str, Union[int, str, bool]]) -> bytes
     return bytes(out)
 
 
-def compute_update_id(revisions: List[str], activate_at_height: int, patch: Optional[Dict[str, Union[int, str, bool]]] = None) -> bytes:
+def compute_update_id(revisions: List[str], activate_at_height: int, patch: Optional[Dict[str, Union[int, str, bool, List[str]]]] = None) -> bytes:
     """
     Derives update_id as BLAKE3(canonical_serialization(consensus_rule_update_payload)).
     Exclude sender_pubkey, sequence_number, expiration_time, fee_limit, and signature.
@@ -226,13 +244,13 @@ def encode_checkpoint_reference(height: int, checkpoint_hash: bytes) -> bytes:
     return bytes(out)
 
 def encode_consensus_meta(
-    host_contract: Dict[str, Union[int, str, bool]],
+    host_contract: Dict[str, Union[int, str, bool, List[str]]],
     active_validators: List[bytes],
     pending_updates: List[bytes],
     vote_records: List[tuple[bytes, bytes]], # (update_id, voter_pubkey)
     activation_schedule: List[tuple[int, bytes]], # (height, update_id)
     checkpoint_references: List[tuple[int, bytes]], # (height, checkpoint_hash)
-    mechanism_specific_metadata: Optional[Dict[str, Union[int, str, bool]]] = None
+    mechanism_specific_metadata: Optional[Dict[str, Union[int, str, bool, List[str]]]] = None
 ) -> bytes:
     """
     Canonical serialization of the full consensus_meta object.
@@ -281,13 +299,13 @@ def encode_consensus_meta(
     return bytes(out)
 
 def compute_consensus_meta_hash(
-    host_contract: Dict[str, Union[int, str, bool]],
+    host_contract: Dict[str, Union[int, str, bool, List[str]]],
     active_validators: List[bytes],
     pending_updates: List[bytes],
     vote_records: List[tuple[bytes, bytes]],
     activation_schedule: List[tuple[int, bytes]],
     checkpoint_references: List[tuple[int, bytes]],
-    mechanism_specific_metadata: Optional[Dict[str, Union[int, str, bool]]] = None
+    mechanism_specific_metadata: Optional[Dict[str, Union[int, str, bool, List[str]]]] = None
 ) -> bytes:
     """Compute BLAKE3 hash of canonical consensus_meta."""
     meta_bytes = encode_consensus_meta(

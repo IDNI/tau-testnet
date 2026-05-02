@@ -79,7 +79,7 @@ _rules_lock = threading.Lock()
 _application_rules_state = ""
 _consensus_rules_state = ""
 _active_consensus_id = "tau_poa_v1"
-from consensus.governance import ConsensusLifecycleManager
+from consensus.governance import ConsensusLifecycleManager, ConsensusRuleUpdate, normalize_validator_set
 _lifecycle_manager = ConsensusLifecycleManager()
 
 _canonical_head_hash = ""
@@ -537,7 +537,8 @@ def process_new_block(block: Block) -> bool:
                 } for uid in _lifecycle_manager.pending_updates],
                 votes=[{"update_id": uid.hex() if isinstance(uid, bytes) else uid, "voter_pubkey": p.hex() if isinstance(p, bytes) else p} for uid, ps in _lifecycle_manager.votes.items() for p in ps],
                 scheduled=[(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates],
-                archival=[uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
+                archival=[uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates],
+                active_validators=sorted(normalize_validator_set(_lifecycle_manager.active_validators))
             )
             
             # Optional: mempool eviction triggers could be mapped here using `apply_result.mempool_hints`
@@ -769,7 +770,8 @@ def load_genesis(genesis_json_path: str):
                 archival_updates=[],
                 votes={}
             )
-            _lifecycle_manager.active_validators = set(meta["active_validators"])
+            _lifecycle_manager.active_validators = normalize_validator_set(meta["active_validators"])
+            _lifecycle_manager.recompute_approval_threshold()
             
         commit_state_to_db(genesis_block.block_hash, 0)
         print(f"[INFO][chain_state] Genesis provisioned. Block 0 Hash: {genesis_block.block_hash}")
@@ -812,6 +814,11 @@ def load_genesis(genesis_json_path: str):
             raise ValueError(f"FATAL: Genesis Block 0 header field '{key}' mismatched! Expected: {expected_val}, Found: {actual_val}")
     loaded = load_state_from_db()
     if loaded:
+        if not _lifecycle_manager.active_validators:
+            meta = genesis_data["consensus_meta"]
+            _lifecycle_manager.active_validators = normalize_validator_set(meta.get("active_validators", []))
+            _lifecycle_manager.recompute_approval_threshold()
+            commit_state_to_db(_canonical_head_hash, latest["header"]["block_number"] if latest else 0)
         print(f"[INFO][chain_state] State loaded successfully. Last known block hash: '{_canonical_head_hash[:16]}...'")
     else:
         print("[WARN][chain_state] DB has blocks but no canonical state! Rebuilding.")
@@ -1090,9 +1097,14 @@ def load_state_from_db() -> bool:
     
     balances, sequences, app_rules, cons_rules, cons_id, last_processed_block_hash, pending_updates, votes, scheduled, archival = db.load_chain_state()
     
+    def _update_id_bytes(value):
+        if isinstance(value, bytes):
+            return value
+        return bytes.fromhex(value)
+
     votes_map = {}
     for v in votes:
-        votes_map.setdefault(v['update_id'], []).append(v['voter_pubkey'])
+        votes_map.setdefault(_update_id_bytes(v['update_id']), []).append(v['voter_pubkey'])
     
     if not balances and not last_processed_block_hash:
         return False
@@ -1103,19 +1115,39 @@ def load_state_from_db() -> bool:
         _balances.update(balances)
         _sequence_numbers.update(sequences)
         
-        global _application_rules_state, _consensus_rules_state, _active_consensus_id
+        global _application_rules_state, _consensus_rules_state, _active_consensus_id, _lifecycle_manager
         
         _application_rules_state = app_rules
         _consensus_rules_state = cons_rules
         _active_consensus_id = cons_id
+        active_validators = []
+        raw_active_validators = db.get_chain_state_value("active_validators", "")
+        if raw_active_validators:
+            try:
+                loaded_active_validators = json.loads(raw_active_validators)
+                if isinstance(loaded_active_validators, list):
+                    active_validators = loaded_active_validators
+            except json.JSONDecodeError:
+                logger.warning("Ignoring malformed active_validators chain_state entry.")
+
+        scheduled_updates = [(height, _update_id_bytes(uid)) for height, uid in scheduled]
+        archival_updates = [_update_id_bytes(uid) for uid in archival]
+        pending_update_ids = [_update_id_bytes(p['update_id']) for p in pending_updates]
+
         _lifecycle_manager = ConsensusLifecycleManager(
-            pending_updates=[p['update_id'] for p in pending_updates],
-            scheduled_updates=scheduled,
-            archival_updates=archival,
-            votes=votes_map
+            pending_updates=pending_update_ids,
+            scheduled_updates=scheduled_updates,
+            archival_updates=archival_updates,
+            votes=votes_map,
+            active_validators=active_validators
         )
         for p in pending_updates:
-            _lifecycle_manager.update_payloads[p['update_id']] = p
+            update = ConsensusRuleUpdate(
+                rule_revisions=p['rule_revisions'],
+                activate_at_height=p['activate_at_height'],
+                host_contract_patch=p.get('host_contract_patch')
+            )
+            _lifecycle_manager.update_payloads[_update_id_bytes(p['update_id'])] = update
 
         global _tau_engine_state_hash
         _tau_engine_state_hash = ""
@@ -1141,12 +1173,14 @@ def commit_state_to_db(block_hash: str, block_number: int):
         votes_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "voter_pubkey": pub.hex() if isinstance(pub, bytes) else pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
         scheduled_list = [(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates]
         archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
+        active_validators_list = sorted(normalize_validator_set(_lifecycle_manager.active_validators))
         
     db.save_canonical_state_atomically(
         block_hash, block_number, 
         balances_snapshot, sequences_snapshot, 
         app_rules_snapshot, cons_rules_snapshot, cons_id_snapshot,
-        pending_updates_list, votes_list, scheduled_list, archival_list
+        pending_updates_list, votes_list, scheduled_list, archival_list,
+        active_validators=active_validators_list
     )
 
 def tick_governance(height: int):
@@ -1156,16 +1190,6 @@ def tick_governance(height: int):
     """
     global _active_consensus_id, _consensus_rules_state
     with _rules_lock:
-        import config
-        validators = getattr(config, "MINER_PUBKEYS", [])
-        if not validators and config.MINER_PUBKEY:
-            validators = [config.MINER_PUBKEY]
-            
-        # Ensure the lifecycle manager uses the active validators to set its threshold
-        _lifecycle_manager.active_validators = set(validators)
-        n_validators = len(validators)
-        _lifecycle_manager.approval_threshold = (2 * n_validators + 2) // 3 # Mock Phase 2 configurable threshold
-        
         # Drive lifecycle transitions
         newly_active = _lifecycle_manager.process_height_transitions(height)
         
@@ -1361,10 +1385,11 @@ def reorg_to(new_head_hash: str):
         app_r = _application_rules_state
         cons_r = _consensus_rules_state
         cons_id = _active_consensus_id
-        pending_updates_list = [{"update_id": k, "rule_revisions": v.rule_revisions, "activate_at_height": v.activate_at_height, "host_contract_patch": v.host_contract_patch} for k, v in _lifecycle_manager.update_payloads.items() if k in _lifecycle_manager.pending_updates]
-        votes_list = [{"update_id": k, "voter_pubkey": pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
-        scheduled_list = _lifecycle_manager.scheduled_updates[:]
-        archival_list = list(_lifecycle_manager.archival_updates)
+        pending_updates_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "rule_revisions": v.rule_revisions, "activate_at_height": v.activate_at_height, "host_contract_patch": v.host_contract_patch} for k, v in _lifecycle_manager.update_payloads.items() if k in _lifecycle_manager.pending_updates]
+        votes_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "voter_pubkey": pub.hex() if isinstance(pub, bytes) else pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
+        scheduled_list = [(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates]
+        archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
+        active_validators_list = sorted(normalize_validator_set(_lifecycle_manager.active_validators))
         head_num = db.get_block_by_hash(new_head_hash)['header']['block_number']
         db.save_canonical_state_atomically(
             new_head_hash,
@@ -1377,7 +1402,8 @@ def reorg_to(new_head_hash: str):
             pending_updates_list,
             votes_list,
             scheduled_list,
-            archival_list
+            archival_list,
+            active_validators=active_validators_list
         )
     
     # Phase 5: Mempool Restore

@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 import os
 import json
 import logging
@@ -7,6 +7,7 @@ import tau_defs
 from tau_manager import communicate_with_tau
 from consensus.serialization import compute_update_id
 from consensus.facade import TipAdmissionView
+from consensus.governance import normalize_validator_delta, normalize_validator_set
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
             
     return success()
 
-def _check_host_contract_patch(patch: dict) -> Optional[str]:
+def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = None) -> Optional[str]:
     """Static checks for host contract parameters to ensure future-proofing definitions."""
     if "proof_scheme" in patch and patch["proof_scheme"] != "bls_header_sig":
         return f"Unsupported proof_scheme inside host_contract_patch: {patch['proof_scheme']}"
@@ -52,6 +53,19 @@ def _check_host_contract_patch(patch: dict) -> Optional[str]:
         return f"Unsupported fork_choice_scheme inside host_contract_patch: {patch['fork_choice_scheme']}"
     if "input_contract_version" in patch and patch["input_contract_version"] != 1:
         return f"Unsupported input_contract_version inside host_contract_patch: {patch['input_contract_version']}"
+    if "validator_additions" in patch or "validator_removals" in patch:
+        try:
+            additions = set(normalize_validator_delta(patch.get("validator_additions"), "validator_additions"))
+            removals = set(normalize_validator_delta(patch.get("validator_removals"), "validator_removals"))
+            validators = normalize_validator_set(active_validators or [])
+        except ValueError as exc:
+            return str(exc)
+        overlap = additions & removals
+        if overlap:
+            return f"Validator pubkey cannot be both added and removed: {sorted(overlap)[0][:10]}"
+        next_validators = (validators - removals) | additions
+        if not next_validators:
+            return "Validator delta would leave no active validators."
     return None
 
 def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
@@ -77,7 +91,7 @@ def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView)
     if patch is not None:
         if not isinstance(patch, dict):
             return format_error("'host_contract_patch' must be a JSON dictionary if provided.")
-        patch_err = _check_host_contract_patch(patch)
+        patch_err = _check_host_contract_patch(patch, tip_view.active_validators)
         if patch_err:
             return format_error(patch_err)
 

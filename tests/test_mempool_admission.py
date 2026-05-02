@@ -175,6 +175,35 @@ class TestMempoolAdmission:
 
     @patch("consensus.admission.communicate_with_tau")
     @patch("os.environ.get")
+    def test_validator_delta_patch_accepted(self, mock_env, mock_tau, tip_view):
+        mock_env.return_value = "0"
+        mock_tau.return_value = "Success"
+        tx = get_update_tx(patch={"validator_additions": ["b" * 96]})
+        res = validate_mempool_admission(tx, tip_view)
+        assert res.is_valid
+
+    @patch("consensus.admission.communicate_with_tau")
+    @patch("os.environ.get")
+    def test_validator_delta_cannot_empty_active_set(self, mock_env, mock_tau, tip_view):
+        mock_env.return_value = "0"
+        mock_tau.return_value = "Success"
+        tx = get_update_tx(patch={"validator_removals": ["a" * 96]})
+        res = validate_mempool_admission(tx, tip_view)
+        assert not res.is_valid
+        assert "no active validators" in res.error
+
+    @patch("consensus.admission.communicate_with_tau")
+    @patch("os.environ.get")
+    def test_validator_delta_rejects_malformed_pubkey(self, mock_env, mock_tau, tip_view):
+        mock_env.return_value = "0"
+        mock_tau.return_value = "Success"
+        tx = get_update_tx(patch={"validator_additions": ["B" * 96]})
+        res = validate_mempool_admission(tx, tip_view)
+        assert not res.is_valid
+        assert "lowercase hex" in res.error
+
+    @patch("consensus.admission.communicate_with_tau")
+    @patch("os.environ.get")
     def test_minimum_activation_delay_enforced(self, mock_env, mock_tau, tip_view):
         # next_block=50, validators=1 -> min_height=51
         tx = get_update_tx(activate_at=50) # Invalid

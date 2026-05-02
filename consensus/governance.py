@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Iterable, Union
 import json
 import logging
 from dataclasses import dataclass
@@ -7,11 +7,49 @@ from consensus.serialization import compute_update_id
 
 logger = logging.getLogger(__name__)
 
+VALIDATOR_DELTA_FIELDS = ("validator_additions", "validator_removals")
+
+
+def normalize_validator_pubkey(pubkey: Any) -> str:
+    """Return a canonical 96-character lowercase validator pubkey hex string."""
+    if isinstance(pubkey, (bytes, bytearray)):
+        pubkey = bytes(pubkey).hex()
+    if not isinstance(pubkey, str):
+        raise ValueError("validator pubkey must be a string")
+    if pubkey.startswith("0x"):
+        raise ValueError("validator pubkey must not have 0x prefix")
+    if len(pubkey) != 96:
+        raise ValueError(f"validator pubkey must be exactly 96 hex chars, got {len(pubkey)}")
+    if pubkey != pubkey.lower():
+        raise ValueError("validator pubkey must be lowercase hex")
+    try:
+        bytes.fromhex(pubkey)
+    except ValueError as exc:
+        raise ValueError("validator pubkey must be valid hex") from exc
+    return pubkey
+
+
+def normalize_validator_set(validators: Optional[Iterable[Any]]) -> set[str]:
+    if not validators:
+        return set()
+    return {normalize_validator_pubkey(validator) for validator in validators}
+
+
+def normalize_validator_delta(values: Any, field_name: str) -> List[str]:
+    if values is None:
+        return []
+    if not isinstance(values, list):
+        raise ValueError(f"{field_name} must be a list")
+    try:
+        return sorted({normalize_validator_pubkey(value) for value in values})
+    except ValueError as exc:
+        raise ValueError(f"{field_name}: {exc}") from exc
+
 @dataclass
 class ConsensusRuleUpdate:
     rule_revisions: List[str]
     activate_at_height: int
-    host_contract_patch: Optional[Dict[str, Union[int, str, bool]]] = None
+    host_contract_patch: Optional[Dict[str, Union[int, str, bool, List[str]]]] = None
 
     @property
     def update_id(self) -> bytes:
@@ -129,7 +167,7 @@ class ConsensusLifecycleManager:
                  scheduled_updates: Optional[List[tuple[int, bytes]]] = None,
                  archival_updates: Optional[List[bytes]] = None,
                  votes: Optional[Dict[bytes, List[bytes]]] = None, # update_id -> list of voter_pubkey bytes
-                 active_validators: Optional[List[bytes]] = None):
+                 active_validators: Optional[Iterable[Any]] = None):
         
         self.pending_updates = set(pending_updates) if pending_updates else set()
         # Scheduled is list of (activation_height, update_id)
@@ -142,10 +180,34 @@ class ConsensusLifecycleManager:
         self.votes: Dict[bytes, set[bytes]] = {
             k: set(v) for k, v in (votes or {}).items()
         }
-        self.active_validators = set(active_validators) if active_validators else set()
-        
-        # A simple >50% threshold for Phase 2 PoA mock, logic could be configurable via patch
-        self.approval_threshold = (len(self.active_validators) // 2) + 1 if self.active_validators else 1
+        self.active_validators = normalize_validator_set(active_validators)
+        self.recompute_approval_threshold()
+
+    def recompute_approval_threshold(self) -> int:
+        n_validators = len(self.active_validators)
+        self.approval_threshold = max(1, (2 * n_validators + 2) // 3) if n_validators else 1
+        return self.approval_threshold
+
+    def preview_validator_patch(self, patch: Optional[Dict[str, Any]]) -> set[str]:
+        """Return the validator set that would result if this host patch activated."""
+        next_validators = set(self.active_validators)
+        if not patch:
+            return next_validators
+        additions = normalize_validator_delta(patch.get("validator_additions"), "validator_additions")
+        removals = normalize_validator_delta(patch.get("validator_removals"), "validator_removals")
+        next_validators.difference_update(removals)
+        next_validators.update(additions)
+        return next_validators
+
+    def apply_host_contract_patch(self, patch: Optional[Dict[str, Any]]) -> None:
+        """Apply activation-time host metadata changes governed by consensus."""
+        if not patch:
+            return
+        next_validators = self.preview_validator_patch(patch)
+        if not next_validators:
+            raise ValueError("validator delta would leave no active validators")
+        self.active_validators = next_validators
+        self.recompute_approval_threshold()
 
     def knows_update(self, update_id: bytes) -> bool:
         """Check if an update is currently known in any state."""
@@ -283,7 +345,9 @@ class ConsensusLifecycleManager:
             if activation_height <= current_height:
                 # Activate
                 if uid in self.update_payloads:
-                    newly_active.append(self.update_payloads[uid])
+                    update = self.update_payloads[uid]
+                    self.apply_host_contract_patch(update.host_contract_patch)
+                    newly_active.append(update)
                 self.archival_updates.add(uid)
                 if uid in self.votes:
                     del self.votes[uid]

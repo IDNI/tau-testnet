@@ -91,5 +91,39 @@ class TestGovernance(unittest.TestCase):
         self.assertNotIn(update.update_id, manager.pending_updates)
         self.assertIn(update.update_id, manager.archival_updates)
 
+    def test_validator_delta_applies_on_activation(self):
+        manager = ConsensusLifecycleManager(active_validators=self.active_validators)
+        new_validator = f"{4:096x}"
+        update = ConsensusRuleUpdate(
+            ["test"],
+            10,
+            {"validator_additions": [new_validator, new_validator]},
+        )
+        manager.submit_update(update)
+        vote = ConsensusRuleVote(update.update_id, True)
+        manager.submit_vote(vote, f"{1:096x}")
+        manager.submit_vote(vote, f"{2:096x}")
+
+        active = manager.process_height_transitions(10)
+
+        self.assertEqual(len(active), 1)
+        self.assertIn(new_validator, manager.active_validators)
+        self.assertEqual(manager.approval_threshold, 3)
+
+    def test_validator_delta_rejects_empty_validator_set(self):
+        only_validator = f"{1:096x}"
+        manager = ConsensusLifecycleManager(active_validators=[only_validator])
+        update = ConsensusRuleUpdate(
+            ["test"],
+            10,
+            {"validator_removals": [only_validator]},
+        )
+        manager.submit_update(update)
+        vote = ConsensusRuleVote(update.update_id, True)
+        manager.submit_vote(vote, only_validator)
+
+        with self.assertRaises(ValueError):
+            manager.process_height_transitions(10)
+
 if __name__ == '__main__':
     unittest.main()
