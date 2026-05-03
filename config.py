@@ -143,6 +143,7 @@ class AuthoritySettings:
     block_signature_scheme: str = "bls_g2"
     state_locator_namespace: str = "state"
     mining_enabled: bool = True
+    open_governance_admission: bool = False
 
     def validate(self) -> None:
         if self.mining_enabled:
@@ -319,6 +320,11 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_BLOCK_SIGNATURE_SCHEME": ("authority", "block_signature_scheme", str),
     "TAU_STATE_LOCATOR_NAMESPACE": ("authority", "state_locator_namespace", str),
     "TAU_MINING_ENABLED": ("authority", "mining_enabled", lambda v: v.lower() in ("true", "1", "yes")),
+    "TAU_GOVERNANCE_OPEN_ADMISSION": (
+        "authority",
+        "open_governance_admission",
+        lambda v: v.lower() in ("true", "1", "yes"),
+    ),
 }
 
 
@@ -483,6 +489,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     global DHT_RECORD_TTL, DHT_VALIDATOR_NAMESPACES, DHT_BOOTSTRAP_PEERS
     global LOGGING
     global MINER_PUBKEY, MINER_PUBKEYS, MINER_PRIVKEY, BLOCK_SIGNATURE_SCHEME, STATE_LOCATOR_NAMESPACE
+    global OPEN_GOVERNANCE_ADMISSION
 
     HOST = current.server.host
     PORT = current.server.port
@@ -515,6 +522,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     MINER_PRIVKEY = current.authority.miner_privkey
     BLOCK_SIGNATURE_SCHEME = current.authority.block_signature_scheme
     STATE_LOCATOR_NAMESPACE = current.authority.state_locator_namespace
+    OPEN_GOVERNANCE_ADMISSION = current.authority.open_governance_admission
 
 
 def reload_settings(env: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> Settings:
@@ -575,6 +583,7 @@ __all__ = [
     "MINER_PRIVKEY",
     "BLOCK_SIGNATURE_SCHEME",
     "STATE_LOCATOR_NAMESPACE",
+    "OPEN_GOVERNANCE_ADMISSION",
 ]
 
 # Feature flags

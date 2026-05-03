@@ -1,6 +1,8 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
+import config as config_module
+
 from consensus.admission import (
     validate_mempool_admission,
     TipAdmissionView,
@@ -141,6 +143,25 @@ class TestMempoolAdmission:
         res = validate_mempool_admission(tx, tip_view)
         assert not res.is_valid
         assert "not an active validator" in res.error
+
+    def test_open_governance_allows_non_validator_vote(self, tip_view, monkeypatch):
+        monkeypatch.setattr(config_module.settings.authority, "open_governance_admission", True)
+        tip_view.get_update_lifecycle_state.return_value = "pending"
+        tx = get_vote_tx()
+        tx["sender_pubkey"] = "b" * 96
+        res = validate_mempool_admission(tx, tip_view)
+        assert res.is_valid
+
+    @patch("consensus.admission.communicate_with_tau")
+    @patch("os.environ.get")
+    def test_open_governance_allows_non_validator_update(self, mock_env, mock_tau, tip_view, monkeypatch):
+        monkeypatch.setattr(config_module.settings.authority, "open_governance_admission", True)
+        mock_env.return_value = "0"
+        mock_tau.return_value = "Success"
+        tx = get_update_tx()
+        tx["sender_pubkey"] = "b" * 96
+        res = validate_mempool_admission(tx, tip_view)
+        assert res.is_valid
 
     def test_duplicate_update_id_rejected_even_if_prior_update_archived(self, tip_view):
         tip_view.get_update_lifecycle_state.return_value = "archived"

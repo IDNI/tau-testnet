@@ -17,6 +17,7 @@ class TestGovernance(unittest.TestCase):
     def test_parse_update(self):
         tx = {
             "tx_type": "consensus_rule_update",
+            "sender_pubkey": f"{1:096x}",
             "payload": {
                 "rule_revisions": ["always o5 = 1"],
                 "activate_at_height": 100,
@@ -28,6 +29,7 @@ class TestGovernance(unittest.TestCase):
         self.assertEqual(update.rule_revisions, ["always o5 = 1"])
         self.assertEqual(update.activate_at_height, 100)
         self.assertEqual(update.host_contract_patch, {"fee": 10})
+        self.assertEqual(update.proposer_pubkey, f"{1:096x}")
         self.assertEqual(len(update.update_id), 32)
         
     def test_parse_vote(self):

@@ -50,6 +50,7 @@ class ConsensusRuleUpdate:
     rule_revisions: List[str]
     activate_at_height: int
     host_contract_patch: Optional[Dict[str, Union[int, str, bool, List[str]]]] = None
+    proposer_pubkey: Optional[str] = None
 
     @property
     def update_id(self) -> bytes:
@@ -108,11 +109,18 @@ def parse_consensus_rule_update(tx: Dict[str, Any]) -> Optional[ConsensusRuleUpd
     patch = payload.get("host_contract_patch")
     if patch is not None and not isinstance(patch, dict):
         return None
+
+    proposer_pubkey = tx.get("sender_pubkey")
+    if not isinstance(proposer_pubkey, str):
+        proposer_pubkey = payload.get("sender_pubkey")
+    if not isinstance(proposer_pubkey, str):
+        proposer_pubkey = None
         
     return ConsensusRuleUpdate(
         rule_revisions=revisions,
         activate_at_height=activate_at,
-        host_contract_patch=patch
+        host_contract_patch=patch,
+        proposer_pubkey=proposer_pubkey
     )
 
 def parse_consensus_rule_vote(tx: Dict[str, Any]) -> Optional[ConsensusRuleVote]:

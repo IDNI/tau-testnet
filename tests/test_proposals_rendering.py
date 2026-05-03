@@ -56,7 +56,8 @@ def test_pending_updates_include_revisions_and_patch():
     update = ConsensusRuleUpdate(
         rule_revisions=["rule 1", "rule 2"],
         activate_at_height=500,
-        host_contract_patch={"proof_scheme": "bls_header_sig"}
+        host_contract_patch={"proof_scheme": "bls_header_sig"},
+        proposer_pubkey=VALIDATOR_1,
     )
     container.chain_state._lifecycle_manager.submit_update(update)
     
@@ -70,6 +71,7 @@ def test_pending_updates_include_revisions_and_patch():
     assert pu["activate_at_height"] == 500
     assert pu["rule_revisions"] == ["rule 1", "rule 2"]
     assert pu["host_contract_patch"] == {"proof_scheme": "bls_header_sig"}
+    assert pu["proposer_pubkey"] == VALIDATOR_1
 
 def test_lifecycle_status_explicit():
     container = MockContainer()

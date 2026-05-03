@@ -43,6 +43,7 @@ def execute(raw_command: str, container):
                         "rule_revisions": list(update.rule_revisions),
                         "activate_at_height": int(update.activate_at_height),
                         "host_contract_patch": update.host_contract_patch,
+                        "proposer_pubkey": update.proposer_pubkey,
                     }
                 )
 
@@ -63,6 +64,7 @@ def execute(raw_command: str, container):
                                     "rule_revisions": list(update_obj.rule_revisions),
                                     "activate_at_height": int(update_obj.activate_at_height),
                                     "host_contract_patch": update_obj.host_contract_patch,
+                                    "proposer_pubkey": update_obj.proposer_pubkey,
                                 }
                             )
                 except Exception:

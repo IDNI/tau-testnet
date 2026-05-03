@@ -588,6 +588,14 @@ def main():
     args = parser.parse_args()
 
     tau_logging.configure(getattr(config, "LOGGING", None))
+    if (
+        config.settings.authority.open_governance_admission
+        and config.settings.network.bootstrap_peers
+    ):
+        logger.warning(
+            "open_governance_admission is enabled with non-empty bootstrap peers; "
+            "unsafe for a networked node."
+        )
     container = ServiceContainer.build(overrides={"logger": logger, "ephemeral_identity": args.ephemeral_identity})
     tau_module = container.tau_manager
     try:

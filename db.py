@@ -210,9 +210,14 @@ def init_db():
                     update_id TEXT PRIMARY KEY,
                     rule_revisions TEXT NOT NULL,
                     activate_at_height INTEGER NOT NULL,
-                    host_contract_patch TEXT
+                    host_contract_patch TEXT,
+                    proposer_pubkey TEXT
                 );
             ''')
+            cur = conn.execute("PRAGMA table_info(consensus_updates_v2);")
+            consensus_update_cols = {row[1] for row in cur.fetchall()}
+            if "proposer_pubkey" not in consensus_update_cols:
+                conn.execute("ALTER TABLE consensus_updates_v2 ADD COLUMN proposer_pubkey TEXT;")
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS consensus_votes_v2 (
                     update_id TEXT NOT NULL,
@@ -689,13 +694,14 @@ def load_chain_state() -> tuple[Dict[str, int], Dict[str, int], str, str, str, s
         canonical_head_hash = entries.get('canonical_head_hash', '')
         
         try:
-            cur = _db_conn.execute('SELECT update_id, rule_revisions, activate_at_height, host_contract_patch FROM consensus_updates_v2')
+            cur = _db_conn.execute('SELECT update_id, rule_revisions, activate_at_height, host_contract_patch, proposer_pubkey FROM consensus_updates_v2')
             for row in cur.fetchall():
                 pending_updates.append({
                     'update_id': row[0],
                     'rule_revisions': json.loads(row[1]),
                     'activate_at_height': row[2],
-                    'host_contract_patch': json.loads(row[3]) if row[3] else None
+                    'host_contract_patch': json.loads(row[3]) if row[3] else None,
+                    'proposer_pubkey': row[4],
                 })
                 
             cur = _db_conn.execute('SELECT update_id, voter_pubkey FROM consensus_votes_v2')
@@ -792,8 +798,14 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
             _db_conn.execute('DELETE FROM consensus_updates_v2')
             for p in pending_updates:
                 _db_conn.execute(
-                    'INSERT INTO consensus_updates_v2 (update_id, rule_revisions, activate_at_height, host_contract_patch) VALUES (?, ?, ?, ?)',
-                    (p['update_id'], json.dumps(p['rule_revisions']), p['activate_at_height'], json.dumps(p['host_contract_patch']) if p['host_contract_patch'] else None)
+                    'INSERT INTO consensus_updates_v2 (update_id, rule_revisions, activate_at_height, host_contract_patch, proposer_pubkey) VALUES (?, ?, ?, ?, ?)',
+                    (
+                        p['update_id'],
+                        json.dumps(p['rule_revisions']),
+                        p['activate_at_height'],
+                        json.dumps(p['host_contract_patch']) if p['host_contract_patch'] else None,
+                        p.get('proposer_pubkey'),
+                    )
                 )
                 
             _db_conn.execute('DELETE FROM consensus_votes_v2')

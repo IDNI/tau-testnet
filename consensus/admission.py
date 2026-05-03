@@ -3,6 +3,7 @@ import os
 import json
 import logging
 
+import config
 import tau_defs
 from tau_manager import communicate_with_tau
 from consensus.serialization import compute_update_id
@@ -22,6 +23,11 @@ def format_error(msg: str) -> AdmissionResult:
 
 def success(data: Optional[Dict] = None) -> AdmissionResult:
     return AdmissionResult(True, data=data)
+
+
+def _open_governance_admission() -> bool:
+    return bool(getattr(config.settings.authority, "open_governance_admission", False))
+
 
 def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """
@@ -73,7 +79,7 @@ def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView)
     Validate the core fields and parameters of a consensus_rule_update payload.
     """
     sender = tx.get("sender_pubkey")
-    if sender not in tip_view.active_validators:
+    if not _open_governance_admission() and sender not in tip_view.active_validators:
         return format_error(f"Proposer {sender[:10]} is not an active validator.")
 
     if "rule_revisions" not in tx or not isinstance(tx["rule_revisions"], list) or len(tx["rule_revisions"]) == 0:
@@ -170,9 +176,9 @@ def validate_consensus_rule_vote_payload(tx: Dict, tip_view: TipAdmissionView) -
     Validate the core fields and precedence of consensus_rule_vote transactions.
     """
     sender = tx.get("sender_pubkey")
-    if sender not in tip_view.active_validators:
-         return format_error(f"Voter {sender[:10]} is not an active validator.")
-         
+    if not _open_governance_admission() and sender not in tip_view.active_validators:
+        return format_error(f"Voter {sender[:10]} is not an active validator.")
+
     update_id = tx.get("update_id")
     if not isinstance(update_id, str):
          return format_error("Missing or malformed 'update_id' in consensus_vote.")

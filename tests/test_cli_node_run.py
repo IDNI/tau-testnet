@@ -160,6 +160,32 @@ def test_listen_overrides_shell_env():
     assert env["TAU_NETWORK_LISTEN"] == "/ip4/127.0.0.1/tcp/4001"
 
 
+def test_open_governance_sets_env_with_isolated():
+    env = _apply(["--isolated", "--open-governance"])
+    assert env["TAU_BOOTSTRAP_PEERS"] == "[]"
+    assert env["TAU_GOVERNANCE_OPEN_ADMISSION"] == "true"
+
+
+def test_open_governance_sets_env_with_test():
+    env = _apply(["--test", "--open-governance"])
+    assert env["TAU_GOVERNANCE_OPEN_ADMISSION"] == "true"
+
+
+def test_open_governance_without_isolated_raises():
+    with pytest.raises(ValueError, match="--open-governance requires"):
+        _apply(["--open-governance"])
+
+
+def test_open_governance_with_test_no_isolated_raises():
+    with pytest.raises(ValueError, match="--open-governance requires"):
+        _apply(["--test", "--no-isolated", "--open-governance"])
+
+
+def test_no_open_governance_explicit_sets_false():
+    env = _apply(["--isolated", "--no-open-governance"])
+    assert env["TAU_GOVERNANCE_OPEN_ADMISSION"] == "false"
+
+
 # --------------------------------------------------------------------------- #
 # Argparse surface
 # --------------------------------------------------------------------------- #
@@ -173,4 +199,5 @@ def test_node_run_help_works():
     assert "--test" in out.getvalue()
     assert "--no-miner" in out.getvalue()
     assert "--no-isolated" in out.getvalue()
+    assert "--open-governance" in out.getvalue()
     assert "--listen" in out.getvalue()

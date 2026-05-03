@@ -681,6 +681,16 @@ def apply_node_run_env(args: argparse.Namespace, env: dict | None = None) -> dic
     # `isolated == False` (explicit --no-isolated or default without --test):
     # don't touch TAU_BOOTSTRAP_PEERS — let the shell or config default win.
 
+    open_gov_explicit = getattr(args, "open_governance", None) is not None
+    open_gov = getattr(args, "open_governance", None)
+    if open_gov_explicit:
+        if open_gov and not isolated:
+            raise ValueError(
+                "--open-governance requires an isolated node "
+                "(use --isolated or --test without --no-isolated)."
+            )
+        env["TAU_GOVERNANCE_OPEN_ADMISSION"] = "true" if open_gov else "false"
+
     if args.fresh:
         env.setdefault("TAU_FORCE_FRESH_START", "1")
 
@@ -990,6 +1000,13 @@ def _add_node_subparsers(sub) -> None:
         help="Toggle TAU_BOOTSTRAP_PEERS=[] (no peer bootstrap). "
         "--no-isolated lets the node use the configured bootstrap list. "
         "Default: implied true by --test, otherwise defer to env/config.",
+    )
+    p_run.add_argument(
+        "--open-governance",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Set TAU_GOVERNANCE_OPEN_ADMISSION: any account may submit consensus_rule_update "
+        "and consensus_rule_vote (mempool admission). Requires --isolated or implied isolation from --test.",
     )
     p_run.add_argument(
         "--fresh",

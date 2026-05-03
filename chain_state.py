@@ -533,7 +533,8 @@ def process_new_block(block: Block) -> bool:
                     "update_id": uid.hex() if isinstance(uid, bytes) else uid,
                     "rule_revisions": _lifecycle_manager.update_payloads[uid].rule_revisions,
                     "activate_at_height": _lifecycle_manager.update_payloads[uid].activate_at_height,
-                    "host_contract_patch": _lifecycle_manager.update_payloads[uid].host_contract_patch
+                    "host_contract_patch": _lifecycle_manager.update_payloads[uid].host_contract_patch,
+                    "proposer_pubkey": _lifecycle_manager.update_payloads[uid].proposer_pubkey
                 } for uid in _lifecycle_manager.pending_updates],
                 votes=[{"update_id": uid.hex() if isinstance(uid, bytes) else uid, "voter_pubkey": p.hex() if isinstance(p, bytes) else p} for uid, ps in _lifecycle_manager.votes.items() for p in ps],
                 scheduled=[(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates],
@@ -1145,7 +1146,8 @@ def load_state_from_db() -> bool:
             update = ConsensusRuleUpdate(
                 rule_revisions=p['rule_revisions'],
                 activate_at_height=p['activate_at_height'],
-                host_contract_patch=p.get('host_contract_patch')
+                host_contract_patch=p.get('host_contract_patch'),
+                proposer_pubkey=p.get('proposer_pubkey')
             )
             _lifecycle_manager.update_payloads[_update_id_bytes(p['update_id'])] = update
 
@@ -1169,7 +1171,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         app_rules_snapshot = _application_rules_state
         cons_rules_snapshot = _consensus_rules_state
         cons_id_snapshot = _active_consensus_id
-        pending_updates_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "rule_revisions": v.rule_revisions, "activate_at_height": v.activate_at_height, "host_contract_patch": v.host_contract_patch} for k, v in _lifecycle_manager.update_payloads.items() if k in _lifecycle_manager.pending_updates]
+        pending_updates_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "rule_revisions": v.rule_revisions, "activate_at_height": v.activate_at_height, "host_contract_patch": v.host_contract_patch, "proposer_pubkey": v.proposer_pubkey} for k, v in _lifecycle_manager.update_payloads.items() if k in _lifecycle_manager.pending_updates]
         votes_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "voter_pubkey": pub.hex() if isinstance(pub, bytes) else pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
         scheduled_list = [(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates]
         archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
@@ -1385,7 +1387,7 @@ def reorg_to(new_head_hash: str):
         app_r = _application_rules_state
         cons_r = _consensus_rules_state
         cons_id = _active_consensus_id
-        pending_updates_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "rule_revisions": v.rule_revisions, "activate_at_height": v.activate_at_height, "host_contract_patch": v.host_contract_patch} for k, v in _lifecycle_manager.update_payloads.items() if k in _lifecycle_manager.pending_updates]
+        pending_updates_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "rule_revisions": v.rule_revisions, "activate_at_height": v.activate_at_height, "host_contract_patch": v.host_contract_patch, "proposer_pubkey": v.proposer_pubkey} for k, v in _lifecycle_manager.update_payloads.items() if k in _lifecycle_manager.pending_updates]
         votes_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "voter_pubkey": pub.hex() if isinstance(pub, bytes) else pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
         scheduled_list = [(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates]
         archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]

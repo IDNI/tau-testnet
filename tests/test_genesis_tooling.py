@@ -26,10 +26,10 @@ from consensus.state import compute_consensus_state_hash
 GENESIS_PATH = os.path.join(project_root, "data", "genesis.json")
 
 # ─── Golden Vectors (computed deterministically from data/genesis.json) ───
-EXPECTED_BLOCK_HASH = "44450a104e70433ba60478e2ef19f290d2db18aaffb56fd22f718b97f1478c8f"
-EXPECTED_STATE_HASH = "188ab4ed11530b091f89e30fefbec3f1e05978576c6476bcd38315b57bb6e186"
+EXPECTED_BLOCK_HASH = "51c07339f193759f696617c80c331f687f54b24bb6b16959a83cabe08fd9e70a"
+EXPECTED_STATE_HASH = "d51440ac8db255f0c0bc10e4b3ce94e0bb3ceec5a5133a7c0a0086007cc21612"
 EXPECTED_ACCOUNTS_HASH = "e357576a464b7cd08de768c8edfaaf226b6e142cccbb743c62c5e0ea4e590790"
-EXPECTED_META_HASH = "76733cac3fe236ba7ab9d3a75dcf2652d2ecd33d13fb6410655c8ea631b03f7e"
+EXPECTED_META_HASH = "6e09fea2ae9cf0cef8e066bf78ca654e657f019969195897f47b35fcde97388d"
 
 
 def _load_genesis():
@@ -279,7 +279,9 @@ class TestGenesisMismatchFatal(unittest.TestCase):
 
         # Now tamper: create a fake genesis.json with a different block hash
         genesis = _load_genesis()
-        genesis["block_0"]["hash"] = "ff" * 32  # wrong hash
+        # Tamper the header so the DB cannot treat this as a legacy hash normalization case.
+        genesis["block_0"]["header"]["state_hash"] = "00" * 32
+        genesis["block_0"]["hash"] = "ff" * 32  # wrong hash (also mismatches header-derived hash now)
         tampered_path = os.path.join(os.path.dirname(self.db_path), "tampered_genesis.json")
         with open(tampered_path, "w") as f:
             json.dump(genesis, f)
