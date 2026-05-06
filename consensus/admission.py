@@ -118,56 +118,67 @@ def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView)
 
 def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """
-    Perform a temporary staging compile against current rules to ensure ABI holds (contains o6, o7).
-    """
-    # 1. Assemble staged exact rulesets
-    current_state = tip_view.current_consensus_rules.strip()
-    if current_state and not current_state.endswith('.'):
-        current_state += '.'
-    
-    for rev in tx["rule_revisions"]:
-        current_state += f"\n{rev}\n"
-    
-    # 2. Static ABI Validation
-    if tau_defs.TAU_OUTPUT_STREAM_BLOCK_VALID not in current_state or tau_defs.TAU_OUTPUT_STREAM_ELIGIBLE not in current_state:
-        # Note: True static validation should compile and dump symbols. In Python testnet, a basic string assertion validates the interface intention.
-        logger.warning("ABI boundaries missing o6 or o7 symbols natively.")
-    
-    # Reject shadowed inputs/outputs
-    for stream_idx in ("i6", "i7", "i8", "i9", "i10", "i11", "o6", "o7"):
-        # We look for user modifications in rule_revisions specifically targeting these.
-        for rev in tx["rule_revisions"]:
-            if stream_idx in rev and "consensus" not in rev: # Crude parser check for python
-                logger.warning(f"Revision potentially shadowing {stream_idx}")
-    
-    # Native dummy execution segfaults when validating isolated revisions due to missing inputs
-    # We instead rely on:
-    # - a preprocessing/syntax pass for each revision, and
-    # - a full staged compile via Tau (o0) to catch hard parse/compile failures.
-    try:
-         for rev in tx["rule_revisions"]:
-             import tau_native
-             # Verify it passes preprocessing (syntax check) without throwing
-             tau_native.TauInterface.preprocess_spec_text(rev)
-    except Exception as e:
-         return format_error(f"Internal compiler failure natively: {e}")
+    Structural and isolated-compile checks for a consensus_rule_update payload.
 
+    The historical implementation concatenated each `rev` onto the current
+    consensus rules string and shipped that lump through the LIVE `i0`, which:
+      a) produced a multi-`always` spec that Tau's parser rejects, and
+      b) silently mutated live interpreter state (the `apply_rules_update` flag
+         is ignored in `tau_native.TauInterface.communicate`).
+
+    Production fix: build a throwaway interpreter from the current consensus
+    rules text and feed each revision through `i0` on that isolated instance.
+    Live mining state is never touched, and unparseable revisions are rejected
+    here instead of at the activation height inside the proposer's
+    `apply_block`. See `tau_native.TauInterface.compile_revisions_isolated`.
+
+    Pass order:
+      1. warn-only ABI check on the joined revisions,
+      2. warn-only shadowing check on reserved consensus streams,
+      3. per-revision preprocessing (syntax shape, normalization),
+      4. isolated staging compile against current consensus rules.
+    """
+    revisions = tx["rule_revisions"]
+
+    joined_for_abi_check = "\n".join(revisions)
+
+    # Static ABI validation (warn-only). Activation will hard-fail if the
+    # post-spec doesn't actually compile, so we don't reject here on a string
+    # absence alone.
+    if (tau_defs.TAU_OUTPUT_STREAM_BLOCK_VALID not in joined_for_abi_check
+            or tau_defs.TAU_OUTPUT_STREAM_ELIGIBLE not in joined_for_abi_check):
+        logger.warning("ABI boundaries missing o6 or o7 symbols natively.")
+
+    # Warn if a revision touches reserved consensus-ABI streams. Crude string
+    # check; Tau itself enforces strict typing at activation.
+    for stream_idx in ("i6", "i7", "i8", "i9", "i10", "i11", "o6", "o7"):
+        for rev in revisions:
+            if stream_idx in rev and "consensus" not in rev:
+                logger.warning(f"Revision potentially shadowing {stream_idx}")
+
+    # Per-revision preprocessing (syntax shape). Anything that explodes here
+    # would also explode at activation, so reject early.
+    import tau_native
     try:
-        # Full staged compile: if Tau rejects the combined spec, admission must fail.
-        # Tests patch `communicate_with_tau` here to simulate compile errors.
-        compile_res = communicate_with_tau(
-            rule_text=current_state,
-            target_output_stream_index=0,
-            source="mempool_admission_compile",
-            wait_for_ready=False,
-        )
-        if isinstance(compile_res, str) and "error" in compile_res.lower():
-            return format_error(f"Consensus update staging compile failed: {compile_res}")
+        for rev in revisions:
+            tau_native.TauInterface.preprocess_spec_text(rev)
     except Exception as e:
-        if "Direct Tau Interface used but not initialized" in str(e):
-            logger.warning("Skipping staged Tau compile because the direct interface is not initialized.")
-            return success()
-        return format_error(f"Consensus update staging compile failed: {e}")
+        return format_error(f"Internal compiler failure natively: {e}")
+
+    # Isolated staging compile. Skip if the live Tau interpreter isn't ready
+    # (early boot, test fixtures without native bindings) — admission stays
+    # available and the activation-height compile remains the backstop.
+    import tau_manager
+    if tau_manager.tau_ready.is_set():
+        try:
+            err = tau_native.TauInterface.compile_revisions_isolated(
+                tip_view.current_consensus_rules,
+                revisions,
+            )
+        except Exception as e:
+            return format_error(f"Consensus update staging compile failed: {e}")
+        if err:
+            return format_error(f"Consensus update staging compile failed: {err}")
 
     return success()
 

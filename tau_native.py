@@ -11,6 +11,21 @@ import tau_io_logger
 # Setup logging
 logger = logging.getLogger(__name__)
 
+
+def _step_io_debug_enabled() -> bool:
+    """
+    Per-step IO logging in communicate()/communicate_multi() (Input Key, Step
+    Inputs, [MEM] tau.step, Step Outputs) is extremely verbose: each Tau step
+    emits ~20 DEBUG lines, and the miner ticks roughly once per second. Gate
+    those lines behind an opt-in env var so plain DEBUG level stays usable.
+
+    Set TAU_DEBUG_STEP_IO=1 (or true/yes/on) to re-enable.
+    """
+    return os.environ.get("TAU_DEBUG_STEP_IO", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 # Global reference to the loaded tau module
 tau = None
 
@@ -490,16 +505,17 @@ class TauInterface:
 
                 input_assignments[input_obj] = value_to_assign
                 tau_io_logger.log_native_input(name, value_to_assign)
-                logger.debug(
-                    "Input Key: %r (name=%s) -> Value: %s (%s)",
-                    input_obj,
-                    name,
-                    value_to_assign,
-                    reason,
-                )
+                if _step_io_debug_enabled():
+                    logger.debug(
+                        "Input Key: %r (name=%s) -> Value: %s (%s)",
+                        input_obj,
+                        name,
+                        value_to_assign,
+                        reason,
+                    )
 
             # Log Inputs
-            if input_assignments:
+            if input_assignments and _step_io_debug_enabled():
                  logger.debug(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Inputs:{COLOR_RESET}")
                  for k, v in input_assignments.items():
                      val_str = str(v)
@@ -515,7 +531,8 @@ class TauInterface:
                 with StdOutCapture() as capture:
                     outputs = self.tau.step(self.interpreter, input_assignments)
                 mem_after = get_memory_rss_mb()
-                logger.debug(f"[MEM] tau.step: {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
+                if _step_io_debug_enabled():
+                    logger.debug(f"[MEM] tau.step: {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
                 captured_output += capture.output
             except Exception as e:
                 raise e
@@ -548,17 +565,20 @@ class TauInterface:
 
         # Log Outputs
         if outputs:
-             logger.debug(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs:{COLOR_RESET}")
              for k, v in outputs.items():
                  val_str = str(v)
                  tau_io_logger.log_native_output(k.name, val_str)
-                 if "\n" in val_str:
-                     logger.debug(f"  {k.name}:")
-                     for line in val_str.splitlines():
-                         logger.debug(f"{COLOR_BLUE}    <<< {line}{COLOR_RESET}")
-                 else:
-                     logger.debug(f"  {k.name}: {COLOR_BLUE}{val_str}{COLOR_RESET}")
-        else:
+             if _step_io_debug_enabled():
+                 logger.debug(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs:{COLOR_RESET}")
+                 for k, v in outputs.items():
+                     val_str = str(v)
+                     if "\n" in val_str:
+                         logger.debug(f"  {k.name}:")
+                         for line in val_str.splitlines():
+                             logger.debug(f"{COLOR_BLUE}    <<< {line}{COLOR_RESET}")
+                     else:
+                         logger.debug(f"  {k.name}: {COLOR_BLUE}{val_str}{COLOR_RESET}")
+        elif _step_io_debug_enabled():
              logger.debug(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs: (None){COLOR_RESET}")
             
         # 3. Extract Output
@@ -668,7 +688,8 @@ class TauInterface:
                 with StdOutCapture() as capture:
                     outputs = self.tau.step(self.interpreter, input_assignments)
                 mem_after = get_memory_rss_mb()
-                logger.debug(f"[MEM] tau.step (multi): {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
+                if _step_io_debug_enabled():
+                    logger.debug(f"[MEM] tau.step (multi): {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
                 captured_output += capture.output
             except Exception as e:
                 raise e
@@ -700,11 +721,14 @@ class TauInterface:
 
         # Log Outputs
         if outputs:
-            logger.debug(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs (multi):{COLOR_RESET}")
             for k, v in outputs.items():
                 val_str = str(v)
                 tau_io_logger.log_native_output(k.name, val_str)
-                logger.debug(f"  {k.name}: {COLOR_BLUE}{val_str}{COLOR_RESET}")
+            if _step_io_debug_enabled():
+                logger.debug(f"{COLOR_MAGENTA}[TAU_DIRECT] Step Outputs (multi):{COLOR_RESET}")
+                for k, v in outputs.items():
+                    val_str = str(v)
+                    logger.debug(f"  {k.name}: {COLOR_BLUE}{val_str}{COLOR_RESET}")
 
         # Process Spec Updates from STDOUT
         try:
@@ -740,4 +764,93 @@ class TauInterface:
             self.preprocess_spec_text(new_spec),
             reason="explicit update_spec request",
         )
+
+    @classmethod
+    def compile_revisions_isolated(
+        cls,
+        consensus_rules_text: str,
+        revisions,
+    ):
+        """
+        Compile each revision against an isolated, throwaway Tau interpreter
+        seeded from `consensus_rules_text`. Returns None on success, or a
+        string describing the first compile failure encountered.
+
+        Used by mempool admission to reject syntactically or semantically bad
+        revisions before they reach `engine.apply_block` at the activation
+        height. The throwaway interpreter is local to this call: no
+        module-level state (`tau` global, live `tau_direct_interface`,
+        `_application_rules_state`, etc.) is mutated.
+        """
+        tau_module = load_tau_module()
+
+        prepared_spec = cls.preprocess_spec_text(consensus_rules_text or "")
+        if not prepared_spec:
+            # No baseline to revise against; admission falls back to its
+            # cheap structural pass.
+            return None
+
+        try:
+            with StdOutCapture() as init_capture:
+                interpreter = tau_module.get_interpreter(prepared_spec)
+        except Exception as e:
+            return f"Failed to construct staging Tau interpreter: {e}"
+
+        if interpreter is None:
+            err = (init_capture.output or "").strip()
+            return (
+                f"Failed to construct staging Tau interpreter from current consensus rules: {err}"
+                if err
+                else "Failed to construct staging Tau interpreter from current consensus rules."
+            )
+        if "(Error)" in (init_capture.output or ""):
+            return f"Tau staging compile error: {init_capture.output.strip()}"
+
+        for rev in revisions or []:
+            if not isinstance(rev, str) or not rev.strip():
+                continue
+
+            prepared_rev = cls._normalize_assignment_value(rev, allow_hex_literal=False)
+
+            captured_output = ""
+            outputs = None
+            rev_consumed = False
+
+            # Bounded lazy-prompt loop matching communicate()'s shape: keep
+            # feeding required inputs (rev for the first i0, fallbacks for
+            # everything else) until tau.step yields outputs or we hit the
+            # iteration cap. (Error) in captured stdout short-circuits.
+            for _ in range(100):
+                try:
+                    required_inputs = tau_module.get_inputs_for_step(interpreter)
+                except Exception as e:
+                    return f"Tau staging compile error: {e}"
+
+                assignments = {}
+                for input_obj in required_inputs:
+                    name = input_obj.name
+                    if name == "i0" and not rev_consumed:
+                        assignments[input_obj] = prepared_rev
+                        rev_consumed = True
+                    else:
+                        assignments[input_obj] = cls._fallback_value_for_stream(name)
+
+                try:
+                    with StdOutCapture() as capture:
+                        outputs = tau_module.step(interpreter, assignments)
+                    captured_output += capture.output
+                except Exception as e:
+                    return f"Tau staging compile error: {e}"
+
+                if "(Error)" in capture.output:
+                    return f"Tau staging compile error: {capture.output.strip()}"
+
+                if outputs is not None:
+                    break
+
+            if "(Error)" in captured_output:
+                return f"Tau staging compile error: {captured_output.strip()}"
+
+        # `interpreter` falls out of scope here and is reclaimed; no live state touched.
+        return None
 

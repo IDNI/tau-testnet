@@ -581,6 +581,22 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
         print("[INFO][chain_state] Cleared existing in-memory state for full rebuild.")
+
+        # Reset the live Tau interpreter to the genesis consensus spec before
+        # replay. `engine.apply_block` routes activation revisions through `i0`
+        # against the live interpreter, so replaying activated blocks against
+        # an arbitrary current spec would stack revisions and produce a
+        # divergent post-state. Reorgs always reach this branch via
+        # `reorg_to -> _rebuild_state_from_blockchain_internal(0, ...)`.
+        if tau_manager.tau_ready.is_set():
+            try:
+                with open(config.TAU_PROGRAM_FILE, "r", encoding="utf-8", errors="replace") as f:
+                    genesis_spec_text = f.read()
+                tau_manager.restore_full_tau_spec(genesis_spec_text)
+                print(f"[INFO][chain_state] Reset live Tau interpreter to {config.TAU_PROGRAM_FILE} for replay.")
+            except Exception:
+                logger.exception("Failed to reset Tau interpreter before rebuild; replay activation determinism is not guaranteed.")
+
         # Initialize genesis state
         with _balance_lock:
             _balances[GENESIS_ADDRESS] = GENESIS_BALANCE
@@ -1189,24 +1205,56 @@ def tick_governance(height: int):
     """
     Called when a block is accepted at the given height. Let the ConsensusLifecycleManager
     execute precise transitions, and if any updates activate, apply them here.
+
+    Production block application drives activation through `engine.apply_block`;
+    this helper exists to support tests and out-of-band lifecycle ticks. Both
+    paths must agree, so we route revisions through `i0` here as well.
     """
     global _active_consensus_id, _consensus_rules_state
+
+    # Snapshot the activated set without holding _rules_lock across the Tau
+    # call: the lock is non-reentrant, and even with apply_rules_update=False
+    # we don't want to block readers of `_consensus_rules_state` /
+    # `_application_rules_state` for the duration of pointwise revision.
     with _rules_lock:
-        # Drive lifecycle transitions
         newly_active = _lifecycle_manager.process_height_transitions(height)
-        
-        # If any activated, the last one deterministically takes effect as active state
-        # In a real V1 chain there's rarely >1 scheduled for the exact same block,
-        # but if there is, we apply the last one sequentially.
-        if newly_active:
-            for update in newly_active:
-                logger.info("Governance activated consensus update: %s", update.update_id_hex)
-                # Combine revisions if multiple 
-                combined_revisions = "\n".join(update.rule_revisions)
-                _consensus_rules_state = combined_revisions
-                
-                # In Phase 2, `_active_consensus_id` isn't used much as an ID, but we keep it tracking the hash.
-                _active_consensus_id = update.update_id_hex[:16] 
+
+    if not newly_active:
+        return
+
+    # Route every activated revision through `i0` in declaration order. The
+    # genesis routing emits `Updated specification:` and tau_native rebuilds
+    # the interpreter, so the live spec advances exactly like user_tx ops['0']
+    # application-rule changes.
+    #
+    # Activation revisions intentionally do NOT trigger the rules-handler
+    # (`apply_rules_update=False`): consensus provenance is updated via the
+    # deterministic `"\n".join(rule_revisions)` tag written into
+    # `_consensus_rules_state` below, not via the live spec extracted from
+    # stdout. Letting the handler fire would briefly write a partially-
+    # stripped intermediate into `_application_rules_state` and persist a
+    # polluted `full_tau_spec` to the DB.
+    import tau_manager
+    for update in newly_active:
+        logger.info("Governance activated consensus update: %s", update.update_id_hex)
+        tag = f"governance_activation:{update.update_id_hex[:16]}"
+        for rev in update.rule_revisions:
+            if not isinstance(rev, str) or not rev.strip():
+                continue
+            tau_manager.communicate_with_tau(
+                rule_text=rev,
+                target_output_stream_index=0,
+                source=tag,
+                apply_rules_update=False,
+            )
+
+    last_update = newly_active[-1]
+    with _rules_lock:
+        # Provenance tag of the most recently activated revisions, used for
+        # state hashing. Live spec lives in the Tau interpreter; the
+        # post-block snapshot commit will not overwrite this.
+        _consensus_rules_state = "\n".join(last_update.rule_revisions)
+        _active_consensus_id = last_update.update_id_hex[:16]
 
 
 def initialize_persistent_state(genesis_json_path: str = "data/genesis.json"):

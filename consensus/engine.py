@@ -316,10 +316,39 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         next_cons_rules = active_view.consensus_rules
         next_active_consensus_id = parent_snapshot.metadata.get("active_consensus_id", "")
         if newly_active:
-             last_update = newly_active[-1]
-             # Update consensus rules string based on combined revisions
-             next_cons_rules = "\\n".join(last_update.rule_revisions)
-             next_active_consensus_id = last_update.update_id_hex[:16]
+            # Route every activated revision through `i0` in declaration order.
+            # The genesis `i0 -> u` routing emits an `Updated specification:`
+            # marker on stdout and tau_native rebuilds the interpreter from
+            # that output, so the live spec advances exactly the same way it
+            # does for user_tx ops['0'] application-rule changes.
+            #
+            # Activation revisions intentionally do NOT trigger the
+            # rules-handler (`apply_rules_update=False`): consensus provenance
+            # is updated via the deterministic `"\n".join(rule_revisions)` tag
+            # written into `next_snapshot.metadata["consensus_rules_state"]`
+            # below, not via the live spec extracted from stdout. Letting the
+            # handler fire here would briefly write a partially-stripped
+            # intermediate into `_application_rules_state` (the old consensus
+            # prefix no longer matches the post-revision spec) and persist a
+            # polluted `full_tau_spec` to the DB before the snapshot commit
+            # overwrites it.
+            for update in newly_active:
+                tag = f"governance_activation:{update.update_id_hex[:16]}"
+                for rev in update.rule_revisions:
+                    if not isinstance(rev, str) or not rev.strip():
+                        continue
+                    tau_manager.communicate_with_tau(
+                        rule_text=rev,
+                        target_output_stream_index=0,
+                        source=tag,
+                        apply_rules_update=False,
+                    )
+            last_update = newly_active[-1]
+            # Provenance tag used by `compute_consensus_state_hash`. Every node
+            # derives this string deterministically from `last_update.rule_revisions`,
+            # so the resulting state hash is independent of the live interpreter.
+            next_cons_rules = "\n".join(last_update.rule_revisions)
+            next_active_consensus_id = last_update.update_id_hex[:16]
         
         # Finalize Hashes
         acc_hash = compute_accounts_hash(t_bals, t_seqs)

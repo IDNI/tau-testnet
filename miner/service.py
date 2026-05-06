@@ -34,28 +34,31 @@ class SoleMiner:
         self._last_mine_time = time.time()  # Initialize to avoid immediate mine on startup
 
     def _should_mine(self) -> bool:
-        # 1. Turn check logic first (fast path)
-        latest_block = db.get_canonical_head_block()
-        next_block_number = latest_block['header']['block_number'] + 1 if latest_block else 0
-        prev_hash = latest_block['block_hash'] if latest_block else db.get_genesis_hash()
-        
-        from consensus.engine import TauConsensusEngine
-        engine = TauConsensusEngine()
-        if not engine.query_eligibility(config.MINER_PUBKEY, next_block_number, int(time.time()), prev_hash):
-            return False # Not our turn according to Tau consensus
-
-        # 2. Check mempool threshold
+        # 1. Cheap local gates first to avoid driving the Tau engine on every tick.
+        #    On an idle node these short-circuits keep us from running a full
+        #    tau.step (and its DEBUG log spam) once per second.
         pending = db.count_mempool_txs()
         if pending == 0:
             return False
-            
-        if pending >= self._threshold:
-            return True
-            
-        if (time.time() - self._last_mine_time) >= self._max_block_interval:
-            return True
-            
-        return False
+
+        threshold_met = pending >= self._threshold
+        interval_met = (time.time() - self._last_mine_time) >= self._max_block_interval
+        if not (threshold_met or interval_met):
+            return False
+
+        # 2. Only now consult Tau for proposer eligibility. create_block_from_mempool
+        #    re-checks this immediately before producing the block, so we don't lose
+        #    any safety by deferring the call until we'd actually want to mine.
+        latest_block = db.get_canonical_head_block()
+        next_block_number = latest_block['header']['block_number'] + 1 if latest_block else 0
+        prev_hash = latest_block['block_hash'] if latest_block else db.get_genesis_hash()
+
+        from consensus.engine import TauConsensusEngine
+        engine = TauConsensusEngine()
+        if not engine.query_eligibility(config.MINER_PUBKEY, next_block_number, int(time.time()), prev_hash):
+            return False  # Not our turn according to Tau consensus
+
+        return True
 
     def try_mine(self) -> None:
         with self._lock:

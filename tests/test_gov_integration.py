@@ -142,3 +142,234 @@ def test_gov_update_reject_approve_false():
     response = sendtx.execute(cmd, None)
     assert response.startswith("FAILURE:")
     assert "approve=false is unsupported" in response
+
+
+def test_apply_block_routes_activation_revisions_through_i0():
+    """
+    End-to-end activation regression. When `engine.apply_block` reaches a
+    block height that activates a scheduled consensus_rule_update, every
+    revision must be sent to Tau via `i0` (matching user_tx ops['0']
+    semantics) and the resulting `next_snapshot.metadata` must:
+
+      - record `consensus_rules_state == "\\n".join(rule_revisions)` (the
+        deterministic provenance tag, not the buggy literal `"\\\\n"`);
+      - produce a `state_hash` that matches a fresh recomputation against
+        the same string. Validators replaying the block independently
+        derive the identical hash without consulting the live interpreter.
+    """
+    from unittest.mock import patch as _patch
+    from consensus.engine import TauConsensusEngine, ActiveConsensusView
+    from consensus.governance import (
+        ConsensusLifecycleManager,
+        ConsensusRuleUpdate,
+        ConsensusRuleVote,
+    )
+    from consensus.state import (
+        TauStateSnapshot,
+        compute_consensus_meta_hash,
+        compute_consensus_state_hash,
+    )
+    from chain_state import compute_accounts_hash
+    from block import Block
+
+    validator_hex = "a" * 96
+    voter_bytes = bytes.fromhex(validator_hex)
+
+    revisions = [
+        "always ( o6[t]:bv[16] = { 0 }:bv[16] ).",
+        "always ( o7[t]:bv[16] = { 1 }:bv[16] ).",
+    ]
+    activate_at = 7
+
+    update = ConsensusRuleUpdate(
+        rule_revisions=revisions,
+        activate_at_height=activate_at,
+    )
+
+    lm = ConsensusLifecycleManager(active_validators=[validator_hex])
+    assert lm.submit_update(update)
+    # One validator, threshold == 1, vote promotes to scheduled.
+    lm.submit_vote(ConsensusRuleVote(update_id=update.update_id, approve=True), voter_bytes)
+    assert any(uid == update.update_id for _, uid in lm.scheduled_updates)
+
+    parent_app_rules = b"always (o0[t]=1)."
+    parent_snapshot = TauStateSnapshot(
+        state_hash="0" * 64,
+        tau_bytes=parent_app_rules,
+        metadata={
+            "balances": {},
+            "sequence_numbers": {},
+            "lifecycle_manager": lm,
+            "consensus_rules_state": "always (o6[t]:bv[64] = i10[t]:bv[64]).",
+            "active_consensus_id": "",
+        },
+    )
+
+    active_view = ActiveConsensusView(
+        target_height=activate_at,
+        consensus_rules=parent_snapshot.metadata["consensus_rules_state"],
+        active_validators=[voter_bytes],
+        mechanism_specific_metadata={"poa": True},
+    )
+
+    block_obj = Block.create(
+        block_number=activate_at,
+        previous_hash="00" * 32,
+        transactions=[],
+        proposer_pubkey=validator_hex,
+        timestamp=1234567890,
+    )
+
+    captured_calls = []
+
+    def _fake_communicate_with_tau(**kwargs):
+        captured_calls.append(kwargs)
+        return "T"
+
+    engine = TauConsensusEngine()
+
+    with _patch("tau_manager.communicate_with_tau", side_effect=_fake_communicate_with_tau):
+        result = engine.apply_block(active_view, block_obj, parent_snapshot)
+
+    rule_text_calls = [c for c in captured_calls if c.get("rule_text") is not None]
+    assert [c["rule_text"] for c in rule_text_calls] == revisions
+    for call in rule_text_calls:
+        assert call.get("target_output_stream_index") == 0
+        # Activation revisions must NOT trigger the rules-handler — consensus
+        # provenance is updated via the snapshot commit, not via the live
+        # spec extracted from stdout. (See `engine.apply_block`.)
+        assert call.get("apply_rules_update") is False
+        assert str(call.get("source", "")).startswith("governance_activation:")
+
+    next_snapshot = result.next_snapshot
+    assert next_snapshot.metadata["consensus_rules_state"] == "\n".join(revisions)
+    assert next_snapshot.metadata["active_consensus_id"] == update.update_id_hex[:16]
+
+    # Recompute the state hash from the deterministic strings and confirm.
+    # apply_block deep-copies the lifecycle manager and runs height transitions
+    # on the copy, so use the post-activation lifecycle manager attached to
+    # the returned snapshot for the meta-hash recomputation.
+    post_lm = next_snapshot.metadata["lifecycle_manager"]
+    expected_meta_hash = compute_consensus_meta_hash(
+        host_contract={},
+        active_validators=list(post_lm.active_validators),
+        pending_updates=list(post_lm.pending_updates),
+        vote_records=[(k, pub) for k, v in post_lm.votes.items() for pub in v],
+        activation_schedule=post_lm.scheduled_updates,
+        checkpoint_references=[],
+    )
+    expected_acc_hash = compute_accounts_hash({}, {})
+    expected_state_hash = compute_consensus_state_hash(
+        ("\n".join(revisions)).encode("utf-8"),
+        next_snapshot.tau_bytes,
+        expected_acc_hash,
+        expected_meta_hash,
+    )
+    assert next_snapshot.state_hash == expected_state_hash
+
+
+def test_apply_block_activates_multiple_updates_in_uid_order():
+    """
+    Determinism regression: when two updates share an `activate_at_height`,
+    `ConsensusLifecycleManager.process_height_transitions` must surface them
+    in `(height, update_id_bytes)` ascending order. `engine.apply_block` then
+    emits each update's revisions through `i0` in that order, and the
+    deterministic provenance recorded in the snapshot is the LAST activated
+    update's joined revisions.
+
+    A refactor that switched `scheduled_updates` to a dict/set or dropped the
+    sort would silently make replay non-deterministic; this test pins the
+    ordering down.
+    """
+    from unittest.mock import patch as _patch
+    from consensus.engine import TauConsensusEngine, ActiveConsensusView
+    from consensus.governance import (
+        ConsensusLifecycleManager,
+        ConsensusRuleUpdate,
+        ConsensusRuleVote,
+    )
+    from consensus.state import TauStateSnapshot
+    from block import Block
+
+    validator_hex = "a" * 96
+    voter_bytes = bytes.fromhex(validator_hex)
+
+    # Two updates at the same height, distinguished only by their
+    # rule_revisions content (which feeds into update_id via canonical hash).
+    revisions_x = ["always ( o6[t]:bv[16] = { 0 }:bv[16] )."]
+    revisions_y = ["always ( o7[t]:bv[16] = { 1 }:bv[16] )."]
+    activate_at = 11
+
+    update_x = ConsensusRuleUpdate(
+        rule_revisions=revisions_x,
+        activate_at_height=activate_at,
+    )
+    update_y = ConsensusRuleUpdate(
+        rule_revisions=revisions_y,
+        activate_at_height=activate_at,
+    )
+
+    # Identify the lexicographically smaller and larger updates by uid bytes.
+    if update_x.update_id < update_y.update_id:
+        first, second = update_x, update_y
+        first_revs, second_revs = revisions_x, revisions_y
+    else:
+        first, second = update_y, update_x
+        first_revs, second_revs = revisions_y, revisions_x
+
+    lm = ConsensusLifecycleManager(active_validators=[validator_hex])
+    assert lm.submit_update(update_x)
+    assert lm.submit_update(update_y)
+    lm.submit_vote(ConsensusRuleVote(update_id=update_x.update_id, approve=True), voter_bytes)
+    lm.submit_vote(ConsensusRuleVote(update_id=update_y.update_id, approve=True), voter_bytes)
+
+    # Both must be scheduled at the same height.
+    scheduled_uids = [uid for h, uid in lm.scheduled_updates if h == activate_at]
+    assert update_x.update_id in scheduled_uids
+    assert update_y.update_id in scheduled_uids
+
+    parent_snapshot = TauStateSnapshot(
+        state_hash="0" * 64,
+        tau_bytes=b"always (o0[t]=1).",
+        metadata={
+            "balances": {},
+            "sequence_numbers": {},
+            "lifecycle_manager": lm,
+            "consensus_rules_state": "always (o6[t]:bv[64] = i10[t]:bv[64]).",
+            "active_consensus_id": "",
+        },
+    )
+
+    active_view = ActiveConsensusView(
+        target_height=activate_at,
+        consensus_rules=parent_snapshot.metadata["consensus_rules_state"],
+        active_validators=[voter_bytes],
+        mechanism_specific_metadata={"poa": True},
+    )
+
+    block_obj = Block.create(
+        block_number=activate_at,
+        previous_hash="00" * 32,
+        transactions=[],
+        proposer_pubkey=validator_hex,
+        timestamp=1234567890,
+    )
+
+    captured_calls = []
+
+    def _fake_communicate_with_tau(**kwargs):
+        captured_calls.append(kwargs)
+        return "T"
+
+    engine = TauConsensusEngine()
+    with _patch("tau_manager.communicate_with_tau", side_effect=_fake_communicate_with_tau):
+        result = engine.apply_block(active_view, block_obj, parent_snapshot)
+
+    # i0 calls in declaration order, with the smaller-uid update activating first.
+    rule_text_calls = [c for c in captured_calls if c.get("rule_text") is not None]
+    assert [c["rule_text"] for c in rule_text_calls] == list(first_revs) + list(second_revs)
+
+    # Provenance: the LAST activated update wins (matches `last_update = newly_active[-1]`).
+    next_snapshot = result.next_snapshot
+    assert next_snapshot.metadata["consensus_rules_state"] == "\n".join(second_revs)
+    assert next_snapshot.metadata["active_consensus_id"] == second.update_id_hex[:16]
