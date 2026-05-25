@@ -55,27 +55,30 @@ def rpc_command(cmd_str, host, port):
                 break
     return b"".join(chunks).decode('utf-8')
 
+def _parse_envelope(resp_text: str):
+    body = resp_text.strip()
+    try:
+        return json.loads(body)
+    except (ValueError, TypeError):
+        return None
+
+
 def assert_success(resp_text: str, context: str):
-    if "ERROR" in resp_text or "REJECTED" in resp_text or "VERDICT_REJECT" in resp_text:
+    env = _parse_envelope(resp_text)
+    if not isinstance(env, dict) or env.get("status") != "ok":
         print(f"\n[FATAL] {context} failed!\nResponse: {resp_text.strip()}")
         sys.exit(1)
 
 
-def _extract_prefixed_body(resp_text: str, prefix: str) -> str:
-    body = resp_text.strip()
-    if body.startswith(prefix):
-        return body[len(prefix):].lstrip("\r\n")
-    return body
-
-
 def rpc_json_command(cmd_str, host, port, prefix=None):
     resp = rpc_command(cmd_str, host, port)
-    body = _extract_prefixed_body(resp, prefix) if prefix else resp.strip()
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError as exc:
+    env = _parse_envelope(resp)
+    if not isinstance(env, dict):
         print(f"\n[FATAL] Failed to parse JSON response for `{cmd_str.strip()}`.\nRaw response: {resp.strip()}")
-        raise SystemExit(1) from exc
+        raise SystemExit(1)
+    if env.get("status") != "ok":
+        return env
+    return env.get("data") or {}
 
 
 def _validate_update_id_hex(update_id: str) -> str:
@@ -85,8 +88,11 @@ def _validate_update_id_hex(update_id: str) -> str:
 
 def get_seq(pk, host, port):
     seq_resp = rpc_command(f"getsequence {pk}\r\n", host, port).strip()
-    if seq_resp.startswith("SEQUENCE: "):
-        return int(seq_resp.split(": ", 1)[1])
+    env = _parse_envelope(seq_resp)
+    if isinstance(env, dict) and env.get("status") == "ok":
+        seq = (env.get("data") or {}).get("sequence_number")
+        if isinstance(seq, int):
+            return seq
     return 0
 
 
@@ -95,8 +101,10 @@ def get_governance_state(host, port):
 
 
 def get_tau_state(host, port):
-    resp = rpc_command("gettaustate\r\n", host, port)
-    return _extract_prefixed_body(resp, "TAUSTATE:")
+    data = rpc_json_command("gettaustate\r\n", host, port)
+    if isinstance(data, dict):
+        return data.get("rules_state", "")
+    return ""
 
 def submit_rule_update(host, port, privkey, activate_at, rule: list, patch=None):
     if not rule:

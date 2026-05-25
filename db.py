@@ -422,6 +422,29 @@ def get_mempool_txs() -> list:
         cur.execute('SELECT payload FROM mempool ORDER BY received_at')
         return [row[0] for row in cur.fetchall()]
 
+
+def get_mempool_entries() -> List[Dict]:
+    """
+    Returns rich mempool rows for inspection: tx_hash, payload, received_at, status.
+    Ordered by received_at ASC (FIFO).
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT tx_hash, payload, received_at, status FROM mempool ORDER BY received_at ASC'
+        )
+        return [
+            {
+                "tx_hash": row[0],
+                "payload": row[1],
+                "received_at": row[2],
+                "status": row[3],
+            }
+            for row in cur.fetchall()
+        ]
+
 def reserve_mempool_txs(limit: int = 1000, max_age_seconds: int = 60) -> List[Dict]:
     """
     Selects pending transactions from the mempool (FIFO by received_at)

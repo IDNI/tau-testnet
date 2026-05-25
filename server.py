@@ -14,8 +14,8 @@ from network import NetworkService
 
 # Project modules
 import config
-import re
 import json
+import api_response
 from commands import createblock, sendtx  # Import command handlers
 from errors import ConfigurationError, TauEngineCrash, TauTestnetError
 import tau_logging
@@ -29,117 +29,71 @@ NETWORK_STOP_FLAG = threading.Event()
 # --- Command Dispatch Table ---
 
 
+SUPPORTED_HANDSHAKE_VERSIONS = {"1", "2"}
+
+
 def process_command(raw_command: str, container: ServiceContainer, client_label: str) -> tuple[bool, str]:
     """
     Process a single command string from any source (TCP or WS).
-    
-    Args:
-        raw_command: The full command string (e.g., "getbalance <key>")
-        container: ServiceContainer instance
-        client_label: Identifier for logging (IP:Port or WS ID)
-        
+
     Returns:
         (success, response_string)
-        success: True if the command was processed (even if it resulted in a Tau error).
-                 False if it was a protocol level error (empty, unknown command, malformed).
-        response_string: The response to send back to the client. Does NOT include trailing newline.
+        success: True if a JSON envelope was produced.
+                 False for the plain-text handshake replies (hello/ok/error <code>).
+        response_string: Body to forward to the client. The TCP transport adds
+        ``\\r\\n`` framing; WebSocket emits it raw.
     """
     if not raw_command:
-        return False, "ERROR: Received empty command."
+        return True, api_response.error_response(
+            "", "Received empty command.", "INVALID_PARAMS"
+        )
 
-    # Handle Handshake (Virtual Command)
+    # Handle Handshake (Virtual Command) — stays plain text.
     if raw_command.startswith("hello version="):
-        # Format: hello version=1
         try:
-            version_val = raw_command.split("=")[1].strip()
-            if version_val == "1":
-                # Return standard handshake response
-                # We can inject node_id if we want, for now minimal is fine
-                return True, f"ok version=1 env={container.settings.env} node=tau-node"
-            else:
-                return False, f"error unsupported_version expected=1 got={version_val}"
+            version_val = raw_command.split("=", 1)[1].strip()
         except IndexError:
             return False, "error malformed_handshake"
+        if version_val in SUPPORTED_HANDSHAKE_VERSIONS:
+            return False, f"ok version={version_val} env={container.settings.env} node=tau-node"
+        return False, f"error unsupported_version expected=1|2 got={version_val}"
 
-    command_str = raw_command.lower()
     parts = raw_command.split()
     if not parts:
-        return False, "ERROR: Empty command."
-        
+        return True, api_response.error_response(
+            "", "Empty command.", "INVALID_PARAMS"
+        )
+
     command_name = parts[0].lower()
     logger.debug("Processing command from %s: %s", client_label, command_name)
 
-    command_handlers = container.command_handlers
-    handler = command_handlers.get(command_name)
-    
-    if not handler:
+    handler = container.command_handlers.get(command_name)
+    if not handler or not hasattr(handler, "execute"):
         logger.warning("Unknown command from %s: %s", client_label, command_name)
-        return False, f"ERROR: Unknown command '{command_name}'"
-
-    # 1. Local execution path
-    if hasattr(handler, 'execute'):
-        try:
-            resp = handler.execute(raw_command, container)
-            return True, resp.rstrip() # Ensure we control newlines
-        except Exception as exc:
-            logger.exception("Error executing local command %s for %s", command_name, client_label)
-            return True, f"ERROR: {exc}"
-
-    # 2. Tau execution path
-    db_module = container.db
-    tau_module = container.tau_manager
-    mempool_state = container.mempool_state
-
-    # Map parameters to IDs for Tau commands
-    mapped = [parts[0]]
-    # We don't really need mapped_params list for logic, just for debug if we wanted
-    for param in parts[1:]:
-        if re.fullmatch(r"[01]+", param) or param.isdigit():
-            mapped.append(param)
-        else:
-            yid = db_module.get_string_id(param)
-            mapped.append(yid)
-    
-    parts = mapped
-
-    try:
-        tau_input = handler.encode_command(parts)
-    except TauTestnetError as exc:
-        logger.warning("Encoding command %s failed for %s: %s", command_name, client_label, exc)
-        return True, f"ERROR: {exc}"
-    except Exception as exc:
-        logger.exception("Encoding command %s failed for %s", command_name, client_label)
-        return True, f"ERROR: {exc}"
-
-    if not tau_module.tau_ready.wait(timeout=config.CLIENT_WAIT_TIMEOUT):
-        logger.error("Tau process not ready for command %s from %s", command_name, client_label)
-        return True, "ERROR: Tau process not ready."
-
-    try:
-        tau_output = tau_module.communicate_with_tau(tau_input)
-        decoded = handler.decode_output(tau_output, tau_input)
-        result_message = handler.handle_result(decoded, tau_input, mempool_state)
-    except TimeoutError:
-        logger.error("Timeout communicating with Tau for %s", client_label)
-        result_message = "ERROR: Timeout communicating with Tau process."
-    except TauTestnetError as e:
-        logger.warning("Tau error processing %s for %s: %s", command_name, client_label, e)
-        result_message = f"ERROR: {e}"
-    except Exception:
-        logger.exception("Internal error processing %s for %s", command_name, client_label)
-        result_message = "ERROR: Internal error processing command."
-
-    # Reverse map IDs
-    try:
-        result_message = re.sub(
-            r"y(\\d+)",
-            lambda m: db_module.get_text_by_id("y" + m.group(1)),
-            result_message,
+        return True, api_response.error_response(
+            command_name, f"Unknown command '{command_name}'", "UNKNOWN_COMMAND"
         )
-    except Exception:
-        logger.debug("Failed to reverse-map Tau IDs for %s", client_label)
-    
-    return True, result_message
+
+    try:
+        resp = handler.execute(raw_command, container)
+    except TauTestnetError as exc:
+        logger.warning("Tau error processing %s for %s: %s", command_name, client_label, exc)
+        return True, api_response.error_response(command_name, str(exc), "INTERNAL_ERROR")
+    except TimeoutError:
+        logger.error("Timeout while running %s for %s", command_name, client_label)
+        return True, api_response.error_response(
+            command_name, "Timeout communicating with Tau process.", "TIMEOUT"
+        )
+    except Exception as exc:
+        logger.exception("Error executing local command %s for %s", command_name, client_label)
+        return True, api_response.error_response(command_name, str(exc), "INTERNAL_ERROR")
+
+    if not isinstance(resp, str):
+        logger.error("Handler %s returned non-string response", command_name)
+        return True, api_response.error_response(
+            command_name, "Handler returned malformed response.", "INTERNAL_ERROR"
+        )
+    return True, resp.rstrip("\r\n")
 
 
 
@@ -242,7 +196,11 @@ async def websocket_handler(request):
             
             if bucket_tokens < 1.0:
                  logger.warning("Rate limit exceeded for %s", client_label)
-                 await ws.send_message("error rate_limit_exceeded")
+                 await ws.send_message(
+                     api_response.error_response(
+                         "rate_limit", "Rate limit exceeded", "RATE_LIMITED"
+                     )
+                 )
                  # Optionally close, or just drop
                  continue
             bucket_tokens -= 1.0
@@ -364,7 +322,10 @@ def handle_client(conn, addr, container: ServiceContainer):
                     raw = data.decode('utf-8').strip()
                 except UnicodeDecodeError as exc:
                     logger.warning("Invalid UTF-8 from %s: %s", client_label, exc)
-                    conn.sendall(b"ERROR: Invalid UTF-8 encoding\n")
+                    err = api_response.error_response(
+                        "", "Invalid UTF-8 encoding", "INVALID_PARAMS"
+                    ) + "\r\n"
+                    conn.sendall(err.encode('utf-8'))
                     continue
 
                 # Use shared process_command logic

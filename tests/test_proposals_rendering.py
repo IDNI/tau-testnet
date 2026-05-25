@@ -44,8 +44,10 @@ from commands.getgovernance import execute as getgov_execute
 def test_getgovernance_includes_approval_threshold():
     container = MockContainer()
     resp_raw = getgov_execute("getgovernance", container)
-    resp = json.loads(resp_raw)
-    
+    envelope = json.loads(resp_raw)
+    assert envelope["status"] == "ok"
+    resp = envelope["data"]
+
     assert "approval_threshold" in resp
     assert resp["approval_threshold"] == 2 # (3 // 2) + 1
 
@@ -62,8 +64,8 @@ def test_pending_updates_include_revisions_and_patch():
     container.chain_state._lifecycle_manager.submit_update(update)
     
     resp_raw = getgov_execute("getgovernance", container)
-    resp = json.loads(resp_raw)
-    
+    resp = json.loads(resp_raw)["data"]
+
     assert len(resp["pending_updates"]) == 1
     pu = resp["pending_updates"][0]
     
@@ -88,8 +90,8 @@ def test_lifecycle_status_explicit():
     mgr.scheduled_updates.append((500, update2.update_id))
     
     resp_raw = getgov_execute("getgovernance", container)
-    resp = json.loads(resp_raw)
-    
+    resp = json.loads(resp_raw)["data"]
+
     assert resp["lifecycle"][update1.update_id_hex] == "pending"
     assert resp["lifecycle"][update2.update_id_hex] == "approved-and-scheduled"
 
@@ -110,8 +112,8 @@ def test_only_pending_in_pending_updates():
     mgr.archival_updates.add(update3.update_id)
     
     resp_raw = getgov_execute("getgovernance", container)
-    resp = json.loads(resp_raw)
-    
+    resp = json.loads(resp_raw)["data"]
+
     assert len(resp["pending_updates"]) == 1
     assert resp["pending_updates"][0]["update_id"] == update1.update_id_hex
 
@@ -128,8 +130,8 @@ def test_votes_only_counted_for_pending():
     mgr.submit_vote(v1, VALIDATOR_2)
     
     resp_raw = getgov_execute("getgovernance", container)
-    resp = json.loads(resp_raw)
-    
+    resp = json.loads(resp_raw)["data"]
+
     assert len(resp["votes"]) == 2
     for v in resp["votes"]:
         assert v["update_id"] == update1.update_id_hex

@@ -190,11 +190,22 @@ def get_sequence(
     response = rpc_mod.send_command(
         f"getsequence {pubkey}", host, port, timeout=timeout
     )
-    if response.startswith("SEQUENCE: "):
-        return int(response.split(": ", 1)[1].strip())
-    if response.startswith("ERROR:"):
-        raise RuntimeError(f"node rejected getsequence: {response}")
-    raise RuntimeError(f"unexpected getsequence response: {response!r}")
+    try:
+        parsed = json.loads(response)
+    except (ValueError, TypeError):
+        raise RuntimeError(f"unexpected getsequence response: {response!r}")
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"unexpected getsequence response: {response!r}")
+    if parsed.get("status") == "error":
+        err = parsed.get("error", {}) or {}
+        raise RuntimeError(
+            f"node rejected getsequence: {err.get('code', 'ERROR')} {err.get('message', '')}".strip()
+        )
+    data = parsed.get("data") or {}
+    seq = data.get("sequence_number")
+    if not isinstance(seq, int):
+        raise RuntimeError(f"unexpected getsequence response: {response!r}")
+    return seq
 
 
 def submit_tx(

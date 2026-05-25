@@ -192,7 +192,7 @@ def test_tx_send_builds_signed_payload(tmp_path, monkeypatch):
             "--amount",
             "10",
         ],
-        send_responses=["SEQUENCE: 5", "SUCCESS: deadbeef"],
+        send_responses=['{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":5}}', '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"deadbeef"}}'],
         recorded=recorded,
     )
     assert rc == 0, err
@@ -235,7 +235,7 @@ def test_tx_send_no_operations_exits_4():
     """No --to/--amount/--transfer/--rule-file/--operations-json → no operations."""
     rc, _, err = _run_cli(
         ["tx", "send", "--privkey", "1" * 64],
-        send_responses=["SEQUENCE: 0"],
+        send_responses=['{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}'],
     )
     assert rc == 4
     assert "operation" in err.lower()
@@ -255,7 +255,10 @@ def test_tx_send_error_response_exits_1(tmp_path, monkeypatch):
             "--amount",
             "1",
         ],
-        send_responses=["SEQUENCE: 0", "ERROR: insufficient funds"],
+        send_responses=[
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}',
+            '{"status":"error","command":"sendtx","error":{"code":"TX_REJECTED","message":"insufficient funds"}}',
+        ],
     )
     assert rc == 1
 
@@ -287,7 +290,9 @@ def test_tx_raw_sign_then_raw_submit_round_trip(tmp_path):
     recorded = []
     rc, _, _ = _run_cli(
         ["tx", "raw-submit", "--file", str(signed_path)],
-        send_responses=["SUCCESS: deadbeef"],
+        send_responses=[
+            '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"deadbeef"}}'
+        ],
         recorded=recorded,
     )
     assert rc == 0
@@ -314,7 +319,10 @@ def test_tx_send_multiple_transfers_combine(tmp_path, monkeypatch):
             "--transfer",
             f"{b}:2",
         ],
-        send_responses=["SEQUENCE: 0", "SUCCESS: ok"],
+        send_responses=[
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}',
+            '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"abcd"}}',
+        ],
         recorded=recorded,
     )
     assert rc == 0

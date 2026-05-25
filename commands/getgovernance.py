@@ -1,5 +1,7 @@
 import json
 
+import api_response
+
 
 def _normalize_hexish(value):
     if isinstance(value, bytes):
@@ -10,7 +12,9 @@ def _normalize_hexish(value):
 def execute(raw_command: str, container):
     parts = raw_command.split()
     if len(parts) != 1:
-        return "ERROR: Usage: getgovernance\r\n"
+        return api_response.error_response(
+            "getgovernance", "Usage: getgovernance", "INVALID_PARAMS"
+        )
 
     chain_state = container.chain_state
     db = container.db
@@ -118,4 +122,4 @@ def execute(raw_command: str, container):
             "lifecycle": lifecycle,
         }
 
-    return json.dumps(payload, sort_keys=True) + "\r\n"
+    return api_response.success_response("getgovernance", payload)

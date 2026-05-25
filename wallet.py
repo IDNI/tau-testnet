@@ -130,10 +130,14 @@ def cmd_send(args):
     
     # Get the current sequence number from the server
     seq_resp = rpc_command(f"getsequence {sender_pk}\r\n", args.host, args.port).strip()
-    if seq_resp.startswith("SEQUENCE: "):
-        seq = int(seq_resp.split(": ", 1)[1])
-    else:
-        # Fallback to history-based calculation if getsequence fails
+    seq = None
+    try:
+        parsed = json.loads(seq_resp)
+        if isinstance(parsed, dict) and parsed.get("status") == "ok":
+            seq = parsed.get("data", {}).get("sequence_number")
+    except (ValueError, TypeError):
+        pass
+    if not isinstance(seq, int):
         print(f"Warning: Could not get sequence number from server ({seq_resp}), falling back to history count")
         hist = rpc_command(f"history {sender_pk}\r\n", args.host, args.port).splitlines()
         seq = len(hist) - 1 if len(hist) > 1 else 0

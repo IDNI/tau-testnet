@@ -53,11 +53,11 @@ def _patch_create_connection(fake):
 
 
 def test_send_command_appends_crlf_and_strips_trailing():
-    fake = FakeSocket([b"BALANCE: 100\r\n"])
+    fake = FakeSocket([b'{"status":"ok","command":"getbalance","data":{"address":"abc","balance":"100"}}\r\n'])
     with _patch_create_connection(fake):
         result = rpc_mod.send_command("getbalance abc", "127.0.0.1", 65432)
     assert fake.sent == b"getbalance abc\r\n"
-    assert result == "BALANCE: 100"
+    assert result == '{"status":"ok","command":"getbalance","data":{"address":"abc","balance":"100"}}'
 
 
 def test_send_command_does_not_double_crlf():
@@ -76,10 +76,11 @@ def test_send_command_reads_until_socket_close():
 
 
 def test_send_command_returns_error_response_verbatim():
-    fake = FakeSocket([b"ERROR: bad request\r\n"])
+    envelope = b'{"status":"error","command":"badcmd","error":{"code":"UNKNOWN_COMMAND","message":"Unknown command \'badcmd\'"}}\r\n'
+    fake = FakeSocket([envelope])
     with _patch_create_connection(fake):
         result = rpc_mod.send_command("badcmd", "127.0.0.1", 65432)
-    assert result == "ERROR: bad request"
+    assert '"status":"error"' in result
     assert rpc_mod.is_error_response(result)
 
 
@@ -120,9 +121,17 @@ def test_handshake_sends_hello_v1():
 
 
 def test_is_error_response():
-    assert rpc_mod.is_error_response("ERROR: bad")
+    assert rpc_mod.is_error_response(
+        '{"status":"error","command":"sendtx","error":{"code":"TX_REJECTED","message":"nope"}}'
+    )
+    assert rpc_mod.is_error_response(
+        '{"status":"error","command":"","error":{"code":"INVALID_PARAMS","message":"bad"}}'
+    )
+    # Plain-text handshake errors still flagged so callers can short-circuit.
     assert rpc_mod.is_error_response("error malformed_handshake")
-    assert rpc_mod.is_error_response("FAILURE: not an active validator")
-    assert not rpc_mod.is_error_response("BALANCE: 10")
+    assert not rpc_mod.is_error_response(
+        '{"status":"ok","command":"getbalance","data":{"address":"x","balance":"10"}}'
+    )
     assert not rpc_mod.is_error_response("ok version=1 env=test")
-    assert not rpc_mod.is_error_response("SUCCESS: Transaction queued.")
+    # Garbage / non-JSON / non-handshake bodies are not classified as errors.
+    assert not rpc_mod.is_error_response("nonsense")

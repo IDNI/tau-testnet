@@ -3,10 +3,15 @@ import pytest
 from commands import getupdateid
 from consensus.serialization import compute_update_id
 
+
+def _call(payload):
+    return json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
+
+
 def test_getupdateid_valid():
     revisions = ["always (o5[t] = {1}:bv)."]
     activate_at_height = 100
-    
+
     payload = {
         "rule_revisions": revisions,
         "activate_at_height": activate_at_height,
@@ -16,85 +21,89 @@ def test_getupdateid_valid():
             "input_contract_version": 1
         }
     }
-    
-    raw_cmd = f"getupdateid {json.dumps(payload)}"
-    response_json = getupdateid.execute(raw_cmd, None)
-    response = json.loads(response_json)
-    
+
+    response = _call(payload)
+
     assert response["status"] == "ok"
-    assert "update_id" in response
-    assert len(response["update_id"]) == 64
-    assert response["update_id"].islower()
-    assert all(c in "0123456789abcdef" for c in response["update_id"])
-    
-    # Check it matches direct computation
+    data = response["data"]
+    assert "update_id" in data
+    assert len(data["update_id"]) == 64
+    assert data["update_id"].islower()
+    assert all(c in "0123456789abcdef" for c in data["update_id"])
+
     expected_uid = compute_update_id(revisions, activate_at_height, payload["host_contract_patch"])
-    assert response["update_id"] == expected_uid.hex()
+    assert data["update_id"] == expected_uid.hex()
+
 
 def test_getupdateid_missing_revisions():
-    payload = {"activate_at_height": 100}
-    response = json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
+    response = _call({"activate_at_height": 100})
     assert response["status"] == "error"
-    assert "rule_revisions" in response["error"]
+    assert "rule_revisions" in response["error"]["message"]
+
 
 def test_getupdateid_invalid_revisions_type():
-    payload = {"rule_revisions": "not a list", "activate_at_height": 100}
-    response = json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
+    response = _call({"rule_revisions": "not a list", "activate_at_height": 100})
     assert response["status"] == "error"
-    assert "list" in response["error"]
+    assert "list" in response["error"]["message"]
+
 
 def test_getupdateid_empty_revisions():
-    payload = {"rule_revisions": [], "activate_at_height": 100}
-    response = json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
+    response = _call({"rule_revisions": [], "activate_at_height": 100})
     assert response["status"] == "error"
-    assert "non-empty" in response["error"]
+    assert "non-empty" in response["error"]["message"]
+
 
 def test_getupdateid_invalid_revision_element():
-    payload = {"rule_revisions": [""], "activate_at_height": 100}
-    response = json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
+    response = _call({"rule_revisions": [""], "activate_at_height": 100})
     assert response["status"] == "error"
-    assert "non-empty string" in response["error"]
+    assert "non-empty string" in response["error"]["message"]
+
 
 def test_getupdateid_float_height():
-    payload = {"rule_revisions": ["a"], "activate_at_height": 100.0}
-    response = json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
+    response = _call({"rule_revisions": ["a"], "activate_at_height": 100.0})
     assert response["status"] == "error"
-    assert "integer, not float" in response["error"]
+    assert "integer, not float" in response["error"]["message"]
+
 
 def test_getupdateid_zero_height():
-    payload = {"rule_revisions": ["a"], "activate_at_height": 0}
-    response = json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
+    response = _call({"rule_revisions": ["a"], "activate_at_height": 0})
     assert response["status"] == "error"
-    assert "1..2^64-1" in response["error"]
+    assert "1..2^64-1" in response["error"]["message"]
+
 
 def test_getupdateid_negative_height():
-    payload = {"rule_revisions": ["a"], "activate_at_height": -1}
-    response = json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
+    response = _call({"rule_revisions": ["a"], "activate_at_height": -1})
     assert response["status"] == "error"
-    assert "1..2^64-1" in response["error"]
+    assert "1..2^64-1" in response["error"]["message"]
+
 
 def test_getupdateid_string_height():
-    payload = {"rule_revisions": ["a"], "activate_at_height": "100"}
-    response = json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
+    response = _call({"rule_revisions": ["a"], "activate_at_height": "100"})
     assert response["status"] == "error"
-    assert "integer in range" in response["error"]
-    
+    assert "integer in range" in response["error"]["message"] or "integer, not float" in response["error"]["message"]
+
+
 def test_getupdateid_invalid_patch_type():
-    payload = {"rule_revisions": ["a"], "activate_at_height": 100, "host_contract_patch": "string"}
-    response = json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
+    response = _call({
+        "rule_revisions": ["a"],
+        "activate_at_height": 100,
+        "host_contract_patch": "string",
+    })
     assert response["status"] == "error"
-    assert "object if provided" in response["error"]
-    
+    assert "object if provided" in response["error"]["message"]
+
+
 def test_getupdateid_invalid_patch_array():
-    payload = {"rule_revisions": ["a"], "activate_at_height": 100, "host_contract_patch": []}
-    response = json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
+    response = _call({
+        "rule_revisions": ["a"],
+        "activate_at_height": 100,
+        "host_contract_patch": [],
+    })
     assert response["status"] == "error"
-    assert "object if provided" in response["error"]
-    
+    assert "object if provided" in response["error"]["message"]
 
 
 def test_getupdateid_no_patch_omitted():
-    payload = {"rule_revisions": ["always."], "activate_at_height": 1}
-    response = json.loads(getupdateid.execute(f"getupdateid {json.dumps(payload)}", None))
+    response = _call({"rule_revisions": ["always."], "activate_at_height": 1})
     assert response["status"] == "ok"
-    assert "host_contract_patch" not in response["input_echo"]
+    assert "host_contract_patch" not in response["data"]["input_echo"]

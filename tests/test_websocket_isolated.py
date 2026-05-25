@@ -55,7 +55,7 @@ async def test_handshake_failure(mock_container, nursery):
     port = server.port
 
     async with trio_websocket.open_websocket_url(f"ws://127.0.0.1:{port}") as ws:
-        await ws.send_message("hello version=2")
+        await ws.send_message("hello version=99")
         resp = await ws.get_message()
         assert "error unsupported_version" in resp
 

@@ -114,7 +114,7 @@ class TestSendTxValidation(unittest.TestCase):
         # If BLS is disabled (setUp), validation might scope signature, but balance check should run?
         # sendtx.py: _validate_transaction checks balance.
         # But if _PY_ECC_AVAILABLE is False, does it check? Yes.
-        self.assertTrue(result.startswith("FAILURE:"), f"Expected failure, got: {result}")
+        self.assertFalse(result["ok"], f"Expected failure, got: {result}")
         self.assertEqual(chain_state.get_balance(GENESIS), 10)
         self.assertEqual(len(db.get_mempool_txs()), 0)
 
@@ -130,12 +130,15 @@ class TestSendTxValidation(unittest.TestCase):
         }
         tx_json = json.dumps(tx)
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("FAILURE: Transaction invalid."))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TX_INVALID")
+        self.assertIn("Transaction invalid.", result["message"])
 
     def test_fail_invalid_to_address_format_python(self):
         tx_json = self._create_tx([[GENESIS, INVALID_ADDR_NON_HEX, "10"]])
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("FAILURE: Transaction invalid."))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TX_INVALID")
 
     def test_no_transfers_key_success(self):
         tx = {
@@ -149,7 +152,7 @@ class TestSendTxValidation(unittest.TestCase):
         }
         tx_json = json.dumps(tx)
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
+        self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
         mempool = db.get_mempool_txs()
         self.assertEqual(len(mempool), 1)
         self.assertEqual(json.loads(mempool[0]), json.loads(tx_json))
@@ -157,7 +160,7 @@ class TestSendTxValidation(unittest.TestCase):
     def test_empty_transfers_list_success(self):
         tx_json = self._create_tx([])
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
+        self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
         # self.assertIn("empty transfer list", result) # Doesn't necessarily return this message
         mempool = db.get_mempool_txs()
         self.assertEqual(len(mempool), 1)
@@ -181,9 +184,7 @@ class TestSendTxValidation(unittest.TestCase):
         }
         tx_json = json.dumps(tx)
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(
-            result.startswith("FAILURE:"),
-            f"expected FAILURE prefix, got {result!r}",
-        )
-        self.assertIn("operation '0'", result)
-        self.assertIn("string", result)
+        self.assertFalse(result["ok"], f"expected failure, got {result!r}")
+        self.assertEqual(result["code"], "TX_INVALID")
+        self.assertIn("operation '0'", result["message"])
+        self.assertIn("string", result["message"])

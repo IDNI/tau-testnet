@@ -118,58 +118,38 @@ def test_chain_state_persistence(mock_chain_state):
 # --- Tests for server.py error handling ---
 
 def test_server_error_handling():
+    import json
     from server import handle_client
     from app.container import ServiceContainer
-    
-    # Mock container and components
+
     container = MagicMock(spec=ServiceContainer)
     container.command_handlers = {}
     container.tau_manager = MagicMock()
     container.db = MagicMock()
     container.chain_state = MagicMock()
     container.mempool_state = MagicMock()
-    
-    # Mock socket
+
     mock_conn = MagicMock()
-    mock_conn.recv.side_effect = [b"unknown_command", b""] # Command then disconnect
-    
-    # 1. Unknown command
+    mock_conn.recv.side_effect = [b"unknown_command", b""]
+
+    # 1. Unknown command -> envelope with UNKNOWN_COMMAND
     handle_client(mock_conn, ("127.0.0.1", 1234), container)
-    # Should send ERROR: Unknown command
     args, _ = mock_conn.sendall.call_args
-    assert b"ERROR: Unknown command" in args[0]
-    
-    # 2. TauTestnetError
+    sent = args[0].decode("utf-8").rstrip("\r\n")
+    parsed = json.loads(sent)
+    assert parsed["status"] == "error"
+    assert parsed["error"]["code"] == "UNKNOWN_COMMAND"
+
+    # 2. Handler whose execute() raises -> INTERNAL_ERROR envelope.
     mock_conn.reset_mock()
     mock_conn.recv.side_effect = [b"test_cmd", b""]
-    
     mock_handler = MagicMock()
-    del mock_handler.execute # Ensure it falls through to Tau path
-    mock_handler.encode_command.side_effect = TauTestnetError("Custom tau error")
+    mock_handler.execute.side_effect = TauTestnetError("Custom tau error")
     container.command_handlers = {"test_cmd": mock_handler}
-    
+
     handle_client(mock_conn, ("127.0.0.1", 1234), container)
-    
-    # Should send ERROR: Custom tau error
-    # Note: handle_client catches exception during encode_command?
-    # Let's check server.py logic.
-    # try: tau_input = handler.encode_command(...) except Exception ...
-    # Wait, I didn't update the try/except block around encode_command, only around communicate_with_tau!
-    # I should check server.py again.
-    
-    # 3. TauCommunicationError
-    mock_conn.reset_mock()
-    mock_conn.recv.side_effect = [b"comm_cmd", b""]
-    
-    mock_handler2 = MagicMock()
-    del mock_handler2.execute # Ensure it falls through to Tau path
-    mock_handler2.encode_command.return_value = "input"
-    container.command_handlers = {"comm_cmd": mock_handler2}
-    
-    container.tau_manager.tau_ready.wait.return_value = True
-    container.tau_manager.communicate_with_tau.side_effect = TauCommunicationError("Comm failed")
-    
-    handle_client(mock_conn, ("127.0.0.1", 1234), container)
-    
     args, _ = mock_conn.sendall.call_args
-    assert b"ERROR: Comm failed" in args[0]
+    parsed = json.loads(args[0].decode("utf-8").rstrip("\r\n"))
+    assert parsed["status"] == "error"
+    assert parsed["error"]["code"] == "INTERNAL_ERROR"
+    assert "Custom tau error" in parsed["error"]["message"]

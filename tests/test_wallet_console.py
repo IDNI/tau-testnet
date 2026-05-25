@@ -43,10 +43,10 @@ class TestWalletConsole(unittest.TestCase):
         
         def rpc_side_effect(cmd, host, port):
             if "getsequence" in cmd:
-                return "SEQUENCE: 5"
+                return '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":5}}'
             if "sendtx" in cmd:
-                return "SUCCESS: txid"
-            return "ERROR"
+                return '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"txid"}}'
+            return '{"status":"error","command":"","error":{"code":"UNKNOWN_COMMAND","message":"Unknown"}}'
         
         mock_rpc.side_effect = rpc_side_effect
         mock_sign.return_value = b"\x00"*96 # Mock signature

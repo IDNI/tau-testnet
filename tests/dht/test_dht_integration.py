@@ -13,13 +13,8 @@ from network.service import NetworkService
 pytestmark = pytest.mark.trio
 
 
-async def _wait_for_listen_addrs(host, timeout: float = 5.0) -> List[multiaddr.Multiaddr]:
-    with trio.fail_after(timeout):
-        while True:
-            addrs = list(host.get_addrs() or [])
-            if addrs:
-                return [multiaddr.Multiaddr(str(addr)) for addr in addrs]
-            await trio.sleep(0.05)
+# Listen-addr helper lives in tests/conftest.py — single source.
+from conftest import wait_for_addrs as _wait_for_listen_addrs  # noqa: E402
 
 
 @pytest.fixture

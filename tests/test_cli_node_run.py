@@ -160,6 +160,24 @@ def test_listen_overrides_shell_env():
     assert env["TAU_NETWORK_LISTEN"] == "/ip4/127.0.0.1/tcp/4001"
 
 
+def test_node_run_reload_applies_listen_to_settings(monkeypatch):
+    """`config` is imported before `node run`; reload must pick up --listen."""
+    import os
+
+    import config
+
+    # Simulate CLI startup: config loaded without TAU_NETWORK_LISTEN.
+    monkeypatch.delenv("TAU_NETWORK_LISTEN", raising=False)
+    config.reload_settings()
+    assert config.settings.network.listen == ["/ip4/0.0.0.0/tcp/0"]
+
+    monkeypatch.setenv("TAU_NETWORK_LISTEN", "/ip4/127.0.0.1/tcp/4001")
+    args = _parse(["--listen", "127.0.0.1:4001"])
+    cli.apply_node_run_env(args, os.environ)
+    config.reload_settings()
+    assert config.settings.network.listen == ["/ip4/127.0.0.1/tcp/4001"]
+
+
 def test_open_governance_sets_env_with_isolated():
     env = _apply(["--isolated", "--open-governance"])
     assert env["TAU_BOOTSTRAP_PEERS"] == "[]"

@@ -11,6 +11,7 @@ from libp2p.peer.peerstore import PERMANENT_ADDR_TTL
 from .config import NetworkConfig
 from .host import HostManager
 from .dht_manager import DHTManager
+from .libp2p_compat import ensure_peer_id, seed_peerstore
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +28,8 @@ class DiscoveryManager:
         self._nursery = nursery
 
     def _ensure_peer_id(self, peer_id: Any):
-        # Helper to convert string/ID to ID object
-        # This logic was in service.py, duplicating here or importing from utils
-        from libp2p.peer.id import ID
-        if isinstance(peer_id, ID):
-            return peer_id
-        return ID.from_base58(peer_id)
+        # Kept for backwards compatibility with external callers; delegates to compat.
+        return ensure_peer_id(peer_id)
 
     async def seed_dht_bootstrap_peers(self, bootstrap_peers: List[Any], dht_bootstrap_peers: List[Any]) -> None:
         host = self._host_manager.host
@@ -47,26 +44,15 @@ class DiscoveryManager:
             combined[str(entry.peer_id)] = entry
 
         for entry in combined.values():
-            try:
-                peer_id = self._ensure_peer_id(entry.peer_id)
-            except ValueError:
+            parsed = seed_peerstore(host, entry.peer_id, entry.addrs)
+            if not parsed:
                 continue
-            
-            # Normalize addrs
-            addrs = []
-            for addr in entry.addrs:
-                try:
-                    addrs.append(multiaddr.Multiaddr(addr))
-                except Exception:
-                    pass
-            
             try:
-                host.get_peerstore().add_addrs(peer_id, addrs, PERMANENT_ADDR_TTL)
+                peer_id = ensure_peer_id(entry.peer_id)
             except Exception:
-                pass
-            
+                continue
             try:
-                await dht.routing_table.add_peer(PeerInfo(peer_id, addrs))
+                await dht.routing_table.add_peer(PeerInfo(peer_id, parsed))
             except Exception:
                 pass
 
@@ -81,27 +67,14 @@ class DiscoveryManager:
                 continue
             peer_id = entry.get("peer_id")
             addrs_raw = entry.get("addrs", [])
-            if not peer_id:
+            if not peer_id or not isinstance(addrs_raw, list):
                 continue
-            
-            addrs = []
-            if isinstance(addrs_raw, list):
-                for addr_str in addrs_raw:
-                    try:
-                        addrs.append(multiaddr.Multiaddr(addr_str))
-                    except Exception:
-                        pass
-            
-            if not addrs:
+
+            parsed = seed_peerstore(host, peer_id, addrs_raw)
+            if not parsed:
                 continue
-                
-            try:
-                pid_obj = self._ensure_peer_id(peer_id)
-                host.get_peerstore().add_addrs(pid_obj, addrs, PERMANENT_ADDR_TTL)
-                self.schedule_opportunistic_seed(peer_id, addrs)
-                ingested.append(peer_id)
-            except Exception:
-                pass
+            self.schedule_opportunistic_seed(peer_id, parsed)
+            ingested.append(peer_id)
         return ingested
 
     def schedule_opportunistic_seed(self, peer_id: str, addrs: Optional[Iterable[Any]] = None) -> None:

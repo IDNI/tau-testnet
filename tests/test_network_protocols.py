@@ -64,21 +64,8 @@ def isolate_db(tmp_path):
     importlib.reload(db_module)
 
 
-def _strip_p2p(addr: multiaddr.Multiaddr) -> multiaddr.Multiaddr:
-    addr_str = str(addr)
-    if "/p2p/" in addr_str:
-        addr_str = addr_str.split("/p2p/")[0]
-    return multiaddr.Multiaddr(addr_str)
-
-
-async def _wait_for_addrs(host, timeout: float = 5.0) -> List[multiaddr.Multiaddr]:
-    """Wait until a host reports at least one listen address or raise TimeoutError."""
-    with trio.fail_after(timeout):
-        while True:
-            addrs = list(host.get_addrs() or [])
-            if addrs:
-                return [_strip_p2p(addr) for addr in addrs]
-            await trio.sleep(0.05)
+# Listen-addr helper lives in tests/conftest.py — single source.
+from conftest import wait_for_addrs as _wait_for_addrs  # noqa: E402
 
 
 @pytest.fixture

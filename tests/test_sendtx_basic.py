@@ -124,7 +124,8 @@ class TestSendTxBasic(unittest.TestCase):
         amount = 10
         tx_json = self._create_tx([[GENESIS, ADDR_A, str(amount)]])
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
+        self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
+        self.assertIn("tx_hash", result)
         mempool = db.get_mempool_txs()
         self.assertEqual(len(mempool), 1)
         self.assertEqual(json.loads(mempool[0]), json.loads(tx_json))
@@ -138,7 +139,7 @@ class TestSendTxBasic(unittest.TestCase):
         ]
         tx_json = self._create_tx(tx_list)
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("SUCCESS: Transaction queued"))
+        self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
         mempool = db.get_mempool_txs()
         self.assertEqual(len(mempool), 1)
         self.assertEqual(json.loads(mempool[0]), json.loads(tx_json))
@@ -151,7 +152,7 @@ class TestSendTxBasic(unittest.TestCase):
         with patch('commands.sendtx.network_bus.get', return_value=mock_service):
             result = sendtx.queue_transaction(tx_json)
 
-        self.assertTrue(result.startswith("SUCCESS"))
+        self.assertTrue(result["ok"])
         self.assertTrue(mock_service.broadcast_transaction.called)
         args, kwargs = mock_service.broadcast_transaction.call_args
         self.assertEqual(len(args), 2)

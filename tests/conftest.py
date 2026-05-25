@@ -1,12 +1,20 @@
-"""Shared pytest fixtures for the Tau Testnet test-suite."""
+"""Shared pytest fixtures and libp2p test helpers for the Tau Testnet test-suite.
+
+Test helpers (`wait_for_addrs`, `connect_peers`, `stream_rpc`) live here and
+delegate to `network.libp2p_compat` for the underlying primitives. Tests should
+import these instead of inlining their own listen-addr / connect / RPC helpers.
+"""
 from __future__ import annotations
 
 import os
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import List
 
+import multiaddr
 import pytest
+import trio
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -64,6 +72,50 @@ def temp_database(tmp_path) -> Iterator[str]:
         db._db_conn.close()
         db._db_conn = None
     config.set_database_path(original_path)
+
+# --------------------------------------------------------------------------
+# libp2p test helpers (A8) — single source of truth, sourced from
+# network.libp2p_compat where possible.
+# --------------------------------------------------------------------------
+
+
+async def wait_for_addrs(host, *, timeout: float = 5.0) -> List[multiaddr.Multiaddr]:
+    """Poll until the host reports at least one observed listen address.
+
+    Thin wrapper over `network.libp2p_compat.wait_for_listening` so tests can
+    import this single name from conftest.
+    """
+    from network.libp2p_compat import wait_for_listening
+    return await wait_for_listening(host, timeout=timeout)
+
+
+async def connect_peers(host_a, host_b) -> None:
+    """Resolve host_b's listen addrs, register them in host_a's peerstore, connect."""
+    from libp2p.peer.peerinfo import PeerInfo
+    addrs_b = await wait_for_addrs(host_b)
+    peer_info = PeerInfo(host_b.get_id(), addrs_b)
+    host_a.get_peerstore().add_addrs(peer_info.peer_id, peer_info.addrs, 60)
+    await host_a.connect(peer_info)
+
+
+async def stream_rpc(
+    host,
+    peer_id,
+    protocol: str,
+    payload: bytes,
+    *,
+    read_timeout: float = 5.0,
+) -> bytes:
+    """Open a new stream to `peer_id`, write payload, read response, close."""
+    stream = await host.new_stream(peer_id, [protocol])
+    await stream.write(payload)
+    try:
+        with trio.fail_after(read_timeout):
+            data = await stream.read()
+    finally:
+        await stream.close()
+    return data or b""
+
 
 _exit_status = 0
 

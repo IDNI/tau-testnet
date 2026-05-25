@@ -1,47 +1,56 @@
+import json
 import logging
+from datetime import datetime, timezone
 
-import utils
-from db import get_mempool_txs
+import api_response
+from db import get_mempool_entries
 
 logger = logging.getLogger(__name__)
 
 
-def encode_command(command_parts):
-    """Encodes the getMempool command into a Tau literal."""
-    logger.debug("Encoding getMempool command.")
-    bit_pattern = "10" + "0" * 9  # Command ID for getMempool
-    tau_literal = utils.bits_to_tau_literal(bit_pattern, length=len(bit_pattern))
-    logger.debug("Encoded Tau literal for getMempool: %s", tau_literal)
-    return tau_literal
-
-
-def decode_output(output_tau_str, original_input_tau_str):
-    """
-    Decodes the Tau output string for a getMempool command.
-    Returns True on expected success output, False otherwise.
-    """
-    output_tau_str = output_tau_str.strip()
-    logger.debug("Decoding Tau output: %s", output_tau_str.strip())
-    return True
-
-
-def handle_result(decoded_success, tau_input, mempool_state):
-    """
-    Handles the decoded result for a getMempool command.
-    """
+def _iso_from_ms(ms: int) -> str:
     try:
-        txs = get_mempool_txs()
-        if txs:
-            result_message = "MEMPOOL:\n" + "\n".join(txs)
-        else:
-            result_message = "MEMPOOL: Empty"
-    except Exception as e:
-        result_message = f"ERROR: Failed to retrieve mempool from database: {e}"
+        return datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc).isoformat()
+    except Exception:
+        return ""
 
-    if not decoded_success:
-        tau_error = "ERROR: Tau program indicated failure or produced unexpected output for getMempool."
-        if result_message.startswith("ERROR: Failed to retrieve mempool"):
-            result_message = tau_error + "\n" + result_message
-        logger.warning("[getmempool] %s", tau_error)
 
-    return result_message
+def _iso_from_seconds(secs) -> str:
+    try:
+        return datetime.fromtimestamp(int(secs), tz=timezone.utc).isoformat()
+    except Exception:
+        return ""
+
+
+def _summarize_entry(entry: dict) -> dict:
+    payload_str = entry.get("payload") or ""
+    try:
+        tx = json.loads(payload_str) if payload_str else {}
+    except Exception:
+        tx = {}
+    operations = tx.get("operations") if isinstance(tx, dict) else None
+    op_count = len(operations) if isinstance(operations, dict) else 0
+    return {
+        "tx_hash": entry.get("tx_hash") or "",
+        "sender": tx.get("sender_pubkey", "") if isinstance(tx, dict) else "",
+        "sequence_number": tx.get("sequence_number") if isinstance(tx, dict) else None,
+        "received_at": _iso_from_ms(entry.get("received_at", 0)),
+        "expires_at": _iso_from_seconds(tx.get("expiration_time")) if isinstance(tx, dict) else "",
+        "operation_count": op_count,
+        "status": entry.get("status") or "pending",
+    }
+
+
+def execute(raw_command: str, container):
+    try:
+        entries = get_mempool_entries()
+    except Exception as exc:
+        logger.exception("Failed to retrieve mempool entries")
+        return api_response.error_response(
+            "getmempool", f"Failed to retrieve mempool: {exc}", "INTERNAL_ERROR"
+        )
+
+    summaries = [_summarize_entry(e) for e in entries]
+    return api_response.success_response(
+        "getmempool", {"count": len(summaries), "transactions": summaries}
+    )

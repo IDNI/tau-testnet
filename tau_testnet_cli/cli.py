@@ -725,12 +725,18 @@ def _normalize_listen_addr(value: str) -> str:
 
 
 def cmd_node_run(args: argparse.Namespace) -> int:
-    """Run the node entrypoint in-process. Imports `server` lazily so the env
-    set by :func:`apply_node_run_env` is in place before `config` loads.
+    """Run the node entrypoint in-process.
+
+    The CLI imports ``commands`` / ``config`` before argparse runs, so settings
+    are loaded once at startup. Re-apply env from flags here, then reload
+    settings so ``--listen``, ``--isolated``, etc. take effect.
     """
     import sys
 
+    import config  # noqa: WPS433 — must reload after apply_node_run_env
+
     apply_node_run_env(args)
+    config.reload_settings()
 
     sys.argv = ["server"] + (
         ["--ephemeral-identity"] if args.ephemeral_identity else []

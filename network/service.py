@@ -20,39 +20,19 @@ logger = logging.getLogger(__name__)
 
 MAX_HANDSHAKE_PROVIDERS = 50
 
-# Monkeypatch QUICStream._cleanup_resources to handle NoneType await error
-# This occurs during stream closure race conditions where resource_scope.done() 
-# seems to trigger an await on None (possibly in deeper libp2p code).
-try:
-    from libp2p.transport.quic.stream import QUICStream
-    
-    _orig_cleanup = QUICStream._cleanup_resources
-    
-    async def _safe_cleanup_resources(self) -> None:
-        try:
-             await _orig_cleanup(self)
-        except TypeError as e:
-             if "NoneType" in str(e) and "await" in str(e):
-                 # Swallow the specific error: object NoneType can't be used in 'await' expression
-                 logger.debug("Swallowed benign cleanup error in QUICStream: %s", e)
-             else:
-                 raise
-        except Exception:
-             # Let other exceptions bubble (or be logged by original handler if it catches them)
-             raise
+# Apply the libp2p 0.5.x QUIC cleanup-race shim at module load. The shim body
+# lives in `network/libp2p_compat.py`; this call site keeps the side effect
+# explicit (no module-load magic in compat). No-op on libp2p >= 0.6.0.
+from .libp2p_compat import apply_quic_cleanup_shim  # noqa: E402
 
-    QUICStream._cleanup_resources = _safe_cleanup_resources
-    logger.info("Monkeypatched QUICStream._cleanup_resources for safety")
-
-except Exception as e:
-    logger.warning("Failed to monkeypatch QUICStream: %s", e)
+apply_quic_cleanup_shim()
 
 class NetworkService:
     def __init__(
         self,
         config: NetworkConfig,
         *,
-        tx_submitter: Optional[Callable[[str], str]] = None,
+        tx_submitter: Optional[Callable[..., Any]] = None,
         state_provider: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
         gossip_handler: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
@@ -61,7 +41,7 @@ class NetworkService:
         self._tx_submitter = tx_submitter
         # Default to None so we don't cache the module function; tests monkeypatch either
         # self._submit_tx or sendtx.queue_transaction.
-        self._submit_tx: Optional[Callable[..., str]] = tx_submitter
+        self._submit_tx: Optional[Callable[..., Any]] = tx_submitter
         
         # Initialize Managers
         self._host_manager = HostManager(config, self._on_host_event)
@@ -688,7 +668,8 @@ class NetworkService:
         import json
         import multiaddr
         import db
-        
+        from .libp2p_compat import bounded_stream_read, close_stream_safely
+
         # Prepare response (default)
         resp = {
             "network_id": self._config.network_id,
@@ -710,21 +691,21 @@ class NetworkService:
 
         try:
             # Read payload
-            data = await stream.read(65535)
+            data = await bounded_stream_read(stream, 65535)
             if logger.isEnabledFor(logging.DEBUG):
                  # Log length only to confirm receipt without flooding raw bytes
                  logger.debug("Handshake received %d bytes", len(data))
-            
+
             if hasattr(stream, "muxed_conn") and getattr(stream.muxed_conn, "peer_id", None):
                 await self._ensure_peer_route(stream.muxed_conn.peer_id)
-            
+
             if data:
                 try:
                     payload = json.loads(data.decode())
-                    
+
                     if payload.get("network_id") != self._config.network_id:
                         logger.warning("Rejecting handshake from %s: incompatible network_id '%s'", getattr(stream.muxed_conn, "peer_id", "Unknown"), payload.get("network_id"))
-                        await stream.close()
+                        # `finally` will close — do not close here (avoid double-close).
                         return
                     
                     remote_pubkey = payload.get("peer_pubkey", "")
@@ -748,39 +729,30 @@ class NetworkService:
                             continue
                         pid_str = peer_data.get("peer_id")
                         addrs_str = peer_data.get("addrs", [])
-                        
+
                         # Input Validation Checks
                         if not pid_str or len(pid_str) > 128:
-                             continue
+                            continue
                         if len(addrs_str) > 20:
-                             addrs_str = addrs_str[:20]
-                             
-                        if pid_str:
-                            try:
-                                from libp2p.peer.id import ID
-                                from libp2p.peer.peerinfo import PeerInfo
-                                pid = ID.from_base58(pid_str)
-                                
-                                maddrs = []
-                                for a in addrs_str:
-                                    try:
-                                        maddrs.append(multiaddr.Multiaddr(a))
-                                    except Exception:
-                                        pass
-                                
-                                if maddrs:
-                                    self.host.get_peerstore().add_addrs(pid, maddrs, 600)
-                                    
-                                    if self._dht_manager.dht:
-                                        pi = PeerInfo(pid, maddrs)
-                                        await self._dht_manager.dht.routing_table.add_peer(pi)
-                                        # Trigger lookup to verify/refresh (satisfies test expectation)
-                                        if self._nursery:
-                                            self._nursery.start_soon(self._dht_manager.dht.peer_routing.find_peer, pid)
-                                    import time
-                                    self._opportunistic_peers[str(pid)] = time.time()
-                            except Exception:
-                                logger.warning("Failed to process handshake peer %s", pid_str, exc_info=True)
+                            addrs_str = addrs_str[:20]
+
+                        try:
+                            from libp2p.peer.peerinfo import PeerInfo
+                            from .libp2p_compat import ensure_peer_id, seed_peerstore
+                            maddrs = seed_peerstore(self.host, pid_str, addrs_str, ttl=600)
+                            if not maddrs:
+                                continue
+                            pid = ensure_peer_id(pid_str)
+                            if self._dht_manager.dht:
+                                pi = PeerInfo(pid, maddrs)
+                                await self._dht_manager.dht.routing_table.add_peer(pi)
+                                # Trigger lookup to verify/refresh (satisfies test expectation)
+                                if self._nursery:
+                                    self._nursery.start_soon(self._dht_manager.dht.peer_routing.find_peer, pid)
+                            import time
+                            self._opportunistic_peers[str(pid)] = time.time()
+                        except Exception:
+                            logger.warning("Failed to process handshake peer %s", pid_str, exc_info=True)
 
                     # Process dht_providers (truncated)
                     dht_providers = payload.get("dht_providers", []) or []
@@ -843,13 +815,14 @@ class NetworkService:
         except Exception:
             logger.error("Error handling handshake", exc_info=True)
         finally:
-            await stream.close()
+            await close_stream_safely(stream)
 
     async def _handle_ping(self, stream) -> None:
         import json
         import time
+        from .libp2p_compat import bounded_stream_read, close_stream_safely
         try:
-            data = await stream.read(65535)
+            data = await bounded_stream_read(stream, 65535)
             req = json.loads(data.decode())
             resp = {
                 "nonce": req.get("nonce"),
@@ -859,20 +832,17 @@ class NetworkService:
         except Exception:
             pass
         finally:
-            await stream.close()
+            await close_stream_safely(stream)
 
     async def _handle_sync(self, stream) -> None:
         import json
         import db
+        from .libp2p_compat import bounded_stream_read, close_stream_safely
         try:
             # Some callers (tests/debug tools) may "send" an empty request by writing b"".
             # libp2p streams won't deliver that as data, so a naive read() would block forever.
-            # Use a short timeout and treat "no bytes" as an empty/default request.
-            data = b""
-            with trio.move_on_after(0.25) as scope:
-                data = await stream.read(65535)
-            if scope.cancelled_caught:
-                data = b""
+            # bounded_stream_read's empty_timeout returns b"" if no bytes arrive in 0.25s.
+            data = await bounded_stream_read(stream, 65535, empty_timeout=0.25)
             req: Dict[str, Any] = {}
             if data:
                 if data.strip() == b"get_headers":
@@ -953,13 +923,14 @@ class NetworkService:
         except Exception:
             pass
         finally:
-            await stream.close()
+            await close_stream_safely(stream)
 
     async def _handle_blocks(self, stream) -> None:
         import json
         import db
+        from .libp2p_compat import bounded_stream_read, close_stream_safely
         try:
-            data = await stream.read(10 * 1024 * 1024)
+            data = await bounded_stream_read(stream, 10 * 1024 * 1024)
             req: Dict[str, Any] = {}
             if data:
                 try:
@@ -1046,27 +1017,28 @@ class NetworkService:
         except Exception:
             pass
         finally:
-            await stream.close()
+            await close_stream_safely(stream)
 
     async def _handle_tx(self, stream) -> None:
         import json
+        from .libp2p_compat import bounded_stream_read, close_stream_safely
         try:
-            data = await stream.read(65535)
+            data = await bounded_stream_read(stream, 65535)
             req = json.loads(data.decode())
             # Submit tx
             res = self._queue_tx(req.get("tx"))
-            # res = "queued" # Mock for now
             resp = {"ok": True, "result": res}
             await stream.write(json.dumps(resp).encode())
         except Exception:
             pass
         finally:
-            await stream.close()
+            await close_stream_safely(stream)
 
     async def _handle_state(self, stream) -> None:
         import json
+        from .libp2p_compat import bounded_stream_read, close_stream_safely
         try:
-            data = await stream.read(65535)
+            data = await bounded_stream_read(stream, 65535)
             logger.debug("State request received: %s", data)
             req = json.loads(data.decode())
             # ... logic ...
@@ -1121,12 +1093,13 @@ class NetworkService:
         except Exception:
             logger.error("Error handling state request", exc_info=True)
         finally:
-            await stream.close()
+            await close_stream_safely(stream)
 
     async def _handle_gossip_stream(self, stream) -> None:
         import json
+        from .libp2p_compat import bounded_stream_read, close_stream_safely
         try:
-            data = await stream.read(65535)
+            data = await bounded_stream_read(stream, 65535)
             req = json.loads((data or b"{}").decode())
 
             sender_pid = req.get("peer_id")
@@ -1185,7 +1158,7 @@ class NetworkService:
         except Exception:
             pass
         finally:
-            await stream.close()
+            await close_stream_safely(stream)
 
 
     async def _run_loop(self) -> None:
@@ -1340,10 +1313,15 @@ class NetworkService:
         except Exception:
             pass
     
-    def _queue_tx(self, payload: str, propagate: bool = True) -> str:
+    def _queue_tx(self, payload: str, propagate: bool = True):
         """
         Dispatch transaction submission, supporting late monkeypatches and submitters
         that may not accept the propagate flag.
+
+        Returns the submitter's native result — ``sendtx.queue_transaction`` now
+        yields a structured dict (``{"ok": bool, "code"?: str, ...}``); test
+        monkeypatches may still return strings. Callers should not assume a
+        specific type.
         """
         submitter = (
             getattr(self, "_submit_tx", None)

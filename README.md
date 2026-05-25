@@ -120,6 +120,9 @@ Full reference, including the validator-setup recipe and the update lifecycle
 (`mempool` → `pending` → `approved-and-scheduled` → `activated`):
 [docs/developer_cli.md](docs/developer_cli.md).
 
+Raw TCP/WebSocket command grammar, JSON envelopes, and per-handler payloads:
+[docs/blockchain_api.md](docs/blockchain_api.md).
+
 ## Setup and Running
 
 ### Prerequisites
@@ -387,6 +390,33 @@ python wallet.py send --privkey <hex_privkey> --rule "rule_formula" --transfer "
     ```
     createblock
     ```
+
+### Response envelope
+
+All node commands reply with a single-line JSON envelope (the TCP transport
+appends `\r\n` framing at the wire; WebSocket emits the raw envelope without
+`\r\n`):
+
+```json
+{"status":"ok","command":"getbalance","data":{"address":"a63b...ea73","balance":"1000"}}
+{"status":"error","command":"sendtx","error":{"code":"INVALID_SEQUENCE","message":"Invalid sequence number: expected 5, got 4.","details":{"expected":5,"received":4}}}
+```
+
+- `status` is `"ok"` or `"error"` (no `"success"`).
+- `command` echoes the requested command name.
+- `data` is present on success; `error.code` + `error.message` (plus optional
+  `error.details`) on failure.
+- Field-type contract: addresses/hashes/IDs are strings; balances and token
+  amounts are strings (to avoid integer overflow); counts, block numbers, and
+  sequence numbers are JSON integers; timestamps are ISO 8601 strings.
+- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`,
+  `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`,
+  `BLS_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MEMPOOL_EMPTY`,
+  `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`,
+  `GOVERNANCE_ERROR`, `NOT_FOUND`, `TAU_NOT_READY`, `TIMEOUT`,
+  `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
+- The `hello version=N` handshake stays plain text (`ok version=N env=…
+  node=…`) — versions 1 and 2 are supported.
 
 ### Block Structure
 

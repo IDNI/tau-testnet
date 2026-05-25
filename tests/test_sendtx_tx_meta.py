@@ -110,14 +110,17 @@ class TestSendTxTxMeta(unittest.TestCase):
         expired_time = int(time.time()) - 10
         tx_json = self._create_tx([[GENESIS, ADDR_A, "1"]], expiration=expired_time)
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("FAILURE: Transaction expired at"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TX_EXPIRED")
+        self.assertEqual(result["details"]["expires_at"], expired_time)
         self.assertEqual(len(db.get_mempool_txs()), 0)
 
     def test_from_address_mismatch(self):
         invalid_transfer = [ADDR_B, ADDR_A, "1"]
         tx_json = self._create_tx([invalid_transfer])
         result = sendtx.queue_transaction(tx_json)
-        self.assertIn("does not match sender_pubkey", result)
+        self.assertFalse(result["ok"])
+        self.assertIn("does not match sender_pubkey", result["message"])
         self.assertEqual(len(db.get_mempool_txs()), 0)
 
     def test_missing_sequence_number(self):
@@ -129,9 +132,10 @@ class TestSendTxTxMeta(unittest.TestCase):
             "signature": "SIG"
         }
         tx_json = json.dumps(tx)
-        with self.assertRaises(ValueError) as cm:
-            sendtx.queue_transaction(tx_json)
-        self.assertIn("Missing 'sequence_number'", str(cm.exception))
+        result = sendtx.queue_transaction(tx_json)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_PARAMS")
+        self.assertIn("sequence_number", result["message"])
 
     def test_missing_signature(self):
         tx = {
@@ -142,6 +146,7 @@ class TestSendTxTxMeta(unittest.TestCase):
             "fee_limit": "0"
         }
         tx_json = json.dumps(tx)
-        with self.assertRaises(ValueError) as cm:
-            sendtx.queue_transaction(tx_json)
-        self.assertIn("Missing 'signature'", str(cm.exception))
+        result = sendtx.queue_transaction(tx_json)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_PARAMS")
+        self.assertIn("signature", result["message"])

@@ -17,6 +17,7 @@ returned verbatim. The CLI command handler decides what to do with them.
 
 from __future__ import annotations
 
+import json
 import socket
 
 DEFAULT_TIMEOUT = 10.0
@@ -125,15 +126,13 @@ def handshake(
 def is_error_response(response: str) -> bool:
     """Whether a server response should map to CLI exit code 1.
 
-    Recognises the three failure prefixes used across server command handlers:
-    - ``ERROR:`` (handler-level: malformed command, parse failure, etc.)
-    - ``error ``  (handshake-level: ``error unsupported_version`` etc.)
-    - ``FAILURE:`` (validation-level: ``commands/sendtx.queue_transaction``,
-      governance admission, mempool admission). The chain *received* the tx
-      but explicitly rejected it.
+    Data API responses are JSON envelopes: ``{"status":"error",...}`` -> error.
+    Handshake replies (``ok version=...`` / ``error <code>``) are plain text and
+    handled separately by the handshake code path; this helper still flags the
+    ``error `` prefix so direct callers can short-circuit.
     """
-    return (
-        response.startswith("ERROR:")
-        or response.startswith("error ")
-        or response.startswith("FAILURE:")
-    )
+    try:
+        parsed = json.loads(response)
+    except (ValueError, TypeError):
+        return response.startswith("error ")
+    return isinstance(parsed, dict) and parsed.get("status") == "error"

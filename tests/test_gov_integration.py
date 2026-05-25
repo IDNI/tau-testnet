@@ -76,8 +76,11 @@ def test_gov_update_acceptance():
     # Submit via sendtx handler
     cmd = f"sendtx {json.dumps(payload)}"
     response = sendtx.execute(cmd, None)
-    assert response.startswith("SUCCESS:")
-    
+    parsed = json.loads(response)
+    assert parsed["status"] == "ok", f"sendtx failed: {response}"
+    assert parsed["command"] == "sendtx"
+    assert "tx_hash" in parsed["data"]
+
     # Verify it entered the mempool
     mempool_txs = db.get_mempool_txs()
     assert len(mempool_txs) == 1
@@ -110,8 +113,9 @@ def test_gov_vote_acceptance():
         with patch('consensus.facade.TipAdmissionView.has_duplicate_vote', return_value=False):
             cmd = f"sendtx {json.dumps(payload)}"
             response = sendtx.execute(cmd, None)
-            assert response.startswith("SUCCESS:")
-    
+            parsed = json.loads(response)
+            assert parsed["status"] == "ok", f"sendtx failed: {response}"
+
     mempool_txs = db.get_mempool_txs()
     assert len(mempool_txs) == 1
     tx1 = json.loads(mempool_txs[0])
@@ -140,8 +144,9 @@ def test_gov_update_reject_approve_false():
     
     cmd = f"sendtx {json.dumps(payload)}"
     response = sendtx.execute(cmd, None)
-    assert response.startswith("FAILURE:")
-    assert "approve=false is unsupported" in response
+    parsed = json.loads(response)
+    assert parsed["status"] == "error", f"expected error envelope, got {response}"
+    assert "approve=false is unsupported" in parsed["error"]["message"]
 
 
 def test_apply_block_routes_activation_revisions_through_i0():

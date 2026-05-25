@@ -57,7 +57,9 @@ class TestConsensusTime(unittest.TestCase):
             "signature": "SIG"
         }
         res = sendtx.queue_transaction(json.dumps(tx))
-        self.assertTrue(res.startswith("FAILURE: Invalid operation key '5'"), f"Got: {res}")
+        self.assertFalse(res["ok"], f"Got: {res}")
+        self.assertEqual(res["code"], "TX_INVALID")
+        self.assertIn("operation key '5'", res["message"])
         self.assertEqual(len(db.get_mempool_txs()), 0)
 
     @patch('tau_manager.communicate_with_tau_multi')

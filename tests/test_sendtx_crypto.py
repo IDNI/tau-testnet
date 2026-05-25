@@ -131,7 +131,7 @@ class TestSendTxCrypto(unittest.TestCase):
         sendtx._PY_ECC_AVAILABLE = True
         sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("SUCCESS: Transaction queued"), msg=f"Transaction failed: {result}")
+        self.assertTrue(result["ok"], msg=f"Transaction failed: {result}")
 
     def test_invalid_signature_rejected(self):
         privkey = bls.KeyGen(b"test_seed_2")
@@ -143,7 +143,8 @@ class TestSendTxCrypto(unittest.TestCase):
         sendtx._PY_ECC_AVAILABLE = True
         sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("FAILURE: Invalid signature"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_SIGNATURE")
 
     def test_invalid_signature_wrong_data(self):
         privkey = bls.KeyGen(b"test_seed_3")
@@ -165,7 +166,8 @@ class TestSendTxCrypto(unittest.TestCase):
         sendtx._PY_ECC_AVAILABLE = True
         sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("FAILURE: Invalid signature"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_SIGNATURE")
 
     def test_invalid_signature_wrong_private_key(self):
         privkey1 = bls.KeyGen(b"test_seed_4")
@@ -187,7 +189,8 @@ class TestSendTxCrypto(unittest.TestCase):
         sendtx._PY_ECC_AVAILABLE = True
         sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("FAILURE: Invalid signature"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_SIGNATURE")
 
     def test_invalid_sequence_number_after_signature(self):
         privkey = bls.KeyGen(b"test_seed_6")
@@ -199,7 +202,8 @@ class TestSendTxCrypto(unittest.TestCase):
         sendtx._PY_ECC_AVAILABLE = True
         sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("FAILURE: Invalid sequence number"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_SEQUENCE")
 
     def test_signature_verification_fails_on_tampered_data(self):
         privkey = bls.KeyGen(b"test_seed_7")
@@ -213,7 +217,8 @@ class TestSendTxCrypto(unittest.TestCase):
         sendtx._PY_ECC_AVAILABLE = True
         sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json_tampered)
-        self.assertTrue(result.startswith("FAILURE: Invalid signature"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_SIGNATURE")
 
     def test_skip_signature_verification_when_disabled(self):
         # Legacy test checking warn-only behavior when BLS is disabled.
@@ -223,7 +228,7 @@ class TestSendTxCrypto(unittest.TestCase):
         tx_json = self._create_tx([[GENESIS, ADDR_A, "5"]], signature="00")
         sendtx._PY_ECC_AVAILABLE = False
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result.startswith("SUCCESS: Transaction queued"), msg=f"Transaction failed: {result}")
+        self.assertTrue(result["ok"], msg=f"Transaction failed: {result}")
         # self.assertEqual(chain_state.get_sequence_number(GENESIS), initial_seq)
         # self.assertEqual(chain_state.get_balance(GENESIS), initial_gen_balance - 5)
         mempool = db.get_mempool_txs()

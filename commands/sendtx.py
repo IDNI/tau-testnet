@@ -15,9 +15,21 @@ import utils
 from errors import TauCommunicationError
 from db import add_mempool_tx
 from network import bus as network_bus
+import api_response
 
 
 logger = logging.getLogger(__name__)
+
+
+def _qt_ok(tx_hash: str, message: str = "Transaction queued.") -> dict:
+    return {"ok": True, "tx_hash": tx_hash, "message": message}
+
+
+def _qt_err(code: str, message: str, **details) -> dict:
+    out = {"ok": False, "code": code, "message": message}
+    if details:
+        out["details"] = details
+    return out
 
 _MAX_TAU_BV_VALUE = (1 << tau_manager.DEFAULT_RULE_BV_WIDTH) - 1
 
@@ -259,53 +271,62 @@ def _process_transfers_operation(transfers, sender_pubkey):
     return True, {"transfers": validated_transfers, "tau_inputs": tau_inputs}, None
 
 
-def queue_transaction(json_blob: str, propagate: bool = True) -> str:
+def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
     blob = json_blob.strip()
     if len(blob) >= 2 and ((blob[0] == '"' and blob[-1] == '"') or (blob[0] == "'" and blob[-1] == "'")):
         blob = blob[1:-1]
     try:
         payload = json.loads(blob)
     except Exception as e:
-        raise ValueError(f"Invalid JSON payload: {e}")
+        return _qt_err("PARSE_ERROR", f"Invalid JSON payload: {e}")
     if not isinstance(payload, dict):
-        raise ValueError("Transaction must be a JSON object.")
+        return _qt_err("INVALID_PARAMS", "Transaction must be a JSON object.")
 
     # --- Structural and Cryptographic Validation ---
     if 'sender_pubkey' not in payload:
-        raise ValueError("Missing 'sender_pubkey' in transaction.")
+        return _qt_err("INVALID_PARAMS", "Missing 'sender_pubkey' in transaction.")
     sender_pubkey = payload['sender_pubkey']
     is_valid_sender, err_sender = _validate_bls12_381_pubkey(sender_pubkey, "sender_pubkey")
     if not is_valid_sender:
-        return f"FAILURE: Transaction invalid. {err_sender}"
+        return _qt_err("TX_INVALID", f"Transaction invalid. {err_sender}")
 
     if 'sequence_number' not in payload:
-        raise ValueError("Missing 'sequence_number' in transaction.")
+        return _qt_err("INVALID_PARAMS", "Missing 'sequence_number' in transaction.")
     if not isinstance(payload.get('sequence_number'), int):
-        raise ValueError("Missing or invalid 'sequence_number' in transaction.")
+        return _qt_err("INVALID_PARAMS", "Missing or invalid 'sequence_number' in transaction.")
     sequence_number = payload['sequence_number']
 
     if 'expiration_time' not in payload or not isinstance(payload.get('expiration_time'), int):
-        raise ValueError("Missing or invalid 'expiration_time' in transaction.")
+        return _qt_err("INVALID_PARAMS", "Missing or invalid 'expiration_time' in transaction.")
     expiration_time = payload['expiration_time']
     current_time = int(time.time())
     if current_time > expiration_time:
-        return f"FAILURE: Transaction expired at {expiration_time}. Current time is {current_time}."
+        return _qt_err(
+            "TX_EXPIRED",
+            f"Transaction expired at {expiration_time}. Current time is {current_time}.",
+            expires_at=expiration_time,
+            current=current_time,
+        )
 
     if 'fee_limit' not in payload:
-        raise ValueError("Missing 'fee_limit' in transaction.")
-        
+        return _qt_err("INVALID_PARAMS", "Missing 'fee_limit' in transaction.")
+
     tx_type = payload.get("tx_type", "user_tx")
     if tx_type not in ("user_tx", "consensus_rule_update", "consensus_rule_vote"):
-        return f"FAILURE: Unknown or legacy tx_type explicitly rejected natively: {tx_type}"
+        return _qt_err(
+            "TX_REJECTED",
+            f"Unknown or legacy tx_type explicitly rejected natively: {tx_type}",
+            tx_type=tx_type,
+        )
 
     if tx_type == "user_tx":
         if 'operations' not in payload or not isinstance(payload['operations'], dict):
-            raise ValueError("Missing or invalid 'operations' in user_tx.")
+            return _qt_err("INVALID_PARAMS", "Missing or invalid 'operations' in user_tx.")
 
     if 'signature' not in payload:
-        raise ValueError("Missing 'signature' in transaction.")
+        return _qt_err("INVALID_PARAMS", "Missing 'signature' in transaction.")
     if not isinstance(payload.get('signature'), str):
-        raise ValueError("Missing or invalid 'signature' in transaction.")
+        return _qt_err("INVALID_PARAMS", "Missing or invalid 'signature' in transaction.")
     signature = payload['signature']
 
     if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
@@ -315,19 +336,24 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
             sig_bytes = bytes.fromhex(signature)
             pubkey_bytes = bytes.fromhex(sender_pubkey)
             if not G2Basic.Verify(pubkey_bytes, msg_hash, sig_bytes):
-                return "FAILURE: Invalid signature."
+                return _qt_err("INVALID_SIGNATURE", "Invalid signature.")
         except Exception as e:
-            return f"FAILURE: Invalid signature format or cryptographic error: {e}"
-        
+            return _qt_err("INVALID_SIGNATURE", f"Invalid signature format or cryptographic error: {e}")
+
         expected_seq = chain_state.get_sequence_number(sender_pubkey)
-        
+
         # Adjust expected sequence if the sender has pending transactions in the mempool
         pending_seq = db.get_pending_sequence(sender_pubkey)
         if pending_seq is not None and pending_seq >= expected_seq:
             expected_seq = pending_seq + 1
 
         if sequence_number != expected_seq:
-            return f"FAILURE: Invalid sequence number: expected {expected_seq}, got {sequence_number}."
+            return _qt_err(
+                "INVALID_SEQUENCE",
+                f"Invalid sequence number: expected {expected_seq}, got {sequence_number}.",
+                expected=expected_seq,
+                received=sequence_number,
+            )
     else:
         logger.warning("BLS crypto not available; skipping signature verification and sequence enforcement.")
 
@@ -342,7 +368,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
     
     admission_eval = validate_mempool_admission(payload, tip_view)
     if not admission_eval.is_valid:
-        return f"FAILURE: {admission_eval.error}"
+        return _qt_err("TX_REJECTED", admission_eval.error)
 
     if tx_type == "user_tx":
         operations = payload.get("operations", {})
@@ -360,7 +386,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
             success, transfer_result, err_msg = _process_transfers_operation(transfers_list, sender_pubkey)
             logger.debug("Transfer result: %s", transfer_result)
             if not success:
-                return f"FAILURE: Transaction invalid. {err_msg}"
+                return _qt_err("TX_INVALID", f"Transaction invalid. {err_msg}")
             all_validated_transfers = transfer_result["transfers"]
             transfer_tau_inputs = transfer_result["tau_inputs"]
 
@@ -373,20 +399,32 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                 if idx in (0, 1):
                     continue
                 if idx in tau_defs.RESERVED_STREAMS and not (6 <= idx <= 11):
-                     return f"FAILURE: Invalid operation key '{key}'. Stream {idx} is reserved."
-                
+                    return _qt_err(
+                        "TX_INVALID",
+                        f"Invalid operation key '{key}'. Stream {idx} is reserved.",
+                        stream=idx,
+                    )
+
                 normalized_val = []
                 if isinstance(value, (str, int)):
                     normalized_val.append(str(value))
                 elif isinstance(value, (list, tuple)):
                     for v in value:
-                         if isinstance(v, (str, int)):
-                             normalized_val.append(str(v))
-                         else:
-                             return f"FAILURE: Invalid value type for stream {idx}. List items must be str or int."
+                        if isinstance(v, (str, int)):
+                            normalized_val.append(str(v))
+                        else:
+                            return _qt_err(
+                                "TX_INVALID",
+                                f"Invalid value type for stream {idx}. List items must be str or int.",
+                                stream=idx,
+                            )
                 else:
-                     return f"FAILURE: Invalid value type for stream {idx}. Must be str, int."
-                
+                    return _qt_err(
+                        "TX_INVALID",
+                        f"Invalid value type for stream {idx}. Must be str, int.",
+                        stream=idx,
+                    )
+
                 custom_tau_inputs[idx] = normalized_val
 
     tau_force_test = os.environ.get("TAU_FORCE_TEST", "0") == "1"
@@ -400,9 +438,12 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                 if has_rules:
                     rule_value = operations.get("0", "")
                     if not isinstance(rule_value, str):
-                        return (
-                            f"FAILURE: Invalid operation '0' (rule). "
-                            f"Must be a string, got {type(rule_value).__name__}."
+                        return _qt_err(
+                            "TX_INVALID",
+                            (
+                                f"Invalid operation '0' (rule). "
+                                f"Must be a string, got {type(rule_value).__name__}."
+                            ),
                         )
                     rule_text = rule_value.strip()
                     if rule_text:
@@ -417,14 +458,17 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                                 apply_rules_update=False,
                             )
                             if "Error" in tau_output_rules:
-                                return f"FAILURE: Transaction rejected by Tau (rule validation). Output: {tau_output_rules}"
+                                return _qt_err(
+                                    "TX_REJECTED",
+                                    f"Transaction rejected by Tau (rule validation). Output: {tau_output_rules}",
+                                )
                             logger.info("Tau rule validation successful.")
 
                 # Step 2: Custom Input Validation (if present)
                 if custom_tau_inputs:
-                     if tau_force_test:
+                    if tau_force_test:
                         logger.info("TAU_FORCE_TEST=1: skipping Tau custom input validation.")
-                     else:
+                    else:
                         logger.info("Validating custom inputs with Tau: %s", custom_tau_inputs.keys())
                         # Send custom inputs targeting o0 (general ack/output)
                         tau_output_custom = tau_manager.communicate_with_tau(
@@ -435,7 +479,10 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                             apply_rules_update=False,
                         )
                         if "Error" in tau_output_custom:
-                            return f"FAILURE: Transaction rejected by Tau (custom input validation). Output: {tau_output_custom}"
+                            return _qt_err(
+                                "TX_REJECTED",
+                                f"Transaction rejected by Tau (custom input validation). Output: {tau_output_custom}",
+                            )
                         logger.info("Tau custom input validation successful.")
 
                 # Step 3: Transfer Validation
@@ -476,9 +523,13 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                             o1_raw = tau_outputs.get(1)
                             expected_amount = transfer_details[2]
                             if not _decode_single_transfer_output(o1_raw or "0", expected_amount):
-                                return (
-                                    f"FAILURE: Transaction rejected by Tau logic for transfer #{i+1} "
-                                    f"({transfer_details}). Tau output: {o1_raw}"
+                                return _qt_err(
+                                    "TX_REJECTED",
+                                    (
+                                        f"Transaction rejected by Tau logic for transfer #{i+1} "
+                                        f"({transfer_details}). Tau output: {o1_raw}"
+                                    ),
+                                    transfer_index=i + 1,
                                 )
 
                             # --- User Policy Check (o5) ---
@@ -487,9 +538,13 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                                 from tau_manager import parse_tau_output as _parse
                                 policy_val = _parse(o5_raw)
                                 if policy_val == tau_defs.USER_POLICY_BLOCK_VALUE:
-                                    return (
-                                        f"FAILURE: Transaction rejected by user policy (o5) for transfer #{i+1} "
-                                        f"({transfer_details}). Policy output: {o5_raw}"
+                                    return _qt_err(
+                                        "TX_REJECTED",
+                                        (
+                                            f"Transaction rejected by user policy (o5) for transfer #{i+1} "
+                                            f"({transfer_details}). Policy output: {o5_raw}"
+                                        ),
+                                        transfer_index=i + 1,
                                     )
                         logger.info("All Tau transfer validations successful.")
 
@@ -544,18 +599,21 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> str:
                 svc = network_bus.get()
                 if svc:
                     svc.broadcast_transaction(tx_canonical_blob, tx_message_id)
-        if empty_transfer_list:
-            return "SUCCESS: Transaction queued (empty transfer list)."
-        return "SUCCESS: Transaction queued."
+        msg = (
+            "Transaction queued (empty transfer list)."
+            if empty_transfer_list
+            else "Transaction queued."
+        )
+        return _qt_ok(tx_message_id, message=msg)
 
     except ValueError as e:
-        return f"ERROR: Could not process transaction. {e}"
+        return _qt_err("INVALID_PARAMS", f"Could not process transaction. {e}")
     except TauCommunicationError as e:
         logger.error("Tau rule validation failed: %s", e)
-        return f"FAILURE: Transaction rejected by Tau. {e}"
+        return _qt_err("TX_REJECTED", f"Transaction rejected by Tau. {e}")
     except Exception as e:
         logger.exception("An unexpected error occurred in queue_transaction: %s", e)
-        return f"FAILURE: An unexpected server error occurred."
+        return _qt_err("INTERNAL_ERROR", "An unexpected server error occurred.")
 
 
 def execute(raw_command: str, container):
@@ -565,19 +623,37 @@ def execute(raw_command: str, container):
     """
     prefix = 'sendtx '
     if not raw_command.lower().startswith(prefix):
-        return "ERROR: Invalid sendtx format. Use sendtx '{\"0\":...}'.\r\n"
-        
+        return api_response.error_response(
+            "sendtx",
+            "Invalid sendtx format. Use sendtx '{\"0\":...}'.",
+            "INVALID_PARAMS",
+        )
+
     if not _PY_ECC_AVAILABLE:
         logger.error("BLS library not available. Transaction rejected.")
-        return "ERROR: BLS signatures are required but py_ecc is missing.\r\n"
-    
+        return api_response.error_response(
+            "sendtx",
+            "BLS signatures are required but py_ecc is missing.",
+            "BLS_UNAVAILABLE",
+        )
+
     json_blob = raw_command[len(prefix):].strip()
     logger.debug("Received sendtx payload: %s", json_blob)
-    
+
     try:
-        result_msg = queue_transaction(json_blob)
+        result = queue_transaction(json_blob)
     except Exception as exc:
         logger.exception("sendtx queue failed")
-        result_msg = f"ERROR: {exc}"
-    
-    return result_msg + "\r\n"
+        return api_response.error_response("sendtx", str(exc), "INTERNAL_ERROR")
+
+    if result.get("ok"):
+        return api_response.success_response(
+            "sendtx",
+            {"message": result.get("message", "Transaction queued."), "tx_hash": result["tx_hash"]},
+        )
+    return api_response.error_response(
+        "sendtx",
+        result.get("message", "Transaction rejected."),
+        result.get("code", "TX_REJECTED"),
+        details=result.get("details"),
+    )

@@ -56,8 +56,9 @@ class TestCustomInputs(unittest.TestCase):
             with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
                 with patch('commands.sendtx.db.add_mempool_tx'):
                     result = sendtx.queue_transaction(json_blob, propagate=False)
-            self.assertIn("FAILURE", result)
-            self.assertIn(f"Stream {key} is reserved", result)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["code"], "TX_INVALID")
+            self.assertIn(f"Stream {key} is reserved", result["message"])
 
     def test_sendtx_accept_custom_keys(self):
         """Test that sendtx accepts keys >= 5 and normalizes values."""
@@ -80,7 +81,7 @@ class TestCustomInputs(unittest.TestCase):
              with patch('commands.sendtx.db.add_mempool_tx'):
                 result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
         
-        self.assertIn("SUCCESS", result)
+        self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
         
         # Check call arguments to tau_manager
         # operations["0"] is missing, so only one call to communicate_with_tau expected (Step 2)
@@ -117,7 +118,7 @@ class TestCustomInputs(unittest.TestCase):
                  with patch('tau_manager.reset_tau_state'): # Mock cleanup
                     result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
         
-        self.assertIn("SUCCESS", result)
+        self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
         
         # Should be called twice
         # 1. Rule (stream 0)

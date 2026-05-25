@@ -91,8 +91,9 @@ class TestInvalidRuleRegression(unittest.TestCase):
                      result = commands.sendtx.queue_transaction(json_blob, propagate=False)
                      
                      print(f"Result: {result}")
-                     self.assertIn("FAILURE", result)
-                     self.assertIn("Transaction rejected by Tau", result)
+                     self.assertFalse(result["ok"])
+                     self.assertEqual(result["code"], "TX_REJECTED")
+                     self.assertIn("Transaction rejected by Tau", result["message"])
 
 if __name__ == '__main__':
     unittest.main()

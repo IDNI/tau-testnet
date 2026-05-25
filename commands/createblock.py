@@ -18,6 +18,7 @@ import tau_manager
 from tau_manager import parse_tau_output
 import tau_defs
 import logging
+import api_response
 
 logger = logging.getLogger(__name__)
 
@@ -378,28 +379,25 @@ def create_block_from_mempool() -> Dict:
     return new_block.to_dict()
 
 
-def encode_command(parts: List[str]) -> str:
-    """
-    Encode the createblock command. No parameters needed.
-    """
-    if len(parts) != 1:
-        raise ValueError("createblock command takes no parameters")
-    return "createblock"
+_CONFIG_ERROR_PREFIXES = ("PoA mining requires", "BLS signing is required")
+_MINING_FAILED_PREFIXES = ("Failed to sign block", "Failed to persist")
 
 
-def decode_output(tau_output: str, tau_input: str) -> str:
-    """
-    Decode output - not applicable for createblock as it doesn't use Tau.
-    """
-    # This function is not expected to be called for createblock,
-    # as the result is handled directly by the execute function.
-    # Returning an empty string or raising an error might be more appropriate
-    # depending on how this is used elsewhere.
-    return ""
+def _classify_createblock_error(block_data: Dict) -> tuple[str, str]:
+    err = block_data.get("error") or ""
+    msg = block_data.get("message") or err or "Block creation failed."
+    if err.startswith(_CONFIG_ERROR_PREFIXES) or msg.startswith(_CONFIG_ERROR_PREFIXES):
+        return "MINING_CONFIG_ERROR", msg
+    if err.startswith(_MINING_FAILED_PREFIXES) or msg.startswith(_MINING_FAILED_PREFIXES):
+        return "MINING_FAILED", msg
+    if msg.startswith("Not our turn"):
+        return "MINING_NOT_ELIGIBLE", msg
+    if "Mempool is empty" in msg:
+        return "MEMPOOL_EMPTY", msg
+    if err:
+        return "MINING_FAILED", msg
+    return "BLOCK_NOT_CREATED", msg
 
-
-import logging
-logger = logging.getLogger(__name__)
 
 def execute(raw_command: str, container):
     """
@@ -408,85 +406,43 @@ def execute(raw_command: str, container):
     logger.info("Create block requested")
     try:
         block_data = create_block_from_mempool()
-        if not block_data or "block_hash" not in block_data:
-            message = None
-            if isinstance(block_data, dict):
-                message = block_data.get("message") or block_data.get("error")
-            resp = (message or "Mempool is empty. No block created.") + "\r\n"
-            logger.info("Create block skipped: %s", message or "empty mempool")
-        else:
-            tx_count = len(block_data.get("transactions", []))
-            block_hash = block_data["block_hash"]
-            block_number = block_data["header"]["block_number"]
-            merkle_root = block_data["header"]["merkle_root"]
-            timestamp = block_data["header"]["timestamp"]
-
-            resp_lines = [
-                f"SUCCESS: Block #{block_number} created successfully!",
-                f"  - Transactions: {tx_count}",
-                f"  - Block Hash: {block_hash}",
-                f"  - Merkle Root: {merkle_root}",
-                f"  - Timestamp: {timestamp}",
-            ]
-            for idx, tx in enumerate(block_data.get("transactions", []), start=1):
-                tx_json = json.dumps(tx, sort_keys=True)
-                resp_lines.append(f"  - TX#{idx}: {tx_json}")
-            resp_lines.append("  - Mempool cleared\r\n")
-            resp = "\n".join(resp_lines)
-            logger.info("Block #%s created", block_number)
-            
-            # Broadcast the new block to the network
-            try:
-                from network import bus
-                service = bus.get()
-                if service:
-                    service.broadcast_block(block_data)
-                    logger.info("Block #%s broadcasted to network", block_number)
-                else:
-                    logger.warning("Network service not available, block not broadcasted")
-            except Exception:
-                logger.exception("Failed to broadcast block")
-
-    except Exception:
+    except Exception as exc:
         logger.exception("Block creation failed")
-        resp = "ERROR: Failed to create block\r\n"
-    return resp
+        return api_response.error_response(
+            "createblock", f"Failed to create block: {exc}", "MINING_FAILED"
+        )
 
+    if isinstance(block_data, dict) and "block_hash" in block_data:
+        header = block_data.get("header", {})
+        transactions = block_data.get("transactions", [])
+        data = {
+            "block_number": header.get("block_number"),
+            "block_hash": block_data["block_hash"],
+            "merkle_root": header.get("merkle_root"),
+            "timestamp": header.get("timestamp"),
+            "tx_count": len(transactions),
+            "transactions": transactions,
+        }
+        logger.info("Block #%s created", header.get("block_number"))
 
-def handle_result(decoded: str, tau_input: str, mempool_state: Dict) -> str:
-    """
-    Handle the result of block creation.
-    """
-    try:
-        block_data = create_block_from_mempool()
-        if not block_data or "block_hash" not in block_data:
-            if isinstance(block_data, dict):
-                message = block_data.get("message") or block_data.get("error")
+        try:
+            from network import bus
+            service = bus.get()
+            if service:
+                service.broadcast_block(block_data)
+                logger.info("Block #%s broadcasted to network", header.get("block_number"))
             else:
-                message = None
-            if not message:
-                message = "Mempool is empty. No block created."
-            return message
+                logger.warning("Network service not available, block not broadcasted")
+        except Exception:
+            logger.exception("Failed to broadcast block")
 
-        # Return a detailed summary of the created block
-        tx_count = len(block_data["transactions"])
-        block_hash = block_data["block_hash"]
-        block_number = block_data["header"]["block_number"]
-        merkle_root = block_data["header"]["merkle_root"]
-        state_hash = block_data["header"].get("state_hash")
-        timestamp = block_data["header"]["timestamp"]
+        return api_response.success_response("createblock", data)
 
-        result = f"SUCCESS: Block #{block_number} created successfully!\n"
-        result += f"  - Transactions: {tx_count}\n"
-        result += f"  - Block Hash: {block_hash}\n"
-        result += f"  - Merkle Root: {merkle_root}\n"
-        result += f"  - Timestamp: {timestamp}\n"
-        if state_hash:
-            result += f"  - State Hash: {state_hash}\n"
-        result += f"  - Mempool cleared"
+    if not isinstance(block_data, dict):
+        return api_response.error_response(
+            "createblock", "Block creation returned no data.", "BLOCK_NOT_CREATED"
+        )
 
-        return result
-
-    except Exception as e:
-        print(f"[ERROR][createblock] Block creation failed: {e}")
-        return f"ERROR: Failed to create block: {e}" 
+    code, message = _classify_createblock_error(block_data)
+    logger.info("Create block skipped: %s (%s)", message, code)
+    return api_response.error_response("createblock", message, code)

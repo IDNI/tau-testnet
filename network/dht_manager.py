@@ -69,66 +69,40 @@ class DHTManager:
         self._trio_token = token
 
     def get_record_sync(self, key: bytes, timeout: float = 5.0) -> bytes | None:
-        """
-        Retrieves a record from the DHT synchronously, bridging to the network thread if needed.
-        """
-        import trio
+        """Retrieve a DHT record synchronously, bridging to the trio thread if needed."""
+        from .libp2p_compat import run_trio_from_thread
 
-        # Ensure key is encoded in slash-prefixed format if needed
-        # We try both raw and encoded to be safe or rely on the caller?
-        # Let's rely on internal encoding/decoding helper.
-        # But if caller passes "state:...", we should encode it.
-        # If caller passes "/state/...", we leave it?
-        # Let's say: Caller manages logic, but we ensure consistent encoding.
-        # But wait, existing callers pass "state:..." bytes.
-        
-        # NOTE: We assume the key passed here is the logical key (e.g. state:...) or raw.
-        # We should probably normalize.
-        # For now, let's just use the key as provided but ensure we check encoding in put.
-        # Actually, get_record_sync calls get_value. If put used encoded key, get must use encoded key.
-
+        # Normalize key to slash-prefixed encoding (KadDHT expects /<ns>/<sfx>).
         encoded_key = key
-        # If it doesn't look like /namespace/..., try to encode it?
-        # The issue is we don't know the namespace easily from bytes if it's just "state:..."
-        # Actually we do, split by :.
         try:
-             decoded = self._decode_dht_key(key)
-             if decoded:
-                 encoded_key = self._encode_dht_key(decoded[0], decoded[1])
+            decoded = self._decode_dht_key(key)
+            if decoded:
+                encoded_key = self._encode_dht_key(decoded[0], decoded[1])
         except Exception:
-             pass
+            pass
 
-        # Try local store first
+        # Try local store first.
         if self._dht and getattr(self._dht, "value_store", None):
             val = self._dht.value_store.get(encoded_key)
             if val:
                 return getattr(val, "value", val)
-            # Fallback: try raw key (legacy)
             if encoded_key != key:
-                 val = self._dht.value_store.get(key)
-                 if val:
-                     return getattr(val, "value", val)
-        
-        # If not local and we have a token, try network
-        if self._dht and self._trio_token:
-            try:
-                async def _get_value_with_timeout() -> bytes | None:
-                    with trio.move_on_after(timeout):
-                         # KadDHT expects string keys (slash-prefixed)
-                         key_to_use = encoded_key.decode("utf-8") if isinstance(encoded_key, bytes) else encoded_key
-                         return await self._dht.get_value(key_to_use)
-                    return None
+                val = self._dht.value_store.get(key)
+                if val:
+                    return getattr(val, "value", val)
 
-                # Execute async get_value on the trio thread (bounded by timeout).
-                return trio.from_thread.run(_get_value_with_timeout, trio_token=self._trio_token)
-            except (trio.RunFinishedError, trio.Cancelled, RuntimeError):
-                # Network might be down or shutting down
-                return None
-            except Exception as e:
-                logger.exception("DHT sync retrieval failed: %s", e)
-                return None
-        
-        return None
+        if not (self._dht and self._trio_token):
+            return None
+
+        key_to_use = encoded_key.decode("utf-8") if isinstance(encoded_key, bytes) else encoded_key
+        try:
+            return run_trio_from_thread(
+                self._dht.get_value, key_to_use,
+                token=self._trio_token, timeout=timeout,
+            )
+        except Exception as e:
+            logger.exception("DHT sync retrieval failed: %s", e)
+            return None
 
     def set_dht(self, dht: KadDHT, manager: Any, host: Any = None) -> None:
         self._dht = dht
@@ -160,83 +134,40 @@ class DHTManager:
     def _setup_dht_validators(self) -> None:
         if self._dht is None:
             return
-        
-        # Configure TTL
-        # Note: In the original code, this accessed self._config.dht_record_ttl
-        # But NetworkConfig object passed here might not have it directly if it's nested in Settings.
-        # We'll assume the caller configures global DHT settings or we pass the full config.
-        # For now, let's assume standard defaults or that dht_common is configured globally.
-        
+
         self._register_default_dht_validators()
-        
-        # Inject validators into the underlying KadDHT validator to ensure put_value works
-        # KadDHT.validator is typically an instance of libp2p.records.validator.Validator
-        # It maintains a dict `validators` mapping key prefix to a validator object/function.
-        # The validator function is expected to raise InvalidRecordType or similar on failure.
-        if hasattr(self._dht, "validator"):
-            # Try to support NamespacedValidator
+
+        # Mechanical wrap (namespace dispatch + put/add_provider guards) lives in
+        # libp2p_compat. Tau-specific record/key validators stay here.
+        from .libp2p_compat import install_validating_dht
+
+        # Idempotency: if we already wrapped value_store/provider_store on a
+        # prior call, skip re-wrapping (original_* would point at our wrapper).
+        already_wrapped = self._dht_value_store_put is not None or self._dht_provider_add is not None
+        if already_wrapped:
+            # Still ensure namespace validators are registered (cheap, idempotent).
+            from .libp2p_compat import _DHTNamespaceValidatorWrapper
             validation_map = None
-            if hasattr(self._dht.validator, "validators"):
-                validation_map = self._dht.validator.validators
-            elif hasattr(self._dht.validator, "_validators"): # Common pattern
-                validation_map = self._dht.validator._validators
-            
+            if hasattr(self._dht, "validator"):
+                if hasattr(self._dht.validator, "validators"):
+                    validation_map = self._dht.validator.validators
+                elif hasattr(self._dht.validator, "_validators"):
+                    validation_map = self._dht.validator._validators
             if validation_map is not None:
-                from libp2p.records.utils import InvalidRecordType
-                 
-                class ValidatorWrapper:
-                    def __init__(self, ns, func):
-                        self.ns = ns
-                        self.func = func
-                    
-                    def validate(self, key, value):
-                        # Ensure key/value types (Validator passes key as str? we handle both)
-                        if not self.func(key, value):
-                            raise InvalidRecordType(f"Validation failed for {self.ns}")
+                for ns, func in self._dht_validators.items():
+                    validation_map[ns] = _DHTNamespaceValidatorWrapper(ns, func)
+            return
 
-                    def select(self, key: str, records: List[bytes]) -> int:
-                        # Simple selector: return index of first record that validates
-                        # In many cases records are just values? 
-                        # KadDHT.get_value passes list of values.
-                        if not records:
-                            raise ValueError("No records to select from")
-                        
-                        # Just pick the first one that validates, or 0 if all valid/unchecked
-                        # Since validate() raises on failure, we might assume filtered beforehand?
-                        # But select() is used to pick the *best*. 
-                        # For immutable data (hashed), any valid one is "best".
-                        return 0
-
-                for ns, v in self._dht_validators.items():
-                    # We must wrap our boolean validators to raise Exception
-                    validation_map[ns] = ValidatorWrapper(ns, v)
-
-        value_store = getattr(self._dht, "value_store", None)
-        logger.debug("DHT value_store: %s", value_store)
-        if value_store is not None and self._dht_value_store_put is None:
-            original_put = value_store.put
-
-            def validating_put(key: bytes, value: bytes, validity: float = 0.0):
-                logger.debug("Validating put for key: %s", key)
-                if not self._validate_dht_record(key, value):
-                    logger.debug("Validation failed for key: %s", key)
-                    raise ValueError("DHT record failed validation")
-                return original_put(key, value, validity)
-
-            value_store.put = validating_put
-            self._dht_value_store_put = original_put
-
-        provider_store = getattr(self._dht, "provider_store", None)
-        if provider_store is not None and self._dht_provider_add is None:
-            original_add = provider_store.add_provider
-
-            def validating_add(key: bytes, provider_info: Any):
-                if not self._validate_dht_key(key):
-                    raise ValueError("Invalid DHT provider key")
-                return original_add(key, provider_info)
-
-            provider_store.add_provider = validating_add
-            self._dht_provider_add = original_add
+        orig_put, orig_add = install_validating_dht(
+            self._dht,
+            namespace_validators=self._dht_validators,
+            record_validator=self._validate_dht_record,
+            key_validator=self._validate_dht_key,
+        )
+        if orig_put is not None:
+            self._dht_value_store_put = orig_put
+        if orig_add is not None:
+            self._dht_provider_add = orig_add
 
     def _register_default_dht_validators(self) -> None:
         self.register_validator("block", self._validate_block_record)
@@ -383,23 +314,17 @@ class DHTManager:
                 return False
 
         if self._dht and self._trio_token:
+            from .libp2p_compat import run_trio_from_thread
+            key_to_use = encoded_key.decode("utf-8") if isinstance(encoded_key, bytes) else encoded_key
             try:
-                import trio
-                # KadDHT expects string keys
-                key_to_use = encoded_key.decode("utf-8") if isinstance(encoded_key, bytes) else encoded_key
-                trio.from_thread.run(
-                    self._dht.put_value,
-                    key_to_use,
-                    value,
-                    trio_token=self._trio_token,
+                run_trio_from_thread(
+                    self._dht.put_value, key_to_use, value,
+                    token=self._trio_token,
                 )
-            except (trio.RunFinishedError, trio.Cancelled, RuntimeError):
-                # Loop may be stopped; keep local store + provider registration.
-                pass
             except Exception as exc:
+                # Loop may be stopped or remote publish may have failed; keep
+                # local store + provider registration regardless.
                 logger.debug("DHT put_record_sync network publish failed: %s", exc)
-                # Keep local store + provider registration even if network publish failed.
-                pass
                 
         # Register as provider for important namespaces
         # This ensures we advertise this key during handshake/provider queries

@@ -32,11 +32,38 @@ the GHCR release workflow are documented in [packaging.md](packaging.md).
 
 | Code | Meaning |
 |---|---|
-| `0` | Success |
-| `1` | Application error — the node returned `ERROR: …`, `error …` (handshake), or `FAILURE: …` (admission/validation rejection) |
+| `0` | Success — node returned `{"status":"ok",...}` JSON envelope. |
+| `1` | Application error — node returned `{"status":"error",...}` envelope, or `error …` plain-text from the handshake. |
 | `2` | argparse misuse |
 | `3` | Connection / timeout / response too large |
 | `4` | Local file, key, or config error |
+
+## Response envelope
+
+Every node command (everything except the `hello` handshake) replies with a
+single-line JSON envelope:
+
+Protocol details (transports, handshake, full command list): [blockchain_api.md](blockchain_api.md).
+
+```json
+{"status":"ok","command":"<name>","data":{...}}
+{"status":"error","command":"<name>","error":{"code":"<CODE>","message":"<text>","details":{...}?}}
+```
+
+The TCP transport adds `\r\n` framing at the wire; WebSocket emits the raw
+envelope without `\r\n`. The handshake (`hello version=1` / `hello version=2`
+→ `ok version=N env=… node=…`) stays plain text — it is session-level, not a
+data API. `tau-testnet ping` and `tau-testnet --json status` consume the
+plain-text handshake reply directly.
+
+Error codes emitted by the node: `INVALID_PARAMS`, `PARSE_ERROR`,
+`INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`,
+`TX_INVALID`, `BLS_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MEMPOOL_EMPTY`,
+`MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`,
+`GOVERNANCE_ERROR`, `NOT_FOUND`, `TAU_NOT_READY`, `TIMEOUT`,
+`UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`. Structured context (e.g.
+`{"expected":5,"received":4}` on `INVALID_SEQUENCE`) lives under
+`error.details`.
 
 ## Commands
 
@@ -73,7 +100,8 @@ tau-testnet --json status
 ### `tau-testnet rpc <command>`
 
 Send a raw command string to the node and print its response verbatim.
-Exits `1` if the response begins with `ERROR:`, `error `, or `FAILURE:`.
+Exits `1` if the JSON envelope has `"status":"error"` (or if the handshake
+reply starts with `error `).
 
 ```bash
 tau-testnet rpc "getbalance 0xabc..."
@@ -173,9 +201,10 @@ tau-testnet tx raw-sign --privkey 0xabc... --payload tx.json > signed_tx.json
 tau-testnet tx raw-submit --file signed_tx.json
 ```
 
-`tx send` exits `1` when the node responds with `ERROR:` or `FAILURE:`, `4`
-for bad amounts/empty operations/missing inputs, `3` on connection/timeout
-errors.
+`tx send` exits `1` when the node returns a `{"status":"error",...}`
+envelope (any `error.code`, e.g. `INVALID_SIGNATURE`, `INVALID_SEQUENCE`,
+`TX_REJECTED`), `4` for bad amounts/empty operations/missing inputs, `3` on
+connection/timeout errors.
 
 ## Governance
 
@@ -216,7 +245,8 @@ level (matching `tests/test_gov_integration.py`).
 Both `gov propose` and `gov vote` are admission-checked by `consensus/admission.py`:
 the sender pubkey must appear in `active_validators` (visible via `tau-testnet
 governance` / `gov list`). Otherwise the node returns
-`FAILURE: Proposer <pk> is not an active validator.` (exit code 1).
+`{"status":"error","command":"sendtx","error":{"code":"TX_REJECTED","message":"Proposer <pk> is not an active validator."}}`
+(exit code 1).
 
 The validator set is populated from two sources:
 
