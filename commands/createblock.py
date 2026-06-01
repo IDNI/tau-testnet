@@ -291,10 +291,10 @@ def create_block_from_mempool() -> Dict:
         )
         
         engine = TauConsensusEngine()
-        
+
         # 2. Derive active_view for next height
         active_view = engine.derive_active_consensus(parent_snapshot, block_number)
-        
+
         # 3. Simulate Candidate using apply_block() natively
         # We need a candidate block body structure.
         candidate_block = block.Block.create(
@@ -305,9 +305,55 @@ def create_block_from_mempool() -> Dict:
             timestamp=block_timestamp,
             state_hash=''
         )
-        
-        # Call the unified path
-        apply_result = engine.apply_block(active_view, candidate_block, parent_snapshot)
+
+        # Snapshot global Tau interpreter + application-rules state BEFORE the
+        # miner-side simulation. `engine.apply_block` ultimately calls
+        # `tau_manager.communicate_with_tau(..., apply_rules_update=True)` for
+        # any user_tx rule op, which mutates the live `tau_direct_interface`
+        # AND writes `chain_state._application_rules_state` + the db
+        # `full_tau_spec` row via `_rules_handler`. We must roll those back
+        # before `process_new_block` re-applies the same block; otherwise the
+        # verifier path runs against an already-advanced interpreter and
+        # produces a divergent `next_app_rules` / `state_hash`, manifesting as
+        # "[BLOCKCHAIN] State hash mismatch for extending block #N".
+        saved_app_rules = chain_state.get_application_rules_state()
+        try:
+            saved_db_full_spec = db.get_chain_state_value("full_tau_spec", "")
+        except Exception:
+            saved_db_full_spec = None
+        saved_full_spec = None
+        try:
+            iface = tau_manager.tau_direct_interface
+            if iface is not None and hasattr(iface, "get_current_spec"):
+                saved_full_spec = iface.get_current_spec()
+        except Exception:
+            saved_full_spec = None
+        if saved_full_spec is None:
+            saved_full_spec = tau_manager.last_known_tau_spec
+
+        try:
+            # Call the unified path
+            apply_result = engine.apply_block(active_view, candidate_block, parent_snapshot)
+        finally:
+            # Restore the interpreter + cached rules state so `process_new_block`
+            # below re-applies the block from the same baseline the miner saw.
+            try:
+                if saved_full_spec is not None:
+                    tau_manager.restore_full_tau_spec(saved_full_spec)
+            except Exception as restore_err:
+                logger.warning(
+                    "createblock: failed to restore Tau spec after miner simulation: %s",
+                    restore_err,
+                )
+            chain_state.save_application_rules_state(saved_app_rules)
+            if saved_db_full_spec is not None:
+                try:
+                    db.set_chain_state_value("full_tau_spec", saved_db_full_spec)
+                except Exception:
+                    logger.warning(
+                        "createblock: failed to restore db full_tau_spec after miner simulation",
+                        exc_info=True,
+                    )
         
         # Extract accepted/skipped outcomes
         final_txs = []

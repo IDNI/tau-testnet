@@ -7,6 +7,7 @@ import threading
 import trio
 import argparse
 import trio_websocket
+import subprocess
 
 
 from app.container import ServiceContainer
@@ -205,8 +206,10 @@ async def websocket_handler(request):
                  continue
             bucket_tokens -= 1.0
             
-            # Process
-            success, response = process_command(message, container, client_label)
+            # Process in a worker thread to avoid blocking the Trio event loop
+            success, response = await trio.to_thread.run_sync(
+                process_command, message, container, client_label
+            )
             await ws.send_message(response)
             
             # Close on fatal protocol errors if desired, or keep open.
@@ -539,6 +542,40 @@ def _run_server(container: ServiceContainer):
         logger.info("Shutdown complete.")
 
 
+def _start_watchdog():
+    status_file = os.path.join(config.DATA_DIR, "tau_status.json")
+    os.makedirs(config.DATA_DIR, exist_ok=True)
+    
+    # Clean up stale status files
+    if os.path.exists(status_file):
+        try:
+            os.remove(status_file)
+        except Exception:
+            pass
+            
+    # Watchdog kills the server when Tau communication exceeds COMM_TIMEOUT (TAU_COMM_TIMEOUT).
+    timeout = getattr(config, "COMM_TIMEOUT", 60)
+    watchdog_script = os.path.join(os.path.dirname(__file__), "watchdog.py")
+    watchdog_log = os.path.join(config.DATA_DIR, "watchdog.log")
+
+    try:
+        log_handle = open(watchdog_log, "a", encoding="utf-8")
+        subprocess.Popen(
+            [sys.executable, watchdog_script, status_file, str(timeout), str(os.getpid())],
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        logger.info(
+            "Watchdog started: kills server if Tau comm exceeds comm_timeout "
+            "(COMM_TIMEOUT=%ss, TAU_COMM_TIMEOUT); log=%s",
+            timeout,
+            watchdog_log,
+        )
+    except Exception as e:
+        logger.error("Failed to start watchdog process: %s", e)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Tau Testnet Server")
     parser.add_argument(
@@ -557,6 +594,8 @@ def main():
             "open_governance_admission is enabled with non-empty bootstrap peers; "
             "unsafe for a networked node."
         )
+    
+    _start_watchdog()
     container = ServiceContainer.build(overrides={"logger": logger, "ephemeral_identity": args.ephemeral_identity})
     tau_module = container.tau_manager
     try:

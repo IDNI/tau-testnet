@@ -98,6 +98,34 @@ last_known_tau_spec: str | None = None
 tau_direct_interface: tau_native.TauInterface | None = None
 
 
+# Watchdog monitors in-flight Tau communication; limit is config.COMM_TIMEOUT (TAU_COMM_TIMEOUT).
+WATCHDOG_COMM_TIMEOUT_NAME = "comm_timeout"
+WATCHDOG_COMM_CONFIG_KEY = "COMM_TIMEOUT"
+WATCHDOG_COMM_ENV_VAR = "TAU_COMM_TIMEOUT"
+
+
+def _write_status(start=True, source: str | None = None):
+    try:
+        import json
+        status_file = os.path.join(config.DATA_DIR, "tau_status.json")
+        data = {
+            "pid": os.getpid(),
+            "db_path": config.STRING_DB_PATH,
+            "last_start_time": time.time() if start else None,
+        }
+        if start:
+            data["watchdog_timeout_name"] = WATCHDOG_COMM_TIMEOUT_NAME
+            data["watchdog_timeout_seconds"] = config.COMM_TIMEOUT
+            data["watchdog_config_key"] = WATCHDOG_COMM_CONFIG_KEY
+            data["watchdog_env_var"] = WATCHDOG_COMM_ENV_VAR
+            if source:
+                data["comm_source"] = source
+        with open(status_file, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.error("Failed to write watchdog status file: %s", e)
+
+
 def set_rules_handler(handler):
     global _rules_handler
     _rules_handler = handler
@@ -217,6 +245,7 @@ def communicate_with_tau(
     except Exception as e:
         raise TauCommunicationError("Failed to acquire communication lock")
 
+    _write_status(start=True, source=source)
     try:
         if tau_test_mode:
             if target_output_stream_index == 0:
@@ -340,6 +369,7 @@ def communicate_with_tau(
             return output_val
 
     finally:
+        _write_status(start=False)
         tau_comm_lock.release()
 
 
@@ -401,6 +431,7 @@ def communicate_with_tau_multi(
                     v_str = _normalize_tau_input_value(v_str) or ""
                 normalized_inputs[k] = v_str
 
+    _write_status(start=True, source=source)
     try:
         _print_tau_dispatch(
             source=source,
@@ -414,6 +445,8 @@ def communicate_with_tau_multi(
         )
     except Exception as ex:
         raise TauCommunicationError(f"Direct Tau multi-output communication failed: {ex}", last_state=last_known_tau_spec)
+    finally:
+        _write_status(start=False)
 
     # Optional disk logging of the multi-response (best-effort)
     try:

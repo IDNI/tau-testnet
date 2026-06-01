@@ -623,6 +623,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
                                 if "error" in output.lower() and "x1001" not in output.lower():
                                     logger.warning("Tau rejected rule: %s", output)
+                                    # A rule Tau cannot parse/compile is
+                                    # structurally invalid and must not be
+                                    # embedded in the block. Hard-reject it,
+                                    # mirroring reserved-stream/bad-format paths,
+                                    # so the "logically valid" count excludes it.
+                                    accepted_in_block = False
+                                    hard_reject = True
                                     execution_success = False
                                     tx_receipt["logs"].append(f"Error: Tau rejected rule output: {output}")
 
@@ -647,6 +654,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             logger.error("Error applying rule: %s", e)
                             execution_success = False
                             tx_receipt["logs"].append(f"Error: {e}")
+                            # A deterministic Tau parse/compile failure (the
+                            # native engine emits "(Error)" lines, which bubble
+                            # up in the exception text) means the rule is
+                            # unparseable — hard-reject so it cannot enter the
+                            # block. Other failures (e.g. transient Tau outage)
+                            # stay soft.
+                            if "(error)" in str(e).lower():
+                                accepted_in_block = False
+                                hard_reject = True
 
                 # --- Step 2 & 3: Unified Custom Inputs & Transfers ---
                 if execution_success and transfers_op_data is not None:
@@ -671,6 +687,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         3: "0",  # Mock IDs for replay
                                         4: "0",
                                     }
+                                    # i12: full 384-bit sender pubkey (bv[384]),
+                                    # mirrors the submit path so any rule that
+                                    # references i12[t] replays deterministically.
+                                    tau_input_stream_values[12] = "{ #x" + str(from_addr) + " }:bv[384]"
                                     for k, v in custom_tau_inputs.items():
                                         tau_input_stream_values[k] = v
                                     tau_input_stream_values[5] = str(block_timestamp)

@@ -450,6 +450,40 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                         if tau_force_test:
                             logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")
                         else:
+                            # Deterministic gate: compile the rule against an
+                            # isolated interpreter seeded from the current
+                            # consensus rules. The live i0 pointwise-revision
+                            # path below compiles the rule lazily on a *later*
+                            # step, so parse/overflow errors (e.g. a constant too
+                            # wide for the target stream's bit-vector type) never
+                            # appear in its returned output and the tx slips into
+                            # the mempool. The isolated compile surfaces them here
+                            # without mutating live interpreter state.
+                            if tau_manager.tau_ready.is_set() and not getattr(
+                                tau_manager, "tau_test_mode", False
+                            ):
+                                try:
+                                    import tau_native
+                                    prior_spec = chain_state.get_rules_state()
+                                    compile_err = tau_native.TauInterface.compile_revisions_isolated(
+                                        prior_spec, [rule_text]
+                                    )
+                                except Exception as compile_exc:
+                                    # Native bindings unavailable (e.g. unbuilt
+                                    # tau-lang): degrade to the live path below
+                                    # rather than 500. The activation-height
+                                    # compile remains the backstop.
+                                    logger.warning(
+                                        "Isolated rule compile unavailable, "
+                                        "falling back to live validation: %s",
+                                        compile_exc,
+                                    )
+                                    compile_err = None
+                                if compile_err:
+                                    return _qt_err(
+                                        "TX_REJECTED",
+                                        f"Transaction rejected by Tau (rule validation). {compile_err}",
+                                    )
                             logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
                             tau_output_rules = tau_manager.communicate_with_tau(
                                 rule_text=rule_text,
@@ -507,6 +541,11 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                             tau_input_stream_values[2] = str(tau_input_dict['balance'])
                             tau_input_stream_values[3] = str(tau_input_dict['from_id'])
                             tau_input_stream_values[4] = str(tau_input_dict['to_id'])
+                            # i12: full 384-bit sender public key (bv[384]) so
+                            # user-policy rules can scope on the real key, not
+                            # the interned bv[16] id on i3. Index >=12 is a free
+                            # (non-reserved) input stream.
+                            tau_input_stream_values[12] = "{ #x" + sender_pubkey + " }:bv[384]"
 
                             logger.info(
                                 "Sending Tau inputs for transfer #%s validation: %s",
