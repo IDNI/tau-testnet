@@ -4,39 +4,46 @@ import sys
 import time
 import json
 import signal
+from datetime import datetime, timezone
 
 DEFAULT_TIMEOUT_NAME = "comm_timeout"
 DEFAULT_CONFIG_KEY = "COMM_TIMEOUT"
 DEFAULT_ENV_VAR = "TAU_COMM_TIMEOUT"
 
+
+def _log(message: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} [WATCHDOG] {message}", flush=True)
+
+
 def kill_process_tree(pid):
-    print(f"[WATCHDOG] Sending SIGKILL to child processes of PID {pid}...")
+    _log(f"Sending SIGKILL to child processes of PID {pid}...")
     try:
         import subprocess
         subprocess.run(["pkill", "-9", "-P", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
-        print(f"[WATCHDOG] Error running pkill: {e}")
-        
-    print(f"[WATCHDOG] Sending SIGKILL to PID {pid}...")
+        _log(f"Error running pkill: {e}")
+
+    _log(f"Sending SIGKILL to PID {pid}...")
     try:
         os.kill(pid, signal.SIGKILL)
     except OSError as e:
-        print(f"[WATCHDOG] Error sending SIGKILL: {e}")
+        _log(f"Error sending SIGKILL: {e}")
 
 def main():
     if len(sys.argv) < 3:
         print("Usage: watchdog.py <status_file_path> <timeout_seconds> [parent_pid]")
         sys.exit(1)
-        
+
     status_file = sys.argv[1]
     timeout = float(sys.argv[2])
-    
+
     parent_pid = None
     if len(sys.argv) > 3:
         parent_pid = int(sys.argv[3])
-        
-    print(
-        f"[WATCHDOG] Started. status_file={status_file} "
+
+    _log(
+        f"Started. status_file={status_file} "
         f"timeout_name={DEFAULT_TIMEOUT_NAME} limit={timeout}s "
         f"({DEFAULT_CONFIG_KEY} / {DEFAULT_ENV_VAR}) parent_pid={parent_pid}"
     )
@@ -49,7 +56,7 @@ def main():
             try:
                 os.kill(parent_pid, 0)
             except OSError:
-                print("[WATCHDOG] Parent process exited. Exiting watchdog.")
+                _log("Parent process exited. Exiting watchdog.")
                 break
                 
         if not os.path.exists(status_file):
@@ -82,6 +89,7 @@ def main():
                 env_var = data.get("watchdog_env_var", DEFAULT_ENV_VAR)
                 comm_source = data.get("comm_source", "unknown")
 
+                killed_at = time.time()
                 kill_report = {
                     "reason": "watchdog_comm_timeout",
                     "timeout_name": timeout_name,
@@ -91,7 +99,10 @@ def main():
                     "elapsed_seconds": round(elapsed, 3),
                     "comm_source": comm_source,
                     "parent_pid": parent_pid,
-                    "killed_at": time.time(),
+                    "killed_at": killed_at,
+                    "killed_at_iso": datetime.fromtimestamp(
+                        killed_at, tz=timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 report_path = os.path.join(
                     os.path.dirname(status_file), "watchdog_kill_report.json"
@@ -100,17 +111,17 @@ def main():
                     with open(report_path, "w", encoding="utf-8") as rf:
                         json.dump(kill_report, rf, indent=2)
                         rf.write("\n")
-                    print(f"[WATCHDOG] Wrote kill report: {report_path}")
+                    _log(f"Wrote kill report: {report_path}")
                 except Exception as e:
-                    print(f"[WATCHDOG] Failed to write kill report: {e}")
+                    _log(f"Failed to write kill report: {e}")
 
-                print(
-                    "[WATCHDOG] CRITICAL: Tau communication exceeded watchdog limit. "
+                _log(
+                    "CRITICAL: Tau communication exceeded watchdog limit. "
                     f"timeout_name={timeout_name!r} "
                     f"({config_key}={limit_seconds}s, override via {env_var}); "
                     f"elapsed={elapsed:.1f}s; comm_source={comm_source!r}"
                 )
-                print(f"[WATCHDOG] Terminating main server PID {parent_pid} and cleaning database...")
+                _log(f"Terminating main server PID {parent_pid} and cleaning database...")
 
                 # 1. Forcefully kill the main process tree (ensuring no zombies)
                 kill_process_tree(parent_pid)
@@ -122,11 +133,11 @@ def main():
                         if os.path.exists(path):
                             try:
                                 os.remove(path)
-                                print(f"[WATCHDOG] Removed database file: {path}")
+                                _log(f"Removed database file: {path}")
                             except Exception as e:
-                                print(f"[WATCHDOG] Failed to remove database file {path}: {e}")
-                                
-                print("[WATCHDOG] Cleanup finished. Watchdog exiting.")
+                                _log(f"Failed to remove database file {path}: {e}")
+
+                _log("Cleanup finished. Watchdog exiting.")
                 sys.exit(0)
 
 if __name__ == "__main__":

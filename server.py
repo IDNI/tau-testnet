@@ -4,6 +4,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 import trio
 import argparse
 import trio_websocket
@@ -259,38 +260,75 @@ def _start_websocket_server(container: ServiceContainer) -> None:
                 return None
             return ssl_ctx
 
+        def _log_ws_exception(prefix, exc):
+            # serve_websocket runs client handlers inside an internal Trio nursery,
+            # so failures arrive wrapped in an ExceptionGroup / trio.MultiError whose
+            # str() is just "Exceptions from Trio nursery (N sub-exceptions)".
+            # Recurse into .exceptions so the real cause + traceback are logged.
+            subs = getattr(exc, "exceptions", None)
+            if subs:
+                logger.error("%s %r (%d sub-exception(s))", prefix, exc, len(subs))
+                for idx, sub in enumerate(subs, 1):
+                    _log_ws_exception(f"{prefix} [sub {idx}/{len(subs)}]", sub)
+            else:
+                logger.error("%s %r", prefix, exc, exc_info=exc)
+
         async def main():
             # Port scanning logic
             actual_ws_port = ws_port
             ssl_context = _build_ws_ssl_context()
             scheme = "wss" if ssl_context else "ws"
-            # Simple scan
+            # Simple scan: bind to the first free port, then serve until it crashes
+            # or is cancelled. A non-OSError escapes this function so the outer
+            # supervisor loop can log it and restart.
             for i in range(10):
+                p = actual_ws_port + i
                 try:
-                    p = actual_ws_port + i
                     logger.info("Attempting to bind %s to 0.0.0.0:%s", scheme, p)
                     # serve_websocket blocks until cancelled.
-                    # We need to run it.
                     await trio_websocket.serve_websocket(
-                        handler_with_container, 
-                        "0.0.0.0", 
-                        p, 
-                        ssl_context=ssl_context
+                        handler_with_container,
+                        "0.0.0.0",
+                        p,
+                        ssl_context=ssl_context,
                     )
-                    # If it returns, it finished?
+                    # If it returns, the server shut down on its own.
                     logger.warning("WS serve returned (unexpected).")
-                    break 
-                except OSError:
-                    logger.warning("WS Port %s busy, trying next...", p)
-                except Exception as e:
-                    logger.error("WS Server failed to start: %s", e)
+                    return
+                except OSError as e:
+                    logger.warning("WS Port %s busy, trying next... (%s)", p, e)
+                    continue
+            raise RuntimeError(
+                f"WS server could not bind any port in {actual_ws_port}-{actual_ws_port + 9}"
+            )
+
+        # Supervisor: restart the WS server if it ever crashes, with exponential
+        # backoff. Without this a single handler crash kills the daemon thread and
+        # the WS endpoint stays dead until the whole node restarts.
+        backoff = 1.0
+        max_backoff = 30.0
+        while not NETWORK_STOP_FLAG.is_set():
+            started = time.monotonic()
+            try:
+                logger.info("WebSocket Thread running trio loop...")
+                trio.run(main)
+                # main() returned without raising (serve exited or stop requested).
+                if NETWORK_STOP_FLAG.is_set():
                     break
-        
-        try:
-           logger.info("WebSocket Thread running trio loop...")
-           trio.run(main)
-        except Exception as e:
-           logger.error("WS Thread crashed: %s", e)
+                logger.warning("WS server exited cleanly; restarting in %.1fs", backoff)
+            except Exception as e:
+                _log_ws_exception("WS Server crashed:", e)
+                logger.warning("Restarting WS server in %.1fs", backoff)
+
+            if NETWORK_STOP_FLAG.is_set():
+                break
+            # Reset backoff if the server stayed up for a while (transient blip).
+            if time.monotonic() - started > 60.0:
+                backoff = 1.0
+            time.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+        logger.info("WebSocket Thread stopped.")
 
     t = threading.Thread(target=_ws_runner, name="WebSocketServerThread", daemon=True)
     t.start()

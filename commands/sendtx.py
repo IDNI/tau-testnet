@@ -465,8 +465,17 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                                 try:
                                     import tau_native
                                     prior_spec = chain_state.get_rules_state()
-                                    compile_err = tau_native.TauInterface.compile_revisions_isolated(
-                                        prior_spec, [rule_text]
+                                    # Run in a throwaway subprocess with a hard
+                                    # timeout: the in-process compile can hang
+                                    # indefinitely inside native Tau and the
+                                    # server watchdog can't see it (no status
+                                    # stamp), which freezes the whole server. A
+                                    # compile that overruns the timeout is
+                                    # rejected like any other invalid rule.
+                                    compile_err = tau_native.compile_revisions_isolated_subprocess(
+                                        prior_spec,
+                                        [rule_text],
+                                        timeout=config.COMM_TIMEOUT,
                                     )
                                 except Exception as compile_exc:
                                     # Native bindings unavailable (e.g. unbuilt

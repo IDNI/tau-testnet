@@ -1,7 +1,9 @@
 import ctypes
+import json
 import logging
 import os
 import re
+import subprocess
 import sys
 from collections import deque
 
@@ -853,4 +855,77 @@ class TauInterface:
 
         # `interpreter` falls out of scope here and is reclaimed; no live state touched.
         return None
+
+
+_COMPILE_WORKER_MODULE = "tau_compile_worker"
+_COMPILE_RESULT_SENTINEL = "__TAU_COMPILE_RESULT__"
+
+
+def compile_revisions_isolated_subprocess(
+    consensus_rules_text: str,
+    revisions,
+    timeout: float,
+):
+    """
+    Run `TauInterface.compile_revisions_isolated` in a throwaway child process
+    with a hard wall-clock `timeout`.
+
+    Returns None on success, or a string describing the failure. A compile that
+    does not finish within `timeout` is treated as a rejection: the child is
+    SIGKILLed and a timeout error string is returned. This is the watchdog-free
+    path's safety net — the in-process classmethod can hang indefinitely inside
+    native Tau with no status stamp for the server watchdog to catch, so we
+    isolate it where we can kill it.
+    """
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    request = json.dumps(
+        {
+            "consensus_rules_text": consensus_rules_text or "",
+            "revisions": list(revisions or []),
+        }
+    )
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", _COMPILE_WORKER_MODULE],
+            input=request,
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        # subprocess.run already SIGKILLed the child on timeout.
+        logger.warning(
+            "Isolated rule compile timed out after %.1fs; rejecting transaction.",
+            timeout,
+        )
+        return f"Rule compile timed out after {timeout:.0f}s."
+    except Exception as exc:
+        # Could not spawn the worker at all (e.g. missing interpreter). Signal
+        # unavailability with None so the caller can fall back to live path.
+        logger.warning("Isolated rule compile worker failed to run: %s", exc)
+        return None
+
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith(_COMPILE_RESULT_SENTINEL):
+            try:
+                result = json.loads(line[len(_COMPILE_RESULT_SENTINEL):])
+            except Exception as exc:
+                return f"Rule compile worker returned unparseable result: {exc}"
+            if result.get("ok"):
+                return None
+            if result.get("unavailable"):
+                # Native bindings absent in the worker: degrade to the live
+                # validation path rather than rejecting the transaction.
+                logger.warning(
+                    "Isolated rule compile worker reports native tau unavailable: %s",
+                    result.get("error"),
+                )
+                return None
+            return result.get("error") or "Rule compile failed."
+
+    # No sentinel: worker died before reporting (crash/OOM/killed). Reject.
+    tail = (proc.stderr or proc.stdout or "").strip()[-500:]
+    return f"Rule compile worker produced no result (exit={proc.returncode}). {tail}"
 
