@@ -233,20 +233,43 @@ def fetch_tau_state_snapshot(state_hash: str) -> Optional[tuple[str, str, str, s
         decoded = val_bytes.decode("utf-8")
         data = json.loads(decoded)
         if isinstance(data, dict):
-            # Backwards compatibility check
+            # Old un-split format cannot be revalidated against the consensus hash
+            # (the producer no longer writes it), so reject rather than trust it.
             if "rules" in data:
-                # Old format
-                rules = data.get("rules", "")
-                accounts_hash = data.get("accounts_hash", "")
-                # We can't safely return valid tuple for strict new format unless caller handles or we shim it.
-                # Since tests/nodes were broken, they aren't using old format actively, but we return parts.
-                return ("", rules, "", accounts_hash)
+                return None
 
             consensus_rules = data.get("consensus_rules")
             application_rules = data.get("application_rules")
             meta_hash = data.get("meta_hash")
             accounts_hash = data.get("accounts_hash")
-            
+
+            # Revalidate the fetched payload against the requested consensus hash.
+            # Mirror the producer-side / DHT-admission recompute so a consumer never
+            # trusts a tampered or mismatched snapshot retrieved from the network.
+            if not isinstance(consensus_rules, str) or not isinstance(application_rules, str) \
+               or not isinstance(meta_hash, str) or not isinstance(accounts_hash, str):
+                return None
+            try:
+                accounts_hash_bytes = bytes.fromhex(accounts_hash)
+                meta_hash_bytes = bytes.fromhex(meta_hash)
+            except ValueError:
+                return None
+            if len(accounts_hash_bytes) != 32:
+                return None
+            computed_state_hash = compute_consensus_state_hash(
+                consensus_rules.encode("utf-8"),
+                application_rules.encode("utf-8"),
+                accounts_hash_bytes,
+                meta_hash_bytes,
+            )
+            if computed_state_hash != state_hash:
+                logger.warning(
+                    "Rejecting fetched tau_state snapshot: recomputed hash %s != requested %s",
+                    computed_state_hash,
+                    state_hash,
+                )
+                return None
+
             if logger.isEnabledFor(logging.DEBUG) and isinstance(consensus_rules, str):
                 try:
                     logger.debug(

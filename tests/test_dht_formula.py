@@ -56,6 +56,69 @@ class TestDHTFormula(unittest.TestCase):
         wrong_ns = f"other:{formula_hash}".encode("ascii")
         self.assertFalse(self.dht_manager._validate_formula_record(wrong_ns, formula))
 
+    def test_validate_block_record_uses_real_block_hash_verification(self):
+        from block import Block
+
+        block = Block.create(
+            block_number=1,
+            previous_hash="0" * 64,
+            transactions=[],
+            proposer_pubkey="a" * 96,
+            timestamp=1234567890,
+        )
+        key = f"block:{block.block_hash}".encode("ascii")
+        noncanonical_json = json.dumps(block.to_dict(), sort_keys=False, indent=2).encode("utf-8")
+
+        self.assertTrue(self.dht_manager._validate_block_record(key, noncanonical_json))
+
+    def test_validate_block_record_rejects_tampered_block_payload(self):
+        from block import Block
+
+        block = Block.create(
+            block_number=1,
+            previous_hash="0" * 64,
+            transactions=[],
+            proposer_pubkey="a" * 96,
+            timestamp=1234567890,
+        )
+        tampered = block.to_dict()
+        tampered["header"]["timestamp"] = 1234567891
+        key = f"block:{block.block_hash}".encode("ascii")
+        payload = json.dumps(tampered, separators=(",", ":")).encode("utf-8")
+
+        self.assertFalse(self.dht_manager._validate_block_record(key, payload))
+
+    def test_validate_tx_record_uses_canonical_transaction_hash(self):
+        from block import compute_tx_hash
+
+        payload = {
+            "signature": "0" * 192,
+            "sender_pubkey": "b" * 96,
+            "operations": {"1": [["b" * 96, "c" * 96, "1"]]},
+            "expiration_time": 9999999999,
+            "fee_limit": "0",
+            "sequence_number": 1,
+        }
+        tx_id = compute_tx_hash(payload)
+        noncanonical_json = json.dumps(payload, sort_keys=False, indent=2).encode("utf-8")
+        key = f"tx:{tx_id}".encode("ascii")
+
+        self.assertTrue(self.dht_manager._validate_tx_record(key, noncanonical_json))
+
+    def test_validate_tx_record_rejects_hash_mismatch(self):
+        payload = {
+            "sender_pubkey": "b" * 96,
+            "sequence_number": 1,
+            "expiration_time": 9999999999,
+            "operations": {"1": [["b" * 96, "c" * 96, "1"]]},
+            "fee_limit": "0",
+            "signature": "0" * 192,
+        }
+        key = f"tx:{'0' * 64}".encode("ascii")
+        canonical_json = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+        self.assertFalse(self.dht_manager._validate_tx_record(key, canonical_json))
+
     def test_tau_state_storage_and_retrieval(self):
         """
         Tau/rules snapshots are stored under `state:<blake3>` with the raw spec bytes as value.

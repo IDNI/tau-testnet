@@ -186,15 +186,17 @@ class DHTManager:
             return False
             
         try:
+            from block import Block
+
             data = json.loads(value.decode("utf-8"))
-            if data.get("block_hash") != block_hash:
+            if not isinstance(data, dict):
                 return False
-            return True
+            block = Block.from_dict(data)
+            return block.block_hash == block_hash
         except Exception:
             return False
 
     def _validate_tx_record(self, key: bytes, value: bytes) -> bool:
-        from commands import sendtx
         decoded = self._decode_dht_key(key)
         if not decoded:
              return False
@@ -203,8 +205,14 @@ class DHTManager:
              return False
 
         try:
-            import hashlib
-            computed_id = hashlib.sha256(value).hexdigest()
+            import json
+            from block import compute_tx_hash
+
+            payload = json.loads(value.decode("utf-8"))
+            if not isinstance(payload, dict):
+                return False
+
+            computed_id = compute_tx_hash(payload)
             return computed_id == tx_id
         except Exception:
             return False

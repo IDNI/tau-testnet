@@ -136,6 +136,22 @@ def set_state_restore_callback(handler):
     _state_restore_callback = handler
 
 
+def is_force_test_enabled() -> bool:
+    requested = os.environ.get("TAU_FORCE_TEST", "0") == "1"
+    if not requested:
+        return False
+
+    runtime_env = getattr(getattr(config, "settings", None), "env", None) or os.environ.get("TAU_ENV", "development")
+    if runtime_env == "test":
+        return True
+
+    logger.error(
+        "Ignoring TAU_FORCE_TEST outside TAU_ENV=test (current env: %s).",
+        runtime_env,
+    )
+    return False
+
+
 def _preprocess_rule_for_tau(rule_text: str | None) -> str | None:
     if rule_text is None:
         return None
@@ -171,7 +187,7 @@ def start_and_manage_tau_process():
     tau_test_mode = False
     last_known_tau_spec = None
 
-    if os.environ.get("TAU_FORCE_TEST", "0") == "1":
+    if is_force_test_enabled():
         logger.warning("TAU_FORCE_TEST enabled. Running in TEST MODE without Tau Engine.")
         tau_test_mode = True
         tau_process_ready.set()
@@ -586,6 +602,7 @@ __all__ = [
     "parse_tau_output",
     "set_rules_handler",
     "set_state_restore_callback",
+    "is_force_test_enabled",
     "start_and_manage_tau_process",
     "reset_tau_state",
 ]

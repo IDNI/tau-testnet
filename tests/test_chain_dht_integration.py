@@ -120,9 +120,65 @@ class TestChainDHTIntegration(unittest.TestCase):
         
     def test_retrieve_missing_formula(self):
         self.chain_state.set_dht_client(self.mock_dht_client)
-        
+
         # Try to retrieve non-existent formula
         result = self.chain_state.fetch_formula_from_dht("nonexistenthash")
+        self.assertIsNone(result)
+
+    def test_fetch_tau_state_snapshot_rejects_hash_mismatch(self):
+        import json
+        self.chain_state.set_dht_client(self.mock_dht_client)
+        # Recomputed hash will be "cafebabe", but the caller requests "deadbeef".
+        self.chain_state.compute_consensus_state_hash.return_value = "cafebabe"
+        payload = json.dumps({
+            "consensus_rules": "tampered cons",
+            "application_rules": "tampered app",
+            "meta_hash": ("00" * 32),
+            "accounts_hash": ("00" * 32),
+        }).encode("utf-8")
+        self.store_data[b"tau_state:deadbeef"] = payload
+
+        result = self.chain_state.fetch_tau_state_snapshot("deadbeef")
+        self.assertIsNone(result)
+
+    def test_fetch_tau_state_snapshot_rejects_invalid_accounts_hash_shape(self):
+        import json
+        self.chain_state.set_dht_client(self.mock_dht_client)
+        payload = json.dumps({
+            "consensus_rules": "cons",
+            "application_rules": "app",
+            "meta_hash": ("00" * 32),
+            "accounts_hash": "not-hex",
+        }).encode("utf-8")
+        self.store_data[b"tau_state:deadbeef"] = payload
+
+        result = self.chain_state.fetch_tau_state_snapshot("deadbeef")
+        self.assertIsNone(result)
+
+    def test_fetch_tau_state_snapshot_rejects_short_accounts_hash(self):
+        import json
+        self.chain_state.set_dht_client(self.mock_dht_client)
+        payload = json.dumps({
+            "consensus_rules": "cons",
+            "application_rules": "app",
+            "meta_hash": ("00" * 32),
+            "accounts_hash": ("00" * 31),
+        }).encode("utf-8")
+        self.store_data[b"tau_state:deadbeef"] = payload
+
+        result = self.chain_state.fetch_tau_state_snapshot("deadbeef")
+        self.assertIsNone(result)
+
+    def test_fetch_tau_state_snapshot_rejects_old_format(self):
+        import json
+        self.chain_state.set_dht_client(self.mock_dht_client)
+        payload = json.dumps({
+            "rules": "legacy un-split rules",
+            "accounts_hash": ("00" * 32),
+        }).encode("utf-8")
+        self.store_data[b"tau_state:deadbeef"] = payload
+
+        result = self.chain_state.fetch_tau_state_snapshot("deadbeef")
         self.assertIsNone(result)
 
 if __name__ == "__main__":

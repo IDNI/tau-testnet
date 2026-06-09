@@ -427,7 +427,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
 
                 custom_tau_inputs[idx] = normalized_val
 
-    tau_force_test = os.environ.get("TAU_FORCE_TEST", "0") == "1"
+    tau_force_test = tau_manager.is_force_test_enabled()
 
     try:
         if tx_type == "user_tx":
