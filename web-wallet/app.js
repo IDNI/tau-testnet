@@ -423,77 +423,103 @@ async function sendRpc(command) {
 }
 
 function handleServerResponse(msg) {
-    // Basic Parsing of common responses
-    if (msg.startsWith("BALANCE: ")) {
-        const bal = msg.split(":")[1].trim();
-        statBalance.textContent = bal;
-    } else if (msg.startsWith("TAUSTATE:")) {
-        const state = msg.substring(9).trim();
-        log(`Tau State:\n${state}`, 'success');
-        if (ruleEditor && state) {
-            ruleEditor.setValue(state);
-        }
-    } else if (msg.startsWith("SEQUENCE: ")) {
-        const seq = parseInt(msg.split(":")[1].trim());
-        statSequence.textContent = seq;
-        // Only update pending if it's null (initial load) or the confirmed sequence has caught up/surpassed our local tracking
-        if (pendingSequence === null || seq > pendingSequence) {
-            pendingSequence = seq;
-        }
-        checkGovPanelState();
-    } else if (msg.startsWith("ACCOUNTS: ")) {
-        try {
-            const jsonStr = msg.substring(10);
-            const accounts = JSON.parse(jsonStr);
-            updateKnownAccounts(accounts);
-        } catch (e) {
-            log("Error parsing accounts list: " + e.message, "error");
-        }
-    } else if (msg.startsWith("[")) {
-        // Handle raw JSON list from getallaccounts
-        try {
-            const accounts = JSON.parse(msg);
-            updateKnownAccounts(accounts);
-        } catch (e) {
-            log("Error parsing raw accounts list: " + e.message, "error");
-        }
-    } else if (msg.trim().startsWith("{")) {
-        try {
-            const data = JSON.parse(msg);
-            // getupdateid response: explicit shape check
-            if (data.status === 'ok' && typeof data.update_id === 'string' && data.update_id.length === 64) {
-                window.dispatchEvent(new CustomEvent('govPreviewResponse', { detail: data }));
-            } else if (data.status === 'error' && typeof data.error === 'string' && data.input_echo !== undefined) {
-                window.dispatchEvent(new CustomEvent('govPreviewResponse', { detail: data }));
-            } else if (data.pending_updates !== undefined && data.next_block_height !== undefined) {
-                // getgovernance response
-                window.dispatchEvent(new CustomEvent('govStatusResponse', { detail: data }));
+    // All blockchain command responses use the standard JSON envelope:
+    //   {"status":"ok","command":"<name>","data":{...}}
+    //   {"status":"error","command":"<name>","error":{"code","message","details"?}}
+    let env;
+    try {
+        env = JSON.parse(msg);
+    } catch (e) {
+        // Non-envelope line (e.g. a plain log echo). Nothing to route.
+        return;
+    }
+    if (!env || typeof env !== 'object' || typeof env.command !== 'string') {
+        return;
+    }
+
+    const ok = env.status === 'ok';
+    const data = (env.data && typeof env.data === 'object') ? env.data : {};
+    const errMsg = (env.error && env.error.message) ? env.error.message : 'Request failed.';
+
+    switch (env.command) {
+        case 'getbalance':
+            if (ok) statBalance.textContent = data.balance;
+            else log(`getbalance: ${errMsg}`, 'error');
+            break;
+
+        case 'getsequence':
+            if (ok) {
+                const seq = parseInt(data.sequence_number);
+                statSequence.textContent = seq;
+                // Only update pending if it's null (initial load) or the
+                // confirmed sequence has caught up/surpassed our local tracking.
+                if (pendingSequence === null || seq > pendingSequence) {
+                    pendingSequence = seq;
+                }
+                checkGovPanelState();
+            } else {
+                log(`getsequence: ${errMsg}`, 'error');
             }
-        } catch (e) {
-            // not json
-        }
-    } else if (msg.startsWith("FAILURE:")) {
-        log(msg, "error");
-        if (_pendingGovTx) {
-            // Governance tx failed — leave sequence unchanged, clear pending state
-            _pendingGovTx = null;
-        } else {
-            // user_tx failed — reset optimistic sequence
-            pendingSequence = null;
-        }
-    } else if (msg.startsWith("SUCCESS:")) {
-        log(msg, "success");
-        if (_pendingGovTx) {
-            const govSeq = _pendingGovTx.seq;
-            const govTab = _pendingGovTx.activeTab;
-            _pendingGovTx = null;
-            if (pendingSequence === null || govSeq >= pendingSequence) {
-                pendingSequence = govSeq + 1;
-                statSequence.textContent = `(Pending) ${govSeq + 1}`;
+            break;
+
+        case 'gettaustate':
+            if (ok) {
+                const state = (data.rules_state || '').trim();
+                log(`Tau State:\n${state}`, 'success');
+                if (ruleEditor && state) ruleEditor.setValue(state);
+            } else {
+                log(`gettaustate: ${errMsg}`, 'error');
             }
-            log("Governance transaction accepted by node.", "success");
-            clearGovInputs(govTab);
-        }
+            break;
+
+        case 'getallaccounts':
+            if (ok) updateKnownAccounts(data.accounts || []);
+            else log(`getallaccounts: ${errMsg}`, 'error');
+            break;
+
+        case 'getupdateid':
+            window.dispatchEvent(new CustomEvent('govPreviewResponse', {
+                detail: ok
+                    ? { status: 'ok', update_id: data.update_id, input_echo: data.input_echo }
+                    : { status: 'error', error: errMsg }
+            }));
+            break;
+
+        case 'getgovernance':
+            window.dispatchEvent(new CustomEvent('govStatusResponse', {
+                detail: ok ? data : { error: errMsg }
+            }));
+            break;
+
+        case 'sendtx':
+            if (ok) {
+                log(`SUCCESS: ${data.message || 'Transaction queued.'}${data.tx_hash ? ' tx=' + data.tx_hash : ''}`, 'success');
+                if (_pendingGovTx) {
+                    const govSeq = _pendingGovTx.seq;
+                    const govTab = _pendingGovTx.activeTab;
+                    _pendingGovTx = null;
+                    if (pendingSequence === null || govSeq >= pendingSequence) {
+                        pendingSequence = govSeq + 1;
+                        statSequence.textContent = `(Pending) ${govSeq + 1}`;
+                    }
+                    log("Governance transaction accepted by node.", "success");
+                    clearGovInputs(govTab);
+                }
+            } else {
+                log(`FAILURE: ${errMsg}`, 'error');
+                if (_pendingGovTx) {
+                    // Governance tx failed — leave sequence unchanged, clear pending state
+                    _pendingGovTx = null;
+                } else {
+                    // user_tx failed — reset optimistic sequence
+                    pendingSequence = null;
+                }
+            }
+            break;
+
+        default:
+            if (!ok) log(`${env.command}: ${errMsg}`, 'error');
+            break;
     }
 }
 
@@ -2112,6 +2138,7 @@ function checkGovPanelState() {
 
 function normalizeGovernanceAdvisory(raw) {
     if (!raw || typeof raw !== 'object') return { error: "Invalid response format" };
+    if (raw.error) return { error: raw.error };
     if (!Array.isArray(raw.pending_updates)) return { error: "Missing pending_updates array" };
     if (!Array.isArray(raw.votes)) return { error: "Missing votes array" };
 

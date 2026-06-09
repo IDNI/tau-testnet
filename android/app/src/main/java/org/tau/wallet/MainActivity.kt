@@ -22,6 +22,7 @@ import androidx.appcompat.app.AlertDialog
 import java.util.ArrayDeque
 import org.tau.wallet.crypto.Bls
 import org.json.JSONArray
+import org.json.JSONObject
 
 import com.google.android.material.tabs.TabLayout
 import android.view.View
@@ -270,9 +271,10 @@ class MainActivity : AppCompatActivity() {
             if (verbose) {
                  runOnUiThread { tvResult.text = "Fetch Peers Response:\n$resp" }
             }
-            if (resp.startsWith("[")) {
+            val accountsArray = envData(resp)?.optJSONArray("accounts")
+            if (accountsArray != null) {
                 try {
-                    val jsonArray = JSONArray(resp)
+                    val jsonArray = accountsArray
                     val accounts = mutableListOf<String>()
                     for (i in 0 until jsonArray.length()) {
                         accounts.add(jsonArray.getString(i))
@@ -466,7 +468,11 @@ class MainActivity : AppCompatActivity() {
         val port = etPort.text.toString().toIntOrNull() ?: return
         thread {
             val resp = rpc("getbalance $addr\r\n", host, port)
-            runOnUiThread { tvBalance.text = resp.trim() }
+            val data = envData(resp)
+            runOnUiThread {
+                tvBalance.text = if (data != null) "Balance: ${data.optString("balance", "0")}"
+                                 else "Balance error: ${envError(resp)}"
+            }
         }
     }
 
@@ -479,8 +485,11 @@ class MainActivity : AppCompatActivity() {
         val port = etPort.text.toString().toIntOrNull() ?: return
         thread {
             val resp = rpc("history $addr\r\n", host, port)
-            
-            // Extract potential peers from history (heuristically)
+            val data = envData(resp)
+            val txArray = data?.optJSONArray("transactions")
+
+            // Extract potential peers from history (heuristically) over the raw
+            // envelope JSON — it still contains the 96-hex BLS public keys.
             val peers = mutableSetOf<String>()
             val regex = Regex("[0-9a-fA-F]{96}") // Match BLS public keys
             regex.findAll(resp).forEach { match ->
@@ -489,9 +498,15 @@ class MainActivity : AppCompatActivity() {
                      peers.add(key)
                  }
             }
-            
-            runOnUiThread { 
-                tvHistory.text = resp.trim()
+
+            val historyText = when {
+                txArray == null -> "History error: ${envError(resp)}"
+                txArray.length() == 0 -> "History: (no transactions)"
+                else -> "History (${txArray.length()} tx):\n${txArray.toString(2)}"
+            }
+
+            runOnUiThread {
+                tvHistory.text = historyText
                 if (peers.isNotEmpty()) {
                     val adapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, peers.toList())
                     actTo.setAdapter(adapter)
@@ -505,11 +520,14 @@ class MainActivity : AppCompatActivity() {
         val port = etPort.text.toString().toIntOrNull() ?: return
         thread {
             val resp = rpc("gettaustate\r\n", host, port).trim()
+            val data = envData(resp)
             runOnUiThread {
-                tvResult.text = resp
-                if (resp.startsWith("TAUSTATE:")) {
-                    val state = resp.substring(9).trim()
-                    etRule.setText(state)
+                if (data != null) {
+                    val state = data.optString("rules_state", "").trim()
+                    tvResult.text = if (state.isEmpty()) "Tau state: (empty)" else "Tau state loaded."
+                    if (state.isNotEmpty()) etRule.setText(state)
+                } else {
+                    tvResult.text = "gettaustate error: ${envError(resp)}"
                 }
             }
         }
@@ -622,11 +640,13 @@ class MainActivity : AppCompatActivity() {
 
         thread {
             val seqLine = rpc("getsequence $senderPk\r\n", host, port).trim()
-            val seq = if (seqLine.startsWith("SEQUENCE: ")) {
-                seqLine.substringAfter(": ").toIntOrNull() ?: 0
+            val seqData = envData(seqLine)
+            val seq = if (seqData != null) {
+                seqData.optInt("sequence_number", 0)
             } else {
-                val hist = rpc("history $senderPk\r\n", host, port).trim().split('\n')
-                if (hist.size > 1) hist.size -1 else 0
+                // Fallback: derive from history length if getsequence failed.
+                val histTx = envData(rpc("history $senderPk\r\n", host, port))?.optJSONArray("transactions")
+                histTx?.length() ?: 0
             }
 
             val expiry = (System.currentTimeMillis() / 1000L + 3600).toInt()
@@ -652,7 +672,37 @@ class MainActivity : AppCompatActivity() {
             val blob = compactJson(payload)
             val cmd = "sendtx '$blob'\r\n"
             val resp = rpc(cmd, host, port)
-            runOnUiThread { tvResult.text = resp.trim() }
+            val data = envData(resp)
+            runOnUiThread {
+                tvResult.text = if (data != null) {
+                    val txHash = data.optString("tx_hash", "")
+                    val msg = data.optString("message", "Transaction queued.")
+                    if (txHash.isNotEmpty()) "$msg\ntx: $txHash" else msg
+                } else {
+                    "Transaction failed: ${envError(resp)}"
+                }
+            }
+        }
+    }
+
+    // Blockchain command responses use the standard JSON envelope:
+    //   {"status":"ok","command":"<name>","data":{...}}
+    //   {"status":"error","command":"<name>","error":{"code","message"}}
+    private fun envData(resp: String): JSONObject? {
+        return try {
+            val env = JSONObject(resp.trim())
+            if (env.optString("status") == "ok") env.optJSONObject("data") else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun envError(resp: String): String {
+        return try {
+            val env = JSONObject(resp.trim())
+            env.optJSONObject("error")?.optString("message") ?: "Request failed."
+        } catch (e: Exception) {
+            resp.trim()
         }
     }
 
