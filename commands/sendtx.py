@@ -429,6 +429,12 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
 
     tau_force_test = tau_manager.is_force_test_enabled()
 
+    # Set once the isolated subprocess compile has validated the rule. When set,
+    # the live validate-then-restore path below is skipped: it mutates the
+    # global interpreter and the restore rebuilds the full accumulated spec
+    # natively, which can hang for minutes (watchdog kill -> restart loop).
+    rules_validated_isolated = False
+
     try:
         if tx_type == "user_tx":
             try:
@@ -462,8 +468,8 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                             if tau_manager.tau_ready.is_set() and not getattr(
                                 tau_manager, "tau_test_mode", False
                             ):
+                                import tau_native
                                 try:
-                                    import tau_native
                                     prior_spec = chain_state.get_rules_state()
                                     # Run in a throwaway subprocess with a hard
                                     # timeout: the in-process compile can hang
@@ -477,35 +483,50 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                                         [rule_text],
                                         timeout=config.COMM_TIMEOUT,
                                     )
-                                except Exception as compile_exc:
+                                except tau_native.NativeTauUnavailable as compile_exc:
                                     # Native bindings unavailable (e.g. unbuilt
-                                    # tau-lang): degrade to the live path below
-                                    # rather than 500. The activation-height
-                                    # compile remains the backstop.
+                                    # tau-lang): degrade to the live path below.
+                                    # The activation-height compile remains the
+                                    # backstop.
                                     logger.warning(
                                         "Isolated rule compile unavailable, "
                                         "falling back to live validation: %s",
                                         compile_exc,
                                     )
-                                    compile_err = None
-                                if compile_err:
+                                except Exception:
+                                    logger.warning(
+                                        "Isolated rule compile errored, "
+                                        "falling back to live validation.",
+                                        exc_info=True,
+                                    )
+                                else:
+                                    if compile_err:
+                                        return _qt_err(
+                                            "TX_REJECTED",
+                                            f"Transaction rejected by Tau (rule validation). {compile_err}",
+                                        )
+                                    # Validated without touching live interpreter
+                                    # state -> skip the live validate-then-restore
+                                    # dance entirely (its restore rebuilds the full
+                                    # accumulated spec natively and can hang the
+                                    # server).
+                                    rules_validated_isolated = True
+                                    logger.info("Tau rule validation successful (isolated compile).")
+
+                            if not rules_validated_isolated:
+                                logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
+                                tau_output_rules = tau_manager.communicate_with_tau(
+                                    rule_text=rule_text,
+                                    target_output_stream_index=0,
+                                    source=sender_pubkey,
+                                    apply_rules_update=False,
+                                )
+                                if "Error" in tau_output_rules:
                                     return _qt_err(
                                         "TX_REJECTED",
-                                        f"Transaction rejected by Tau (rule validation). {compile_err}",
+                                        f"Transaction rejected by Tau (rule validation). Output: {tau_output_rules}",
                                     )
-                            logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
-                            tau_output_rules = tau_manager.communicate_with_tau(
-                                rule_text=rule_text,
-                                target_output_stream_index=0,
-                                source=sender_pubkey,
-                                apply_rules_update=False,
-                            )
-                            if "Error" in tau_output_rules:
-                                return _qt_err(
-                                    "TX_REJECTED",
-                                    f"Transaction rejected by Tau (rule validation). Output: {tau_output_rules}",
-                                )
-                            logger.info("Tau rule validation successful.")
+                                logger.info("Tau rule validation successful (live).")
 
                 # Step 2: Custom Input Validation (if present)
                 if custom_tau_inputs:
@@ -597,8 +618,12 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                         logger.info("All Tau transfer validations successful.")
 
             finally:
-                # Cleanup: Restore prior Tau state so sendtx does not mutate global state.
-                if has_rules:
+                # Cleanup: Restore prior Tau state so sendtx does not mutate
+                # global state. Only needed when the *live* path ran and mutated
+                # the interpreter; the isolated subprocess compile never touches
+                # live state, so skip the restore (it rebuilds the full spec
+                # natively and can hang -> watchdog kill -> restart loop).
+                if has_rules and not rules_validated_isolated:
                     try:
                         prior_spec = chain_state.get_rules_state()
                         if prior_spec:
@@ -612,9 +637,6 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                             logger.warning(
                                 "No prior Tau spec available for restore; skipping sendtx-restore."
                             )
-                    except Exception:
-                        logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
-
                     except Exception:
                         logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
 

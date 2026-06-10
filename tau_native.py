@@ -861,6 +861,15 @@ _COMPILE_WORKER_MODULE = "tau_compile_worker"
 _COMPILE_RESULT_SENTINEL = "__TAU_COMPILE_RESULT__"
 
 
+class NativeTauUnavailable(Exception):
+    """
+    Raised by `compile_revisions_isolated_subprocess` when the isolated compile
+    could not run at all (native bindings absent, worker un-spawnable). Distinct
+    from a rule rejection: the caller should degrade to the live validation path
+    rather than rejecting the transaction.
+    """
+
+
 def compile_revisions_isolated_subprocess(
     consensus_rules_text: str,
     revisions,
@@ -870,12 +879,19 @@ def compile_revisions_isolated_subprocess(
     Run `TauInterface.compile_revisions_isolated` in a throwaway child process
     with a hard wall-clock `timeout`.
 
-    Returns None on success, or a string describing the failure. A compile that
-    does not finish within `timeout` is treated as a rejection: the child is
-    SIGKILLed and a timeout error string is returned. This is the watchdog-free
-    path's safety net — the in-process classmethod can hang indefinitely inside
-    native Tau with no status stamp for the server watchdog to catch, so we
-    isolate it where we can kill it.
+    Returns:
+        None        -- the revisions compiled successfully.
+        str         -- a rejection reason (timeout, native crash, bad rule, or
+                       a worker that died without reporting). The caller must
+                       reject the transaction.
+    Raises:
+        NativeTauUnavailable -- the compile could not run (native bindings
+                       absent / worker un-spawnable); caller should fall back to
+                       live validation.
+
+    This is the watchdog-free path's safety net — the in-process classmethod can
+    hang indefinitely inside native Tau with no status stamp for the server
+    watchdog to catch, so we isolate it where we can SIGKILL it on timeout.
     """
     repo_root = os.path.dirname(os.path.abspath(__file__))
     request = json.dumps(
@@ -902,10 +918,9 @@ def compile_revisions_isolated_subprocess(
         )
         return f"Rule compile timed out after {timeout:.0f}s."
     except Exception as exc:
-        # Could not spawn the worker at all (e.g. missing interpreter). Signal
-        # unavailability with None so the caller can fall back to live path.
+        # Could not spawn the worker at all (e.g. missing interpreter).
         logger.warning("Isolated rule compile worker failed to run: %s", exc)
-        return None
+        raise NativeTauUnavailable(str(exc)) from exc
 
     for line in (proc.stdout or "").splitlines():
         if line.startswith(_COMPILE_RESULT_SENTINEL):
@@ -922,7 +937,7 @@ def compile_revisions_isolated_subprocess(
                     "Isolated rule compile worker reports native tau unavailable: %s",
                     result.get("error"),
                 )
-                return None
+                raise NativeTauUnavailable(result.get("error") or "native tau unavailable")
             return result.get("error") or "Rule compile failed."
 
     # No sentinel: worker died before reporting (crash/OOM/killed). Reject.

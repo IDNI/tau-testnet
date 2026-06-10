@@ -28,12 +28,21 @@ class TestCustomInputs(unittest.TestCase):
 
         self.env_patcher = patch.dict('os.environ', {'TAU_FORCE_TEST': '0'})
         self.env_patcher.start()
-        
+
+        # Rule validation now runs through the isolated subprocess compile.
+        # Mock it so the test is deterministic and does not spawn a child / need
+        # a native tau build. None == validated OK.
+        self.isolated_patcher = patch(
+            'tau_native.compile_revisions_isolated_subprocess', return_value=None
+        )
+        self.mock_isolated = self.isolated_patcher.start()
+
         # Ensure we clean up patches
         self.addCleanup(self.comm_patcher.stop)
         self.addCleanup(self.ready_patcher.stop)
         self.addCleanup(self.env_patcher.stop)
-        
+        self.addCleanup(self.isolated_patcher.stop)
+
         # Patch other dependencies safely
         self.crypto_patcher = patch('commands.sendtx._PY_ECC_AVAILABLE', False)
         self.crypto_patcher.start()
@@ -100,7 +109,9 @@ class TestCustomInputs(unittest.TestCase):
         self.assertEqual(inputs[200], ["a", "1"]) # Normalized
 
     def test_sendtx_two_step_validation(self):
-        """Test that sendtx performs two-step validation when rules AND custom inputs exist."""
+        """Rules are validated by the isolated compile; custom inputs by the live
+        path. The rule no longer goes through communicate_with_tau, and the live
+        validate-then-restore is skipped entirely on the isolated path."""
         payload = {
             "sender_pubkey": "a" * 96,
             "sequence_number": 1,
@@ -115,27 +126,25 @@ class TestCustomInputs(unittest.TestCase):
 
         with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
              with patch('commands.sendtx.db.add_mempool_tx'):
-                 with patch('tau_manager.reset_tau_state'): # Mock cleanup
+                 with patch('tau_manager.reset_tau_state') as mock_reset:
                     result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
-        
+
         self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
-        
-        # Should be called twice
-        # 1. Rule (stream 0)
-        # 2. Custom Inputs (stream 100)
-        self.assertEqual(self.mock_communicate.call_count, 2)
-        
-        # Check first call (Rule)
-        args1, kwargs1 = self.mock_communicate.call_args_list[0]
-        self.assertEqual(kwargs1['rule_text'], "some rule")
-        self.assertNotIn('input_stream_values', kwargs1) # Ensure input values NOT sent with rule in step 1 if separated
-        self.assertEqual(kwargs1['source'], payload['sender_pubkey'])
-        
-        # Check second call (Custom)
-        args2, kwargs2 = self.mock_communicate.call_args_list[1]
-        self.assertIsNone(kwargs2['rule_text'])
-        self.assertEqual(kwargs2['input_stream_values'][100], ["42"])
-        self.assertEqual(kwargs2['source'], payload['sender_pubkey'])
+
+        # Rule validated via isolated subprocess compile (once, with the rule).
+        self.mock_isolated.assert_called_once()
+        iso_args, _iso_kwargs = self.mock_isolated.call_args
+        self.assertEqual(iso_args[1], ["some rule"])
+
+        # communicate_with_tau is now used only for the custom-input step.
+        self.assertEqual(self.mock_communicate.call_count, 1)
+        _, kwargs = self.mock_communicate.call_args
+        self.assertIsNone(kwargs['rule_text'])
+        self.assertEqual(kwargs['input_stream_values'][100], ["42"])
+        self.assertEqual(kwargs['source'], payload['sender_pubkey'])
+
+        # Isolated path never mutates live state, so no restore is performed.
+        mock_reset.assert_not_called()
 
     def test_engine_apply_execution_order(self):
         """Test TauConsensusEngine.apply executes Rule then Custom Inputs and captures receipts."""

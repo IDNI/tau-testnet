@@ -73,10 +73,12 @@ def test_bad_rule_returns_error_string(stub_worker, monkeypatch):
     assert err == "rule is garbage"
 
 
-def test_native_unavailable_falls_back_to_none(stub_worker, monkeypatch):
+def test_native_unavailable_raises_for_fallback(stub_worker, monkeypatch):
     monkeypatch.setenv("WF_STUB_MODE", "unavail")
-    # unavailable must NOT reject the tx (caller degrades to live validation)
-    assert tau_native.compile_revisions_isolated_subprocess("spec", ["r"], timeout=10) is None
+    # unavailable must NOT reject the tx: it raises so the caller degrades to
+    # the live validation path instead of returning a rejection string.
+    with pytest.raises(tau_native.NativeTauUnavailable):
+        tau_native.compile_revisions_isolated_subprocess("spec", ["r"], timeout=10)
 
 
 def test_no_sentinel_is_rejected(stub_worker, monkeypatch):
@@ -101,9 +103,15 @@ def test_timeout_is_killed_and_rejected(stub_worker, monkeypatch):
 def test_real_worker_plumbing_empty_rules(monkeypatch):
     """
     End-to-end against the real tau_compile_worker. Empty consensus rules return
-    None whether native tau is present (no baseline -> early return) or absent
-    (ImportError -> unavailable -> None). Bounds the real subprocess + sentinel
-    parsing path without requiring a native build.
+    None when native tau is present (no baseline -> early return); when native
+    is absent the worker raises NativeTauUnavailable. Either outcome exercises
+    the real subprocess + sentinel parsing path without requiring a build.
     """
     monkeypatch.delenv("WF_STUB_MODE", raising=False)
-    assert tau_native.compile_revisions_isolated_subprocess("", ["always o5[t]:bv[16] = 0."], timeout=30) is None
+    try:
+        result = tau_native.compile_revisions_isolated_subprocess(
+            "", ["always o5[t]:bv[16] = 0."], timeout=30
+        )
+    except tau_native.NativeTauUnavailable:
+        return  # no native build in this environment; plumbing still exercised
+    assert result is None
