@@ -13,6 +13,8 @@ import tau_manager
 from tau_manager import parse_tau_output
 import utils
 from errors import TauCommunicationError
+from consensus import fees
+from consensus.fees import FeeRuleError
 from db import add_mempool_tx
 from network import bus as network_bus
 import api_response
@@ -310,6 +312,16 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
 
     if 'fee_limit' not in payload:
         return _qt_err("INVALID_PARAMS", "Missing 'fee_limit' in transaction.")
+    # All tx types (governance included) must carry a syntactically valid
+    # fee_limit; only user_tx is charged. The payload field itself is never
+    # rewritten — the BLS signature covers the original representation.
+    fee_limit_int = fees.parse_fee_limit(payload['fee_limit'])
+    if fee_limit_int is None:
+        return _qt_err(
+            "INVALID_PARAMS",
+            "Invalid 'fee_limit': must be a non-negative integer (int or decimal string) <= 2**63-1.",
+            fee_limit=str(payload.get('fee_limit'))[:64],
+        )
 
     tx_type = payload.get("tx_type", "user_tx")
     if tx_type not in ("user_tx", "consensus_rule_update", "consensus_rule_vote"):
@@ -360,6 +372,10 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
     all_validated_transfers = []
     transfer_tau_inputs = []
     empty_transfer_list = False
+    # Admission-time fee estimate: sum over Tau steps of (o9 consensus fee
+    # + o8 user custom fee). Best-effort anti-spam — the engine re-derives
+    # the fee authoritatively at block application.
+    estimated_fee_total = 0
     
     # 1. Structural Dispatch & Thin Admission Validations
     from consensus.admission import validate_mempool_admission
@@ -615,7 +631,62 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                                         ),
                                         transfer_index=i + 1,
                                     )
+
+                            # --- Fee Estimation (o9 consensus + o8 custom) ---
+                            # Same tau_outputs dict: zero extra roundtrips.
+                            try:
+                                estimated_fee_total += fees.parse_consensus_fee(
+                                    tau_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
+                                    context=f"queue transfer #{i+1}",
+                                ) + fees.parse_custom_fee(
+                                    tau_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
+                                    context=f"queue transfer #{i+1}",
+                                )
+                            except FeeRuleError as fee_exc:
+                                # Voted consensus rules emit garbage on o9:
+                                # the fee is undeterminable -> cannot admit.
+                                return _qt_err(
+                                    "FEE_RULE_ERROR",
+                                    f"Consensus fee rule failure: {fee_exc}",
+                                )
                         logger.info("All Tau transfer validations successful.")
+
+                # Step 3b: Fee estimate for transfer-less user_tx — one
+                # fee-query step with the canonical mocked transfer inputs
+                # (mirrors the engine's apply-time convention).
+                if (
+                    tx_type == "user_tx"
+                    and not all_validated_transfers
+                    and not tau_force_test
+                    and tau_manager.tau_ready.is_set()
+                ):
+                    try:
+                        fee_query_inputs = {1: "0", 2: "0", 3: "0", 4: "0"}
+                        for k, v in custom_tau_inputs.items():
+                            fee_query_inputs[k] = v
+                        fee_query_inputs[12] = "{ #x" + sender_pubkey + " }:bv[384]"
+                        fee_outputs = tau_manager.communicate_with_tau_multi(
+                            input_stream_values=fee_query_inputs,
+                            source=sender_pubkey,
+                            apply_rules_update=False,
+                        )
+                        estimated_fee_total += fees.parse_consensus_fee(
+                            fee_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
+                            context="queue fee-query",
+                        ) + fees.parse_custom_fee(
+                            fee_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
+                            context="queue fee-query",
+                        )
+                    except FeeRuleError as fee_exc:
+                        return _qt_err(
+                            "FEE_RULE_ERROR",
+                            f"Consensus fee rule failure: {fee_exc}",
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Fee-query estimation failed; estimate stays %s (engine is authoritative).",
+                            estimated_fee_total, exc_info=True,
+                        )
 
             finally:
                 # Cleanup: Restore prior Tau state so sendtx does not mutate
@@ -658,11 +729,41 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
             #             f"Could not apply transfer ({from_addr[:10]}... -> {to_addr[:10]}..., amount {amt})."
             #         )
 
+        # --- Fee cap + best-effort funds check (user_tx only) ---
+        # The engine re-derives and charges the fee authoritatively at
+        # block application; this layer is anti-spam. The estimate can
+        # diverge only for fee rules that violate the documented
+        # determinism constraint (i2/i3/i4 are mocked at apply time).
+        if tx_type == "user_tx":
+            if estimated_fee_total > fee_limit_int:
+                return _qt_err(
+                    "FEE_LIMIT_TOO_LOW",
+                    f"required estimated fee {estimated_fee_total}, fee_limit {fee_limit_int}",
+                    required_fee=estimated_fee_total,
+                    fee_limit=fee_limit_int,
+                )
+            sum_amounts = sum(amt for _, _, amt in all_validated_transfers)
+            sender_balance = chain_state.get_balance(sender_pubkey)
+            if sender_balance < sum_amounts + estimated_fee_total:
+                return _qt_err(
+                    "INSUFFICIENT_FUNDS",
+                    (
+                        f"Sender balance {sender_balance} cannot cover transfers "
+                        f"{sum_amounts} plus estimated fee {estimated_fee_total}."
+                    ),
+                    balance=sender_balance,
+                    required=sum_amounts + estimated_fee_total,
+                )
+
         tx_message_id, tx_canonical_blob = _compute_transaction_message_id(payload)
         # Use canonical blob for storage to ensure consistency
         # Use milliseconds for received_at for better ordering resolution
         received_at = int(time.time() * 1000)
-        db.add_mempool_tx(tx_canonical_blob, tx_message_id, received_at)
+        db.add_mempool_tx(
+            tx_canonical_blob, tx_message_id, received_at,
+            fee_limit=fee_limit_int,
+            estimated_fee=estimated_fee_total if tx_type == "user_tx" else 0,
+        )
         logger.info("Transaction successfully queued in mempool.")
         if propagate:
             if network_bus is not None:

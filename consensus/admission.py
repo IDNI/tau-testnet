@@ -48,7 +48,23 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         # Block attempts to use reserved streams in application transactions natively
         if 6 <= idx <= 11:
             return format_error(f"Invalid operation target '{key}'. Streams 6-11 are reserved for consensus ABI inputs.")
-            
+
+    # Screen user rule TEXT for consensus output streams. A user rule
+    # writing o6/o7 (block validity / eligibility) or o9 (consensus fee)
+    # would conflict with the voted consensus rules in the composed spec
+    # (unsat -> DoS) or forge consensus verdicts/fees. Crude token scan,
+    # same precedent as the warn-only governance check below — but HARD
+    # for user txs (comment false-positives are an accepted trade-off;
+    # governance revisions stay exempt because writing these streams is
+    # their legitimate job).
+    rule_text = operations.get("0")
+    if isinstance(rule_text, str) and rule_text:
+        for stream_token in ("o6", "o7", "o9"):
+            if stream_token in rule_text:
+                return format_error(
+                    f"user_tx rule text references reserved consensus output stream '{stream_token}'."
+                )
+
     return success()
 
 def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = None) -> Optional[str]:

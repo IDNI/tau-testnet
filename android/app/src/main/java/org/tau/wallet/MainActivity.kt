@@ -655,7 +655,9 @@ class MainActivity : AppCompatActivity() {
                 "sequence_number" to seq,
                 "expiration_time" to expiry,
                 "operations" to operations,
-                "fee_limit" to "0"
+                // Matches the genesis consensus fee rule (o9); keep in sync
+                // with the network's active fee rule.
+                "fee_limit" to "10"
             )
             val signingJson = canonicalJson(payloadNoSig)
             val signingBytes = signingJson.toByteArray()

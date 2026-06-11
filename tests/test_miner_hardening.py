@@ -245,9 +245,12 @@ class TestMinerHardening(unittest.TestCase):
         })
         db.add_mempool_tx(payload, "hash_faucet", 1000)
         
-        # Run Mining
+        # Run Mining (the createblock/chain_state fee guards consult their
+        # own tau_manager references; share the mock)
         try:
-            with patch('py_ecc.bls.G2Basic.Verify', return_value=True):
+            with patch('py_ecc.bls.G2Basic.Verify', return_value=True), \
+                 patch('commands.createblock.tau_manager', mock_tau), \
+                 patch('chain_state.tau_manager', mock_tau):
                 res = createblock.create_block_from_mempool()
         except Exception as e:
             import traceback

@@ -153,7 +153,9 @@ class TestGhostTxIntegration(unittest.TestCase):
              patch('consensus.engine.TauConsensusEngine.query_eligibility', return_value=True), \
              patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True), \
              patch('consensus.engine.tau_manager.tau_ready.is_set', return_value=True), \
-             patch('consensus.engine.tau_manager.communicate_with_tau', side_effect=tau_side_effect):
+             patch('consensus.engine.tau_manager.communicate_with_tau', side_effect=tau_side_effect), \
+             patch('consensus.engine.tau_manager.communicate_with_tau_multi', return_value={}), \
+             patch('chain_state.tau_manager.tau_ready.wait', return_value=True):
              # Mock Sig Validation (Always valid for this test)
              mock_sig.return_value = True
              

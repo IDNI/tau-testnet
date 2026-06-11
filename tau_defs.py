@@ -55,6 +55,36 @@ USER_POLICY_STREAM_INDEX = 5
 USER_POLICY_BLOCK_VALUE = 0
 USER_POLICY_ALLOW_VALUE = 1
 
+# --- Fee Streams ---
+# o8: user CUSTOM FEE output stream (application rules, user-deployed).
+# o9: CONSENSUS FEE output stream (consensus rules, governance-voted).
+# Like i5/o5, the i8/i9 consensus ABI inputs below and the o8/o9 fee
+# outputs are separate namespaces and do not conflict.
+#
+# During each per-transfer Tau evaluation step the node reads both streams
+# and adds them to the transaction's total fee:
+#   total_fee = sum over steps of (o9 + o8)
+# A transfer-less user_tx is charged via one dedicated fee-query step with
+# the canonical mocked transfer inputs (i1=i2=i3=i4="0", i5=block
+# timestamp, i12=sender pubkey).
+#
+# Parse policy (see consensus/fees.py):
+#   o9 STRICT  — absent -> 0 (fee model inactive); present-but-invalid ->
+#                FeeRuleError (consensus failure: proposer aborts the
+#                round, validator defers the block).
+#   o8 LENIENT — absent -> 0 silently; invalid -> 0 + loud warning.
+#
+# DETERMINISM CONSTRAINT for rule authors: during block apply the node
+# feeds real values only on i1 (amount), i5 (block timestamp), i12 (sender
+# pubkey bv[384]) and the tx's custom input streams; i2 (balance) and
+# i3/i4 (from/to ids) are mocked to "0". A fee rule that depends on
+# i2/i3/i4 will compute a different fee at queue time than at apply time
+# and can desync admission estimates from consensus charging. Wallets
+# cannot know the final fee without simulating the same rules; admission
+# errors return the computed estimate (required_fee).
+CUSTOM_FEE_STREAM_INDEX = 8
+CONSENSUS_FEE_STREAM_INDEX = 9
+
 # Input Streams (additional)
 TAU_INPUT_STREAM_TIMESTAMP = "i5"
 

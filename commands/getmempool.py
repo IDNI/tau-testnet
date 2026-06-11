@@ -38,6 +38,8 @@ def _summarize_entry(entry: dict) -> dict:
         "expires_at": _iso_from_seconds(tx.get("expiration_time")) if isinstance(tx, dict) else "",
         "operation_count": op_count,
         "status": entry.get("status") or "pending",
+        "fee_limit": entry.get("fee_limit", 0),
+        "estimated_fee": entry.get("estimated_fee", 0),
     }
 
 

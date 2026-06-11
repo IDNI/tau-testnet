@@ -1221,7 +1221,9 @@ def _add_tx_subparsers(sub) -> None:
         help="Path to a JSON file whose object overrides the operations dict",
     )
     p_send.add_argument(
-        "--fee", default="0", help="Fee limit (string-encoded integer; default '0')"
+        # Default matches the genesis consensus fee rule (o9); keep in sync
+        # with the network's active fee rule.
+        "--fee", default="10", help="Fee limit (string-encoded integer; default '10')"
     )
     p_send.add_argument(
         "--expiry",

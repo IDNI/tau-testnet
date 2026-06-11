@@ -820,7 +820,9 @@ async function onSendTransaction() {
         "sequence_number": seq,
         "expiration_time": Math.floor(Date.now() / 1000) + 300, // 5 mins
         "operations": ops,
-        "fee_limit": "0"
+        // Matches the genesis consensus fee rule (o9); keep in sync with
+        // the network's active fee rule.
+        "fee_limit": "10"
     };
 
     try {
