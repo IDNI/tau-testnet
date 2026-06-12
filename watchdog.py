@@ -17,18 +17,43 @@ def _log(message: str) -> None:
 
 
 def kill_process_tree(pid):
-    _log(f"Sending SIGKILL to child processes of PID {pid}...")
-    try:
-        import subprocess
-        subprocess.run(["pkill", "-9", "-P", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        _log(f"Error running pkill: {e}")
+    import subprocess
 
+    self_pid = os.getpid()
+
+    # Collect the server's children BEFORE killing it. The watchdog is itself a
+    # direct child of `pid`, so a blanket `pkill -9 -P <pid>` would kill the
+    # watchdog before it ever signals the server (the server then survives,
+    # spinning, with the watchdog dead). Once the parent dies its children
+    # reparent to init, so `-P <pid>` would no longer match them either — hence
+    # snapshot the list up front.
+    children = []
+    try:
+        out = subprocess.run(
+            ["pgrep", "-P", str(pid)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        children = [int(tok) for tok in out.stdout.split() if tok.strip().isdigit()]
+    except Exception as e:
+        _log(f"Error listing child processes of PID {pid}: {e}")
+
+    # Kill the main server first so it stops spawning work and its in-process
+    # native Tau thread dies with it.
     _log(f"Sending SIGKILL to PID {pid}...")
     try:
         os.kill(pid, signal.SIGKILL)
     except OSError as e:
         _log(f"Error sending SIGKILL: {e}")
+
+    # Reap the (now orphaned) children, never signalling the watchdog itself.
+    _log(f"Sending SIGKILL to {len(children)} child process(es) of PID {pid}...")
+    for child in children:
+        if child == self_pid:
+            continue
+        try:
+            os.kill(child, signal.SIGKILL)
+        except OSError as e:
+            _log(f"Error sending SIGKILL to child {child}: {e}")
 
 def main():
     if len(sys.argv) < 3:
