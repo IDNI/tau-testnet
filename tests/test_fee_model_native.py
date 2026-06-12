@@ -46,9 +46,8 @@ CUSTOM_FEE_RULE_5 = "always (o8[t]:bv[16] = { #x0005 }:bv[16])."
 RECIPIENT = "c" * 96
 
 
-@pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
-class TestFeeModelNativeE2E(unittest.TestCase):
-    """Full pipeline with a live Tau interpreter."""
+class _NativeFeeE2EBase(unittest.TestCase):
+    """Shared live-interpreter harness (no test methods)."""
 
     def setUp(self):
         self.test_db = "test_fee_native_db.sqlite"
@@ -122,6 +121,10 @@ class TestFeeModelNativeE2E(unittest.TestCase):
             "fee_limit": str(fee_limit),
             "signature": "SIG",
         })
+
+@pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
+class TestFeeModelNativeE2E(_NativeFeeE2EBase):
+    """Full pipeline with a live Tau interpreter."""
 
     def test_fee_inactive_without_o9_rule(self):
         """No fee rule seeded -> real Tau emits no o9 -> legacy behavior."""
@@ -218,6 +221,102 @@ class TestFeeModelNativeE2E(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertEqual(res["code"], "INSUFFICIENT_FUNDS")
         self.assertEqual(chain_state.get_balance(poor), 100)
+
+
+@pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
+class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
+    """Fee changed through the REAL governance pipeline: consensus_rule_update
+    proposal -> validator vote -> height activation -> new o9 fee charged.
+    Inherits the live-interpreter setUp; the genesis consensus rules (which
+    include the o9 fee term since gen_genesis --base-fee) are seeded as one
+    i0 update, exactly like the startup restore plan does."""
+
+    def _mine(self, expect_txs):
+        block_res = createblock.create_block_from_mempool()
+        self.assertNotIn("error", block_res, block_res)
+        self.assertEqual(len(block_res.get("transactions", [])), expect_txs, block_res)
+        return block_res
+
+    def test_full_governance_fee_change(self):
+        validator = next(iter(chain_state._lifecycle_manager.active_validators))
+        if isinstance(validator, (bytes, bytearray)):
+            validator = validator.hex()
+        chain_state._balances.setdefault(validator, 0)
+
+        # Seed the live interpreter with the actual genesis consensus rules
+        # (single i0 update, like the startup restore plan) — fee 10 is in.
+        # Read from the genesis artifact: the in-memory consensus_rules_state
+        # gets rewritten with snapshot provenance after the first block.
+        genesis_consensus = json.load(open("data/genesis.json"))["consensus_rules"]
+        genesis_spec = chain_state._preprocess_tau_spec_text(genesis_consensus)
+        self.assertIn("o9", genesis_spec)
+        self._seed_rule(genesis_spec, "genesis-consensus")
+
+        start = chain_state.get_balance(self.sender)
+
+        # Block 1: user tx pays the genesis fee (10).
+        res = sendtx.queue_transaction(self._tx(100, 50), propagate=False)
+        self.assertTrue(res["ok"], f"queue failed: {res}")
+        self.assertEqual(db.get_mempool_entries()[0]["estimated_fee"], 10)
+        self._mine(expect_txs=1)
+        self.assertEqual(chain_state.get_balance(config.MINER_PUBKEY), 10)
+
+        # Block 2: governance proposal — full new consensus spec, o9 doubled.
+        new_spec = genesis_consensus.replace("#x000a", "#x0014")
+        self.assertNotEqual(new_spec, genesis_consensus)
+        activate_at = 4
+        update_tx = json.dumps({
+            "tx_type": "consensus_rule_update",
+            "sender_pubkey": validator,
+            "sequence_number": chain_state.get_sequence_number(validator),
+            "expiration_time": int(time.time()) + 3600,
+            "rule_revisions": [new_spec],
+            "activate_at_height": activate_at,
+            "host_contract_patch": {},
+            "fee_limit": "0",
+            "signature": "SIG",
+        })
+        res = sendtx.queue_transaction(update_tx, propagate=False)
+        self.assertTrue(res["ok"], f"proposal rejected: {res}")
+        self._mine(expect_txs=1)
+        pending = list(chain_state._lifecycle_manager.pending_updates)
+        self.assertEqual(len(pending), 1)
+        update_id_hex = pending[0][1].hex() if isinstance(pending[0], tuple) else (
+            pending[0].update_id.hex() if hasattr(pending[0], "update_id") else pending[0].hex()
+        )
+
+        # Block 3: validator vote reaches threshold (1 of 1) -> scheduled.
+        vote_tx = json.dumps({
+            "tx_type": "consensus_rule_vote",
+            "sender_pubkey": validator,
+            "sequence_number": chain_state.get_sequence_number(validator),
+            "expiration_time": int(time.time()) + 3600,
+            "update_id": update_id_hex,
+            "approve": True,
+            "fee_limit": "0",
+            "signature": "SIG",
+        })
+        res = sendtx.queue_transaction(vote_tx, propagate=False)
+        self.assertTrue(res["ok"], f"vote rejected: {res}")
+        self._mine(expect_txs=1)
+        self.assertTrue(chain_state._lifecycle_manager.scheduled_updates,
+                        "vote did not schedule the update")
+
+        # Block 4: empty block crosses the activation height — the engine
+        # pushes the new spec into the LIVE interpreter via i0.
+        self._mine(expect_txs=0)
+        self.assertIn("#x0014", chain_state.get_consensus_rules_state())
+
+        # Block 5: user tx now pays the governance-voted fee (20).
+        res = sendtx.queue_transaction(self._tx(100, 50), propagate=False)
+        self.assertTrue(res["ok"], f"queue failed: {res}")
+        self.assertEqual(db.get_mempool_entries()[0]["estimated_fee"], 20,
+                         "admission estimate did not follow the voted fee")
+        self._mine(expect_txs=1)
+
+        self.assertEqual(chain_state.get_balance(config.MINER_PUBKEY), 30)  # 10 + 20
+        self.assertEqual(chain_state.get_balance(self.sender), start - 200 - 30)
+        self.assertEqual(chain_state.get_balance(RECIPIENT), 200)
 
 
 if __name__ == "__main__":
