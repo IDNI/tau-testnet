@@ -42,6 +42,10 @@ class TestStateReconstruction(unittest.TestCase):
         tau_manager.request_shutdown()
         if hasattr(self, 'tau_thread'):
             self.tau_thread.join(timeout=10)
+        # start_and_manage_tau_process leaves tau_test_mode=True after a
+        # TAU_FORCE_TEST run; reset it so later tests (e.g. sendtx's isolated
+        # compile path) don't see stale test-mode state.
+        tau_manager.tau_test_mode = False
         os.environ["TAU_FORCE_TEST"] = getattr(self, "_prev_tau_force_test", "1")
     def setUp(self):
         """Set up a temporary database for testing state reconstruction."""
@@ -91,6 +95,7 @@ class TestStateReconstruction(unittest.TestCase):
                 tau_manager.request_shutdown()
             except Exception:
                 pass
+        tau_manager.tau_test_mode = False
         # Restore original database path
         config.set_database_path(self.original_db_path)
         

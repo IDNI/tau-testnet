@@ -29,6 +29,12 @@ class TestCustomInputs(unittest.TestCase):
         self.env_patcher = patch.dict('os.environ', {'TAU_FORCE_TEST': '0'})
         self.env_patcher.start()
 
+        # tau_test_mode may be left True by other test modules that ran a
+        # TAU_FORCE_TEST tau_manager loop; force it off so sendtx takes the
+        # isolated-compile validation path this test asserts on.
+        self.test_mode_patcher = patch.object(tau_manager, 'tau_test_mode', False)
+        self.test_mode_patcher.start()
+
         # Rule validation now runs through the isolated subprocess compile.
         # Mock it so the test is deterministic and does not spawn a child / need
         # a native tau build. None == validated OK.
@@ -41,6 +47,7 @@ class TestCustomInputs(unittest.TestCase):
         self.addCleanup(self.comm_patcher.stop)
         self.addCleanup(self.ready_patcher.stop)
         self.addCleanup(self.env_patcher.stop)
+        self.addCleanup(self.test_mode_patcher.stop)
         self.addCleanup(self.isolated_patcher.stop)
 
         # Patch other dependencies safely
