@@ -17,6 +17,10 @@ import secrets
 import hashlib
 from py_ecc.bls import G2Basic
 from commands.sendtx import _get_signing_message_bytes
+
+# Matches the genesis consensus fee rule (o9); keep in sync with the
+# network's active fee rule. See README: Transaction Fees.
+DEFAULT_FEE_LIMIT = 10
 import config
 from tau_manager import DEFAULT_RULE_BV_WIDTH
 
@@ -259,7 +263,7 @@ def main():
     p_send.add_argument("--operations-json", help="Raw JSON operations object (overrides other operation options)")
     
     # Transaction metadata
-    p_send.add_argument("--fee", "-f", default=0, type=int, help="Fee limit")
+    p_send.add_argument("--fee", "-f", default=DEFAULT_FEE_LIMIT, type=int, help="Fee limit (cap on the total fee charged)")
     p_send.add_argument("--expiry", "-e", default=3600, type=int, help="Expiration seconds from now")
     p_send.set_defaults(func=cmd_send)
     

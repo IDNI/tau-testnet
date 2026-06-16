@@ -8,6 +8,7 @@ import tau_manager
 import config
 import tau_native
 from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
+from consensus.fees import FeeRuleError
 from block import Block
 import hashlib
 from consensus.state import compute_state_hash as compute_rules_hash, compute_consensus_state_hash, compute_consensus_meta_hash
@@ -472,9 +473,32 @@ def process_new_block(block: Block) -> bool:
                 logger.error(f"[BLOCKCHAIN] Block #{block.header.block_number} failed network verification.")
                 return False
 
+            # Fee model: fees are emitted by the consensus rules on Tau
+            # stream o9 — unknowable without Tau. Defer (retry/resync
+            # later) rather than validate user_tx blocks on guessed fees.
+            has_user_tx = any(
+                isinstance(tx, dict) and tx.get("tx_type", "user_tx") == "user_tx"
+                for tx in (block.transactions or [])
+            )
+            if has_user_tx and not tau_manager.tau_ready.wait(timeout=5):
+                logger.error(
+                    "[BLOCKCHAIN] Tau unavailable; deferring block #%s (cannot evaluate fees for user transactions).",
+                    block.header.block_number,
+                )
+                return False
+
             # 4. Pure Apply Block Executor
             if active_view is not None and hasattr(engine, "apply_block"):
-                apply_result = engine.apply_block(active_view, block, parent_snapshot)
+                try:
+                    apply_result = engine.apply_block(active_view, block, parent_snapshot)
+                except FeeRuleError as exc:
+                    # Voted consensus rules emitted an invalid fee (o9).
+                    # Strict: reject/defer rather than guess.
+                    logger.error(
+                        "[BLOCKCHAIN] Fee rule failure applying block #%s: %s",
+                        block.header.block_number, exc,
+                    )
+                    return False
                 next_snapshot = apply_result.next_snapshot
             else:
                 temp_balances = dict(_balances)

@@ -120,6 +120,13 @@ class TestBlockCreation(unittest.TestCase):
         self.mock_tau.tau_ready.is_set.return_value = True
         self.mock_tau.communicate_with_tau.return_value = "100" # Dummy return for validate
         self.mock_tau.communicate_with_tau_multi.return_value = {1: "100"}  # Multi-output mock
+        # The consensus engine holds its own tau_manager reference (used by
+        # the fee-era transfer/fee-query steps); share the same mock.
+        self.engine_tau_patcher = unittest.mock.patch('consensus.engine.tau_manager', self.mock_tau)
+        self.engine_tau_patcher.start()
+        # chain_state's fee-era validation guard waits on tau_ready too.
+        self.chain_tau_patcher = unittest.mock.patch('chain_state.tau_manager', self.mock_tau)
+        self.chain_tau_patcher.start()
         
         # Mock Signature Validation
         self.sig_patcher = unittest.mock.patch('commands.createblock._validate_signature', return_value=True)
@@ -133,6 +140,8 @@ class TestBlockCreation(unittest.TestCase):
     def tearDown(self):
         """Clean up the temporary database."""
         self.tau_patcher.stop()
+        self.engine_tau_patcher.stop()
+        self.chain_tau_patcher.stop()
         self.sig_patcher.stop()
         self.verify_patcher.stop()
         clear_mempool()

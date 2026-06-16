@@ -10,6 +10,8 @@ from .tau_engine import TauEngine, TauExecutionResult, TauStateSnapshot
 from .serialization import canonical_json, canonicalize_parent_hash_yid, canonicalize_proposer_yid
 from .state import StateStore, compute_state_hash
 from .governance import normalize_validator_set
+from . import fees
+from .fees import FeeRuleError
 
 # We need to import chain_state and tau_manager, but we must be careful about circular imports.
 # We'll import them inside methods or use a lazy import pattern if needed.
@@ -279,6 +281,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             target_sequences=t_seqs,
             target_lifecycle=lm,
             replay_mode=replay_mode,
+            proposer_pubkey=block.header.proposer_pubkey,
+            block_height=block.header.block_number,
         )
         
         # Convert internal apply result into structural outcomes
@@ -439,13 +443,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         target_sequences: Optional[Dict[str, int]] = None,
         target_lifecycle: Optional[Any] = None,
         replay_mode: bool = False,
+        proposer_pubkey: Optional[str] = None,
+        block_height: Optional[int] = None,
     ) -> TauExecutionResult:
         """
         Apply transactions to the current state.
-        
+
         This executes operations:
         - '0' (Rules): Sent to Tau process.
         - '1' (Transfers): Applied to chain_state balances.
+
+        Fee model: when `proposer_pubkey` is supplied together with a
+        `target_balances` overlay, every accepted user_tx is charged
+        total_fee = sum over its Tau steps of (o9 consensus fee + o8 user
+        custom fee), capped by the signed `fee_limit` field, and the fee is
+        credited to the proposer. o9 absent -> fee 0 (model inactive).
+        A FeeRuleError (invalid o9 from the voted consensus rules) is
+        strict and propagates: callers must abort the proposal / defer the
+        block rather than guess a fee.
         """
         import chain_state  # Import here to avoid circular dependency
 
@@ -465,6 +480,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # snapshot. In tests/mocks (no rules handler), fall back to concatenating
         # rule payloads for determinism.
         current_tau_bytes = snapshot.tau_bytes
+
+        # Fee charging requires the isolated balance overlay: there is no
+        # proposer-credit primitive on the direct chain_state mutation path
+        # (only legacy tests use it), and staged commit-on-accept semantics
+        # depend on the overlay.
+        fees_enabled = bool(proposer_pubkey) and target_balances is not None
+        if bool(proposer_pubkey) and target_balances is None:
+            logger.error(
+                "Fee charging requested without target_balances overlay; fees skipped (legacy path)."
+            )
 
         for i, tx in enumerate(transactions):
             tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
@@ -515,7 +540,47 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # 3. Transfers (key "1") - applied last to state, though input validation happened upstream
 
             tx_type = tx.get('tx_type', 'user_tx')
-            
+
+            # --- Fee preamble (user_tx only; governance txs are exempt by
+            # design so validators never need funds to govern) ---
+            charge_fee = fees_enabled and tx_type == 'user_tx'
+            fee_limit_int: Optional[int] = None
+            fee_components: List[int] = []
+            staged_writes: Dict[str, int] = {}
+
+            def _read_bal(addr: str) -> int:
+                """Balance as seen through this tx's staged writes."""
+                if addr in staged_writes:
+                    return staged_writes[addr]
+                if target_balances is not None and addr in target_balances:
+                    return target_balances[addr]
+                return chain_state.get_balance(addr)
+
+            if charge_fee:
+                # Absent field -> cap 0: legacy/feeless txs stay valid while
+                # the fee model is inactive (total fee 0) and are rejected
+                # by the cap check once it is active. Only a PRESENT but
+                # malformed value is structurally invalid.
+                raw_fee_limit = tx.get('fee_limit')
+                fee_limit_int = 0 if raw_fee_limit is None else fees.parse_fee_limit(raw_fee_limit)
+                if fee_limit_int is None:
+                    if replay_mode:
+                        # Stored blocks are canonical; never re-litigate.
+                        logger.error(
+                            "Replay: tx %s has malformed fee_limit %r; fee skipped.",
+                            tx_id, tx.get('fee_limit'),
+                        )
+                        tx_receipt["logs"].append("Replay: malformed fee_limit; fee skipped")
+                        charge_fee = False
+                    else:
+                        accepted_in_block = False
+                        hard_reject = True
+                        execution_success = False
+                        tx_receipt["reason"] = "invalid_fee_limit"
+                        tx_receipt["logs"].append(
+                            f"Invalid fee_limit: {tx.get('fee_limit')!r}"
+                        )
+
             rule_op_data = None
             transfers_op_data = None
             custom_tau_inputs: dict[int, list[str]] = {}
@@ -564,7 +629,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             for k, v in operations.items():
                 if k.isdigit():
                     idx = int(k)
-                    import tau_defs
                     if idx in (0, 1):
                         continue
                     if idx in tau_defs.RESERVED_STREAMS:
@@ -666,7 +730,95 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
                 # --- Step 2 & 3: Unified Custom Inputs & Transfers ---
                 if execution_success and transfers_op_data is not None:
-                    if isinstance(transfers_op_data, list):
+                    if isinstance(transfers_op_data, list) and charge_fee:
+                        # Fee-era path: o1+o8+o9 in one roundtrip per
+                        # transfer, tx-atomic balance staging (writes commit
+                        # only if the whole tx is accepted — a mid-tx
+                        # failure must not pollute the overlay/state hash).
+                        for transfer in transfers_op_data:
+                            if not (isinstance(transfer, (list, tuple)) and len(transfer) == 3):
+                                continue
+                            from_addr, to_addr, amount_val = transfer
+                            try:
+                                amount = int(amount_val)
+
+                                tau_input_stream_values = {
+                                    1: str(amount),
+                                    2: "0",  # Mock balance (parity with legacy apply path)
+                                    3: "0",  # Mock IDs
+                                    4: "0",
+                                }
+                                tau_input_stream_values[12] = "{ #x" + str(from_addr) + " }:bv[384]"
+                                for k, v in custom_tau_inputs.items():
+                                    tau_input_stream_values[k] = v
+                                tau_input_stream_values[5] = str(block_timestamp)
+
+                                if not tau_manager.tau_ready.is_set():
+                                    tau_manager.tau_ready.wait(timeout=5)
+                                if not tau_manager.tau_ready.is_set():
+                                    if replay_mode:
+                                        # Tau-less replay is supported for
+                                        # pre-fee chains (fee 0 matches).
+                                        # For fee-era chains the state-hash
+                                        # invariant catches the divergence.
+                                        logger.warning(
+                                            "Replay without Tau: fee step assumed 0 for tx %s.",
+                                            tx_id,
+                                        )
+                                        fee_components.append(0)
+                                    else:
+                                        # The fee value is unknowable without
+                                        # Tau; "pretend 0" would be a locally-
+                                        # valid divergent transition. Strict.
+                                        raise FeeRuleError(
+                                            f"Tau unavailable during fee-era transfer execution (tx {tx_id})"
+                                        )
+                                else:
+                                    with tau_manager.tau_comm_lock:
+                                        tau_outputs = tau_manager.communicate_with_tau_multi(
+                                            input_stream_values=tau_input_stream_values,
+                                            apply_rules_update=False,
+                                        )
+                                    tx_receipt["logs"].append(
+                                        f"Tau(transfer) o1: {tau_outputs.get(1)}"
+                                    )
+                                    step_fee = fees.parse_consensus_fee(
+                                        tau_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
+                                        context=f"tx {tx_id}",
+                                    ) + fees.parse_custom_fee(
+                                        tau_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
+                                        context=f"tx {tx_id}",
+                                    )
+                                    fee_components.append(step_fee)
+                                    if step_fee:
+                                        tx_receipt["logs"].append(f"Tau fee step: {step_fee}")
+
+                                current_from = _read_bal(from_addr)
+                                if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
+                                    current_from = 1000
+                                if current_from < amount:
+                                    logger.error(
+                                        "Insufficient funds for %s to send %s. Has: %s.",
+                                        from_addr[:10], amount, current_from,
+                                    )
+                                    if not replay_mode:
+                                        accepted_in_block = False
+                                        hard_reject = True
+                                    execution_success = False
+                                    tx_receipt["logs"].append("Transfer balance state failed (insufficient)")
+                                    break
+                                staged_writes[from_addr] = current_from - amount
+                                staged_writes[to_addr] = _read_bal(to_addr) + amount
+                            except FeeRuleError:
+                                raise
+                            except Exception as e:
+                                logger.error("Error applying transfer: %s", e)
+                                if not replay_mode:
+                                    accepted_in_block = False
+                                    hard_reject = True
+                                execution_success = False
+                                break
+                    elif isinstance(transfers_op_data, list):
                         for transfer in transfers_op_data:
                             if isinstance(transfer, (list, tuple)) and len(transfer) == 3:
                                 from_addr, to_addr, amount_val = transfer
@@ -768,6 +920,111 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                          execution_success = False
                          tx_receipt["logs"].append(f"Error (unified custom): {e}")
 
+            # --- Step 5: Fee settlement (charged only on inclusion) ---
+            # A transfer-less user_tx is charged via one dedicated fee-query
+            # step with the canonical mocked transfer inputs so governance
+            # fees apply uniformly to all user transactions.
+            if charge_fee and accepted_in_block and not hard_reject and not transfers_op_data:
+                try:
+                    fee_query_inputs = {
+                        1: "0", 2: "0", 3: "0", 4: "0",
+                        5: str(block_timestamp),
+                        12: "{ #x" + str(sender) + " }:bv[384]",
+                    }
+                    for k, v in custom_tau_inputs.items():
+                        fee_query_inputs[k] = v
+                    if not tau_manager.tau_ready.is_set():
+                        tau_manager.tau_ready.wait(timeout=5)
+                    if not tau_manager.tau_ready.is_set():
+                        if replay_mode:
+                            logger.warning(
+                                "Replay without Tau: fee-query step assumed 0 for tx %s.", tx_id
+                            )
+                        else:
+                            raise FeeRuleError(
+                                f"Tau unavailable during fee-query step (tx {tx_id})"
+                            )
+                    else:
+                        with tau_manager.tau_comm_lock:
+                            fee_outputs = tau_manager.communicate_with_tau_multi(
+                                input_stream_values=fee_query_inputs,
+                                apply_rules_update=False,
+                            )
+                        fee_components.append(
+                            fees.parse_consensus_fee(
+                                fee_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
+                                context=f"tx {tx_id} fee-query",
+                            ) + fees.parse_custom_fee(
+                                fee_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
+                                context=f"tx {tx_id} fee-query",
+                            )
+                        )
+                except FeeRuleError:
+                    raise
+                except Exception as e:
+                    logger.error("Error during fee-query step for tx %s: %s", tx_id, e)
+                    if not replay_mode:
+                        accepted_in_block = False
+                        hard_reject = True
+                    execution_success = False
+                    tx_receipt["logs"].append(f"Error (fee query): {e}")
+
+            if charge_fee and accepted_in_block and not hard_reject:
+                total_fee = sum(fee_components)
+                if total_fee == 0:
+                    pass  # fee model inactive (no o9/o8): zero writes, legacy-identical
+                elif total_fee > fee_limit_int:
+                    if replay_mode:
+                        logger.error(
+                            "Replay: tx %s total fee %s exceeds fee_limit %s; fee skipped.",
+                            tx_id, total_fee, fee_limit_int,
+                        )
+                        tx_receipt["logs"].append("Replay: fee exceeds fee_limit; fee skipped")
+                    else:
+                        accepted_in_block = False
+                        hard_reject = True
+                        execution_success = False
+                        tx_receipt["reason"] = "fee_limit_exceeded"
+                        tx_receipt["logs"].append(
+                            f"Fee {total_fee} exceeds fee_limit {fee_limit_int}"
+                        )
+                else:
+                    # No faucet shim here: fee settlement reads plain
+                    # balances; a 0-balance faucet sender cannot pay fees.
+                    sender_bal = _read_bal(sender) if sender else 0
+                    if sender is None or sender_bal < total_fee:
+                        if replay_mode:
+                            logger.error(
+                                "Replay: tx %s sender cannot cover fee %s (has %s); fee skipped.",
+                                tx_id, total_fee, sender_bal,
+                            )
+                            tx_receipt["logs"].append("Replay: insufficient balance for fee; fee skipped")
+                        else:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = "insufficient_funds_for_fee"
+                            tx_receipt["logs"].append(
+                                f"Insufficient balance for fee: need {total_fee}, have {sender_bal}"
+                            )
+                    else:
+                        # Aliasing-safe ordering: deduct the sender first,
+                        # then credit the proposer THROUGH the staged view —
+                        # sender == proposer nets to zero because the credit
+                        # reads the already-deducted value.
+                        staged_writes[sender] = sender_bal - total_fee
+                        staged_writes[proposer_pubkey] = _read_bal(proposer_pubkey) + total_fee
+                        tx_receipt["fee_charged"] = total_fee
+                        tx_receipt["logs"].append(
+                            f"Fee charged: {total_fee} -> proposer {str(proposer_pubkey)[:10]}..."
+                        )
+
+            # Commit staged balance writes only for txs that stay accepted.
+            # (Replay soft-fails intentionally commit partial stages — same
+            # observable behavior as the legacy immediate-write loop.)
+            if charge_fee and accepted_in_block and not hard_reject and staged_writes:
+                target_balances.update(staged_writes)
+
             if accepted_in_block and not hard_reject:
                 if should_increment_seq and sender:
                     try:
@@ -786,7 +1043,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 receipts[tx_id] = tx_receipt
             else:
                 rejected_txs.append(tx)
-                receipts[tx_id] = {"status": "failed", "logs": tx_receipt["logs"]}
+                rejected_receipt = {"status": "failed", "logs": tx_receipt["logs"]}
+                if "reason" in tx_receipt:
+                    # Machine-readable fee rejection cause; a rejected tx
+                    # never pays anything.
+                    rejected_receipt["reason"] = tx_receipt["reason"]
+                    rejected_receipt["fee_charged"] = 0
+                receipts[tx_id] = rejected_receipt
                 logger.error("TX REJECTED during apply: %s", tx_receipt["logs"])
 
         # Create new snapshot

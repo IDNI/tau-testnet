@@ -30,6 +30,15 @@ def get_args():
     parser.add_argument("--genesis-balance", type=int, default=1000000, help="Genesis balance in AGRS")
     parser.add_argument("--network-id", type=str, default="tau-testnet-v2", help="Network ID")
     parser.add_argument("--out", type=str, default="data/genesis.json", help="Output path for genesis.json")
+    parser.add_argument(
+        "--base-fee", type=int, default=10,
+        help=(
+            "Network base fee per user transaction, emitted by the genesis "
+            "consensus rules on Tau output stream o9 (governance-votable "
+            "later via consensus_rule_update). 0 omits the fee rule "
+            "(fee-less network). Max 65535 (bv[16])."
+        ),
+    )
     return parser.parse_args()
 
 def derive_pubkey_from_privkey(privkey_hex: str) -> str:
@@ -119,6 +128,27 @@ def main():
 
     with open(args.genesis_consensus_path, "r", encoding="utf-8") as f:
         consensus_rules = f.read()
+
+    if args.base_fee:
+        if not (0 < args.base_fee <= 0xFFFF):
+            raise ValueError("--base-fee must be in [0, 65535] (bv[16]).")
+        # Consensus fee rule: the node reads o9 during each per-transfer
+        # Tau evaluation step and charges sum(o9 + o8) per user_tx,
+        # credited to the block proposer. Change the fee by voting in a
+        # new consensus spec through the standard governance flow.
+        #
+        # The fee term must live INSIDE the existing always(...) block:
+        # the consensus spec is replayed as a single i0 update at startup
+        # and a Tau formula is one statement — appending a second
+        # `always (...)` statement makes the combined text unparseable.
+        stripped = consensus_rules.rstrip()
+        closing = stripped.rfind(")")
+        if closing == -1:
+            raise ValueError(
+                f"Cannot inject fee rule: no closing ')' found in {args.genesis_consensus_path}"
+            )
+        fee_term = " &&\n    o9[t]:bv[16] = { #x%04x }:bv[16]\n" % args.base_fee
+        consensus_rules = stripped[:closing] + fee_term + stripped[closing:] + "\n"
 
     validate_consensus_rules(consensus_rules)
 

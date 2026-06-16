@@ -106,6 +106,12 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
 
         monkeypatch.setattr("time.time", _fake_time)
         monkeypatch.setattr("time.sleep", lambda _seconds: None)
+        # The fee-era validation guard and engine fee steps require Tau for
+        # user_tx blocks; mock readiness and the multi-output call (no o9
+        # emitted -> fee 0, legacy-identical behavior).
+        monkeypatch.setattr(chain_state.tau_manager.tau_ready, "wait", lambda timeout=None: True)
+        monkeypatch.setattr(chain_state.tau_manager.tau_ready, "is_set", lambda: True)
+        monkeypatch.setattr(chain_state.tau_manager, "communicate_with_tau_multi", lambda **kwargs: {})
 
         assert chain_state.process_new_block(block) is True
         assert chain_state._canonical_head_hash == block.block_hash

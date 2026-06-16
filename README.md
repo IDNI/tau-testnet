@@ -375,12 +375,27 @@ python wallet.py send --privkey <hex_privkey> --rule "rule_formula" --transfer "
       "operations": {
         "1": [["a63b...ea73", "000a...000a", "10"]]
       },
-      "fee_limit": "0",
+      "fee_limit": "10",
       "signature": "HEX_SIGNATURE_OVER_OTHER_FIELDS"
     }'
     ```
     *   Replace placeholders with actual values.
     *   The client is responsible for creating the canonical message, hashing it, signing the hash, and providing the hex-encoded signature.
+
+### Transaction Fees
+
+Fees are sourced from Tau and votable by validators with no dedicated governance machinery:
+
+*   **Consensus fee (o9, strict).** The active consensus rules emit the network base fee on output stream `o9` (genesis default: `always (o9[t]:bv[16] = { #x000a }:bv[16]).` → 10 per step). To change the fee, propose a `consensus_rule_update` whose `rule_revisions` carry the full new consensus spec, gather validator votes, and let it activate at its height. Absent `o9` → fee model inactive (0). A present-but-invalid `o9` is a consensus failure: proposers abort the round and validators defer the block rather than guess (a voted rule emitting garbage is real breakage; silently charging 0 would be a fee holiday).
+*   **User custom fee (o8, lenient).** User-deployed application rules may add an extra fee on output stream `o8` per transfer. Absent → 0 silently; invalid values normalize to 0 with a node-side warning.
+*   **Total**: `total_fee = Σ over the tx's Tau evaluation steps of (o9 + o8)` — one step per transfer; a transfer-less `user_tx` is charged via one fee-query step with canonical mocked transfer inputs (`i1=i2=i3=i4="0"`, `i5` = block timestamp, `i12` = sender pubkey). A flat rule therefore charges per transfer, not per tx — multi-transfer txs pay N× the step fee by design.
+*   **`fee_limit` is a cap.** The tx is rejected (at admission and in-block) if `total_fee > fee_limit`; the sender pays `total_fee`, not the cap. All transactions — governance included — must carry a syntactically valid `fee_limit`; **only `user_tx` is charged** (validators never need funds to govern).
+*   **Recipient**: the fee is credited to `block.header.proposer_pubkey`.
+*   **Charge-on-inclusion**: a tx rejected for fee reasons pays nothing — no transfer writes, no fee writes, no sequence-number increment. The sender's balance must cover `sum(transfer amounts) + total_fee`.
+*   **Determinism constraint for fee rules**: during block application only `i1` (amount), `i5` (block timestamp), `i12` (sender pubkey) and the tx's custom input streams carry real values; `i2`/`i3`/`i4` are mocked to `"0"`. Fee rules depending on the mocked streams desync admission estimates from consensus charging. Wallets cannot know the final fee without simulating the same rules; the admission error `FEE_LIMIT_TOO_LOW` returns the computed estimate as `required_fee`.
+*   **Mempool priority**: pending transactions are ordered by the admission-time fee estimate (`estimated_fee DESC, fee_limit DESC, received_at ASC`); inflating `fee_limit` does not buy priority.
+*   **Tau availability**: fees are unknowable without Tau, so a proposer aborts the round and a validator defers any block containing `user_tx` while Tau is down. Tau-less startup replay assumes fee 0 (correct for pre-fee chains; the state-hash invariant catches divergence on fee-era chains).
+*   **Limitations**: multiplication is not verified in the deployed tau-lang usage, so percentage fees are not expressible yet — flat fees and comparison-ladder tiers (e.g. `i1 > threshold → higher o9`) only. User rule text referencing `o6`/`o7`/`o9` is rejected at admission (consensus streams are written only by voted consensus rules).
 
 *   **Get Mempool:**
     ```
@@ -441,7 +456,7 @@ The `block.py` module provides the `Block` and `BlockHeader` classes, along with
 
 ## Known Issues / Notes
 
-*   The fee model (`fee_limit`) is a placeholder and not yet enforced.
+*   The fee model is enforced: the network fee is emitted by the consensus rules on Tau stream `o9` and credited to the block proposer (see "Transaction Fees" above). Networks generated without a fee rule (`gen_genesis.py --base-fee 0`) remain fee-less until governance votes one in.
 *   Gossipsub topics (`tau/blocks/1.0.0`, `tau/transactions/1.0.0`) must be subscribed to by peers that expect block or transaction updates.
 
 ## Submitting issues

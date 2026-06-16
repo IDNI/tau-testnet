@@ -34,6 +34,9 @@ class TestMiningLoopIntegration(unittest.TestCase):
         tau_manager.tau_ready.set()
         self.original_communicate = tau_manager.communicate_with_tau
         tau_manager.communicate_with_tau = lambda **kwargs: "require_bls_sig"
+        # Fee-era engine steps read o1/o8/o9 via the multi-output call.
+        self.original_communicate_multi = tau_manager.communicate_with_tau_multi
+        tau_manager.communicate_with_tau_multi = lambda **kwargs: {}
         
         # Mock validation to accept dummy signature
         from commands import createblock
@@ -65,6 +68,7 @@ class TestMiningLoopIntegration(unittest.TestCase):
         # Restore tau_manager
         import tau_manager
         tau_manager.communicate_with_tau = self.original_communicate
+        tau_manager.communicate_with_tau_multi = self.original_communicate_multi
         tau_manager.tau_ready.clear()
         
         from consensus.engine import TauConsensusEngine

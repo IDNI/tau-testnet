@@ -171,13 +171,15 @@ def init_db():
             ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS mempool (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tx_hash     TEXT    NOT NULL UNIQUE,
-                    payload     TEXT    NOT NULL,
-                    received_at INTEGER NOT NULL,
-                    status      TEXT    NOT NULL DEFAULT 'pending', -- pending, reserved
-                    reserved_at INTEGER NOT NULL DEFAULT 0,
-                    batch_id    TEXT
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tx_hash       TEXT    NOT NULL UNIQUE,
+                    payload       TEXT    NOT NULL,
+                    received_at   INTEGER NOT NULL,
+                    status        TEXT    NOT NULL DEFAULT 'pending', -- pending, reserved
+                    reserved_at   INTEGER NOT NULL DEFAULT 0,
+                    batch_id      TEXT,
+                    fee_limit     INTEGER NOT NULL DEFAULT 0,
+                    estimated_fee INTEGER NOT NULL DEFAULT 0
                 );
             ''')
             conn.execute('''
@@ -267,15 +269,29 @@ def init_db():
                 conn.execute("DROP TABLE IF EXISTS mempool;")
                 conn.execute('''
                     CREATE TABLE mempool (
-                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                        tx_hash     TEXT    NOT NULL UNIQUE,
-                        payload     TEXT    NOT NULL,
-                        received_at INTEGER NOT NULL,
-                        status      TEXT    NOT NULL DEFAULT 'pending', -- pending, reserved
-                        reserved_at INTEGER NOT NULL DEFAULT 0,
-                        batch_id    TEXT
+                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tx_hash       TEXT    NOT NULL UNIQUE,
+                        payload       TEXT    NOT NULL,
+                        received_at   INTEGER NOT NULL,
+                        status        TEXT    NOT NULL DEFAULT 'pending', -- pending, reserved
+                        reserved_at   INTEGER NOT NULL DEFAULT 0,
+                        batch_id      TEXT,
+                        fee_limit     INTEGER NOT NULL DEFAULT 0,
+                        estimated_fee INTEGER NOT NULL DEFAULT 0
                     );
                 ''')
+            else:
+                # Additive fee-model columns (existing rows default to 0 =
+                # lowest priority; harmless on live nodes).
+                for fee_col in ("fee_limit", "estimated_fee"):
+                    if fee_col not in cols_info:
+                        conn.execute(
+                            f"ALTER TABLE mempool ADD COLUMN {fee_col} INTEGER NOT NULL DEFAULT 0;"
+                        )
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_mempool_pending_order
+                ON mempool(status, estimated_fee DESC, received_at ASC);
+            ''')
 
             _normalize_legacy_genesis_row(conn)
 
@@ -348,7 +364,8 @@ def get_text_by_id(yid: str) -> str:
         else:
             raise KeyError(f"No text found for Tau ID: {yid}")
 
-def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int):
+def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
+                   fee_limit: int = 0, estimated_fee: int = 0):
     """Adds data to the mempool. Prefixes with 'json:' if it looks like JSON."""
     if _db_conn is None:
         init_db()
@@ -368,9 +385,9 @@ def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int):
         cur = _db_conn.cursor()
         # Idempotency: INSERT OR IGNORE
         cur.execute('''
-            INSERT OR IGNORE INTO mempool (tx_hash, payload, received_at, status)
-            VALUES (?, ?, ?, 'pending')
-        ''', (tx_hash, payload, received_at))
+            INSERT OR IGNORE INTO mempool (tx_hash, payload, received_at, status, fee_limit, estimated_fee)
+            VALUES (?, ?, ?, 'pending', ?, ?)
+        ''', (tx_hash, payload, received_at, int(fee_limit), int(estimated_fee)))
         _db_conn.commit()
         
 def count_mempool_txs() -> int:
@@ -433,7 +450,8 @@ def get_mempool_entries() -> List[Dict]:
     with _db_lock:
         cur = _db_conn.cursor()
         cur.execute(
-            'SELECT tx_hash, payload, received_at, status FROM mempool ORDER BY received_at ASC'
+            'SELECT tx_hash, payload, received_at, status, fee_limit, estimated_fee '
+            'FROM mempool ORDER BY received_at ASC'
         )
         return [
             {
@@ -441,6 +459,8 @@ def get_mempool_entries() -> List[Dict]:
                 "payload": row[1],
                 "received_at": row[2],
                 "status": row[3],
+                "fee_limit": row[4],
+                "estimated_fee": row[5],
             }
             for row in cur.fetchall()
         ]
@@ -478,11 +498,13 @@ def reserve_mempool_txs(limit: int = 1000, max_age_seconds: int = 60) -> List[Di
             logger.info("Released %s stale mempool reservations", released)
 
         # 2. Select pending
-        # We process in order of arrival (received_at)
+        # Fee priority: highest admission-time fee estimate first (declared
+        # fee_limit alone is free to inflate, so it only tie-breaks), then
+        # arrival order, then id for full determinism.
         cur.execute('''
-            SELECT id, tx_hash, payload FROM mempool 
-            WHERE status = 'pending' 
-            ORDER BY received_at ASC 
+            SELECT id, tx_hash, payload FROM mempool
+            WHERE status = 'pending'
+            ORDER BY estimated_fee DESC, fee_limit DESC, received_at ASC, id ASC
             LIMIT ?
         ''', (limit,))
         rows = cur.fetchall()

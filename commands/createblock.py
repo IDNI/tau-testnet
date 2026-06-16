@@ -166,6 +166,33 @@ def execute_batch(transactions: List[Dict], reserved_ids: List[int], block_times
     return final_txs, final_reserved_ids, final_rules, working_balances, working_sequences
 
 
+def _restore_per_sender_sequence_order(transactions, execution_transactions, reserved_ids):
+    """
+    reserve_mempool_txs orders by fee priority, which can place a sender's
+    later-sequence tx before an earlier one; the engine would then
+    hard-reject it for sequence mismatch and it would be disposed with the
+    block. Rearrange each sender's txs into ascending sequence_number
+    within the slots that sender already occupies; the global fee-priority
+    slot assignment is preserved. All three lists are mutated in lockstep.
+    """
+    by_sender: Dict[str, list] = {}
+    for i, tx in enumerate(transactions):
+        if isinstance(tx, dict) and tx.get("sender_pubkey"):
+            by_sender.setdefault(tx["sender_pubkey"], []).append(i)
+    for idxs in by_sender.values():
+        if len(idxs) < 2:
+            continue
+        bundles = sorted(
+            ((transactions[i], execution_transactions[i], reserved_ids[i]) for i in idxs),
+            key=lambda b: b[0].get("sequence_number")
+            if isinstance(b[0].get("sequence_number"), int) else 0,
+        )
+        for slot, (tx, etx, rid) in zip(idxs, bundles):
+            transactions[slot] = tx
+            execution_transactions[slot] = etx
+            reserved_ids[slot] = rid
+
+
 def create_block_from_mempool() -> Dict:
     """
     Creates a new block from all transactions currently in the mempool,
@@ -251,12 +278,29 @@ def create_block_from_mempool() -> Dict:
             
     if skipped_count > 0:
         print(f"[WARN][createblock] Skipped {skipped_count} invalid transactions")
-    
+
     if reserved_ids and not transactions:
         print("[INFO][createblock] No valid transactions parsed. Cleared reserved.")
         import db as _db
         _db.remove_transactions(reserved_ids)
-    
+
+    # Fee-priority reservation can reorder a sender's transactions out of
+    # sequence order; restore per-sender ascending sequence within the
+    # slots that sender occupies (global priority assignment preserved).
+    _restore_per_sender_sequence_order(transactions, execution_transactions, filtered_reserved_ids)
+
+    # Fee model: the fee value is unknowable without Tau (consensus rules
+    # emit it on o9). Never build a user_tx block on guessed fees.
+    if any(
+        isinstance(tx, dict) and tx.get("tx_type", "user_tx") == "user_tx"
+        for tx in transactions
+    ) and not tau_manager.tau_ready.wait(timeout=5):
+        msg = "Tau unavailable; aborting block round (cannot evaluate fees for user transactions)."
+        print(f"[ERROR][createblock] {msg}")
+        import db as _db
+        _db.unreserve_mempool_txs(reserved_ids)
+        return {"error": msg, "message": msg}
+
     print(f"[INFO][createblock] Validating and Executing Batch Natively...")
     block_timestamp = int(time.time())
     
