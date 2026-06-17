@@ -160,3 +160,26 @@ class TestSendTxBasic(unittest.TestCase):
         self.assertEqual(payload_arg, canonical)
         self.assertIsInstance(message_id_arg, str)
         self.assertEqual(len(message_id_arg), 64)
+
+    def test_mempool_full_rejected(self):
+        original_limit = config.MAX_MEMPOOL_TXS
+        config.MAX_MEMPOOL_TXS = 2
+        try:
+            tx1 = self._create_tx([[GENESIS, ADDR_A, "10"]], sequence=1)
+            tx2 = self._create_tx([[GENESIS, ADDR_A, "10"]], sequence=2)
+            tx3 = self._create_tx([[GENESIS, ADDR_A, "10"]], sequence=3)
+            
+            # First two should succeed
+            res1 = sendtx.queue_transaction(tx1)
+            res2 = sendtx.queue_transaction(tx2)
+            self.assertTrue(res1["ok"])
+            self.assertTrue(res2["ok"])
+            
+            # Third should fail with MEMPOOL_FULL
+            res3 = sendtx.queue_transaction(tx3)
+            self.assertFalse(res3["ok"])
+            self.assertEqual(res3["code"], "MEMPOOL_FULL")
+            self.assertIn("Mempool is full", res3["message"])
+        finally:
+            config.MAX_MEMPOOL_TXS = original_limit
+

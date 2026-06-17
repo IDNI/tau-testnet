@@ -12,6 +12,7 @@ from .state import StateStore, compute_state_hash
 from .governance import normalize_validator_set
 from . import fees
 from .fees import FeeRuleError
+from errors import TauCommunicationError, TauEngineBug
 
 # We need to import chain_state and tau_manager, but we must be careful about circular imports.
 # We'll import them inside methods or use a lazy import pattern if needed.
@@ -341,12 +342,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 for rev in update.rule_revisions:
                     if not isinstance(rev, str) or not rev.strip():
                         continue
-                    tau_manager.communicate_with_tau(
-                        rule_text=rev,
-                        target_output_stream_index=0,
-                        source=tag,
-                        apply_rules_update=False,
-                    )
+                    try:
+                        tau_manager.communicate_with_tau(
+                            rule_text=rev,
+                            target_output_stream_index=0,
+                            source=tag,
+                            apply_rules_update=False,
+                        )
+                    except (TauCommunicationError, TauEngineBug) as e:
+                        # Triggers round abort (proposer) or block deferral (validator),
+                        # preventing state divergence.
+                        raise FeeRuleError(
+                            f"Governance rule activation rejected by live Tau interpreter "
+                            f"at height {block.header.block_number}: {e}"
+                        )
             last_update = newly_active[-1]
             # Provenance tag used by `compute_consensus_state_hash`. Every node
             # derives this string deterministically from `last_update.rule_revisions`,

@@ -4,6 +4,8 @@ import sys
 import time
 import json
 import signal
+import shutil
+import hashlib
 from datetime import datetime, timezone
 
 DEFAULT_TIMEOUT_NAME = "comm_timeout"
@@ -54,6 +56,50 @@ def kill_process_tree(pid):
             os.kill(child, signal.SIGKILL)
         except OSError as e:
             _log(f"Error sending SIGKILL to child {child}: {e}")
+
+
+def quarantine_database(db_path: str) -> str:
+    abs_db_path = os.path.abspath(db_path)
+    db_dir = os.path.dirname(abs_db_path)
+    db_basename = os.path.basename(abs_db_path)
+    
+    quarantine_base = os.path.join(db_dir, "watchdog_quarantine")
+    try:
+        os.makedirs(quarantine_base, exist_ok=True)
+    except Exception as e:
+        _log(f"Failed to create quarantine base directory {quarantine_base}: {e}")
+        quarantine_base = "watchdog_quarantine"
+        os.makedirs(quarantine_base, exist_ok=True)
+        
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    path_hash = hashlib.sha256(abs_db_path.encode('utf-8')).hexdigest()[:6]
+    
+    folder_name = f"quarantine_{timestamp}_{path_hash}"
+    quarantine_dir = os.path.join(quarantine_base, folder_name)
+    
+    counter = 1
+    while os.path.exists(quarantine_dir):
+        quarantine_dir = os.path.join(quarantine_base, f"{folder_name}_{counter}")
+        counter += 1
+        
+    try:
+        os.makedirs(quarantine_dir, exist_ok=True)
+    except Exception as e:
+        _log(f"Failed to create quarantine directory {quarantine_dir}: {e}")
+        return ""
+
+    for ext in ["", "-wal", "-shm", "-journal"]:
+        src_path = db_path + ext
+        if os.path.exists(src_path):
+            dst_path = os.path.join(quarantine_dir, db_basename + ext)
+            try:
+                shutil.move(src_path, dst_path)
+                _log(f"Quarantined {src_path} -> {dst_path}")
+            except Exception as e:
+                _log(f"Failed to move database file {src_path} to {dst_path}: {e}")
+                
+    return quarantine_dir
+
 
 def main():
     if len(sys.argv) < 3:
@@ -151,16 +197,13 @@ def main():
                 # 1. Forcefully kill the main process tree (ensuring no zombies)
                 kill_process_tree(parent_pid)
                 
-                # 2. Clean/delete the database node.db and its temp files
+                # 2. Quarantine the database files rather than deleting them
                 if db_path:
-                    for ext in ["", "-wal", "-shm", "-journal"]:
-                        path = db_path + ext
-                        if os.path.exists(path):
-                            try:
-                                os.remove(path)
-                                _log(f"Removed database file: {path}")
-                            except Exception as e:
-                                _log(f"Failed to remove database file {path}: {e}")
+                    quarantined_dir = quarantine_database(db_path)
+                    if quarantined_dir:
+                        _log(f"CRITICAL: Database quarantined to {quarantined_dir}; normal startup will rebuild from genesis")
+                    else:
+                        _log("WARNING: Database quarantine failed.")
 
                 _log("Cleanup finished. Watchdog exiting.")
                 sys.exit(0)

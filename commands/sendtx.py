@@ -756,6 +756,13 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                 )
 
         tx_message_id, tx_canonical_blob = _compute_transaction_message_id(payload)
+        if db.count_mempool_txs() >= config.MAX_MEMPOOL_TXS:
+            return _qt_err(
+                "MEMPOOL_FULL",
+                f"Mempool is full ({config.MAX_MEMPOOL_TXS} pending transactions). Please try again later.",
+                current_count=db.count_mempool_txs(),
+                limit=config.MAX_MEMPOOL_TXS
+            )
         # Use canonical blob for storage to ensure consistency
         # Use milliseconds for received_at for better ordering resolution
         received_at = int(time.time() * 1000)

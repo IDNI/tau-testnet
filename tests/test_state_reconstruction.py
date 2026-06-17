@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 import os
 import json
 import tempfile
@@ -558,5 +559,35 @@ class TestStateReconstruction(unittest.TestCase):
         self.assertEqual(get_sequence_number(self.addr1), 2)  # Both transactions processed
 
 
+class TestStateHashInvariant(TestStateReconstruction):
+    @patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
+    @patch('tau_manager.tau_ready.wait', return_value=True)
+    def test_process_new_block_rejects_mismatched_state_hash(self, mock_tau_wait, mock_verify):
+        from unittest.mock import patch
+        genesis_hash = db.get_genesis_hash()
+        
+        # Create a structurally valid Block extending genesis
+        block = Block.create(
+            block_number=1,
+            previous_hash=genesis_hash,
+            transactions=[],
+            proposer_pubkey="a"*96
+        )
+        
+        # Deliberately set state_hash to wrong value after creation
+        block.header.state_hash = "f" * 64
+        
+        # Ensure we patch db.get_canonical_head to return genesis block metadata
+        with patch('db.get_canonical_head', return_value={"block_hash": genesis_hash, "block_number": 0}):
+            # Call process_new_block and assert it returns False
+            res = chain_state.process_new_block(block)
+            self.assertFalse(res)
+            
+            # Verify the block was NOT added to DB
+            self.assertIsNone(db.get_block_by_hash(block.block_hash))
+            
+            self.assertEqual(chain_state._canonical_head_hash, genesis_hash)
+
+
 if __name__ == '__main__':
-    unittest.main() 
+    unittest.main()

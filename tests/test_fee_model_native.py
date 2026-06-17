@@ -319,5 +319,53 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
         self.assertEqual(chain_state.get_balance(RECIPIENT), 200)
 
 
+@pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
+class TestGenesisGenO9Tests(_NativeFeeE2EBase):
+    def test_gen_genesis_o9_parses_on_real_tau(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_json = os.path.join(tmpdir, "genesis.json")
+            validator_key = "a" * 96
+            test_argv = [
+                "gen_genesis.py",
+                "--validator-key", validator_key,
+                "--genesis-rules-path", "genesis.tau",
+                "--genesis-consensus-path", "genesis_consensus.tau",
+                "--out", out_json,
+                "--base-fee", "10"
+            ]
+            with patch("sys.argv", test_argv):
+                try:
+                    from scripts import gen_genesis
+                    gen_genesis.main()
+                except SystemExit as e:
+                    self.assertEqual(e.code, 0)
+            
+            self.assertTrue(os.path.exists(out_json))
+            with open(out_json, "r") as f:
+                genesis_data = json.load(f)
+            
+            consensus_rules = genesis_data.get("consensus_rules", "")
+            preprocessed_rules = chain_state._preprocess_tau_spec_text(consensus_rules)
+            
+            self._seed_rule(preprocessed_rules, "test-gen-genesis-fee")
+            
+            inputs = {
+                1: ["0"],
+                2: ["0"],
+                3: ["0"],
+                4: ["0"],
+                5: ["0"],
+            }
+            outputs = tau_manager.communicate_with_tau_multi(
+                input_stream_values=inputs,
+                apply_rules_update=False
+            )
+            
+            self.assertIn(9, outputs)
+            fee_val = tau_manager.parse_tau_output(outputs[9])
+            self.assertEqual(fee_val, 10)
+
+
 if __name__ == "__main__":
     unittest.main()

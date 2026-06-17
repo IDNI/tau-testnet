@@ -18,7 +18,7 @@ DEFAULT_PROD_DB_PATH = "node.db"
 
 @dataclass
 class ServerSettings:
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 65432
     buffer_size: int = 1024
 
@@ -144,6 +144,7 @@ class AuthoritySettings:
     state_locator_namespace: str = "state"
     mining_enabled: bool = True
     open_governance_admission: bool = False
+    max_mempool_txs: int = 5000
 
     def validate(self) -> None:
         if self.mining_enabled:
@@ -296,6 +297,7 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_CONN_HIGH_WATER": ("network", "conn_high_water", int),
     "TAU_CONN_GRACE_PERIOD": ("network", "conn_grace_period", float),
     "TAU_MAX_CONNECTIONS": ("network", "max_connections", int),
+    "TAU_MAX_MEMPOOL_TXS": ("authority", "max_mempool_txs", int),
     "TAU_RATE_LIMIT_PER_PEER": ("network", "rate_limit_per_peer", float),
     "TAU_BURST_PER_PEER": ("network", "burst_per_peer", float),
     "TAU_DHT_TTL": ("dht", "record_ttl", int),
@@ -490,6 +492,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     global LOGGING
     global MINER_PUBKEY, MINER_PUBKEYS, MINER_PRIVKEY, BLOCK_SIGNATURE_SCHEME, STATE_LOCATOR_NAMESPACE
     global OPEN_GOVERNANCE_ADMISSION
+    global MAX_MEMPOOL_TXS
 
     HOST = current.server.host
     PORT = current.server.port
@@ -523,6 +526,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     BLOCK_SIGNATURE_SCHEME = current.authority.block_signature_scheme
     STATE_LOCATOR_NAMESPACE = current.authority.state_locator_namespace
     OPEN_GOVERNANCE_ADMISSION = current.authority.open_governance_admission
+    MAX_MEMPOOL_TXS = current.authority.max_mempool_txs
 
 
 def reload_settings(env: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> Settings:
@@ -584,7 +588,10 @@ __all__ = [
     "BLOCK_SIGNATURE_SCHEME",
     "STATE_LOCATOR_NAMESPACE",
     "OPEN_GOVERNANCE_ADMISSION",
+    "MAX_MEMPOOL_TXS",
+    "MAX_BLOCK_FUTURE_DRIFT_SECONDS",
 ]
 
 # Feature flags
 TESTNET_AUTO_FAUCET = True
+MAX_BLOCK_FUTURE_DRIFT_SECONDS = int(os.environ.get('TAU_MAX_BLOCK_FUTURE_DRIFT', '120'))

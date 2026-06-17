@@ -378,3 +378,79 @@ def test_apply_block_activates_multiple_updates_in_uid_order():
     next_snapshot = result.next_snapshot
     assert next_snapshot.metadata["consensus_rules_state"] == "\n".join(second_revs)
     assert next_snapshot.metadata["active_consensus_id"] == second.update_id_hex[:16]
+
+
+def test_apply_block_raises_fee_rule_error_on_activation_failure():
+    """
+    Test that if communicate_with_tau raises TauCommunicationError (or TauEngineBug)
+    during governance activation inside apply_block, FeeRuleError is raised.
+    """
+    from unittest.mock import patch as _patch
+    from consensus.engine import TauConsensusEngine, ActiveConsensusView
+    from consensus.governance import (
+        ConsensusLifecycleManager,
+        ConsensusRuleUpdate,
+        ConsensusRuleVote,
+    )
+    from consensus.state import TauStateSnapshot
+    from block import Block
+    from errors import TauCommunicationError
+    from consensus.fees import FeeRuleError
+
+    validator_hex = "a" * 96
+    voter_bytes = bytes.fromhex(validator_hex)
+
+    revisions = [
+        "always ( o6[t]:bv[16] = { 0 }:bv[16] ).",
+    ]
+    activate_at = 7
+
+    update = ConsensusRuleUpdate(
+        rule_revisions=revisions,
+        activate_at_height=activate_at,
+    )
+
+    lm = ConsensusLifecycleManager(active_validators=[validator_hex])
+    assert lm.submit_update(update)
+    lm.submit_vote(ConsensusRuleVote(update_id=update.update_id, approve=True), voter_bytes)
+
+    parent_app_rules = b"always (o0[t]=1)."
+    parent_snapshot = TauStateSnapshot(
+        state_hash="0" * 64,
+        tau_bytes=parent_app_rules,
+        metadata={
+            "balances": {},
+            "sequence_numbers": {},
+            "lifecycle_manager": lm,
+            "consensus_rules_state": "always (o6[t]:bv[64] = i10[t]:bv[64]).",
+            "active_consensus_id": "",
+        },
+    )
+
+    active_view = ActiveConsensusView(
+        target_height=activate_at,
+        consensus_rules=parent_snapshot.metadata["consensus_rules_state"],
+        active_validators=[voter_bytes],
+        mechanism_specific_metadata={"poa": True},
+    )
+
+    block_obj = Block.create(
+        block_number=activate_at,
+        previous_hash="00" * 32,
+        transactions=[],
+        proposer_pubkey=validator_hex,
+        timestamp=1234567890,
+    )
+
+    def _broken_communicate_with_tau(**kwargs):
+        raise TauCommunicationError("Tau connection lost")
+
+    engine = TauConsensusEngine()
+
+    with _patch("tau_manager.communicate_with_tau", side_effect=_broken_communicate_with_tau):
+        with pytest.raises(FeeRuleError) as excinfo:
+            engine.apply_block(active_view, block_obj, parent_snapshot)
+
+    assert "Governance rule activation rejected" in str(excinfo.value)
+    assert "Tau connection lost" in str(excinfo.value)
+

@@ -58,3 +58,10 @@ def test_miner_pubkeys_env_rejects_invalid_pubkey(monkeypatch):
     finally:
         monkeypatch.delenv("TAU_MINER_PUBKEYS", raising=False)
         config.reload_settings(env="test")
+
+
+def test_server_settings_defaults():
+    assert config.settings.server.host == "127.0.0.1"
+    assert config.settings.server.port == 65432
+    assert config.HOST == "127.0.0.1"
+

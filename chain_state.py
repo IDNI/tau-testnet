@@ -411,6 +411,25 @@ def fetch_accounts_snapshot(block_hash: str) -> Optional[tuple[Dict[str, int], D
 GENESIS_ADDRESS = "a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b"
 GENESIS_BALANCE = 10000
 
+
+def _validate_block_timestamp(block: Block, parent_block_data: Optional[Dict]) -> tuple[bool, str]:
+    import time
+    import config
+    
+    current_time = int(time.time())
+    max_allowed_timestamp = current_time + config.MAX_BLOCK_FUTURE_DRIFT_SECONDS
+    
+    if block.header.timestamp > max_allowed_timestamp:
+        return False, f"Block timestamp {block.header.timestamp} is too far in the future (max allowed {max_allowed_timestamp})"
+        
+    if block.header.block_number > 0:
+        parent_timestamp = int(parent_block_data['header']['timestamp']) if parent_block_data else 0
+        if block.header.timestamp < parent_timestamp:
+            return False, f"Block timestamp {block.header.timestamp} is less than parent block timestamp {parent_timestamp}"
+            
+    return True, ""
+
+
 def process_new_block(block: Block) -> bool:
     """
     Standard network/import block ingestion path.
@@ -426,6 +445,7 @@ def process_new_block(block: Block) -> bool:
         
         # Fast path: cleanly extends the canonical chain
         if block.header.previous_hash == current_head_hash or current_head_hash == '':
+            parent_block_data = db.get_block_by_hash(current_head_hash) if current_head_hash else None
             from consensus.state import TauStateSnapshot, compute_consensus_meta_hash, compute_consensus_state_hash
             engine = TauConsensusEngine()
             
@@ -471,6 +491,11 @@ def process_new_block(block: Block) -> bool:
 
             if not verify_ok:
                 logger.error(f"[BLOCKCHAIN] Block #{block.header.block_number} failed network verification.")
+                return False
+
+            valid_ts, ts_reason = _validate_block_timestamp(block, parent_block_data)
+            if not valid_ts:
+                logger.error(f"[BLOCKCHAIN] Block #{block.header.block_number} timestamp invalid: {ts_reason}")
                 return False
 
             # Fee model: fees are emitted by the consensus rules on Tau
@@ -1389,6 +1414,11 @@ def ingest_block(block: Block) -> IngestResult:
     
     # Enforce parent linkage rules for non-genesis
     parent = db.get_block_by_hash(block.header.previous_hash)
+    
+    valid_ts, ts_reason = _validate_block_timestamp(block, parent)
+    if not valid_ts:
+        return IngestResult('invalid', f"Timestamp validation failed: {ts_reason}")
+
     if parent:
         parent_num = int(parent['header'].get('block_number', -1))
         if block.header.block_number != parent_num + 1:

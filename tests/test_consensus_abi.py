@@ -107,3 +107,97 @@ def test_verify_block_header_uses_o6_and_validates_bv_widths():
         config.set_database_path(original_path)
         if os.path.exists(path):
             os.remove(path)
+
+
+def test_verify_block_header_accepts_valid_bls_signature():
+    import hashlib
+    from py_ecc.bls import G2Basic
+    
+    fd, path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    original_path = config.STRING_DB_PATH
+    try:
+        _reset_db(path)
+        engine = TauConsensusEngine()
+        
+        # Generate BLS keypair
+        priv = G2Basic.KeyGen(b"seed_must_be_32_bytes_long_12345")
+        pubkey_bytes = G2Basic.SkToPk(priv)
+        pubkey_hex = pubkey_bytes.hex()
+        
+        # Calculate signature over the block canonical bytes
+        msg_bytes = b"header"
+        msg_hash = hashlib.sha256(msg_bytes).digest()
+        sig_bytes = G2Basic.Sign(priv, msg_hash)
+        sig_hex = sig_bytes.hex()
+        
+        block = SimpleNamespace(
+            header=SimpleNamespace(
+                proposer_pubkey=pubkey_hex,
+                block_number=9,
+                timestamp=654321,
+                previous_hash="d" * 64,
+                canonical_bytes=lambda: msg_bytes,
+            ),
+            consensus_proof=sig_hex,
+        )
+
+        with patch("tau_manager.tau_ready.is_set", return_value=True), patch(
+            "tau_manager.communicate_with_tau", return_value="require_bls_sig: true"
+        ):
+            assert ORIGINAL_VERIFY_BLOCK_HEADER(engine, block, {"proof_ok": True}) is True
+    finally:
+        if db._db_conn:
+            db._db_conn.close()
+            db._db_conn = None
+        config.set_database_path(original_path)
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def test_verify_block_header_rejects_invalid_bls_signature():
+    import hashlib
+    from py_ecc.bls import G2Basic
+    
+    fd, path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    original_path = config.STRING_DB_PATH
+    try:
+        _reset_db(path)
+        engine = TauConsensusEngine()
+        
+        # Generate two different BLS keypairs
+        priv_correct = G2Basic.KeyGen(b"seed_must_be_32_bytes_long_correct")
+        pubkey_correct_bytes = G2Basic.SkToPk(priv_correct)
+        pubkey_correct_hex = pubkey_correct_bytes.hex()
+        
+        priv_wrong = G2Basic.KeyGen(b"seed_must_be_32_bytes_long_wrong__")
+        
+        msg_bytes = b"header"
+        msg_hash = hashlib.sha256(msg_bytes).digest()
+        # Sign with wrong key
+        sig_bytes = G2Basic.Sign(priv_wrong, msg_hash)
+        sig_hex = sig_bytes.hex()
+        
+        block = SimpleNamespace(
+            header=SimpleNamespace(
+                proposer_pubkey=pubkey_correct_hex,
+                block_number=9,
+                timestamp=654321,
+                previous_hash="d" * 64,
+                canonical_bytes=lambda: msg_bytes,
+            ),
+            consensus_proof=sig_hex,
+        )
+
+        with patch("tau_manager.tau_ready.is_set", return_value=True), patch(
+            "tau_manager.communicate_with_tau", return_value="require_bls_sig: true"
+        ):
+            assert ORIGINAL_VERIFY_BLOCK_HEADER(engine, block, {"proof_ok": True}) is False
+    finally:
+        if db._db_conn:
+            db._db_conn.close()
+            db._db_conn = None
+        config.set_database_path(original_path)
+        if os.path.exists(path):
+            os.remove(path)
