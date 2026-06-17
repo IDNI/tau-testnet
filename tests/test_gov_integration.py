@@ -454,3 +454,192 @@ def test_apply_block_raises_fee_rule_error_on_activation_failure():
     assert "Governance rule activation rejected" in str(excinfo.value)
     assert "Tau connection lost" in str(excinfo.value)
 
+
+def test_apply_block_raises_fee_rule_error_on_rejection_string():
+    """
+    Test that if communicate_with_tau returns a string containing "error" (except x1001)
+    during governance activation inside apply_block, FeeRuleError is raised.
+    """
+    from unittest.mock import patch as _patch
+    from consensus.engine import TauConsensusEngine, ActiveConsensusView
+    from consensus.governance import (
+        ConsensusLifecycleManager,
+        ConsensusRuleUpdate,
+        ConsensusRuleVote,
+    )
+    from consensus.state import TauStateSnapshot
+    from block import Block
+    from consensus.fees import FeeRuleError
+
+    validator_hex = "a" * 96
+    voter_bytes = bytes.fromhex(validator_hex)
+
+    revisions = [
+        "always ( o6[t]:bv[16] = { 0 }:bv[16] ).",
+    ]
+    activate_at = 7
+
+    update = ConsensusRuleUpdate(
+        rule_revisions=revisions,
+        activate_at_height=activate_at,
+    )
+
+    lm = ConsensusLifecycleManager(active_validators=[validator_hex])
+    assert lm.submit_update(update)
+    lm.submit_vote(ConsensusRuleVote(update_id=update.update_id, approve=True), voter_bytes)
+
+    parent_app_rules = b"always (o0[t]=1)."
+    parent_snapshot = TauStateSnapshot(
+        state_hash="0" * 64,
+        tau_bytes=parent_app_rules,
+        metadata={
+            "balances": {},
+            "sequence_numbers": {},
+            "lifecycle_manager": lm,
+            "consensus_rules_state": "always (o6[t]:bv[64] = i10[t]:bv[64]).",
+            "active_consensus_id": "",
+        },
+    )
+
+    active_view = ActiveConsensusView(
+        target_height=activate_at,
+        consensus_rules=parent_snapshot.metadata["consensus_rules_state"],
+        active_validators=[voter_bytes],
+        mechanism_specific_metadata={"poa": True},
+    )
+
+    block_obj = Block.create(
+        block_number=activate_at,
+        previous_hash="00" * 32,
+        transactions=[],
+        proposer_pubkey=validator_hex,
+        timestamp=1234567890,
+    )
+
+    def _reject_communicate_with_tau(**kwargs):
+        return "Parsing Error: Invalid symbol inside rule"
+
+    engine = TauConsensusEngine()
+
+    with _patch("tau_manager.communicate_with_tau", side_effect=_reject_communicate_with_tau):
+        with pytest.raises(FeeRuleError) as excinfo:
+            engine.apply_block(active_view, block_obj, parent_snapshot)
+
+    assert "Governance rule activation revision rejected by live Tau interpreter" in str(excinfo.value)
+    assert "Parsing Error" in str(excinfo.value)
+
+
+def test_apply_block_raises_fee_rule_error_on_engine_crash():
+    """
+    Test that if communicate_with_tau raises TauEngineCrash during governance
+    activation inside apply_block, FeeRuleError is raised.
+    """
+    from unittest.mock import patch as _patch
+    from consensus.engine import TauConsensusEngine, ActiveConsensusView
+    from consensus.governance import (
+        ConsensusLifecycleManager,
+        ConsensusRuleUpdate,
+        ConsensusRuleVote,
+    )
+    from consensus.state import TauStateSnapshot
+    from block import Block
+    from errors import TauEngineCrash
+    from consensus.fees import FeeRuleError
+
+    validator_hex = "a" * 96
+    voter_bytes = bytes.fromhex(validator_hex)
+
+    revisions = [
+        "always ( o6[t]:bv[16] = { 0 }:bv[16] ).",
+    ]
+    activate_at = 7
+
+    update = ConsensusRuleUpdate(
+        rule_revisions=revisions,
+        activate_at_height=activate_at,
+    )
+
+    lm = ConsensusLifecycleManager(active_validators=[validator_hex])
+    assert lm.submit_update(update)
+    lm.submit_vote(ConsensusRuleVote(update_id=update.update_id, approve=True), voter_bytes)
+
+    parent_app_rules = b"always (o0[t]=1)."
+    parent_snapshot = TauStateSnapshot(
+        state_hash="0" * 64,
+        tau_bytes=parent_app_rules,
+        metadata={
+            "balances": {},
+            "sequence_numbers": {},
+            "lifecycle_manager": lm,
+            "consensus_rules_state": "always (o6[t]:bv[64] = i10[t]:bv[64]).",
+            "active_consensus_id": "",
+        },
+    )
+
+    active_view = ActiveConsensusView(
+        target_height=activate_at,
+        consensus_rules=parent_snapshot.metadata["consensus_rules_state"],
+        active_validators=[voter_bytes],
+        mechanism_specific_metadata={"poa": True},
+    )
+
+    block_obj = Block.create(
+        block_number=activate_at,
+        previous_hash="00" * 32,
+        transactions=[],
+        proposer_pubkey=validator_hex,
+        timestamp=1234567890,
+    )
+
+    def _crash_communicate_with_tau(**kwargs):
+        raise TauEngineCrash("Tau process closed unexpectedly")
+
+    engine = TauConsensusEngine()
+
+    with _patch("tau_manager.communicate_with_tau", side_effect=_crash_communicate_with_tau):
+        with pytest.raises(FeeRuleError) as excinfo:
+            engine.apply_block(active_view, block_obj, parent_snapshot)
+
+    assert "Governance rule activation rejected" in str(excinfo.value)
+    assert "Tau process closed unexpectedly" in str(excinfo.value)
+
+
+def test_rebuild_state_aborts_on_fee_rule_error():
+    """
+    Test that chain state rebuild aborts cleanly (returns) when FeeRuleError is raised.
+    """
+    from unittest.mock import patch as _patch
+    from chain_state import rebuild_state_from_blockchain
+    from consensus.fees import FeeRuleError
+    from block import BlockHeader, sha256_hex
+
+    hdr = BlockHeader(
+        block_number=1,
+        previous_hash="0" * 64,
+        timestamp=100,
+        merkle_root="0" * 64,
+        state_hash="0" * 64,
+        proposer_pubkey="a" * 96
+    )
+    correct_hash = sha256_hex(hdr.canonical_bytes())
+
+    mock_block_data = {
+        "header": {
+            "block_number": 1,
+            "previous_hash": "0" * 64,
+            "timestamp": 100,
+            "merkle_root": "0" * 64,
+            "state_hash": "0" * 64,
+            "proposer_pubkey": "a" * 96
+        },
+        "transactions": [],
+        "consensus_proof": {},
+        "block_hash": correct_hash
+    }
+
+    with _patch("db.get_canonical_blocks_at_or_after_height", return_value=[mock_block_data]):
+        with _patch("consensus.engine.TauConsensusEngine.apply_block", side_effect=FeeRuleError("mock error")):
+            # This should catch FeeRuleError and return cleanly without raising.
+            rebuild_state_from_blockchain(start_block=1)
+
+

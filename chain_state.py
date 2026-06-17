@@ -745,7 +745,11 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                 print(f"[WARN][chain_state] Tau unavailable during rebuild; skipping header verification for block #{block_number}.")
             
             # 4. Execute Core Block Application Natively
-            apply_result = engine.apply_block(active_view, block, parent_snapshot, replay_mode=True)
+            try:
+                apply_result = engine.apply_block(active_view, block, parent_snapshot, replay_mode=True)
+            except FeeRuleError as e:
+                print(f"[ERROR][chain_state] Fee rule failure replaying block #{block_number}: {e}")
+                return
             next_snapshot = apply_result.next_snapshot
             
             # 5. Execute Required Invariant Replay Checks (comparing state hashes)
@@ -781,10 +785,13 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             
         except json.JSONDecodeError as e:
             print(f"[ERROR][chain_state] Failed to parse block #{block_idx}: {e}")
+            return
         except KeyError as e:
             print(f"[ERROR][chain_state] Missing required field in block #{block_idx}: {e}")
+            return
         except Exception as e:
             print(f"[ERROR][chain_state] Unexpected error processing block #{block_idx}: {e}")
+            return
         
         # Update the last processed block hash after successfully processing a block
         _canonical_head_hash = block_data['block_hash']
