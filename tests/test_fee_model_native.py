@@ -326,21 +326,27 @@ class TestGenesisGenO9Tests(_NativeFeeE2EBase):
         with tempfile.TemporaryDirectory() as tmpdir:
             out_json = os.path.join(tmpdir, "genesis.json")
             validator_key = "a" * 96
+            # Run the generator as a SUBPROCESS: gen_genesis.main() ends in
+            # os._exit(0) (native-binding segfault workaround), which would
+            # terminate the pytest process if called in-process.
+            import subprocess
+            script_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "scripts", "gen_genesis.py")
+            )
             test_argv = [
-                "gen_genesis.py",
                 "--validator-key", validator_key,
                 "--genesis-rules-path", "genesis.tau",
                 "--genesis-consensus-path", "genesis_consensus.tau",
                 "--out", out_json,
-                "--base-fee", "10"
+                "--base-fee", "10",
             ]
-            with patch("sys.argv", test_argv):
-                try:
-                    from scripts import gen_genesis
-                    gen_genesis.main()
-                except SystemExit as e:
-                    self.assertEqual(e.code, 0)
-            
+            result = subprocess.run(
+                [sys.executable, script_path] + test_argv,
+                capture_output=True, text=True, env=os.environ,
+            )
+            self.assertEqual(result.returncode, 0, f"gen_genesis failed: {result.stderr}")
+
+
             self.assertTrue(os.path.exists(out_json))
             with open(out_json, "r") as f:
                 genesis_data = json.load(f)
