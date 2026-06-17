@@ -71,3 +71,36 @@ def test_gen_genesis_fee_injection():
         assert "o9" not in consensus_rules_0
         assert "#x000a" not in consensus_rules_0
 
+
+def test_derive_pubkey_privkey_leading_zero():
+    """Regression: a privkey whose hex starts with '0' must not have its leading
+    zero stripped. The old lstrip("0x") stripped any leading '0'/'x' chars, making
+    the key odd-length and raising "Private key contains non-hex characters"."""
+    G2Basic = pytest.importorskip("py_ecc.bls").G2Basic
+
+    # 64 hex chars, leading "00". Value is far below the BLS12-381 curve order
+    # (r = 0x73ed...), so it is a valid scalar.
+    privkey_hex = "00" + "11" * 31
+    assert len(privkey_hex) == 64
+
+    # Must not raise.
+    derived = gen_genesis.derive_pubkey_from_privkey(privkey_hex)
+
+    expected = G2Basic.SkToPk(int.from_bytes(bytes.fromhex(privkey_hex), "big")).hex()
+    assert derived == expected
+    # Leading-zero byte preserved -> derivation used the full 32-byte key.
+    assert derived != gen_genesis.derive_pubkey_from_privkey("11" * 31 + "11")
+
+
+def test_derive_pubkey_strips_0x_prefix():
+    """A literal "0x" prefix is stripped; an embedded leading 0 is not."""
+    G2Basic = pytest.importorskip("py_ecc.bls").G2Basic
+    body = "00" + "11" * 31
+    expected = G2Basic.SkToPk(int.from_bytes(bytes.fromhex(body), "big")).hex()
+    assert gen_genesis.derive_pubkey_from_privkey("0x" + body) == expected
+
+
+def test_derive_pubkey_rejects_wrong_length():
+    with pytest.raises(ValueError, match="64 hex chars"):
+        gen_genesis.derive_pubkey_from_privkey("00" + "11" * 30)  # 62 chars
+

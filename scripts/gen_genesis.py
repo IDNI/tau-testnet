@@ -47,7 +47,10 @@ def derive_pubkey_from_privkey(privkey_hex: str) -> str:
         from py_ecc.bls import G2Basic
     except ImportError:
         raise ImportError("py_ecc is required to derive a public key. Run: pip install py_ecc")
-    s = privkey_hex.strip().lstrip("0x")
+    s = privkey_hex.strip()
+    s = s[2:] if s.lower().startswith("0x") else s
+    if len(s) != 64:
+        raise ValueError(f"Private key must be 64 hex chars (32 bytes), got {len(s)}")
     try:
         raw = bytes.fromhex(s)
     except ValueError:
