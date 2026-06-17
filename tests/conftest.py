@@ -30,6 +30,12 @@ def test_environment() -> Iterator[None]:
     """Ensure tests run with the dedicated 'test' configuration and logging."""
     original_env = os.environ.get("TAU_ENV")
     os.environ["TAU_ENV"] = "test"
+    # Orchestration/network/state tests default to the deterministic test
+    # validator (mock) — running the real engine on them is meaningless and,
+    # for rule-accumulating stress tests, pathologically slow. The tests that
+    # actually validate Tau semantics opt into the real engine themselves,
+    # either by instantiating tau_native.TauInterface directly or by setting
+    # TAU_FORCE_TEST=0 in their own setup.
     os.environ.setdefault("TAU_FORCE_TEST", "1")
 
     config.reload_settings(env="test")

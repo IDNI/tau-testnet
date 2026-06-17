@@ -39,9 +39,9 @@ from commands import sendtx, createblock
 GENESIS_TAU = os.path.join(project_root, "genesis.tau")
 TRANSFER_RULE_PATH = os.path.join(project_root, "rules", "04_handle_valid_transfer.tau")
 
-FEE_RULE_10 = "always (o9[t]:bv[16] = { #x000a }:bv[16])."
-FEE_RULE_20 = "always (o9[t]:bv[16] = { #x0014 }:bv[16])."
-CUSTOM_FEE_RULE_5 = "always (o8[t]:bv[16] = { #x0005 }:bv[16])."
+FEE_RULE_10 = "always (o9[t]:bv[24] = { #x00000a }:bv[24])."
+FEE_RULE_20 = "always (o9[t]:bv[24] = { #x000014 }:bv[24])."
+CUSTOM_FEE_RULE_5 = "always (o8[t]:bv[24] = { #x000005 }:bv[24])."
 
 RECIPIENT = "c" * 96
 
@@ -262,7 +262,7 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
         self.assertEqual(chain_state.get_balance(config.MINER_PUBKEY), 10)
 
         # Block 2: governance proposal — full new consensus spec, o9 doubled.
-        new_spec = genesis_consensus.replace("#x000a", "#x0014")
+        new_spec = genesis_consensus.replace("#x00000a", "#x000014")
         self.assertNotEqual(new_spec, genesis_consensus)
         activate_at = 4
         update_tx = json.dumps({
@@ -305,7 +305,7 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
         # Block 4: empty block crosses the activation height — the engine
         # pushes the new spec into the LIVE interpreter via i0.
         self._mine(expect_txs=0)
-        self.assertIn("#x0014", chain_state.get_consensus_rules_state())
+        self.assertIn("#x000014", chain_state.get_consensus_rules_state())
 
         # Block 5: user tx now pays the governance-voted fee (20).
         res = sendtx.queue_transaction(self._tx(100, 50), propagate=False)

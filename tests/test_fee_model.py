@@ -52,7 +52,7 @@ class TestFeeParsers(unittest.TestCase):
     def test_parse_consensus_fee_strict(self):
         self.assertEqual(fees.parse_consensus_fee(None), 0)  # absent = inactive
         self.assertEqual(fees.parse_consensus_fee("10"), 10)
-        self.assertEqual(fees.parse_consensus_fee("{ #x0a }:bv[16]"), 10)
+        self.assertEqual(fees.parse_consensus_fee("{ #x0a }:bv[24]"), 10)
         self.assertEqual(fees.parse_consensus_fee("#b101"), 5)
         self.assertEqual(fees.parse_consensus_fee("result: 3"), 3)
         with self.assertRaises(FeeRuleError):

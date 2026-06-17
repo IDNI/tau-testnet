@@ -44,7 +44,7 @@ def test_gen_genesis_fee_injection():
             genesis_data = json.load(f)
         consensus_rules = genesis_data.get("consensus_rules", "")
         assert "o9" in consensus_rules
-        assert "#x000a" in consensus_rules
+        assert "#x00000a" in consensus_rules
 
         # Base fee 0
         out_path_0 = os.path.join(tmpdir, "genesis_0.json")
@@ -69,7 +69,7 @@ def test_gen_genesis_fee_injection():
             genesis_data = json.load(f)
         consensus_rules_0 = genesis_data.get("consensus_rules", "")
         assert "o9" not in consensus_rules_0
-        assert "#x000a" not in consensus_rules_0
+        assert "#x00000a" not in consensus_rules_0
 
 
 def test_derive_pubkey_privkey_leading_zero():

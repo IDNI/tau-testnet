@@ -26,8 +26,8 @@ from consensus.state import compute_consensus_state_hash
 GENESIS_PATH = os.path.join(project_root, "data", "genesis.json")
 
 # ─── Golden Vectors (computed deterministically from data/genesis.json) ───
-EXPECTED_BLOCK_HASH = "23e161c30843a540bceca37cf316687eb8ac340288a4ea3bb2fede786cb7b092"
-EXPECTED_STATE_HASH = "f0eb0fcb21e7035e1a48c680bf04d08853eeb9c7516c123009d386354491a3dd"
+EXPECTED_BLOCK_HASH = "a3cc02c83cef5995a0bab455db028e5a979289003ad5e41f4c4aebae53a182e6"
+EXPECTED_STATE_HASH = "cff5555542a8a55e9006989e697dfb548e2069045e51fcb786985ee73edf6f71"
 EXPECTED_ACCOUNTS_HASH = "e357576a464b7cd08de768c8edfaaf226b6e142cccbb743c62c5e0ea4e590790"
 EXPECTED_META_HASH = "6e09fea2ae9cf0cef8e066bf78ca654e657f019969195897f47b35fcde97388d"
 

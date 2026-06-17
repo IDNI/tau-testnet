@@ -196,9 +196,9 @@ class TestStateReconstruction(unittest.TestCase):
         self.start_tau()
         try:
             BASE_PATTERNS = [
-                "{ 3 }:bv[64]",
-                "{ 7 }:bv[64]",
-                "{ 15 }:bv[64]",
+                "{ 3 }:bv[24]",
+                "{ 7 }:bv[24]",
+                "{ 15 }:bv[24]",
             ]
             random.seed(42)
 
@@ -210,7 +210,7 @@ class TestStateReconstruction(unittest.TestCase):
             # Simple helper to build a unique rule for index i
             def rule_for(i: int) -> str:
                 pat = random_pattern()
-                return f"always ((i1[t]:bv[64] = {pat})? o1[t]:bv[64] = {{ 0 }}:bv[64] : o1[t]:bv[64] = i1[t]:bv[64])."
+                return f"always ((i1[t]:bv[24] = {pat})? o1[t]:bv[24] = {{ 0 }}:bv[24] : o1[t]:bv[24] = i1[t]:bv[24])."
 
             # -------- Block 0  (sender = addr1) --------
             tx1 = self.create_test_transaction(

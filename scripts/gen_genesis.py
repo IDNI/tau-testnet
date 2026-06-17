@@ -36,7 +36,7 @@ def get_args():
             "Network base fee per user transaction, emitted by the genesis "
             "consensus rules on Tau output stream o9 (governance-votable "
             "later via consensus_rule_update). 0 omits the fee rule "
-            "(fee-less network). Max 65535 (bv[16])."
+            "(fee-less network). Max 16777215 (bv[24])."
         ),
     )
     return parser.parse_args()
@@ -133,8 +133,8 @@ def main():
         consensus_rules = f.read()
 
     if args.base_fee:
-        if not (0 < args.base_fee <= 0xFFFF):
-            raise ValueError("--base-fee must be in [0, 65535] (bv[16]).")
+        if not (0 < args.base_fee <= 0xFFFFFF):
+            raise ValueError("--base-fee must be in [0, 16777215] (bv[24]).")
         # Consensus fee rule: the node reads o9 during each per-transfer
         # Tau evaluation step and charges sum(o9 + o8) per user_tx,
         # credited to the block proposer. Change the fee by voting in a
@@ -150,7 +150,7 @@ def main():
             raise ValueError(
                 f"Cannot inject fee rule: no closing ')' found in {args.genesis_consensus_path}"
             )
-        fee_term = " &&\n    o9[t]:bv[16] = { #x%04x }:bv[16]\n" % args.base_fee
+        fee_term = " &&\n    o9[t]:bv[24] = { #x%06x }:bv[24]\n" % args.base_fee
         consensus_rules = stripped[:closing] + fee_term + stripped[closing:] + "\n"
 
     validate_consensus_rules(consensus_rules)

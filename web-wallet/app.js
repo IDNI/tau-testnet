@@ -998,10 +998,15 @@ function validateRuleSyntax(rule) {
 }
 
 function generateRandomTauRule() {
-    const RESERVED_MAX_IDX = 5;
+    // Streams 0..11 are protocol-reserved (see tau_defs.RESERVED_STREAMS):
+    // i1/i2 = transfer amount/balance (bv[24]), i3/i4 = addresses, o0..o11 =
+    // validation/policy/consensus/fee outputs. Generated demo rules must read
+    // only the bv[24] value inputs and write only to FREE output streams, or
+    // they would clash with the live engine's per-stream bit-width typing.
+    const RESERVED_MAX_IDX = 11;
 
-    const randOut = () => (RESERVED_MAX_IDX + 1) + Math.floor(Math.random() * 10); // o6..o15
-    const randIn = () => 1 + Math.floor(Math.random() * 4); // i1..i4
+    const randOut = () => (RESERVED_MAX_IDX + 1) + Math.floor(Math.random() * 10); // o12..o21
+    const randIn = () => 1 + Math.floor(Math.random() * 2); // i1..i2 (bv[24] value streams)
     const outA = randOut();
     const outB = randOut();
     const inA = randIn();
@@ -1011,7 +1016,7 @@ function generateRandomTauRule() {
     const sh2 = 1 + Math.floor(Math.random() * 7);
     const bit = Math.floor(Math.random() * 2);
 
-    const hx = (n) => `{ #x${n.toString(16).padStart(2, '0')} }:bv[16]`;
+    const hx = (n) => `{ #x${n.toString(16).padStart(2, '0')} }:bv[24]`;
 
     const templates = [
         () => [
@@ -1022,39 +1027,39 @@ function generateRandomTauRule() {
 
         () => [
             `# Example 2 - Threshold gate (classifier-like)`,
-            `# If i${inA}+i${inB} >= 0x80 then output 1 else 0 (bv[16]).`,
-            `always ( ((i${inA}[t]:bv[16] + i${inB}[t]:bv[16]) >= ${hx(0x80)} && o${outA}[t] = ${hx(1)}) || ((i${inA}[t]:bv[16] + i${inB}[t]:bv[16]) < ${hx(0x80)} && o${outA}[t] = ${hx(0)}) ).`
+            `# If i${inA}+i${inB} >= 0x80 then output 1 else 0 (bv[24]).`,
+            `always ( ((i${inA}[t]:bv[24] + i${inB}[t]:bv[24]) >= ${hx(0x80)} && o${outA}[t] = ${hx(1)}) || ((i${inA}[t]:bv[24] + i${inB}[t]:bv[24]) < ${hx(0x80)} && o${outA}[t] = ${hx(0)}) ).`
         ].join('\n'),
 
         () => [
             `# Example 3 - Feature extraction (bit shifts + combine)`,
             `# Produces an 8-bit feature deterministically from two inputs.`,
-            `always ( o${outA}[t]:bv[16] = (i${inA}[t]:bv[16] >> ${hx(sh1)}) + (i${inB}[t]:bv[16] << ${hx(sh2)}) ).`
+            `always ( o${outA}[t]:bv[24] = (i${inA}[t]:bv[24] >> ${hx(sh1)}) + (i${inB}[t]:bv[24] << ${hx(sh2)}) ).`
         ].join('\n'),
 
         () => [
             `# Example 4 - Temporal check`,
-            `# If i${inA} increased vs previous step, set a flag (bv[16]).`,
-            `always ( ((i${inA}[t]:bv[16] > i${inA}[t-1]:bv[16]) && o${outA}[t] = ${hx(1)}) || ((i${inA}[t]:bv[16] <= i${inA}[t-1]:bv[16]) && o${outA}[t] = ${hx(0)}) ).`
+            `# If i${inA} increased vs previous step, set a flag (bv[24]).`,
+            `always ( ((i${inA}[t]:bv[24] > i${inA}[t-1]:bv[24]) && o${outA}[t] = ${hx(1)}) || ((i${inA}[t]:bv[24] <= i${inA}[t-1]:bv[24]) && o${outA}[t] = ${hx(0)}) ).`
         ].join('\n'),
 
         () => [
             `# Example 5 - Multiple outputs`,
             `# Two deterministic arithmetic relations in one rule.`,
-            `always ( (o${outA}[t]:bv[16] = i${inA}[t]:bv[16] + i${inB}[t]:bv[16]) && (o${outB}[t]:bv[16] = i${inC}[t]:bv[16] - i${inB}[t]:bv[16]) ).`
+            `always ( (o${outA}[t]:bv[24] = i${inA}[t]:bv[24] + i${inB}[t]:bv[24]) && (o${outB}[t]:bv[24] = i${inC}[t]:bv[24] - i${inB}[t]:bv[24]) ).`
         ].join('\n'),
 
         () => [
             `# Example 6 - "Network" style rule with local variables`,
             `# Computes two hidden gates and outputs:`,
-            `# - o${outA}[t] allow flag (bv[16])`,
-            `# - o${outB}[t] risk-ish score (bv[16])`,
+            `# - o${outA}[t] allow flag (bv[24])`,
+            `# - o${outB}[t] risk-ish score (bv[24])`,
             `always ( ex s1 ex s2 ex h1 ex h2 (`,
-            `  (s1 = (i${inA}[t]:bv[16] * ${hx(0x03)}) + (i${inB}[t]:bv[16] * ${hx(0x02)}))`,
+            `  (s1 = (i${inA}[t]:bv[24] * ${hx(0x03)}) + (i${inB}[t]:bv[24] * ${hx(0x02)}))`,
             `  && ((s1 >= ${hx(0x80)} && h1 = ${hx(1)}) || (s1 < ${hx(0x80)} && h1 = ${hx(0)}))`,
-            `  && (s2 = (i${inC}[t]:bv[16] * ${hx(0x05)}) + (${hx(0x00)} - i${inA}[t]:bv[16]))`,
+            `  && (s2 = (i${inC}[t]:bv[24] * ${hx(0x05)}) + (${hx(0x00)} - i${inA}[t]:bv[24]))`,
             `  && ((s2 >= ${hx(0x40)} && h2 = ${hx(1)}) || (s2 < ${hx(0x40)} && h2 = ${hx(0)}))`,
-            `  && (o${outB}[t]:bv[16] = (h2:bv[16] * ${hx(0xC8)}) + ((${hx(0x01)} - h1:bv[16]) * ${hx(0x32)}))`,
+            `  && (o${outB}[t]:bv[24] = (h2:bv[24] * ${hx(0xC8)}) + ((${hx(0x01)} - h1:bv[24]) * ${hx(0x32)}))`,
             `  && ( (h2 = ${hx(0)} && o${outA}[t] = ${hx(1)}) || (h2 = ${hx(1)} && o${outA}[t] = ${hx(0)}) )`,
             `) ).`
         ].join('\n'),

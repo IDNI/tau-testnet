@@ -92,7 +92,7 @@ def _parse_tau_int(raw_output) -> Optional[int]:
     Decode a Tau output value to an int, or None if undecodable.
 
     Mirrors tau_manager.parse_tau_output's accepted literal forms
-    ("result:" prefix, "{ #x0a }:bv[16]" wrappers, "#b"/"#x" radixes,
+    ("result:" prefix, "{ #x0a }:bv[24]" wrappers, "#b"/"#x" radixes,
     plain decimals) but — unlike it — does NOT swallow garbage to 0:
     the strict o9 policy needs to distinguish a real 0 from breakage.
     """

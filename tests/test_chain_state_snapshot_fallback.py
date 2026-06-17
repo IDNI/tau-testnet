@@ -22,7 +22,7 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
 
         target_balances = {"addr1": 7}
         target_sequences = {"addr1": 1}
-        target_rules = "always (o1[t]:bv[16] = i1[t]:bv[16])."
+        target_rules = "always (o1[t]:bv[24] = i1[t]:bv[24])."
 
         accounts_hash = chain_state.compute_accounts_hash(target_balances, target_sequences)
         expected_state_hash = compute_consensus_state_hash(target_rules.encode("utf-8"), b"", accounts_hash, b"")

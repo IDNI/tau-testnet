@@ -12,22 +12,25 @@ from tau_native import TauInterface, TauEngineCrash
 
 # The templates from web-wallet/app.js generateRandomTauRule()
 def get_templates():
-    outA, outB = 5, 6
-    inA, inB, inC = 1, 2, 3
+    # Mirror generateRandomTauRule(): read the bv[24] value inputs i1/i2 and
+    # write to FREE output streams (>=12) so the demo rules never clash with
+    # the protocol-reserved streams 0..11 under the engine's global typing.
+    outA, outB = 12, 13
+    inA, inB, inC = 1, 2, 2
     sh1, sh2 = 3, 2
     bit = 1
     
-    # Keep these consistent with the current web wallet generator, which uses bv[16].
-    hx = lambda n: f"{{ #x{n:02x} }}:bv[16]"
-    
+    # Keep these consistent with the current web wallet generator, which uses bv[24].
+    hx = lambda n: f"{{ #x{n:02x} }}:bv[24]"
+
     return [
         f"always (o{outA}[t] = {hx(bit)}).",
-        
-        f"always ( ((i{inA}[t]:bv[16] + i{inB}[t]:bv[16]) >= {hx(0x80)} && o{outA}[t] = {hx(1)}) || ((i{inA}[t]:bv[16] + i{inB}[t]:bv[16]) < {hx(0x80)} && o{outA}[t] = {hx(0)}) ).",
-        
-        f"always ( o{outA}[t]:bv[16] = (i{inA}[t]:bv[16] >> {hx(sh1)}) + (i{inB}[t]:bv[16] << {hx(sh2)}) ).",
-        
-        f"always ( ((i{inA}[t]:bv[16] > i{inA}[t-1]:bv[16]) && o{outA}[t] = {hx(1)}) || ((i{inA}[t]:bv[16] <= i{inA}[t-1]:bv[16]) && o{outA}[t] = {hx(0)}) )."
+
+        f"always ( ((i{inA}[t]:bv[24] + i{inB}[t]:bv[24]) >= {hx(0x80)} && o{outA}[t] = {hx(1)}) || ((i{inA}[t]:bv[24] + i{inB}[t]:bv[24]) < {hx(0x80)} && o{outA}[t] = {hx(0)}) ).",
+
+        f"always ( o{outA}[t]:bv[24] = (i{inA}[t]:bv[24] >> {hx(sh1)}) + (i{inB}[t]:bv[24] << {hx(sh2)}) ).",
+
+        f"always ( ((i{inA}[t]:bv[24] > i{inA}[t-1]:bv[24]) && o{outA}[t] = {hx(1)}) || ((i{inA}[t]:bv[24] <= i{inA}[t-1]:bv[24]) && o{outA}[t] = {hx(0)}) )."
     ]
 
 @pytest.mark.parametrize("rule_idx, rule_text", enumerate(get_templates()))

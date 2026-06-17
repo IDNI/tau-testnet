@@ -132,7 +132,7 @@ class TestTauOutputDeterminism(_TauDeterminismBase):
 
     def test_determinism_o5_user_policy(self):
         # o5 is index 5
-        rule = "always ((i3[t] = {#x0011}:bv[16] && i1[t] > {1000}:bv[16]) ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16])."
+        rule = "always ((i3[t] = {#x0011}:bv[16] && i1[t] > {1000}:bv[24]) ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16])."
         
         interface1 = tau_native.TauInterface(GENESIS_TAU)
         interface2 = tau_native.TauInterface(GENESIS_TAU)
@@ -152,7 +152,7 @@ class TestTauOutputDeterminism(_TauDeterminismBase):
 
     def test_determinism_o9_consensus_fee(self):
         # o9 is index 9
-        rule = "always (o9[t]:bv[16] = { #x000a }:bv[16])."
+        rule = "always (o9[t]:bv[24] = { #x00000a }:bv[24])."
         
         interface1 = tau_native.TauInterface(GENESIS_TAU)
         interface2 = tau_native.TauInterface(GENESIS_TAU)
