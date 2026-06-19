@@ -341,6 +341,18 @@ def get_string_id(text: str) -> str:
             _db_conn.commit()
         return f'y{id_num}'
 
+def get_max_string_id() -> int:
+    """Largest assigned tau_strings id (0 if empty). Used to pick the smallest
+    bv shrink width that covers the current interned-address count."""
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT MAX(id) FROM tau_strings')
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
 def get_text_by_id(yid: str) -> str:
     """
     Given a Tau-style ID ('y<id>'), returns the original text.

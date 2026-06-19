@@ -36,6 +36,14 @@ class TauSettings:
     program_file: str = 'genesis.tau'
     ready_signal: str = "Execution step: 0"
     comm_debug_path: Optional[str] = None
+    # Eval-only shrinking of long equality-only bitvectors (see tau_shrink.py).
+    # Consensus-safe: the state hash commits to canonical raw application-rule text
+    # (chain_state accumulation), never the interpreter's shrunk composed spec, so
+    # the node-local shrink width is invisible to consensus. ON by default.
+    shrink_enabled: bool = True
+    # Force-exclude input stream indices from shrinking (safety override; the
+    # usage classifier is the primary gate).
+    shrink_stream_exclude: frozenset = field(default_factory=frozenset)
 
     def validate(self) -> None:
         if not self.program_file:
@@ -282,6 +290,12 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_PROGRAM_FILE": ("tau", "program_file", str),
     "TAU_READY_SIGNAL": ("tau", "ready_signal", str),
     "TAU_COMM_DEBUG_PATH": ("tau", "comm_debug_path", str),
+    "TAU_SHRINK_ENABLED": ("tau", "shrink_enabled", lambda v: v.lower() in ("true", "1", "yes")),
+    "TAU_SHRINK_STREAM_EXCLUDE": (
+        "tau",
+        "shrink_stream_exclude",
+        lambda value: frozenset(int(x) for x in value.split(",") if x.strip()),
+    ),
     "TAU_PROCESS_TIMEOUT": ("timeouts", "process_timeout", int),
     "TAU_COMM_TIMEOUT": ("timeouts", "comm_timeout", int),
     "TAU_CLIENT_WAIT_TIMEOUT": ("timeouts", "client_wait_timeout", int),
@@ -484,7 +498,7 @@ def load_settings(env: Optional[str] = None, overrides: Optional[Dict[str, Any]]
 
 def _sync_legacy_exports(current: Settings) -> None:
     global HOST, PORT, BUFFER_SIZE
-    global TAU_PROGRAM_FILE, TAU_READY_SIGNAL, COMM_DEBUG_PATH
+    global TAU_PROGRAM_FILE, TAU_READY_SIGNAL, COMM_DEBUG_PATH, TAU_SHRINK_ENABLED, TAU_SHRINK_STREAM_EXCLUDE
     global PROCESS_TIMEOUT, COMM_TIMEOUT, CLIENT_WAIT_TIMEOUT, SHUTDOWN_TIMEOUT
     global STRING_DB_PATH
     global BOOTSTRAP_PEERS, NETWORK_ID, NETWORK_LISTEN, PEERSTORE_PATH, peerstore_path
@@ -501,6 +515,8 @@ def _sync_legacy_exports(current: Settings) -> None:
     TAU_PROGRAM_FILE = current.tau.program_file
     TAU_READY_SIGNAL = current.tau.ready_signal
     COMM_DEBUG_PATH = current.tau.comm_debug_path
+    TAU_SHRINK_ENABLED = current.tau.shrink_enabled
+    TAU_SHRINK_STREAM_EXCLUDE = current.tau.shrink_stream_exclude
 
     PROCESS_TIMEOUT = current.timeouts.process_timeout
     COMM_TIMEOUT = current.timeouts.comm_timeout
@@ -568,6 +584,8 @@ __all__ = [
     "TAU_PROGRAM_FILE",
     "TAU_READY_SIGNAL",
     "COMM_DEBUG_PATH",
+    "TAU_SHRINK_ENABLED",
+    "TAU_SHRINK_STREAM_EXCLUDE",
     "PROCESS_TIMEOUT",
     "COMM_TIMEOUT",
     "CLIENT_WAIT_TIMEOUT",

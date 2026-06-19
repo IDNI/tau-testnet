@@ -1050,18 +1050,6 @@ def _load_tau_bootstrap_spec() -> str:
         return ""
 
 
-def _derive_application_rules_fragment(spec_text: str, consensus_text: str = "") -> str:
-    remainder = _preprocess_tau_spec_text(spec_text)
-    bootstrap_spec = _load_tau_bootstrap_spec()
-    consensus_spec = _preprocess_tau_spec_text(consensus_text)
-
-    if bootstrap_spec and remainder.startswith(bootstrap_spec):
-        remainder = remainder[len(bootstrap_spec):].lstrip()
-    if consensus_spec and remainder.startswith(consensus_spec):
-        remainder = remainder[len(consensus_spec):].lstrip()
-    return remainder
-
-
 def get_tau_restore_state() -> str:
     """
     Returns a Tau-native restoreable spec. The application rules natively encode the
@@ -1115,10 +1103,13 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
         application_snapshot = ""
 
     normalized_consensus = _preprocess_tau_spec_text(consensus_snapshot)
-    normalized_application = _derive_application_rules_fragment(
-        application_snapshot,
-        consensus_text=consensus_snapshot,
-    )
+    # The application snapshot is now a canonical raw accumulation of newline-
+    # separated rule units. Replay them ONE-BY-ONE in order (preserves u-state
+    # override/retraction semantics; the interpreter re-shrinks each on the way in).
+    application_units = [
+        u for u in (application_snapshot or "").split("\n") if u.strip()
+    ]
+    application_unit_set = set(application_units)
 
     plan: List[Dict[str, object]] = []
     if normalized_consensus:
@@ -1127,10 +1118,10 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
             "text": normalized_consensus,
             "persist": False,
         })
-    if normalized_application:
+    for u_idx, unit in enumerate(application_units, start=1):
         plan.append({
-            "label": "application_rules",
-            "text": normalized_application,
+            "label": f"application_rule_{u_idx}",
+            "text": unit,
             "persist": False,
         })
 
@@ -1138,7 +1129,8 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
         normalized_rule = _preprocess_tau_spec_text(rule_text)
         if not normalized_rule:
             continue
-        if normalized_application and normalized_rule in normalized_application:
+        # Exact-unit dedup (NOT substring) against the application accumulation.
+        if normalized_rule in application_unit_set:
             continue
         plan.append({
             "label": f"builtin_rule_{idx}",
@@ -1162,22 +1154,29 @@ def save_application_rules_state(rules_content: str):
         _application_rules_state = rules_content or ""
 
 
-def save_effective_tau_spec(spec_text: str):
+def save_effective_tau_spec(canonical_rule_text: str):
     """
-    Persist a full Tau interpreter spec by stripping any currently-known consensus
-    prefix before storing the application-rules fragment.
+    Append ONE canonical (full-width, pre-shrink) application rule to the raw
+    application-rules accumulation. The accumulation -- not the interpreter's
+    composed (and possibly shrunk) spec -- is the authoritative, hashed
+    application-rules state, mirroring how consensus rules use
+    `"\\n".join(rule_revisions)`. Because it is canonical full-width text, the
+    consensus state hash is independent of the node-local shrink width.
     """
     global _application_rules_state
-    normalized_full_spec = _preprocess_tau_spec_text(spec_text)
+    unit = _preprocess_tau_spec_text(canonical_rule_text)
+    if not unit:
+        return
     with _rules_lock:
-        _application_rules_state = _derive_application_rules_fragment(
-            normalized_full_spec,
-            consensus_text=_consensus_rules_state,
-        )
+        units = [u for u in (_application_rules_state or "").split("\n") if u.strip()]
+        if unit not in units:  # idempotent: dedup exact units (re-apply / replay)
+            units.append(unit)
+        _application_rules_state = "\n".join(units)
+        snapshot = _application_rules_state
     try:
-        db.set_chain_state_value("full_tau_spec", normalized_full_spec)
+        db.set_chain_state_value("full_tau_spec", snapshot)
     except Exception:
-        logger.exception("Failed to persist full Tau spec snapshot")
+        logger.exception("Failed to persist application-rules accumulation")
         
 def save_consensus_rules_state(rules_content: str):
     global _consensus_rules_state

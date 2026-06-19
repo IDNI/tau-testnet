@@ -8,6 +8,7 @@ import tau_defs
 import utils
 from errors import TauCommunicationError, TauEngineCrash
 import tau_native
+import tau_shrink
 import tau_io_logger
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,15 @@ _state_restore_callback = None
 last_known_tau_spec: str | None = None
 tau_direct_interface: tau_native.TauInterface | None = None
 
+# Eval-only shrink state. `last_known_tau_spec` is always the CANONICAL
+# full-width spec (the only thing persisted). `_current_prepared_spec` holds the
+# canonical/runtime split for the spec currently loaded in the interpreter, and
+# `_runtime_shrunk_streams` is the set of input stream indices whose runtime
+# values must be shrunk to match the loaded (shrunk) rule. These are updated
+# only AFTER a successful interpreter update, under `tau_comm_lock`.
+_current_prepared_spec: "tau_shrink.PreparedTauSpec | None" = None
+_runtime_shrunk_streams: frozenset = frozenset()
+
 
 # Watchdog monitors in-flight Tau communication; limit is config.COMM_TIMEOUT (TAU_COMM_TIMEOUT).
 WATCHDOG_COMM_TIMEOUT_NAME = "comm_timeout"
@@ -153,6 +163,11 @@ def is_force_test_enabled() -> bool:
 
 
 def _preprocess_rule_for_tau(rule_text: str | None) -> str | None:
+    """Return the CANONICAL full-width normalized rule text (never shrunk).
+
+    This is the authoritative form that gets persisted and hashed. Shrinking is
+    layered on top by `_prepare_rule_for_tau`.
+    """
     if rule_text is None:
         return None
     if tau_direct_interface and hasattr(tau_direct_interface, "preprocess_spec_text"):
@@ -161,6 +176,29 @@ def _preprocess_rule_for_tau(rule_text: str | None) -> str | None:
     if text.lstrip().startswith("always"):
         text = normalize_rule_bitvector_sizes(text)
     return text
+
+
+def _shrink_exclude() -> frozenset:
+    if not getattr(config, "TAU_SHRINK_ENABLED", False):
+        return frozenset()
+    return frozenset(getattr(config, "TAU_SHRINK_STREAM_EXCLUDE", frozenset()))
+
+
+def _prepare_rule_for_tau(rule_text: str | None) -> "tau_shrink.PreparedTauSpec | None":
+    """Canonical/runtime split for a rule. canonical_text is persisted; the
+    interpreter is fed runtime_text. Disabled => canonical == runtime."""
+    canonical = _preprocess_rule_for_tau(rule_text)
+    if canonical is None:
+        return None
+    if not getattr(config, "TAU_SHRINK_ENABLED", False):
+        return tau_shrink.PreparedTauSpec(canonical, canonical, False, frozenset())
+    return tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
+
+
+def get_canonical_spec() -> str | None:
+    """The full-width spec safe to persist/hash. NEVER the interpreter's
+    (possibly shrunk) `get_current_spec()`."""
+    return last_known_tau_spec
 
 
 def _normalize_tau_input_value(value: str | None) -> str | None:
@@ -174,6 +212,87 @@ def _normalize_tau_input_value(value: str | None) -> str | None:
     if re.fullmatch(r"[0-9a-fA-F]+", text) and any(ch in "abcdefABCDEF" for ch in text):
         return f"#x{text}"
     return text
+
+
+def _collect_i0_prepared(input_stream_values) -> list:
+    """Prepare any rule(s) supplied via the i0 input stream (rare). Returns the
+    PreparedTauSpec for each so the caller can union shrink sets and commit."""
+    out = []
+    if not input_stream_values:
+        return out
+    for k, v in input_stream_values.items():
+        if str(k) not in {"0", "i0"}:
+            continue
+        items = v if isinstance(v, (list, tuple)) else [v]
+        for p in items:
+            prep = _prepare_rule_for_tau(str(p).replace('\n', ' '))
+            if prep is not None:
+                out.append(prep)
+    return out
+
+
+def _normalize_inputs(input_stream_values, effective_shrunk: frozenset):
+    """Normalize every stream value, shrinking allowlisted address streams.
+
+    May raise tau_shrink.ShrinkUnavailable if a value that MUST shrink (its index
+    is in effective_shrunk) cannot be interned -- the caller fails closed."""
+    if not input_stream_values:
+        return None
+
+    def _one(k, p):
+        idx = None
+        try:
+            idx = int(k)
+        except (TypeError, ValueError):
+            idx = None
+        p_str = str(p).replace('\n', ' ')
+        if str(k) in {"0", "i0"}:
+            prep = _prepare_rule_for_tau(p_str)
+            return (prep.runtime_text if prep else p_str) or ""
+        if p_str.lstrip().startswith("always"):
+            prep = _prepare_rule_for_tau(p_str)
+            return (prep.runtime_text if prep else p_str) or ""
+        base = _normalize_tau_input_value(p_str) or ""
+        if idx is not None:
+            base = tau_shrink.shrink_stream_value(base, idx, effective_shrunk)
+        return base
+
+    normalized = {}
+    for k, v in input_stream_values.items():
+        if isinstance(v, (list, tuple)):
+            normalized[k] = [_one(k, p) for p in v]
+        else:
+            normalized[k] = _one(k, v)
+    return normalized
+
+
+def _commit_runtime_spec(prepared) -> None:
+    """Commit the runtime shrink state (which input streams to shrink) for a
+    successfully-loaded spec. MUST be called under tau_comm_lock, AFTER the
+    interpreter update succeeds. Does NOT touch last_known_tau_spec: that stays
+    the full COMPOSED interpreter spec (see communicate_with_tau), which
+    createblock save/restore and persistence both depend on."""
+    global _current_prepared_spec, _runtime_shrunk_streams
+    _current_prepared_spec = prepared
+    _runtime_shrunk_streams = prepared.shrunk_streams
+
+
+def _handle_width_overflow(exc: "tau_shrink.ShrinkWidthOverflow"):
+    """A newly-interned address overflowed the current process shrink width. The
+    width cannot grow in-process (the native engine's per-stream bv typing is
+    sticky), so re-exec the process: a fresh process re-reads the now-larger intern
+    table and picks the wider width. The overflowing id is already persisted, and
+    the in-flight tx/block was NOT committed, so nothing is lost; it is re-processed
+    after restart. Tests set TAU_NO_WIDTH_REEXEC=1 (or run in tau_test_mode) to
+    observe the exception instead of replacing the process."""
+    import sys
+    if tau_test_mode or os.environ.get("TAU_NO_WIDTH_REEXEC") == "1":
+        raise exc
+    logger.warning(
+        "tau_shrink: %s -- re-exec to grow the shrink bv width (sticky per-stream "
+        "typing cannot widen in-process).", exc
+    )
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def start_and_manage_tau_process():
@@ -201,6 +320,10 @@ def start_and_manage_tau_process():
     try:
         tau_direct_interface = tau_native.TauInterface(config.TAU_PROGRAM_FILE)
         logger.info("Tau Native Interface initialized successfully.")
+        # Pick the smallest shrink width for this process from the current intern
+        # table. Sticky per-stream typing means it is fixed until the next re-exec.
+        if getattr(config, "TAU_SHRINK_ENABLED", False):
+            tau_shrink.set_shrink_width_from_db()
         tau_process_ready.set()
 
         if _state_restore_callback:
@@ -303,34 +426,33 @@ def communicate_with_tau(
              filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
              raise TauEngineCrash(msg)
 
+        # --- Shrink: canonical (persisted) vs runtime (interpreter) split ---
+        prepared = None
         if rule_text is not None:
-            rule_text = _preprocess_rule_for_tau(rule_text)
+            prepared = _prepare_rule_for_tau(rule_text)
+            if prepared is not None:
+                rule_text = prepared.runtime_text  # feed the interpreter the shrunk form
 
-        normalized_inputs = None
-        if input_stream_values:
-            normalized_inputs = {}
-            for k, v in input_stream_values.items():
-                if isinstance(v, (list, tuple)):
-                    parts = []
-                    for p in v:
-                        p_str = str(p).replace('\n', ' ')
-                        if str(k) in {"0", "i0"}:
-                            p_str = _preprocess_rule_for_tau(p_str) or ""
-                        elif p_str.lstrip().startswith("always"):
-                            p_str = normalize_rule_bitvector_sizes(p_str)
-                        else:
-                            p_str = _normalize_tau_input_value(p_str) or ""
-                        parts.append(p_str)
-                    normalized_inputs[k] = parts
-                else:
-                    v_str = str(v).replace('\n', ' ')
-                    if str(k) in {"0", "i0"}:
-                        v_str = _preprocess_rule_for_tau(v_str) or ""
-                    elif v_str.lstrip().startswith("always"):
-                        v_str = normalize_rule_bitvector_sizes(v_str)
-                    else:
-                        v_str = _normalize_tau_input_value(v_str) or ""
-                    normalized_inputs[k] = v_str
+        i0_stream_preps = _collect_i0_prepared(input_stream_values)
+
+        # Effective shrink set for THIS evaluation: a spec update redefines it,
+        # otherwise use the committed runtime set.
+        if prepared is not None:
+            effective_shrunk = set(prepared.shrunk_streams)
+        else:
+            effective_shrunk = set(_runtime_shrunk_streams)
+        for p in i0_stream_preps:
+            effective_shrunk |= set(p.shrunk_streams)
+        effective_shrunk = frozenset(effective_shrunk)
+
+        try:
+            normalized_inputs = _normalize_inputs(input_stream_values, effective_shrunk)
+        except tau_shrink.ShrinkUnavailable as exc:
+            # A stream value that must shrink could not be interned while a shrunk
+            # convention is active. Abort rather than feed a mixed-width wrong verdict.
+            raise TauCommunicationError(
+                f"Shrink unavailable for stream value: {exc}", last_state=last_known_tau_spec
+            )
 
         try:
             _print_tau_dispatch(
@@ -361,29 +483,43 @@ def communicate_with_tau(
         except Exception:
             pass
 
-        current_full_spec = None
-        if hasattr(tau_direct_interface, "get_current_spec"):
-            try:
-                current_full_spec = tau_direct_interface.get_current_spec()
-            except Exception:
-                pass
+        # Commit runtime shrink state (shrunk-stream set) AFTER a successful
+        # interpreter update.
+        spec_for_commit = i0_stream_preps[-1] if i0_stream_preps else prepared
+        if spec_for_commit is not None:
+            _commit_runtime_spec(spec_for_commit)
 
-        if current_full_spec:
-            last_known_tau_spec = current_full_spec
-        elif rule_text is not None and target_output_stream_index == 0:
-            last_known_tau_spec = rule_text
+        # last_known_tau_spec is kept ONLY as a debug/error-state aid. It is the
+        # interpreter's composed (possibly shrunk) spec and is NEVER hashed or
+        # persisted -- the authoritative application-rules state is the canonical
+        # raw accumulation in chain_state (fed below), so consensus is width-independent.
+        try:
+            if hasattr(tau_direct_interface, "get_current_spec"):
+                last_known_tau_spec = tau_direct_interface.get_current_spec() or last_known_tau_spec
+        except Exception:
+            pass
 
-        if apply_rules_update and rule_text is not None and target_output_stream_index == 0 and _rules_handler and last_known_tau_spec:
+        # Persist the CANONICAL full-width rule text (append to the raw accumulation).
+        # Only application-rule updates (target o0, apply_rules_update=True); consensus
+        # rules are tracked separately via "\n".join(rule_revisions).
+        if apply_rules_update and target_output_stream_index == 0 and _rules_handler and spec_for_commit is not None:
             try:
-                _rules_handler(last_known_tau_spec)
+                _rules_handler(spec_for_commit.canonical_text)
             except Exception as e:
                 logger.error("Failed to save updated spec: %s", e)
+
+        try:
+            output_val = tau_shrink.expand_output_value(output_val, target_output_stream_index)
+        except Exception:
+            pass
 
         try:
             return utils.normalize_tau_atoms(str(output_val))
         except Exception:
             return output_val
 
+    except tau_shrink.ShrinkWidthOverflow as wexc:
+        _handle_width_overflow(wexc)  # re-execs (or re-raises in test mode)
     finally:
         _write_status(start=False)
         tau_comm_lock.release()
@@ -423,44 +559,43 @@ def communicate_with_tau_multi(
         filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
         raise TauEngineCrash(msg)
 
-    normalized_inputs = None
-    if input_stream_values:
-        normalized_inputs = {}
-        for k, v in input_stream_values.items():
-            if isinstance(v, (list, tuple)):
-                parts = []
-                for p in v:
-                    p_str = str(p).replace('\n', ' ')
-                    if str(k) in {"0", "i0"}:
-                        p_str = _preprocess_rule_for_tau(p_str) or ""
-                    else:
-                        p_str = _normalize_tau_input_value(p_str) or ""
-                    parts.append(p_str)
-                normalized_inputs[k] = parts
-            else:
-                v_str = str(v).replace('\n', ' ')
-                if str(k) in {"0", "i0"}:
-                    v_str = _preprocess_rule_for_tau(v_str) or ""
-                elif v_str.lstrip().startswith("always"):
-                    v_str = normalize_rule_bitvector_sizes(v_str)
-                else:
-                    v_str = _normalize_tau_input_value(v_str) or ""
-                normalized_inputs[k] = v_str
-
+    # NOTE: deliberately lock-free, mirroring the pre-shrink behavior. This path
+    # can be entered while tau_comm_lock is already held elsewhere (e.g. nested
+    # under the rule-exec path in apply_block), so acquiring it here would
+    # self-deadlock on the non-reentrant lock.
     _write_status(start=True, source=source)
     try:
-        _print_tau_dispatch(
-            source=source,
-            input_stream_values=normalized_inputs or input_stream_values,
-        )
-        result = tau_direct_interface.communicate_multi(
-            rule_text=None,
-            input_stream_values=normalized_inputs or input_stream_values,
-            source=source,
-            apply_rules_update=apply_rules_update,
-        )
-    except Exception as ex:
-        raise TauCommunicationError(f"Direct Tau multi-output communication failed: {ex}", last_state=last_known_tau_spec)
+        i0_stream_preps = _collect_i0_prepared(input_stream_values)
+        effective_shrunk = set(_runtime_shrunk_streams)
+        for p in i0_stream_preps:
+            effective_shrunk |= set(p.shrunk_streams)
+        effective_shrunk = frozenset(effective_shrunk)
+
+        try:
+            normalized_inputs = _normalize_inputs(input_stream_values, effective_shrunk)
+        except tau_shrink.ShrinkUnavailable as exc:
+            raise TauCommunicationError(
+                f"Shrink unavailable for stream value: {exc}", last_state=last_known_tau_spec
+            )
+
+        try:
+            _print_tau_dispatch(
+                source=source,
+                input_stream_values=normalized_inputs or input_stream_values,
+            )
+            result = tau_direct_interface.communicate_multi(
+                rule_text=None,
+                input_stream_values=normalized_inputs or input_stream_values,
+                source=source,
+                apply_rules_update=apply_rules_update,
+            )
+        except Exception as ex:
+            raise TauCommunicationError(f"Direct Tau multi-output communication failed: {ex}", last_state=last_known_tau_spec)
+
+        if i0_stream_preps:
+            _commit_runtime_spec(i0_stream_preps[-1])
+    except tau_shrink.ShrinkWidthOverflow as wexc:
+        _handle_width_overflow(wexc)  # re-execs (or re-raises in test mode)
     finally:
         _write_status(start=False)
 
@@ -481,9 +616,13 @@ def communicate_with_tau_multi(
     normalized_result = {}
     for idx, val in result.items():
         try:
-            normalized_result[idx] = utils.normalize_tau_atoms(str(val))
+            expanded = tau_shrink.expand_output_value(val, idx)
         except Exception:
-            normalized_result[idx] = str(val)
+            expanded = val
+        try:
+            normalized_result[idx] = utils.normalize_tau_atoms(str(expanded))
+        except Exception:
+            normalized_result[idx] = str(expanded)
     return normalized_result
 
 
@@ -511,10 +650,25 @@ def restore_full_tau_spec(spec_text: str) -> None:
     if not tau_direct_interface:
         raise TauEngineCrash("Cannot restore Tau spec before direct interface initialization.")
 
-    prepared_spec = tau_direct_interface.preprocess_spec_text(spec_text or "")
-    _print_tau_send("restore_full_tau_spec update_spec", prepared_spec)
-    tau_direct_interface.update_spec(prepared_spec)
-    last_known_tau_spec = tau_direct_interface.get_current_spec() or prepared_spec
+    # Feed the interpreter the shrunk runtime form (matching the i0 path) so
+    # runtime stream values stay consistent post-recovery. When shrink is off
+    # (default) runtime == canonical and this is identical to the pre-shrink path.
+    canonical = tau_direct_interface.preprocess_spec_text(spec_text or "")
+    if getattr(config, "TAU_SHRINK_ENABLED", False):
+        # Re-pick the process width from the (now-restored) intern table first.
+        tau_shrink.set_shrink_width_from_db()
+        prepared = tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
+    else:
+        prepared = tau_shrink.PreparedTauSpec(canonical, canonical, False, frozenset())
+    _print_tau_send("restore_full_tau_spec update_spec", prepared.runtime_text)
+    tau_direct_interface.update_spec(prepared.runtime_text)
+    _commit_runtime_spec(prepared)
+    try:
+        last_known_tau_spec = tau_direct_interface.get_current_spec() or canonical
+    except Exception:
+        last_known_tau_spec = canonical
+    # Full composed interpreter spec (== canonical when shrink is off).
+    last_known_tau_spec = tau_direct_interface.get_current_spec() or prepared.canonical_text
 
 
 def get_tau_process_status():
@@ -595,6 +749,7 @@ def parse_tau_output(output_val: str) -> int:
 __all__ = [
     "communicate_with_tau",
     "communicate_with_tau_multi",
+    "get_canonical_spec",
     "get_tau_process_status",
     "get_recent_stderr",
     "request_shutdown",
