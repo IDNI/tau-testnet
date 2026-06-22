@@ -37,8 +37,12 @@ let governanceAdvisory = null;
 const GOV_DEBUG = false;
 let revisionEditors = [];
 
-const DEFAULT_RULE_BV_WIDTH = 64;
-const MAX_TAU_TRANSFER_AMOUNT = (1 << DEFAULT_RULE_BV_WIDTH) - 1;
+// Balances/amounts/fees are bv[24] on-chain (commit 519fec0). Max value is
+// 2**24 - 1 = 16777215. Compute with exponentiation, NOT `1 << 24`: JS bitwise
+// shifts operate on 32-bit ints with a mod-32 shift count, so `1 << N` silently
+// wraps for N >= 32 (e.g. `1 << 64 === 1`).
+const TAU_BV_WIDTH = 24;
+const MAX_TAU_TRANSFER_AMOUNT = 2 ** TAU_BV_WIDTH - 1;
 
 // --- DOM Elements ---
 const hostInput = document.getElementById('host');
@@ -82,6 +86,7 @@ const btnRefreshAccounts = document.getElementById('btn-refresh-accounts');
 const knownAccountsList = document.getElementById('known-accounts-menu'); // UPDATED for Dropdown
 
 const txAmount = document.getElementById('tx-amount');
+const txFeeLimit = document.getElementById('tx-fee-limit');
 const txRule = document.getElementById('tx-rule');
 const txCustom = document.getElementById('tx-custom'); // New element
 const ruleValidationStatus = document.getElementById('rule-validation-status');
@@ -507,6 +512,19 @@ function handleServerResponse(msg) {
                 }
             } else {
                 log(`FAILURE: ${errMsg}`, 'error');
+                const errCode = (env.error && env.error.code) || '';
+                const errDetails = (env.error && env.error.details) || {};
+                // Reactive fee auto-estimate: the chain returns the computed
+                // required fee on rejection. Prefill the fee field so the user
+                // can resend at the correct cap (no dry-run RPC exists).
+                if (errCode === 'FEE_LIMIT_TOO_LOW' && txFeeLimit &&
+                        Number.isFinite(Number(errDetails.required_fee))) {
+                    txFeeLimit.value = String(errDetails.required_fee);
+                    log(`Fee limit too low. Updated fee limit to required ${errDetails.required_fee}. Review and resend.`, 'warn');
+                } else if (errCode === 'INSUFFICIENT_FUNDS' &&
+                        errDetails.required !== undefined) {
+                    log(`Insufficient funds: balance ${errDetails.balance}, need ${errDetails.required} (transfers + fee).`, 'warn');
+                }
                 if (_pendingGovTx) {
                     // Governance tx failed — leave sequence unchanged, clear pending state
                     _pendingGovTx = null;
@@ -767,8 +785,8 @@ async function onSendTransaction() {
                 log(`Custom key must be an integer: "${keyStr}"`, "error");
                 return;
             }
-            if (kInt < 4) {
-                log(`Custom key must be >= 4 (reserved): "${keyStr}"`, "error");
+            if (kInt < 6) {
+                log(`Custom key must be >= 6 (streams 0-5 reserved): "${keyStr}"`, "error");
                 return;
             }
             ops[keyStr] = valStr;
@@ -813,6 +831,16 @@ async function onSendTransaction() {
         return;
     }
 
+    // Fee limit: the max fee the sender will pay. The chain charges the actual
+    // fee (sum of o9 consensus + o8 custom over eval steps) and rejects the tx
+    // if it exceeds this cap. Default 10 matches the genesis base fee (o9).
+    const feeLimitVal = txFeeLimit && txFeeLimit.value !== "" ? txFeeLimit.value : "10";
+    const feeLimitNum = Number(feeLimitVal);
+    if (!Number.isFinite(feeLimitNum) || !Number.isInteger(feeLimitNum) || feeLimitNum < 0) {
+        log("Fee limit must be a non-negative integer.", "error");
+        return;
+    }
+
     // Payload for the wire (what gets sent to the server)
     const payload = {
         "tx_type": "user_tx",
@@ -820,9 +848,7 @@ async function onSendTransaction() {
         "sequence_number": seq,
         "expiration_time": Math.floor(Date.now() / 1000) + 300, // 5 mins
         "operations": ops,
-        // Matches the genesis consensus fee rule (o9); keep in sync with
-        // the network's active fee rule.
-        "fee_limit": "10"
+        "fee_limit": String(feeLimitNum)
     };
 
     try {
@@ -1315,16 +1341,17 @@ const ruleTemplates = {
     "Block all transfers": `# ---------------------------------------------------------
 # BLOCK ALL TRANSFERS FROM MY ACCOUNT
 # ---------------------------------------------------------
-# This rule unconditionally blocks all outgoing transfers from 
-# your specific account. Because Tau rules become part of the 
-# global state, we must scope this rule strictly to your own 
-# public key (i3) so we don't accidentally block the entire network!
+# This rule unconditionally blocks all outgoing transfers from
+# your specific account. Because Tau rules become part of the
+# global state, we must scope this rule strictly to your own
+# public key (i12) so we don't accidentally block the whole network!
 #
-# i3[t] : The sender's public key (represented as a 384-bit vector)
-# o5[t] : Output signal (0 = block, 1 = allow)
+# i12[t] : The sender's real public key (384-bit). i3/i4 are interned
+#          bv[16] ids, NOT pubkeys; the node injects the full key on i12.
+# o5[t]  : User-policy signal (bv[24]: 0 = block, 1 = allow)
 # ---------------------------------------------------------
 # Replace '#x1111...1111' with your own 96-character public key hex.
-always (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] -> o5[t] = {0}:bv[16]).`,
+always (i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] -> o5[t]:bv[24] = {#x000000}:bv[24]).`,
 
     "Limit transfers to max 5000": `# ---------------------------------------------------------
 # LIMIT TRANSFERS FROM MY ACCOUNT TO MAX 5000
@@ -1333,40 +1360,28 @@ always (i3[t] = {#x1111111111111111111111111111111111111111111111111111111111111
 # cannot exceed a maximum value of 5000. It is scoped to your
 # public key, so it only restricts your own transactions globally.
 #
-# i1[t] : The amount being transferred in the current transaction.
-# i3[t] : The sender's public key (represented as a 384-bit vector)
-# o5[t] : Output signal (0 = block if limit exceeded)
+# i1[t]  : The amount being transferred (bv[24], max 16777215).
+# i12[t] : The sender's real public key (bv[384]).
+# o5[t]  : Policy signal (bv[24]: 0 = block if limit exceeded, 1 = allow)
 # ---------------------------------------------------------
 # Replace '#x1111...1111' with your own 96-character public key hex.
-always ((i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && i1[t] > {5000}:bv[64]) -> o5[t] = {0}:bv[16]).`,
-
-    "Only allow transfers to a specific address": `# ---------------------------------------------------------
-# WHITELIST SPECIFIC RECIPIENT FOR MY ACCOUNT
-# ---------------------------------------------------------
-# This rule restricts outgoing transfers from your account so they 
-# can only be sent to one specific, verified address. Any attempt 
-# to send funds to a different address will be blocked.
-#
-# i3[t] : The sender's public key
-# i4[t] : The recipient's public key
-# o5[t] : Output signal (0 = block, 1 = allow)
-# ---------------------------------------------------------
-# Replace the placeholders with your public key and the allowed recipient's key.
-always ((i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && !(i4[t] = {#x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222}:bv[384])) ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]).`,
+always ((i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && i1[t]:bv[24] > {5000}:bv[24]) -> o5[t]:bv[24] = {#x000000}:bv[24]).`,
 
     "Require a specific custom input": `# ---------------------------------------------------------
 # REQUIRE TWO-FACTOR / CUSTOM DATA
 # ---------------------------------------------------------
-# This rule requires a specific custom data payload to be attached 
-# to any transaction originating from your account. This acts like 
+# This rule requires a specific custom data payload to be attached
+# to any transaction originating from your account. This acts like
 # a secret password that must be present.
 #
-# i3[t] : The sender's public key
-# i6[t] : The custom input data provided in the transaction
-#         (In this example, we expect #x4142 which is 'AB')
-# o5[t] : Output signal (0 = block, 1 = allow)
+# i12[t] : The sender's real public key (bv[384]).
+# i13[t] : Your custom input data. Attach it via Custom op key 13
+#          (streams 0-11 are reserved; i12 carries the sender key).
+#          In this example we expect the token 0x4142 ('AB').
+# o5[t]  : Policy signal (bv[24]: 0 = block, 1 = allow)
 # ---------------------------------------------------------
-always ((i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && !(i6[t] = {#x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004142}:bv[384])) ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]).`,
+# NOTE: every rule that reads i13 must agree on its bit-width (bv[24] here).
+always ((i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && !(i13[t]:bv[24] = {#x004142}:bv[24])) ? o5[t]:bv[24] = {#x000000}:bv[24] : o5[t]:bv[24] = {#x000001}:bv[24]).`,
 
     "Time-locked (Block transfers before time X)": `# ---------------------------------------------------------
 # TIME-LOCKED WALLET
@@ -1374,12 +1389,12 @@ always ((i3[t] = {#x111111111111111111111111111111111111111111111111111111111111
 # This rule completely freezes all outgoing transfers from your 
 # account until a specific blockchain timestamp has passed.
 #
-# i3[t] : The sender's public key
-# i5[t] : The current block timestamp (Unix epoch time)
-# o5[t] : Output signal (0 = block, 1 = allow)
+# i12[t] : The sender's real public key (bv[384]).
+# i5[t]  : The current block timestamp (Unix epoch, bv[64]).
+# o5[t]  : Policy signal (bv[24]: 0 = block, 1 = allow)
 # ---------------------------------------------------------
 # Change {1704067200} to your target Unix timestamp.
-always ((i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && i5[t] < {1704067200}:bv[64]) -> o5[t] = {0}:bv[16]).`,
+always ((i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && i5[t]:bv[64] < {1704067200}:bv[64]) -> o5[t]:bv[24] = {#x000000}:bv[24]).`,
 
     "Time-Decaying Multi-Signature Vault": `# ---------------------------------------------------------
 # TIME-DECAYING MULTI-SIGNATURE VAULT
@@ -1392,16 +1407,17 @@ always ((i3[t] = {#x111111111111111111111111111111111111111111111111111111111111
 # Useful for temporal escrows, trust funds, or security setups
 # where you want backup control to expire after a certain date.
 #
-# i3[t] : The primary sender's public key (The Vault)
-# i5[t] : The current block timestamp (injected as integer)
-# i6[t] : Custom input payload containing the Co-Signer's public key
-# o5[t] : Output signal (0 = block, 1 = allow)
+# i12[t] : The primary sender's real public key (The Vault, bv[384]).
+# i5[t]  : The current block timestamp (bv[64]).
+# i14[t] : Co-Signer's public key, supplied as custom input via Custom
+#          op key 14 (bv[384]).
+# o5[t]  : Policy signal (bv[24]: 0 = block, 1 = allow)
 # ---------------------------------------------------------
 always (
-  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] 
-   && i5[t] < {1800000000}:bv[64] 
-   && !(i6[t] = {#x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222}:bv[384])) 
-  ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
+  (i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
+   && i5[t]:bv[64] < {1800000000}:bv[64]
+   && !(i14[t]:bv[384] = {#x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222}:bv[384]))
+  ? o5[t]:bv[24] = {#x000000}:bv[24] : o5[t]:bv[24] = {#x000001}:bv[24]
 ).`,
 
     "Temporary Spending Limit": `# ---------------------------------------------------------
@@ -1413,18 +1429,18 @@ always (
 # expires, the spending limit permanently drops to a lower
 # threshold (e.g., 500).
 #
-# i1[t] : The amount being transferred
-# i3[t] : The sender's public key
-# i5[t] : The current block timestamp (injected as integer)
-# o5[t] : Output signal (0 = block transaction, 1 = allow)
+# i1[t]  : The amount being transferred (bv[24]).
+# i12[t] : The sender's real public key (bv[384]).
+# i5[t]  : The current block timestamp (bv[64]).
+# o5[t]  : Policy signal (bv[24]: 0 = block transaction, 1 = allow)
 # ---------------------------------------------------------
 always (
-  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]) ->
+  (i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]) ->
   (
     # Phase 1: High Limit before Timestamp (1800000000)
-    (i5[t] < {1800000000}:bv[64] && i1[t] > {5000}:bv[64] ? o5[t] = {0}:bv[16] : 
+    (i5[t]:bv[64] < {1800000000}:bv[64] && i1[t]:bv[24] > {5000}:bv[24] ? o5[t]:bv[24] = {#x000000}:bv[24] :
       # Phase 2: Low Limit after Timestamp (1800000000)
-      (!(i5[t] < {1800000000}:bv[64]) && i1[t] > {500}:bv[64] ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]))
+      (!(i5[t]:bv[64] < {1800000000}:bv[64]) && i1[t]:bv[24] > {500}:bv[24] ? o5[t]:bv[24] = {#x000000}:bv[24] : o5[t]:bv[24] = {#x000001}:bv[24]))
   )
 ).`,
 
@@ -1436,18 +1452,18 @@ always (
 # designated 3rd-party Arbiter approves the release.
 #
 # Input Streams:
-# i3[t] : Sender address of the transaction. We use this to scope the
-#         rule globally so it ONLY affects the Escrow Account.
-# i6[t] : Custom input payload containing the Arbiter's approval signal.
-#         (In this example, the Arbiter must provide {#x01}:bv[8] to release)
+# i12[t] : Sender's real public key (bv[384]). Scopes the rule so it ONLY
+#          affects the Escrow Account.
+# i13[t] : Custom input carrying the Arbiter's approval signal, attached
+#          via Custom op key 13 (bv[24]; provide 1 to release).
 #
 # Output Stream:
-# o5[t] : Output signal (0 = Keep funds locked, 1 = Release).
+# o5[t]  : Policy signal (bv[24]: 0 = keep locked, 1 = release).
 # ---------------------------------------------------------
 # Replace '#x1111...1111' with the Escrow's public key (96-char hex).
 always (
-  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && !(i6[t] = {1}:bv[64])) 
-  ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
+  (i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && !(i13[t]:bv[24] = {#x000001}:bv[24]))
+  ? o5[t]:bv[24] = {#x000000}:bv[24] : o5[t]:bv[24] = {#x000001}:bv[24]
 ).`,
 
     "2FA for High Value Transfers": `# ---------------------------------------------------------
@@ -1466,46 +1482,17 @@ always (
 # would provide the pre-image. For this readable community demo, 
 # we use a simple numeric token '9999'.
 #
-# i1[t] : The amount being transferred in the transaction.
-# i3[t] : The sender's public key (384-bit BLS signature).
-# i6[t] : The 2FA token provided in Custom operations. 
-# o5[t] : Output signal (0 = blocks the transaction, 1 = allows).
+# i1[t]  : The amount being transferred (bv[24]).
+# i12[t] : The sender's real public key (bv[384]).
+# i13[t] : The 2FA token, attached via Custom op key 13 (bv[24]).
+# o5[t]  : Policy signal (bv[24]: 0 = block, 1 = allow).
 # ---------------------------------------------------------
 # Replace '#x11111111...1111' with your 96-character public key hex.
 always (
-  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] 
-   && i1[t] > {1000}:bv[64] 
-   && !(i6[t] = {9999}:bv[64])) 
-  ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
-).`,
-
-    "Multi-Signature Smart Vault": `# ---------------------------------------------------------
-# MULTI-SIGNATURE SMART VAULT
-# ---------------------------------------------------------
-# This contract uses mathematical logic and bitvector 
-# arithmetic to manage fund security without relying on hidden states.
-#
-# STREAMS:
-# i1[t]   : Current transfer amount
-# i3[t]   : Primary sender's public key (The Vault)
-# i4[t]   : Secondary/Co-signer public key (Authenticated by network)
-# o5[t]   : Output signal (0 = block transaction, 1 = allow)
-# ---------------------------------------------------------
-
-always (
-  # SCOPE: This rule only triggers when the Vault is the sender.
-  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]) 
-  -> 
-  (
-    # 1. MULTI-SIGNATURE FOR LARGE TRANSFERS
-    # If the amount is > 1000, the specified Co-Signer public key MUST be present in Custom operation '4'.
-    ( (i1[t] > {1000}:bv[64] && !(i4[t] = {#x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222}:bv[384])) 
-      ? o5[t] = {0}:bv[16] :
-      
-      # 2. ABSOLUTE CEILING
-      # Even with a co-signer, no single normal transfer can exceed 10,000.
-      ( (i1[t] > {10000}:bv[64]) ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16] )
-    )
+  (i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
+   && i1[t]:bv[24] > {1000}:bv[24]
+   && !(i13[t]:bv[24] = {9999}:bv[24]))
+  ? o5[t]:bv[24] = {#x000000}:bv[24] : o5[t]:bv[24] = {#x000001}:bv[24]
 ).`,
 
     "Adaptive Treasury Vault (Pointwise Revision Demo)": `# =============================================================
@@ -1533,11 +1520,13 @@ always (
 #   All other senders pass through (vacuous truth from '->').
 #
 # STREAM TYPES:
-#   i1[t] : transfer amount           (bv[16])
-#   i3[t] : sender public key         (bv[384])
-#   i4[t] : recipient/counterparty    (bv[384])
-#   i5[t] : block timestamp           (bv[16])
-#   o5[t] : policy guard signal       (bv[16]: 0=block, 1=allow)
+#   i1[t]  : transfer amount          (bv[24])
+#   i12[t] : sender real public key   (bv[384])
+#   i5[t]  : block timestamp          (bv[64])
+#   o5[t]  : policy guard signal      (bv[24]: 0=block, 1=allow)
+#
+# NOTE: i3/i4 are interned bv[16] ids (not pubkeys) and there is no
+# real-recipient stream, so counterparty-based clauses are omitted.
 #
 # ----- POINTWISE REVISION INSTRUCTIONS -----
 # To revise ONLY the spending cap (Layer 2), send a SEPARATE
@@ -1547,43 +1536,36 @@ always (
 #
 # REVISION EXAMPLE A — Raise cap to 10000:
 #   always (
-#     (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
-#       && i1[t] > {10000}:bv[16])
-#     ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
+#     (i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
+#       && i1[t]:bv[24] > {10000}:bv[24])
+#     ? o5[t]:bv[24] = {#x000000}:bv[24] : o5[t]:bv[24] = {#x000001}:bv[24]
 #   ).
 #
 # REVISION EXAMPLE B — Time-dependent cap using 'ex':
 #   always (
 #     ex c (
-#       (i5[t] >= {1800000000}:bv[16] && c = {20000}:bv[16])
-#       || (i5[t] < {1800000000}:bv[16] && c = {10000}:bv[16])
+#       (i5[t]:bv[64] >= {1800000000}:bv[64] && c:bv[24] = {20000}:bv[24])
+#       || (i5[t]:bv[64] < {1800000000}:bv[64] && c:bv[24] = {10000}:bv[24])
 #     ) && (
-#       (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
-#         && i1[t] > c:bv[16])
-#       ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
+#       (i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
+#         && i1[t]:bv[24] > c:bv[24])
+#       ? o5[t]:bv[24] = {#x000000}:bv[24] : o5[t]:bv[24] = {#x000001}:bv[24]
 #     )
 #   ).
 # =============================================================
 
 # --- LAYER 1: IMMUTABLE CORE GUARD (o5) ---
 (always (
-  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384])
+  (i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384])
   -> (
     # 1. TIME-LOCK: Block all transfers before this timestamp.
-    (i5[t] < {1750000000}:bv[16]
-      ? o5[t] = {0}:bv[16]
+    (i5[t]:bv[64] < {1750000000}:bv[64]
+      ? o5[t]:bv[24] = {#x000000}:bv[24]
       : (
         # 2. ABSOLUTE CAP: No single transfer may exceed 50000.
-        (i1[t] > {50000}:bv[16]
-          ? o5[t] = {0}:bv[16]
-          : (
-            # 3. APPROVED-COUNTERPARTY: Transfers above 1000 require
-            #    the recipient to be a specific approved counterparty.
-            (i1[t] > {1000}:bv[16]
-              && !(i4[t] = {#x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222}:bv[384]))
-            ? o5[t] = {0}:bv[16]
-            : o5[t] = {1}:bv[16]
-          ))
+        (i1[t]:bv[24] > {50000}:bv[24]
+          ? o5[t]:bv[24] = {#x000000}:bv[24]
+          : o5[t]:bv[24] = {#x000001}:bv[24])
       ))
   )
 )) &&
@@ -1592,9 +1574,9 @@ always (
 # Tau composes it with Layer 1: transfer allowed only if
 # BOTH clauses output o5 = 1.
 (always (
-  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
-    && i1[t] > {5000}:bv[16])
-  ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16]
+  (i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]
+    && i1[t]:bv[24] > {5000}:bv[24])
+  ? o5[t]:bv[24] = {#x000000}:bv[24] : o5[t]:bv[24] = {#x000001}:bv[24]
 )).`,
 
     "Programmable Finance Protocol (Aspirational Features)": `# ================================================================
@@ -1613,24 +1595,26 @@ always (
 # needed to make on-chain programmable finance practical.
 #
 # ================================================================
-# STREAM LAYOUT:
+# STREAM LAYOUT (current ABI):
 #   INPUTS:
-#     i1[t] : transfer amount         (bv[16])
-#     i3[t] : sender address           (bv[384])
-#     i4[t] : recipient address        (bv[384])
-#     i5[t] : block timestamp          (bv[16])
-#     i6[t] : operation type           (bv[16])
-#             0=transfer, 1=governance_vote, 2=vesting_claim
-#     i7[t] : governance proposal id   (bv[16])
-#     i8[t] : vote weight / approval   (bv[16])
+#     i1[t]  : transfer amount        (bv[24])
+#     i2[t]  : sender balance         (bv[24])
+#     i3/i4  : interned from/to ids   (bv[16]; NOT pubkeys)
+#     i5[t]  : block timestamp        (bv[64])
+#     i6..i11: consensus ABI (height, ts, proposer, parent hash, ...)
+#     i12[t] : sender real public key (bv[384])
+#     i13+   : your custom inputs (attach via Custom op keys >= 13)
 #
-#   OUTPUTS:
-#     o5[t] : policy decision          (bv[16]: 0=block, 1=allow)
-#     o7[t] : governance tally         (bv[16]: accumulated votes)
-#     o8[t] : vesting release amount   (bv[16]: claimable tokens)
-#     o9[t] : audit log / reason code  (bv[16])
-#             0=ok, 1=rate_limit, 2=governance_denied,
-#             3=vesting_locked, 4=fee_too_low
+#   OUTPUTS (reserved):
+#     o1[t]  : transfer validation result (bv[24])
+#     o5[t]  : user policy decision        (bv[24]: 0=block, 1=allow)
+#     o6[t]  : block validity verdict
+#     o7[t]  : proposer eligibility verdict
+#     o8[t]  : user CUSTOM fee             (added to total fee)
+#     o9[t]  : CONSENSUS fee               (added to total fee)
+#     o12+   : free outputs for your own computations
+#
+#   The aspirational sections below are PSEUDOCODE (not valid Tau today).
 # ================================================================
 
 
@@ -1642,11 +1626,11 @@ always (
 # a hard spending cap and time-lock.
 
 (always (
-  (i3[t] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384])
+  (i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384])
   -> (
-    (i1[t] > {50000}:bv[16]
-      ? o5[t] = {0}:bv[16]
-      : o5[t] = {1}:bv[16])
+    (i1[t]:bv[24] > {50000}:bv[24]
+      ? o5[t]:bv[24] = {#x000000}:bv[24]
+      : o5[t]:bv[24] = {#x000001}:bv[24])
   )
 ))
 

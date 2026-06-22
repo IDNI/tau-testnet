@@ -188,8 +188,15 @@
                 <div class="tab-pane fade show active" id="tab-transfer" role="tabpanel">
                     <div class="mb-3">
                         <label for="tx-amount" class="form-label">Amount</label>
-                        <input type="number" class="form-control" id="tx-amount" placeholder="0" min="0" max="65535"
+                        <input type="number" class="form-control" id="tx-amount" placeholder="0" min="0" max="16777215"
                             step="1">
+                    </div>
+                    <div class="mb-3">
+                        <label for="tx-fee-limit" class="form-label">Fee limit</label>
+                        <input type="number" class="form-control" id="tx-fee-limit" placeholder="10" min="0"
+                            value="10" step="1">
+                        <div class="form-text">Max fee you'll pay. Tx is rejected if the actual fee exceeds this.
+                            Default 10 matches the network base fee.</div>
                     </div>
                 </div>
 

@@ -39,8 +39,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etRule: EditText
     private lateinit var actTo: AutoCompleteTextView
     private lateinit var etAmount: EditText
-    private lateinit var etCustomOps: EditText
-
+    private lateinit var etFeeLimit: EditText
     private lateinit var etCustomOps: EditText
     private lateinit var tabLayoutTx: TabLayout
     private lateinit var layoutTransfer: LinearLayout
@@ -55,6 +54,9 @@ class MainActivity : AppCompatActivity() {
     private var privateKeyBytes: ByteArray? = null
     private var publicKeyHex: String? = null
     private val secureRandom = SecureRandom()
+
+    // Balances/amounts/fees are bv[24] on-chain (max 2^24 - 1 = 16777215).
+    private val MAX_TRANSFER_AMOUNT = 16_777_215L
 
     private lateinit var sharedPreferences: SharedPreferences
     private val wallets = mutableMapOf<String, String>()
@@ -80,6 +82,7 @@ class MainActivity : AppCompatActivity() {
         actTo = findViewById(R.id.actTo)
         setupRecipientValidation()
         etAmount = findViewById(R.id.etAmount)
+        etFeeLimit = findViewById(R.id.etFeeLimit)
         etCustomOps = findViewById(R.id.etCustomOps)
         
         tabLayoutTx = findViewById(R.id.tabLayoutTx)
@@ -598,8 +601,8 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread { tvResult.text = "Error: Custom op key '$keyStr' must be an integer." }
                     return
                 }
-                if (kInt < 5) {
-                    runOnUiThread { tvResult.text = "Error: Custom op key '$keyStr' is reserved (must be >= 5)." }
+                if (kInt < 6) {
+                    runOnUiThread { tvResult.text = "Error: Custom op key '$keyStr' is reserved (must be >= 6)." }
                     return
                 }
                 operations[keyStr] = valStr
@@ -624,6 +627,10 @@ class MainActivity : AppCompatActivity() {
                      runOnUiThread { tvResult.text = "Error: Invalid amount." }
                      return
                  }
+                 if (amount > MAX_TRANSFER_AMOUNT) {
+                     runOnUiThread { tvResult.text = "Error: Amount exceeds max ($MAX_TRANSFER_AMOUNT)." }
+                     return
+                 }
                  val transfer = listOf(listOf(senderPk, to, amount.toString()))
                  operations["1"] = transfer
              } else if (!hasOtherOps) {
@@ -637,6 +644,15 @@ class MainActivity : AppCompatActivity() {
              return
         }
 
+        // Fee limit: max fee the sender will pay. The chain charges the actual
+        // fee (sum of o9 consensus + o8 custom over eval steps) and rejects the
+        // tx if it exceeds this cap. Default 10 matches the genesis base fee.
+        val feeStr = etFeeLimit.text.toString().trim().ifEmpty { "10" }
+        val feeLimit = feeStr.toLongOrNull()
+        if (feeLimit == null || feeLimit < 0) {
+            runOnUiThread { tvResult.text = "Error: Fee limit must be a non-negative integer." }
+            return
+        }
 
         thread {
             val seqLine = rpc("getsequence $senderPk\r\n", host, port).trim()
@@ -655,9 +671,7 @@ class MainActivity : AppCompatActivity() {
                 "sequence_number" to seq,
                 "expiration_time" to expiry,
                 "operations" to operations,
-                // Matches the genesis consensus fee rule (o9); keep in sync
-                // with the network's active fee rule.
-                "fee_limit" to "10"
+                "fee_limit" to feeLimit.toString()
             )
             val signingJson = canonicalJson(payloadNoSig)
             val signingBytes = signingJson.toByteArray()
@@ -675,13 +689,25 @@ class MainActivity : AppCompatActivity() {
             val cmd = "sendtx '$blob'\r\n"
             val resp = rpc(cmd, host, port)
             val data = envData(resp)
+            val err = if (data == null) envErrorObj(resp) else null
             runOnUiThread {
-                tvResult.text = if (data != null) {
+                if (data != null) {
                     val txHash = data.optString("tx_hash", "")
                     val msg = data.optString("message", "Transaction queued.")
-                    if (txHash.isNotEmpty()) "$msg\ntx: $txHash" else msg
+                    tvResult.text = if (txHash.isNotEmpty()) "$msg\ntx: $txHash" else msg
                 } else {
-                    "Transaction failed: ${envError(resp)}"
+                    val code = err?.optString("code") ?: ""
+                    val details = err?.optJSONObject("details")
+                    // Reactive fee auto-estimate: the chain returns the computed
+                    // required fee on rejection. Prefill the field so the user can
+                    // resend at the correct cap (no dry-run RPC exists).
+                    if (code == "FEE_LIMIT_TOO_LOW" && details != null && details.has("required_fee")) {
+                        val required = details.optLong("required_fee")
+                        etFeeLimit.setText(required.toString())
+                        tvResult.text = "Fee limit too low. Updated fee limit to required $required. Review and resend."
+                    } else {
+                        tvResult.text = "Transaction failed: ${err?.optString("message") ?: resp.trim()}"
+                    }
                 }
             }
         }
@@ -705,6 +731,15 @@ class MainActivity : AppCompatActivity() {
             env.optJSONObject("error")?.optString("message") ?: "Request failed."
         } catch (e: Exception) {
             resp.trim()
+        }
+    }
+
+    // Full error object: {"code","message","details"?}. Null on parse failure.
+    private fun envErrorObj(resp: String): JSONObject? {
+        return try {
+            JSONObject(resp.trim()).optJSONObject("error")
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -810,30 +845,31 @@ class MainActivity : AppCompatActivity() {
         return md.digest(input)
     }
     private fun generateRandomTauRule(): String {
-        // o5..o14
-        val outIdx = 5 + secureRandom.nextInt(10)
-        
-        val exprs = listOf(
-            "(i1[t] & i2[t] | { #b0 }:bv)",
-            "(i3[t] | i4[t] | { #b0 }:bv)",
-            "((i1[t] | { #b0 }:bv)')",
-            "((i1[t] | i2[t]) & (i3[t] | { 170 }:bv))",
-            "((i4[t] | { 66 }:bv)' | (i1[t] & i2[t]))",
-            "(((i1[t] | i2[t]) & i3[t]) | { #b0 }:bv)",
-            "(((i1[t] & i2[t] | { #b0 }:bv) | (i3[t] | i4[t] | { #b0 }:bv)))"
+        // Streams 0..11 are protocol-reserved (see tau_defs.RESERVED_STREAMS):
+        // i1/i2 are the bv[24] value inputs (amount/balance); i3/i4 are interned
+        // bv[16] ids; o0..o11 are validation/policy/consensus/fee outputs. Demo
+        // rules must read only the bv[24] value inputs and write to FREE outputs
+        // (>= o12), or they clash with the live engine's per-stream bv-width typing.
+        val outA = 12 + secureRandom.nextInt(10)   // o12..o21
+        val outB = 12 + secureRandom.nextInt(10)
+        val inA = 1 + secureRandom.nextInt(2)      // i1..i2 (bv[24] value streams)
+        val inB = 1 + secureRandom.nextInt(2)
+        val sh1 = 1 + secureRandom.nextInt(7)
+        val sh2 = 1 + secureRandom.nextInt(7)
+        val bit = secureRandom.nextInt(2)
+        fun hx(n: Int) = "{ #x" + n.toString(16).padStart(2, '0') + " }:bv[24]"
+
+        val templates = listOf(
+            // Constant flag into an unused output (sanity test).
+            "always (o$outA[t] = ${hx(bit)}).",
+            // Threshold gate over two bv[24] inputs.
+            "always ( ((i$inA[t]:bv[24] + i$inB[t]:bv[24]) >= ${hx(0x80)} && o$outA[t] = ${hx(1)}) || ((i$inA[t]:bv[24] + i$inB[t]:bv[24]) < ${hx(0x80)} && o$outA[t] = ${hx(0)}) ).",
+            // Feature extraction via bit shifts.
+            "always ( o$outA[t]:bv[24] = (i$inA[t]:bv[24] >> ${hx(sh1)}) + (i$inB[t]:bv[24] << ${hx(sh2)}) ).",
+            // Two arithmetic relations writing two free outputs.
+            "always ( (o$outA[t]:bv[24] = i$inA[t]:bv[24] + i$inB[t]:bv[24]) && (o$outB[t]:bv[24] = i$inA[t]:bv[24] - i$inB[t]:bv[24]) )."
         )
-        val expr = exprs[secureRandom.nextInt(exprs.size)]
-        
-        val shape = secureRandom.nextInt(4)
-        return when (shape) {
-            0 -> "always (o$outIdx[t] = $expr)."
-            1 -> "always (($expr != { #b0 }:bv) ? o$outIdx[t] = $expr : o$outIdx[t] = ($expr)')."
-            2 -> "always (($expr = { #b0 }:bv) ? o$outIdx[t] = $expr : o$outIdx[t] = ($expr)')."
-            else -> {
-                val bit = secureRandom.nextInt(2)
-                "always (o$outIdx[t] = { #b$bit }:bv)."
-            }
-        }
+        return templates[secureRandom.nextInt(templates.size)]
     }
 }
 
