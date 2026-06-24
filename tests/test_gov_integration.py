@@ -643,3 +643,167 @@ def test_rebuild_state_aborts_on_fee_rule_error():
             rebuild_state_from_blockchain(start_block=1)
 
 
+
+
+# --- W1 on-chain validator set: proposer membership gate + quorum roundtrip ---
+def _w1_fixture(active_validator_hexes, proposer_hex, block_number=5):
+    from consensus.engine import TauConsensusEngine, ActiveConsensusView
+    from consensus.governance import ConsensusLifecycleManager
+    from consensus.state import TauStateSnapshot
+    from block import Block
+
+    lm = ConsensusLifecycleManager(active_validators=list(active_validator_hexes))
+    parent_snapshot = TauStateSnapshot(
+        state_hash="0" * 64,
+        tau_bytes=b"always (o0[t]=1).",
+        metadata={
+            "balances": {},
+            "sequence_numbers": {},
+            "lifecycle_manager": lm,
+            "consensus_rules_state": "always (o6[t]:bv[64] = i10[t]:bv[64]).",
+            "active_consensus_id": "",
+        },
+    )
+    active_view = ActiveConsensusView(
+        target_height=block_number,
+        consensus_rules=parent_snapshot.metadata["consensus_rules_state"],
+        active_validators=[bytes.fromhex(v) for v in active_validator_hexes],
+        mechanism_specific_metadata={"poa": True},
+    )
+    block_obj = Block.create(
+        block_number=block_number,
+        previous_hash="00" * 32,
+        transactions=[],
+        proposer_pubkey=proposer_hex,
+        timestamp=1234567890,
+    )
+    return TauConsensusEngine(), lm, parent_snapshot, active_view, block_obj
+
+
+def test_removed_validator_block_rejected():
+    """A block proposed by a key outside the active validator set must fail
+    header verification — before any Tau interaction."""
+    validator_hex = "a" * 96
+    outsider_hex = "b" * 96
+    engine, _, _, active_view, block_obj = _w1_fixture([validator_hex], outsider_hex)
+    assert engine.verify_block_header(active_view, block_obj, {"proof_ok": True}) is False
+
+
+def test_in_set_proposer_passes_membership_gate():
+    """Positive twin: an in-set proposer clears the membership gate and reaches
+    the Tau verdict, which we mock to accept."""
+    validator_hex = "a" * 96
+    engine, _, _, active_view, block_obj = _w1_fixture([validator_hex], validator_hex)
+    block_obj.consensus_proof = {"signature": "00" * 48}
+
+    ready = Mock()
+    ready.is_set.return_value = True
+    with patch("tau_manager.tau_ready", ready), \
+         patch("tau_manager.communicate_with_tau", return_value="1"), \
+         patch("tau_manager.parse_tau_output", return_value=1):
+        assert engine.verify_block_header(active_view, block_obj, {"proof_ok": True}) is True
+
+
+def test_genesis_block_skips_membership_gate():
+    """Block #0 has the all-zero sentinel proposer and must not be rejected."""
+    validator_hex = "a" * 96
+    engine, _, _, active_view, block_obj = _w1_fixture([validator_hex], "0" * 96, block_number=0)
+    block_obj.consensus_proof = {"signature": "00" * 48}
+
+    ready = Mock()
+    ready.is_set.return_value = True
+    with patch("tau_manager.tau_ready", ready), \
+         patch("tau_manager.communicate_with_tau", return_value="1"), \
+         patch("tau_manager.parse_tau_output", return_value=1):
+        assert engine.verify_block_header(active_view, block_obj, {"proof_ok": True}) is True
+
+
+def test_forged_vote_in_block_is_noop():
+    """A vote tx from a non-validator inside a block must not hard-reject the
+    block and must not advance the tally."""
+    from consensus.governance import ConsensusRuleUpdate
+
+    validator_hex = "a" * 96
+    outsider_hex = "b" * 96
+    engine, lm, parent_snapshot, active_view, _ = _w1_fixture([validator_hex], validator_hex)
+
+    update = ConsensusRuleUpdate(["always ( o6[t]:bv[16] = { 0 }:bv[16] )."], 100)
+    assert lm.submit_update(update)
+
+    from block import Block
+    vote_tx = {
+        "tx_type": "consensus_rule_vote",
+        "sender_pubkey": outsider_hex,
+        "update_id": update.update_id.hex(),
+        "approve": True,
+    }
+    block_obj = Block.create(
+        block_number=5,
+        previous_hash="00" * 32,
+        transactions=[vote_tx],
+        proposer_pubkey=validator_hex,
+        timestamp=1234567890,
+    )
+
+    with patch("tau_manager.communicate_with_tau", return_value="T"):
+        result = engine.apply_block(active_view, block_obj, parent_snapshot)
+
+    post_lm = result.next_snapshot.metadata["lifecycle_manager"]
+    assert len(post_lm.votes.get(update.update_id, set())) == 0
+    assert update.update_id in post_lm.pending_updates
+    # The tx itself is included (soft no-op), never a hard reject.
+    assert not result.invalid_tx_ids if hasattr(result, "invalid_tx_ids") else True
+
+
+def test_three_validator_roundtrip():
+    """Add a 4th validator via quorum, then remove the original proposer; the
+    removed key must fail header verification against the new set."""
+    from consensus.governance import (
+        ConsensusLifecycleManager,
+        ConsensusRuleUpdate,
+        ConsensusRuleVote,
+    )
+    from consensus.engine import TauConsensusEngine, ActiveConsensusView
+    from block import Block
+
+    v = [f"{i:096x}" for i in range(1, 4)]  # 3 validators, threshold 2
+    lm = ConsensusLifecycleManager(active_validators=v)
+    assert lm.approval_threshold == 2
+
+    # Round 1: add v4.
+    v4 = f"{4:096x}"
+    add = ConsensusRuleUpdate(["test-add"], 10, {"validator_additions": [v4]})
+    lm.submit_update(add)
+    vote = ConsensusRuleVote(add.update_id, True)
+    lm.submit_vote(vote, v[0])
+    lm.submit_vote(vote, v[1])
+    assert len(lm.process_height_transitions(10)) == 1
+    assert v4 in lm.active_validators
+    assert lm.approval_threshold == 3  # n=4 supermajority
+
+    # Round 2: remove v1 (needs 3 of 4 votes).
+    rm = ConsensusRuleUpdate(["test-rm"], 20, {"validator_removals": [v[0]]})
+    lm.submit_update(rm)
+    rm_vote = ConsensusRuleVote(rm.update_id, True)
+    lm.submit_vote(rm_vote, v[1])
+    lm.submit_vote(rm_vote, v[2])
+    lm.submit_vote(rm_vote, v4)
+    assert len(lm.process_height_transitions(20)) == 1
+    assert v[0] not in lm.active_validators
+
+    # The removed validator's block now fails verification.
+    engine = TauConsensusEngine()
+    view = ActiveConsensusView(
+        target_height=21,
+        consensus_rules="always (o6[t]:bv[64] = i10[t]:bv[64]).",
+        active_validators=[bytes.fromhex(x) for x in lm.active_validators],
+        mechanism_specific_metadata={"poa": True},
+    )
+    bad_block = Block.create(
+        block_number=21,
+        previous_hash="00" * 32,
+        transactions=[],
+        proposer_pubkey=v[0],
+        timestamp=1234567890,
+    )
+    assert engine.verify_block_header(view, bad_block, {"proof_ok": True}) is False

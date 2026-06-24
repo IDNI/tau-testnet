@@ -5,7 +5,6 @@ TAU_PROTOCOL_PING = "/tau/ping/2.0.0"
 TAU_PROTOCOL_SYNC = "/tau/sync/2.0.0"
 TAU_PROTOCOL_BLOCKS = "/tau/blocks/2.0.0"
 TAU_PROTOCOL_TX = "/tau/tx/2.0.0"
-TAU_PROTOCOL_STATE = "/tau/state/2.0.0"
 TAU_PROTOCOL_GOSSIP = "/tau/gossip/2.0.0"
 TAU_PROTOCOL_DHT = "/tau/dht/2.0.0"
 

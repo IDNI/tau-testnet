@@ -68,6 +68,11 @@ coverage.xml
 *.db
 *.sqlite
 *.sqlite3
+# SQLite WAL/SHM sidecars (journal_mode=WAL)
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
 
 # Android
 /android/app/build/

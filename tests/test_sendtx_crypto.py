@@ -220,16 +220,13 @@ class TestSendTxCrypto(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "INVALID_SIGNATURE")
 
-    def test_skip_signature_verification_when_disabled(self):
-        # Legacy test checking warn-only behavior when BLS is disabled.
-        # This will pass if queue_transaction warns.
-        # But balance checks must be removed.
-        initial_seq = chain_state.get_sequence_number(GENESIS)
+    def test_bls_unavailable_rejects_transaction(self):
+        # When BLS crypto is unavailable, transactions must be rejected — never
+        # admitted with verification silently skipped.
         tx_json = self._create_tx([[GENESIS, ADDR_A, "5"]], signature="00")
         sendtx._PY_ECC_AVAILABLE = False
         result = sendtx.queue_transaction(tx_json)
-        self.assertTrue(result["ok"], msg=f"Transaction failed: {result}")
-        # self.assertEqual(chain_state.get_sequence_number(GENESIS), initial_seq)
-        # self.assertEqual(chain_state.get_balance(GENESIS), initial_gen_balance - 5)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "BLS_UNAVAILABLE")
         mempool = db.get_mempool_txs()
-        self.assertEqual(len(mempool), 1)
+        self.assertEqual(len(mempool), 0)

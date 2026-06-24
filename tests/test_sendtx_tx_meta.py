@@ -18,6 +18,9 @@ GENESIS = chain_state.GENESIS_ADDRESS
 # Use stub BLS keys for test addresses
 ADDR_A = bls.SkToPk(bls.KeyGen(b"meta_seed_A")).hex()
 ADDR_B = bls.SkToPk(bls.KeyGen(b"meta_seed_B")).hex()
+# Real signing key for the default sender (signatures are verified for real now).
+SK_SENDER = bls.KeyGen(b"meta_sender")
+SENDER = bls.SkToPk(SK_SENDER).hex()
 
 class TestSendTxTxMeta(unittest.TestCase):
     def setUp(self):
@@ -77,7 +80,8 @@ class TestSendTxTxMeta(unittest.TestCase):
             o1_val = mock_tau_response(input_stream_values=input_stream_values, target_output_stream_index=1)
             return {1: o1_val}
         patch('commands.sendtx.tau_manager.communicate_with_tau_multi', side_effect=mock_tau_multi).start()
-        sendtx._PY_ECC_AVAILABLE = False
+        # Signatures are verified for real; fund the signing sender.
+        chain_state._balances[SENDER] = 1000
         # Patch pubkey validation to bypass format checks for meta tests
         patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
 
@@ -90,10 +94,10 @@ class TestSendTxTxMeta(unittest.TestCase):
             os.remove(self.test_db)
         config.set_database_path(self.original_db_path)
 
-    def _create_tx(self, transfers, expiration=None, sequence=None, signature="SIG", sender_pubkey=None):
+    def _create_tx(self, transfers, expiration=None, sequence=None, signature=None, sender_pubkey=None):
         ops = {"1": transfers}
         exp_time = expiration if expiration is not None else int(time.time()) + 1000
-        pk_hex = sender_pubkey or GENESIS
+        pk_hex = sender_pubkey or SENDER
         seq = sequence if sequence is not None else chain_state.get_sequence_number(pk_hex)
         tx_dict = {
             "tx_type": "user_tx",
@@ -102,8 +106,12 @@ class TestSendTxTxMeta(unittest.TestCase):
             "expiration_time": exp_time,
             "operations": ops,
             "fee_limit": "0",
-            "signature": signature,
         }
+        if signature is not None:
+            tx_dict["signature"] = signature
+        else:
+            msg_hash = hashlib.sha256(_get_signing_message_bytes(tx_dict)).digest()
+            tx_dict["signature"] = bls.Sign(SK_SENDER, msg_hash).hex()
         return json.dumps(tx_dict)
 
     def test_expired_transaction(self):

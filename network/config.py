@@ -17,6 +17,8 @@ class NetworkConfig:
     network_id: str
     listen_addrs: List[multiaddr.Multiaddr]
     bootstrap_peers: List[BootstrapPeer] = field(default_factory=list)
+    # Advertised instead of bound listeners when set (NAT/public address).
+    announce_addrs: List[multiaddr.Multiaddr] = field(default_factory=list)
     agent: str = "tau-testnet/0.1"
     genesis_hash: str = ""
     peerstore_path: Optional[str] = None

@@ -411,6 +411,20 @@ def fetch_accounts_snapshot(block_hash: str) -> Optional[tuple[Dict[str, int], D
 GENESIS_ADDRESS = "a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b"
 GENESIS_BALANCE = 10000
 
+# Pre-funded accounts from the loaded genesis artifact; used to seed rebuilds
+# so a full replay reproduces exactly the load_genesis starting state.
+_genesis_accounts_state: dict = {}
+# Genesis consensus baseline (validator set + quorum policy), captured at
+# load_genesis and re-seeded on every full rebuild so a synced/reorged node
+# does not end up with an empty validator set.
+_genesis_active_validators: list = []
+_genesis_vote_quorum: str = ""
+# Genesis rule text, re-seeded on full rebuild so the replayed state hash
+# matches the mined chain (the reorg path replays only the new suffix, not
+# the genesis block, so its rules would otherwise be lost).
+_genesis_application_rules: str = ""
+_genesis_consensus_rules: str = ""
+
 
 def _validate_block_timestamp(block: Block, parent_block_data: Optional[Dict]) -> tuple[bool, str]:
     import time
@@ -521,6 +535,14 @@ def process_new_block(block: Block) -> bool:
                     # Strict: reject/defer rather than guess.
                     logger.error(
                         "[BLOCKCHAIN] Fee rule failure applying block #%s: %s",
+                        block.header.block_number, exc,
+                    )
+                    return False
+                except ValueError as exc:
+                    # e.g. a governance activation that would empty the validator set:
+                    # reject the block instead of crashing ingestion.
+                    logger.error(
+                        "[BLOCKCHAIN] Governance activation failed for block #%s: %s",
                         block.header.block_number, exc,
                     )
                     return False
@@ -646,10 +668,20 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
         with _balance_lock, _sequence_lock, _rules_lock:
             _balances.clear()
             _sequence_numbers.clear()
-            _application_rules_state = ""
-            _consensus_rules_state = ""
+            # Re-seed genesis rule text (the reorg path replays only the new
+            # suffix, not the genesis block, so these would otherwise be lost
+            # and the replayed state hash would diverge from the mined chain).
+            _application_rules_state = _genesis_application_rules
+            _consensus_rules_state = _genesis_consensus_rules
             _active_consensus_id = "tau_poa_v1"
-            _lifecycle_manager = ConsensusLifecycleManager()
+            # Re-seed the genesis validator set + quorum policy so a rebuilt
+            # node verifies blocks against the correct PoA set (governance
+            # updates in replayed blocks mutate from this baseline).
+            _lifecycle_manager = ConsensusLifecycleManager(
+                active_validators=list(_genesis_active_validators)
+            )
+            _lifecycle_manager.quorum_policy = _genesis_vote_quorum
+            _lifecycle_manager.recompute_approval_threshold()
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
         print("[INFO][chain_state] Cleared existing in-memory state for full rebuild.")
@@ -669,11 +701,29 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             except Exception:
                 logger.exception("Failed to reset Tau interpreter before rebuild; replay activation determinism is not guaranteed.")
 
-        # Initialize genesis state
-        with _balance_lock:
-            _balances[GENESIS_ADDRESS] = GENESIS_BALANCE
-        print(f"[INFO][chain_state] Initialized genesis balance: {GENESIS_ADDRESS[:10]}... = {GENESIS_BALANCE}")
-    
+        # Initialize genesis state from the loaded genesis artifact so rebuild
+        # matches load_genesis exactly (multi-account aware). Fallbacks: read
+        # data/genesis.json directly, else the legacy hardcoded seed (tests).
+        seed_accounts = dict(_genesis_accounts_state)
+        if not seed_accounts:
+            genesis_path = os.path.join(os.path.dirname(__file__), "data", "genesis.json")
+            try:
+                with open(genesis_path, "r", encoding="utf-8") as f:
+                    seed_accounts = {
+                        k: int(v) for k, v in json.load(f).get("accounts_state", {}).items()
+                    }
+            except Exception:
+                seed_accounts = {}
+        with _balance_lock, _sequence_lock:
+            if seed_accounts:
+                _balances.update(seed_accounts)
+                for addr in seed_accounts:
+                    _sequence_numbers.setdefault(addr, 0)
+                print(f"[INFO][chain_state] Initialized {len(seed_accounts)} genesis account(s) from artifact.")
+            else:
+                _balances[GENESIS_ADDRESS] = GENESIS_BALANCE
+                print(f"[INFO][chain_state] Initialized genesis balance: {GENESIS_ADDRESS[:10]}... = {GENESIS_BALANCE}")
+
     import db
     if path_hashes is not None:
         block_rows = [db.get_block_by_hash(h) for h in path_hashes]
@@ -831,8 +881,21 @@ def load_genesis(genesis_json_path: str):
     with open(genesis_json_path, "r", encoding="utf-8") as f:
         genesis_data = json.load(f)
 
+    # Remember the artifact's pre-funded accounts for rebuild/reorg seeding,
+    # regardless of whether the DB is fresh or already provisioned.
+    global _genesis_accounts_state, _genesis_active_validators, _genesis_vote_quorum
+    global _genesis_application_rules, _genesis_consensus_rules
+    _genesis_accounts_state = {
+        k: int(v) for k, v in genesis_data.get("accounts_state", {}).items()
+    }
+    _gmeta = genesis_data.get("consensus_meta", {}) or {}
+    _genesis_active_validators = list(_gmeta.get("active_validators", []) or [])
+    _genesis_vote_quorum = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("vote_quorum", "")
+    _genesis_application_rules = genesis_data.get("application_rules", "")
+    _genesis_consensus_rules = genesis_data.get("consensus_rules", "")
+
     db.init_db()
-    
+
     # 1. Evaluate if empty
     latest = db.get_canonical_head_block()
     
@@ -867,8 +930,10 @@ def load_genesis(genesis_json_path: str):
                 votes={}
             )
             _lifecycle_manager.active_validators = normalize_validator_set(meta["active_validators"])
+            # Genesis may pin the quorum policy network-wide; overrides the local config knob.
+            _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
             _lifecycle_manager.recompute_approval_threshold()
-            
+
         commit_state_to_db(genesis_block.block_hash, 0)
         print(f"[INFO][chain_state] Genesis provisioned. Block 0 Hash: {genesis_block.block_hash}")
         return
@@ -913,6 +978,8 @@ def load_genesis(genesis_json_path: str):
         if not _lifecycle_manager.active_validators:
             meta = genesis_data["consensus_meta"]
             _lifecycle_manager.active_validators = normalize_validator_set(meta.get("active_validators", []))
+            # Genesis may pin the quorum policy network-wide; overrides the local config knob.
+            _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
             _lifecycle_manager.recompute_approval_threshold()
             commit_state_to_db(_canonical_head_hash, latest["header"]["block_number"] if latest else 0)
         print(f"[INFO][chain_state] State loaded successfully. Last known block hash: '{_canonical_head_hash[:16]}...'")
@@ -926,8 +993,6 @@ def load_genesis(genesis_json_path: str):
 def get_balance(address_hex: str) -> int:
     """Returns the balance of the given address. Returns 0 if address not found."""
     with _balance_lock:
-        if address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-            return 1000
         return _balances.get(address_hex, 0)
 
 def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, amount: int) -> bool:
@@ -942,10 +1007,6 @@ def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, a
 
     with _balance_lock:
         current_from_balance = _balances.get(from_address_hex, 0)
-
-        # Auto-faucet logic for sender: if missing, assume 100k
-        if from_address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-             current_from_balance = 1000
 
         # Enforce sufficient funds during balance updates to avoid negative balances
         if current_from_balance < amount:
@@ -1236,6 +1297,12 @@ def load_state_from_db() -> bool:
             votes=votes_map,
             active_validators=active_validators
         )
+        # Re-pin the genesis quorum policy (not persisted in the DB) so a node
+        # reloading from disk computes the same threshold as a freshly-rebuilt
+        # or freshly-synced peer; otherwise the two could diverge when genesis
+        # pins a policy different from the local config default.
+        _lifecycle_manager.quorum_policy = _genesis_vote_quorum
+        _lifecycle_manager.recompute_approval_threshold()
         for p in pending_updates:
             update = ConsensusRuleUpdate(
                 rule_revisions=p['rule_revisions'],
@@ -1547,7 +1614,7 @@ def reorg_to(new_head_hash: str):
     for tx_id, tx in old_txs.items():
         if tx_id not in new_txs:
             try:
-                db.add_mempool_tx(json.dumps(tx, separators=(",", ":")), tx_id, int(time.time()))
+                db.add_mempool_tx(json.dumps(tx, separators=(",", ":")), tx_id, int(time.time() * 1000))
             except Exception as e:
                 logger.error(f"[chain_state] Failed to restore tx {tx_id} to mempool: {e}")
     

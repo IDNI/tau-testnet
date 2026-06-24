@@ -79,6 +79,9 @@ class NetworkSettings:
     network_id: str = "tau-local"
     listen: List[str] = field(default_factory=lambda: ["/ip4/0.0.0.0/tcp/0"])
     bootstrap_peers: List[Dict[str, Any]] = field(default_factory=list)
+    # Multiaddrs advertised to peers instead of the bound listeners; set this
+    # to your public address when behind NAT/port-forwarding.
+    announce_addrs: List[str] = field(default_factory=list)
     peerstore_path: Optional[str] = None
     # Optional path to a private key file for persistent libp2p identity
     identity_key_path: Optional[str] = None
@@ -152,6 +155,12 @@ class AuthoritySettings:
     state_locator_namespace: str = "state"
     mining_enabled: bool = True
     open_governance_admission: bool = False
+    # Vote quorum for governance updates: "supermajority" (2/3) or "majority" (1/2 + 1).
+    # Must be identical across all nodes; genesis consensus_meta may override.
+    validator_vote_quorum: str = "supermajority"
+    # Allow non-loopback RPC clients to invoke createblock (off for safety;
+    # validators mine via the internal SoleMiner loop, never via remote RPC).
+    allow_remote_createblock: bool = False
     max_mempool_txs: int = 5000
 
     def validate(self) -> None:
@@ -189,6 +198,10 @@ class AuthoritySettings:
             raise ConfigurationError("Authority block_signature_scheme must be a non-empty string.")
         if not isinstance(self.state_locator_namespace, str) or not self.state_locator_namespace.strip():
             raise ConfigurationError("Authority state_locator_namespace must be a non-empty string.")
+        if self.validator_vote_quorum not in ("supermajority", "majority"):
+            raise ConfigurationError(
+                "Authority validator_vote_quorum must be 'supermajority' or 'majority'."
+            )
 
 
 @dataclass
@@ -234,9 +247,10 @@ BASE_DEFAULTS: Dict[str, Any] = {
     "database": asdict(DatabaseSettings()),
     "network": {
         "network_id": "tau-local",
-        "listen": ["/ip4/0.0.0.0/tcp/0"], 
+        "listen": ["/ip4/0.0.0.0/tcp/0"],
         "bootstrap_peers": [],
-        "peerstore_path": None,
+        "announce_addrs": [],
+        "peerstore_path": os.path.join(DATA_DIR, "peerstore"),
         # Persist the libp2p identity here unless --ephemeral-identity is set.
         "identity_key_path": os.path.join(DATA_DIR, "identity.key"),
         "conn_low_water": 50,
@@ -266,12 +280,9 @@ ENVIRONMENT_OVERRIDES: Dict[str, Dict[str, Any]] = {
             "miner_privkey_path": os.path.join(DATA_DIR, "test_miner.key"),
         },
         "network": {
-            "bootstrap_peers": [
-                {
-                    "peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC",
-                    "addrs": ["/ip4/0.0.0.0/tcp/4001"],
-                },
-            ],
+            "bootstrap_peers": [],
+            # Tests must not inherit the persistent peerstore default.
+            "peerstore_path": None,
         },
     },
     "production": {
@@ -302,8 +313,8 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_SHUTDOWN_TIMEOUT": ("timeouts", "shutdown_timeout", int),
     "TAU_DB_PATH": ("database", "path", str),
     "TAU_NETWORK_ID": ("network", "network_id", str),
-    "TAU_GENESIS_HASH": ("network", "genesis_hash", str),
     "TAU_NETWORK_LISTEN": ("network", "listen", lambda value: [addr.strip() for addr in value.split(',') if addr.strip()]),
+    "TAU_ANNOUNCE_ADDRS": ("network", "announce_addrs", lambda value: [addr.strip() for addr in value.split(',') if addr.strip()]),
     "TAU_BOOTSTRAP_PEERS": ("network", "bootstrap_peers", lambda value: json.loads(value)),
     "TAU_PEERSTORE_PATH": ("network", "peerstore_path", str),
     "TAU_IDENTITY_KEY_PATH": ("network", "identity_key_path", str),
@@ -339,6 +350,12 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_GOVERNANCE_OPEN_ADMISSION": (
         "authority",
         "open_governance_admission",
+        lambda v: v.lower() in ("true", "1", "yes"),
+    ),
+    "TAU_VALIDATOR_VOTE_QUORUM": ("authority", "validator_vote_quorum", str),
+    "TAU_ALLOW_REMOTE_CREATEBLOCK": (
+        "authority",
+        "allow_remote_createblock",
         lambda v: v.lower() in ("true", "1", "yes"),
     ),
 }
@@ -611,5 +628,7 @@ __all__ = [
 ]
 
 # Feature flags
-TESTNET_AUTO_FAUCET = True
+# Auto-faucet removed for launch: unknown accounts have balance 0. The flag is
+# kept (always False) so legacy tests that toggle it remain harmless no-ops.
+TESTNET_AUTO_FAUCET = False
 MAX_BLOCK_FUTURE_DRIFT_SECONDS = int(os.environ.get('TAU_MAX_BLOCK_FUTURE_DRIFT', '120'))

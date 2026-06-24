@@ -112,6 +112,65 @@ class TestGovernance(unittest.TestCase):
         self.assertIn(new_validator, manager.active_validators)
         self.assertEqual(manager.approval_threshold, 3)
 
+    def test_below_quorum_does_not_activate(self):
+        manager = ConsensusLifecycleManager(active_validators=self.active_validators)
+        update = ConsensusRuleUpdate(["test"], 10)
+        manager.submit_update(update)
+        vote = ConsensusRuleVote(update.update_id, True)
+        manager.submit_vote(vote, self.active_validators[0])  # 1 of threshold 2
+
+        active = manager.process_height_transitions(10)
+
+        self.assertEqual(active, [])
+        self.assertNotIn(update.update_id, manager.pending_updates)
+        self.assertIn(update.update_id, manager.archival_updates)
+        self.assertEqual(manager.active_validators, {f"{i:096x}" for i in range(1, 4)})
+
+    def test_non_validator_vote_does_not_count(self):
+        manager = ConsensusLifecycleManager(active_validators=self.active_validators)
+        update = ConsensusRuleUpdate(["test"], 10)
+        manager.submit_update(update)
+        vote = ConsensusRuleVote(update.update_id, True)
+
+        outsider = bytes.fromhex(f"{99:096x}")
+        self.assertFalse(manager.submit_vote(vote, outsider))
+        self.assertEqual(len(manager.votes.get(update.update_id, set())), 0)
+
+        # A real validator vote still counts; update stays pending at 1/2.
+        self.assertTrue(manager.submit_vote(vote, self.active_validators[0]))
+        self.assertIn(update.update_id, manager.pending_updates)
+
+    def test_garbage_voter_pubkey_is_noop(self):
+        manager = ConsensusLifecycleManager(active_validators=self.active_validators)
+        update = ConsensusRuleUpdate(["test"], 10)
+        manager.submit_update(update)
+        vote = ConsensusRuleVote(update.update_id, True)
+        self.assertFalse(manager.submit_vote(vote, "not-a-pubkey"))
+        self.assertEqual(len(manager.votes.get(update.update_id, set())), 0)
+
+    def test_removal_reaches_quorum_and_activates(self):
+        manager = ConsensusLifecycleManager(active_validators=self.active_validators)
+        removed = f"{3:096x}"
+        update = ConsensusRuleUpdate(["test"], 10, {"validator_removals": [removed]})
+        manager.submit_update(update)
+        vote = ConsensusRuleVote(update.update_id, True)
+        manager.submit_vote(vote, self.active_validators[0])
+        manager.submit_vote(vote, self.active_validators[1])
+
+        active = manager.process_height_transitions(10)
+
+        self.assertEqual(len(active), 1)
+        self.assertNotIn(removed, manager.active_validators)
+        self.assertEqual(manager.approval_threshold, 2)  # recomputed for n=2
+
+    def test_majority_quorum_policy(self):
+        validators = [bytes.fromhex(f"{i:096x}") for i in range(1, 6)]  # n=5
+        manager = ConsensusLifecycleManager(active_validators=validators)
+        manager.quorum_policy = "majority"
+        self.assertEqual(manager.recompute_approval_threshold(), 3)
+        manager.quorum_policy = "supermajority"
+        self.assertEqual(manager.recompute_approval_threshold(), 4)
+
     def test_validator_delta_rejects_empty_validator_set(self):
         only_validator = f"{1:096x}"
         manager = ConsensusLifecycleManager(active_validators=[only_validator])

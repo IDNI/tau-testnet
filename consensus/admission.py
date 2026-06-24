@@ -12,6 +12,12 @@ from consensus.governance import normalize_validator_delta, normalize_validator_
 
 logger = logging.getLogger(__name__)
 
+# DoS bounds enforced at mempool admission (phase 1, before any expensive compile).
+MAX_RULE_REVISIONS = 32
+MAX_RULE_REVISIONS_BYTES = 196608   # 192 KiB total UTF-8, nests under the 262144 wire cap
+MAX_TRANSFERS_PER_TX = 64
+MAX_CUSTOM_INPUT_STREAMS = 16
+
 class AdmissionResult:
     def __init__(self, is_valid: bool, error: Optional[str] = None, data: Optional[Dict] = None):
         self.is_valid = is_valid
@@ -40,6 +46,15 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
     operations = tx.get("operations", {})
     if not isinstance(operations, dict):
         return format_error("Missing or invalid 'operations' in user_tx.")
+
+    transfers = operations.get("1")
+    if isinstance(transfers, list) and len(transfers) > MAX_TRANSFERS_PER_TX:
+        return format_error(f"user_tx exceeds MAX_TRANSFERS_PER_TX ({len(transfers)} > {MAX_TRANSFERS_PER_TX}).")
+    custom_stream_count = sum(1 for k in operations if str(k).isdigit() and int(k) not in (0, 1))
+    if custom_stream_count > MAX_CUSTOM_INPUT_STREAMS:
+        return format_error(
+            f"user_tx exceeds MAX_CUSTOM_INPUT_STREAMS ({custom_stream_count} > {MAX_CUSTOM_INPUT_STREAMS})."
+        )
 
     for key, val in operations.items():
         if not str(key).isdigit():
@@ -98,12 +113,18 @@ def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView)
     if not _open_governance_admission() and sender not in tip_view.active_validators:
         return format_error(f"Proposer {sender[:10]} is not an active validator.")
 
-    if "rule_revisions" not in tx or not isinstance(tx["rule_revisions"], list) or len(tx["rule_revisions"]) == 0:
-        return format_error("Missing or invalid 'rule_revisions' list. Must be a non-empty list.")
-    
+    if "rule_revisions" not in tx or not isinstance(tx["rule_revisions"], list) or len(tx["rule_revisions"]) == 0 \
+            or len(tx["rule_revisions"]) > MAX_RULE_REVISIONS:
+        return format_error(
+            f"Missing or invalid 'rule_revisions' list. Must be a non-empty list of at most {MAX_RULE_REVISIONS} entries."
+        )
+
     for rev in tx["rule_revisions"]:
         if not isinstance(rev, str):
             return format_error("Every entry in 'rule_revisions' must be a string.")
+
+    if sum(len(rev.encode("utf-8")) for rev in tx["rule_revisions"]) > MAX_RULE_REVISIONS_BYTES:
+        return format_error(f"'rule_revisions' total size exceeds MAX_RULE_REVISIONS_BYTES ({MAX_RULE_REVISIONS_BYTES}).")
 
     h_activate = tx.get("activate_at_height")
     if not isinstance(h_activate, int) or h_activate < 1 or h_activate > 0xFFFFFFFFFFFFFFFF:

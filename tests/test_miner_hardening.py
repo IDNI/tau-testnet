@@ -68,7 +68,9 @@ class TestMinerHardening(unittest.TestCase):
         chain_state._balances = {}
         chain_state._sequence_numbers = {}
         chain_state._application_rules_state = ""
-        
+        from consensus.governance import ConsensusLifecycleManager
+        chain_state._lifecycle_manager = ConsensusLifecycleManager()
+
         # Disable auto-faucet for strict balance testing
         self.original_faucet = config.TESTNET_AUTO_FAUCET
         config.TESTNET_AUTO_FAUCET = False
@@ -197,10 +199,8 @@ class TestMinerHardening(unittest.TestCase):
     @patch('commands.createblock._validate_signature')
     @patch('consensus.engine.tau_manager')
     def test_faucet_safety_no_negative_balance(self, mock_tau, mock_sig):
-        print("\n[TEST] Verifying Faucet Safety (No Negative Balance)...")
-        # Ensure auto-faucet is ON for this test
-        config.TESTNET_AUTO_FAUCET = True
-        
+        print("\n[TEST] Verifying No Negative Balance (seeded funds)...")
+
         # Configure mock_tau to distinguish calls
         # 1. Rule validation (stream 0) -> "Success"
         # 2. Transfer validation (stream 1) -> "10000" (the amount)
@@ -224,13 +224,11 @@ class TestMinerHardening(unittest.TestCase):
         
         mock_sig.return_value = True
         
-        # User is NEW (not in balances)
+        # Seed the user explicitly — there is no auto-faucet anymore.
         user_addr = "UserNew"
-        if user_addr in chain_state._balances:
-            del chain_state._balances[user_addr]
+        chain_state._balances[user_addr] = 1000
 
-        # Use the configured faucet behavior instead of hardcoding 100000.
-        # This test verifies "no negative balance" and correct initialization.
+        # This test verifies "no negative balance" and correct debit.
         faucet_start = chain_state.get_balance(user_addr)
         transfer_amount = max(1, faucet_start // 2)
             

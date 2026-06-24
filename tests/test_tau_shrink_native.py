@@ -95,3 +95,63 @@ def test_shrunk_equality_verdicts_match_real_engine(tmp_path):
     # The interpreter is running the shrunk spec at the smallest dynamic width.
     assert runtime_shrunk == "True", f"interpreter should hold the shrunk spec: {line}"
     assert width == "W=8", f"tiny table should pick bv[8]: {line}"
+
+
+# --- rule 02 (src==dest) with FULL pubkeys on i3/i4 via the real engine --------
+_CHILD_SRC_EQ = r'''
+import os, tempfile
+os.environ["TAU_ENV"] = "test"
+os.environ["TAU_FORCE_TEST"] = "0"
+os.environ["TAU_SHRINK_ENABLED"] = "true"
+import config
+config.set_database_path(os.environ["SHRINK_DB"])
+import db; db.init_db()
+import tau_native, tau_manager
+
+HEX = "%s"; OTHER = "%s"
+# The actual src==dest rule, now bv[384] on i3/i4 (shrunk for eval).
+RULE = ("always ( ((i3[t]:bv[384] = i4[t]:bv[384]) && o3[t] = { #x0000 }:bv[16]) "
+        "|| ((i3[t]:bv[384] != i4[t]:bv[384]) && o3[t] = { #x0001 }:bv[16]) ).")
+
+boot = tempfile.NamedTemporaryFile("w", suffix=".tau", delete=False)
+boot.write("always ( o9[t]:bv[64] = { 1 }:bv[64] ).\n"); boot.close()
+iface = tau_native.TauInterface(boot.name)
+tau_manager.tau_direct_interface = iface
+tau_manager.tau_test_mode = False
+tau_manager._runtime_shrunk_streams = frozenset()
+tau_manager.tau_ready.set()
+
+tau_manager.restore_full_tau_spec(RULE)
+streams = sorted(tau_manager._runtime_shrunk_streams)
+# from == to  -> o3 = 0 (src==dest fails the check)
+same = tau_manager.parse_tau_output(str(tau_manager.communicate_with_tau(
+    target_output_stream_index=3,
+    input_stream_values={3: "{ #x"+HEX+" }:bv[384]", 4: "{ #x"+HEX+" }:bv[384]"})))
+# from != to  -> o3 = 1
+diff = tau_manager.parse_tau_output(str(tau_manager.communicate_with_tau(
+    target_output_stream_index=3,
+    input_stream_values={3: "{ #x"+HEX+" }:bv[384]", 4: "{ #x"+OTHER+" }:bv[384]"})))
+print("SRC_EQ_RESULT", "/".join(str(s) for s in streams), same, diff)
+'''
+
+
+def test_src_eq_dest_rule_full_pubkeys_real_engine(tmp_path):
+    """Rule 02 with bv[384] i3/i4 fed FULL pubkeys: shrink interns both, equality
+    is preserved (same -> o3=0, different -> o3=1) on the real interpreter."""
+    child = _CHILD_SRC_EQ % (HEX, OTHER)
+    script = tmp_path / "child_srceq.py"
+    script.write_text(child)
+    env = dict(os.environ)
+    env["SHRINK_DB"] = str(tmp_path / "srceq.db")
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True, text=True, env=env, timeout=120,
+    )
+    line = next((l for l in proc.stdout.splitlines() if l.startswith("SRC_EQ_RESULT")), None)
+    assert line is not None, f"child produced no result.\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    _, streams, same, diff = line.split(maxsplit=3)
+    assert streams == "3/4", line          # both address streams shrunk
+    assert same == "0", f"from==to must fail src!=dest (o3=0): {line}"
+    assert diff == "1", f"from!=to must pass (o3=1): {line}"

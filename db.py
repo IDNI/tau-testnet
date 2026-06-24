@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 _db_conn = None
 _db_lock = threading.Lock()
 
+# Expected on-disk schema version. Bump only with an explicit migration path;
+# init_db refuses to start on mismatch instead of silently dropping tables.
+SCHEMA_VERSION = 1
+
+# Upper bound on mempool rows; enforced at insert time in add_mempool_tx.
+MEMPOOL_MAX_TXS = 5000
+
 
 def _is_hash_hex(value: object) -> bool:
     if not isinstance(value, str) or len(value) != 64:
@@ -150,18 +157,19 @@ def init_db():
         if data_dir and not os.path.exists(data_dir):
             os.makedirs(str(data_dir), exist_ok=True)
 
-        conn = sqlite3.connect(config.STRING_DB_PATH, check_same_thread=False)
+        conn = sqlite3.connect(config.STRING_DB_PATH, check_same_thread=False, timeout=10.0)
         conn.execute('PRAGMA foreign_keys = ON;')
+        conn.execute('PRAGMA journal_mode=WAL;')
+        conn.execute('PRAGMA busy_timeout=5000;')
         with conn:
-            # Migration to Fork Choice schema: Check if block_hash is PK (or is missing)
+            # Legacy pre-Fork-Choice schema detector: refuse to start instead of wiping data.
             cur = conn.execute("PRAGMA table_info(blocks);")
             blocks_cols = {row[1]: row for row in cur.fetchall()}
             if blocks_cols and ("block_hash" not in blocks_cols or blocks_cols["block_hash"][5] != 1):
-                logger.info("Migrating to Fork Choice schema (dropping old tables)...")
-                conn.execute("DROP TABLE IF EXISTS blocks;")
-                conn.execute("DROP TABLE IF EXISTS accounts;")
-                conn.execute("DROP TABLE IF EXISTS chain_state;")
-                conn.execute("DROP TABLE IF EXISTS mempool;")
+                raise DatabaseError(
+                    f"Database schema at {config.STRING_DB_PATH} predates schema_version {SCHEMA_VERSION}; "
+                    "manual migration required (or delete the DB to resync)."
+                )
 
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS tau_strings (
@@ -265,21 +273,10 @@ def init_db():
                 should_migrate = True
             
             if should_migrate:
-                logger.info("Migrating mempool to new schema (dropping old table)...")
-                conn.execute("DROP TABLE IF EXISTS mempool;")
-                conn.execute('''
-                    CREATE TABLE mempool (
-                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                        tx_hash       TEXT    NOT NULL UNIQUE,
-                        payload       TEXT    NOT NULL,
-                        received_at   INTEGER NOT NULL,
-                        status        TEXT    NOT NULL DEFAULT 'pending', -- pending, reserved
-                        reserved_at   INTEGER NOT NULL DEFAULT 0,
-                        batch_id      TEXT,
-                        fee_limit     INTEGER NOT NULL DEFAULT 0,
-                        estimated_fee INTEGER NOT NULL DEFAULT 0
-                    );
-                ''')
+                raise DatabaseError(
+                    f"Database schema at {config.STRING_DB_PATH} predates schema_version {SCHEMA_VERSION}; "
+                    "manual migration required (or delete the DB to resync)."
+                )
             else:
                 # Additive fee-model columns (existing rows default to 0 =
                 # lowest priority; harmless on live nodes).
@@ -292,6 +289,15 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_mempool_pending_order
                 ON mempool(status, estimated_fee DESC, received_at ASC);
             ''')
+
+            conn.execute('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);')
+            row = conn.execute('SELECT version FROM schema_version LIMIT 1').fetchone()
+            if row is None:
+                conn.execute('INSERT INTO schema_version (version) VALUES (?)', (SCHEMA_VERSION,))
+            elif row[0] != SCHEMA_VERSION:
+                raise DatabaseError(
+                    f"DB schema_version {row[0]} != expected {SCHEMA_VERSION}; refusing to start."
+                )
 
             _normalize_legacy_genesis_row(conn)
 
@@ -395,6 +401,40 @@ def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
 
     with _db_lock:
         cur = _db_conn.cursor()
+
+        # Prune expired pending txs (expiration_time is epoch seconds inside the JSON payload).
+        import time as _time
+        now_s = int(_time.time())
+        try:
+            cur.execute(
+                "DELETE FROM mempool WHERE status='pending' "
+                "AND CAST(json_extract(payload, '$.expiration_time') AS INTEGER) < ?",
+                (now_s,),
+            )
+        except sqlite3.Error:
+            # JSON1 unavailable: Python-side fallback.
+            expired_ids = []
+            for row in cur.execute("SELECT id, payload FROM mempool WHERE status='pending'").fetchall():
+                try:
+                    exp = json.loads(row[1]).get("expiration_time")
+                    if isinstance(exp, int) and exp < now_s:
+                        expired_ids.append(row[0])
+                except (ValueError, TypeError):
+                    continue
+            if expired_ids:
+                marks = ",".join("?" for _ in expired_ids)
+                cur.execute(f"DELETE FROM mempool WHERE id IN ({marks})", tuple(expired_ids))
+
+        # Cap total mempool size; evict oldest pending only (never reserved — the miner holds them).
+        total = cur.execute("SELECT COUNT(*) FROM mempool").fetchone()[0]
+        if total >= MEMPOOL_MAX_TXS:
+            overflow = total - MEMPOOL_MAX_TXS + 1
+            cur.execute(
+                "DELETE FROM mempool WHERE id IN ("
+                "SELECT id FROM mempool WHERE status='pending' ORDER BY received_at ASC LIMIT ?)",
+                (overflow,),
+            )
+
         # Idempotency: INSERT OR IGNORE
         cur.execute('''
             INSERT OR IGNORE INTO mempool (tx_hash, payload, received_at, status, fee_limit, estimated_fee)

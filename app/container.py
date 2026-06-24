@@ -106,6 +106,13 @@ class ServiceContainer:
             except Exception as exc:
                 self.logger.warning("Skipping invalid listen address %s: %s", addr, exc)
 
+        announce_addrs = []
+        for addr in getattr(self.settings.network, "announce_addrs", []) or []:
+            try:
+                announce_addrs.append(multiaddr.Multiaddr(addr))
+            except Exception as exc:
+                self.logger.warning("Skipping invalid announce address %s: %s", addr, exc)
+
         bootstrap_peers: list[BootstrapPeer] = []
         for entry in self.settings.network.bootstrap_peers:
             try:
@@ -193,6 +200,7 @@ class ServiceContainer:
             network_id=self.settings.network.network_id,
             listen_addrs=listen_addrs,
             bootstrap_peers=bootstrap_peers,
+            announce_addrs=announce_addrs,
             peerstore_path=self.settings.network.peerstore_path,
             identity_key=identity_key_bytes,
             dht_record_ttl=self.settings.dht.record_ttl,

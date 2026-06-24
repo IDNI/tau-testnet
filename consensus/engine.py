@@ -12,7 +12,7 @@ from .state import StateStore, compute_state_hash
 from .governance import normalize_validator_set
 from . import fees
 from .fees import FeeRuleError
-from errors import TauCommunicationError, TauEngineBug, TauEngineCrash
+from errors import BlockchainBug, TauCommunicationError, TauEngineBug, TauEngineCrash
 
 # We need to import chain_state and tau_manager, but we must be careful about circular imports.
 # We'll import them inside methods or use a lazy import pattern if needed.
@@ -181,6 +181,26 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if proof_result.get("proof_ok", False) is False:
                 return False
             block = kwargs.get("block") if "block" in kwargs else (args[1] if len(args) > 1 else None)
+            # PoA: the proposer must be in the active validator set (skip for
+            # genesis, whose proposer is the all-zero sentinel).
+            active_view = args[0] if (args and isinstance(args[0], ActiveConsensusView)) else kwargs.get("active_view")
+            if (
+                block is not None
+                and getattr(block.header, "block_number", None) != 0
+                and active_view is not None
+                and not getattr(config.settings.authority, "open_governance_admission", False)
+            ):
+                try:
+                    allowed = normalize_validator_set(active_view.active_validators)
+                    proposer_hex = (block.header.proposer_pubkey or "").lower()
+                except (ValueError, AttributeError):
+                    return False
+                if allowed and proposer_hex not in allowed:
+                    logger.warning(
+                        "Consensus: proposer %s not in active validator set for block #%s",
+                        proposer_hex[:10], block.header.block_number,
+                    )
+                    return False
         else:
             # Phase 1 Legacy Signature: (block)
             block = args[0] if len(args) > 0 else kwargs.get("block")
@@ -260,7 +280,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         metadata = parent_snapshot.metadata
         t_bals = copy.deepcopy(metadata.get('balances', {}))
         t_seqs = copy.deepcopy(metadata.get('sequence_numbers', {}))
-        
+        # Pre-block total supply, captured before apply mutates t_bals.
+        parent_total = sum(int(v) for v in t_bals.values())
+
         # Make a deep copy of the lifecycle manager or instantiate a snapshot equivalent
         parent_lm = metadata.get('lifecycle_manager')
         if parent_lm:
@@ -285,7 +307,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             proposer_pubkey=block.header.proposer_pubkey,
             block_height=block.header.block_number,
         )
-        
+
+        # Conservation invariant: the native fee model debits the sender and
+        # credits the proposer through the same staged_writes pass, so total
+        # supply is preserved across a block (no mint, no burn). A mismatch is
+        # a consensus bug, not a recoverable error.
+        post_total = sum(int(v) for v in t_bals.values())
+        if post_total != parent_total:
+            raise BlockchainBug(
+                f"Supply not conserved applying block #{block.header.block_number}: "
+                f"parent_total={parent_total} post_total={post_total}"
+            )
+
         # Convert internal apply result into structural outcomes
         outcomes = []
         accepted_ids = []
@@ -520,6 +553,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             hard_reject = False
             execution_success = True
             tx_receipt = {"logs": []}
+
+            # Expiration recheck against the deterministic block timestamp
+            # (admission checks wall clock; this is the consensus-side gate).
+            expiration_time = tx.get('expiration_time')
+            if block_timestamp and isinstance(expiration_time, int) and block_timestamp > expiration_time:
+                if not replay_mode:
+                    accepted_in_block = False
+                    hard_reject = True
+                execution_success = False
+                tx_receipt["logs"].append("Transaction expired at block timestamp")
 
             # Sequence number handling: only increment if the tx is included/accepted.
             sequence_number = tx.get('sequence_number')
@@ -807,8 +850,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         tx_receipt["logs"].append(f"Tau fee step: {step_fee}")
 
                                 current_from = _read_bal(from_addr)
-                                if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                                    current_from = 1000
                                 if current_from < amount:
                                     logger.error(
                                         "Insufficient funds for %s to send %s. Has: %s.",
@@ -874,10 +915,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                             current_from = target_balances[from_addr]
                                         else:
                                             current_from = chain_state.get_balance(from_addr)
-                                        
-                                        if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                                            current_from = 1000
-                                            
+
                                         if current_from < amount:
                                             logger.error("Insufficient funds for %s to send %s. Has: %s.", from_addr[:10], amount, current_from)
                                             if not replay_mode:

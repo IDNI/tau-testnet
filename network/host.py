@@ -100,7 +100,9 @@ class HostManager:
                 peer_id_str = str(self.get_id())
             except Exception:
                 peer_id_str = "<unknown>"
-            connect_hints = [f"{addr}/p2p/{peer_id_str}" for addr in listen_strs]
+            announce = getattr(self._config, "announce_addrs", None)
+            hint_addrs = [str(a) for a in announce] if isinstance(announce, (list, tuple)) and announce else listen_strs
+            connect_hints = [f"{addr}/p2p/{peer_id_str}" for addr in hint_addrs]
             self._listening.set()
             logger.info(
                 "NetworkService listening peer_id=%s addrs=%s connect=%s",

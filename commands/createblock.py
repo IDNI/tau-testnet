@@ -222,7 +222,15 @@ def create_block_from_mempool() -> Dict:
 
     from consensus.engine import TauConsensusEngine
     engine = TauConsensusEngine()
-    
+
+    # PoA: refuse to propose if our key has been removed from the active set.
+    active = getattr(chain_state._lifecycle_manager, "active_validators", set())
+    if active and not getattr(config.settings.authority, "open_governance_admission", False) \
+            and (config.MINER_PUBKEY or "").lower() not in active:
+        msg = "Local miner pubkey is not in the active validator set; not proposing."
+        print(f"[INFO][createblock] {msg}")
+        return {"message": msg}
+
     current_time = int(time.time())
     if not engine.query_eligibility(config.MINER_PUBKEY, block_number, current_time, previous_hash):
         msg = f"Not our turn to mine block #{block_number} according to Tau consensus."

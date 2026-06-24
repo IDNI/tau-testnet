@@ -20,8 +20,18 @@ GENESIS = chain_state.GENESIS_ADDRESS
 # Use stub BLS keys for test addresses
 ADDR_A = bls.SkToPk(bls.KeyGen(b"validation_seed_A")).hex()
 ADDR_B = bls.SkToPk(bls.KeyGen(b"validation_seed_B")).hex()
+# Real signing key for the default sender (signatures are verified for real now).
+SK_SENDER = bls.KeyGen(b"validation_sender")
+SENDER = bls.SkToPk(SK_SENDER).hex()
 INVALID_ADDR_SHORT = "short"
 INVALID_ADDR_NON_HEX = "000...g"
+
+
+def _sign_tx(tx_dict, sk=SK_SENDER):
+    """Sign a tx dict in place with a real BLS signature and return its JSON."""
+    msg_hash = hashlib.sha256(_get_signing_message_bytes(tx_dict)).digest()
+    tx_dict["signature"] = bls.Sign(sk, msg_hash).hex()
+    return json.dumps(tx_dict)
 
 class TestSendTxValidation(unittest.TestCase):
     def setUp(self):
@@ -77,7 +87,8 @@ class TestSendTxValidation(unittest.TestCase):
             o1_val = mock_tau_response(input_stream_values=input_stream_values, target_output_stream_index=1)
             return {1: o1_val}
         patch('commands.sendtx.tau_manager.communicate_with_tau_multi', side_effect=mock_tau_multi).start()
-        sendtx._PY_ECC_AVAILABLE = False
+        # Signatures are verified for real; fund the signing sender.
+        chain_state._balances[SENDER] = 1000
         # Patch pubkey validation to bypass format checks for basic validation tests
         patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
 
@@ -90,9 +101,9 @@ class TestSendTxValidation(unittest.TestCase):
             os.remove(self.test_db)
         config.set_database_path(self.original_db_path)
 
-    def _create_tx(self, transfers, signature="SIG", sender_pubkey=None):
+    def _create_tx(self, transfers, sender_pubkey=None):
         ops = {"1": transfers}
-        pk_hex = sender_pubkey or GENESIS
+        pk_hex = sender_pubkey or SENDER
         tx_dict = {
             "tx_type": "user_tx",
             "sender_pubkey": pk_hex,
@@ -100,42 +111,30 @@ class TestSendTxValidation(unittest.TestCase):
             "expiration_time": int(time.time()) + 1000,
             "operations": ops,
             "fee_limit": "0",
-            "signature": signature,
         }
-        return json.dumps(tx_dict)
+        return _sign_tx(tx_dict)
 
     def test_fail_amount_too_large_python(self):
-        chain_state._balances[GENESIS] = 10
+        chain_state._balances[SENDER] = 10
         amount_to_send = 16
-        tx_json = self._create_tx([[GENESIS, ADDR_A, str(amount_to_send)]])
+        tx_json = self._create_tx([[SENDER, ADDR_A, str(amount_to_send)]])
         # Temporarily enable validation by patching os.environ
         with patch.dict(os.environ, {"TAU_FORCE_TEST": "0"}):
              result = sendtx.queue_transaction(tx_json)
-        # If BLS is disabled (setUp), validation might scope signature, but balance check should run?
-        # sendtx.py: _validate_transaction checks balance.
-        # But if _PY_ECC_AVAILABLE is False, does it check? Yes.
         self.assertFalse(result["ok"], f"Expected failure, got: {result}")
-        self.assertEqual(chain_state.get_balance(GENESIS), 10)
+        self.assertEqual(chain_state.get_balance(SENDER), 10)
         self.assertEqual(len(db.get_mempool_txs()), 0)
 
     def test_fail_invalid_from_address_format_python(self):
-        tx = {
-            "tx_type": "user_tx",
-            "sender_pubkey": INVALID_ADDR_SHORT,
-            "sequence_number": 0,
-            "expiration_time": int(time.time()) + 1000,
-            "operations": {"1": [[INVALID_ADDR_SHORT, ADDR_A, "10"]]},
-            "fee_limit": "0",
-            "signature": "SIG"
-        }
-        tx_json = json.dumps(tx)
+        # Sender signs validly; the transfer's from-address is malformed.
+        tx_json = self._create_tx([[INVALID_ADDR_SHORT, ADDR_A, "10"]])
         result = sendtx.queue_transaction(tx_json)
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "TX_INVALID")
         self.assertIn("Transaction invalid.", result["message"])
 
     def test_fail_invalid_to_address_format_python(self):
-        tx_json = self._create_tx([[GENESIS, INVALID_ADDR_NON_HEX, "10"]])
+        tx_json = self._create_tx([[SENDER, INVALID_ADDR_NON_HEX, "10"]])
         result = sendtx.queue_transaction(tx_json)
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "TX_INVALID")
@@ -143,14 +142,13 @@ class TestSendTxValidation(unittest.TestCase):
     def test_no_transfers_key_success(self):
         tx = {
             "tx_type": "user_tx",
-            "sender_pubkey": GENESIS,
-            "sequence_number": chain_state.get_sequence_number(GENESIS),
+            "sender_pubkey": SENDER,
+            "sequence_number": chain_state.get_sequence_number(SENDER),
             "expiration_time": int(time.time()) + 1000,
             "operations": {"0": "some_other_op_data"},
             "fee_limit": "0",
-            "signature": "SIG"
         }
-        tx_json = json.dumps(tx)
+        tx_json = _sign_tx(tx)
         result = sendtx.queue_transaction(tx_json)
         self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
         mempool = db.get_mempool_txs()
@@ -174,15 +172,14 @@ class TestSendTxValidation(unittest.TestCase):
         """
         tx = {
             "tx_type": "user_tx",
-            "sender_pubkey": GENESIS,
-            "sequence_number": chain_state.get_sequence_number(GENESIS),
+            "sender_pubkey": SENDER,
+            "sequence_number": chain_state.get_sequence_number(SENDER),
             "expiration_time": int(time.time()) + 1000,
             # operations['0'] is a list — invalid; the server must not crash.
             "operations": {"0": ["always."]},
             "fee_limit": "0",
-            "signature": "SIG",
         }
-        tx_json = json.dumps(tx)
+        tx_json = _sign_tx(tx)
         result = sendtx.queue_transaction(tx_json)
         self.assertFalse(result["ok"], f"expected failure, got {result!r}")
         self.assertEqual(result["code"], "TX_INVALID")

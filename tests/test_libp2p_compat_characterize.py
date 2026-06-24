@@ -1,7 +1,7 @@
 """Characterization tests for current libp2p stream-handler behavior on libp2p 0.5.0.
 
-These tests lock the *observable* behavior of the 7 stream handlers in
-`network/service.py` (handshake, ping, sync, blocks, tx, state, gossip_stream)
+These tests lock the *observable* behavior of the 6 stream handlers in
+`network/service.py` (handshake, ping, sync, blocks, tx, gossip_stream)
 before the Phase A refactor extracts stream primitives into
 `network/libp2p_compat.py`. Per the unification plan, each per-handler refactor
 in step A5 must keep these tests green.
@@ -332,51 +332,6 @@ async def test_blocks_empty_request(service):
         await service._handle_blocks(stream)
     # empty -> req={} -> not get_blocks -> default empty
     assert _written_json(stream) == {"blocks": []}
-    assert stream.close.await_count == 1
-
-
-# --------------------------------------------------------------------------
-# _handle_state
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.trio
-async def test_state_valid(service):
-    # _handle_state imports chain_state at function scope; mock the attribute lookups.
-    mock_cs = MagicMock()
-    mock_cs._balances = {"0xabc": 42}
-    mock_cs._sequence_numbers = {"0xabc": 3}
-    blk = {"header": {"merkle_root": "f" * 64}}
-    with _patch_db(get_block_by_hash=blk), \
-         patch.dict(sys.modules, {"chain_state": mock_cs}):
-        stream = _make_stream(json.dumps(
-            {"block_hash": "h1", "accounts": ["0xabc"]}
-        ).encode())
-        await service._handle_state(stream)
-    resp = _written_json(stream)
-    assert resp["ok"] is True
-    assert resp["block_hash"] == "h1"
-    assert resp["state_root"] == "f" * 64
-    assert resp["accounts"]["0xabc"] == {"balance": 42, "sequence": 3}
-    assert stream.close.await_count == 1
-
-
-@pytest.mark.trio
-async def test_state_invalid_json(service):
-    with _patch_db():
-        stream = _make_stream(b"garbage")
-        await service._handle_state(stream)
-    # Today: JSON decode error is caught, no write, only close.
-    assert stream.write.await_count == 0
-    assert stream.close.await_count == 1
-
-
-@pytest.mark.trio
-async def test_state_empty_request(service):
-    with _patch_db():
-        stream = _make_stream(b"")
-        await service._handle_state(stream)
-    assert stream.write.await_count == 0
     assert stream.close.await_count == 1
 
 

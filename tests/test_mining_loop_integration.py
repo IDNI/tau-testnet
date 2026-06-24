@@ -18,13 +18,18 @@ class TestMiningLoopIntegration(unittest.TestCase):
         config.set_database_path(self.db_path)
         db.init_db()
         chain_state.load_genesis("data/genesis.json")
-        
+        # The local miner must be in the active validator set to propose.
+        chain_state._lifecycle_manager.active_validators = {config.MINER_PUBKEY}
+
         # Explicit state cleanup
         chain_state._balances.clear()
         chain_state._sequence_numbers.clear()
         chain_state._application_rules_state = ""
         chain_state._tau_engine_state_hash = ""
-        
+        # Fees are real: fund the test tx senders (txs carry fee_limit=1000).
+        chain_state._balances["a" * 96] = 10000
+        chain_state._balances["c" * 96] = 10000
+
         # Ensure we have a valid miner key
         self.original_key = config.MINER_PRIVKEY
         config.MINER_PRIVKEY = "1" * 64 # Dummy hex key

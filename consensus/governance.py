@@ -10,6 +10,15 @@ logger = logging.getLogger(__name__)
 VALIDATOR_DELTA_FIELDS = ("validator_additions", "validator_removals")
 
 
+def _open_governance_admission() -> bool:
+    """Lazy config read; must match network-wide (same fork caveat as quorum policy)."""
+    try:
+        import config as _config
+        return bool(getattr(_config.settings.authority, "open_governance_admission", False))
+    except Exception:
+        return False
+
+
 def normalize_validator_pubkey(pubkey: Any) -> str:
     """Return a canonical 96-character lowercase validator pubkey hex string."""
     if isinstance(pubkey, (bytes, bytearray)):
@@ -189,11 +198,27 @@ class ConsensusLifecycleManager:
             k: set(v) for k, v in (votes or {}).items()
         }
         self.active_validators = normalize_validator_set(active_validators)
+        # Quorum policy: "" defers to config (TAU_VALIDATOR_VOTE_QUORUM); genesis
+        # consensus_meta.mechanism_specific_metadata.vote_quorum overrides when present.
+        # Must be identical across all nodes or the network forks.
+        self.quorum_policy: str = ""
         self.recompute_approval_threshold()
 
     def recompute_approval_threshold(self) -> int:
+        policy = self.quorum_policy
+        if not policy:
+            try:
+                import config as _config
+                policy = getattr(_config.settings.authority, "validator_vote_quorum", "supermajority")
+            except Exception:
+                policy = "supermajority"
         n_validators = len(self.active_validators)
-        self.approval_threshold = max(1, (2 * n_validators + 2) // 3) if n_validators else 1
+        if not n_validators:
+            self.approval_threshold = 1
+        elif policy == "majority":
+            self.approval_threshold = (n_validators // 2) + 1
+        else:
+            self.approval_threshold = max(1, (2 * n_validators + 2) // 3)
         return self.approval_threshold
 
     def preview_validator_patch(self, patch: Optional[Dict[str, Any]]) -> set[str]:
@@ -276,9 +301,20 @@ class ConsensusLifecycleManager:
             # Known non-pending (already approved/archival) -> reject from mempool
             if is_mempool:
                 return False
-                
+
+        # Non-validator voters are dropped at the mempool only. The block path
+        # must NOT hard-reject here: submit_vote ignores them as a soft no-op,
+        # which keeps block validity deterministic across replays.
+        if is_mempool and not _open_governance_admission():
+            try:
+                voter_hex = normalize_validator_pubkey(voter_pubkey)
+            except ValueError:
+                return False
+            if voter_hex not in self.active_validators:
+                return False
+
         # Already voted duplicate check
-        if uid in self.votes and voter_pubkey in self.votes[uid]:
+        if uid in self.votes and self._normalize_voter(voter_pubkey) in self.votes[uid]:
             if is_mempool:
                 return False
 
@@ -297,21 +333,34 @@ class ConsensusLifecycleManager:
             # However, the top-level block application normally checks this. We return False to signify no tally change.
             return False
 
-        # if voter_pubkey not in self.active_validators:
-        #     return False # Only validators can vote
-            
+        # Only active validators may contribute to the tally. A forged vote
+        # inside a block is a deterministic soft no-op, never a hard reject.
+        try:
+            voter_hex = normalize_validator_pubkey(voter_pubkey)
+        except ValueError:
+            return False
+        if not _open_governance_admission() and voter_hex not in self.active_validators:
+            return False
+
         if uid not in self.votes:
             self.votes[uid] = set()
-            
-        if voter_pubkey in self.votes[uid]:
+
+        if voter_hex in self.votes[uid]:
             # Duplicate vote by the same validator for the same update_id is a valid no-op.
             return False
-            
-        self.votes[uid].add(voter_pubkey)
-        
+
+        self.votes[uid].add(voter_hex)
+
         # Check for promotion
         self._check_approval_promotion(uid)
         return True
+
+    @staticmethod
+    def _normalize_voter(voter_pubkey) -> str:
+        try:
+            return normalize_validator_pubkey(voter_pubkey)
+        except ValueError:
+            return ""
 
     def _check_approval_promotion(self, update_id: bytes):
         """Evaluate threshold and promote to scheduled if approved."""

@@ -18,6 +18,16 @@ GENESIS = chain_state.GENESIS_ADDRESS
 # Use stub BLS keys for test addresses
 ADDR_A = bls.SkToPk(bls.KeyGen(b"basic_seed_A")).hex()
 ADDR_B = bls.SkToPk(bls.KeyGen(b"basic_seed_B")).hex()
+# Real signing key for the default sender (signatures are verified for real now).
+SK_SENDER = bls.KeyGen(b"basic_sender")
+SENDER = bls.SkToPk(SK_SENDER).hex()
+
+
+def _sign_tx(tx_dict, sk=SK_SENDER):
+    """Sign a tx dict in place with a real BLS signature and return its JSON."""
+    msg_hash = hashlib.sha256(_get_signing_message_bytes(tx_dict)).digest()
+    tx_dict["signature"] = bls.Sign(sk, msg_hash).hex()
+    return json.dumps(tx_dict)
 
 class TestSendTxBasic(unittest.TestCase):
     def setUp(self):
@@ -77,11 +87,10 @@ class TestSendTxBasic(unittest.TestCase):
             o1_val = mock_tau_response(input_stream_values=input_stream_values, target_output_stream_index=1)
             return {1: o1_val}
         patch('tau_manager.communicate_with_tau_multi', side_effect=mock_tau_multi).start()
-        sendtx._PY_ECC_AVAILABLE = False
+        # Signatures are verified for real; fund the signing sender.
+        chain_state._balances[SENDER] = 1000
         # Patch pubkey validation to bypass format checks for basic tests
         patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
-        # Disable BLS signature verification for basic tests
-        sendtx._PY_ECC_AVAILABLE = False
 
     def tearDown(self):
         patch.stopall()
@@ -103,11 +112,10 @@ class TestSendTxBasic(unittest.TestCase):
                 sendtx._PY_ECC_AVAILABLE = False
                 sendtx._PY_ECC_BLS = None
 
-    def _create_tx(self, transfers, expiration=None, sequence=None, signature="SIG", sender_pubkey=None):
-        # copy helper logic verbatim from original _create_tx_json
+    def _create_tx(self, transfers, expiration=None, sequence=None, sender_pubkey=None):
         ops = {"1": transfers}
         exp_time = expiration if expiration is not None else int(time.time()) + 1000
-        pk_hex = sender_pubkey or GENESIS
+        pk_hex = sender_pubkey or SENDER
         seq = sequence if sequence is not None else chain_state.get_sequence_number(pk_hex)
         tx_dict = {
             "tx_type": "user_tx",
@@ -116,13 +124,12 @@ class TestSendTxBasic(unittest.TestCase):
             "expiration_time": exp_time,
             "operations": ops,
             "fee_limit": "0",
-            "signature": signature,
         }
-        return json.dumps(tx_dict)
+        return _sign_tx(tx_dict)
 
     def test_successful_single_transfer(self):
         amount = 10
-        tx_json = self._create_tx([[GENESIS, ADDR_A, str(amount)]])
+        tx_json = self._create_tx([[SENDER, ADDR_A, str(amount)]])
         result = sendtx.queue_transaction(tx_json)
         self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
         self.assertIn("tx_hash", result)
@@ -134,8 +141,8 @@ class TestSendTxBasic(unittest.TestCase):
         amount1 = 10
         amount2 = 5
         tx_list = [
-            [GENESIS, ADDR_A, str(amount1)],
-            [GENESIS, ADDR_B, str(amount2)]
+            [SENDER, ADDR_A, str(amount1)],
+            [SENDER, ADDR_B, str(amount2)]
         ]
         tx_json = self._create_tx(tx_list)
         result = sendtx.queue_transaction(tx_json)
@@ -145,7 +152,7 @@ class TestSendTxBasic(unittest.TestCase):
         self.assertEqual(json.loads(mempool[0]), json.loads(tx_json))
 
     def test_queue_transaction_notifies_network_bus(self):
-        tx_json = self._create_tx([[GENESIS, ADDR_A, "1"]])
+        tx_json = self._create_tx([[SENDER, ADDR_A, "1"]])
         canonical = json.dumps(json.loads(tx_json), sort_keys=True, separators=(",", ":"))
 
         mock_service = Mock()
@@ -165,16 +172,18 @@ class TestSendTxBasic(unittest.TestCase):
         original_limit = config.MAX_MEMPOOL_TXS
         config.MAX_MEMPOOL_TXS = 2
         try:
-            tx1 = self._create_tx([[GENESIS, ADDR_A, "10"]], sequence=1)
-            tx2 = self._create_tx([[GENESIS, ADDR_A, "10"]], sequence=2)
-            tx3 = self._create_tx([[GENESIS, ADDR_A, "10"]], sequence=3)
-            
+            # Real signatures are enforced; sequences must be consecutive from 0
+            # (pending-aware), and the signing SENDER is funded in setUp.
+            tx1 = self._create_tx([[SENDER, ADDR_A, "10"]], sequence=0)
+            tx2 = self._create_tx([[SENDER, ADDR_A, "10"]], sequence=1)
+            tx3 = self._create_tx([[SENDER, ADDR_A, "10"]], sequence=2)
+
             # First two should succeed
             res1 = sendtx.queue_transaction(tx1)
             res2 = sendtx.queue_transaction(tx2)
-            self.assertTrue(res1["ok"])
-            self.assertTrue(res2["ok"])
-            
+            self.assertTrue(res1["ok"], msg=res1)
+            self.assertTrue(res2["ok"], msg=res2)
+
             # Third should fail with MEMPOOL_FULL
             res3 = sendtx.queue_transaction(tx3)
             self.assertFalse(res3["ok"])
@@ -182,4 +191,3 @@ class TestSendTxBasic(unittest.TestCase):
             self.assertIn("Mempool is full", res3["message"])
         finally:
             config.MAX_MEMPOOL_TXS = original_limit
-

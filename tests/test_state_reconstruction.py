@@ -70,7 +70,12 @@ class TestStateReconstruction(unittest.TestCase):
         init_db()
         clear_mempool()
         chain_state.load_genesis("data/genesis.json")
-        
+        # These tests build synthetic histories on the legacy GENESIS_ADDRESS
+        # baseline; pin the rebuild seed accordingly (rebuild now seeds from
+        # the loaded genesis artifact by default).
+        chain_state._genesis_accounts_state = {GENESIS_ADDRESS: GENESIS_BALANCE}
+        chain_state._balances[GENESIS_ADDRESS] = GENESIS_BALANCE
+
         # Sample addresses for testing
         self.addr1 = GENESIS_ADDRESS
         self.addr2 = "893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2"

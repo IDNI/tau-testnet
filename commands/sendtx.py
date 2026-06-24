@@ -139,16 +139,11 @@ def _prepare_transfer_inputs(transfer_entry, sender_balance: int) -> dict:
     if not is_valid_to:
         raise ValueError(err_to)
 
-    from_yid = db.get_string_id(from_addr_key)
-    to_yid = db.get_string_id(to_addr_key)
-    
-    try:
-        from_id = int(from_yid[1:])
-        to_id = int(to_yid[1:])
-    except (ValueError, IndexError):
-        raise ValueError(f"Could not parse numeric ID from yID '{from_yid}' or '{to_yid}'")
-    _validate_tau_bv_range(from_id, "From ID")
-    _validate_tau_bv_range(to_id, "To ID")
+    # i3/i4 now carry the FULL 384-bit pubkey (lowercase hex). The bv-shrink layer
+    # interns equality-only address streams to a small bv automatically -- no
+    # hand-rolled id interning here. (Rule 02 declares i3/i4 as bv[384].)
+    from_addr_hex = from_addr_key.lower()
+    to_addr_hex = to_addr_key.lower()
 
     try:
         # Amount is now a 32-byte (256-bit) integer, represented as a string.
@@ -166,8 +161,8 @@ def _prepare_transfer_inputs(transfer_entry, sender_balance: int) -> dict:
     return {
         'amount': amount,
         'balance': sender_balance,
-        'from_id': from_id,
-        'to_id': to_id,
+        'from_addr': from_addr_hex,
+        'to_addr': to_addr_hex,
     }
 
 
@@ -341,33 +336,33 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
         return _qt_err("INVALID_PARAMS", "Missing or invalid 'signature' in transaction.")
     signature = payload['signature']
 
-    if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
-        msg_bytes = _get_signing_message_bytes(payload)
-        msg_hash = hashlib.sha256(msg_bytes).digest()
-        try:
-            sig_bytes = bytes.fromhex(signature)
-            pubkey_bytes = bytes.fromhex(sender_pubkey)
-            if not G2Basic.Verify(pubkey_bytes, msg_hash, sig_bytes):
-                return _qt_err("INVALID_SIGNATURE", "Invalid signature.")
-        except Exception as e:
-            return _qt_err("INVALID_SIGNATURE", f"Invalid signature format or cryptographic error: {e}")
+    if not (_PY_ECC_AVAILABLE and _PY_ECC_BLS):
+        return _qt_err("BLS_UNAVAILABLE", "BLS signatures are required but py_ecc is missing.")
 
-        expected_seq = chain_state.get_sequence_number(sender_pubkey)
+    msg_bytes = _get_signing_message_bytes(payload)
+    msg_hash = hashlib.sha256(msg_bytes).digest()
+    try:
+        sig_bytes = bytes.fromhex(signature)
+        pubkey_bytes = bytes.fromhex(sender_pubkey)
+        if not G2Basic.Verify(pubkey_bytes, msg_hash, sig_bytes):
+            return _qt_err("INVALID_SIGNATURE", "Invalid signature.")
+    except Exception as e:
+        return _qt_err("INVALID_SIGNATURE", f"Invalid signature format or cryptographic error: {e}")
 
-        # Adjust expected sequence if the sender has pending transactions in the mempool
-        pending_seq = db.get_pending_sequence(sender_pubkey)
-        if pending_seq is not None and pending_seq >= expected_seq:
-            expected_seq = pending_seq + 1
+    expected_seq = chain_state.get_sequence_number(sender_pubkey)
 
-        if sequence_number != expected_seq:
-            return _qt_err(
-                "INVALID_SEQUENCE",
-                f"Invalid sequence number: expected {expected_seq}, got {sequence_number}.",
-                expected=expected_seq,
-                received=sequence_number,
-            )
-    else:
-        logger.warning("BLS crypto not available; skipping signature verification and sequence enforcement.")
+    # Adjust expected sequence if the sender has pending transactions in the mempool
+    pending_seq = db.get_pending_sequence(sender_pubkey)
+    if pending_seq is not None and pending_seq >= expected_seq:
+        expected_seq = pending_seq + 1
+
+    if sequence_number != expected_seq:
+        return _qt_err(
+            "INVALID_SEQUENCE",
+            f"Invalid sequence number: expected {expected_seq}, got {sequence_number}.",
+            expected=expected_seq,
+            received=sequence_number,
+        )
 
     all_validated_transfers = []
     transfer_tau_inputs = []
@@ -585,12 +580,13 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                             tau_input_stream_values = {}
                             tau_input_stream_values[1] = str(tau_input_dict['amount'])
                             tau_input_stream_values[2] = str(tau_input_dict['balance'])
-                            tau_input_stream_values[3] = str(tau_input_dict['from_id'])
-                            tau_input_stream_values[4] = str(tau_input_dict['to_id'])
-                            # i12: full 384-bit sender public key (bv[384]) so
-                            # user-policy rules can scope on the real key, not
-                            # the interned bv[16] id on i3. Index >=12 is a free
-                            # (non-reserved) input stream.
+                            # i3/i4: full 384-bit from/to pubkeys. The bv-shrink layer
+                            # interns these equality-only address streams to a small bv
+                            # for evaluation; the canonical full-width rule text is hashed.
+                            tau_input_stream_values[3] = "{ #x" + tau_input_dict['from_addr'] + " }:bv[384]"
+                            tau_input_stream_values[4] = "{ #x" + tau_input_dict['to_addr'] + " }:bv[384]"
+                            # i12: full 384-bit sender public key (bv[384]) for user-policy
+                            # rules that scope on the real key.
                             tau_input_stream_values[12] = "{ #x" + sender_pubkey + " }:bv[384]"
 
                             logger.info(

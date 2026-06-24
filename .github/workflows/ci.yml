@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    name: Unit tests (mock Tau)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Generate genesis artifact (data/ is gitignored)
+        run: |
+          python scripts/generate_miner_keys.py
+          python scripts/gen_genesis.py --validator-privkey "$(cat test_miner.key)" --out data/genesis.json
+          mv test_miner.key test_miner.pub data/
+
+      - name: Run test suite
+        run: >
+          python -m pytest tests/
+          --ignore=tests/test_web_wallet_examples.py
+          --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_temporary_spending_limit
+          --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_time_decaying_multisig
+          -p no:asyncio -q
+
+  native-tau-tests:
+    name: Consensus tests (real Tau, in docker image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build standalone image (cached)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.standalone
+          push: false
+          load: true
+          tags: tau-node:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Native preflight (fail if tau module silently missing)
+        run: >
+          docker run --rm -w /app/tau-testnet tau-node:ci
+          python -c "import tau_native; tau_native.load_tau_module()"
+
+      - name: Run real-Tau consensus suite
+        run: >
+          docker run --rm -e TAU_FORCE_TEST=0 -w /app/tau-testnet tau-node:ci
+          sh -c "
+          python scripts/generate_miner_keys.py &&
+          python scripts/gen_genesis.py --validator-privkey \"\$(cat test_miner.key)\" --out data/genesis.json &&
+          mv test_miner.key test_miner.pub data/ &&
+          python -m pytest
+          tests/test_governance.py
+          tests/test_gov_integration.py
+          tests/test_validator_governance.py
+          tests/test_tau_logic.py
+          tests/test_consensus_time.py
+          tests/test_web_wallet_examples.py
+          tests/test_state_reconstruction.py
+          tests/test_custom_inputs.py
+          tests/test_fee_model_native.py
+          -p no:asyncio -v
+          "

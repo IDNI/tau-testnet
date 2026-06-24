@@ -50,10 +50,17 @@ class TestCustomInputs(unittest.TestCase):
         self.addCleanup(self.test_mode_patcher.stop)
         self.addCleanup(self.isolated_patcher.stop)
 
-        # Patch other dependencies safely
-        self.crypto_patcher = patch('commands.sendtx._PY_ECC_AVAILABLE', False)
-        self.crypto_patcher.start()
+        # Crypto is mandatory now: mock signature verification instead of disabling it.
+        self.crypto_patcher = patch('commands.sendtx.G2Basic')
+        mock_bls = self.crypto_patcher.start()
+        mock_bls.Verify.return_value = True
         self.addCleanup(self.crypto_patcher.stop)
+        self.seq_patcher = patch('commands.sendtx.chain_state.get_sequence_number', return_value=1)
+        self.seq_patcher.start()
+        self.addCleanup(self.seq_patcher.stop)
+        self.pending_seq_patcher = patch('commands.sendtx.db.get_pending_sequence', return_value=None)
+        self.pending_seq_patcher.start()
+        self.addCleanup(self.pending_seq_patcher.stop)
         
     def test_sendtx_reject_reserved_keys(self):
         """Test that sendtx rejects reserved keys 2, 3, 4."""
@@ -66,7 +73,7 @@ class TestCustomInputs(unittest.TestCase):
                 "expiration_time": 9999999999,
                 "operations": {key: "val"},
                 "fee_limit": 100,
-                "signature": "sig"
+                "signature": "00" * 48
             }
             json_blob = json.dumps(payload)
             with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
@@ -88,7 +95,7 @@ class TestCustomInputs(unittest.TestCase):
                 "200": ["a", 1]
             },
             "fee_limit": 100,
-            "signature": "sig",
+            "signature": "00" * 48,
             "sender_pubkey": "a" * 96 # Valid-ish hex
         }
         
@@ -128,7 +135,7 @@ class TestCustomInputs(unittest.TestCase):
                 "100": "42"
             },
             "fee_limit": 100,
-            "signature": "sig"
+            "signature": "00" * 48
         }
 
         with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):

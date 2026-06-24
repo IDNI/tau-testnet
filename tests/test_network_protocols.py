@@ -409,51 +409,6 @@ async def test_dht_value_validators(two_nodes):
         dht.provider_store.add_provider(b"block:", peer_info)
 
 
-async def test_state_protocol_accounts(two_nodes):
-    from network.protocols import TAU_PROTOCOL_STATE
-    import block as block_module
-    import chain_state
-    import db as db_module
-
-    svc1, svc2, _ = two_nodes
-
-    chain_state._balances["0xabc"] = 42
-    chain_state._sequence_numbers["0xabc"] = 7
-
-    test_block = block_module.Block.create(
-        block_number=0,
-        previous_hash="0" * 64,
-        transactions=[],
-            proposer_pubkey="a"*96,
-)
-    db_module.add_block(test_block)
-
-    addrs2 = await _wait_for_addrs(svc2.host)
-    peer_info = PeerInfo(svc2.host.get_id(), addrs2)
-    svc1.host.get_peerstore().add_addrs(peer_info.peer_id, peer_info.addrs, 60)
-    await svc1.host.connect(peer_info)
-
-    req = {
-        "block_hash": test_block.block_hash,
-        "state_root": test_block.header.merkle_root,
-        "accounts": ["0xabc", chain_state.GENESIS_ADDRESS],
-        "receipts": ["tx1"],
-    }
-    stream = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_STATE])
-    await stream.write(json.dumps(req).encode())
-    data = await stream.read()
-    await stream.close()
-    resp = json.loads((data or b"{}").decode())
-    assert resp["ok"] is True
-    assert resp.get("state_root") == test_block.header.merkle_root
-    assert resp.get("block_hash") == test_block.block_hash
-    accounts = resp.get("accounts", {})
-    assert accounts["0xabc"]["balance"] == 42
-    assert accounts["0xabc"]["sequence"] == 7
-    receipts = resp.get("receipts", {})
-    assert receipts.get("tx1") is None
-
-
 async def test_sync_protocol_typical_flow(two_nodes):
     from network.protocols import (
         TAU_PROTOCOL_BLOCKS,

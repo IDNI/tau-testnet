@@ -342,9 +342,13 @@ class DHTManager:
                 if ns in ("state", "tau_state"):
                      from libp2p.peer.peerinfo import PeerInfo
                      
-                     # Add self as provider
+                     # Add self as provider (prefer configured announce addrs)
                      if self._host:
-                         addrs = self._host.get_addrs()
+                         announce = getattr(self._config, "announce_addrs", None)
+                         if isinstance(announce, (list, tuple)) and announce:
+                             addrs = list(announce)
+                         else:
+                             addrs = self._host.get_addrs()
                          # Use self._dht.peer_id if available, else host's
                          pid = getattr(self._dht, "peer_id", None) or self._host.get_id()
                          pi = PeerInfo(pid, addrs)

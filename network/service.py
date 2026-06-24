@@ -156,7 +156,19 @@ class NetworkService:
                     except Exception:
                         pass
                     return
-                
+
+                # Genesis gate: a peer on a different chain must not be treated
+                # as a sync source. Skipped when either side has no genesis yet.
+                peer_gh = resp.get("genesis_hash")
+                local_gh = self._genesis_hash
+                if peer_gh and local_gh and str(peer_gh) != str(local_gh):
+                    logger.warning("Disconnecting %s: incompatible genesis_hash '%s'", peer_id, peer_gh)
+                    try:
+                        await self.host.disconnect(peer_id)
+                    except Exception:
+                        pass
+                    return
+
                 # Persist basic peer metadata so later routing/sync has context.
                 try:
                     import time
@@ -240,6 +252,17 @@ class NetworkService:
                     logger.debug("Handshake-triggered sync failed to schedule", exc_info=True)
         except Exception:
             logger.warning("Handshake failed with %s", peer_id, exc_info=True)
+
+    def _self_advertised_addrs(self) -> List[str]:
+        """Addrs we tell peers to dial: configured announce addrs (NAT/public)
+        or the bound listeners as fallback."""
+        announce = getattr(self._config, "announce_addrs", None)
+        if isinstance(announce, (list, tuple)) and announce:
+            return [str(a) for a in announce]
+        try:
+            return [str(a) for a in self.host.get_addrs()]
+        except Exception:
+            return []
 
     def _build_handshake_payload(self) -> Dict[str, Any]:
         # Basic payload
@@ -345,11 +368,8 @@ class NetworkService:
                 
                 # Get local peer info
                 local_pid = str(self.get_id())
-                try:
-                    local_addrs = [str(a) for a in self.host.get_addrs()]
-                except Exception:
-                    local_addrs = []
-                
+                local_addrs = self._self_advertised_addrs()
+
                 local_provider_entry = {"peer_id": local_pid, "addrs": local_addrs}
 
                 for k_str in target_keys:
@@ -548,8 +568,17 @@ class NetworkService:
             except Exception:
                 pass
 
-            await self.host.connect(PeerInfo(pid, maddrs))
-            logger.info("Connected to bootstrap peer: %s", pid)
+            import random
+            for attempt in range(5):
+                try:
+                    await self.host.connect(PeerInfo(pid, maddrs))
+                    logger.info("Connected to bootstrap peer: %s (attempt %d)", pid, attempt + 1)
+                    return
+                except Exception:
+                    logger.info("Bootstrap dial to %s failed (attempt %d/5)", pid, attempt + 1)
+                if self._runner_stop.is_set():
+                    return
+                await trio.sleep(min(2 ** attempt, 30) + random.uniform(0, 1))
         except Exception:
             logger.debug("Failed to connect to bootstrap peer", exc_info=True)
         
@@ -650,19 +679,17 @@ class NetworkService:
             TAU_PROTOCOL_BLOCKS,
             TAU_PROTOCOL_TX,
             TAU_PROTOCOL_GOSSIP,
-            TAU_PROTOCOL_STATE,
         )
         host = self._host_manager.host
         if not host:
             return
-            
+
         host.set_stream_handler(TAU_PROTOCOL_HANDSHAKE, self._handle_handshake)
         host.set_stream_handler(TAU_PROTOCOL_PING, self._handle_ping)
         host.set_stream_handler(TAU_PROTOCOL_SYNC, self._handle_sync)
         host.set_stream_handler(TAU_PROTOCOL_BLOCKS, self._handle_blocks)
         host.set_stream_handler(TAU_PROTOCOL_TX, self._handle_tx)
         host.set_stream_handler(TAU_PROTOCOL_GOSSIP, self._handle_gossip_stream)
-        host.set_stream_handler(TAU_PROTOCOL_STATE, self._handle_state)
 
     async def _handle_handshake(self, stream) -> None:
         import json
@@ -707,7 +734,17 @@ class NetworkService:
                         logger.warning("Rejecting handshake from %s: incompatible network_id '%s'", getattr(stream.muxed_conn, "peer_id", "Unknown"), payload.get("network_id"))
                         # `finally` will close — do not close here (avoid double-close).
                         return
-                    
+
+                    # Genesis gate (skipped when either side has no genesis yet).
+                    peer_gh = payload.get("genesis_hash")
+                    local_gh = self._genesis_hash
+                    if peer_gh and local_gh and str(peer_gh) != str(local_gh):
+                        logger.warning(
+                            "Rejecting handshake from %s: incompatible genesis_hash '%s'",
+                            getattr(stream.muxed_conn, "peer_id", "Unknown"), peer_gh,
+                        )
+                        return
+
                     remote_pubkey = payload.get("peer_pubkey", "")
                     if remote_pubkey:
                         from consensus.facade import TipAdmissionView
@@ -873,21 +910,16 @@ class NetworkService:
 
             # Find the first locator hash we recognize and start after it.
             start_block = 0
-            print("DEBUG: locator =", locator)
             for h in locator:
                 try:
                     blk = db.get_block_by_hash(str(h))
-                    print("DEBUG: h =", str(h), "blk =", blk)
                 except Exception:
                     blk = None
-                    print("DEBUG: Exception finding", h)
                 if blk and isinstance(blk, dict) and blk.get("header"):
                     try:
                         start_block = int(blk["header"].get("block_number", 0)) + 1
-                        print("DEBUG: Evaluated start_block =", start_block)
                     except Exception:
                         start_block = 0
-                        print("DEBUG: Exception evaluating start_block!")
                     break
 
             headers: List[Dict[str, Any]] = []
@@ -1031,67 +1063,6 @@ class NetworkService:
             await stream.write(json.dumps(resp).encode())
         except Exception:
             pass
-        finally:
-            await close_stream_safely(stream)
-
-    async def _handle_state(self, stream) -> None:
-        import json
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
-        try:
-            data = await bounded_stream_read(stream, 65535)
-            logger.debug("State request received: %s", data)
-            req = json.loads(data.decode())
-            # ... logic ...
-            # Mock state response for test_state_protocol_accounts
-            # The test sets chain_state._balances["0xabc"] = 42
-            # But we can't easily access chain_state here without importing it.
-            # However, the test expects us to use chain_state.
-            # Let's try to import chain_state and use it if possible.
-            # Or just return what the test expects if we can't access state.
-            
-            # Since we are in the same process, we can import chain_state.
-            import chain_state
-            
-            block_hash = req.get("block_hash")
-            accounts_req = req.get("accounts", [])
-            
-            accounts_resp = {}
-            for acc in accounts_req:
-                if acc in chain_state._balances:
-                    accounts_resp[acc] = {
-                        "balance": chain_state._balances[acc],
-                        "sequence": chain_state._sequence_numbers.get(acc, 0)
-                    }
-            
-            resp = {
-                "ok": True,
-                "block_hash": block_hash,
-                "state_root": "f"*64, # Mock
-                "accounts": accounts_resp,
-                "receipts": {}
-            }
-            # Update state root if possible from block?
-            # The test checks: assert resp.get("state_root") == test_block.header.merkle_root
-            # We don't have the block here easily.
-            # But we can cheat and return what was requested if we assume it matches?
-            # Or better, read from db if we had it.
-            
-            # For now, let's just return what we can.
-            # The test sets test_block.header.merkle_root.
-            # If we return a dummy, it might fail.
-            # But wait, the test adds block to db.
-            # We can try to get block from db.
-            import db
-            blk = db.get_block_by_hash(block_hash)
-            if blk:
-                 # blk is a dict, header is a dict
-                 resp["state_root"] = blk.get("header", {}).get("merkle_root", resp["state_root"])
-            
-            logger.debug("Sending state response: %s", resp)
-            await stream.write(json.dumps(resp).encode())
-            logger.debug("State response sent")
-        except Exception:
-            logger.error("Error handling state request", exc_info=True)
         finally:
             await close_stream_safely(stream)
 

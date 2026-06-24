@@ -6,8 +6,7 @@ This project is the codebase for the Tau Testnet Alpha Blockchain. Its primary g
 The architecture is designed around the principle of extralogical processing. The core engine, written in Python, handles networking, storage, and any operations not yet implemented in pure Tau logic, such as cryptographic signature verification. This engine prepares transactions and validates them against a separate Tau logic program (executed either via Docker or direct native bindings), which serves as the ultimate arbiter of the chain's rules. This hybrid model allows us to build a robust and feature-complete testnet today, showcasing the power of Tau's logical core while providing all the necessary functions for a working blockchain.
 
 ## Tau Execution Mode
-Tau logic is fully integrated into the blockchain pipeline, but runtime evaluation is currently disabled by default through the TAU_FORCE_TEST switch. When this flag is enabled, the node bypasses real Tau logic execution and uses a deterministic "test" validator path instead. This allows development and debugging without requiring a running Tau Docker instance.
-To enable true Tau-driven validation, unset TAU_FORCE_TEST in your environment or configuration.
+Tau logic is fully integrated into the blockchain pipeline and real Tau evaluation is **enabled by default**. Setting `TAU_FORCE_TEST=1` bypasses real Tau logic execution and uses a deterministic "test" validator path instead — for development and debugging only (the test suite sets it automatically). Starting a node with `TAU_FORCE_TEST=1` and `TAU_ENV=production` is refused.
 
 ## Tau Direct Bindings (Native Mode)
 For improved performance and simplified deployment, you can bypass the Docker container and interact directly with the local native Tau library (`libtau` via `tau_native.py`).
@@ -225,16 +224,11 @@ Notes:
 - Mount only persistent node data to `/data` (for example `-v "$(pwd)/data:/data"`), not the whole repository.
 
 6.  **Optional: Configure Bootstrap Peers**
-    Edit `config.py` to point at one or more peers to sync from:
-    ```py
-    BOOTSTRAP_PEERS = [
-        {
-            "peer_id": "<REMOTE_NODE_ID>",
-            "addrs": ["/ip4/127.0.0.1/tcp/12345"]
-        },
-    ]
+    Set the `TAU_BOOTSTRAP_PEERS` environment variable (JSON list of peers) — do not edit `config.py`:
+    ```bash
+    export TAU_BOOTSTRAP_PEERS='[{"peer_id":"<REMOTE_NODE_PEER_ID>","addrs":["/ip4/<REMOTE_IP>/tcp/4001"]}]'
     ```
-    On start, the node will connect, handshake, sync headers, request missing block bodies, and rebuild its state.
+    On start, the node will connect (with retry/backoff), handshake, sync headers, request missing block bodies, and rebuild its state. Known peer addresses persist in the peerstore across restarts.
 
 ### Running a local test miner (standalone container, no testnet connection)
 
@@ -267,18 +261,43 @@ This runs an isolated PoA miner in the standalone container and persists state i
      mv test_miner.key test_miner.pub data/
      ```
 
-### Running as a node in the testnet (default)
+### Join the Tau Testnet
 
-This runs as a follower node that syncs from `testnet.tau.net`. Mining stays off unless you explicitly configure a miner key.
+Every node on the network must share the same genesis artifacts and network id; a mismatching `genesis_hash` or `network_id` is rejected at handshake.
 
+**1. Obtain the canonical genesis artifacts** from the testnet operators and place them in the repo:
+- `data/genesis.json` (generated once with `scripts/gen_genesis.py`; defines pre-funded accounts, the validator set, and the governance vote quorum)
+- `genesis.tau` and `genesis_consensus.tau` (repo root)
+
+**2. Run a read/RPC node** (anyone can; no keys needed):
 ```bash
-python server.py
-```
-
-Optional safety (explicitly disable mining on followers):
-```bash
+export TAU_NETWORK_ID=tau-testnet-v2          # must match the network
+export TAU_BOOTSTRAP_PEERS='[{"peer_id":"<BOOTNODE_PEER_ID>","addrs":["/ip4/<BOOTNODE_IP>/tcp/4001"]}]'
+export TAU_NETWORK_LISTEN='/ip4/0.0.0.0/tcp/4001'
 TAU_MINING_ENABLED=false python server.py
 ```
+The node dials the bootnode, syncs the chain, and rebuilds state by replaying every block from genesis. Remote clients cannot trigger `createblock` (loopback-only unless `TAU_ALLOW_REMOTE_CREATEBLOCK=true`).
+
+**3. Behind NAT / on a public server**, advertise your reachable address (the node still binds `TAU_NETWORK_LISTEN` locally):
+```bash
+export TAU_ANNOUNCE_ADDRS='/ip4/<YOUR_PUBLIC_IP>/tcp/4001'
+```
+
+**4. Validators** additionally need their BLS keypair and must be in the on-chain active validator set (genesis, or added later via a `consensus_rule_update` with `validator_additions` that reaches the vote quorum):
+```bash
+export TAU_MINING_ENABLED=true
+export TAU_MINER_PUBKEY=<96-hex-pubkey>
+export TAU_MINER_PRIVKEY=<64-hex-privkey>
+python server.py
+```
+A validator whose key is removed from the active set stops proposing, and its blocks are rejected by the network.
+
+**Network-wide settings that must be identical on every node** (or the network forks):
+- `TAU_NETWORK_ID`, the genesis artifacts,
+- `TAU_VALIDATOR_VOTE_QUORUM` (`supermajority` default; genesis `consensus_meta.mechanism_specific_metadata.vote_quorum` overrides it when present),
+- `TAU_GOVERNANCE_OPEN_ADMISSION` (keep `false` on the public testnet).
+
+**Fees:** the network fee is computed by the consensus rules (Tau stream `o9`, plus an optional user `o8`) per transfer, debited from the sender on block inclusion, and credited to the block proposer. The signed `fee_limit` is an upper bound — the sender pays the computed `total_fee`, not the cap — and only `user_tx` is charged (see "Transaction Fees" below). Unknown accounts have balance 0 — there is no auto-faucet; fund accounts at genesis (`scripts/gen_genesis.py --account ADDR:BALANCE`, repeatable) or via transfers.
 
 ### Running tests (Trio)
 

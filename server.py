@@ -34,7 +34,7 @@ NETWORK_STOP_FLAG = threading.Event()
 SUPPORTED_HANDSHAKE_VERSIONS = {"1", "2"}
 
 
-def process_command(raw_command: str, container: ServiceContainer, client_label: str) -> tuple[bool, str]:
+def process_command(raw_command: str, container: ServiceContainer, client_label: str, *, is_local: bool = False) -> tuple[bool, str]:
     """
     Process a single command string from any source (TCP or WS).
 
@@ -68,6 +68,15 @@ def process_command(raw_command: str, container: ServiceContainer, client_label:
 
     command_name = parts[0].lower()
     logger.debug("Processing command from %s: %s", client_label, command_name)
+
+    # Block production must not be remotely triggerable: createblock uses the
+    # node's MINER_PRIVKEY. Validators mine via the internal SoleMiner loop.
+    if command_name == "createblock" and not is_local \
+            and not getattr(container.settings.authority, "allow_remote_createblock", False):
+        logger.warning("Refusing remote createblock from %s", client_label)
+        return True, api_response.error_response(
+            command_name, "createblock is not allowed from remote clients.", "FORBIDDEN"
+        )
 
     handler = container.command_handlers.get(command_name)
     if not handler or not hasattr(handler, "execute"):
@@ -340,6 +349,7 @@ def handle_client(conn, addr, container: ServiceContainer):
     import socket
 
     client_label = f"{addr[0]}:{addr[1]}" if isinstance(addr, tuple) else str(addr)
+    is_local = isinstance(addr, tuple) and addr[0] in ("127.0.0.1", "::1")
     logger.info("Connection accepted from %s", client_label)
 
     try:
@@ -370,7 +380,7 @@ def handle_client(conn, addr, container: ServiceContainer):
                     continue
 
                 # Use shared process_command logic
-                success, result_message = process_command(raw, container, client_label)
+                success, result_message = process_command(raw, container, client_label, is_local=is_local)
                 
                 # Append newline for TCP clients if missing (process_command returns raw response)
                 if not result_message.endswith("\n"):
@@ -391,6 +401,14 @@ def handle_client(conn, addr, container: ServiceContainer):
 def _run_server(container: ServiceContainer):
     """Runs the main server loop. The caller is responsible for exception handling."""
     logger.info("Bootstrapping server in '%s' environment", container.settings.env)
+
+    if container.settings.env == "production":
+        if os.environ.get("TAU_FORCE_TEST", "0") == "1":
+            raise ConfigurationError("TAU_FORCE_TEST=1 is forbidden when TAU_ENV=production.")
+        if os.environ.get("TAU_FORCE_FRESH_START") == "1":
+            logger.warning(
+                "TAU_FORCE_FRESH_START=1 with TAU_ENV=production: persisted Tau state will be ignored this boot."
+            )
 
     tau_module = container.tau_manager
     db_module = container.db

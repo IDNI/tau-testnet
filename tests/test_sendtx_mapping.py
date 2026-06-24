@@ -26,6 +26,12 @@ from commands import sendtx
 
 GENESIS = chain_state.GENESIS_ADDRESS
 
+# Real signing key for the default sender (signatures are verified for real now).
+from py_ecc.bls import G2Basic as _bls
+import hashlib as _hashlib
+SK_SENDER = _bls.KeyGen(b"mapping_sender")
+SENDER = _bls.SkToPk(SK_SENDER).hex()
+
 
 def _mock_tau_ok(*args, **kwargs):
     target = kwargs.get("target_output_stream_index", 1)
@@ -57,7 +63,8 @@ class TestSendTxMapping(unittest.TestCase):
         patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
         patch("commands.sendtx.tau_manager.communicate_with_tau", _mock_tau_ok).start()
         patch("commands.sendtx.tau_manager.communicate_with_tau_multi", _mock_tau_multi_ok).start()
-        sendtx._PY_ECC_AVAILABLE = False
+        # Signatures are verified for real; fund the signing sender.
+        chain_state._balances[SENDER] = 1000
 
     def tearDown(self):
         patch.stopall()
@@ -71,14 +78,17 @@ class TestSendTxMapping(unittest.TestCase):
     def _base_tx(self, **overrides):
         tx = {
             "tx_type": "user_tx",
-            "sender_pubkey": GENESIS,
-            "sequence_number": chain_state.get_sequence_number(GENESIS),
+            "sender_pubkey": SENDER,
+            "sequence_number": chain_state.get_sequence_number(SENDER),
             "expiration_time": int(time.time()) + 1000,
             "operations": {"1": []},
             "fee_limit": "0",
-            "signature": "SIG",
         }
+        explicit_signature = "signature" in overrides
         tx.update(overrides)
+        if not explicit_signature:
+            msg = sendtx._get_signing_message_bytes(tx)
+            tx["signature"] = _bls.Sign(SK_SENDER, _hashlib.sha256(msg).digest()).hex()
         return tx
 
     # 1. Success
@@ -128,8 +138,6 @@ class TestSendTxMapping(unittest.TestCase):
 
     # 5. Tau rejection (rule validation)
     def test_tau_rejection(self):
-        sendtx._PY_ECC_AVAILABLE = False
-
         def reject(*args, **kwargs):
             return "Error: rejected"
         patch("commands.sendtx.tau_manager.communicate_with_tau", reject).start()

@@ -379,9 +379,26 @@ class TestAdmissionFees(unittest.TestCase):
         self.iso_patcher.start()
         self.addCleanup(self.iso_patcher.stop)
 
-        self.crypto_patcher = patch("commands.sendtx._PY_ECC_AVAILABLE", False)
-        self.crypto_patcher.start()
+        # Crypto is mandatory now: mock signature verification instead of disabling it.
+        self.crypto_patcher = patch("commands.sendtx.G2Basic")
+        mock_bls = self.crypto_patcher.start()
+        mock_bls.Verify.return_value = True
         self.addCleanup(self.crypto_patcher.stop)
+
+        # Sequence enforcement is on; pin the sender's expected sequence to match
+        # the payload (sequence_number=1) and fund the sender (no auto-faucet).
+        self.seq_patcher = patch(
+            "commands.sendtx.chain_state.get_sequence_number", return_value=1
+        )
+        self.seq_patcher.start()
+        self.addCleanup(self.seq_patcher.stop)
+        self.pending_seq_patcher = patch(
+            "commands.sendtx.db.get_pending_sequence", return_value=None
+        )
+        self.pending_seq_patcher.start()
+        self.addCleanup(self.pending_seq_patcher.stop)
+        import chain_state as _cs
+        _cs._balances[SENDER] = 1_000_000
 
         self.pub_patcher = patch(
             "commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)
@@ -406,7 +423,7 @@ class TestAdmissionFees(unittest.TestCase):
             "expiration_time": 9999999999,
             "operations": operations if operations is not None else {"100": "42"},
             "fee_limit": fee_limit,
-            "signature": "sig",
+            "signature": "00" * 48,
         }
         if tx_type != "user_tx":
             p["tx_type"] = tx_type

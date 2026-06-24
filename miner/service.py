@@ -53,6 +53,13 @@ class SoleMiner:
         next_block_number = latest_block['header']['block_number'] + 1 if latest_block else 0
         prev_hash = latest_block['block_hash'] if latest_block else db.get_genesis_hash()
 
+        # PoA: stop proposing if our key has been removed from the active set.
+        import chain_state
+        active = getattr(chain_state._lifecycle_manager, "active_validators", set())
+        if active and not getattr(config.settings.authority, "open_governance_admission", False) \
+                and (config.MINER_PUBKEY or "").lower() not in active:
+            return False
+
         from consensus.engine import TauConsensusEngine
         engine = TauConsensusEngine()
         if not engine.query_eligibility(config.MINER_PUBKEY, next_block_number, int(time.time()), prev_hash):

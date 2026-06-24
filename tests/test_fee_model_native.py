@@ -69,6 +69,11 @@ class _NativeFeeE2EBase(unittest.TestCase):
         chain_state._balances[self.sender] = 100000
         self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
         config.TESTNET_AUTO_FAUCET = False
+        # The local miner proposes every block here, so it must be the (sole)
+        # active validator: in-set for the W1 proposer gate, and the single
+        # voter that reaches a 1-of-1 governance quorum in the fee-change tests.
+        chain_state._lifecycle_manager.active_validators = {config.MINER_PUBKEY.lower()}
+        chain_state._lifecycle_manager.recompute_approval_threshold()
 
         # Live interpreter from the real genesis program; rules arrive the
         # same way they do in production: as i0 pointwise updates.
@@ -81,8 +86,9 @@ class _NativeFeeE2EBase(unittest.TestCase):
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}).start()
 
         # Signature plumbing is out of scope here (covered elsewhere);
-        # everything Tau/fee related runs for real.
-        sendtx._PY_ECC_AVAILABLE = False
+        # everything Tau/fee related runs for real. BLS is mandatory now, so
+        # mock the verifier instead of disabling it.
+        patch("commands.sendtx.G2Basic.Verify", return_value=True).start()
         patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
         patch("commands.createblock._BLS_AVAILABLE", True).start()
         patch("commands.createblock._validate_signature", return_value=True).start()
@@ -119,7 +125,7 @@ class _NativeFeeE2EBase(unittest.TestCase):
             "expiration_time": int(time.time()) + 3600,
             "operations": {"1": [[self.sender, RECIPIENT, str(amount)]]},
             "fee_limit": str(fee_limit),
-            "signature": "SIG",
+            "signature": "00" * 48,
         })
 
 @pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
@@ -215,7 +221,7 @@ class TestFeeModelNativeE2E(_NativeFeeE2EBase):
             "expiration_time": int(time.time()) + 3600,
             "operations": {"1": [[poor, RECIPIENT, "100"]]},
             "fee_limit": "50",
-            "signature": "SIG",
+            "signature": "00" * 48,
         })
         res = sendtx.queue_transaction(tx, propagate=False)
         self.assertFalse(res["ok"])
@@ -274,7 +280,7 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
             "activate_at_height": activate_at,
             "host_contract_patch": {},
             "fee_limit": "0",
-            "signature": "SIG",
+            "signature": "00" * 48,
         })
         res = sendtx.queue_transaction(update_tx, propagate=False)
         self.assertTrue(res["ok"], f"proposal rejected: {res}")
@@ -294,7 +300,7 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
             "update_id": update_id_hex,
             "approve": True,
             "fee_limit": "0",
-            "signature": "SIG",
+            "signature": "00" * 48,
         })
         res = sendtx.queue_transaction(vote_tx, propagate=False)
         self.assertTrue(res["ok"], f"vote rejected: {res}")

@@ -28,6 +28,10 @@ def get_args():
     parser.add_argument("--genesis-consensus-path", type=str, default="genesis_consensus.tau", help="Path to genesis_consensus.tau")
     parser.add_argument("--genesis-address", type=str, default="f427fbf4cb8cc5ebcfc50add98ba574b94c03b1e32626e2e50cf60ba5e0a6d0c42d3ed702c2e0eeef7fae29bc4f3d2f9", help="Genesis address")
     parser.add_argument("--genesis-balance", type=int, default=1000000, help="Genesis balance in AGRS")
+    parser.add_argument(
+        "--account", action="append", default=[], metavar="ADDR:BALANCE",
+        help="Extra pre-funded account as ADDR:BALANCE (repeatable; ADDR is 96 lowercase hex chars)",
+    )
     parser.add_argument("--network-id", type=str, default="tau-testnet-v2", help="Network ID")
     parser.add_argument("--out", type=str, default="data/genesis.json", help="Output path for genesis.json")
     parser.add_argument(
@@ -162,6 +166,14 @@ def main():
     genesis_sequences = {
         args.genesis_address: 0
     }
+    for entry in args.account:
+        addr, _, bal = entry.partition(":")
+        validate_validator_key(addr)  # same 96-lowercase-hex shape as account addresses
+        balance = int(bal)
+        if balance < 0:
+            raise ValueError(f"Account balance must be non-negative: {entry}")
+        genesis_accounts[addr] = balance
+        genesis_sequences[addr] = 0
     accounts_hash_bytes = compute_accounts_hash(genesis_accounts, genesis_sequences)
 
     # 2. Consensus Meta Domain
@@ -174,7 +186,8 @@ def main():
         "vote_records": [],
         "activation_schedule": [],
         "checkpoint_references": [],
-        "mechanism_specific_metadata": {}
+        # vote_quorum pins the governance quorum policy network-wide.
+        "mechanism_specific_metadata": {"vote_quorum": "supermajority"}
     }
 
     host_contract = {
@@ -190,7 +203,7 @@ def main():
         vote_records=[],
         activation_schedule=[],
         checkpoint_references=[],
-        mechanism_specific_metadata={}
+        mechanism_specific_metadata=consensus_meta["mechanism_specific_metadata"]
     )
 
     # 3. State Hash

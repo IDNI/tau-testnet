@@ -29,7 +29,9 @@ class TestConsensusTime(unittest.TestCase):
         db.init_db()
         chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
-        sendtx._PY_ECC_AVAILABLE = False
+        # Crypto is mandatory now: mock signature verification instead of disabling it.
+        mock_bls = patch('commands.sendtx.G2Basic').start()
+        mock_bls.Verify.return_value = True
         patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
         patch('commands.createblock._BLS_AVAILABLE', True).start()
         patch('commands.createblock._validate_signature', return_value=True).start()
@@ -54,7 +56,7 @@ class TestConsensusTime(unittest.TestCase):
                 "5": "1234567890"  # Attempting to inject consensus time!
             },
             "fee_limit": "0",
-            "signature": "SIG"
+            "signature": "00" * 48
         }
         res = sendtx.queue_transaction(json.dumps(tx))
         self.assertFalse(res["ok"], f"Got: {res}")
@@ -81,7 +83,7 @@ class TestConsensusTime(unittest.TestCase):
                 "20": "custom_data"
             },
             "fee_limit": "0",
-            "signature": "SIG"
+            "signature": "00" * 48
         }
         
         # Give Genesis some funds
@@ -122,7 +124,7 @@ class TestConsensusTime(unittest.TestCase):
                 "1": [[chain_state.GENESIS_ADDRESS, "some_addr", "1"]],
                 "20": "custom_data"
             },
-            "signature": "SIG"
+            "signature": "00" * 48
         }
         
         snap = chain_state.TauStateSnapshot(

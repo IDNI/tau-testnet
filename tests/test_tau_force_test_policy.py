@@ -31,7 +31,7 @@ def test_sendtx_ignores_force_test_outside_test_env(monkeypatch):
             "expiration_time": int(time.time()) + 1000,
             "operations": {"0": "always o1[t] := i9[t]."},
             "fee_limit": "0",
-            "signature": "SIG",
+            "signature": "00" * 48,
         }
 
         tau_calls = []
@@ -40,7 +40,8 @@ def test_sendtx_ignores_force_test_outside_test_env(monkeypatch):
             tau_calls.append(kwargs)
             return "Error: syntax"
 
-        monkeypatch.setattr(sendtx, "_PY_ECC_AVAILABLE", False)
+        # Crypto is mandatory now: mock signature verification instead of disabling it.
+        monkeypatch.setattr(sendtx.G2Basic, "Verify", lambda *args, **kwargs: True)
         monkeypatch.setattr(sendtx, "_validate_bls12_381_pubkey", lambda *args, **kwargs: (True, None))
         monkeypatch.setattr(sendtx.chain_state, "get_sequence_number", lambda *_args, **_kwargs: 0)
         monkeypatch.setattr(sendtx.chain_state, "get_rules_state", lambda: None)
