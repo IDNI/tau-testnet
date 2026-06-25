@@ -125,31 +125,82 @@ tau-testnet node run --miner --isolated        # real-Tau isolated dev chain
 
 ## Join the Tau Testnet
 
-Every node on a network must share the **same genesis artifacts and network id**. A peer advertising a mismatching `genesis_hash` or `network_id` is rejected at the handshake (fork protection).
+The public network is **`tau-testnet-v2`**. Everything needed to join is **already committed to this repo** under [`networks/tau-testnet-v2/`](networks/tau-testnet-v2/) (`genesis.json`, the bootnode address, and the network id); `genesis.tau` and `genesis_consensus.tau` sit at the repo root. You do **not** need to obtain anything from the operator.
 
-**1. Get the canonical genesis artifacts** from the network operator and place them in the repo / data dir:
+> Every node must advertise the **same `genesis_hash` and `TAU_NETWORK_ID`** or it is rejected at the P2P handshake (fork protection). Using the committed profile guarantees a match.
 
-- `data/genesis.json` — pre-funded accounts, the validator set, the vote-quorum policy (generated once with `scripts/gen_genesis.py`).
-- `genesis.tau` and `genesis_consensus.tau` — the application and consensus rule programs (repo root).
+Pick the path for your machine. **Docker is the quickest** and works the same on all three OSes; **from source** is for development.
 
-**2. Run a read / RPC node** (no keys required):
+### Option 1 — Docker · Windows / macOS / Linux (no toolchain to build)
 
-```bash
-export TAU_NETWORK_ID=tau-testnet-v2
-export TAU_BOOTSTRAP_PEERS='[{"peer_id":"12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC","addrs":["/ip4/34.251.82.246/tcp/4001"]}]'
-export TAU_NETWORK_LISTEN='/ip4/0.0.0.0/tcp/4001'
-TAU_MINING_ENABLED=false tau-testnet node run --no-isolated
-```
-
-The node dials the bootnode (with retry/backoff), handshakes, syncs headers + block bodies, and rebuilds state by replaying from genesis. Known peers persist in the peerstore across restarts. Remote clients cannot trigger block production (`createblock` is loopback-only unless `TAU_ALLOW_REMOTE_CREATEBLOCK=true`).
-
-**3. Behind NAT / on a public host**, advertise a reachable address (the node still binds `TAU_NETWORK_LISTEN` locally):
+Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows, macOS) or Docker Engine (Linux). The image compiles `tau-lang` for you — nothing else to set up.
 
 ```bash
-export TAU_ANNOUNCE_ADDRS='/ip4/<YOUR_PUBLIC_IP>/tcp/4001'
+# 1. clone, then build the image once (slow: compiles tau-lang inside the image)
+git clone https://github.com/IDNI/tau-testnet.git && cd tau-testnet
+docker build -f Dockerfile.standalone -t tau-testnet-standalone .
+
+# 2. join — loads the committed genesis profile; chain data persists in the `tau_data` volume
+docker run --rm -it -p 65432:65432 -p 65433:65433 -p 4001:4001 \
+  -v tau_data:/data \
+  -e TAU_NETWORK_ID=tau-testnet-v2 \
+  -e TAU_BOOTSTRAP_PEERS='[{"peer_id":"12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC","addrs":["/ip4/34.251.82.246/tcp/4001"]}]' \
+  -e TAU_MINING_ENABLED=false \
+  tau-testnet-standalone \
+  bash -c 'mkdir -p data && cp networks/tau-testnet-v2/genesis.json data/genesis.json && python server.py'
 ```
 
-**4. Run as a validator** (must be in the active set — see [Operating a network](#operating-a-network-genesis-keys-validators)):
+> **Windows:** run the above in **PowerShell** or **Git Bash**. In PowerShell, put the `docker run` on one line (or break lines with a backtick `` ` `` instead of `\`); keep the single quotes around the `TAU_BOOTSTRAP_PEERS` and `bash -c` values.
+
+RPC is exposed on `localhost:65432`, WebSocket on `65433`.
+
+### Option 2 — From source · macOS / Linux / Windows-WSL2
+
+For development, or to run without Docker. **On Windows, run these inside [WSL2](#windows)** — the node is Unix-only.
+
+```bash
+# 1. clone + install the CLI (Python 3.10+)
+git clone https://github.com/IDNI/tau-testnet.git && cd tau-testnet
+python3 -m venv venv && source venv/bin/activate
+pip install -e .
+
+# 2. build the tau-lang native engine once (prerequisites: see "Run from source")
+git clone https://github.com/IDNI/tau-lang.git ../tau-lang
+( cd ../tau-lang && ./dev dep-cvc5 && ./dev dep-boost \
+  && ./dev build Release -DTAU_BUILD_BINDING_PYTHON=ON )
+# only if auto-discovery of ../tau-lang fails:
+# export PYTHONPATH=../tau-lang/build-Release/bindings/python/nanobind
+
+# 3. join — copies the genesis profile into data/, loads the network env, starts the node
+./networks/tau-testnet-v2/join.sh
+```
+
+`join.sh` simply does:
+
+```bash
+cp networks/tau-testnet-v2/genesis.json data/genesis.json
+set -a; . networks/tau-testnet-v2/env; set +a   # TAU_NETWORK_ID + bootnode + listen addr
+tau-testnet node run --no-isolated
+```
+
+The node dials the bootnode (with retry/backoff), handshakes, syncs headers + block bodies, and rebuilds state by replaying from genesis. Known peers persist across restarts. Remote clients cannot trigger block production (`createblock` is loopback-only unless `TAU_ALLOW_REMOTE_CREATEBLOCK=true`).
+
+### Verify you joined
+
+Both join commands run the node in the **foreground**, so sync progress (`Header sync …`, `Added block #N …`) streams live in your terminal. To query state, use the CLI from **another terminal** (it talks to the node's TCP port `65432`):
+
+```bash
+tau-testnet status                       # node started from source
+tau-testnet --host localhost status      # node started via Docker (CLI installed on the host)
+```
+
+> The Docker image ships only the node, not the `tau-testnet` CLI. To query a Docker node, install the client on the host with `pip install -e .` (no `tau-lang` build needed — the CLI is a thin RPC client), or just read the container's foreground logs.
+
+A rising `head_number` means you are syncing. If it stays at 0, the handshake was rejected — confirm `TAU_NETWORK_ID=tau-testnet-v2` and that `data/genesis.json` matches the committed profile (`block_0.hash` = `4bf5ee70…fbce`). The node logs the exact reason for any mismatch.
+
+### Run as a validator
+
+A validator additionally **proposes** blocks and must already be in the active set (granted at genesis or via governance — see [Operating a network](#operating-a-network-genesis-keys-validators)). Add a BLS keypair on top of either path above:
 
 ```bash
 export TAU_MINING_ENABLED=true
@@ -158,32 +209,21 @@ export TAU_MINER_PRIVKEY=<64-hex-privkey>     # or TAU_MINER_PRIVKEY_PATH=/path/
 tau-testnet node run --no-isolated
 ```
 
+For a **Docker** node, pass the same as `-e` flags (and mount the key, e.g. `-v "$(pwd)/test_miner.key:/data/test_miner.key:ro"` with `-e TAU_MINER_PRIVKEY_PATH=/data/test_miner.key`).
+
 A validator whose key is removed from the active set stops proposing, and its blocks are rejected by peers.
+
+### Behind NAT / on a public host
+
+Advertise a reachable address (the node still binds `TAU_NETWORK_LISTEN` locally):
+
+```bash
+export TAU_ANNOUNCE_ADDRS='/ip4/<YOUR_PUBLIC_IP>/tcp/4001'   # Docker: -e TAU_ANNOUNCE_ADDRS=...
+```
 
 > **Must be identical on every node, or the network forks:** `TAU_NETWORK_ID` and the three genesis artifacts (which pin the validator set, the `vote_quorum` policy, and the base fee). Keep `TAU_GOVERNANCE_OPEN_ADMISSION=false` on a public network. The `vote_quorum` policy is read from **genesis, not per-node config**, and is bound into the state hash — a misconfigured node surfaces as a hash mismatch, not a silent fork.
 
-### Docker variants
-
-```bash
-# isolated local miner (generates its own keys on first start)
-docker run --rm -it -p 65432:65432 -p 65433:65433 -p 4001:4001 -v "$(pwd)/data:/data" \
-  -e TAU_MINING_ENABLED=true tau-testnet-standalone
-
-# join a network
-docker run --rm -it -p 65432:65432 -p 65433:65433 -p 4001:4001 -v "$(pwd)/data:/data" \
-  -e TAU_NETWORK_ID=tau-testnet-v2 \
-  -e TAU_BOOTSTRAP_PEERS='[{"peer_id":"<ID>","addrs":["/ip4/<IP>/tcp/4001"]}]' \
-  -e TAU_ANNOUNCE_ADDRS='/ip4/<YOUR_PUBLIC_IP>/tcp/4001' \
-  tau-testnet-standalone
-
-# or via compose / helper script
-docker compose -f docker-compose.standalone.yml up --build
-./scripts/run_standalone_node.sh
-```
-
-In the container, if `TAU_MINING_ENABLED=true` and no keys exist, the entrypoint generates `test_miner.key`/`.pub` under `/data`. Place your `data/genesis.json` + `genesis.tau` + `genesis_consensus.tau` on the mounted volume / image to join an existing network.
-
-#### Rebuilding the image against a specific tau-lang
+### Rebuilding the Docker image against a specific tau-lang
 
 ```bash
 TAU_LANG_REF=$(git ls-remote https://github.com/IDNI/tau-lang.git refs/heads/main | awk '{print $1}')
