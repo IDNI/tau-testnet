@@ -21,8 +21,25 @@ _db_lock = threading.Lock()
 # init_db refuses to start on mismatch instead of silently dropping tables.
 SCHEMA_VERSION = 1
 
-# Upper bound on mempool rows; enforced at insert time in add_mempool_tx.
+# Default upper bound on pending mempool rows; enforced at insert time in
+# add_mempool_tx. Overridden at runtime by config.MAX_MEMPOOL_TXS
+# (env: TAU_MAX_MEMPOOL_TXS) via _configured_mempool_max(); this constant is
+# only the fallback when config is unavailable or unset.
 MEMPOOL_MAX_TXS = 5000
+
+
+def _configured_mempool_max() -> int:
+    """Effective cap on pending mempool rows.
+
+    Reads the live, env-synced config value (config.MAX_MEMPOOL_TXS, fed by
+    TAU_MAX_MEMPOOL_TXS) so the DB-layer eviction honors the same limit as the
+    soft admission pre-check in commands/sendtx.py. Falls back to the module
+    default if config is missing or non-positive.
+    """
+    limit = getattr(config, "MAX_MEMPOOL_TXS", None)
+    if isinstance(limit, int) and limit > 0:
+        return limit
+    return MEMPOOL_MAX_TXS
 
 
 def _is_hash_hex(value: object) -> bool:
@@ -425,10 +442,13 @@ def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
                 marks = ",".join("?" for _ in expired_ids)
                 cur.execute(f"DELETE FROM mempool WHERE id IN ({marks})", tuple(expired_ids))
 
-        # Cap total mempool size; evict oldest pending only (never reserved — the miner holds them).
-        total = cur.execute("SELECT COUNT(*) FROM mempool").fetchone()[0]
-        if total >= MEMPOOL_MAX_TXS:
-            overflow = total - MEMPOOL_MAX_TXS + 1
+        # Cap the pending mempool; evict oldest pending only (never reserved — the miner holds them).
+        # Count pending-only (matching count_mempool_txs / the soft sendtx pre-check) so the
+        # configured limit means the same thing on both the soft and hard paths.
+        cap = _configured_mempool_max()
+        pending = cur.execute("SELECT COUNT(*) FROM mempool WHERE status='pending'").fetchone()[0]
+        if pending >= cap:
+            overflow = pending - cap + 1
             cur.execute(
                 "DELETE FROM mempool WHERE id IN ("
                 "SELECT id FROM mempool WHERE status='pending' ORDER BY received_at ASC LIMIT ?)",

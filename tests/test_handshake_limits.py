@@ -171,3 +171,68 @@ async def test_inbound_handshake_truncation(service):
     # The code calls: self._dht_manager.dht.provider_store.add_provider(key, pi)
     add_provider = service._dht_manager.dht.provider_store.add_provider
     assert add_provider.call_count <= MAX_HANDSHAKE_PROVIDERS + 10
+
+
+# --- Genesis handshake gate (fork protection) ---------------------------------
+#
+# Once a node has a genesis, a peer must present the EXACT same genesis_hash to
+# be treated as a sync source. A missing/empty value must NOT bypass the check
+# (the bug this guards against), and a mismatch must be rejected. On rejection
+# the handler returns before writing its response, so `stream.write` is never
+# called.
+
+def _handshake_stream(payload_dict):
+    import json
+    stream = MagicMock()
+    stream.read = AsyncMock(return_value=json.dumps(payload_dict).encode())
+    stream.write = AsyncMock()
+    stream.close = AsyncMock()
+    return stream
+
+
+_HS_MODULES = {
+    "db": MagicMock(),
+    "multiaddr": MagicMock(),
+    "libp2p.peer.id": MagicMock(),
+    "libp2p.peer.peerinfo": MagicMock(),
+}
+
+
+@pytest.mark.trio
+async def test_handshake_rejects_empty_peer_genesis(service):
+    service._config.genesis_hash = "realgenesis"  # property reads _config fallback
+    service._ensure_peer_route = AsyncMock()
+    stream = _handshake_stream({"network_id": "test-net", "genesis_hash": ""})
+    with patch.dict(sys.modules, _HS_MODULES):
+        await service._handle_handshake(stream)
+    stream.write.assert_not_called()
+
+
+@pytest.mark.trio
+async def test_handshake_rejects_missing_peer_genesis(service):
+    service._config.genesis_hash = "realgenesis"  # property reads _config fallback
+    service._ensure_peer_route = AsyncMock()
+    stream = _handshake_stream({"network_id": "test-net"})  # no genesis_hash key
+    with patch.dict(sys.modules, _HS_MODULES):
+        await service._handle_handshake(stream)
+    stream.write.assert_not_called()
+
+
+@pytest.mark.trio
+async def test_handshake_rejects_mismatched_peer_genesis(service):
+    service._config.genesis_hash = "realgenesis"  # property reads _config fallback
+    service._ensure_peer_route = AsyncMock()
+    stream = _handshake_stream({"network_id": "test-net", "genesis_hash": "otherchain"})
+    with patch.dict(sys.modules, _HS_MODULES):
+        await service._handle_handshake(stream)
+    stream.write.assert_not_called()
+
+
+@pytest.mark.trio
+async def test_handshake_accepts_matching_genesis(service):
+    service._config.genesis_hash = "realgenesis"  # property reads _config fallback
+    service._ensure_peer_route = AsyncMock()
+    stream = _handshake_stream({"network_id": "test-net", "genesis_hash": "realgenesis"})
+    with patch.dict(sys.modules, _HS_MODULES):
+        await service._handle_handshake(stream)
+    stream.write.assert_called()  # reached the response write -> accepted

@@ -11,7 +11,7 @@ from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
 from consensus.fees import FeeRuleError
 from block import Block
 import hashlib
-from consensus.state import compute_state_hash as compute_rules_hash, compute_consensus_state_hash, compute_consensus_meta_hash
+from consensus.state import compute_state_hash as compute_rules_hash, compute_consensus_state_hash
 
 def compute_accounts_hash(balances: Dict[str, int], sequences: Dict[str, int]) -> bytes:
     """
@@ -138,13 +138,7 @@ def _republish_state_to_dht():
          acc_hash = compute_accounts_hash(_balances, _sequence_numbers)
          app_rules_bytes = (_application_rules_state or "").encode("utf-8")
          cons_rules_bytes = (_consensus_rules_state or "").encode("utf-8")
-         vote_records = [(k, pub) for k, v in _lifecycle_manager.votes.items() for pub in v]
-         meta_hash = compute_consensus_meta_hash(
-             host_contract={}, active_validators=list(_lifecycle_manager.active_validators),
-             pending_updates=list(_lifecycle_manager.pending_updates),
-             vote_records=vote_records, activation_schedule=_lifecycle_manager.scheduled_updates,
-             checkpoint_references=[]
-         )
+         meta_hash = _lifecycle_manager.consensus_meta_hash()
     
     state_hash = compute_consensus_state_hash(cons_rules_bytes, app_rules_bytes, acc_hash, meta_hash)
     
@@ -460,20 +454,14 @@ def process_new_block(block: Block) -> bool:
         # Fast path: cleanly extends the canonical chain
         if block.header.previous_hash == current_head_hash or current_head_hash == '':
             parent_block_data = db.get_block_by_hash(current_head_hash) if current_head_hash else None
-            from consensus.state import TauStateSnapshot, compute_consensus_meta_hash, compute_consensus_state_hash
+            from consensus.state import TauStateSnapshot, compute_consensus_state_hash
             engine = TauConsensusEngine()
             
             # 1. Load Canonical Parent Snapshot natively
             app_rules = (_application_rules_state or "").encode('utf-8')
             cons_rules = (_consensus_rules_state or "").encode('utf-8')
             acc_hash = compute_accounts_hash(_balances, _sequence_numbers)
-            vote_records = [(k, pub) for k, v in _lifecycle_manager.votes.items() for pub in v]
-            meta_hash = compute_consensus_meta_hash(
-                host_contract={}, active_validators=list(_lifecycle_manager.active_validators),
-                pending_updates=list(_lifecycle_manager.pending_updates),
-                vote_records=vote_records, activation_schedule=_lifecycle_manager.scheduled_updates,
-                checkpoint_references=[]
-            )
+            meta_hash = _lifecycle_manager.consensus_meta_hash()
             state_hash = compute_consensus_state_hash(cons_rules, app_rules, acc_hash, meta_hash)
             
             parent_snapshot = TauStateSnapshot(
@@ -560,12 +548,7 @@ def process_new_block(block: Block) -> bool:
                 next_app_rules = exec_result.snapshot.tau_bytes.decode('utf-8', errors='ignore')
                 next_cons_rules = _consensus_rules_state
                 next_acc_hash = compute_accounts_hash(temp_balances, temp_sequences)
-                next_meta_hash = compute_consensus_meta_hash(
-                    host_contract={}, active_validators=list(_lifecycle_manager.active_validators),
-                    pending_updates=list(_lifecycle_manager.pending_updates),
-                    vote_records=vote_records, activation_schedule=_lifecycle_manager.scheduled_updates,
-                    checkpoint_references=[]
-                )
+                next_meta_hash = _lifecycle_manager.consensus_meta_hash()
                 next_state_hash = block.header.state_hash or compute_consensus_state_hash(
                     next_cons_rules.encode('utf-8'),
                     next_app_rules.encode('utf-8'),
@@ -758,13 +741,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             app_rules = (_application_rules_state or "").encode('utf-8')
             cons_rules = (_consensus_rules_state or "").encode('utf-8')
             acc_hash = compute_accounts_hash(_balances, _sequence_numbers)
-            vote_records = [(k, pub) for k, v in _lifecycle_manager.votes.items() for pub in v]
-            meta_hash = compute_consensus_meta_hash(
-                host_contract={}, active_validators=list(_lifecycle_manager.active_validators),
-                pending_updates=list(_lifecycle_manager.pending_updates),
-                vote_records=vote_records, activation_schedule=_lifecycle_manager.scheduled_updates,
-                checkpoint_references=[]
-            )
+            meta_hash = _lifecycle_manager.consensus_meta_hash()
             state_hash = compute_consensus_state_hash(cons_rules, app_rules, acc_hash, meta_hash)
             
             # Build input parent_snapshot natively utilizing runtime state

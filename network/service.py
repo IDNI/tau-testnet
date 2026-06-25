@@ -157,12 +157,16 @@ class NetworkService:
                         pass
                     return
 
-                # Genesis gate: a peer on a different chain must not be treated
-                # as a sync source. Skipped when either side has no genesis yet.
+                # Genesis gate: a peer on a different chain — or one that hides
+                # its genesis to slip past this check — must not be treated as a
+                # sync source. Once THIS node has a genesis, any peer that does
+                # not present the exact same genesis_hash (including a
+                # missing/empty value) is rejected. Only skipped while we
+                # ourselves have no genesis yet (early boot).
                 peer_gh = resp.get("genesis_hash")
                 local_gh = self._genesis_hash
-                if peer_gh and local_gh and str(peer_gh) != str(local_gh):
-                    logger.warning("Disconnecting %s: incompatible genesis_hash '%s'", peer_id, peer_gh)
+                if local_gh and str(peer_gh or "") != str(local_gh):
+                    logger.warning("Disconnecting %s: incompatible genesis_hash %r", peer_id, peer_gh)
                     try:
                         await self.host.disconnect(peer_id)
                     except Exception:
@@ -735,12 +739,15 @@ class NetworkService:
                         # `finally` will close — do not close here (avoid double-close).
                         return
 
-                    # Genesis gate (skipped when either side has no genesis yet).
+                    # Genesis gate: reject any peer that does not present our
+                    # exact genesis_hash once we have one — including a
+                    # missing/empty value, which must not be usable to bypass
+                    # the check. Only skipped while we ourselves have no genesis.
                     peer_gh = payload.get("genesis_hash")
                     local_gh = self._genesis_hash
-                    if peer_gh and local_gh and str(peer_gh) != str(local_gh):
+                    if local_gh and str(peer_gh or "") != str(local_gh):
                         logger.warning(
-                            "Rejecting handshake from %s: incompatible genesis_hash '%s'",
+                            "Rejecting handshake from %s: incompatible genesis_hash %r",
                             getattr(stream.muxed_conn, "peer_id", "Unknown"), peer_gh,
                         )
                         return

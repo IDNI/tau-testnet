@@ -191,6 +191,41 @@ class Block:
             "tx_ids": self.tx_ids,
         }
 
+    def verify_consensus_proof(self) -> bool:
+        """Cryptographically verify the proposer's BLS signature (the
+        ``consensus_proof``) over this block's canonical header bytes.
+
+        This is the host-side check the genesis consensus rule gates block
+        validity on: it produces Tau input ``i10`` (host proof validity), and
+        the rule ``o6 = i10`` rejects any block whose signature does not
+        verify (see ``chain_state.process_new_block`` ->
+        ``TauConsensusEngine.verify_block_header``). Without it, the
+        validator-set membership check alone proves only that the named
+        proposer is *listed*, not that the sender holds its key — so a peer
+        could forge a block naming any active validator as proposer.
+
+        Genesis (block 0) is provisioned directly with the all-zero proposer
+        sentinel and carries no proposer signature, so it is treated as valid.
+        Fails closed (returns ``False``) if BLS is unavailable or the
+        signature/pubkey is missing or malformed.
+        """
+        if self.header.block_number == 0:
+            return True
+        proof = self.consensus_proof
+        if isinstance(proof, dict):
+            proof = proof.get("signature")
+        if not proof or not self.header.proposer_pubkey:
+            return False
+        try:
+            import hashlib
+            from py_ecc.bls import G2Basic
+            msg_hash = hashlib.sha256(self.header.canonical_bytes()).digest()
+            pubkey_bytes = bytes.fromhex(self.header.proposer_pubkey)
+            sig_bytes = bytes.fromhex(proof)
+            return bool(G2Basic.Verify(pubkey_bytes, msg_hash, sig_bytes))
+        except Exception:
+            return False
+
 
 def bls_signing_available() -> bool:
     return _BLS_AVAILABLE

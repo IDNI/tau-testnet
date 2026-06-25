@@ -272,7 +272,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         Pure Implementation: Operates on state passed implicitly through parent_snapshot.metadata and returns ApplyBlockResult.
         """
         import copy
-        from consensus.state import compute_consensus_meta_hash, compute_consensus_state_hash
+        from consensus.state import compute_consensus_state_hash
         from chain_state import compute_accounts_hash
         import chain_state
 
@@ -402,13 +402,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         
         # Finalize Hashes
         acc_hash = compute_accounts_hash(t_bals, t_seqs)
-        vote_records = [(k, pub) for k, v in lm.votes.items() for pub in v]
-        meta_hash = compute_consensus_meta_hash(
-            host_contract={}, active_validators=list(lm.active_validators),
-            pending_updates=list(lm.pending_updates),
-            vote_records=vote_records, activation_schedule=lm.scheduled_updates,
-            checkpoint_references=[]
-        )
+        meta_hash = lm.consensus_meta_hash()
         state_hash = compute_consensus_state_hash(next_cons_rules.encode('utf-8'), next_app_rules.encode('utf-8'), acc_hash, meta_hash)
         
         # 4. Construct Next Snapshot
@@ -647,7 +641,27 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if tx_type == 'consensus_rule_update':
                 update = parse_consensus_rule_update(tx)
                 if update:
-                    if lifecycle_mgr.can_admit_update(update, is_mempool=False):
+                    # Consensus-enforced activation delay. Mirrors the mempool
+                    # admission floor (admission.validate_consensus_rule_update_payload)
+                    # so a crafted block — which never passed admission — cannot
+                    # submit a governance update that activates before the
+                    # validator set has had time to react; in the limit, reaching
+                    # quorum and activating in the same block. The reference
+                    # height is the inclusion height, so the floor is identical
+                    # on every node applying this block. Breach is a soft no-op
+                    # (block stays valid, update is simply not recorded), matching
+                    # forged-vote / unknown-update handling and keeping replay
+                    # deterministic.
+                    min_activation = (
+                        block_height + len(lifecycle_mgr.active_validators)
+                        if block_height is not None else None
+                    )
+                    if min_activation is not None and update.activate_at_height < min_activation:
+                        tx_receipt["logs"].append(
+                            "Update ignored (activation delay breached): "
+                            f"{update.activate_at_height} < {min_activation}"
+                        )
+                    elif lifecycle_mgr.can_admit_update(update, is_mempool=False):
                         if lifecycle_mgr.submit_update(update):
                             tx_receipt["logs"].append("Update submitted: " + update.update_id_hex)
                         else:

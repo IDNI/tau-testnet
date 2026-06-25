@@ -18,8 +18,14 @@ def compute_consensus_meta_hash(
     pending_updates: List[bytes],
     vote_records: List[tuple[bytes, bytes]],
     activation_schedule: List[tuple[int, bytes]],
-    checkpoint_references: List[tuple[int, bytes]]
+    checkpoint_references: List[tuple[int, bytes]],
+    mechanism_specific_metadata: Optional[Dict[str, Any]] = None,
 ) -> bytes:
+    # `mechanism_specific_metadata` carries consensus-critical policy that is NOT
+    # otherwise bound (notably the governance `vote_quorum`). gen_genesis already
+    # folds it into the block-0 state hash; every runtime recomputation MUST pass
+    # it too, or two nodes with divergent quorum policy compute identical state
+    # hashes while reaching different governance outcomes (silent fork).
     from consensus.serialization import encode_consensus_meta
     canon = encode_consensus_meta(
         host_contract=host_contract,
@@ -27,7 +33,8 @@ def compute_consensus_meta_hash(
         pending_updates=pending_updates,
         vote_records=vote_records,
         activation_schedule=activation_schedule,
-        checkpoint_references=checkpoint_references
+        checkpoint_references=checkpoint_references,
+        mechanism_specific_metadata=mechanism_specific_metadata,
     )
     return blake3(canon).digest()
 

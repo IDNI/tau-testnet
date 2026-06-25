@@ -43,6 +43,17 @@ def get_args():
             "(fee-less network). Max 16777215 (bv[24])."
         ),
     )
+    parser.add_argument(
+        "--vote-quorum", type=str, default="supermajority",
+        choices=["supermajority", "majority"],
+        help=(
+            "Governance vote quorum policy, pinned network-wide into genesis "
+            "consensus_meta (supermajority = ceil(2N/3), majority = N/2+1). "
+            "Bound into the genesis state hash, so it is identical on every "
+            "node. This is the ONLY source of the runtime quorum policy — "
+            "nodes never read it from local config."
+        ),
+    )
     return parser.parse_args()
 
 def derive_pubkey_from_privkey(privkey_hex: str) -> str:
@@ -187,7 +198,7 @@ def main():
         "activation_schedule": [],
         "checkpoint_references": [],
         # vote_quorum pins the governance quorum policy network-wide.
-        "mechanism_specific_metadata": {"vote_quorum": "supermajority"}
+        "mechanism_specific_metadata": {"vote_quorum": args.vote_quorum}
     }
 
     host_contract = {

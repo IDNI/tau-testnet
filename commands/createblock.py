@@ -78,7 +78,7 @@ def execute_batch(transactions: List[Dict], reserved_ids: List[int], block_times
     """
     from copy import deepcopy
     from consensus.engine import TauConsensusEngine
-    from consensus.state import TauStateSnapshot, compute_consensus_meta_hash, compute_consensus_state_hash
+    from consensus.state import TauStateSnapshot, compute_consensus_state_hash
     from chain_state import compute_accounts_hash
 
     latest_block = db.get_canonical_head_block()
@@ -87,13 +87,7 @@ def execute_batch(transactions: List[Dict], reserved_ids: List[int], block_times
     app_rules = (chain_state._application_rules_state or "").encode('utf-8')
     cons_rules = (chain_state._consensus_rules_state or "").encode('utf-8')
     acc_hash = compute_accounts_hash(chain_state._balances, chain_state._sequence_numbers)
-    vote_records = [(k, pub) for k, v in chain_state._lifecycle_manager.votes.items() for pub in v]
-    meta_hash = compute_consensus_meta_hash(
-        host_contract={}, active_validators=list(chain_state._lifecycle_manager.active_validators),
-        pending_updates=list(chain_state._lifecycle_manager.pending_updates),
-        vote_records=vote_records, activation_schedule=chain_state._lifecycle_manager.scheduled_updates,
-        checkpoint_references=[]
-    )
+    meta_hash = chain_state._lifecycle_manager.consensus_meta_hash()
     state_hash = compute_consensus_state_hash(cons_rules, app_rules, acc_hash, meta_hash)
 
     parent_snapshot = TauStateSnapshot(
@@ -314,20 +308,14 @@ def create_block_from_mempool() -> Dict:
     
     try:
         from consensus.engine import TauConsensusEngine
-        from consensus.state import TauStateSnapshot, compute_consensus_meta_hash, compute_consensus_state_hash
+        from consensus.state import TauStateSnapshot, compute_consensus_state_hash
         from chain_state import compute_accounts_hash
         
         # 1. Load canonical parent snapshot
         app_rules = (chain_state._application_rules_state or "").encode('utf-8')
         cons_rules = (chain_state._consensus_rules_state or "").encode('utf-8')
         acc_hash = compute_accounts_hash(chain_state._balances, chain_state._sequence_numbers)
-        vote_records = [(k, pub) for k, v in chain_state._lifecycle_manager.votes.items() for pub in v]
-        meta_hash = compute_consensus_meta_hash(
-            host_contract={}, active_validators=list(chain_state._lifecycle_manager.active_validators),
-            pending_updates=list(chain_state._lifecycle_manager.pending_updates),
-            vote_records=vote_records, activation_schedule=chain_state._lifecycle_manager.scheduled_updates,
-            checkpoint_references=[]
-        )
+        meta_hash = chain_state._lifecycle_manager.consensus_meta_hash()
         state_hash = compute_consensus_state_hash(cons_rules, app_rules, acc_hash, meta_hash)
         
         parent_snapshot = TauStateSnapshot(

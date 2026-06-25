@@ -9,6 +9,15 @@ logger = logging.getLogger(__name__)
 
 VALIDATOR_DELTA_FIELDS = ("validator_additions", "validator_removals")
 
+# Network-wide quorum policy used when genesis does not pin one. The consensus
+# tally MUST resolve to a deterministic value here and never read per-node
+# config: two nodes with different TAU_VALIDATOR_VOTE_QUORUM would otherwise
+# compute different approval thresholds and silently fork. The resolved policy
+# is additionally bound into the consensus state hash (see
+# ConsensusLifecycleManager.consensus_meta_hash) so any divergence surfaces as
+# a hash mismatch rather than an undetected split.
+DEFAULT_QUORUM_POLICY = "supermajority"
+
 
 def _open_governance_admission() -> bool:
     """Lazy config read; must match network-wide (same fork caveat as quorum policy)."""
@@ -198,20 +207,22 @@ class ConsensusLifecycleManager:
             k: set(v) for k, v in (votes or {}).items()
         }
         self.active_validators = normalize_validator_set(active_validators)
-        # Quorum policy: "" defers to config (TAU_VALIDATOR_VOTE_QUORUM); genesis
-        # consensus_meta.mechanism_specific_metadata.vote_quorum overrides when present.
-        # Must be identical across all nodes or the network forks.
+        # Quorum policy is pinned by genesis
+        # (consensus_meta.mechanism_specific_metadata.vote_quorum) and is "" until
+        # that genesis value is loaded, at which point it resolves to
+        # DEFAULT_QUORUM_POLICY. It is NEVER read from per-node config (fork
+        # hazard) and is bound into the consensus state hash.
         self.quorum_policy: str = ""
         self.recompute_approval_threshold()
 
+    def effective_quorum_policy(self) -> str:
+        """Deterministic resolved quorum policy: the genesis-pinned value, else
+        the network-wide DEFAULT_QUORUM_POLICY. Never reads per-node config, so
+        every node with the same genesis resolves the same threshold."""
+        return self.quorum_policy or DEFAULT_QUORUM_POLICY
+
     def recompute_approval_threshold(self) -> int:
-        policy = self.quorum_policy
-        if not policy:
-            try:
-                import config as _config
-                policy = getattr(_config.settings.authority, "validator_vote_quorum", "supermajority")
-            except Exception:
-                policy = "supermajority"
+        policy = self.effective_quorum_policy()
         n_validators = len(self.active_validators)
         if not n_validators:
             self.approval_threshold = 1
@@ -220,6 +231,29 @@ class ConsensusLifecycleManager:
         else:
             self.approval_threshold = max(1, (2 * n_validators + 2) // 3)
         return self.approval_threshold
+
+    def consensus_meta_hash(self) -> bytes:
+        """Canonical BLAKE3 digest of this manager's consensus metadata.
+
+        Single source of truth for every state-hash call site (chain_state,
+        engine, createblock). Binds the active validator set, pending/scheduled
+        governance, votes, AND the resolved quorum policy, so none of those
+        fields can drift between code paths or between nodes without surfacing
+        as a state-hash mismatch.
+        """
+        from consensus.state import compute_consensus_meta_hash
+        vote_records = [
+            (uid, voter) for uid, voters in self.votes.items() for voter in voters
+        ]
+        return compute_consensus_meta_hash(
+            host_contract={},
+            active_validators=list(self.active_validators),
+            pending_updates=list(self.pending_updates),
+            vote_records=vote_records,
+            activation_schedule=self.scheduled_updates,
+            checkpoint_references=[],
+            mechanism_specific_metadata={"vote_quorum": self.effective_quorum_policy()},
+        )
 
     def preview_validator_patch(self, patch: Optional[Dict[str, Any]]) -> set[str]:
         """Return the validator set that would result if this host patch activated."""

@@ -255,14 +255,9 @@ def test_apply_block_routes_activation_revisions_through_i0():
     # on the copy, so use the post-activation lifecycle manager attached to
     # the returned snapshot for the meta-hash recomputation.
     post_lm = next_snapshot.metadata["lifecycle_manager"]
-    expected_meta_hash = compute_consensus_meta_hash(
-        host_contract={},
-        active_validators=list(post_lm.active_validators),
-        pending_updates=list(post_lm.pending_updates),
-        vote_records=[(k, pub) for k, v in post_lm.votes.items() for pub in v],
-        activation_schedule=post_lm.scheduled_updates,
-        checkpoint_references=[],
-    )
+    # Recompute via the same centralized method the engine uses, so the test
+    # also guards that the runtime hash binds the resolved quorum policy.
+    expected_meta_hash = post_lm.consensus_meta_hash()
     expected_acc_hash = compute_accounts_hash({}, {})
     expected_state_hash = compute_consensus_state_hash(
         ("\n".join(revisions)).encode("utf-8"),

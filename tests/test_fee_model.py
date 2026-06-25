@@ -495,6 +495,27 @@ class TestAdmissionFees(unittest.TestCase):
         result, _ = self.queue(self.payload(operations={"0": rule}))
         self.assertTrue(result["ok"], msg=f"benign rule rejected: {result}")
 
+    def test_user_rule_reading_apply_mocked_streams_rejected(self):
+        # i2/i3/i4 are mocked to "0" at block apply but carry real values at
+        # admission; a user fee rule reading them would be admitted then
+        # rejected at inclusion. Hard-reject at admission instead.
+        for stream in ("i2", "i3", "i4"):
+            rule = f"always (o8[t]:bv[24] = {stream}[t]:bv[24])."
+            result, _ = self.queue(self.payload(operations={"0": rule}))
+            self.assertFalse(result["ok"], msg=f"stream {stream} not screened")
+            self.assertIn(stream, result["message"])
+
+    def test_flat_fee_and_ladder_rules_pass_screen(self):
+        flat = "always (o8[t]:bv[24] = { #x000003 }:bv[24])."
+        # Comparison-ladder tier keyed on the real amount stream i1.
+        ladder = (
+            "always ((i1[t]:bv[24] > { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000005 }:bv[24]) "
+            "|| (i1[t]:bv[24] <= { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000001 }:bv[24]))."
+        )
+        for rule in (flat, ladder):
+            result, _ = self.queue(self.payload(operations={"0": rule}))
+            self.assertTrue(result["ok"], msg=f"benign fee rule rejected: {rule} -> {result}")
+
 
 # ---------------------------------------------------------------------------
 # Mempool priority + migration

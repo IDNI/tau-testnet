@@ -1,5 +1,6 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import os
+import re
 import json
 import logging
 
@@ -17,6 +18,55 @@ MAX_RULE_REVISIONS = 32
 MAX_RULE_REVISIONS_BYTES = 196608   # 192 KiB total UTF-8, nests under the 262144 wire cap
 MAX_TRANSFERS_PER_TX = 64
 MAX_CUSTOM_INPUT_STREAMS = 16
+
+# Input streams the native fee/application path MOCKS to "0" during block apply
+# (consensus/engine.py) yet feeds REAL values at mempool admission
+# (commands/sendtx.py). A fee/application rule that READS any of these emits a
+# different fee at admission than at inclusion: the tx is admitted, then
+# rejected at block build (liveness/UX footgun; the engine stays authoritative,
+# so it is not a safety hole). We reject such rule text outright instead of only
+# documenting the constraint. Fee/policy rules scope on i12 (real sender pubkey
+# at apply) and compare tiers on i1 (real amount at apply); they never need
+# i2/i3/i4. See tau_defs.py "DETERMINISM CONSTRAINT" and the README
+# "Transaction fees" section.
+APPLY_MOCKED_INPUT_STREAMS = ("i2", "i3", "i4")
+
+
+def _strip_tau_comments(rule_text: str) -> str:
+    """
+    Drop Tau '#' comments while preserving '#b...'/'#x...' bitvector literals,
+    so a stream screen never false-positives on a stream named only in a
+    comment. Mirrors tau_native.TauInterface._strip_nonliteral_hash_comments,
+    kept local to avoid importing the native bindings on the admission path.
+    """
+    out: List[str] = []
+    for line in (rule_text or "").splitlines():
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if ch != "#":
+                out.append(ch)
+                i += 1
+                continue
+            nxt = line[i + 1].lower() if i + 1 < len(line) else ""
+            if nxt in ("b", "x"):  # #b.../#x... literal, not a comment
+                out.append(ch)
+                i += 1
+                continue
+            break  # comment marker -> drop the rest of this line
+        out.append("\n")
+    return "".join(out)
+
+
+def _streams_referenced(rule_text: str, tokens) -> List[str]:
+    """
+    Subset of `tokens` (e.g. ('i2','i3','i4')) the rule TEXT actually
+    references, after stripping comments. Word-boundary matched so custom
+    streams such as i23/i40/o90 are not mistaken for i2/i4/o9.
+    """
+    scrubbed = _strip_tau_comments(rule_text)
+    return [tok for tok in tokens if re.search(rf"\b{re.escape(tok)}\b", scrubbed)]
+
 
 class AdmissionResult:
     def __init__(self, is_valid: bool, error: Optional[str] = None, data: Optional[Dict] = None):
@@ -64,21 +114,34 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         if 6 <= idx <= 11:
             return format_error(f"Invalid operation target '{key}'. Streams 6-11 are reserved for consensus ABI inputs.")
 
-    # Screen user rule TEXT for consensus output streams. A user rule
-    # writing o6/o7 (block validity / eligibility) or o9 (consensus fee)
-    # would conflict with the voted consensus rules in the composed spec
-    # (unsat -> DoS) or forge consensus verdicts/fees. Crude token scan,
-    # same precedent as the warn-only governance check below — but HARD
-    # for user txs (comment false-positives are an accepted trade-off;
-    # governance revisions stay exempt because writing these streams is
-    # their legitimate job).
+    # Screen user rule TEXT for reserved streams. Comment-stripped and
+    # word-boundary matched (so custom streams like i23/o90 are not mistaken
+    # for i2/o9, and a stream named only in a comment is ignored).
+    #
+    #  (a) A user rule writing o6/o7 (block validity / eligibility) or o9
+    #      (consensus fee) would conflict with the voted consensus rules in the
+    #      composed spec (unsat -> DoS) or forge consensus verdicts/fees.
+    #  (b) A user rule reading i2/i3/i4 (mocked to "0" at block apply) emits a
+    #      different o8 fee at admission than at inclusion -> admitted then
+    #      rejected at block build. Fee/policy rules scope on i12 / compare i1.
+    #
+    # HARD for user txs; governance revisions stay exempt for (a) because
+    # writing those output streams is their legitimate job (see the consensus
+    # revision screen, which still hard-rejects (b)).
     rule_text = operations.get("0")
     if isinstance(rule_text, str) and rule_text:
-        for stream_token in ("o6", "o7", "o9"):
-            if stream_token in rule_text:
-                return format_error(
-                    f"user_tx rule text references reserved consensus output stream '{stream_token}'."
-                )
+        forbidden_out = _streams_referenced(rule_text, ("o6", "o7", "o9"))
+        if forbidden_out:
+            return format_error(
+                f"user_tx rule text references reserved consensus output stream '{forbidden_out[0]}'."
+            )
+        mocked_in = _streams_referenced(rule_text, APPLY_MOCKED_INPUT_STREAMS)
+        if mocked_in:
+            return format_error(
+                f"user_tx rule text references apply-time-mocked input stream "
+                f"'{mocked_in[0]}'; reading i2/i3/i4 diverges the fee between admission "
+                f"and block apply (scope on i12, compare amount on i1 instead)."
+            )
 
     return success()
 
@@ -172,8 +235,9 @@ def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView)
     Pass order:
       1. warn-only ABI check on the joined revisions,
       2. warn-only shadowing check on reserved consensus streams,
-      3. per-revision preprocessing (syntax shape, normalization),
-      4. isolated staging compile against current consensus rules.
+      3. HARD reject of revisions reading apply-time-mocked inputs (i2/i3/i4),
+      4. per-revision preprocessing (syntax shape, normalization),
+      5. isolated staging compile against current consensus rules.
     """
     revisions = tx["rule_revisions"]
 
@@ -192,6 +256,21 @@ def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView)
         for rev in revisions:
             if stream_idx in rev and "consensus" not in rev:
                 logger.warning(f"Revision potentially shadowing {stream_idx}")
+
+    # HARD-reject any revision that reads an apply-time-mocked input stream.
+    # Block-level consensus rules operate on the i6-i11 ABI and have no
+    # legitimate need for the transfer streams i2/i3/i4 (mocked to "0" at block
+    # apply). A consensus fee rule (o9) reading them would compute a different
+    # fee at admission than at inclusion — the same divergence footgun the user
+    # o8 screen rejects. Comment-stripped, word-boundary matched.
+    for rev in revisions:
+        mocked_in = _streams_referenced(rev, APPLY_MOCKED_INPUT_STREAMS)
+        if mocked_in:
+            return format_error(
+                f"Consensus revision references apply-time-mocked input stream "
+                f"'{mocked_in[0]}': a fee rule reading i2/i3/i4 diverges between "
+                f"admission and block apply."
+            )
 
     # Per-revision preprocessing (syntax shape). Anything that explodes here
     # would also explode at activation, so reject early.

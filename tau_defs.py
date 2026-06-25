@@ -78,10 +78,13 @@ USER_POLICY_ALLOW_VALUE = 1
 # feeds real values only on i1 (amount), i5 (block timestamp), i12 (sender
 # pubkey bv[384]) and the tx's custom input streams; i2 (balance) and
 # i3/i4 (from/to ids) are mocked to "0". A fee rule that depends on
-# i2/i3/i4 will compute a different fee at queue time than at apply time
-# and can desync admission estimates from consensus charging. Wallets
-# cannot know the final fee without simulating the same rules; admission
-# errors return the computed estimate (required_fee).
+# i2/i3/i4 would compute a different fee at queue time than at apply time
+# and desync admission estimates from consensus charging. This is now
+# ENFORCED: rule text referencing i2/i3/i4 is hard-rejected at mempool
+# admission for both user o8 rules and consensus o9 revisions (see
+# consensus/admission.py APPLY_MOCKED_INPUT_STREAMS). Scope on i12 and tier
+# on i1 instead. Wallets cannot know the final fee without simulating the
+# same rules; admission errors return the computed estimate (required_fee).
 CUSTOM_FEE_STREAM_INDEX = 8
 CONSENSUS_FEE_STREAM_INDEX = 9
 

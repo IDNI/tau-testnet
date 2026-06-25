@@ -2,493 +2,563 @@
 
 # Tau Testnet Alpha Blockchain
 
-This project is the codebase for the Tau Testnet Alpha Blockchain. Its primary goal is to provide a live, working demonstration of a blockchain where core state transitions and rules are governed by Tau's formal logic.
-The architecture is designed around the principle of extralogical processing. The core engine, written in Python, handles networking, storage, and any operations not yet implemented in pure Tau logic, such as cryptographic signature verification. This engine prepares transactions and validates them against a separate Tau logic program (executed either via Docker or direct native bindings), which serves as the ultimate arbiter of the chain's rules. This hybrid model allows us to build a robust and feature-complete testnet today, showcasing the power of Tau's logical core while providing all the necessary functions for a working blockchain.
+A live, working blockchain whose state transitions and consensus rules are governed by **Tau formal logic**. A Python host handles networking, storage, and cryptography (BLS12-381 signatures); a separate Tau logic program — run via native bindings or the bundled Docker image — is the ultimate arbiter of block validity, proposer eligibility, transfers, and fees.
 
-## Tau Execution Mode
-Tau logic is fully integrated into the blockchain pipeline and real Tau evaluation is **enabled by default**. Setting `TAU_FORCE_TEST=1` bypasses real Tau logic execution and uses a deterministic "test" validator path instead — for development and debugging only (the test suite sets it automatically). Starting a node with `TAU_FORCE_TEST=1` and `TAU_ENV=production` is refused.
+- **Tau-driven consensus** — block validity (`o6`) and proposer eligibility (`o7`) come from living, governance-votable Tau rules.
+- **On-chain PoA validator set** — proposers must be in the active validator set; the set changes only through governance with a configurable vote quorum.
+- **Native fee model** — fees are emitted by the consensus rules (`o9` + optional user `o8`), charged on inclusion, credited to the block proposer.
+- **Multi-node ready** — libp2p P2P, header/block sync, fork choice + reorgs, genesis-hash handshake gate, NAT-friendly announce addresses.
 
-## Tau Direct Bindings (Native Mode)
-For improved performance and simplified deployment, you can bypass the Docker container and interact directly with the local native Tau library (`libtau` via `tau_native.py`).
-To enable this mode, set `TAU_USE_DIRECT_BINDINGS=1` in your environment or `.env` file. This mode requires the `tau` native python extension to be available in your `PYTHONPATH` or properly installed.
-When enabled, the system maintains a single `tau::interpreter` instance and captures state updates directly from the engine's stdout.
+> **Status: Alpha.** Under active development, for testing and experimentation.
+>
+> ⚠️ **This alpha network has no economic finality, no slashing, and limited DoS protection, and it may reorg. Do not use it with real funds.** Specifically: tokens have **no real value**; there is **no finality** (PoA with possible deep reorgs); **no validator slashing**; the cryptography and consensus are **not audited**; sustained Tau use can hit a **native segfault** that stops the node process; and a **bad governance update can halt the chain** until corrected. See [Security & risk model](#security--risk-model).
 
-## Features
+> **Platforms:** Linux and macOS run the node natively. **Windows is supported via Docker Desktop or WSL2** — the node is not supported on *native* Windows (it relies on Unix-only process control and a bash/cmake Tau build). See [Windows](#windows).
 
-*   **TCP Server**: Handles client connections and commands.
-*   **P2P Networking (libp2p shim)**:
-    *   Protocols (all implemented on the libp2p shim):
-        - `TAU_PROTOCOL_HANDSHAKE` (`/tau/handshake/1.0.0`): Exchange node info and current tip.
-        - `TAU_PROTOCOL_PING` (`/tau/ping/1.0.0`): Latency/keepalive round-trip with a nonce.
-        - `TAU_PROTOCOL_SYNC` (`/tau/sync/1.0.0`): Header/tip synchronization with locator/stop/limit semantics.
-        - `TAU_PROTOCOL_BLOCKS` (`/tau/blocks/1.0.0`): Serve block bodies by hash list or by range (`from`/`from_number` + `limit`).
-        - `TAU_PROTOCOL_STATE` (`/tau/state/1.0.0`): Fetch the latest known block metadata alongside requested account/receipt data.
-        - `TAU_PROTOCOL_TX` (`/tau/tx/1.0.0`): Compatibility channel for submitting transactions, which queues locally and re-broadcasts over gossipsub.
-        - `TAU_PROTOCOL_GOSSIP` (`/tau/gossip/1.0.0`): Gossipsub-style transport used for topic-based dissemination.
-    *   Gossip topics:
-        - `tau/blocks/1.0.0`: Propagates new headers/tip summaries prior to full sync.
-        - `tau/transactions/1.0.0`: Propagates canonical, signed transactions across the mesh.
-    *   Bootstrapping connects to peers, performs handshake + sync, fetches missing blocks, rebuilds state, and replays gossip subscriptions so the node immediately participates in block/transaction mesh traffic.
-    *   **Tip semantics**: Block numbers are **0-indexed**. A node with no persisted blocks may still report `head_number: 0` with `head_hash` set to the `genesis_hash` sentinel. A node with exactly one block (block `#0`) will also report `head_number: 0`, but with `head_hash` equal to that block hash. Sync decisions must consider `head_hash` (not just `head_number`).
-    *   Verbose debug logging traces requests/responses and bootstrap progress for easier development.
-*   **Persistent Blockchain & Fork Choice**:
-    *   Creates blocks from transactions stored in the mempool.
-    *   Links blocks together in a chain by referencing the previous block's hash.
-    *   Persists the entire chain of blocks to a SQLite database, tracking multiple competing tips and forks.
-    *   Evaluates the heaviest valid branch using a robust, fork-choice algorithm based on highest-block-height with deterministic tie-breaking.
-    *   Performs chain reorganizations ("reorgs") seamlessly, reverting and re-applying transactions and state when the main chain tips to a different path log.
-*   **Tau-Driven Pluggable Consensus Architecture**:
-    *   The node's consensus policy (who can propose blocks, what makes a block valid) is governed entirely by living Tau rules (`consensus_rules`).
-    *   The Python host orchestrates state storage and cryptographic checks, while Tau evaluates the block against the active rules to emit `o6 = 1` for validity.
-    *   Governance is fully on-chain. Active validators can submit `consensus_rule_update` and `consensus_rule_vote` transactions to dynamically mutate the chain's consensus rules with built-in activation delays.
-*   **Authenticated Transactions via BLS Signatures**:
-    *   Transactions are cryptographically signed using BLS12-381 signatures.
-    *   The server verifies the signature against the `sender_pubkey` and a canonical representation of the transaction data.
-    *   Requires `py_ecc.bls` for signature verification.
-*   **Replay Protection with Sequence Numbers**:
-    *   Each account (`sender_pubkey`) has a sequence number managed by `chain_state.py`.
-    *   Transactions must include the correct sequence number, which is incremented upon successful validation.
-*   **Transaction Expiration**:
-    *   Transactions include an `expiration_time` (Unix timestamp) after which they are considered invalid.
-*   **Typed JSON Transaction Structure**:
-    *   The `sendtx` command now expects typed JSON transactions parameterized by `tx_type`:
-        *   `tx_type="user_tx"`: Standard application payload supporting custom `operations` and rules.
-        *   `tx_type="consensus_rule_update"`: A governance transaction containing `rule_revisions` and an `activate_at_height` integer.
-        *   `tx_type="consensus_rule_vote"`: A vote referencing a pending `update_id` to approve a rule change.
-    *   Common fields across all types include `sender_pubkey`, `sequence_number`, `expiration_time`, `fee_limit`, and a BLS `signature` securing the payload.
-*   **Tau Integration for Operation Validation**: The `genesis.tau` program validates the logic of operations within a transaction (e.g., coin transfers via Tau bitvectors). This now includes robust structural validation to ensure transfer data is complete and well-formed.
-*   **String-to-ID Mapping**: Dynamically assigns `y<ID>` identifiers for Tau payloads.
-*   **In-Memory Balances & Sequence Numbers**: Tracks account balances and sequence numbers for rapid validation.
-*   **SQLite Mempool**: Persists transactions awaiting inclusion in a block.
-*   **BLS12-381 Public Key Validation**: Format and optional cryptographic checks for public keys.
-*   **Strict Execution Validation**: Transactions that are structurally valid but fail during execution (e.g., Tau errors, insufficient funds) are accepted into the block (consuming the nonce) but marked with a "failed" status in the receipt.
+---
 
-### DHT Configuration & Gossip Health
+## Quickstart (Docker, ~2 commands)
 
-The libp2p-based DHT layer now exposes several runtime knobs through `NetworkConfig`:
+The standalone Docker image bundles the node **and** the Tau engine — no separate Tau install needed.
 
-| Option | Default | Purpose |
+```bash
+# 1. Build (compiles tau-lang inside the image; one-time, slow)
+docker build -f Dockerfile.standalone -t tau-testnet-standalone .
+
+# 2. Run a local node (isolated, no mining) with persistent data in ./data
+docker run --rm -it \
+  -p 65432:65432 -p 65433:65433 -p 4001:4001 \
+  -v "$(pwd)/data:/data" \
+  tau-testnet-standalone
+```
+
+The node exposes three ports: **65432** (RPC/TCP + CLI), **65433** (WebSocket, for the web wallet), **4001** (libp2p P2P). The `-v` mount keeps the database, identity, and keys across restarts.
+
+> ⚠️ **Bind RPC/WS to localhost, not all interfaces.** `-p 65432:65432` publishes the port on **every** host interface (`0.0.0.0`). The RPC/WS API has no authentication beyond a loopback gate on `createblock`; anyone who can reach the port can read chain state, submit transactions, and (over plaintext WS) interact with the wallet. P2P (`4001`) is meant to be public; **RPC (`65432`) and WS (`65433`) are not.** For local use, bind them to loopback:
+>
+> ```bash
+> docker run --rm -it \
+>   -p 127.0.0.1:65432:65432 -p 127.0.0.1:65433:65433 -p 4001:4001 \
+>   -v "$(pwd)/data:/data" tau-testnet-standalone
+> ```
+>
+> To expose RPC/WS deliberately, put them behind a TLS-terminating reverse proxy and set `TAU_WS_ALLOWED_ORIGINS`. See [RPC / WebSocket exposure](#rpc--websocket-exposure).
+
+Talk to it from another terminal:
+
+```bash
+pip install -e .                       # installs the `tau-testnet` CLI
+tau-testnet status                     # node health + chain tip
+tau-testnet keys new                   # generate a BLS keypair
+```
+
+To **join a network** instead of running isolated, jump to [Join the Tau Testnet](#join-the-tau-testnet). To run **without Docker**, see [Run from source](#run-from-source).
+
+---
+
+## Ways to run a node
+
+| Path | Best for | Tau engine |
 | --- | --- | --- |
-| `dht_refresh_interval` | `60.0` | Seconds between background calls to `KadDHT.refresh_routing_table`. |
-| `dht_bucket_refresh_interval` | `dht_refresh_interval` | Interval for opportunistic stale peer refresh/eviction. |
-| `dht_bucket_refresh_limit` | `8` | Maximum stale peers revalidated per cycle. |
-| `dht_stale_peer_threshold` | `3600.0` | Age (seconds) before a peer is considered stale. |
-| `dht_opportunistic_cooldown` | `120.0` | Minimum time between reseeding the same peer discovered via gossip/handshake. |
-| `gossip_health_window` | `120.0` | Sliding window used by `get_metrics_snapshot()` to flag gossip as healthy/stale. |
+| **Docker standalone** (above) | Fastest start, operators | Bundled (compiled in image) |
+| **From source + native bindings** | Development, contributors | You build `tau-lang` locally |
+| **`tau-testnet node run`** | Either of the above, ergonomic flags | Whatever the env provides |
 
-Call `NetworkService.get_metrics_snapshot()` (or read the periodic `[metrics]` log line) to monitor gossip activity, routing table counts, and bucket refresh results.
+### Node roles
 
-## Developer CLI (`tau-testnet`)
+- **Read / RPC node** — syncs the chain, serves queries, relays gossip. No keys, mining off. Anyone can run one.
+- **Validator** — additionally proposes blocks. Needs a BLS keypair **and** membership in the on-chain active validator set (granted at genesis or via governance).
 
-The repo ships a single installable CLI named `tau-testnet` that wraps node
-RPC, key management, transaction signing, governance, and Docker. The legacy
-entrypoints `python server.py`, `python wallet.py`, and the standalone
-Dockerfile remain fully supported.
+### Windows
+
+The node does **not** run on native Windows: the watchdog uses `SIGKILL`/`pgrep`, the Tau engine reads `/proc` and loads a `.so`, and tau-lang builds with bash/cmake/clang. Use one of:
+
+- **Docker Desktop (recommended).** Run the exact same image as everyone else. The only difference from the Linux/macOS commands is the volume-mount path. In **PowerShell**:
+
+  ```powershell
+  docker build -f Dockerfile.standalone -t tau-testnet-standalone .
+  docker run --rm -it -p 65432:65432 -p 65433:65433 -p 4001:4001 -v "${PWD}/data:/data" tau-testnet-standalone
+  ```
+
+  In **cmd.exe** use `-v "%cd%/data:/data"`. PowerShell has no `\` line continuation — keep `docker run` on one line, or use a backtick `` ` `` to continue.
+
+- **WSL2 (for development / from source).** Install WSL2 with a Linux distro (Ubuntu), open the Linux shell, and follow the [Run from source](#run-from-source) steps verbatim — inside WSL it is Linux, so every bash command works as written.
+
+The `tau-testnet` CLI is pure Python and runs under native Windows Python to query a remote node (`tau-testnet --host <ip> --port 65432 status`); only *running a node* needs Docker/WSL2.
+
+---
+
+## Run from source
+
+> On Windows, run these inside **WSL2** (see [Windows](#windows)). On Linux/macOS, run them directly.
+
+**Prerequisites:** Python **3.10+** (3.10 / 3.11 / 3.12).
 
 ```bash
-python -m venv venv
-source venv/bin/activate
-pip install -e .
-tau-testnet --help
+python3 -m venv venv && source venv/bin/activate
+pip install -e .                       # installs deps + the `tau-testnet` CLI
 ```
 
-Common workflows:
+**Option A — quick mock node (no Tau build).** `--test` sets `TAU_ENV=test` + `TAU_FORCE_TEST=1` and implies `--miner --isolated`: a self-mining single node using the deterministic mock validator path. Great for trying the CLI/API without compiling tau-lang.
 
 ```bash
-# Inspect a running node
-tau-testnet ping
-tau-testnet --json governance
-
-# Manage local keys (stored under ~/.tau-testnet/keys, chmod 0600)
-tau-testnet keys save --name alice
-tau-testnet keys list
-
-# Send a transfer
-tau-testnet tx send --key alice --to <recipient_pubkey> --amount 10
-
-# Submit a governance proposal / vote (sender must be an active validator;
-# see docs/developer_cli.md for the validator-setup recipe)
-tau-testnet gov propose --key alice --file consensus_update.json
-tau-testnet gov vote --key alice --update-id <update_id_hex>
-
-# Connect to a remote node
-tau-testnet --host testnet.tau.net --port 65432 status
+tau-testnet node run --test
 ```
 
-Full reference, including the validator-setup recipe and the update lifecycle
-(`mempool` → `pending` → `approved-and-scheduled` → `activated`):
-[docs/developer_cli.md](docs/developer_cli.md).
+**Option B — real Tau engine.** Build the `tau-lang` native bindings once, then run **without** `--test` (real evaluation is the default — see [Tau execution mode](#tau-execution-mode)):
 
-Raw TCP/WebSocket command grammar, JSON envelopes, and per-handler payloads:
-[docs/blockchain_api.md](docs/blockchain_api.md).
-
-## Setup and Running
-
-### Prerequisites
-
-*   Python 3.8+
-*   Docker
-*   A Tau Docker image (default: `tau`, configurable in `config.py`).
-*   `py_ecc` (specifically `py_ecc.bls`): **Required** for BLS public key validation and transaction signature verification.
-
-### Setup Steps
-
-1.  **Clone the Repository:**
-    ```bash
-    git clone <repository_url>
-    cd <repository_directory>
-    ```
-2.  **Set up Python Environment (Recommended):**
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate 
-    pip install py_ecc
-    ```
-3.  **Ensure `genesis.tau` is Present:**
-    Place your `genesis.tau` file in the location specified by `config.TAU_PROGRAM_FILE` (defaults to the project root).
-
-4.  **Ensure Tau Docker Image:**
-    Make sure the Docker image specified in `config.TAU_DOCKER_IMAGE` (default: `tau`) is available.
-
-5.  **Run the Server:**
-    ```bash
-    python server.py 
-    ```
-    The server will initialize the database and manage the Tau Docker process.
-
-### Standalone Docker Node (tau-testnet + tau-lang in one container)
-
-This repository now includes a standalone container build that embeds both:
-- the Tau Testnet node (`server.py`)
-- the Tau language engine (compiled from `tau-lang` with Python nanobind bindings)
-
-The container defaults to native bindings mode (`TAU_USE_DIRECT_BINDINGS=1`), so it does **not** require Docker-in-Docker.
-
-1. Build the standalone image:
-   ```bash
-   docker build -f Dockerfile.standalone -t tau-testnet-standalone .
-   ```
-
-2. Run a single standalone node:
-   ```bash
-   docker run --rm -it \
-     -p 65432:65432 -p 65433:65433 -p 4001:4001 \
-     -v "$(pwd)/data:/data" \
-     tau-testnet-standalone
-   ```
-   Important: without the `-p` mappings, the node will only be reachable from inside the container network.
-
-   Or use the helper script (publishes required ports by default):
-   ```bash
-   ./scripts/run_standalone_node.sh
-   ```
-
-3. Or run with Compose:
-   ```bash
-   docker compose -f docker-compose.standalone.yml up --build
-   ```
-
-Useful runtime toggles:
-- `TAU_MINING_ENABLED=true` to enable local PoA mining.
-- `TAU_BOOTSTRAP_PEERS='[]'` to keep the node isolated.
-- `TAU_BOOTSTRAP_PEERS='[{"peer_id":"...","addrs":["/ip4/X.X.X.X/tcp/4001"]}]'` to connect to peers.
-
-#### Updating and rebuilding the standalone image
-
-Use this routine when you want the latest `tau-testnet` code and a fresh `tau-lang` build:
-
-1. Update `tau-testnet`:
-   ```bash
-   git fetch origin
-   git checkout main
-   git pull --ff-only
-   ```
-
-2. Resolve the latest `tau-lang` main commit (or replace with `main` / a tag):
-   ```bash
-   TAU_LANG_REF=$(git ls-remote https://github.com/IDNI/tau-lang.git refs/heads/main | awk '{print $1}')
-   ```
-
-3. Rebuild:
-   ```bash
-   docker build --pull \
-     -f Dockerfile.standalone \
-     --build-arg TAU_LANG_REF="$TAU_LANG_REF" \
-     --build-arg TAU_BUILD_JOBS=4 \
-     -t tau-testnet-standalone:latest .
-   ```
-
-Notes:
-- `TAU_LANG_REF` supports branch, tag, or commit SHA.
-- Keep `TAU_BUILD_JOBS` positive (do not use `0` for dependency build steps).
-- Mount only persistent node data to `/data` (for example `-v "$(pwd)/data:/data"`), not the whole repository.
-
-6.  **Optional: Configure Bootstrap Peers**
-    Set the `TAU_BOOTSTRAP_PEERS` environment variable (JSON list of peers) — do not edit `config.py`:
-    ```bash
-    export TAU_BOOTSTRAP_PEERS='[{"peer_id":"<REMOTE_NODE_PEER_ID>","addrs":["/ip4/<REMOTE_IP>/tcp/4001"]}]'
-    ```
-    On start, the node will connect (with retry/backoff), handshake, sync headers, request missing block bodies, and rebuild its state. Known peer addresses persist in the peerstore across restarts.
-
-### Running a local test miner (standalone container, no testnet connection)
-
-This runs an isolated PoA miner in the standalone container and persists state in `./data`.
-
-1. **Build image (if needed):**
-   ```bash
-   docker build -f Dockerfile.standalone -t tau-testnet-standalone .
-   ```
-
-2. **Start miner with test networking (no bootstrap peers):**
-   ```bash
-   docker run --rm -it \
-     -p 65432:65432 -p 65433:65433 -p 4001:4001 \
-     -v "$(pwd)/data:/data" \
-     -e TAU_ENV=test \
-     -e TAU_BOOTSTRAP_PEERS='[]' \
-     -e TAU_NETWORK_LISTEN='/ip4/0.0.0.0/tcp/4001' \
-     -e TAU_MINING_ENABLED=true \
-     tau-testnet-standalone
-   ```
-
-3. **Miner keys behavior:**
-   - If `/data/test_miner.key` and `/data/test_miner.pub` are missing, the container entrypoint generates them automatically on first start.
-   - Because `/data` is mounted from `./data`, keys and DB persist across restarts.
-   - Optional manual key generation on host:
-     ```bash
-     python scripts/generate_miner_keys.py
-     mkdir -p data
-     mv test_miner.key test_miner.pub data/
-     ```
-
-### Join the Tau Testnet
-
-Every node on the network must share the same genesis artifacts and network id; a mismatching `genesis_hash` or `network_id` is rejected at handshake.
-
-**1. Obtain the canonical genesis artifacts** from the testnet operators and place them in the repo:
-- `data/genesis.json` (generated once with `scripts/gen_genesis.py`; defines pre-funded accounts, the validator set, and the governance vote quorum)
-- `genesis.tau` and `genesis_consensus.tau` (repo root)
-
-**2. Run a read/RPC node** (anyone can; no keys needed):
 ```bash
-export TAU_NETWORK_ID=tau-testnet-v2          # must match the network
+# clone tau-lang as a SIBLING of this repo (../tau-lang is auto-discovered)
+git clone https://github.com/IDNI/tau-lang.git ../tau-lang
+( cd ../tau-lang && ./dev dep-cvc5 && ./dev dep-boost \
+  && ./dev build Release -DTAU_BUILD_BINDING_PYTHON=ON )   # → build-Release/bindings/python/nanobind/tau*.so
+
+# only needed if auto-discovery of ../tau-lang fails:
+export PYTHONPATH=../tau-lang/build-Release/bindings/python/nanobind
+
+tau-testnet node run --miner --isolated        # real-Tau isolated dev chain
+```
+
+`tau-testnet node run` wraps `server.py` (you can also run `python server.py` directly with the same `TAU_*` env vars). Useful flags: `--miner/--no-miner`, `--isolated/--no-isolated`, `--listen <multiaddr|host:port>`, `--ephemeral-identity`, `--fresh`, `--open-governance` (isolated dev only), `--port`, `--host`.
+
+---
+
+## Join the Tau Testnet
+
+Every node on a network must share the **same genesis artifacts and network id**. A peer advertising a mismatching `genesis_hash` or `network_id` is rejected at the handshake (fork protection).
+
+**1. Get the canonical genesis artifacts** from the network operator and place them in the repo / data dir:
+
+- `data/genesis.json` — pre-funded accounts, the validator set, the vote-quorum policy (generated once with `scripts/gen_genesis.py`).
+- `genesis.tau` and `genesis_consensus.tau` — the application and consensus rule programs (repo root).
+
+**2. Run a read / RPC node** (no keys required):
+
+```bash
+export TAU_NETWORK_ID=tau-testnet-v2
 export TAU_BOOTSTRAP_PEERS='[{"peer_id":"<BOOTNODE_PEER_ID>","addrs":["/ip4/<BOOTNODE_IP>/tcp/4001"]}]'
 export TAU_NETWORK_LISTEN='/ip4/0.0.0.0/tcp/4001'
-TAU_MINING_ENABLED=false python server.py
+TAU_MINING_ENABLED=false tau-testnet node run --no-isolated
 ```
-The node dials the bootnode, syncs the chain, and rebuilds state by replaying every block from genesis. Remote clients cannot trigger `createblock` (loopback-only unless `TAU_ALLOW_REMOTE_CREATEBLOCK=true`).
 
-**3. Behind NAT / on a public server**, advertise your reachable address (the node still binds `TAU_NETWORK_LISTEN` locally):
+The node dials the bootnode (with retry/backoff), handshakes, syncs headers + block bodies, and rebuilds state by replaying from genesis. Known peers persist in the peerstore across restarts. Remote clients cannot trigger block production (`createblock` is loopback-only unless `TAU_ALLOW_REMOTE_CREATEBLOCK=true`).
+
+**3. Behind NAT / on a public host**, advertise a reachable address (the node still binds `TAU_NETWORK_LISTEN` locally):
+
 ```bash
 export TAU_ANNOUNCE_ADDRS='/ip4/<YOUR_PUBLIC_IP>/tcp/4001'
 ```
 
-**4. Validators** additionally need their BLS keypair and must be in the on-chain active validator set (genesis, or added later via a `consensus_rule_update` with `validator_additions` that reaches the vote quorum):
+**4. Run as a validator** (must be in the active set — see [Operating a network](#operating-a-network-genesis-keys-validators)):
+
 ```bash
 export TAU_MINING_ENABLED=true
 export TAU_MINER_PUBKEY=<96-hex-pubkey>
-export TAU_MINER_PRIVKEY=<64-hex-privkey>
-python server.py
+export TAU_MINER_PRIVKEY=<64-hex-privkey>     # or TAU_MINER_PRIVKEY_PATH=/path/to/key
+tau-testnet node run --no-isolated
 ```
-A validator whose key is removed from the active set stops proposing, and its blocks are rejected by the network.
 
-**Network-wide settings that must be identical on every node** (or the network forks):
-- `TAU_NETWORK_ID`, the genesis artifacts,
-- `TAU_VALIDATOR_VOTE_QUORUM` (`supermajority` default; genesis `consensus_meta.mechanism_specific_metadata.vote_quorum` overrides it when present),
-- `TAU_GOVERNANCE_OPEN_ADMISSION` (keep `false` on the public testnet).
+A validator whose key is removed from the active set stops proposing, and its blocks are rejected by peers.
 
-**Fees:** the network fee is computed by the consensus rules (Tau stream `o9`, plus an optional user `o8`) per transfer, debited from the sender on block inclusion, and credited to the block proposer. The signed `fee_limit` is an upper bound — the sender pays the computed `total_fee`, not the cap — and only `user_tx` is charged (see "Transaction Fees" below). Unknown accounts have balance 0 — there is no auto-faucet; fund accounts at genesis (`scripts/gen_genesis.py --account ADDR:BALANCE`, repeatable) or via transfers.
+> **Must be identical on every node, or the network forks:** `TAU_NETWORK_ID` and the three genesis artifacts (which pin the validator set, the `vote_quorum` policy, and the base fee). Keep `TAU_GOVERNANCE_OPEN_ADMISSION=false` on a public network. The `vote_quorum` policy is read from **genesis, not per-node config**, and is bound into the state hash — a misconfigured node surfaces as a hash mismatch, not a silent fork.
 
-### Running tests (Trio)
-
-This project uses **Trio** for async tests. Recommended invocation (Trio-only, disable asyncio plugin):
+### Docker variants
 
 ```bash
-./venv/bin/python3 -m pytest -p no:asyncio
+# isolated local miner (generates its own keys on first start)
+docker run --rm -it -p 65432:65432 -p 65433:65433 -p 4001:4001 -v "$(pwd)/data:/data" \
+  -e TAU_MINING_ENABLED=true tau-testnet-standalone
+
+# join a network
+docker run --rm -it -p 65432:65432 -p 65433:65433 -p 4001:4001 -v "$(pwd)/data:/data" \
+  -e TAU_NETWORK_ID=tau-testnet-v2 \
+  -e TAU_BOOTSTRAP_PEERS='[{"peer_id":"<ID>","addrs":["/ip4/<IP>/tcp/4001"]}]' \
+  -e TAU_ANNOUNCE_ADDRS='/ip4/<YOUR_PUBLIC_IP>/tcp/4001' \
+  tau-testnet-standalone
+
+# or via compose / helper script
+docker compose -f docker-compose.standalone.yml up --build
+./scripts/run_standalone_node.sh
 ```
 
-To bypass Tau Docker during tests/dev, set `TAU_FORCE_TEST=1` (see **Tau Execution Mode** above).
+In the container, if `TAU_MINING_ENABLED=true` and no keys exist, the entrypoint generates `test_miner.key`/`.pub` under `/data`. Place your `data/genesis.json` + `genesis.tau` + `genesis_consensus.tau` on the mounted volume / image to join an existing network.
 
-### Connecting to the Server
-
-Use any TCP client, e.g., `netcat`:
-```bash
-netcat 127.0.0.1 65432
-```
-
-## Core Components
-
-*   **`server.py`**: The main TCP server application.
-*   **`tau_manager.py`**: Manages the Tau Docker process lifecycle and communication.
-*   **`commands/`**: Modules for handling client commands:
-    *   `sendtx.py`: Handles submission and validation of complex transactions (including signature checks, sequence numbers, and Tau logic for operations).
-    *   `getmempool.py`: Retrieves mempool content.
-    *   `createblock.py`: Creates new blocks from mempool transactions.
-*   **`db.py`**: SQLite database interface, managing the mempool, string-to-ID mappings, and persistent block storage.
-*   **`network/`**: P2P protocols and service implementation (`handshake`, `ping`, `sync`, `blocks`, `tx`).
-*   **`chain_state.py`**: Manages in-memory state (account balances, sequence numbers).
-*   **`tau_defs.py`**: Tau stream constants for validator interaction.
-*   **`utils.py`**: Utilities for Tau bitvectors, data conversions, and transaction message canonicalization.
-*   **`config.py`**: Centralized configuration.
-*   **`block.py`**: Defines block data structures (block header, transactions list) and merkle root computation.
-*   **`genesis.tau`**: The Tau logic program for validating operations, including structural checks on transaction data and logic for applying new rules via pointwise revision.
-*   **`wallet.py`**: Command-line wallet interface for interacting with the Tau node (see `WALLET_USAGE.md` for comprehensive usage guide).
-*   **`rules/`**: Directory containing Tau rule files:
-    *   `01_handle_insufficient_funds.tau`: Logic for handling insufficient fund scenarios.
-*   **`tests/`**: Directory containing unit tests:
-    - `test_sendtx_basic.py`: Basic transaction functionality tests.
-    - `test_sendtx_validation.py`: Transaction validation logic tests.
-    - `test_sendtx_tx_meta.py`: Transaction metadata handling tests.
-    - `test_sendtx_crypto.py`: Cryptographic signature verification tests.
-    - `test_sendtx_sequential.py`: Sequential multi-operation transaction tests.
-    - `test_tau_logic.py`: Tests all logic paths and validation rules directly within `genesis.tau`.
-    - `test_chain_state.py`: Tests balance and sequence number management.
-    - `test_block.py`: Tests the block data structure and the persistent block creation/chaining logic.
-    - `test_persistent_chain_state.py`: Tests for persistent chain state management (currently skipped).
-    - `test_state_reconstruction.py`: Tests for state reconstruction from blockchain data.
-    - `test_p2p.py`: Connectivity and custom protocol round-trip using libp2p shim.
-    - `test_network_protocols.py`: End-to-end tests for Tau protocols (handshake, ping, sync, blocks, state, tx, gossip). Coverage includes header sync, transaction gossip, subscription handling, DHT routing-table refresh, gossip health metrics, opportunistic peer seeding, and multi-hop gossip propagation driven solely by KadDHT lookups.
-
-## Console Wallet
-
-A comprehensive command-line wallet `wallet.py` is provided to interact with the Tau node. It supports generating a new keypair, sending complex multi-operation transactions (including rules, transfers, and custom operations), querying balances, and listing transaction history. For detailed usage instructions, see `WALLET_USAGE.md`.
-
-### Prerequisites
-
-Requires `py_ecc` for BLS operations (install with `pip install py_ecc`).
-
-### Usage
+#### Rebuilding the image against a specific tau-lang
 
 ```bash
-# Generate a new keypair
-python wallet.py new
-
-# Query balance (by private key or address)
-python wallet.py balance --privkey <hex_privkey>
-python wallet.py balance --address <pubkey_hex>
-
-# List transaction history
-python wallet.py history --privkey <hex_privkey>
-python wallet.py history --address <pubkey_hex>
-
-# Send a simple transaction
-python wallet.py send --privkey <hex_privkey> --to <recipient_pubkey_hex> --amount <amount> [--fee <fee_limit>] [--expiry <seconds>]
-
-# Send a transaction with rules
-python wallet.py send --privkey <hex_privkey> --rule "o2[t]=i1[t]" --transfer "recipient:amount"
-
-# Send multi-operation transaction  
-python wallet.py send --privkey <hex_privkey> --rule "rule_formula" --transfer "addr:amt" --operation "2:custom_data"
+TAU_LANG_REF=$(git ls-remote https://github.com/IDNI/tau-lang.git refs/heads/main | awk '{print $1}')
+docker build --pull -f Dockerfile.standalone \
+  --build-arg TAU_LANG_REF="$TAU_LANG_REF" --build-arg TAU_BUILD_JOBS=4 \
+  -t tau-testnet-standalone:latest .
 ```
 
-## Available Commands and Block Structure
+`TAU_LANG_REF` accepts a branch, tag, or commit SHA. Keep `TAU_BUILD_JOBS` ≥ 1.
 
-### Available Commands
+---
 
-*   **Send Transaction (New Structure):**
-    ```
-    sendtx '{
-      "sender_pubkey": "a63b...ea73", 
-      "sequence_number": 0, 
-      "expiration_time": 1700000000, 
-      "operations": {
-        "1": [["a63b...ea73", "000a...000a", "10"]]
-      },
-      "fee_limit": "10",
-      "signature": "HEX_SIGNATURE_OVER_OTHER_FIELDS"
-    }'
-    ```
-    *   Replace placeholders with actual values.
-    *   The client is responsible for creating the canonical message, hashing it, signing the hash, and providing the hex-encoded signature.
+## Using the node
 
-### Transaction Fees
+The `tau-testnet` CLI is the primary interface; it speaks the RPC over TCP (default `127.0.0.1:65432`). Use `--host`/`--port` to target a remote node and `--json` for machine-readable output.
 
-Fees are sourced from Tau and votable by validators with no dedicated governance machinery:
+```bash
+# keys (stored under ~/.tau-testnet/keys, chmod 0600)
+tau-testnet keys new                              # print a fresh keypair
+tau-testnet keys save --name alice                # generate + save under a name
+tau-testnet keys list
 
-*   **Consensus fee (o9, strict).** The active consensus rules emit the network base fee on output stream `o9` (genesis default: `always (o9[t]:bv[24] = { #x00000a }:bv[24]).` → 10 per step). To change the fee, propose a `consensus_rule_update` whose `rule_revisions` carry the full new consensus spec, gather validator votes, and let it activate at its height. Absent `o9` → fee model inactive (0). A present-but-invalid `o9` is a consensus failure: proposers abort the round and validators defer the block rather than guess (a voted rule emitting garbage is real breakage; silently charging 0 would be a fee holiday).
-*   **User custom fee (o8, lenient).** User-deployed application rules may add an extra fee on output stream `o8` per transfer. Absent → 0 silently; invalid values normalize to 0 with a node-side warning.
-*   **Total**: `total_fee = Σ over the tx's Tau evaluation steps of (o9 + o8)` — one step per transfer; a transfer-less `user_tx` is charged via one fee-query step with canonical mocked transfer inputs (`i1=i2=i3=i4="0"`, `i5` = block timestamp, `i12` = sender pubkey). A flat rule therefore charges per transfer, not per tx — multi-transfer txs pay N× the step fee by design.
-*   **`fee_limit` is a cap.** The tx is rejected (at admission and in-block) if `total_fee > fee_limit`; the sender pays `total_fee`, not the cap. All transactions — governance included — must carry a syntactically valid `fee_limit`; **only `user_tx` is charged** (validators never need funds to govern).
-*   **Recipient**: the fee is credited to `block.header.proposer_pubkey`.
-*   **Charge-on-inclusion**: a tx rejected for fee reasons pays nothing — no transfer writes, no fee writes, no sequence-number increment. The sender's balance must cover `sum(transfer amounts) + total_fee`.
-*   **Determinism constraint for fee rules**: during block application only `i1` (amount), `i5` (block timestamp), `i12` (sender pubkey) and the tx's custom input streams carry real values; `i2`/`i3`/`i4` are mocked to `"0"`. Fee rules depending on the mocked streams desync admission estimates from consensus charging. Wallets cannot know the final fee without simulating the same rules; the admission error `FEE_LIMIT_TOO_LOW` returns the computed estimate as `required_fee`.
-*   **Mempool priority**: pending transactions are ordered by the admission-time fee estimate (`estimated_fee DESC, fee_limit DESC, received_at ASC`); inflating `fee_limit` does not buy priority.
-*   **Tau availability**: fees are unknowable without Tau, so a proposer aborts the round and a validator defers any block containing `user_tx` while Tau is down. Tau-less startup replay assumes fee 0 (correct for pre-fee chains; the state-hash invariant catches divergence on fee-era chains).
-*   **Limitations**: multiplication is not verified in the deployed tau-lang usage, so percentage fees are not expressible yet — flat fees and comparison-ladder tiers (e.g. `i1 > threshold → higher o9`) only. User rule text referencing `o6`/`o7`/`o9` is rejected at admission (consensus streams are written only by voted consensus rules).
+# query chain state
+tau-testnet status
+tau-testnet balance <pubkey>
+tau-testnet sequence <pubkey>
+tau-testnet history <pubkey>
+tau-testnet blocks --limit 10
+tau-testnet mempool
+tau-testnet governance
 
-*   **Get Mempool:**
-    ```
-    getmempool
-    ```
-*   **Create Block:**
-    ```
-    createblock
-    ```
+# send a transfer (default fee 10, expiry 600s)
+tau-testnet tx send --key alice --to <recipient_pubkey> --amount 10
+tau-testnet tx send --key alice --transfer <pk1>:5 --transfer <pk2>:3 --fee 10
 
-### Response envelope
+# governance (sender must be an active validator; default fee 0)
+tau-testnet gov propose --key alice --file consensus_update.json
+tau-testnet gov vote --key alice --update-id <update_id_hex>
 
-All node commands reply with a single-line JSON envelope (the TCP transport
-appends `\r\n` framing at the wire; WebSocket emits the raw envelope without
-`\r\n`):
+# target a remote node
+tau-testnet --host testnet.tau.net --port 65432 status
+```
+
+Full CLI reference, validator-setup recipe, and the governance update lifecycle: [docs/developer_cli.md](docs/developer_cli.md). Raw TCP/WebSocket command grammar and JSON envelopes: [docs/blockchain_api.md](docs/blockchain_api.md).
+
+### Web wallet
+
+A browser wallet lives in [`web-wallet/`](web-wallet/) (static client; connects to the node's **WebSocket** port, 65433 by default). It is not auto-served — open it with a static server:
+
+```bash
+cd web-wallet && python3 -m http.server 8000
+# then browse http://localhost:8000 and point the wallet at ws://<node-host>:65433
+```
+
+### Console wallet (legacy)
+
+`python wallet.py` provides the original command-line wallet (`new`, `balance`, `history`, `send`); see [WALLET_USAGE.md](WALLET_USAGE.md). The `tau-testnet` CLI above is the preferred path.
+
+---
+
+## Operating a network (genesis, keys, validators)
+
+A network is defined by its genesis artifacts. Generate them once and distribute the **identical** files to every node.
+
+```bash
+# 1. validator keypair (writes test_miner.key + test_miner.pub)
+python scripts/generate_miner_keys.py        # or: tau-testnet keys new
+
+# 2. genesis (pre-funds accounts, pins validator set + vote quorum + base fee)
+python scripts/gen_genesis.py \
+  --validator-key <96-hex-pubkey> \
+  --account <addr1>:1000000 --account <addr2>:500000 \
+  --network-id tau-testnet-v2 \
+  --base-fee 10 \
+  --genesis-rules-path genesis.tau \
+  --genesis-consensus-path genesis_consensus.tau \
+  --out data/genesis.json
+```
+
+- Validator and account addresses are **96 lowercase hex chars** (48-byte BLS pubkeys, no `0x`). Private keys are 64 hex chars (32 bytes). Use `--validator-privkey` to derive the pubkey automatically.
+- **No auto-faucet** — unknown accounts have balance 0. Fund accounts at genesis with repeatable `--account ADDR:BALANCE`, or by transfer afterward.
+- Transfer amounts are `bv[24]` → capped at **16,777,215** per step; `--base-fee` likewise (0–16777215).
+- **Adding a validator after launch:** an existing validator proposes a `consensus_rule_update` with `host_contract_patch.validator_additions`; once it reaches the vote quorum (`supermajority` = ⌈2N/3⌉ by default, or `majority`) it activates. Removal works symmetrically.
+
+---
+
+## Configuration reference (`TAU_*` env vars)
+
+Defaults shown; set via environment or `tau-testnet node run` flags. **Bold** vars must match across all peers on a network.
+
+**Core**
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `TAU_ENV` | `development` | Profile: `development` / `test` / `production`. |
+| **`TAU_NETWORK_ID`** | `tau-local` | Consensus network identifier. |
+| `TAU_HOST` | `127.0.0.1` | TCP API bind address. |
+| `TAU_PORT` | `65432` | TCP API port (WebSocket = `+1` = 65433). |
+| `TAU_DB_PATH` | `node.db` | SQLite database path. |
+| `TAU_PROGRAM_FILE` | `genesis.tau` | Application Tau rules program. |
+| `TAU_FORCE_TEST` | `0` | `1` = mock Tau (test only; refused in `production`). |
+| `TAU_USE_DIRECT_BINDINGS` | — | `1` = use native tau-lang bindings (default in Docker). |
+
+**Networking**
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `TAU_NETWORK_LISTEN` | `/ip4/0.0.0.0/tcp/0` | libp2p bind multiaddr(s); use a fixed port (e.g. `/ip4/0.0.0.0/tcp/4001`) to be reachable. |
+| `TAU_ANNOUNCE_ADDRS` | _(empty)_ | Multiaddrs advertised to peers (set to your public addr behind NAT). |
+| `TAU_BOOTSTRAP_PEERS` | `[]` | JSON `[{"peer_id":…,"addrs":[…]}]` for discovery. |
+| `TAU_IDENTITY_KEY_PATH` | `data/identity.key` | Persistent libp2p identity (`--ephemeral-identity` to skip). |
+| `TAU_PEERSTORE_PATH` | `data/peerstore` | Persisted known-peer store. |
+
+**Mining / validator**
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `TAU_MINING_ENABLED` | `true` | Run the internal block proposer. Set `false` for read nodes. **The standalone Docker image overrides this to `false`**, so the quickstart node does not mine; pass `-e TAU_MINING_ENABLED=true` to mine. |
+| `TAU_MINER_PUBKEY` | _(test key)_ | 96-hex validator public key. |
+| `TAU_MINER_PRIVKEY` / `_PATH` | — / `data/test_miner.key` | 64-hex signing key (direct value wins over path). |
+| `TAU_ALLOW_REMOTE_CREATEBLOCK` | `false` | Allow non-loopback `createblock` RPC (leave off). |
+
+**Governance / consensus** (network-wide)
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `TAU_VALIDATOR_VOTE_QUORUM` | `supermajority` | Default `vote_quorum` baked into genesis by `gen_genesis.py` (`supermajority` = ⌈2N/3⌉, or `majority` = N/2+1). **Runtime nodes read the policy from genesis, not this var.** Set it at genesis with `gen_genesis.py --vote-quorum`. |
+| **`TAU_BLOCK_SIGNATURE_SCHEME`** | `bls_g2` | Block signature algorithm. |
+| `TAU_GOVERNANCE_OPEN_ADMISSION` | `false` | Allow non-validators into governance (keep off in public). |
+
+Operational extras: `TAU_MAX_MEMPOOL_TXS` (5000), `TAU_MAX_CONNECTIONS` (200), `TAU_RATE_LIMIT_PER_PEER` (2.0/s), `TAU_COMM_TIMEOUT` (60s; watchdog kills a stalled Tau), `TAU_WS_ALLOWED_ORIGINS`, `TAU_WS_CERT_PATH`/`TAU_WS_KEY_PATH` (WSS), `TAU_FORCE_FRESH_START` (crash recovery). See `config.py` for the full list.
+
+---
+
+## Tau execution mode
+
+Real Tau evaluation is **enabled by default**. Setting `TAU_FORCE_TEST=1` bypasses the real engine and uses a deterministic mock validator path — for development/CI only (the test suite sets it automatically). Booting with `TAU_FORCE_TEST=1` **and** `TAU_ENV=production` is refused.
+
+When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker), the node holds a single `tau::interpreter` instance and reads state updates from its output streams. The interpreter is process-global and Tau calls are serialized; a watchdog (`TAU_COMM_TIMEOUT`) kills a stalled evaluation. A native segfault under sustained use is a known alpha risk and is **not** isolated — it can stop the node process (see [Security & risk model](#security--risk-model)).
+
+---
+
+## Consensus boundary
+
+"Tau-driven" means the Tau program is the **arbiter of the consensus verdict**, but the Python host performs all the cryptography, encoding, and state mechanics the verdict depends on. The split is fixed:
+
+**Tau decides** (verdict output streams):
+- `o6` — block validity. The genesis rule is `o6 = i10` — "valid iff the host's cryptographic proof check passed" (see below).
+- `o7` — proposer eligibility.
+- `o9` — consensus base fee (strict); `o8` — optional user fee (lenient).
+
+**Python host enforces _before_ Tau** (the inputs Tau trusts):
+- Transaction BLS signature verification + canonical decoding (`commands/sendtx.py`).
+- **Block proposer signature** — `Block.verify_consensus_proof()` verifies the proposer's BLS signature over the canonical header and feeds the result to Tau as `i10`; the `o6 = i10` rule then rejects an unsigned/forged block. Validator-set membership alone proves only that the named proposer is _listed_, not that the sender holds its key — the signature check is what binds them.
+- Proposer ∈ active validator set (`consensus/engine.py`).
+- Per-account sequence, expiration, `fee_limit` admission estimate, and DoS size bounds (`consensus/admission.py`).
+- Canonical Tau input-stream construction (heights, timestamps, ids).
+
+**Python host enforces _after_ Tau** (applying the verdict):
+- Account balance/sequence updates and fee charging as a single staged overlay, committed only if the tx stays accepted (all-or-nothing).
+- Supply-conservation invariant (no mint/burn) — a mismatch raises, it does not silently continue.
+- Governance lifecycle: quorum tally, **activation-delay floor**, and height transitions.
+- `state_hash` computation and **exact-match** comparison against the block header.
+
+**If Tau and Python disagree:**
+- The host **may reject a Tau-valid block** — a wrong `state_hash`, a supply violation, a proposer not in the set, or a failed signature reject the block regardless of the Tau verdict.
+- The host does **not** accept anything the Tau verdict failed: `o6 == 0` (with no `require_bls_sig` escape clause) ⇒ rejected.
+- An invalid consensus fee (`o9`) raises `FeeRuleError`: the proposer aborts the round and validators **defer** the block — it is simply not committed and can be re-offered later (there is no negative cache; a persistently-bad voted-in rule can therefore halt progress at that height until governance corrects it).
+
+**Non-consensus local policy** (may differ per node without forking): mempool size/eviction, rate limits, gossip/DHT discovery, log verbosity, RPC bind address.
+
+---
+
+## State hash & canonical encoding
+
+Every block commits to its full post-state via `state_hash` and to its body via `merkle_root`. Both must be reproduced bit-for-bit by every node, so the encodings are fixed.
+
+**State hash** (`consensus/state.py::compute_consensus_state_hash`):
+
+```
+state_hash = BLAKE3(
+    consensus_rules_text  ||   # active consensus Tau program (UTF-8)
+    application_rules_text ||   # active application Tau program (UTF-8)
+    accounts_hash         ||   # SHA-256(canonical_json({"balances":…,"sequences":…}))
+    consensus_meta_hash        # BLAKE3(encode_consensus_meta(…))
+)
+```
+
+`consensus_meta_hash` binds the **active validator set, pending governance updates, votes, the activation schedule (with heights), and the resolved `vote_quorum` policy**. So `state_hash` commits to: account balances, sequence numbers, both rule programs (hence the fee policy, which the rules emit), the validator set, all in-flight governance, and the quorum policy. All collections are canonically sorted before hashing.
+
+**Deliberately _not_ in `state_hash`:**
+- `network_id` / `genesis_hash` — bound separately: the genesis hash is fixed by the `previous_hash` chain back to block 0, and both are enforced at the P2P handshake.
+- `state_locator` — a DHT lookup hint, not consensus data.
+- `consensus_proof` (the block signature) and the mempool — not state.
+
+> **Breaking change:** the `vote_quorum` policy is now folded into `state_hash` (previously it was not, which allowed two nodes with different quorum config to agree on the hash while computing different governance outcomes). Genesis artifacts and chains created before this change are incompatible — regenerate with `scripts/gen_genesis.py`.
+
+**Canonical identifiers:**
+
+| Identifier | Function → hash | Encoding |
+| --- | --- | --- |
+| Block hash | `BlockHeader.canonical_bytes` → SHA-256 | Fixed big-endian binary: `block_number`(8B) ‖ `previous_hash`(32B) ‖ `timestamp`(8B) ‖ `merkle_root`(32B) ‖ `proposer_pubkey`(48B, omitted if empty) ‖ `state_hash`(32B). Excludes `state_locator`, `consensus_proof`. |
+| `tx_id` | `compute_tx_hash` → SHA-256 | Compact sorted-key JSON of the **whole transaction, including `signature`**. |
+| `merkle_root` | `compute_merkle_root` → SHA-256 | Leaves = `tx_id`s; odd levels duplicate the last node; empty tree = `SHA-256("")`. |
+| `update_id` | `compute_update_id` → BLAKE3 | Length-prefixed binary over `(rule_revisions, activate_at_height, host_contract_patch)`; excludes signature/sequence/fee. |
+
+**Determinism caveats — clients must match the host byte-for-byte:**
+- Token amounts and `fee_limit` travel as **decimal strings**, and `tx_id`/signatures are computed over the raw JSON **without type-normalization**. A client that sends `100` instead of `"100"`, or uppercase hex, produces a different `tx_id` and signature. **Always send amounts as strings and pubkeys/hashes as lowercase hex.**
+- Hashed JSON is always `sort_keys=True, separators=(",",":")`. Timestamps are integer seconds (no timezone, no float). No floats appear in any hashed payload.
+
+---
+
+## Cryptography & signatures
+
+- **Scheme:** BLS12-381 via `py_ecc` **`G2Basic`** (IETF basic scheme, DST `…G2_XMD:SHA-256_SSWU_RO_NUL_`). Public keys are **G1, 48 bytes / 96 lowercase hex**; signatures are **G2, 96 bytes**; private keys are 32 bytes / 64 hex. `TAU_BLOCK_SIGNATURE_SCHEME=bls_g2` is descriptive metadata — the scheme is fixed in code.
+- **Validation:** `Verify` runs public-key and signature **subgroup checks** and rejects the **point at infinity**; transaction ingest additionally runs `KeyValidate` on `sender_pubkey` and both transfer addresses. Malformed keys/signatures fail closed (`INVALID_SIGNATURE`); if `py_ecc` is unavailable, ingest is **refused** (`BLS_UNAVAILABLE`), never skipped.
+- **Signed payloads:**
+  - Transaction → `SHA-256` of canonical JSON of `{sender_pubkey, sequence_number, expiration_time, fee_limit, tx_type, …type-specific}`. `tx_type` **is** signed, so a `user_tx` signature cannot be replayed as a governance vote.
+  - Block header → `SHA-256` of `BlockHeader.canonical_bytes()`, verified by `Block.verify_consensus_proof()`.
+
+> ⚠️ **No cross-network / version domain separation (replay risk).** Signed payloads do **not** include `network_id`, `genesis_hash`, or a protocol version, and there is no explicit `tx`-vs-`block` domain tag (they are separated only implicitly by incompatible encodings). A transaction signed for one Tau network is cryptographically valid on any other network where the same keypair is funded. **Do not reuse account/validator keys across networks.** Adding explicit domain tags (e.g. `TAU_TESTNET_TX_V1 | network_id | genesis_hash | tx_type | body`) is planned and will be a breaking signature-format change.
+
+---
+
+## Transaction fees
+
+Fees are sourced from the Tau consensus rules and votable by validators — no separate fee machinery.
+
+- **Consensus fee (`o9`, strict).** Active consensus rules emit the base fee on stream `o9` (genesis default `always (o9[t]:bv[24] = { #x00000a }:bv[24]).` → 10/step). Change it via a `consensus_rule_update` carrying the full new consensus spec, voted to its activation height. Absent `o9` → fee model inactive (0). A present-but-invalid `o9` is a consensus failure: proposers abort the round and validators defer the block rather than guess.
+- **User custom fee (`o8`, lenient).** User application rules may add a per-transfer fee on `o8`. Absent → 0 silently; invalid → 0 with a node-side warning.
+- **Total:** `total_fee = Σ over the tx's Tau steps of (o9 + o8)` — one step per transfer; a transfer-less `user_tx` is charged one fee-query step. Multi-transfer txs pay N× by design.
+- **`fee_limit` is a cap.** Rejected (at admission and in-block) if `total_fee > fee_limit`; the sender pays `total_fee`, not the cap. Every tx carries a valid `fee_limit`; **only `user_tx` is charged** (validators never need funds to govern).
+- **Credited to** `block.header.proposer_pubkey`. **Charge-on-inclusion:** a fee-rejected tx pays nothing (no writes, no nonce bump). Sender must cover `Σ transfers + total_fee`.
+- **Determinism note:** during block application only `i1` (amount), `i5` (block timestamp), `i12` (sender pubkey) and the tx's custom inputs carry real values; `i2`/`i3`/`i4` are mocked to `"0"`. A fee rule reading a mocked stream would charge a different fee at admission than at inclusion, so rule text referencing `i2`/`i3`/`i4` is **rejected at admission** (both user `o8` rules and consensus `o9` revisions). Scope on `i12` and tier on `i1` instead. Admission error `FEE_LIMIT_TOO_LOW` returns the computed `required_fee`.
+- **Mempool priority** is by admission-time estimate (`estimated_fee DESC, fee_limit DESC, received_at ASC`); inflating `fee_limit` does not buy priority.
+- **Limitations:** multiplication isn't verified in the deployed tau-lang usage, so percentage fees aren't expressible yet — flat fees and comparison-ladder tiers only. User rule text referencing `o6`/`o7`/`o9`, or any rule text reading the apply-time-mocked streams `i2`/`i3`/`i4`, is rejected at admission.
+
+---
+
+## Governance
+
+Consensus rules and the validator set change **only** through on-chain governance. A `consensus_rule_update` carries the full new consensus spec (plus an optional `host_contract_patch` for validator add/remove); `consensus_rule_vote`s approve it. Update identity is `update_id = BLAKE3(rule_revisions, activate_at_height, host_contract_patch)` (signature / sequence / fee excluded), so the id is canonical and collision-resistant.
+
+**Lifecycle:**
+
+```
+submitted ──(quorum reached)──> scheduled ──(height ≥ activate_at_height)──> active ──> archived
+    │
+    └──(activate_at_height passes while still pending)──> expired (archived)
+```
+
+- **Quorum** — promotion to `scheduled` needs votes ≥ `approval_threshold` = ⌈2N/3⌉ (`supermajority`) or N/2+1 (`majority`), where N is the **current** active validator set and the policy comes from genesis (bound into the state hash). A validator cannot vote twice (votes are a set); only active validators count — a forged or non-validator vote inside a block is a deterministic no-op.
+- **Activation delay** — enforced at admission **and** at block application: `activate_at_height ≥ inclusion_height + N`. A crafted block cannot reach quorum and activate in the same block.
+- **Expiry** — a pending update whose `activate_at_height` arrives before quorum is archived, not activated.
+- **Safety** — a revision that fails to compile is rejected at admission (isolated staging compile) and again at activation; an activated rule emitting an invalid `o9` halts progress until further governance (see [Security & risk model](#security--risk-model)). Governance txs still require a valid signature, sequence, and expiration; they carry fee 0 and therefore sort **below** any paid user tx.
+
+## Mempool policy
+
+- **Selection order** — `estimated_fee DESC, fee_limit DESC, received_at ASC`. Inflating `fee_limit` does not outrank a higher estimate.
+- **Sequences** — admission checks projected (confirmed + pending) state; a sender may stack contiguous sequences, but a **gap is rejected**. There is **no replacement / RBF** — a stuck low-fee tx must expire or be evicted, not be replaced.
+- **Duplicates** — a repeat `tx_id` is idempotently ignored.
+- **Capacity & eviction** — at the cap the **oldest pending** tx is evicted (FIFO, fee-blind; reserved txs are never evicted). The cap is `TAU_MAX_MEMPOOL_TXS` (default 5000), enforced consistently on both the soft admission pre-check and the DB-layer eviction, each counting pending rows only.
+- **Expiry** — expired txs are pruned opportunistically on insert (no background reaper).
+- **Persistence** — the mempool survives restart (same SQLite file) and is not re-validated on boot.
+- **Re-validation** — the proposer fully re-executes and re-validates every tx at block-build time, so admission is best-effort, not authoritative.
+
+## Features
+
+- **Tau-driven pluggable consensus** — block validity (`o6`) and proposer eligibility (`o7`) decided by living `consensus_rules`; fully on-chain governance via `consensus_rule_update` / `consensus_rule_vote` with activation delays and a vote quorum.
+- **On-chain PoA validator set** — proposers are gated against the active validator set; set membership changes only through governance.
+- **Persistent blockchain & fork choice** — SQLite-backed chain, multiple competing tips, heaviest-valid-branch fork choice with deterministic tie-break, seamless reorgs (revert/re-apply state).
+- **P2P networking (libp2p)** — protocols: `handshake`, `ping`, `sync`, `blocks`, `tx`, `gossip`; gossip topics `tau/blocks/1.0.0` and `tau/transactions/1.0.0`; genesis-hash handshake gate; bootstrap retry/backoff; NAT announce addresses; DHT-backed state/provider records. Block numbers are **0-indexed**; sync decisions use `head_hash`, not just `head_number`.
+- **Authenticated transactions & blocks** — BLS12-381 signatures over canonical payloads ([details](#cryptography--signatures)); transactions carry per-account sequence numbers (replay protection) and expiration; blocks carry a proposer signature verified before they affect the head. Signatures are **not yet domain-separated across networks** — see the replay-risk note in [Cryptography & signatures](#cryptography--signatures).
+- **Typed transactions** — `user_tx`, `consensus_rule_update`, `consensus_rule_vote`; common fields `sender_pubkey`, `sequence_number`, `expiration_time`, `fee_limit`, `signature`.
+- **Hardening** — block proposer-signature verification, governance vote-quorum bound into the state hash, consensus-enforced activation delay, genesis-hash handshake gate; SQLite WAL + busy timeout, refuse-to-start on schema drift (no silent data loss), mempool size cap + expiry pruning, admission size limits, production guards on dev/test flags.
+
+### DHT configuration & gossip health
+
+The libp2p DHT layer exposes runtime knobs through `NetworkConfig`:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `dht_refresh_interval` | `60.0` | Seconds between routing-table refreshes. |
+| `dht_bucket_refresh_interval` | `dht_refresh_interval` | Stale-peer refresh/eviction interval. |
+| `dht_bucket_refresh_limit` | `8` | Max stale peers revalidated per cycle. |
+| `dht_stale_peer_threshold` | `3600.0` | Age before a peer is considered stale. |
+| `dht_opportunistic_cooldown` | `120.0` | Min time between reseeding the same gossip/handshake-discovered peer. |
+| `gossip_health_window` | `120.0` | Sliding window for `get_metrics_snapshot()` gossip health. |
+
+`NetworkService.get_metrics_snapshot()` (or the periodic `[metrics]` log line) reports gossip activity, routing-table counts, and bucket refresh results.
+
+---
+
+## Response envelope
+
+Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSocket emits it raw):
 
 ```json
 {"status":"ok","command":"getbalance","data":{"address":"a63b...ea73","balance":"1000"}}
 {"status":"error","command":"sendtx","error":{"code":"INVALID_SEQUENCE","message":"Invalid sequence number: expected 5, got 4.","details":{"expected":5,"received":4}}}
 ```
 
-- `status` is `"ok"` or `"error"` (no `"success"`).
-- `command` echoes the requested command name.
-- `data` is present on success; `error.code` + `error.message` (plus optional
-  `error.details`) on failure.
-- Field-type contract: addresses/hashes/IDs are strings; balances and token
-  amounts are strings (to avoid integer overflow); counts, block numbers, and
-  sequence numbers are JSON integers; timestamps are ISO 8601 strings.
-- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`,
-  `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`,
-  `BLS_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MEMPOOL_EMPTY`,
-  `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`,
-  `GOVERNANCE_ERROR`, `NOT_FOUND`, `TAU_NOT_READY`, `TIMEOUT`,
-  `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
-- The `hello version=N` handshake stays plain text (`ok version=N env=…
-  node=…`) — versions 1 and 2 are supported.
+- `status` is `"ok"` or `"error"`; `command` echoes the request; `data` on success, `error.code`/`error.message`(+`details`) on failure.
+- Types: addresses/hashes/IDs and token amounts are **strings** (overflow-safe); counts/heights/sequence numbers are integers; timestamps are ISO 8601 strings.
+- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `BLS_UNAVAILABLE`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `MINING_NOT_ELIGIBLE`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
+- The `hello version=N` handshake stays plain text (versions 1 and 2).
 
-### Block Structure
+## Block structure
 
-A block is a fundamental data structure that organizes transactions into an atomic unit for chain progression. Each block consists of:
+A block header carries `block_number` (0-indexed height), `previous_hash`, `timestamp`, `merkle_root`, `state_hash` (the full post-state commitment — see [State hash & canonical encoding](#state-hash--canonical-encoding)), and `state_locator` (a DHT lookup hint, **not** consensus data). The body carries the ordered `transactions` and their `tx_ids`. Consensus is attested by `consensus_proof` — the proposer's BLS signature over the canonical header, verified by `Block.verify_consensus_proof()` and gated by the `o6 = i10` rule. There is **no proof-of-work**; validity and proposer eligibility are decided by the Tau consensus program at each height. See `block.py` (`Block`, `BlockHeader`, `compute_tx_hash`, `compute_merkle_root`).
 
-- A **block header** containing:
-  - `block_number` (integer): Height of the block in the chain.
-  - `previous_hash` (string): Hex-encoded SHA256 hash of the previous block's header.
-  - `timestamp` (integer): Unix timestamp when the block was created.
-  - `merkle_root` (string): Hex-encoded Merkle root of the included transactions.
-  - `state_hash` (string): Hex-encoded hash of the current Tau/rules snapshot (used to bind state to a block).
-  - `state_locator` (string): A namespaced lookup key (e.g. `state:<hash>`) for DHT/state distribution.
-- A **block body** containing:
-  - `transactions` (list): Ordered list of transactions (`user_tx`, `consensus_rule_update`, or `consensus_rule_vote`).
-  - `tx_ids` (list): Transaction hashes used to build the Merkle root.
-- **Consensus fields**:
-  - `consensus_proof` (string): Proof/signature verified against the active rules. Replaces legacy `block_signature`.
+---
 
-Blocks do **not** include proof-of-work. Block validity and proposer eligibility are governed strictly by the living Tau consensus logic program evaluated dynamically at each height.
+## Development
 
-The `block.py` module provides the `Block` and `BlockHeader` classes, along with utility functions for computing transaction hashes (`compute_tx_hash`), Merkle roots (`compute_merkle_root`), and block hashes.
+```bash
+# fast unit suite (Trio; disable the asyncio plugin)
+./venv/bin/python3 -m pytest -p no:asyncio
 
-## Known Issues / Notes
+# with the real Tau engine, point at the native bindings
+PYTHONPATH=../tau-lang/build-Release/bindings/python/nanobind \
+  ./venv/bin/python3 -m pytest -p no:asyncio
+```
 
-*   The fee model is enforced: the network fee is emitted by the consensus rules on Tau stream `o9` and credited to the block proposer (see "Transaction Fees" above). Networks generated without a fee rule (`gen_genesis.py --base-fee 0`) remain fee-less until governance votes one in.
-*   Gossipsub topics (`tau/blocks/1.0.0`, `tau/transactions/1.0.0`) must be subscribed to by peers that expect block or transaction updates.
+CI builds tau-lang and runs the consensus suite against the real engine ([.github/workflows/ci.yml](.github/workflows/ci.yml)). The full suite in a single process can hit a known pre-existing native segfault under sustained Tau use; run per-file if you see it.
+
+**Key components:** `server.py` (TCP/WS server), `tau_manager.py` + `tau_native.py` (Tau engine lifecycle/IPC), `commands/` (RPC handlers incl. `sendtx`, `createblock`), `consensus/` (engine, governance, fees, admission), `chain_state.py` (balances/sequences/rebuild), `network/` (libp2p service, DHT, gossip), `db.py` (SQLite), `block.py`, `config.py`, `rules/` (built-in transfer-validation Tau rules), `scripts/gen_genesis.py`, `tests/`.
 
 ## Submitting issues
 
-Please submit issues at the following link: [Tau Testnet issues](https://github.com/IDNI/tau-testnet/issues)
+[Tau Testnet issues](https://github.com/IDNI/tau-testnet/issues).
 
-## Project Status
+## Production safety checklist
 
-**Alpha:** This is an early alpha version. It's under active development and is intended for testing and experimentation. The core engine for a functional blockchain is in place, including transaction validation, mempool management, and persistent block creation.
+`TAU_ENV=production` enforces exactly one thing in code: it **refuses to boot with `TAU_FORCE_TEST=1`** (no mock Tau in production). Every other safe default below is global, not production-gated, and several can be overridden by env vars with no guard — so verify them yourself before exposing a node:
 
-## Future Work
+- [ ] **Network id** — set a unique `TAU_NETWORK_ID` (the `tau-local` default is not rejected).
+- [ ] **Validator key** — supply your own `TAU_MINER_PRIVKEY(_PATH)` / `TAU_MINER_PUBKEY`; the shipped `data/test_miner.key` is **not** refused.
+- [ ] **RPC/WS bind** — keep `TAU_HOST=127.0.0.1` (default) or firewall it; `0.0.0.0` is accepted with no warning. In Docker, publish RPC/WS only on `127.0.0.1` (see quickstart).
+- [ ] **WS origins** — set `TAU_WS_ALLOWED_ORIGINS` explicitly. The check is **substring-based** and **always allows no-Origin clients and any `localhost`/`127.0.0.1` origin**.
+- [ ] **WSS** — set **both** `TAU_WS_CERT_PATH` and `TAU_WS_KEY_PATH`; a partial/invalid TLS config **silently downgrades to plaintext** WS.
+- [ ] **Governance** — keep `TAU_GOVERNANCE_OPEN_ADMISSION=false` (production only warns if it is on alongside bootstrap peers).
+- [ ] **Remote createblock** — leave `TAU_ALLOW_REMOTE_CREATEBLOCK=false`; the loopback gate is the only protection.
+- [ ] **Identity & DB** — set/back up `TAU_IDENTITY_KEY_PATH` and `TAU_DB_PATH`; both default into `data/` and are auto-created.
+- [ ] **Rate limiting** — the plain TCP RPC path has **none**; the WS limiter is a fixed 5 req/s **per connection** (reset on reconnect). Front it with a proxy if exposed.
 
-*   Expansion of Tau logic.
-*   Multi-authority PoA (validator set, rotation) and stronger fork-choice/finality rules.
-*   More robust error handling and reporting.
-*   More comprehensive unit and integration tests.
+---
+
+## Security & risk model
+
+This is **alpha, non-finalized PoA**. Tokens have no value; the cryptography and consensus are unaudited.
+
+**Fork choice & finality.** The "heaviest-valid-branch" weight is simply **block height**, with ties broken on the lexicographically smallest block hash (`fork_choice_scheme: height_then_hash`). There is **no finality and no checkpoints** — a reorg can run as deep as the common ancestor (bounded only by a 2000-block path cap in `get_chain_path`, beyond which the switch is refused). A validator controlling enough proposer slots can build a competing branch; honest nodes switch to a longer valid one. Reorgs revert and re-apply full state by replaying from genesis along the new path and commit it in a single DB transaction; the fast extend path writes the block and the head pointer in two transactions and relies on replay-on-restart for crash consistency.
+
+**P2P threat model.**
+- **Authentication** — transport is libp2p (Ed25519 peer identity). The application handshake gates peers on matching `network_id` **and** `genesis_hash`; a peer presenting an empty/missing or mismatching genesis is rejected once this node has a genesis (fork protection).
+- **Block/tx relay** — gossiped transactions pass through the same admission path as RPC submissions; blocks are fully validated (proposer signature, validator-set membership, `state_hash`, fees) before they can affect the canonical head. Invalid blocks are rejected and never committed, but there is **no peer scoring/banning yet** — a peer can keep re-sending junk (throttled only at the libp2p connection level, `TAU_RATE_LIMIT_PER_PEER`).
+- **DHT records are discovery hints, not trusted consensus data** — advertised state is re-validated against the local chain before use; provider/peer records are capped and truncated on intake to bound poisoning.
+- **Not yet addressed** — eclipse/Sybil resistance (bootstrap peers are trusted for discovery), per-peer block/header quarantine, and a per-object Tau-evaluation budget beyond the global watchdog.
+
+### RPC / WebSocket exposure
+
+RPC (TCP, default `127.0.0.1:65432`) and WebSocket (`+1` → `65433`) bind to `TAU_HOST`. There is **no per-call authentication**; the only network gate is that `createblock` is refused from non-loopback clients (and always over WS) unless `TAU_ALLOW_REMOTE_CREATEBLOCK=true`, decided from the real socket peer address (not header-spoofable). The web wallet keeps private keys client-side and signs locally — keys are never sent to the node. Treat RPC/WS as a loopback / trusted-LAN surface; front it with TLS and an origin allowlist if you must expose it.
+
+**Known alpha risks:** no economic finality; no slashing; possible deep reorgs; unaudited cryptography and consensus; **no cross-network signature domain separation** (do not reuse keys across networks); a sustained Tau run can hit a **native segfault that stops the node process** (no process isolation yet); and a voted-in consensus rule that emits an invalid `o9` (or otherwise fails at runtime) can **halt progress at a height** until governance corrects it.
+
+---
+
+## Project status
+
+**Alpha** — active development, for testing and experimentation. In place: Tau-driven consensus, on-chain PoA validator set with governance quorum, native fee model, BLS-authenticated transactions, persistent chain with fork choice/reorgs, multi-node P2P sync.
+
+## Future work
+
+- Richer Tau logic (verified multiplication → percentage fees; finality/checkpoints).
+- Validator rotation policies and stronger fork-choice/finality rules.
+- Metrics/observability endpoints and operator runbooks.
+- Broader integration-test coverage.

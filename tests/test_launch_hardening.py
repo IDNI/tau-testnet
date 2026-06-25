@@ -124,19 +124,45 @@ class TestMempoolBounds:
         assert {"fresh1", "fresh2"} <= hashes
 
     def test_cap_evicts_oldest_pending_only(self, temp_db, monkeypatch):
-        monkeypatch.setattr(db, "MEMPOOL_MAX_TXS", 3)
+        # The cap counts pending-only, so reserved rows neither count toward it nor get evicted.
+        monkeypatch.setattr(config, "MAX_MEMPOOL_TXS", 2)
         future = int(time.time()) + 10000
         db.add_mempool_tx(_mk_payload(future), "old", 1)
         db.add_mempool_tx(_mk_payload(future), "mid", 2)
-        # Reserve 'old' — reserved rows must never be evicted.
+        # Reserve 'old' — reserved rows must never be evicted and don't count toward the cap.
         db._db_conn.execute("UPDATE mempool SET status='reserved', reserved_at=999 WHERE tx_hash='old'")
         db._db_conn.commit()
         db.add_mempool_tx(_mk_payload(future), "new1", 3)
-        db.add_mempool_tx(_mk_payload(future), "new2", 4)  # over cap → evict oldest pending ('mid')
+        db.add_mempool_tx(_mk_payload(future), "new2", 4)  # pending over cap → evict oldest pending ('mid')
         hashes = {r[0] for r in db._db_conn.execute("SELECT tx_hash FROM mempool").fetchall()}
         assert "old" in hashes  # reserved survived
         assert "mid" not in hashes  # oldest pending evicted
         assert "new2" in hashes
+
+    def test_env_max_mempool_txs_caps_stored_pending(self, temp_db, monkeypatch):
+        """A low TAU_MAX_MEMPOOL_TXS must actually cap the stored (pending) mempool at the
+        DB layer, not only the soft sendtx pre-check. Drives the env var through
+        reload_settings into add_mempool_tx's eviction."""
+        prev_settings = config.settings
+        prev_limit = config.MAX_MEMPOOL_TXS
+        try:
+            monkeypatch.setenv("TAU_MAX_MEMPOOL_TXS", "3")
+            config.reload_settings()
+            assert config.MAX_MEMPOOL_TXS == 3  # env wired through config
+
+            future = int(time.time()) + 10000
+            for i in range(10):
+                db.add_mempool_tx(_mk_payload(future), f"tx{i}", i + 1)
+
+            # Capped at the configured 3, not the hardcoded MEMPOOL_MAX_TXS fallback (5000).
+            assert db.count_mempool_txs() == 3
+            stored = db._db_conn.execute(
+                "SELECT COUNT(*) FROM mempool WHERE status='pending'"
+            ).fetchone()[0]
+            assert stored == 3
+        finally:
+            config.settings = prev_settings
+            config.MAX_MEMPOOL_TXS = prev_limit
 
 
 class TestAdmissionLimits:
@@ -183,3 +209,63 @@ class TestAdmissionLimits:
             result = validate_consensus_rule_update_payload(tx, self._tip_view())
         assert not result.is_valid
         assert "MAX_RULE_REVISIONS_BYTES" in result.error
+
+    # --- Apply-time-mocked input streams (i2/i3/i4) screen ---------------------
+    # i2 (balance), i3/i4 (from/to) are fed real values at admission but mocked
+    # to "0" at block apply. A fee/application rule reading them computes a
+    # different fee at admission than at inclusion -> admitted then rejected at
+    # block build. Both the user-rule screen and the consensus-revision screen
+    # hard-reject such rule text. Fee/policy rules scope on i12 / compare i1.
+
+    def test_user_rule_reading_apply_mocked_streams_rejected(self):
+        from consensus.admission import validate_user_tx_reserved_domains
+        for stream in ("i2", "i3", "i4"):
+            rule = f"always (o8[t]:bv[24] = {stream}[t]:bv[24])."
+            result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+            assert not result.is_valid, f"stream {stream} not screened"
+            assert stream in result.error
+
+    def test_user_flat_fee_and_ladder_rules_pass(self):
+        from consensus.admission import validate_user_tx_reserved_domains
+        flat = "always (o8[t]:bv[24] = { #x000003 }:bv[24])."
+        # Tiered fee on the real amount stream i1 (fed at apply) — the supported
+        # alternative to rules keyed on a mocked stream.
+        ladder = (
+            "always ((i1[t]:bv[24] > { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000005 }:bv[24]) "
+            "|| (i1[t]:bv[24] <= { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000001 }:bv[24]))."
+        )
+        for rule in (flat, ladder):
+            result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+            assert result.is_valid, f"benign rule rejected: {rule} -> {result.error}"
+
+    def test_user_rule_mocked_stream_only_in_comment_passes(self):
+        # A mocked stream named only in a '#' comment must not trip the screen.
+        from consensus.admission import validate_user_tx_reserved_domains
+        rule = "always (o8[t]:bv[24] = { #x000003 }:bv[24]). # flat fee, not scaled by i2 balance"
+        result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+        assert result.is_valid, f"comment false-positive: {result.error}"
+
+    def test_user_rule_custom_stream_not_mistaken_for_mocked(self):
+        # Custom input stream i23 must not be screened as i2 (word boundary).
+        from consensus.admission import validate_user_tx_reserved_domains
+        rule = "always (o8[t]:bv[24] = i23[t]:bv[24])."
+        result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+        assert result.is_valid, f"i23 mis-screened as i2: {result.error}"
+
+    def test_consensus_revision_reading_mocked_input_rejected(self):
+        from consensus.admission import stage_and_validate_consensus_revisions
+        for stream in ("i2", "i3", "i4"):
+            tx = {"rule_revisions": [f"always (o9[t]:bv[24] = {stream}[t]:bv[24])."]}
+            result = stage_and_validate_consensus_revisions(tx, self._tip_view())
+            assert not result.is_valid, f"stream {stream} not screened"
+            assert stream in result.error
+
+    def test_consensus_revision_flat_fee_passes(self):
+        from consensus.admission import stage_and_validate_consensus_revisions
+        tx = {"rule_revisions": ["always (o9[t]:bv[24] = { #x00000a }:bv[24])."]}
+        # Skip the isolated staging compile (no live Tau in this unit test); the
+        # i2/i3/i4 screen runs before it regardless.
+        with patch("tau_manager.tau_ready") as ready:
+            ready.is_set.return_value = False
+            result = stage_and_validate_consensus_revisions(tx, self._tip_view())
+        assert result.is_valid, f"flat consensus fee rejected: {result.error}"
