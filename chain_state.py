@@ -680,7 +680,22 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                 with open(config.TAU_PROGRAM_FILE, "r", encoding="utf-8", errors="replace") as f:
                     genesis_spec_text = f.read()
                 tau_manager.restore_full_tau_spec(genesis_spec_text)
-                print(f"[INFO][chain_state] Reset live Tau interpreter to {config.TAU_PROGRAM_FILE} for replay.")
+                # `genesis.tau` is the application program only (o0..); it does
+                # NOT define the consensus streams o6/o7. Replay the genesis-
+                # derived restore plan (consensus rules first, then application
+                # units + builtin rules) so the replay interpreter matches a
+                # freshly-started node. Without this, `verify_block_header`'s
+                # `o6 = i10` query hits an undefined o6 -> 0 and every synced
+                # block is rejected ("Block #N rejected by Tau rules (o6: 0)").
+                # `_consensus_rules_state` / `_application_rules_state` were just
+                # re-seeded to their genesis values above, so use_persisted_state
+                # here yields exactly the genesis baseline (block-derived rule
+                # updates are re-applied by the per-block replay that follows).
+                replay_tau_restore_plan(
+                    get_tau_restore_plan(use_persisted_state=True),
+                    source_prefix="rebuild",
+                )
+                print(f"[INFO][chain_state] Reset live Tau interpreter to {config.TAU_PROGRAM_FILE} + genesis consensus/builtin rules for replay.")
             except Exception:
                 logger.exception("Failed to reset Tau interpreter before rebuild; replay activation determinism is not guaranteed.")
 
@@ -1177,6 +1192,37 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
         })
 
     return plan
+
+
+def replay_tau_restore_plan(plan: List[Dict[str, object]], *, source_prefix: str = "restore") -> bool:
+    """Replay an ordered i0 restore plan into the live Tau interpreter.
+
+    Shared by the startup bootstrap callback and the rebuild-from-genesis path
+    so both reconstruct an IDENTICAL interpreter (consensus rules o6/o7 +
+    application rules + builtin rules) and identical in-memory rule state. The
+    rebuild path previously reset the interpreter to the application-only
+    program file (`genesis.tau`) and skipped this replay, leaving o6/o7
+    undefined -- so verifying a synced block's validity (`o6 = i10`) always
+    returned 0 and aborted the rebuild. Returns True if any replayed unit was
+    persistence-bearing (caller decides whether to commit).
+    """
+    if not plan:
+        return False
+    persist_needed = False
+    for idx, entry in enumerate(plan, start=1):
+        rule_text = str(entry.get("text") or "")
+        label = str(entry.get("label") or f"rule_{idx}")
+        should_persist = bool(entry.get("persist"))
+        tau_manager.communicate_with_tau(
+            rule_text=rule_text,
+            target_output_stream_index=0,
+            source=f"{source_prefix}:{label}",
+            apply_rules_update=should_persist,
+            wait_for_ready=False,
+        )
+        persist_needed = persist_needed or should_persist
+    return persist_needed
+
 
 def get_application_rules_state() -> str:
     with _rules_lock:

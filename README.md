@@ -136,7 +136,7 @@ Every node on a network must share the **same genesis artifacts and network id**
 
 ```bash
 export TAU_NETWORK_ID=tau-testnet-v2
-export TAU_BOOTSTRAP_PEERS='[{"peer_id":"<BOOTNODE_PEER_ID>","addrs":["/ip4/<BOOTNODE_IP>/tcp/4001"]}]'
+export TAU_BOOTSTRAP_PEERS='[{"peer_id":"12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC","addrs":["/ip4/34.251.82.246/tcp/4001"]}]'
 export TAU_NETWORK_LISTEN='/ip4/0.0.0.0/tcp/4001'
 TAU_MINING_ENABLED=false tau-testnet node run --no-isolated
 ```

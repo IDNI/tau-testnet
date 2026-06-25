@@ -80,6 +80,7 @@ py-modules = [
     "tau_logging",
     "tau_manager",
     "tau_native",
+    "tau_shrink",
     "utils",
     "wallet",
 ]

@@ -455,20 +455,11 @@ def _run_server(container: ServiceContainer):
             restore_plan = chain_state_module.get_tau_restore_plan(use_persisted_state=use_persisted_state)
             if restore_plan:
                 logger.info("Replaying %s Tau rule update(s) via i0 after bootstrap from %s...", len(restore_plan), config.TAU_PROGRAM_FILE)
-                persist_needed = False
-                for idx, entry in enumerate(restore_plan, start=1):
-                    rule_text = str(entry.get("text") or "")
-                    label = str(entry.get("label") or f"rule_{idx}")
-                    should_persist = bool(entry.get("persist"))
-                    logger.info("Replaying Tau update %s/%s: %s (len=%s)", idx, len(restore_plan), label, len(rule_text))
-                    tau_module.communicate_with_tau(
-                        rule_text=rule_text,
-                        target_output_stream_index=0,
-                        source=f"startup:{label}",
-                        apply_rules_update=should_persist,
-                        wait_for_ready=False,
-                    )
-                    persist_needed = persist_needed or should_persist
+                # Shared with the rebuild-from-genesis path so both reconstruct
+                # an identical interpreter (consensus o6/o7 + application + builtin).
+                persist_needed = chain_state_module.replay_tau_restore_plan(
+                    restore_plan, source_prefix="startup"
+                )
 
                 if persist_needed:
                     latest = db_module.get_canonical_head_block()
