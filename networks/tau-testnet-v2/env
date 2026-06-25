@@ -1,0 +1,20 @@
+# tau-testnet-v2 network join profile.
+# Source before running the node:
+#   set -a; . networks/tau-testnet-v2/env; set +a
+#
+# The JSON value is single-quoted so the shell preserves its inner double
+# quotes when sourced.
+
+# Network identity. MUST be byte-identical on every node or the handshake
+# rejects the peer (fork protection). Also pinned in genesis.json.
+TAU_NETWORK_ID=tau-testnet-v2
+
+# Bootnode to dial on first start (libp2p base58 PeerID + multiaddr).
+TAU_BOOTSTRAP_PEERS='[{"peer_id":"12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC","addrs":["/ip4/34.251.82.246/tcp/4001"]}]'
+
+# Local libp2p listen address.
+TAU_NETWORK_LISTEN=/ip4/0.0.0.0/tcp/4001
+
+# Read / RPC node by default. Validators set this true and supply a BLS keypair
+# (TAU_MINER_PUBKEY / TAU_MINER_PRIVKEY) — see README "Run as a validator".
+TAU_MINING_ENABLED=false

@@ -1,0 +1,36 @@
+{
+  "genesis_version": 1,
+  "network_id": "tau-testnet-v2",
+  "protocol_version": "2.0.0",
+  "block_0": {
+    "header": {
+      "block_number": 0,
+      "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "timestamp": 0,
+      "merkle_root": "0000000000000000000000000000000000000000000000000000000000000000",
+      "state_hash": "bd2352c98da92396faa85a9c88c65c4134bb418f93393025552a9a088eb11a81",
+      "proposer_pubkey": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "transactions": [],
+    "consensus_proof": {},
+    "hash": "4bf5ee708a6577dc13d7bb6a209e028b55c13ba30525d62e19f7a9bbc833fbce"
+  },
+  "consensus_rules": "# Tau-Driven Consensus v1 Interface\n#\n# i6: Block height\n# i7: Block timestamp\n# i8: Proposer identity (yid)\n# i9: Previous block hash (yid)\n# i10: Host proof validity (1 for valid, 0 for invalid)\n# i11: Claims summary (yid)\n#\n# o6: Block validity\n# o7: Proposer eligibility\n\n# Initial V1 Rule:\n# All authorized proposals handled by host PoA are considered eligible (o7 = 1)\n# Blocks are valid strictly if the host cryptographically verifies the proof (o6 = i10)\nalways (\n    o6[t]:bv[16] = i10[t]:bv[16] &&\n    o7[t]:bv[16] = { 1 }:bv[16]\n)\n",
+  "application_rules": "((!(i0[t]=0))? (u[t] = i0[t] && o0[t] = 0 & { u[t] = i0[t] & { u[t] = i0[t] } }) : o0[t] = 1) \n",
+  "accounts_state": {
+    "f427fbf4cb8cc5ebcfc50add98ba574b94c03b1e32626e2e50cf60ba5e0a6d0c42d3ed702c2e0eeef7fae29bc4f3d2f9": 1000000
+  },
+  "consensus_meta": {
+    "proof_scheme": "bls_header_sig",
+    "fork_choice_scheme": "height_then_hash",
+    "input_contract_version": 1,
+    "active_validators": [
+      "a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b"
+    ],
+    "pending_updates": [],
+    "vote_records": [],
+    "activation_schedule": [],
+    "checkpoint_references": [],
+    "mechanism_specific_metadata": {}
+  }
+}
