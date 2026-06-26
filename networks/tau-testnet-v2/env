@@ -18,3 +18,7 @@ TAU_NETWORK_LISTEN=/ip4/0.0.0.0/tcp/4001
 # Read / RPC node by default. Validators set this true and supply a BLS keypair
 # (TAU_MINER_PUBKEY / TAU_MINER_PRIVKEY) — see README "Run as a validator".
 TAU_MINING_ENABLED=false
+
+# New accounts receive this balance on first transaction (minted testnet faucet).
+TAU_AUTO_FAUCET=true
+TAU_AUTO_FAUCET_AMOUNT=100000

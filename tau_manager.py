@@ -636,15 +636,34 @@ def reset_tau_state(rule_text: str, *, source: str = "unknown", apply_rules_upda
     )
 
 
-def restore_full_tau_spec(spec_text: str) -> None:
+def get_runtime_shrunk_streams() -> frozenset:
+    """Snapshot of the input-stream indices currently shrunk in the live
+    interpreter. Pair this with get_current_spec()/last_known_tau_spec whenever
+    you snapshot+restore live Tau state, and pass it back to
+    restore_full_tau_spec(runtime_shrunk_streams=...) so the shrunk-stream set is
+    re-pinned to match the restored (already-shrunk) interpreter."""
+    return frozenset(_runtime_shrunk_streams)
+
+
+def restore_full_tau_spec(spec_text: str, *, runtime_shrunk_streams: "frozenset | None" = None) -> None:
     """
     Replace the direct-mode interpreter with a fully composed persisted spec.
     This is used at startup/recovery instead of sending the whole spec through i0.
+
+    `runtime_shrunk_streams`: when the spec_text is the interpreter's already-shrunk
+    runtime form (e.g. a get_current_spec() snapshot whose address streams are
+    bv[W<MIN_SHRINK_WIDTH]), prepare_rule below re-classifies nothing and the
+    commit would WIPE the shrunk-stream set -- leaving the bookkeeping out of sync
+    with the restored interpreter, so a later transfer feeds a wide bv[384] literal
+    the shrunk interpreter cannot parse (wrong verdict). Pass the pre-restore set
+    (from get_runtime_shrunk_streams()) to re-pin it.
     """
-    global tau_direct_interface, last_known_tau_spec
+    global tau_direct_interface, last_known_tau_spec, _runtime_shrunk_streams
 
     if tau_test_mode:
         last_known_tau_spec = spec_text or ""
+        if runtime_shrunk_streams is not None:
+            _runtime_shrunk_streams = frozenset(runtime_shrunk_streams)
         return
 
     if not tau_direct_interface:
@@ -663,6 +682,10 @@ def restore_full_tau_spec(spec_text: str) -> None:
     _print_tau_send("restore_full_tau_spec update_spec", prepared.runtime_text)
     tau_direct_interface.update_spec(prepared.runtime_text)
     _commit_runtime_spec(prepared)
+    if runtime_shrunk_streams is not None:
+        # Re-pin the caller-supplied set: _commit_runtime_spec just set it from the
+        # re-prepared (already-shrunk -> empty) spec, which is wrong here.
+        _runtime_shrunk_streams = frozenset(runtime_shrunk_streams)
     try:
         last_known_tau_spec = tau_direct_interface.get_current_spec() or canonical
     except Exception:

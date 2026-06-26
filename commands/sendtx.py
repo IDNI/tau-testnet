@@ -446,6 +446,13 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
     # natively, which can hang for minutes (watchdog kill -> restart loop).
     rules_validated_isolated = False
 
+    # Snapshot of the live interpreter's composed spec + its shrunk-stream set,
+    # captured immediately before the live validation mutates them (see restore in
+    # the finally below). Both are needed: the spec rebuilds the interpreter, the
+    # shrunk set keeps input normalization consistent with it (TAU_SHRINK_ENABLED).
+    saved_full_spec_for_restore = None
+    saved_shrunk_streams_for_restore = None
+
     try:
         if tx_type == "user_tx":
             try:
@@ -525,6 +532,30 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                                     logger.info("Tau rule validation successful (isolated compile).")
 
                             if not rules_validated_isolated:
+                                # Capture the live interpreter's composed spec
+                                # BEFORE the i0 pointwise-revision mutates it. The
+                                # restore (finally) must feed THIS normalized,
+                                # single-formula spec back -- NOT
+                                # chain_state.get_rules_state(), which is the raw
+                                # newline accumulation (genesis conditional with no
+                                # trailing '.', then builtin units) meant for
+                                # one-by-one i0 replay. Feeding that whole blob to
+                                # the interpreter (via i0 OR update_spec) is a parse
+                                # error at the first `) always`. This mirrors the
+                                # snapshot/restore createblock already does.
+                                try:
+                                    _iface = tau_manager.tau_direct_interface
+                                    if _iface is not None and hasattr(_iface, "get_current_spec"):
+                                        saved_full_spec_for_restore = _iface.get_current_spec()
+                                except Exception:
+                                    saved_full_spec_for_restore = None
+                                if saved_full_spec_for_restore is None:
+                                    saved_full_spec_for_restore = tau_manager.last_known_tau_spec
+                                try:
+                                    saved_shrunk_streams_for_restore = tau_manager.get_runtime_shrunk_streams()
+                                except Exception:
+                                    saved_shrunk_streams_for_restore = None
+
                                 logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
                                 tau_output_rules = tau_manager.communicate_with_tau(
                                     rule_text=rule_text,
@@ -692,17 +723,22 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                 # natively and can hang -> watchdog kill -> restart loop).
                 if has_rules and not rules_validated_isolated:
                     try:
-                        prior_spec = chain_state.get_rules_state()
-                        if prior_spec:
+                        if saved_full_spec_for_restore:
                             logger.info("Restoring prior Tau state after validation...")
-                            tau_manager.reset_tau_state(
-                                prior_spec,
-                                source="sendtx-restore",
-                                apply_rules_update=False,
-                            )
+                            # Rebuild the interpreter from the pre-validation
+                            # snapshot (normalized single-formula spec). NOT the
+                            # raw get_rules_state() accumulation, which is not a
+                            # parseable standalone spec. Hold tau_comm_lock to
+                            # preserve the mutual exclusion the old reset_tau_state
+                            # (-> communicate_with_tau) provided.
+                            with tau_manager.tau_comm_lock:
+                                tau_manager.restore_full_tau_spec(
+                                    saved_full_spec_for_restore,
+                                    runtime_shrunk_streams=saved_shrunk_streams_for_restore,
+                                )
                         else:
                             logger.warning(
-                                "No prior Tau spec available for restore; skipping sendtx-restore."
+                                "No pre-validation Tau snapshot captured; skipping sendtx-restore."
                             )
                     except Exception:
                         logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)

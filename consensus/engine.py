@@ -313,7 +313,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # supply is preserved across a block (no mint, no burn). A mismatch is
         # a consensus bug, not a recoverable error.
         post_total = sum(int(v) for v in t_bals.values())
-        if post_total != parent_total:
+        if post_total != parent_total and not getattr(config, "TESTNET_AUTO_FAUCET", False):
             raise BlockchainBug(
                 f"Supply not conserved applying block #{block.header.block_number}: "
                 f"parent_total={parent_total} post_total={post_total}"
@@ -864,6 +864,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         tx_receipt["logs"].append(f"Tau fee step: {step_fee}")
 
                                 current_from = _read_bal(from_addr)
+                                if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
+                                    current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
                                 if current_from < amount:
                                     logger.error(
                                         "Insufficient funds for %s to send %s. Has: %s.",
@@ -929,6 +931,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                             current_from = target_balances[from_addr]
                                         else:
                                             current_from = chain_state.get_balance(from_addr)
+
+                                        if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
+                                            current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
 
                                         if current_from < amount:
                                             logger.error("Insufficient funds for %s to send %s. Has: %s.", from_addr[:10], amount, current_from)

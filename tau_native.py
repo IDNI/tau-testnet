@@ -50,12 +50,24 @@ def get_memory_rss_mb() -> float:
     except Exception:
         return 0.0
 
+_native_tau_dir: "str | None" = None
+
+
+def native_tau_dir() -> "str | None":
+    """Directory the native `tau` module was actually imported from (the dir
+    holding tau*.so), or None if not yet loaded / found via a non-file path.
+    Propagated to the isolated-compile subprocess via PYTHONPATH so the child
+    imports the SAME module instead of re-discovering it (which fails when the
+    parent found tau via a runtime sys.path insert the child cannot inherit)."""
+    return _native_tau_dir
+
+
 def load_tau_module():
     """
     Attempts to locate and import the native `tau` module.
     It searches in likely build directories within a sibling `tau-lang` repository.
     """
-    global tau
+    global tau, _native_tau_dir
     if tau is not None:
         return tau
 
@@ -86,6 +98,7 @@ def load_tau_module():
         try:
             import tau as tau_module
             tau = tau_module
+            _native_tau_dir = found_path
             return tau
         except ImportError as e:
             import glob
@@ -104,6 +117,9 @@ def load_tau_module():
         try:
             import tau as tau_module
             tau = tau_module
+            mod_file = getattr(tau_module, "__file__", None)
+            if mod_file:
+                _native_tau_dir = os.path.dirname(os.path.abspath(mod_file))
             logger.info("Found native tau module in PYTHONPATH")
             return tau
         except ImportError:
@@ -775,26 +791,44 @@ class TauInterface:
     ):
         """
         Compile each revision against an isolated, throwaway Tau interpreter
-        seeded from `consensus_rules_text`. Returns None on success, or a
-        string describing the first compile failure encountered.
+        built the SAME way the live interpreter is: the FIRST rule unit of
+        `consensus_rules_text` seeds the interpreter (it is a single parseable
+        spec -- the genesis i0->u conditional, or the active consensus formula),
+        and every remaining unit is replayed through i0 so the genesis u-stream
+        joins them. Returns None on success, or a string describing the first
+        compile failure encountered.
 
-        Used by mempool admission to reject syntactically or semantically bad
-        revisions before they reach `engine.apply_block` at the activation
-        height. The throwaway interpreter is local to this call: no
+        IMPORTANT: `consensus_rules_text` may be the raw newline accumulation
+        from chain_state.get_rules_state() (genesis conditional + builtin units +
+        prior rules). That blob is NOT a single parseable spec -- the genesis
+        conditional has no trailing '.', so `get_interpreter(blob)` fails at the
+        first ') always'. Seeding from unit[0] and replaying the rest via i0
+        avoids that. For a single-unit consensus seed this is identical to the
+        previous behavior.
+
+        Used by mempool admission and sendtx to reject syntactically or
+        semantically bad revisions before they reach `engine.apply_block` at the
+        activation height. The throwaway interpreter is local to this call: no
         module-level state (`tau` global, live `tau_direct_interface`,
         `_application_rules_state`, etc.) is mutated.
         """
         tau_module = load_tau_module()
 
-        prepared_spec = cls.preprocess_spec_text(consensus_rules_text or "")
-        if not prepared_spec:
+        units = [
+            u for u in (consensus_rules_text or "").split("\n") if u.strip()
+        ]
+        if not units:
             # No baseline to revise against; admission falls back to its
             # cheap structural pass.
             return None
 
+        seed_spec = cls.preprocess_spec_text(units[0])
+        if not seed_spec:
+            return None
+
         try:
             with StdOutCapture() as init_capture:
-                interpreter = tau_module.get_interpreter(prepared_spec)
+                interpreter = tau_module.get_interpreter(seed_spec)
         except Exception as e:
             return f"Failed to construct staging Tau interpreter: {e}"
 
@@ -808,7 +842,10 @@ class TauInterface:
         if "(Error)" in (init_capture.output or ""):
             return f"Tau staging compile error: {init_capture.output.strip()}"
 
-        for rev in revisions or []:
+        # Replay the remaining accumulated units (joined via i0 -> u like the
+        # live interpreter), then the candidate revisions, through i0.
+        staged_inputs = list(units[1:]) + list(revisions or [])
+        for rev in staged_inputs:
             if not isinstance(rev, str) or not rev.strip():
                 continue
 
@@ -901,6 +938,23 @@ def compile_revisions_isolated_subprocess(
         }
     )
 
+    # The child re-imports the native tau module via load_tau_module(). The parent
+    # may have loaded it from a runtime sys.path insert (sibling tau-lang build)
+    # the child cannot inherit, so it would report "native tau unavailable" and the
+    # caller would fall back to the (slower, mutating) live validation path on every
+    # rule. Propagate the parent's resolved native dir + repo root via PYTHONPATH so
+    # the child imports the SAME module deterministically.
+    try:
+        load_tau_module()
+    except Exception:
+        pass  # leave PYTHONPATH augmentation best-effort; worker still falls back
+    child_env = dict(os.environ)
+    extra_paths = [p for p in (native_tau_dir(), repo_root) if p]
+    existing_pp = child_env.get("PYTHONPATH", "")
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        extra_paths + ([existing_pp] if existing_pp else [])
+    )
+
     try:
         proc = subprocess.run(
             [sys.executable, "-m", _COMPILE_WORKER_MODULE],
@@ -909,6 +963,7 @@ def compile_revisions_isolated_subprocess(
             text=True,
             cwd=repo_root,
             timeout=timeout,
+            env=child_env,
         )
     except subprocess.TimeoutExpired:
         # subprocess.run already SIGKILLed the child on timeout.

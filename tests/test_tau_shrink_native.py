@@ -135,6 +135,78 @@ print("SRC_EQ_RESULT", "/".join(str(s) for s in streams), same, diff)
 '''
 
 
+# --- sendtx restore must NOT desync the shrunk-stream set (regression) ----------
+# Repro of the live validate-then-restore path: a rule sendtx snapshots the
+# interpreter's (shrunk) spec + shrunk-stream set, validates a user rule via i0
+# (mutating the interpreter), then restores. restore_full_tau_spec on the
+# already-shrunk snapshot re-classifies nothing (bv[W<128]) and WIPES the set;
+# passing runtime_shrunk_streams= re-pins it so a following transfer that feeds a
+# wide bv[384] literal still shrinks correctly and yields the right verdict.
+_CHILD_RESTORE = r'''
+import os, tempfile
+os.environ["TAU_ENV"] = "test"; os.environ["TAU_FORCE_TEST"] = "0"
+os.environ["TAU_SHRINK_ENABLED"] = "true"
+import config; config.set_database_path(os.environ["SHRINK_DB"])
+import db; db.init_db()
+import tau_native, tau_manager
+
+HEX = "%s"; KEY = "11" * 48
+BASE = ("always ( ((i12[t]:bv[384] = { #x"+HEX+" }:bv[384]) && o2[t]:bv[64] = { 1 }:bv[64]) "
+        "|| ((i12[t]:bv[384] != { #x"+HEX+" }:bv[384]) && o2[t]:bv[64] = { 0 }:bv[64]) ).")
+USER = ("always ((i12[t]:bv[384] = { #x"+KEY+" }:bv[384] && i1[t]:bv[24] > { 5000 }:bv[24]) "
+        "-> o5[t]:bv[24] = { #x000000 }:bv[24]).")
+
+boot = tempfile.NamedTemporaryFile("w", suffix=".tau", delete=False)
+boot.write("always ( o9[t]:bv[64] = { 1 }:bv[64] ).\n"); boot.close()
+tau_manager.tau_direct_interface = tau_native.TauInterface(boot.name)
+tau_manager.tau_test_mode = False
+tau_manager._runtime_shrunk_streams = frozenset()
+tau_manager.tau_ready.set()
+
+def verdict():
+    return tau_manager.parse_tau_output(str(tau_manager.communicate_with_tau(
+        target_output_stream_index=2, input_stream_values={12: "{ #x"+HEX+" }:bv[384]"})))
+
+tau_manager.restore_full_tau_spec(BASE)
+spec0 = tau_manager.tau_direct_interface.get_current_spec()
+set0 = tau_manager.get_runtime_shrunk_streams()
+tau_manager.communicate_with_tau(rule_text=USER, target_output_stream_index=0, apply_rules_update=False)
+
+# WITHOUT the kwarg: set wipes (the bug this guards against).
+tau_manager.restore_full_tau_spec(spec0)
+wiped = sorted(tau_manager._runtime_shrunk_streams)
+
+# WITH the kwarg (the fix): set re-pinned, verdict correct.
+tau_manager.restore_full_tau_spec(spec0, runtime_shrunk_streams=set0)
+fixed = sorted(tau_manager._runtime_shrunk_streams)
+v = verdict()
+print("RESTORE_RESULT", "/".join(map(str, wiped)) or "EMPTY", "/".join(map(str, fixed)), v)
+'''
+
+
+def test_sendtx_restore_repins_shrunk_streams_real_engine(tmp_path):
+    """restore_full_tau_spec(runtime_shrunk_streams=...) keeps the shrunk-stream
+    set consistent with the restored interpreter; without it the set wipes and a
+    later bv[384] input mis-validates."""
+    child = _CHILD_RESTORE % (HEX,)
+    script = tmp_path / "child_restore.py"
+    script.write_text(child)
+    env = dict(os.environ)
+    env["SHRINK_DB"] = str(tmp_path / "restore.db")
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True, text=True, env=env, timeout=120,
+    )
+    line = next((l for l in proc.stdout.splitlines() if l.startswith("RESTORE_RESULT")), None)
+    assert line is not None, f"child produced no result.\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    _, wiped, fixed, verdict = line.split(maxsplit=3)
+    assert wiped == "EMPTY", f"without the kwarg the set should wipe (proves the hazard): {line}"
+    assert fixed == "12", f"with the kwarg the shrunk set must be re-pinned to [12]: {line}"
+    assert verdict == "1", f"matching i12 must still verify (o2=1) after restore: {line}"
+
+
 def test_src_eq_dest_rule_full_pubkeys_real_engine(tmp_path):
     """Rule 02 with bv[384] i3/i4 fed FULL pubkeys: shrink interns both, equality
     is preserved (same -> o3=0, different -> o3=1) on the real interpreter."""

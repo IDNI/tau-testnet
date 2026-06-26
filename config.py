@@ -162,6 +162,9 @@ class AuthoritySettings:
     # validators mine via the internal SoleMiner loop, never via remote RPC).
     allow_remote_createblock: bool = False
     max_mempool_txs: int = 5000
+    # Credit unseen accounts with this balance on first use (testnet convenience).
+    auto_faucet: bool = True
+    auto_faucet_amount: int = 100000
 
     def validate(self) -> None:
         if self.mining_enabled:
@@ -202,6 +205,8 @@ class AuthoritySettings:
             raise ConfigurationError(
                 "Authority validator_vote_quorum must be 'supermajority' or 'majority'."
             )
+        if self.auto_faucet_amount <= 0:
+            raise ConfigurationError("Authority auto_faucet_amount must be positive.")
 
 
 @dataclass
@@ -278,6 +283,7 @@ ENVIRONMENT_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "authority": {
             "miner_pubkey_path": os.path.join(DATA_DIR, "test_miner.pub"),
             "miner_privkey_path": os.path.join(DATA_DIR, "test_miner.key"),
+            "auto_faucet": False,
         },
         "network": {
             "bootstrap_peers": [],
@@ -358,6 +364,12 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
         "allow_remote_createblock",
         lambda v: v.lower() in ("true", "1", "yes"),
     ),
+    "TAU_AUTO_FAUCET": (
+        "authority",
+        "auto_faucet",
+        lambda v: v.lower() in ("true", "1", "yes"),
+    ),
+    "TAU_AUTO_FAUCET_AMOUNT": ("authority", "auto_faucet_amount", int),
 }
 
 
@@ -524,6 +536,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     global MINER_PUBKEY, MINER_PUBKEYS, MINER_PRIVKEY, BLOCK_SIGNATURE_SCHEME, STATE_LOCATOR_NAMESPACE
     global OPEN_GOVERNANCE_ADMISSION
     global MAX_MEMPOOL_TXS
+    global TESTNET_AUTO_FAUCET, TESTNET_AUTO_FAUCET_AMOUNT
 
     HOST = current.server.host
     PORT = current.server.port
@@ -560,6 +573,8 @@ def _sync_legacy_exports(current: Settings) -> None:
     STATE_LOCATOR_NAMESPACE = current.authority.state_locator_namespace
     OPEN_GOVERNANCE_ADMISSION = current.authority.open_governance_admission
     MAX_MEMPOOL_TXS = current.authority.max_mempool_txs
+    TESTNET_AUTO_FAUCET = current.authority.auto_faucet
+    TESTNET_AUTO_FAUCET_AMOUNT = current.authority.auto_faucet_amount
 
 
 def reload_settings(env: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> Settings:
@@ -624,11 +639,9 @@ __all__ = [
     "STATE_LOCATOR_NAMESPACE",
     "OPEN_GOVERNANCE_ADMISSION",
     "MAX_MEMPOOL_TXS",
+    "TESTNET_AUTO_FAUCET",
+    "TESTNET_AUTO_FAUCET_AMOUNT",
     "MAX_BLOCK_FUTURE_DRIFT_SECONDS",
 ]
 
-# Feature flags
-# Auto-faucet removed for launch: unknown accounts have balance 0. The flag is
-# kept (always False) so legacy tests that toggle it remain harmless no-ops.
-TESTNET_AUTO_FAUCET = False
 MAX_BLOCK_FUTURE_DRIFT_SECONDS = int(os.environ.get('TAU_MAX_BLOCK_FUTURE_DRIFT', '120'))

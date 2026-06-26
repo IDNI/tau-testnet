@@ -985,6 +985,8 @@ def load_genesis(genesis_json_path: str):
 def get_balance(address_hex: str) -> int:
     """Returns the balance of the given address. Returns 0 if address not found."""
     with _balance_lock:
+        if address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
+            return int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
         return _balances.get(address_hex, 0)
 
 def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, amount: int) -> bool:
@@ -999,6 +1001,9 @@ def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, a
 
     with _balance_lock:
         current_from_balance = _balances.get(from_address_hex, 0)
+
+        if from_address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
+            current_from_balance = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
 
         # Enforce sufficient funds during balance updates to avoid negative balances
         if current_from_balance < amount:
