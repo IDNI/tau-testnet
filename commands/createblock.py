@@ -370,6 +370,14 @@ def create_block_from_mempool() -> Dict:
             saved_full_spec = None
         if saved_full_spec is None:
             saved_full_spec = tau_manager.last_known_tau_spec
+        # Snapshot the shrunk-stream set too: restoring the (shrunk) get_current_spec()
+        # would otherwise re-classify nothing and leave the set empty, so a transfer
+        # before process_new_block re-applies the block would feed a raw bv[384] the
+        # engine rejects. Re-pin it with the restore.
+        try:
+            saved_shrunk_streams = tau_manager.get_runtime_shrunk_streams()
+        except Exception:
+            saved_shrunk_streams = None
 
         try:
             # Call the unified path
@@ -379,7 +387,9 @@ def create_block_from_mempool() -> Dict:
             # below re-applies the block from the same baseline the miner saw.
             try:
                 if saved_full_spec is not None:
-                    tau_manager.restore_full_tau_spec(saved_full_spec)
+                    tau_manager.restore_full_tau_spec(
+                        saved_full_spec, runtime_shrunk_streams=saved_shrunk_streams
+                    )
             except Exception as restore_err:
                 logger.warning(
                     "createblock: failed to restore Tau spec after miner simulation: %s",

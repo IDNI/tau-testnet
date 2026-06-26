@@ -266,15 +266,34 @@ def _normalize_inputs(input_stream_values, effective_shrunk: frozenset):
     return normalized
 
 
-def _commit_runtime_spec(prepared) -> None:
+def _commit_runtime_spec(prepared, *, accumulate: bool = False) -> None:
     """Commit the runtime shrink state (which input streams to shrink) for a
     successfully-loaded spec. MUST be called under tau_comm_lock, AFTER the
     interpreter update succeeds. Does NOT touch last_known_tau_spec: that stays
     the full COMPOSED interpreter spec (see communicate_with_tau), which
-    createblock save/restore and persistence both depend on."""
+    createblock save/restore and persistence both depend on.
+
+    `accumulate`: incremental i0 rule applications each carry only THEIR OWN
+    shrunk streams, but the live interpreter accumulates every applied rule via
+    the u-stream. Replacing the set per call makes it reflect only the LAST rule
+    -- so e.g. after replaying builtins [insufficient, src==dest(i3/i4 bv[384]),
+    zero, echo] the set ends up empty (the echo rule shrinks nothing), and a
+    later transfer feeds a raw `{ #x.. }:bv[384]` the engine rejects. Union so
+    the set tracks the composed spec. (restore_full_tau_spec replaces, since it
+    rebuilds from a complete spec / re-pins explicitly.)"""
     global _current_prepared_spec, _runtime_shrunk_streams
     _current_prepared_spec = prepared
-    _runtime_shrunk_streams = prepared.shrunk_streams
+    if accumulate:
+        _runtime_shrunk_streams = frozenset(_runtime_shrunk_streams) | frozenset(prepared.shrunk_streams)
+    else:
+        _runtime_shrunk_streams = prepared.shrunk_streams
+
+
+def _union_runtime_shrunk_streams(streams) -> None:
+    """Fold additional shrunk-stream indices into the committed set (under
+    tau_comm_lock). Used when several rules are applied in one call."""
+    global _runtime_shrunk_streams
+    _runtime_shrunk_streams = frozenset(_runtime_shrunk_streams) | frozenset(streams)
 
 
 def _handle_width_overflow(exc: "tau_shrink.ShrinkWidthOverflow"):
@@ -438,7 +457,10 @@ def communicate_with_tau(
         # Effective shrink set for THIS evaluation: a spec update redefines it,
         # otherwise use the committed runtime set.
         if prepared is not None:
-            effective_shrunk = set(prepared.shrunk_streams)
+            # Union with the already-committed set: a rule update accumulates into
+            # the live interpreter, so its shrunk streams add to (not replace) the
+            # streams already shrunk by previously-applied rules.
+            effective_shrunk = set(prepared.shrunk_streams) | set(_runtime_shrunk_streams)
         else:
             effective_shrunk = set(_runtime_shrunk_streams)
         for p in i0_stream_preps:
@@ -487,7 +509,15 @@ def communicate_with_tau(
         # interpreter update.
         spec_for_commit = i0_stream_preps[-1] if i0_stream_preps else prepared
         if spec_for_commit is not None:
-            _commit_runtime_spec(spec_for_commit)
+            # Incremental rule application: accumulate shrunk streams (union) so the
+            # set tracks the composed interpreter, not just the last rule applied.
+            _commit_runtime_spec(spec_for_commit, accumulate=True)
+            if len(i0_stream_preps) > 1:
+                # Several rules arrived on i0 this call; fold in every rule's set.
+                extra = set()
+                for p in i0_stream_preps:
+                    extra |= set(p.shrunk_streams)
+                _union_runtime_shrunk_streams(extra)
 
         # last_known_tau_spec is kept ONLY as a debug/error-state aid. It is the
         # interpreter's composed (possibly shrunk) spec and is NEVER hashed or

@@ -96,14 +96,17 @@ def test_interpreter_receives_shrunk_rule(direct_mode):
     assert tau_manager._runtime_shrunk_streams == frozenset({12})
 
 
-def test_runtime_shrink_set_tracks_loaded_spec(direct_mode):
+def test_runtime_shrink_set_accumulates_across_loaded_rules(direct_mode):
     tau_manager.communicate_with_tau(rule_text=EQ_RULE, target_output_stream_index=0)
     assert tau_manager._runtime_shrunk_streams == frozenset({12})
-    # A rule with no shrinkable streams resets the set.
+    # The live interpreter accumulates rules via the u-stream, so a later rule
+    # with no shrinkable streams must NOT drop i12 from the shrunk set. Replacing
+    # (the old behavior) made e.g. the final builtin wipe i3/i4, after which a
+    # transfer fed a raw `{ #x.. }:bv[384]` the engine rejects ("Unexpected '{'").
     tau_manager.communicate_with_tau(
         rule_text=_rule("o2[t]:bv[24] = i1[t]:bv[24]"), target_output_stream_index=0
     )
-    assert tau_manager._runtime_shrunk_streams == frozenset()
+    assert tau_manager._runtime_shrunk_streams == frozenset({12})
 
 
 def test_multi_shrinks_i12_stream_value_to_bare_id(direct_mode):

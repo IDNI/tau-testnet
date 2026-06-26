@@ -135,6 +135,67 @@ print("SRC_EQ_RESULT", "/".join(str(s) for s in streams), same, diff)
 '''
 
 
+# --- shrunk set accumulates across replayed builtins; transfer validates --------
+# Regression for the "Unexpected '{'" transfer error: builtins are replayed one
+# by one via i0. Builtin 02 (i3/i4 bv[384]) shrinks {3,4}; the later echo builtin
+# shrinks nothing. If the runtime shrunk-set REPLACED per rule it would end up
+# empty, and a transfer feeding `{ #x.. }:bv[384]` on i3/i4 would be rejected.
+# It must ACCUMULATE so the address streams stay shrunk.
+_CHILD_ACCUM = r'''
+import os, tempfile, json
+os.environ["TAU_ENV"] = "test"; os.environ["TAU_FORCE_TEST"] = "0"
+os.environ["TAU_SHRINK_ENABLED"] = "true"
+import config; config.set_database_path(os.environ["SHRINK_DB"])
+import db; db.init_db()
+import tau_native, tau_manager
+
+FROM = "%s"; TO = "%s"
+GEN = "((!(i0[t] = 0)) ? ( u[t] = i0[t] && o0[t] = 0 ) : o0[t] = 1)"
+BUILTINS = [
+ "always ( ((i1[t]:bv[24] > i2[t]:bv[24]) && o2[t] = { #x000000 }:bv[24]) || ((i1[t]:bv[24] <= i2[t]:bv[24]) && o2[t] = { #x000001 }:bv[24]) ).",
+ "always ( ((i3[t]:bv[384] = i4[t]:bv[384]) && o3[t] = { #x0000 }:bv[16]) || ((i3[t]:bv[384] != i4[t]:bv[384]) && o3[t] = { #x0001 }:bv[16]) ).",
+ "always (o1[t]:bv[24] = ((i1[t]:bv[24] + { #x000000 }:bv[24]) & ((i1[t]:bv[24] + { #x000000 }:bv[24]) | { #x000000 }:bv[24]))).",
+]
+boot = tempfile.NamedTemporaryFile("w", suffix=".tau", delete=False); boot.write(GEN+"\n"); boot.close()
+tau_manager.tau_direct_interface = tau_native.TauInterface(boot.name)
+tau_manager.tau_test_mode = False
+tau_manager._runtime_shrunk_streams = frozenset()
+tau_manager.tau_ready.set()
+for b in BUILTINS:
+    tau_manager.communicate_with_tau(rule_text=b, target_output_stream_index=0, apply_rules_update=True)
+streams = sorted(tau_manager._runtime_shrunk_streams)
+err = None
+try:
+    out = tau_manager.communicate_with_tau_multi(input_stream_values={
+        1: "1", 2: "100000",
+        3: "{ #x"+FROM+" }:bv[384]", 4: "{ #x"+TO+" }:bv[384]"})
+    o3 = tau_manager.parse_tau_output(str(out.get(3)))
+except Exception as e:
+    err = type(e).__name__ + ": " + str(e)[:60]; o3 = None
+print("ACCUM_RESULT " + json.dumps({"streams": streams, "o3": o3, "err": err}))
+'''
+
+
+def test_shrunk_set_accumulates_over_builtins_then_transfer(tmp_path):
+    from_hex = "91" * 48
+    to_hex = "93" * 48
+    child = _CHILD_ACCUM % (from_hex, to_hex)
+    script = tmp_path / "child_accum.py"
+    script.write_text(child)
+    env = dict(os.environ)
+    env["SHRINK_DB"] = str(tmp_path / "accum.db")
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env, timeout=120)
+    line = next((l for l in proc.stdout.splitlines() if l.startswith("ACCUM_RESULT")), None)
+    assert line is not None, f"no result.\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    import json
+    res = json.loads(line[len("ACCUM_RESULT "):])
+    assert res["err"] is None, f"transfer must not raise a parse error: {res['err']}"
+    assert res["streams"] == [3, 4], f"address streams must stay shrunk after all builtins: {res}"
+    assert str(res["o3"]) == "1", f"from != to -> o3=1 (src!=dest passes): {res}"
+
+
 # --- sendtx restore must NOT desync the shrunk-stream set (regression) ----------
 # Repro of the live validate-then-restore path: a rule sendtx snapshots the
 # interpreter's (shrunk) spec + shrunk-stream set, validates a user rule via i0
