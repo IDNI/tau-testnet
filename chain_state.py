@@ -472,10 +472,11 @@ def process_new_block(block: Block) -> bool:
                     "balances": _balances,
                     "sequence_numbers": _sequence_numbers,
                     "lifecycle_manager": _lifecycle_manager,
-                    "active_consensus_id": _active_consensus_id
+                    "active_consensus_id": _active_consensus_id,
+                    "consensus_rules_state": _consensus_rules_state,
                 }
             )
-            
+
             # 2. Derive Active consensus / execute with compatibility for tests that
             # still monkeypatch the legacy engine surface.
             active_view = None
@@ -768,10 +769,11 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                     "balances": _balances,
                     "sequence_numbers": _sequence_numbers,
                     "lifecycle_manager": _lifecycle_manager,
-                    "active_consensus_id": _active_consensus_id
+                    "active_consensus_id": _active_consensus_id,
+                    "consensus_rules_state": _consensus_rules_state,
                 }
             )
-            
+
             # 2. Derive Active Consensus
             active_view = engine.derive_active_consensus(parent_snapshot, block_number)
             

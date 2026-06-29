@@ -163,9 +163,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # In Phase 2, this will traverse the consensus_meta to build the view. 
         # For now, it delegates to PoA parameters.
         validator_hexes = self._active_validator_hexes_from_snapshot(parent_snapshot)
+        # consensus_rules is the CONSENSUS spec (o6/o7), carried in the parent
+        # snapshot metadata -- NOT parent_snapshot.tau_bytes, which is the
+        # APPLICATION accumulation. Using tau_bytes here meant every non-governance
+        # block wrote the application spec into consensus_rules_state, which then
+        # failed to parse when replayed via i0 on restart ("Unexpected 'a'").
         return ActiveConsensusView(
             target_height=target_height,
-            consensus_rules=parent_snapshot.tau_bytes.decode('utf-8', errors='ignore'),
+            consensus_rules=str(parent_snapshot.metadata.get("consensus_rules_state", "") or ""),
             active_validators=[bytes.fromhex(v) for v in validator_hexes],
             mechanism_specific_metadata={"poa": True}
         )

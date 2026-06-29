@@ -38,6 +38,42 @@ def test_engine_derives_active_validators_from_lifecycle_snapshot(monkeypatch):
     assert view.active_validators == [bytes.fromhex(chain_validator)]
 
 
+def test_derive_active_consensus_reads_consensus_rules_from_metadata_not_tau_bytes():
+    """Regression: consensus_rules must come from the snapshot's
+    consensus_rules_state metadata, NOT tau_bytes (the application accumulation).
+
+    Mislabeling tau_bytes as consensus_rules made every non-governance block write
+    the application spec into _consensus_rules_state; on restart the restore fed
+    that multi-statement blob via i0 and the engine rejected it
+    ("(Error) Unexpected 'a'"), so o6/o7 were undefined and synced blocks failed.
+    """
+    APP_BLOB = (
+        "((!(i0[t] = 0)) ? ( u[t] = i0[t] && o0[t] = 0 ) : o0[t] = 1) "
+        "always ( o2[t]:bv[24] = i1[t]:bv[24] )."
+    )
+    CONS = "always ( o6[t]:bv[64] = i10[t]:bv[64] && o7[t]:bv[64] = { 1 }:bv[64] )."
+    snapshot = TauStateSnapshot(
+        state_hash="0" * 64,
+        tau_bytes=APP_BLOB.encode("utf-8"),
+        metadata={
+            "lifecycle_manager": ConsensusLifecycleManager(active_validators=["a" * 96]),
+            "consensus_rules_state": CONS,
+        },
+    )
+
+    view = TauConsensusEngine().derive_active_consensus(snapshot, 5)
+
+    assert view.consensus_rules == CONS
+    assert "u[t]" not in view.consensus_rules  # application spec must not leak in
+    # Absent metadata -> empty (never the application tau_bytes).
+    bare = TauStateSnapshot(
+        state_hash="0" * 64,
+        tau_bytes=APP_BLOB.encode("utf-8"),
+        metadata={"lifecycle_manager": ConsensusLifecycleManager(active_validators=["a" * 96])},
+    )
+    assert TauConsensusEngine().derive_active_consensus(bare, 5).consensus_rules == ""
+
+
 def test_active_validators_persist_and_reload(temp_database):
     validators = ["a" * 96, "b" * 96]
     chain_state._balances.clear()

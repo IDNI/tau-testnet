@@ -326,7 +326,10 @@ def create_block_from_mempool() -> Dict:
                 "balances": chain_state._balances,
                 "sequence_numbers": chain_state._sequence_numbers,
                 "lifecycle_manager": chain_state._lifecycle_manager,
-                "active_consensus_id": chain_state._active_consensus_id
+                "active_consensus_id": chain_state._active_consensus_id,
+                # Carry the CONSENSUS spec so derive_active_consensus/apply_block
+                # propagate it (not tau_bytes, which is the application spec).
+                "consensus_rules_state": chain_state._consensus_rules_state,
             }
         )
         
