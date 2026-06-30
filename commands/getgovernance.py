@@ -80,12 +80,22 @@ def execute(raw_command: str, container):
         for activation_height, uid in chain_state._lifecycle_manager.scheduled_updates:
             uid_hex = _normalize_hexish(uid)
             lifecycle[uid_hex] = "approved-and-scheduled"
-            scheduled_updates.append(
-                {
-                    "activation_height": int(activation_height),
-                    "update_id": uid_hex,
-                }
-            )
+            entry = {
+                "activation_height": int(activation_height),
+                "update_id": uid_hex,
+            }
+            # The full payload is retained in update_payloads for the whole
+            # scheduled lifetime (read at promotion and again at activation), so
+            # surface it here too. Without this, clients can show the rule text of
+            # PENDING proposals but not of approved/scheduled ones, even though the
+            # node already holds it. Mirrors the pending serialization above.
+            payload_obj = chain_state._lifecycle_manager.update_payloads.get(uid)
+            if payload_obj is not None:
+                entry["rule_revisions"] = list(payload_obj.rule_revisions)
+                entry["activate_at_height"] = int(payload_obj.activate_at_height)
+                entry["host_contract_patch"] = payload_obj.host_contract_patch
+                entry["proposer_pubkey"] = payload_obj.proposer_pubkey
+            scheduled_updates.append(entry)
 
         for uid, voter_set in chain_state._lifecycle_manager.votes.items():
             uid_hex = _normalize_hexish(uid)
