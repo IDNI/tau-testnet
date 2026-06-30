@@ -819,9 +819,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
                                 tau_input_stream_values = {
                                     1: str(amount),
-                                    2: "0",  # Mock balance (parity with legacy apply path)
-                                    3: "0",  # Mock IDs
-                                    4: "0",
+                                    # i2 (balance) is the ONLY stream that genuinely
+                                    # diverges queue-time vs apply-time (other txs in
+                                    # the block may debit the account); it stays mocked
+                                    # and rule text reading it is rejected at admission.
+                                    2: "0",
+                                    # i3/i4 are the real from/to pubkeys (immutable in
+                                    # the transfer tuple -> identical at admission and
+                                    # apply), so recipient-aware policy/fee rules are
+                                    # deterministic across the two.
+                                    3: "{ #x" + str(from_addr) + " }:bv[384]",
+                                    4: "{ #x" + str(to_addr) + " }:bv[384]",
                                 }
                                 tau_input_stream_values[12] = "{ #x" + str(from_addr) + " }:bv[384]"
                                 for k, v in custom_tau_inputs.items():
@@ -868,6 +876,32 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     if step_fee:
                                         tx_receipt["logs"].append(f"Tau fee step: {step_fee}")
 
+                                    # --- User policy (o5) — consensus-enforced ---
+                                    # Read from the SAME multi result (no extra
+                                    # roundtrip, no perturbation), mirroring admission
+                                    # (commands/sendtx.py). Semantics: o5 absent -> allow;
+                                    # present and == BLOCK (0) -> reject the WHOLE tx
+                                    # (a policy block on any transfer invalidates the
+                                    # user_tx — staged writes never commit, so no partial
+                                    # execution). parse_tau_output maps unparseable -> 0,
+                                    # so a malformed policy output fails closed (reject).
+                                    o5_raw = tau_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
+                                    if o5_raw is not None and \
+                                            tau_manager.parse_tau_output(o5_raw) == tau_defs.USER_POLICY_BLOCK_VALUE:
+                                        logger.info(
+                                            "Transfer rejected by user policy (o5) for %s->%s (o5=%s)",
+                                            str(from_addr)[:10], str(to_addr)[:10], o5_raw,
+                                        )
+                                        if not replay_mode:
+                                            accepted_in_block = False
+                                            hard_reject = True
+                                        execution_success = False
+                                        tx_receipt["reason"] = "user_policy_block"
+                                        tx_receipt["logs"].append(
+                                            f"Transfer rejected by user policy (o5={o5_raw})"
+                                        )
+                                        break
+
                                 current_from = _read_bal(from_addr)
                                 if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
                                     current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
@@ -911,13 +945,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     tau_input_stream_values = {
                                         1: str(amount),
                                         2: "0",  # Mock balance for replay
-                                        3: "0",  # Mock IDs for replay
-                                        4: "0",
+                                        # Real from/to pubkeys for eval/width parity
+                                        # with the fee-era path.
+                                        3: "{ #x" + str(from_addr) + " }:bv[384]",
+                                        4: "{ #x" + str(to_addr) + " }:bv[384]",
                                     }
                                     # i12: full 384-bit sender pubkey (bv[384]),
                                     # mirrors the submit path so any rule that
                                     # references i12[t] replays deterministically.
                                     tau_input_stream_values[12] = "{ #x" + str(from_addr) + " }:bv[384]"
+                                    # NOTE: o5 user policy is consensus-enforced in the
+                                    # fee-era loop above (the live path when fees are on,
+                                    # which is the release config). This feeless legacy
+                                    # path mutates balances non-atomically and is not the
+                                    # consensus-determining path, so it does not enforce o5.
                                     for k, v in custom_tau_inputs.items():
                                         tau_input_stream_values[k] = v
                                     tau_input_stream_values[5] = str(block_timestamp)

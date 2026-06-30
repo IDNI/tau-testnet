@@ -192,7 +192,15 @@ def cmd_send(args):
                 # Validate operation number
                 if not op_num.isdigit():
                     raise ValueError(f"Operation number must be a digit, got '{op_num}'")
-                
+                # Streams 0-12 are reserved (0=rules, 1=transfers, 2=balance,
+                # 3/4=from/to pubkeys, 5=timestamp, 6-11=consensus ABI, 12=sender
+                # pubkey). User custom inputs must use keys >= 13; the node rejects
+                # any user_tx operation key in 2-11 at admission.
+                if int(op_num) < 13:
+                    raise ValueError(
+                        f"Custom operation key must be >= 13 (streams 0-12 are reserved), got '{op_num}'"
+                    )
+
                 operations[op_num] = op_data
                 print(f"Adding custom operation {op_num}: {op_data}")
             except ValueError as e:

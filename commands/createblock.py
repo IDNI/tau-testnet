@@ -126,8 +126,12 @@ def execute_batch(transactions: List[Dict], reserved_ids: List[int], block_times
             tau_input_stream_values = {
                 1: str(amount),
                 2: str(working_balances.get(str(from_addr), chain_state.get_balance(str(from_addr)))),
-                3: "0",
-                4: "0",
+                # Real from/to pubkeys so the interpreter's sticky per-stream bv
+                # width is warmed identically to engine.apply (avoids a mid-build
+                # width re-exec). Results here are discarded; apply_block is
+                # authoritative.
+                3: "{ #x" + str(from_addr) + " }:bv[384]",
+                4: "{ #x" + str(to_addr) + " }:bv[384]",
                 5: str(block_timestamp),
             }
             tau_input_stream_values.update(custom_inputs)

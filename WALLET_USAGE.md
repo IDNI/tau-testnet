@@ -52,6 +52,12 @@ python wallet.py send --privkey <private_key> \
   --transfer "recipient3:amount3"
 ```
 
+A single transaction can carry up to 64 transfers in `operations["1"]`, applied
+atomically (all commit or none). This is the supported way to do **fee-splits,
+donations, or fan-out payouts** entirely client-side — no special protocol
+primitive is needed. There is no amount-transform / routing output; the credited
+amounts are exactly the tuple amounts.
+
 ### Custom Operations
 ```bash
 python wallet.py send --privkey <private_key> \
@@ -98,11 +104,45 @@ python wallet.py send --privkey <private_key> \
 
 ## Operation Types
 
-The wallet supports the following operation types:
+An operation key `N` maps to Tau input stream `iN`. The wallet supports:
 
 - **Operation "0"**: Rules/Logic formulas (sent as-is to Tau)
-- **Operation "1"**: Coin transfers (SBF-encoded by the server)
-- **Operation "5" and above**: Custom operations. Note: Operations 2, 3, and 4 are reserved. Custom inputs are normalized to lists of strings.
+- **Operation "1"**: Coin transfers — a **list** of `[from, to, amount]` tuples
+  (up to 64 per transaction; SBF-encoded by the server)
+- **Operations "13" and above**: User custom inputs (normalized to lists of
+  strings). Up to 16 custom streams per transaction.
+
+**Reserved streams (cannot be set by a user_tx):**
+
+| Stream | Meaning |
+|--------|---------|
+| `i2` | balance (mocked to "0" at apply — not readable by rules) |
+| `i3` / `i4` | sender / recipient pubkey (`bv[384]`, real at admission and apply) |
+| `i5` | block timestamp (consensus clock) |
+| `i6`–`i11` | consensus ABI (block height, ts, proposer, parent hash, proof, claims) |
+| `i12` | sender pubkey (`bv[384]`, set by the node) |
+
+So user-controllable custom input streams start at **`i13`**. Attempting to set
+any reserved stream (`2`–`11`) as an operation key is rejected at admission.
+
+### User Policy Rules (`o5`)
+
+A rule written to operation `"0"` can emit the user-policy stream `o5`
+(`0` = block the transfer, `1`/absent = allow). **`o5` is consensus-enforced**:
+it is checked at mempool admission AND re-checked by every validator at block
+apply. A policy block on any transfer rejects the whole transaction (no partial
+execution); a malformed `o5` fails closed (treated as block).
+
+Rules scope on the sender (`i12` pubkey, or `i3`) and may read the recipient
+(`i4`), block time (`i5`), and amount (`i1`) — all real at both admission and
+apply. Examples expressible today:
+
+- **Recipient whitelist:** `always ( (i4[t] = {#x…}:bv[384]) ? o5[t] = {1}:bv[16] : o5[t] = {0}:bv[16] ).`
+- **Time-lock:** block transfers while `i5[t] < {unlock_ts}:bv[64]`.
+- **Spending limit:** block when `i1[t]` exceeds a per-tier cap.
+
+Rules must NOT read `i2` (balance): it is mocked at apply, so a rule reading it
+would diverge between admission and inclusion — such rule text is rejected.
 
 ## Examples
 
@@ -124,11 +164,14 @@ python wallet.py send \
   --privkey "0x1234567890abcdef..." \
   --rule "o2[t]=i1[t]" \
   --transfer "recipient1:5" \
-  --operation "3:custom_asset_data" \
-  --operation "7:governance_vote"
+  --operation "13:custom_asset_data" \
+  --operation "14:extra_input"
 ```
 
-This creates a transaction with operations 0, 1, 3, and 7, with missing operations 2, 4, 5, 6 filled with "F" when sent to Tau.
+This creates a transaction with operations 0, 1, 13, and 14. Custom inputs must
+use keys ≥ 13 (keys 2–12 are reserved; see Operation Types). Governance
+(rule proposals/votes) is a separate transaction type restricted to active
+validators on the public testnet — it is not expressed via operation keys.
 
 ## Transaction Structure
 
@@ -142,7 +185,7 @@ The wallet constructs transactions with this JSON structure:
   "operations": {
     "0": "rule_formula",
     "1": [["from_address", "to_address", "amount"]],
-    "2": "custom_operation_data"
+    "13": "custom_operation_data"
   },
   "fee_limit": "0",
   "signature": "BLS_SIGNATURE_HEX"

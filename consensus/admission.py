@@ -19,17 +19,18 @@ MAX_RULE_REVISIONS_BYTES = 196608   # 192 KiB total UTF-8, nests under the 26214
 MAX_TRANSFERS_PER_TX = 64
 MAX_CUSTOM_INPUT_STREAMS = 16
 
-# Input streams the native fee/application path MOCKS to "0" during block apply
+# Input stream(s) the native fee/application path MOCKS to "0" during block apply
 # (consensus/engine.py) yet feeds REAL values at mempool admission
-# (commands/sendtx.py). A fee/application rule that READS any of these emits a
-# different fee at admission than at inclusion: the tx is admitted, then
-# rejected at block build (liveness/UX footgun; the engine stays authoritative,
-# so it is not a safety hole). We reject such rule text outright instead of only
-# documenting the constraint. Fee/policy rules scope on i12 (real sender pubkey
-# at apply) and compare tiers on i1 (real amount at apply); they never need
-# i2/i3/i4. See tau_defs.py "DETERMINISM CONSTRAINT" and the README
-# "Transaction fees" section.
-APPLY_MOCKED_INPUT_STREAMS = ("i2", "i3", "i4")
+# (commands/sendtx.py). Only i2 (balance) genuinely diverges: other txs in the
+# same block may debit the account between queue time and apply time, so a rule
+# reading i2 emits a different fee at admission than at inclusion (admitted, then
+# rejected at block build). We reject such rule text outright. i3/i4 (from/to
+# pubkeys) and i5 (block timestamp) are NOT mocked — they are immutable in the
+# transfer tuple / injected by consensus, hence identical at admission and apply,
+# so recipient-aware and time-aware policy rules are deterministic across both and
+# are permitted. Fee/policy rules may scope on i12 (sender), i3/i4 (from/to), i5
+# (time) and i1 (amount). See tau_defs.py "DETERMINISM CONSTRAINT".
+APPLY_MOCKED_INPUT_STREAMS = ("i2",)
 
 
 def _strip_tau_comments(rule_text: str) -> str:
@@ -121,9 +122,9 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
     #  (a) A user rule writing o6/o7 (block validity / eligibility) or o9
     #      (consensus fee) would conflict with the voted consensus rules in the
     #      composed spec (unsat -> DoS) or forge consensus verdicts/fees.
-    #  (b) A user rule reading i2/i3/i4 (mocked to "0" at block apply) emits a
+    #  (b) A user rule reading i2 (balance — mocked to "0" at block apply) emits a
     #      different o8 fee at admission than at inclusion -> admitted then
-    #      rejected at block build. Fee/policy rules scope on i12 / compare i1.
+    #      rejected at block build. i3/i4/i5 are real at both points and allowed.
     #
     # HARD for user txs; governance revisions stay exempt for (a) because
     # writing those output streams is their legitimate job (see the consensus
@@ -139,8 +140,8 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         if mocked_in:
             return format_error(
                 f"user_tx rule text references apply-time-mocked input stream "
-                f"'{mocked_in[0]}'; reading i2/i3/i4 diverges the fee between admission "
-                f"and block apply (scope on i12, compare amount on i1 instead)."
+                f"'{mocked_in[0]}' (balance): reading i2 diverges the fee between admission "
+                f"and block apply. Scope on i12/i3/i4, gate on i5, compare amount on i1."
             )
 
     return success()
@@ -258,17 +259,16 @@ def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView)
                 logger.warning(f"Revision potentially shadowing {stream_idx}")
 
     # HARD-reject any revision that reads an apply-time-mocked input stream.
-    # Block-level consensus rules operate on the i6-i11 ABI and have no
-    # legitimate need for the transfer streams i2/i3/i4 (mocked to "0" at block
-    # apply). A consensus fee rule (o9) reading them would compute a different
-    # fee at admission than at inclusion — the same divergence footgun the user
-    # o8 screen rejects. Comment-stripped, word-boundary matched.
+    # Only i2 (balance) is mocked to "0" at block apply. A consensus fee rule (o9)
+    # reading it would compute a different fee at admission than at inclusion — the
+    # same divergence footgun the user o8 screen rejects. i3/i4/i5 are real at both
+    # points. Comment-stripped, word-boundary matched.
     for rev in revisions:
         mocked_in = _streams_referenced(rev, APPLY_MOCKED_INPUT_STREAMS)
         if mocked_in:
             return format_error(
                 f"Consensus revision references apply-time-mocked input stream "
-                f"'{mocked_in[0]}': a fee rule reading i2/i3/i4 diverges between "
+                f"'{mocked_in[0]}' (balance): a fee rule reading i2 diverges between "
                 f"admission and block apply."
             )
 

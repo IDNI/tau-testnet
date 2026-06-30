@@ -409,7 +409,12 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                 idx = int(key)
                 if idx in (0, 1):
                     continue
-                if idx in tau_defs.RESERVED_STREAMS and not (6 <= idx <= 11):
+                # Reject ALL reserved streams (2-11) uniformly: i2-i5 are transfer
+                # context / clock, i6-i11 are consensus ABI inputs the node injects.
+                # Matches the authoritative gate (admission.validate_user_tx_reserved_domains)
+                # and the apply-time check (consensus/engine.py). User custom inputs
+                # start at i13 (i12 is the sender pubkey, overwritten at apply).
+                if idx in tau_defs.RESERVED_STREAMS:
                     return _qt_err(
                         "TX_INVALID",
                         f"Invalid operation key '{key}'. Stream {idx} is reserved.",
@@ -591,6 +596,24 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                             )
                         logger.info("Tau custom input validation successful.")
 
+                # Advisory block timestamp for i5 at admission. Apply re-checks
+                # against the AUTHORITATIVE block timestamp, so this is a soft
+                # pre-check only: a tx may pass admission yet be rejected at
+                # inclusion near a time threshold (and vice versa). Source the
+                # chain tip's timestamp (deterministic across this node's view,
+                # avoids wall-clock skew); fall back to wall-clock if unavailable.
+                admission_ts = None
+                try:
+                    _head = db.get_canonical_head_block()
+                    if isinstance(_head, dict):
+                        _hdr = _head.get("header")
+                        if isinstance(_hdr, dict):
+                            admission_ts = _hdr.get("timestamp")
+                except Exception:
+                    admission_ts = None
+                if admission_ts is None:
+                    admission_ts = int(time.time())
+
                 # Step 3: Transfer Validation
                 if has_transfers and all_validated_transfers:
                     if tau_force_test:
@@ -619,6 +642,10 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                             # i12: full 384-bit sender public key (bv[384]) for user-policy
                             # rules that scope on the real key.
                             tau_input_stream_values[12] = "{ #x" + sender_pubkey + " }:bv[384]"
+                            # i5: advisory block timestamp (see admission_ts above) so
+                            # time-lock o5 rules pre-check at admission; apply is
+                            # authoritative.
+                            tau_input_stream_values[5] = str(admission_ts)
 
                             logger.info(
                                 "Sending Tau inputs for transfer #%s validation: %s",
@@ -692,6 +719,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                         for k, v in custom_tau_inputs.items():
                             fee_query_inputs[k] = v
                         fee_query_inputs[12] = "{ #x" + sender_pubkey + " }:bv[384]"
+                        fee_query_inputs[5] = str(admission_ts)
                         fee_outputs = tau_manager.communicate_with_tau_multi(
                             input_stream_values=fee_query_inputs,
                             source=sender_pubkey,

@@ -64,6 +64,38 @@ class TestConsensusTime(unittest.TestCase):
         self.assertIn("operation key '5'", res["message"])
         self.assertEqual(len(db.get_mempool_txs()), 0)
 
+    @patch('tau_manager.is_force_test_enabled', return_value=False)
+    @patch('tau_manager.communicate_with_tau_multi')
+    @patch('tau_manager.tau_ready')
+    def test_admission_injects_advisory_i5(self, mock_ready, mock_multi, mock_force):
+        """queue_transaction feeds the advisory tip timestamp on i5 per transfer
+        so time-lock o5 rules can pre-check at admission (apply is authoritative)."""
+        mock_ready.is_set.return_value = True
+        mock_multi.return_value = {1: "1", 5: "1"}  # o1 success flag, o5 allow
+        chain_state._balances[chain_state.GENESIS_ADDRESS] = 100000
+
+        tip = db.get_canonical_head_block()["header"]["timestamp"]
+        recipient = "ab" * 48
+        tx = {
+            "sender_pubkey": chain_state.GENESIS_ADDRESS,
+            "sequence_number": chain_state.get_sequence_number(chain_state.GENESIS_ADDRESS),
+            "expiration_time": int(time.time()) + 1000,
+            "operations": {"1": [[chain_state.GENESIS_ADDRESS, recipient, "1"]]},
+            "fee_limit": "1000",
+            "signature": "00" * 48,
+        }
+        res = sendtx.queue_transaction(json.dumps(tx))
+        self.assertTrue(res["ok"], f"queue failed: {res}")
+
+        transfer_inputs = [
+            c.kwargs.get("input_stream_values", {})
+            for c in mock_multi.call_args_list
+            if 1 in c.kwargs.get("input_stream_values", {})
+        ]
+        self.assertTrue(transfer_inputs, "no per-transfer Tau call captured")
+        self.assertIn(5, transfer_inputs[0], "i5 not injected at admission")
+        self.assertEqual(transfer_inputs[0][5], str(tip))
+
     @patch('tau_manager.communicate_with_tau_multi')
     @patch('tau_manager.communicate_with_tau')
     @patch('tau_manager.tau_ready')

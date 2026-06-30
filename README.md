@@ -374,6 +374,7 @@ When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker)
 - `o6` — block validity. The genesis rule is `o6 = i10` — "valid iff the host's cryptographic proof check passed" (see below).
 - `o7` — proposer eligibility.
 - `o9` — consensus base fee (strict); `o8` — optional user fee (lenient).
+- `o5` — user policy on a transfer (`0` = block, `1`/absent = allow). User-deployed, sender-scoped rules; **consensus-enforced** at both admission and block apply. A block on any transfer rejects the whole `user_tx`. Lets users express recipient whitelists (`i4`), time-locks (`i5`), and spending limits (`i1`). See [WALLET_USAGE.md](WALLET_USAGE.md).
 
 **Python host enforces _before_ Tau** (the inputs Tau trusts):
 - Transaction BLS signature verification + canonical decoding (`commands/sendtx.py`).
@@ -457,9 +458,9 @@ Fees are sourced from the Tau consensus rules and votable by validators — no s
 - **Total:** `total_fee = Σ over the tx's Tau steps of (o9 + o8)` — one step per transfer; a transfer-less `user_tx` is charged one fee-query step. Multi-transfer txs pay N× by design.
 - **`fee_limit` is a cap.** Rejected (at admission and in-block) if `total_fee > fee_limit`; the sender pays `total_fee`, not the cap. Every tx carries a valid `fee_limit`; **only `user_tx` is charged** (validators never need funds to govern).
 - **Credited to** `block.header.proposer_pubkey`. **Charge-on-inclusion:** a fee-rejected tx pays nothing (no writes, no nonce bump). Sender must cover `Σ transfers + total_fee`.
-- **Determinism note:** during block application only `i1` (amount), `i5` (block timestamp), `i12` (sender pubkey) and the tx's custom inputs carry real values; `i2`/`i3`/`i4` are mocked to `"0"`. A fee rule reading a mocked stream would charge a different fee at admission than at inclusion, so rule text referencing `i2`/`i3`/`i4` is **rejected at admission** (both user `o8` rules and consensus `o9` revisions). Scope on `i12` and tier on `i1` instead. Admission error `FEE_LIMIT_TOO_LOW` returns the computed `required_fee`.
+- **Determinism note:** during block application the node feeds real values on `i1` (amount), `i3`/`i4` (from/to pubkeys `bv[384]`), `i5` (block timestamp), `i12` (sender pubkey) and the tx's custom inputs. **Only `i2` (balance) is mocked to `"0"`** — other txs in the same block may debit the account, so a fee rule reading `i2` would charge a different fee at admission than at inclusion; rule text referencing `i2` is **rejected at admission** (both user `o8` rules and consensus `o9` revisions). `i3`/`i4`/`i5` are immutable-per-transfer / consensus-injected, hence identical at admission and apply, and may be read freely. Scope on `i12`/`i3`/`i4`, gate on `i5`, tier on `i1`. Admission error `FEE_LIMIT_TOO_LOW` returns the computed `required_fee`.
 - **Mempool priority** is by admission-time estimate (`estimated_fee DESC, fee_limit DESC, received_at ASC`); inflating `fee_limit` does not buy priority.
-- **Limitations:** multiplication isn't verified in the deployed tau-lang usage, so percentage fees aren't expressible yet — flat fees and comparison-ladder tiers only. User rule text referencing `o6`/`o7`/`o9`, or any rule text reading the apply-time-mocked streams `i2`/`i3`/`i4`, is rejected at admission.
+- **Limitations:** multiplication isn't verified in the deployed tau-lang usage, so percentage fees aren't expressible yet — flat fees and comparison-ladder tiers only. User rule text referencing `o6`/`o7`/`o9`, or reading the apply-time-mocked balance stream `i2`, is rejected at admission.
 
 ---
 

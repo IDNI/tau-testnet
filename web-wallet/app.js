@@ -785,8 +785,8 @@ async function onSendTransaction() {
                 log(`Custom key must be an integer: "${keyStr}"`, "error");
                 return;
             }
-            if (kInt < 6) {
-                log(`Custom key must be >= 6 (streams 0-5 reserved): "${keyStr}"`, "error");
+            if (kInt < 13) {
+                log(`Custom key must be >= 13 (streams 0-12 are reserved: i1 amount, i2 balance, i3/i4 from/to pubkeys, i5 timestamp, i6-i11 consensus, i12 sender pubkey): "${keyStr}"`, "error");
                 return;
             }
             ops[keyStr] = valStr;
@@ -815,9 +815,8 @@ async function onSendTransaction() {
         let count = 0;
         let customOpsText = '';
         for (const [k, v] of Object.entries(ops)) {
-            // Skip rule (0) and transfer ops (1-4 if transfer is sent)
-            if (k === "0") continue;
-            if (shouldSendTransfer && ["1", "2", "3", "4"].includes(k)) continue;
+            // Skip rule (op 0) and the transfer list (op 1). Custom inputs are >= 13.
+            if (k === "0" || k === "1") continue;
             count++;
             customOpsText += `  ${k}: ${v}\n`;
         }
@@ -1025,14 +1024,16 @@ function validateRuleSyntax(rule) {
 
 function generateRandomTauRule() {
     // Streams 0..11 are protocol-reserved (see tau_defs.RESERVED_STREAMS):
-    // i1/i2 = transfer amount/balance (bv[24]), i3/i4 = addresses, o0..o11 =
-    // validation/policy/consensus/fee outputs. Generated demo rules must read
-    // only the bv[24] value inputs and write only to FREE output streams, or
-    // they would clash with the live engine's per-stream bit-width typing.
+    // i1 = transfer amount (bv[24]), i2 = balance (MOCKED to 0 at apply — rule
+    // text reading i2 is hard-rejected at admission), i3/i4 = from/to pubkeys
+    // (bv[384]), i5 = timestamp, i12 = sender pubkey, o0..o11 = consensus/policy/
+    // fee outputs. Generated demo rules read only the bv[24] amount input (i1)
+    // and write only to FREE output streams (>= o12), or they would be rejected
+    // or clash with the live engine's per-stream bit-width typing.
     const RESERVED_MAX_IDX = 11;
 
     const randOut = () => (RESERVED_MAX_IDX + 1) + Math.floor(Math.random() * 10); // o12..o21
-    const randIn = () => 1 + Math.floor(Math.random() * 2); // i1..i2 (bv[24] value streams)
+    const randIn = () => 1; // only i1 (amount) is a rule-readable bv[24] value input
     const outA = randOut();
     const outB = randOut();
     const inA = randIn();
@@ -1346,12 +1347,27 @@ const ruleTemplates = {
 # global state, we must scope this rule strictly to your own
 # public key (i12) so we don't accidentally block the whole network!
 #
-# i12[t] : The sender's real public key (384-bit). i3/i4 are interned
-#          bv[16] ids, NOT pubkeys; the node injects the full key on i12.
-# o5[t]  : User-policy signal (bv[24]: 0 = block, 1 = allow)
+# i12[t] : The sender's real public key (384-bit). i3 = sender, i4 = recipient
+#          (both full bv[384] pubkeys, real at admission and block apply).
+# o5[t]  : User-policy signal (bv[24]: 0 = block, 1 = allow). Consensus-enforced.
 # ---------------------------------------------------------
 # Replace '#x1111...1111' with your own 96-character public key hex.
 always (i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] -> o5[t]:bv[24] = {#x000000}:bv[24]).`,
+
+    "Recipient whitelist (only send to approved address)": `# ---------------------------------------------------------
+# RECIPIENT WHITELIST
+# ---------------------------------------------------------
+# Transfers FROM your account are allowed only when the recipient
+# (i4) is an approved address; everything else is blocked. Scoped to
+# your own sender key (i12) so it does not affect other users.
+#
+# i12[t] : The sender's real public key (bv[384]).
+# i4[t]  : The recipient's real public key (bv[384]) — now readable by
+#          policy rules and enforced at consensus.
+# o5[t]  : Policy signal (bv[24]: 0 = block, 1 = allow)
+# ---------------------------------------------------------
+# Replace the first key with YOUR pubkey, the second with the ALLOWED recipient.
+always ((i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384]) -> ((i4[t]:bv[384] = {#x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222}:bv[384]) ? o5[t]:bv[24] = {#x000001}:bv[24] : o5[t]:bv[24] = {#x000000}:bv[24])).`,
 
     "Limit transfers to max 5000": `# ---------------------------------------------------------
 # LIMIT TRANSFERS FROM MY ACCOUNT TO MAX 5000
@@ -1525,8 +1541,9 @@ always (
 #   i5[t]  : block timestamp          (bv[64])
 #   o5[t]  : policy guard signal      (bv[24]: 0=block, 1=allow)
 #
-# NOTE: i3/i4 are interned bv[16] ids (not pubkeys) and there is no
-# real-recipient stream, so counterparty-based clauses are omitted.
+# NOTE: i3 (sender) and i4 (recipient) are real bv[384] pubkeys, readable by
+# policy rules and enforced at consensus — so counterparty/recipient clauses
+# (e.g. an i4 whitelist) ARE expressible. Only i2 (balance) is mocked.
 #
 # ----- POINTWISE REVISION INSTRUCTIONS -----
 # To revise ONLY the spending cap (Layer 2), send a SEPARATE
@@ -1598,8 +1615,8 @@ always (
 # STREAM LAYOUT (current ABI):
 #   INPUTS:
 #     i1[t]  : transfer amount        (bv[24])
-#     i2[t]  : sender balance         (bv[24])
-#     i3/i4  : interned from/to ids   (bv[16]; NOT pubkeys)
+#     i2[t]  : sender balance         (bv[24]; MOCKED to 0 at apply — not rule-readable)
+#     i3/i4  : from/to pubkeys        (bv[384]; real at admission and apply)
 #     i5[t]  : block timestamp        (bv[64])
 #     i6..i11: consensus ABI (height, ts, proposer, parent hash, ...)
 #     i12[t] : sender real public key (bv[384])

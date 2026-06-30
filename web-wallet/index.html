@@ -234,14 +234,14 @@
                         <label for="tx-custom" class="form-label">Custom Operations</label>
                         <div class="editor-container">
                             <textarea class="form-control" id="tx-custom"
-                                placeholder="Key:Value (e.g. 5:my_data)"></textarea>
+                                placeholder="Key:Value (e.g. 13:my_data)"></textarea>
                         </div>
                         <div class="form-text mt-2">
                             <strong>Format:</strong> <code>Key:Value</code> (One operation per line).<br>
-                            <em>Note: Keys must be &ge; 5 (Stream 5 is reserved for Consensus Time).</em><br>
+                            <em>Note: Keys must be &ge; 13. Streams 0-12 are reserved (i1 amount, i2 balance, i3/i4 from/to pubkeys, i5 timestamp, i6-i11 consensus, i12 sender pubkey).</em><br>
                             <strong>Examples:</strong><br>
-                            <code>6:Hello World</code><br>
-                            <code>7:CustomDataHex</code>
+                            <code>13:Hello World</code><br>
+                            <code>14:CustomDataHex</code>
                         </div>
                         <div class="d-flex justify-content-between align-items-center mt-2">
                             <div id="custom-validation-status" class="form-text mb-0"></div>

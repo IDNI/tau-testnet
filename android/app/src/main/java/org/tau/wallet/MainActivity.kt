@@ -601,8 +601,8 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread { tvResult.text = "Error: Custom op key '$keyStr' must be an integer." }
                     return
                 }
-                if (kInt < 6) {
-                    runOnUiThread { tvResult.text = "Error: Custom op key '$keyStr' is reserved (must be >= 6)." }
+                if (kInt < 13) {
+                    runOnUiThread { tvResult.text = "Error: Custom op key '$keyStr' is reserved (must be >= 13; streams 0-12 are reserved, i12 is the sender pubkey)." }
                     return
                 }
                 operations[keyStr] = valStr
@@ -846,28 +846,36 @@ class MainActivity : AppCompatActivity() {
     }
     private fun generateRandomTauRule(): String {
         // Streams 0..11 are protocol-reserved (see tau_defs.RESERVED_STREAMS):
-        // i1/i2 are the bv[24] value inputs (amount/balance); i3/i4 are interned
-        // bv[16] ids; o0..o11 are validation/policy/consensus/fee outputs. Demo
-        // rules must read only the bv[24] value inputs and write to FREE outputs
-        // (>= o12), or they clash with the live engine's per-stream bv-width typing.
+        // i1 = amount (bv[24]); i2 = balance (MOCKED to 0 at apply — rule text
+        // reading i2 is hard-rejected at admission); i3/i4 = from/to pubkeys
+        // (bv[384], real at admission and apply); i5 = timestamp; i12 = sender
+        // pubkey; o0..o11 are consensus/policy/fee outputs (o5 = user policy,
+        // consensus-enforced). Demo rules read only i1 and write FREE outputs
+        // (>= o12), or they would be rejected / clash with per-stream bv typing.
         val outA = 12 + secureRandom.nextInt(10)   // o12..o21
         val outB = 12 + secureRandom.nextInt(10)
-        val inA = 1 + secureRandom.nextInt(2)      // i1..i2 (bv[24] value streams)
-        val inB = 1 + secureRandom.nextInt(2)
+        val inA = 1                                // only i1 (amount) is rule-readable
+        val inB = 1
         val sh1 = 1 + secureRandom.nextInt(7)
         val sh2 = 1 + secureRandom.nextInt(7)
         val bit = secureRandom.nextInt(2)
         fun hx(n: Int) = "{ #x" + n.toString(16).padStart(2, '0') + " }:bv[24]"
+        val key1 = "#x" + "11".repeat(48)  // placeholder 384-bit pubkeys
+        val key2 = "#x" + "22".repeat(48)
 
         val templates = listOf(
             // Constant flag into an unused output (sanity test).
             "always (o$outA[t] = ${hx(bit)}).",
-            // Threshold gate over two bv[24] inputs.
+            // Threshold gate over the amount input.
             "always ( ((i$inA[t]:bv[24] + i$inB[t]:bv[24]) >= ${hx(0x80)} && o$outA[t] = ${hx(1)}) || ((i$inA[t]:bv[24] + i$inB[t]:bv[24]) < ${hx(0x80)} && o$outA[t] = ${hx(0)}) ).",
             // Feature extraction via bit shifts.
             "always ( o$outA[t]:bv[24] = (i$inA[t]:bv[24] >> ${hx(sh1)}) + (i$inB[t]:bv[24] << ${hx(sh2)}) ).",
-            // Two arithmetic relations writing two free outputs.
-            "always ( (o$outA[t]:bv[24] = i$inA[t]:bv[24] + i$inB[t]:bv[24]) && (o$outB[t]:bv[24] = i$inA[t]:bv[24] - i$inB[t]:bv[24]) )."
+            // Recipient whitelist (o5 user policy, consensus-enforced). Scope on
+            // your sender key (i12); allow only an approved recipient (i4); block
+            // all others. EDIT the keys: first ($key1) = your pubkey, second
+            // ($key2) = the allowed recipient. (No '#' comment in the rule text:
+            // the rule is flattened to one line before sending.)
+            "always ((i12[t]:bv[384] = { $key1 }:bv[384]) -> ((i4[t]:bv[384] = { $key2 }:bv[384]) ? o5[t]:bv[24] = ${hx(1)} : o5[t]:bv[24] = ${hx(0)}))."
         )
         return templates[secureRandom.nextInt(templates.size)]
     }

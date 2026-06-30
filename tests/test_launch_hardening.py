@@ -210,20 +210,29 @@ class TestAdmissionLimits:
         assert not result.is_valid
         assert "MAX_RULE_REVISIONS_BYTES" in result.error
 
-    # --- Apply-time-mocked input streams (i2/i3/i4) screen ---------------------
-    # i2 (balance), i3/i4 (from/to) are fed real values at admission but mocked
-    # to "0" at block apply. A fee/application rule reading them computes a
-    # different fee at admission than at inclusion -> admitted then rejected at
-    # block build. Both the user-rule screen and the consensus-revision screen
-    # hard-reject such rule text. Fee/policy rules scope on i12 / compare i1.
+    # --- Apply-time-mocked input stream (i2) screen ---------------------------
+    # ONLY i2 (balance) is mocked to "0" at block apply (other txs in the block
+    # may debit the account), so a fee rule reading it diverges admission vs
+    # inclusion. i3/i4 (from/to pubkeys) and i5 (block timestamp) are real at
+    # both points and are PERMITTED (recipient whitelists, time-locks). Both the
+    # user-rule and consensus-revision screens hard-reject i2 only.
 
     def test_user_rule_reading_apply_mocked_streams_rejected(self):
         from consensus.admission import validate_user_tx_reserved_domains
-        for stream in ("i2", "i3", "i4"):
-            rule = f"always (o8[t]:bv[24] = {stream}[t]:bv[24])."
+        # i2 (balance) is still screened.
+        rule = "always (o8[t]:bv[24] = i2[t]:bv[24])."
+        result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+        assert not result.is_valid, "stream i2 not screened"
+        assert "i2" in result.error
+
+    def test_user_rule_reading_recipient_and_time_now_allowed(self):
+        # i3/i4 (from/to) and i5 (timestamp) are deterministic at admission and
+        # apply -> recipient/time policy rules are now admissible.
+        from consensus.admission import validate_user_tx_reserved_domains
+        for stream in ("i3", "i4", "i5"):
+            rule = f"always (o5[t]:bv[24] = {stream}[t]:bv[24])."
             result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
-            assert not result.is_valid, f"stream {stream} not screened"
-            assert stream in result.error
+            assert result.is_valid, f"stream {stream} wrongly screened: {result.error}"
 
     def test_user_flat_fee_and_ladder_rules_pass(self):
         from consensus.admission import validate_user_tx_reserved_domains
@@ -254,11 +263,11 @@ class TestAdmissionLimits:
 
     def test_consensus_revision_reading_mocked_input_rejected(self):
         from consensus.admission import stage_and_validate_consensus_revisions
-        for stream in ("i2", "i3", "i4"):
-            tx = {"rule_revisions": [f"always (o9[t]:bv[24] = {stream}[t]:bv[24])."]}
-            result = stage_and_validate_consensus_revisions(tx, self._tip_view())
-            assert not result.is_valid, f"stream {stream} not screened"
-            assert stream in result.error
+        # Only i2 (balance) is screened for consensus revisions now.
+        tx = {"rule_revisions": ["always (o9[t]:bv[24] = i2[t]:bv[24])."]}
+        result = stage_and_validate_consensus_revisions(tx, self._tip_view())
+        assert not result.is_valid, "stream i2 not screened"
+        assert "i2" in result.error
 
     def test_consensus_revision_flat_fee_passes(self):
         from consensus.admission import stage_and_validate_consensus_revisions

@@ -43,14 +43,21 @@ TAU_OUTPUT_STREAM_VALIDATION_RESULT = "o1"
 # o5 is the shared user-policy output stream.
 # Multiple users can write sender-scoped rules to o5; Tau composes them
 # into a single logical constraint. Each user rule must be guarded by
-# that user's sender identity (i3) to avoid affecting other users.
+# that user's sender identity (i12 sender pubkey, or i3 from-address) to
+# avoid affecting other users. Rules may also read i4 (recipient) and i5
+# (block timestamp) — both real at admission and apply — for recipient
+# whitelists and time-locks.
 #
 # Semantics:
 #   o5 = 0       -> explicit block (user policy rejects transfer)
 #   o5 = 1       -> explicit allow  (user policy approves transfer)
 #   o5 missing   -> no user policy triggered -> allow
 #
-# The engine enforces: allow only if o1 passes AND (o5 is absent OR o5 != 0).
+# Enforced at BOTH mempool admission (commands/sendtx.py) AND block apply
+# (consensus/engine.py, fee-era transfer loop): a transfer is allowed only if
+# o1 passes AND (o5 absent OR o5 != 0). A policy block on ANY transfer rejects
+# the WHOLE user_tx (no partial execution). Malformed/unparseable o5 fails
+# closed (parse_tau_output -> 0 -> block).
 USER_POLICY_STREAM_INDEX = 5
 USER_POLICY_BLOCK_VALUE = 0
 USER_POLICY_ALLOW_VALUE = 1
@@ -74,17 +81,20 @@ USER_POLICY_ALLOW_VALUE = 1
 #                round, validator defers the block).
 #   o8 LENIENT — absent -> 0 silently; invalid -> 0 + loud warning.
 #
-# DETERMINISM CONSTRAINT for rule authors: during block apply the node
-# feeds real values only on i1 (amount), i5 (block timestamp), i12 (sender
-# pubkey bv[384]) and the tx's custom input streams; i2 (balance) and
-# i3/i4 (from/to ids) are mocked to "0". A fee rule that depends on
-# i2/i3/i4 would compute a different fee at queue time than at apply time
-# and desync admission estimates from consensus charging. This is now
-# ENFORCED: rule text referencing i2/i3/i4 is hard-rejected at mempool
-# admission for both user o8 rules and consensus o9 revisions (see
-# consensus/admission.py APPLY_MOCKED_INPUT_STREAMS). Scope on i12 and tier
-# on i1 instead. Wallets cannot know the final fee without simulating the
-# same rules; admission errors return the computed estimate (required_fee).
+# DETERMINISM CONSTRAINT for rule authors: during block apply the node feeds
+# real values on i1 (amount), i3/i4 (from/to pubkeys bv[384]), i5 (block
+# timestamp), i12 (sender pubkey bv[384]) and the tx's custom input streams.
+# ONLY i2 (balance) is mocked to "0": other txs in the same block may debit the
+# account, so i2 genuinely differs between queue time and apply time. A fee rule
+# depending on i2 would compute a different fee at queue time than at apply time
+# and desync admission estimates from consensus charging. This is ENFORCED: rule
+# text referencing i2 is hard-rejected at mempool admission for both user o8
+# rules and consensus o9 revisions (see consensus/admission.py
+# APPLY_MOCKED_INPUT_STREAMS). i3/i4/i5 are immutable per-transfer / consensus-
+# injected, hence identical at admission and apply, and may be read freely
+# (recipient whitelists on i4, time-locks on i5). Wallets cannot know the final
+# fee without simulating the same rules; admission errors return the computed
+# estimate (required_fee).
 CUSTOM_FEE_STREAM_INDEX = 8
 CONSENSUS_FEE_STREAM_INDEX = 9
 
