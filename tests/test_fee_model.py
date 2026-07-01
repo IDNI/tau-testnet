@@ -496,14 +496,24 @@ class TestAdmissionFees(unittest.TestCase):
         self.assertTrue(result["ok"], msg=f"benign rule rejected: {result}")
 
     def test_user_rule_reading_apply_mocked_streams_rejected(self):
-        # i2/i3/i4 are mocked to "0" at block apply but carry real values at
-        # admission; a user fee rule reading them would be admitted then
-        # rejected at inclusion. Hard-reject at admission instead.
-        for stream in ("i2", "i3", "i4"):
+        # Only i2 (balance) is mocked to "0" at block apply, so a fee rule
+        # reading it emits a different fee at admission than at inclusion ->
+        # hard-reject at admission (consensus/admission.py
+        # APPLY_MOCKED_INPUT_STREAMS).
+        rule = "always (o8[t]:bv[24] = i2[t]:bv[24])."
+        result, _ = self.queue(self.payload(operations={"0": rule}))
+        self.assertFalse(result["ok"], msg="stream i2 not screened")
+        self.assertIn("i2", result["message"])
+
+    def test_user_rule_reading_recipient_streams_allowed(self):
+        # i3/i4 (from/to pubkeys) are real at both admission and block apply, so
+        # recipient-aware fee/policy rules are deterministic across both and are
+        # permitted (o5 recipient whitelist; commit 09d54d4). They must pass the
+        # admission screen even though they read input streams.
+        for stream in ("i3", "i4"):
             rule = f"always (o8[t]:bv[24] = {stream}[t]:bv[24])."
             result, _ = self.queue(self.payload(operations={"0": rule}))
-            self.assertFalse(result["ok"], msg=f"stream {stream} not screened")
-            self.assertIn(stream, result["message"])
+            self.assertTrue(result["ok"], msg=f"stream {stream} wrongly screened: {result}")
 
     def test_flat_fee_and_ladder_rules_pass_screen(self):
         flat = "always (o8[t]:bv[24] = { #x000003 }:bv[24])."

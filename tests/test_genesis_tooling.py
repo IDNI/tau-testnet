@@ -22,14 +22,15 @@ from block import Block, BlockHeader, sha256_hex
 from chain_state import compute_accounts_hash
 from consensus.serialization import compute_consensus_meta_hash as cmh_serial
 from consensus.state import compute_consensus_state_hash
+from consensus.governance import ConsensusLifecycleManager, normalize_validator_set
 
 GENESIS_PATH = os.path.join(project_root, "data", "genesis.json")
 
 # ─── Golden Vectors (computed deterministically from data/genesis.json) ───
-EXPECTED_BLOCK_HASH = "a3cc02c83cef5995a0bab455db028e5a979289003ad5e41f4c4aebae53a182e6"
-EXPECTED_STATE_HASH = "cff5555542a8a55e9006989e697dfb548e2069045e51fcb786985ee73edf6f71"
+EXPECTED_BLOCK_HASH = "2da3767f9c3be834919ccb1f7d6fd6f87655dd1e1e611dd17ff8cffa3585afec"
+EXPECTED_STATE_HASH = "0d88dc5895c6abd230bb6ccbfa5815f285779b31ec25038e6880565eb4a7a3b7"
 EXPECTED_ACCOUNTS_HASH = "e357576a464b7cd08de768c8edfaaf226b6e142cccbb743c62c5e0ea4e590790"
-EXPECTED_META_HASH = "6e09fea2ae9cf0cef8e066bf78ca654e657f019969195897f47b35fcde97388d"
+EXPECTED_META_HASH = "c94af2b386a8e659fb7bb3dc3cc991259f4e658a3151f647772f91c5048f2415"
 
 
 def _load_genesis():
@@ -64,19 +65,19 @@ class TestGoldenVectors(unittest.TestCase):
         seqs = {addr: 0 for addr in accts}
         accounts_hash = compute_accounts_hash(accts, seqs)
 
-        host_contract = {
-            "proof_scheme": "bls_header_sig",
-            "fork_choice_scheme": "height_then_hash",
-            "input_contract_version": 1,
-        }
+        # Recipe MUST match the runtime (consensus/governance.py
+        # GovernanceManager.consensus_meta_hash): host_contract={} and the
+        # genesis-pinned vote_quorum in mechanism_specific_metadata. Binding the
+        # proof_scheme/fork_choice fields here would diverge from the runtime and
+        # make block 0 unverifiable on replay.
         meta_hash = cmh_serial(
-            host_contract=host_contract,
+            host_contract={},
             active_validators=[validator_bytes],
             pending_updates=[],
             vote_records=[],
             activation_schedule=[],
             checkpoint_references=[],
-            mechanism_specific_metadata={},
+            mechanism_specific_metadata=g["consensus_meta"]["mechanism_specific_metadata"],
         )
 
         state_hash = compute_consensus_state_hash(
@@ -102,19 +103,19 @@ class TestGoldenVectors(unittest.TestCase):
         validator_key = g["consensus_meta"]["active_validators"][0]
         validator_bytes = bytes.fromhex(validator_key)
 
-        host_contract = {
-            "proof_scheme": "bls_header_sig",
-            "fork_choice_scheme": "height_then_hash",
-            "input_contract_version": 1,
-        }
+        # Recipe MUST match the runtime (consensus/governance.py
+        # GovernanceManager.consensus_meta_hash): host_contract={} and the
+        # genesis-pinned vote_quorum in mechanism_specific_metadata. Binding the
+        # proof_scheme/fork_choice fields here would diverge from the runtime and
+        # make block 0 unverifiable on replay.
         meta_hash = cmh_serial(
-            host_contract=host_contract,
+            host_contract={},
             active_validators=[validator_bytes],
             pending_updates=[],
             vote_records=[],
             activation_schedule=[],
             checkpoint_references=[],
-            mechanism_specific_metadata={},
+            mechanism_specific_metadata=g["consensus_meta"]["mechanism_specific_metadata"],
         )
         self.assertEqual(meta_hash.hex(), EXPECTED_META_HASH)
 
@@ -124,6 +125,39 @@ class TestGoldenVectors(unittest.TestCase):
             self.genesis["block_0"]["header"]["state_hash"],
             EXPECTED_STATE_HASH,
         )
+
+    def test_runtime_meta_recipe_reproduces_block0_state_hash(self):
+        """The live runtime recipe must reproduce block 0's embedded state_hash.
+
+        Guards against the meta-hash recipe drifting between genesis tooling and
+        the runtime. We build a ConsensusLifecycleManager exactly the way
+        chain_state.load_genesis does (validators + genesis-pinned quorum), ask
+        it for the canonical consensus_meta_hash that gets replayed for every
+        block, and confirm the resulting state_hash equals the hash baked into
+        block 0. If gen_genesis.py and consensus/governance.py ever disagree on
+        host_contract / mechanism_specific_metadata again, this fails.
+        """
+        g = self.genesis
+        meta = g["consensus_meta"]
+
+        mgr = ConsensusLifecycleManager(
+            pending_updates=[], scheduled_updates=[], archival_updates=[], votes={}
+        )
+        mgr.active_validators = normalize_validator_set(meta["active_validators"])
+        mgr.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
+        mgr.recompute_approval_threshold()
+
+        accts = g["accounts_state"]
+        accounts_hash = compute_accounts_hash(accts, {addr: 0 for addr in accts})
+        state_hash = compute_consensus_state_hash(
+            g["consensus_rules"].encode("utf-8"),
+            g["application_rules"].encode("utf-8"),
+            accounts_hash,
+            mgr.consensus_meta_hash(),
+        )
+
+        self.assertEqual(state_hash, g["block_0"]["header"]["state_hash"])
+        self.assertEqual(state_hash, EXPECTED_STATE_HASH)
 
 
 class TestGenesisReplay(unittest.TestCase):

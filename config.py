@@ -13,6 +13,12 @@ from errors import ConfigurationError
 
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+# Local-only (gitignored) directory holding throwaway test-miner keys
+# (test_miner.key/.pub) and a matching local genesis. The "test" environment
+# sources its miner identity from here so the mining/governance E2E suites can
+# sign real blocks. On a fresh checkout / CI where data_local/ is absent the
+# key loaders return None (MINER_PRIVKEY unset) and those tests skip cleanly.
+DATA_LOCAL_DIR = os.path.join(os.path.dirname(__file__), "data_local")
 DEFAULT_PROD_DB_PATH = "node.db"
 
 
@@ -281,8 +287,8 @@ ENVIRONMENT_OVERRIDES: Dict[str, Dict[str, Any]] = {
             "shutdown_timeout": 1,
         },
         "authority": {
-            "miner_pubkey_path": os.path.join(DATA_DIR, "test_miner.pub"),
-            "miner_privkey_path": os.path.join(DATA_DIR, "test_miner.key"),
+            "miner_pubkey_path": os.path.join(DATA_LOCAL_DIR, "test_miner.pub"),
+            "miner_privkey_path": os.path.join(DATA_LOCAL_DIR, "test_miner.key"),
             "auto_faucet": False,
         },
         "network": {

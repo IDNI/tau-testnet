@@ -85,11 +85,10 @@ class TestGenesisApplicationRule(unittest.TestCase):
                 accts = {a: int(b) for a, b in g["accounts_state"].items()}
                 accounts_hash = compute_accounts_hash(accts, {a: 0 for a in accts})
                 meta_hash = compute_consensus_meta_hash(
-                    host_contract={
-                        "proof_scheme": meta["proof_scheme"],
-                        "fork_choice_scheme": meta["fork_choice_scheme"],
-                        "input_contract_version": meta["input_contract_version"],
-                    },
+                    # host_contract={} mirrors the runtime recipe
+                    # (consensus/governance.py); proof_scheme/fork_choice_scheme/
+                    # input_contract_version are informational and not hash-bound.
+                    host_contract={},
                     active_validators=[bytes.fromhex(v) for v in meta["active_validators"]],
                     pending_updates=[],
                     vote_records=[],

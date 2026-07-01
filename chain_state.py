@@ -797,6 +797,15 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             next_snapshot = apply_result.next_snapshot
             
             # 5. Execute Required Invariant Replay Checks (comparing state hashes)
+            # Block 0 is exempt by design, not to paper over a hash mismatch:
+            # genesis accounts/rules are seeded axiomatically above (and in
+            # load_genesis), but block 0 carries an empty tx list, so its state
+            # is not reconstructible by replaying its own contents. The genesis
+            # meta-hash recipe is unified with the runtime (gen_genesis.py and
+            # ConsensusLifecycleManager.consensus_meta_hash both use
+            # host_contract={} + the pinned vote_quorum), so the parent snapshot
+            # built at line ~761 already matches block 0's embedded state_hash;
+            # this guard simply skips re-deriving it from the empty block body.
             if block_number != 0 and getattr(block.header, 'state_hash', "") not in ("", "0"*64) and next_snapshot.state_hash != block.header.state_hash:
                  # Legacy blocks generated prior to Phase 2 might lack this.
                  print(f"[ERROR][chain_state] Block #{block_number} state_hash invariant mismatch!")

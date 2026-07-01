@@ -201,14 +201,15 @@ def main():
         "mechanism_specific_metadata": {"vote_quorum": args.vote_quorum}
     }
 
-    host_contract = {
-        "proof_scheme": "bls_header_sig",
-        "fork_choice_scheme": "height_then_hash",
-        "input_contract_version": 1
-    }
-
+    # The genesis meta hash MUST use the exact same recipe the runtime replays
+    # for every block (GovernanceManager.consensus_meta_hash in
+    # consensus/governance.py): host_contract={} and the resolved vote_quorum in
+    # mechanism_specific_metadata. The proof_scheme / fork_choice_scheme /
+    # input_contract_version fields above are informational genesis metadata and
+    # are NOT bound into the state hash by the runtime, so binding them here
+    # would make block 0 fail its own state-hash invariant on replay.
     consensus_meta_hash_bytes = compute_consensus_meta_hash(
-        host_contract=host_contract,
+        host_contract={},
         active_validators=[active_validator_bytes],
         pending_updates=[],
         vote_records=[],

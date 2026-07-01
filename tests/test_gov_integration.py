@@ -24,28 +24,43 @@ def setup_module(module):
         db._db_conn.close(); db._db_conn = None
     if os.path.exists(test_db):
         os.remove(test_db)
-        
+
     chain_state._balances.clear(); chain_state._sequence_numbers.clear()
     db.init_db()
     try:
         chain_state.load_genesis("data/genesis.json")
         if hasattr(chain_state, "_lifecycle_manager"):
+            # The "test" env miner (data_local/test_miner.*) is the sole active
+            # validator so the signing tests can propose/vote; defaults harmlessly
+            # to the genesis validator when data_local/ is absent.
             chain_state._lifecycle_manager.active_validators = {config.MINER_PUBKEY}
     except Exception:
         pass
     db.clear_mempool()
     sendtx._PY_ECC_AVAILABLE = True
-    
+
 def teardown_module(module):
     if db._db_conn:
         db._db_conn.close(); db._db_conn = None
     if os.path.exists("test_gov_db.sqlite"):
         os.remove("test_gov_db.sqlite")
 
+def _require_miner_privkey():
+    # The signing tests below need a miner private key, sourced by the "test"
+    # env from data_local/ (gitignored, local-only). Skip cleanly when it is
+    # absent (fresh checkout / CI) rather than crashing on int(None, 16).
+    if not config.MINER_PRIVKEY:
+        pytest.skip(
+            "data_local/test_miner.key absent; local miner identity required "
+            "for governance signing (see config.DATA_LOCAL_DIR)"
+        )
+
+
 def test_gov_update_acceptance():
+    _require_miner_privkey()
     # Clear mempool before test
     db.clear_mempool()
-    
+
     # Use the active network validator identity
     sk = int(config.MINER_PRIVKEY, 16)
     pk_hex = config.MINER_PUBKEY
@@ -88,8 +103,9 @@ def test_gov_update_acceptance():
     assert tx1["tx_type"] == "consensus_rule_update"
 
 def test_gov_vote_acceptance():
+    _require_miner_privkey()
     db.clear_mempool()
-    
+
     sk = int(config.MINER_PRIVKEY, 16)
     pk_hex = config.MINER_PUBKEY
     
@@ -122,6 +138,7 @@ def test_gov_vote_acceptance():
     assert tx1["tx_type"] == "consensus_rule_vote"
 
 def test_gov_update_reject_approve_false():
+    _require_miner_privkey()
     db.clear_mempool()
     sk = int(config.MINER_PRIVKEY, 16)
     pk_hex = config.MINER_PUBKEY

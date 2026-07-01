@@ -50,6 +50,15 @@ class _NativeFeeE2EBase(unittest.TestCase):
     """Shared live-interpreter harness (no test methods)."""
 
     def setUp(self):
+        # Real PoA mining needs a miner private key. The "test" env sources the
+        # throwaway identity from data_local/ (gitignored, local-only); when it
+        # is absent (fresh checkout / CI) MINER_PRIVKEY is unset, so skip cleanly
+        # instead of failing on a missing-key error.
+        if not config.MINER_PRIVKEY:
+            self.skipTest(
+                "data_local/test_miner.key absent; local miner identity required "
+                "for real PoA mining (see config.DATA_LOCAL_DIR)"
+            )
         self.test_db = "test_fee_native_db.sqlite"
         self.original_db = config.STRING_DB_PATH
         config.set_database_path(self.test_db)
