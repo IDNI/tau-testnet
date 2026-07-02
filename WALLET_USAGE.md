@@ -23,6 +23,21 @@ python wallet.py history --address <public_key_hex>
 python wallet.py history --privkey <private_key>
 ```
 
+### Pending-aware account state and tx status
+
+`getbalance` returns only the confirmed chain balance. Two additive node
+commands give a wallet the mempool view:
+
+- `getaccountstate <address>` — `chain_balance`, `pending_outgoing`,
+  `pending_incoming`, `pending_fees`, `available_balance`, and a `pending_txs`
+  list. `pending_outgoing` includes the node's fee estimate (matching admission),
+  and `available_balance = max(0, chain_balance − pending_outgoing −
+  pending_fees)`; unconfirmed incoming is reported but not spendable. All amounts
+  are decimal strings.
+- `gettxstatus <tx_hash>` — `queued` | `confirmed` | `expired` | `evicted` |
+  `rejected` | `unknown`. `sendtx` returns the `tx_hash` on success, so a wallet
+  can poll status right after queuing.
+
 ## Sending Transactions
 
 The `send` command now supports multiple operation types:

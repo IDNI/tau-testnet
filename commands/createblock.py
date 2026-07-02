@@ -416,6 +416,7 @@ def create_block_from_mempool() -> Dict:
         final_txs = []
         final_reserved_ids = []
         
+        rejected_hashes = []
         for i, tx in enumerate(execution_transactions):
              tx_id = tx.get('tx_id')
              if tx_id in apply_result.accepted_tx_ids or tx_id in apply_result.skipped_tx_ids:
@@ -423,7 +424,15 @@ def create_block_from_mempool() -> Dict:
              # Whether applied, skipped, or structurally invalid, we dispose of them from mempool!
              if tx_id in apply_result.accepted_tx_ids or tx_id in apply_result.skipped_tx_ids or tx_id in apply_result.invalid_tx_ids:
                  final_reserved_ids.append(filtered_reserved_ids[i])
-                 
+             if tx_id in apply_result.invalid_tx_ids:
+                 rejected_hashes.append(tx_id)
+
+        # Record rejected-at-apply txs so gettxstatus can report "rejected"
+        # rather than "unknown" once they leave the mempool. (tx_id == tx_hash;
+        # see the assignment when the block body is formed.)
+        if rejected_hashes:
+            db.record_dropped_txs(rejected_hashes, "rejected")
+
         print(f"[INFO][createblock] Execution Result: {len(final_txs)}/{len(transactions)} logically valid")
         # Removed check to allow creation of empty block
         # 4. Form Complete Valid Block Header

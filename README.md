@@ -532,6 +532,36 @@ Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSoc
 - Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `BLS_UNAVAILABLE`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `MINING_NOT_ELIGIBLE`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
 - The `hello version=N` handshake stays plain text (versions 1 and 2).
 
+### Pending-aware wallet queries
+
+`getbalance <address>` returns only the confirmed chain balance. For a wallet
+view that accounts for queued sends, use the additive commands (both read-only):
+
+- **`getaccountstate <address>`** — confirmed balance plus the mempool view:
+
+  ```json
+  {"status":"ok","command":"getaccountstate","data":{
+    "address":"a63b...ea73","chain_balance":"1000","pending_outgoing":"103",
+    "pending_incoming":"0","pending_fees":"2","available_balance":"897",
+    "pending_txs":[{"hash":"…","direction":"outgoing","amount":"101","fee":"2",
+                    "status":"queued","sequence_number":3,"tx_type":"user_tx",
+                    "received_at":"…","expires_at":"…"}]}}
+  ```
+
+  `pending_outgoing` and `pending_fees` mirror the admission check
+  (`balance >= transfers + estimated_fee`), and `available_balance =
+  max(0, chain_balance − pending_outgoing − pending_fees)`. Unconfirmed
+  `pending_incoming` is reported but never counted as spendable. Amounts are
+  strings; `direction` is `outgoing` / `incoming` / `self`.
+
+- **`gettxstatus <tx_hash>`** — lifecycle of a transaction by hash. `data.status`
+  is one of `queued` (in the mempool, incl. reserved-for-mining), `confirmed`
+  (with `block_hash`/`block_number`/`confirmations`), `expired`, `evicted`,
+  `rejected`, or `unknown`. `unknown` is a normal answer, not an error.
+
+`sendtx` returns the computed `tx_hash` in its success `data`, so a wallet can
+poll `gettxstatus` immediately after queuing.
+
 ## Block structure
 
 A block header carries `block_number` (0-indexed height), `previous_hash`, `timestamp`, `merkle_root`, `state_hash` (the full post-state commitment — see [State hash & canonical encoding](#state-hash--canonical-encoding)), and `state_locator` (a DHT lookup hint, **not** consensus data). The body carries the ordered `transactions` and their `tx_ids`. Consensus is attested by `consensus_proof` — the proposer's BLS signature over the canonical header, verified by `Block.verify_consensus_proof()` and gated by the `o6 = i10` rule. There is **no proof-of-work**; validity and proposer eligibility are decided by the Tau consensus program at each height. See `block.py` (`Block`, `BlockHeader`, `compute_tx_hash`, `compute_merkle_root`).

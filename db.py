@@ -275,7 +275,58 @@ def init_db():
                     last_seen    INTEGER
                 );
             ''')
-            
+            # tx_index maps a transaction hash to the block(s) that contain it,
+            # so gettxstatus can answer "confirmed" without scanning block bodies.
+            # Keyed on (tx_hash, block_hash): a tx may appear in more than one
+            # fork block; canonicality is resolved at query time, so the index
+            # needs no maintenance across reorgs.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS tx_index (
+                    tx_hash      TEXT NOT NULL,
+                    block_hash   TEXT NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    PRIMARY KEY (tx_hash, block_hash)
+                );
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_tx_index_hash ON tx_index(tx_hash);')
+            # mempool_dropped records txs that leave the mempool WITHOUT being
+            # mined (expired, evicted under cap pressure, or rejected at apply),
+            # so gettxstatus can distinguish "expired/evicted/rejected" from
+            # "never seen". Self-pruning (24h TTL + row cap) on insert.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS mempool_dropped (
+                    tx_hash    TEXT PRIMARY KEY,
+                    reason     TEXT NOT NULL,
+                    dropped_at INTEGER NOT NULL
+                );
+            ''')
+
+            # Backfill tx_index for databases created before it existed: if the
+            # index is empty but blocks exist, populate it once from stored block
+            # bodies. Idempotent (INSERT OR IGNORE); runs only on the first init
+            # after upgrade.
+            have_index = conn.execute("SELECT 1 FROM tx_index LIMIT 1;").fetchone()
+            have_blocks = conn.execute("SELECT 1 FROM blocks LIMIT 1;").fetchone()
+            if not have_index and have_blocks:
+                for b_hash, b_num, b_data in conn.execute(
+                    "SELECT block_hash, block_number, block_data FROM blocks;"
+                ).fetchall():
+                    try:
+                        b = json.loads(b_data)
+                    except (ValueError, TypeError):
+                        continue
+                    tx_hashes = b.get("tx_ids")
+                    if not tx_hashes:
+                        tx_hashes = [
+                            block_module.compute_tx_hash(tx)
+                            for tx in (b.get("transactions") or [])
+                        ]
+                    for th in tx_hashes:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO tx_index (tx_hash, block_hash, block_number) VALUES (?, ?, ?);",
+                            (th, b_hash, b_num),
+                        )
+
 
 
             # Migration: Check schema against requirements
@@ -420,27 +471,42 @@ def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
         cur = _db_conn.cursor()
 
         # Prune expired pending txs (expiration_time is epoch seconds inside the JSON payload).
+        # Record their hashes as 'expired' first so gettxstatus can report them.
         import time as _time
         now_s = int(_time.time())
+        now_ms = int(_time.time() * 1000)
         try:
+            # Collect victims' hashes first (for the dropped-tx audit), then
+            # delete. Both use json_extract; a malformed-JSON row raises
+            # OperationalError, handled by the Python fallback below.
+            expired_hashes = [
+                r[0] for r in cur.execute(
+                    "SELECT tx_hash FROM mempool WHERE status='pending' "
+                    "AND CAST(json_extract(payload, '$.expiration_time') AS INTEGER) < ?",
+                    (now_s,),
+                ).fetchall()
+            ]
             cur.execute(
                 "DELETE FROM mempool WHERE status='pending' "
                 "AND CAST(json_extract(payload, '$.expiration_time') AS INTEGER) < ?",
                 (now_s,),
             )
         except sqlite3.Error:
-            # JSON1 unavailable: Python-side fallback.
+            # JSON1 unavailable OR a non-JSON payload: Python-side fallback.
             expired_ids = []
-            for row in cur.execute("SELECT id, payload FROM mempool WHERE status='pending'").fetchall():
+            expired_hashes = []
+            for row in cur.execute("SELECT id, tx_hash, payload FROM mempool WHERE status='pending'").fetchall():
                 try:
-                    exp = json.loads(row[1]).get("expiration_time")
+                    exp = json.loads(row[2]).get("expiration_time")
                     if isinstance(exp, int) and exp < now_s:
                         expired_ids.append(row[0])
+                        expired_hashes.append(row[1])
                 except (ValueError, TypeError):
                     continue
             if expired_ids:
                 marks = ",".join("?" for _ in expired_ids)
                 cur.execute(f"DELETE FROM mempool WHERE id IN ({marks})", tuple(expired_ids))
+        _record_dropped_locked(cur, expired_hashes, "expired", now_ms)
 
         # Cap the pending mempool; evict oldest pending only (never reserved — the miner holds them).
         # Count pending-only (matching count_mempool_txs / the soft sendtx pre-check) so the
@@ -449,11 +515,19 @@ def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
         pending = cur.execute("SELECT COUNT(*) FROM mempool WHERE status='pending'").fetchone()[0]
         if pending >= cap:
             overflow = pending - cap + 1
+            evicted_hashes = [
+                r[0] for r in cur.execute(
+                    "SELECT tx_hash FROM mempool WHERE status='pending' "
+                    "ORDER BY received_at ASC LIMIT ?",
+                    (overflow,),
+                ).fetchall()
+            ]
             cur.execute(
                 "DELETE FROM mempool WHERE id IN ("
                 "SELECT id FROM mempool WHERE status='pending' ORDER BY received_at ASC LIMIT ?)",
                 (overflow,),
             )
+            _record_dropped_locked(cur, evicted_hashes, "evicted", now_ms)
 
         # Idempotency: INSERT OR IGNORE
         cur.execute('''
@@ -498,6 +572,206 @@ def get_pending_sequence(sender_pubkey: str) -> Optional[int]:
                 continue
                 
     return max_seq
+
+# --- Dropped-tx audit (issue #11: gettxstatus) ---
+_DROPPED_TTL_MS = 24 * 60 * 60 * 1000  # keep drop records ~24h
+_DROPPED_MAX_ROWS = 5000
+
+
+def _record_dropped_locked(cur, tx_hashes, reason: str, now_ms: int) -> None:
+    """Record dropped tx hashes with the given reason, then self-prune. Uses the
+    provided cursor (caller already holds _db_lock)."""
+    if not tx_hashes:
+        return
+    for th in tx_hashes:
+        cur.execute(
+            "INSERT OR REPLACE INTO mempool_dropped (tx_hash, reason, dropped_at) VALUES (?, ?, ?)",
+            (th, reason, now_ms),
+        )
+    # TTL prune, then cap to the newest rows.
+    cur.execute("DELETE FROM mempool_dropped WHERE dropped_at < ?", (now_ms - _DROPPED_TTL_MS,))
+    cur.execute(
+        "DELETE FROM mempool_dropped WHERE tx_hash IN ("
+        "SELECT tx_hash FROM mempool_dropped ORDER BY dropped_at DESC, tx_hash "
+        "LIMIT -1 OFFSET ?)",
+        (_DROPPED_MAX_ROWS,),
+    )
+
+
+def record_dropped_txs(tx_hashes, reason: str) -> None:
+    """Public: record txs that left the mempool without being mined (e.g.
+    rejected at block apply). Acquires the db lock."""
+    if not tx_hashes:
+        return
+    if _db_conn is None:
+        init_db()
+    import time as _time
+    now_ms = int(_time.time() * 1000)
+    with _db_lock:
+        cur = _db_conn.cursor()
+        _record_dropped_locked(cur, list(tx_hashes), reason, now_ms)
+        _db_conn.commit()
+
+
+def get_dropped_tx(tx_hash: str) -> Optional[Dict]:
+    """Return {'reason', 'dropped_at'} for a dropped tx, or None."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT reason, dropped_at FROM mempool_dropped WHERE tx_hash = ? LIMIT 1",
+            (tx_hash,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {"reason": row[0], "dropped_at": row[1]}
+
+
+def get_tx_block_locations(tx_hash: str) -> List[Dict]:
+    """Return [{'block_hash', 'block_number'}] for every block containing tx_hash
+    (may span fork blocks). Canonicality is resolved separately."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT block_hash, block_number FROM tx_index WHERE tx_hash = ? "
+            "ORDER BY block_number ASC",
+            (tx_hash,),
+        )
+        return [{"block_hash": r[0], "block_number": r[1]} for r in cur.fetchall()]
+
+
+def get_canonical_confirmation(block_hash: str, block_number: int) -> tuple[bool, int]:
+    """Return (is_canonical, canonical_head_number). A block is canonical iff
+    walking back from the canonical head by (head_number - block_number) steps
+    lands on `block_hash`. Uses the blocks table's indexed columns (no JSON
+    parse). Returns (False, -1) if there is no canonical head."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        head_hash_row = cur.execute(
+            "SELECT value FROM chain_state WHERE key = 'canonical_head_hash'"
+        ).fetchone()
+        head_num_row = cur.execute(
+            "SELECT value FROM chain_state WHERE key = 'canonical_head_number'"
+        ).fetchone()
+        if not head_hash_row or not head_hash_row[0]:
+            return (False, -1)
+        head_hash = head_hash_row[0]
+        try:
+            head_number = int(head_num_row[0]) if head_num_row else -1
+        except (ValueError, TypeError):
+            head_number = -1
+        if head_number < block_number:
+            return (False, head_number)
+        # Walk back from the head to the target height.
+        current = head_hash
+        steps = head_number - block_number
+        visited = set()
+        for _ in range(steps):
+            if not current or current in visited:
+                return (False, head_number)
+            visited.add(current)
+            row = cur.execute(
+                "SELECT previous_hash FROM blocks WHERE block_hash = ? LIMIT 1",
+                (current,),
+            ).fetchone()
+            if not row:
+                return (False, head_number)
+            current = row[0]
+        return (current == block_hash, head_number)
+
+
+def get_mempool_entry(tx_hash: str) -> Optional[Dict]:
+    """Single-row variant of get_mempool_entries, keyed by tx_hash."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT tx_hash, payload, received_at, status, fee_limit, estimated_fee "
+            "FROM mempool WHERE tx_hash = ? LIMIT 1",
+            (tx_hash,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "tx_hash": row[0],
+        "payload": row[1],
+        "received_at": row[2],
+        "status": row[3],
+        "fee_limit": row[4],
+        "estimated_fee": row[5],
+    }
+
+
+def get_mempool_txs_for_address(address: str) -> List[Dict]:
+    """Return pending/reserved mempool txs that touch `address` as sender or as a
+    party in any operations["1"] transfer triple. Each entry carries per-tx
+    amount_out (sum sent by address) and amount_in (sum received by address).
+    Expired-but-unpruned rows are skipped (they can never apply)."""
+    if _db_conn is None:
+        init_db()
+    import time as _time
+    now_s = int(_time.time())
+    out: List[Dict] = []
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT tx_hash, payload, status, received_at, fee_limit, estimated_fee "
+            "FROM mempool ORDER BY received_at ASC"
+        )
+        rows = cur.fetchall()
+    for tx_hash, payload, status, received_at, fee_limit, estimated_fee in rows:
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        exp = data.get("expiration_time")
+        if isinstance(exp, int) and exp < now_s:
+            continue  # expired but not yet pruned; excluded from pending view
+        sender = data.get("sender_pubkey")
+        transfers = (data.get("operations") or {}).get("1") or []
+        amount_out = 0
+        amount_in = 0
+        touches = (sender == address)
+        if isinstance(transfers, list):
+            for tr in transfers:
+                if not (isinstance(tr, (list, tuple)) and len(tr) == 3):
+                    continue
+                frm, to, amt = tr
+                try:
+                    amt_i = int(amt)
+                except (ValueError, TypeError):
+                    continue
+                if frm == address:
+                    amount_out += amt_i
+                    touches = True
+                if to == address:
+                    amount_in += amt_i
+                    touches = True
+        if not touches:
+            continue
+        out.append({
+            "tx_hash": tx_hash,
+            "status": status,
+            "received_at": received_at,
+            "fee_limit": fee_limit,
+            "estimated_fee": estimated_fee,
+            "sender_pubkey": sender,
+            "sequence_number": data.get("sequence_number"),
+            "tx_type": data.get("tx_type", "user_tx"),
+            "expiration_time": exp,
+            "amount_out": amount_out,
+            "amount_in": amount_in,
+        })
+    return out
+
 
 def get_mempool_txs() -> list:
     """
@@ -691,6 +965,20 @@ def add_block(new_block: block_module.Block):
                 block_data_json,
             )
         )
+        # Index every tx hash in this block (same transaction as the block row)
+        # so gettxstatus can resolve "confirmed". tx_ids is authoritative;
+        # fall back to computing from the transaction bodies if it is absent.
+        # Defensive getattr: some callers/tests pass block-like objects without
+        # these attributes.
+        tx_hashes = getattr(new_block, "tx_ids", None) or [
+            block_module.compute_tx_hash(tx)
+            for tx in (getattr(new_block, "transactions", None) or [])
+        ]
+        for th in tx_hashes:
+            cur.execute(
+                'INSERT OR IGNORE INTO tx_index (tx_hash, block_hash, block_number) VALUES (?, ?, ?)',
+                (th, new_block.block_hash, new_block.header.block_number),
+            )
         _db_conn.commit()
         logger.info("Added block #%s to database", new_block.header.block_number)
 
