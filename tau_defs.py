@@ -83,7 +83,13 @@ USER_POLICY_ALLOW_VALUE = 1
 #
 # DETERMINISM CONSTRAINT for rule authors: during block apply the node feeds
 # real values on i1 (amount), i3/i4 (from/to pubkeys bv[384]), i5 (block
-# timestamp), i12 (sender pubkey bv[384]) and the tx's custom input streams.
+# timestamp), i12 (sender pubkey bv[384]) and the tx's custom input streams
+# (i13+). Custom streams are merged into the SAME per-transfer evaluation step
+# at both mempool admission (commands/sendtx.py) and block apply
+# (consensus/engine.py), in byte-identical overlay order, so a rule combining a
+# custom stream (i13+) with the transfer fields (i1/i3/i4/i5/i12) is enforced
+# identically at admission and apply — passphrase confirmation, 2FA flags,
+# escrow conditions and multi-party approval all gate `sendtx`, not just apply.
 # ONLY i2 (balance) is mocked to "0": other txs in the same block may debit the
 # account, so i2 genuinely differs between queue time and apply time. A fee rule
 # depending on i2 would compute a different fee at queue time than at apply time
@@ -105,6 +111,11 @@ TAU_INPUT_STREAM_TIMESTAMP = "i5"
 # 0..4 are core protocol streams; 5 is consensus timestamp injected by node (i5).
 # Note: i5 is a reserved INPUT stream (consensus clock). o5 is the user policy
 # OUTPUT stream — these are separate namespaces and do not conflict.
+# i12 (sender pubkey, node-injected) is ALSO reserved as an operations key but is
+# NOT in this set: this constant is shared with the engine, which uses it for
+# other purposes, so i12 is screened explicitly at every ingest/apply site
+# (commands/sendtx.py, consensus/admission.py, consensus/engine.py). User custom
+# input streams therefore start at i13.
 RESERVED_STREAMS = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
 
 # --- Tau Consensus ABI v1 ---

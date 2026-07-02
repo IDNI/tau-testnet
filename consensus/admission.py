@@ -114,6 +114,13 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         # Block attempts to use reserved streams in application transactions natively
         if 6 <= idx <= 11:
             return format_error(f"Invalid operation target '{key}'. Streams 6-11 are reserved for consensus ABI inputs.")
+        # i12 is the sender pubkey the node injects at apply; a custom
+        # operations["12"] would override it in the engine's input merge and
+        # spoof the sender-scoped o5/o8 policy stream. Reject on every ingest
+        # path so the mempool gate matches sendtx and apply. (i2-i5 are already
+        # rejected at apply via RESERVED_STREAMS; i12 is not in that set.)
+        if idx == 12:
+            return format_error(f"Invalid operation target '{key}'. Stream 12 is reserved for the sender public key.")
 
     # Screen user rule TEXT for reserved streams. Comment-stripped and
     # word-boundary matched (so custom streams like i23/o90 are not mistaken

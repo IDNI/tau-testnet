@@ -706,7 +706,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     idx = int(k)
                     if idx in (0, 1):
                         continue
-                    if idx in tau_defs.RESERVED_STREAMS:
+                    # i12 is the sender pubkey the node sets below; a custom
+                    # operations["12"] would override it in the merge at
+                    # tau_input_stream_values[12] and spoof the sender-scoped
+                    # o5/o8 policy stream. Reject it here (it is not in
+                    # RESERVED_STREAMS, a consensus-shared constant) so apply
+                    # agrees with the sendtx/admission gate. Consensus change.
+                    if idx in tau_defs.RESERVED_STREAMS or idx == 12:
                          reserved_error = f"Operation key '{k}' matches reserved stream {idx}."
                          break
                     

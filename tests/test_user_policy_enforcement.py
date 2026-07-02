@@ -178,6 +178,40 @@ class TestRecipientWhitelistRealEngine(unittest.TestCase):
         finally:
             os.remove(path)
 
+    def test_custom_input_combined_with_amount_gates_o5(self):
+        """Issue #16: a rule combining a custom stream (i13) with the transfer
+        amount (i1) emits o5=allow/block in ONE evaluation step — the same step
+        sendtx now feeds i13 into at admission. Proves passphrase/2FA-class rules
+        are enforceable, not just theoretically wired."""
+        import tempfile
+        from tau_native import TauInterface
+
+        # Allow only when the passphrase i13 == #x002a AND a non-zero amount is
+        # sent; block otherwise. i13 as bv[16] (fast compile), i1 as bv[24] amount.
+        rule = (
+            "always ( (i13[t] = {#x002a}:bv[16] && i1[t] > {0}:bv[24]) "
+            "? o5[t] = {1}:bv[16] : o5[t] = {0}:bv[16] )."
+        )
+        fd, path = tempfile.mkstemp(suffix=".tau")
+        with os.fdopen(fd, "w") as f:
+            f.write(rule)
+        try:
+            iface = TauInterface(path)
+            # Correct passphrase + non-zero amount -> allow (o5 != 0).
+            res = iface.communicate(
+                target_output_stream_index=5,
+                input_stream_values={13: ["#x002a"], 1: ["10"]},
+            )
+            self.assertNotIn("0", res.split())
+            # Wrong passphrase -> block (o5 == 0), even with a valid amount.
+            res = iface.communicate(
+                target_output_stream_index=5,
+                input_stream_values={13: ["#x0000"], 1: ["10"]},
+            )
+            self.assertIn("0", res.split())
+        finally:
+            os.remove(path)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -61,24 +61,24 @@ amounts are exactly the tuple amounts.
 ### Custom Operations
 ```bash
 python wallet.py send --privkey <private_key> \
-  --operation "5:custom_data" \
+  --operation "13:custom_data" \
   --operation "100:more_data"
 ```
-*Note: Keys 2, 3, and 4 are reserved. Use keys 5 and above for custom application data.*
+*Note: Keys 2–12 are reserved (see Operation Types). Use keys 13 and above for custom application data.*
 
 ### Complex Multi-Operation Transaction
 ```bash
 python wallet.py send --privkey <private_key> \
   --rule "o2[t]=i1[t]" \
   --transfer "recipient_address:5" \
-  --operation "2:custom_data" \
-  --operation "5:more_data"
+  --operation "13:custom_data" \
+  --operation "14:more_data"
 ```
 
 ### Raw JSON Operations (Advanced)
 ```bash
 python wallet.py send --privkey <private_key> \
-  --operations-json '{"0": "o2[t]=i1[t]", "1": [["sender", "receiver", "10"]], "3": "custom_op"}'
+  --operations-json '{"0": "o2[t]=i1[t]", "1": [["sender", "receiver", "10"]], "13": "custom_op"}'
 ```
 
 ## Command Line Options
@@ -123,7 +123,25 @@ An operation key `N` maps to Tau input stream `iN`. The wallet supports:
 | `i12` | sender pubkey (`bv[384]`, set by the node) |
 
 So user-controllable custom input streams start at **`i13`**. Attempting to set
-any reserved stream (`2`–`11`) as an operation key is rejected at admission.
+any reserved stream (`2`–`12`) as an operation key is rejected at admission (and
+at block apply), so a crafted `operations["12"]` cannot spoof the sender pubkey.
+
+**Combining custom inputs with the transfer.** Custom streams are evaluated in
+the *same* Tau step as the transfer at both admission and apply, so a policy
+rule may gate a transfer on a custom input alongside the transfer fields. For
+example, a passphrase-confirmation gate on `o5` (block unless `i13` matches and a
+non-zero amount is sent):
+
+```
+always ( (i13[t] = { #x2A }:bv[16] && i1[t] != {0}:bv[16])
+         ? o5[t] = {1}:bv[16]
+         : o5[t] = {0}:bv[16] ).
+```
+
+Sending the transfer with `--operation "13:0x2A"` yields `o5=1` (allow); a wrong
+or absent `i13` yields `o5=0` and the transfer is rejected at `sendtx`, not just
+at apply. The same holds for 2FA flags, escrow conditions, and multi-party
+approval keyed on i13+.
 
 ### User Policy Rules (`o5`)
 

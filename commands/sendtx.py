@@ -409,12 +409,16 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                 idx = int(key)
                 if idx in (0, 1):
                     continue
-                # Reject ALL reserved streams (2-11) uniformly: i2-i5 are transfer
-                # context / clock, i6-i11 are consensus ABI inputs the node injects.
-                # Matches the authoritative gate (admission.validate_user_tx_reserved_domains)
+                # Reject ALL reserved streams (2-12) uniformly: i2-i5 are transfer
+                # context / clock, i6-i11 are consensus ABI inputs the node injects,
+                # i12 is the sender pubkey the node sets at apply. Matches the
+                # authoritative gate (admission.validate_user_tx_reserved_domains)
                 # and the apply-time check (consensus/engine.py). User custom inputs
-                # start at i13 (i12 is the sender pubkey, overwritten at apply).
-                if idx in tau_defs.RESERVED_STREAMS:
+                # start at i13. i12 is screened explicitly (not via RESERVED_STREAMS,
+                # which is a consensus-shared constant the engine reads elsewhere) so
+                # a crafted operations["12"] cannot spoof the sender-pubkey stream that
+                # i12-scoped o5/o8 policy rules rely on.
+                if idx in tau_defs.RESERVED_STREAMS or idx == 12:
                     return _qt_err(
                         "TX_INVALID",
                         f"Invalid operation key '{key}'. Stream {idx} is reserved.",
@@ -575,8 +579,14 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                                     )
                                 logger.info("Tau rule validation successful (live).")
 
-                # Step 2: Custom Input Validation (if present)
-                if custom_tau_inputs:
+                # Step 2: Custom Input Validation (transfer-less user_tx only).
+                # For txs WITH transfers the custom streams are merged into the
+                # per-transfer step below (mirrors apply, where the custom-only
+                # step runs only when there are no transfers), so o1/o5/o8/o9 see
+                # i13+ together with the transfer fields. Keeping a separate custom
+                # step for transfer txs would create an admission-only rejection
+                # surface that apply never runs -> divergence and a wasted roundtrip.
+                if custom_tau_inputs and not all_validated_transfers:
                     if tau_force_test:
                         logger.info("TAU_FORCE_TEST=1: skipping Tau custom input validation.")
                     else:
@@ -642,6 +652,14 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                             # i12: full 384-bit sender public key (bv[384]) for user-policy
                             # rules that scope on the real key.
                             tau_input_stream_values[12] = "{ #x" + sender_pubkey + " }:bv[384]"
+                            # Custom input streams (i13+). Merged AFTER i12 and BEFORE
+                            # i5, byte-identical to the apply-time overlay order in
+                            # consensus/engine.py, so rules combining i13+ with the
+                            # transfer fields (i1/i3/i4/i5/i12) are enforced the same
+                            # at admission and apply. Keys 2-12 are rejected upstream,
+                            # so custom keys can never clobber a reserved stream.
+                            for k, v in custom_tau_inputs.items():
+                                tau_input_stream_values[k] = v
                             # i5: advisory block timestamp (see admission_ts above) so
                             # time-lock o5 rules pre-check at admission; apply is
                             # authoritative.
@@ -716,10 +734,12 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                 ):
                     try:
                         fee_query_inputs = {1: "0", 2: "0", 3: "0", 4: "0"}
-                        for k, v in custom_tau_inputs.items():
-                            fee_query_inputs[k] = v
                         fee_query_inputs[12] = "{ #x" + sender_pubkey + " }:bv[384]"
                         fee_query_inputs[5] = str(admission_ts)
+                        # Custom streams (i13+) last, matching the apply-time
+                        # fee-query overlay order in consensus/engine.py.
+                        for k, v in custom_tau_inputs.items():
+                            fee_query_inputs[k] = v
                         fee_outputs = tau_manager.communicate_with_tau_multi(
                             input_stream_values=fee_query_inputs,
                             source=sender_pubkey,
