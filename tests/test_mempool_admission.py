@@ -201,6 +201,46 @@ class TestMempoolAdmission:
         assert not res.is_valid
         assert "lowercase hex" in res.error
 
+    def test_application_operation_key_12_rejected(self, tip_view):
+        # Issue #16: operations["12"] would spoof the sender-pubkey stream.
+        tx = get_user_tx(operations={"12": "deadbeef"})
+        res = validate_mempool_admission(tx, tip_view)
+        assert not res.is_valid
+        assert "12" in res.error
+
+    def test_vote_quorum_patch_accepted(self, tip_view):
+        # tip_view has 1 validator; count:1 is reachable.
+        tx = get_update_tx(patch={"vote_quorum": "count:1"})
+        res = validate_mempool_admission(tx, tip_view)
+        assert res.is_valid
+
+    def test_vote_quorum_named_policy_accepted(self, tip_view):
+        tx = get_update_tx(patch={"vote_quorum": "majority"})
+        res = validate_mempool_admission(tx, tip_view)
+        assert res.is_valid
+
+    def test_vote_quorum_count_exceeds_validators_rejected(self, tip_view):
+        # 1 validator at tip; count:10 is unreachable -> rejected early.
+        tx = get_update_tx(patch={"vote_quorum": "count:10"})
+        res = validate_mempool_admission(tx, tip_view)
+        assert not res.is_valid
+        assert "exceeds" in res.error
+
+    def test_vote_quorum_malformed_rejected(self, tip_view):
+        for bad in ("count:0", "count:010", "Majority", "", 5):
+            tx = get_update_tx(patch={"vote_quorum": bad})
+            res = validate_mempool_admission(tx, tip_view)
+            assert not res.is_valid, f"expected rejection for {bad!r}"
+
+    def test_vote_quorum_count_bound_uses_post_delta_set(self, tip_view):
+        # Adding a validator makes the set size 2, so count:2 is reachable.
+        tx = get_update_tx(patch={
+            "validator_additions": ["b" * 96],
+            "vote_quorum": "count:2",
+        })
+        res = validate_mempool_admission(tx, tip_view)
+        assert res.is_valid
+
     def test_minimum_activation_delay_enforced(self, tip_view):
         # next_block=50, validators=1 -> min_height=51
         tx = get_update_tx(activate_at=50) # Invalid

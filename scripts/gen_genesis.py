@@ -45,16 +45,24 @@ def get_args():
     )
     parser.add_argument(
         "--vote-quorum", type=str, default="supermajority",
-        choices=["supermajority", "majority"],
         help=(
             "Governance vote quorum policy, pinned network-wide into genesis "
-            "consensus_meta (supermajority = ceil(2N/3), majority = N/2+1). "
+            "consensus_meta: 'supermajority' (ceil(2N/3)), 'majority' (N/2+1), or "
+            "'count:N' (a fixed number of votes, clamped to the validator count). "
             "Bound into the genesis state hash, so it is identical on every "
             "node. This is the ONLY source of the runtime quorum policy — "
-            "nodes never read it from local config."
+            "nodes never read it from local config; it is thereafter mutable via "
+            "an activated governance host_contract_patch."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    # Validate with the same grammar the runtime/admission uses so a bad genesis
+    # value fails loudly here instead of silently falling back at consensus time.
+    from consensus.governance import validate_quorum_policy
+    _q_err = validate_quorum_policy(args.vote_quorum)
+    if _q_err:
+        parser.error(f"--vote-quorum {_q_err}")
+    return args
 
 def derive_pubkey_from_privkey(privkey_hex: str) -> str:
     """Derive a BLS12-381 public key hex from a 32-byte private key hex string."""

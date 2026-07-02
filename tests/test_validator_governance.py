@@ -120,3 +120,50 @@ def test_below_quorum_votes_persist_and_reload(temp_database):
     assert len(votes) == 1
     # Reloaded voters are hex strings.
     assert validators[0] in {v if isinstance(v, str) else v.hex() for v in votes}
+
+
+def test_quorum_policy_persists_and_reloads(temp_database):
+    # Issue #18: a governance-activated quorum policy survives a reload rather
+    # than reverting to the genesis value.
+    validators = ["a" * 96, "b" * 96, "c" * 96]  # n=3
+    chain_state._balances.clear()
+    chain_state._sequence_numbers.clear()
+    chain_state._application_rules_state = "app rules"
+    chain_state._consensus_rules_state = "consensus rules"
+    chain_state._active_consensus_id = ""
+    lm = ConsensusLifecycleManager(active_validators=validators)
+    lm.quorum_policy = "count:2"
+    lm.recompute_approval_threshold()
+    chain_state._lifecycle_manager = lm
+
+    chain_state.commit_state_to_db("head-hash", 11)
+    chain_state._lifecycle_manager = ConsensusLifecycleManager(active_validators=["d" * 96])
+
+    assert chain_state.load_state_from_db() is True
+    reloaded = chain_state._lifecycle_manager
+    assert reloaded.quorum_policy == "count:2"
+    assert reloaded.approval_threshold == 2  # min(2, 3)
+
+
+def test_legacy_db_without_quorum_key_falls_back_to_genesis(temp_database, monkeypatch):
+    # A DB written before quorum was persisted has no 'quorum_policy' row; the
+    # loader must fall back to the genesis-pinned value.
+    import db
+    validators = ["a" * 96, "b" * 96, "c" * 96]
+    chain_state._balances.clear()
+    chain_state._sequence_numbers.clear()
+    chain_state._application_rules_state = "app rules"
+    chain_state._consensus_rules_state = "consensus rules"
+    chain_state._active_consensus_id = ""
+    chain_state._lifecycle_manager = ConsensusLifecycleManager(active_validators=validators)
+    chain_state.commit_state_to_db("head-hash", 3)
+
+    # Simulate a legacy DB: drop the persisted quorum row.
+    with db._db_lock:
+        db._db_conn.execute("DELETE FROM chain_state WHERE key = 'quorum_policy'")
+        db._db_conn.commit()
+
+    monkeypatch.setattr(chain_state, "_genesis_vote_quorum", "majority")
+    chain_state._lifecycle_manager = ConsensusLifecycleManager(active_validators=["d" * 96])
+    assert chain_state.load_state_from_db() is True
+    assert chain_state._lifecycle_manager.quorum_policy == "majority"

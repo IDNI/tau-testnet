@@ -72,6 +72,40 @@ def test_gen_genesis_fee_injection():
         assert "#x00000a" not in consensus_rules_0
 
 
+def _run_gen_genesis(extra_argv, tmpdir):
+    script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "gen_genesis.py"))
+    out_path = os.path.join(tmpdir, "genesis.json")
+    argv = [
+        "--validator-key", "a" * 96,
+        "--genesis-rules-path", "genesis.tau",
+        "--genesis-consensus-path", "genesis_consensus.tau",
+        "--out", out_path,
+    ] + extra_argv
+    result = subprocess.run(
+        [sys.executable, script_path] + argv,
+        capture_output=True, text=True, env=os.environ,
+    )
+    return result, out_path
+
+
+def test_gen_genesis_vote_quorum_count_pinned():
+    # Issue #18: a fixed-count quorum is accepted and pinned into consensus_meta.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result, out_path = _run_gen_genesis(["--vote-quorum", "count:2"], tmpdir)
+        assert result.returncode == 0, f"gen_genesis failed: {result.stderr}"
+        with open(out_path) as f:
+            genesis_data = json.load(f)
+        meta = genesis_data["consensus_meta"]["mechanism_specific_metadata"]
+        assert meta["vote_quorum"] == "count:2"
+
+
+def test_gen_genesis_rejects_malformed_vote_quorum():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result, _ = _run_gen_genesis(["--vote-quorum", "count:0"], tmpdir)
+        assert result.returncode != 0
+        assert "vote-quorum" in result.stderr.lower() or "vote_quorum" in result.stderr.lower()
+
+
 def test_derive_pubkey_privkey_leading_zero():
     """Regression: a privkey whose hex starts with '0' must not have its leading
     zero stripped. The old lstrip("0x") stripped any leading '0'/'x' chars, making

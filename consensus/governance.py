@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Iterable, Union
 import json
 import logging
+import re
 from dataclasses import dataclass
 
 from consensus.serialization import compute_update_id
@@ -8,6 +9,38 @@ from consensus.serialization import compute_update_id
 logger = logging.getLogger(__name__)
 
 VALIDATOR_DELTA_FIELDS = ("validator_additions", "validator_removals")
+
+# Quorum policy grammar (shared by genesis tooling, admission, and the runtime).
+# A policy is one canonical STRING: "majority", "supermajority", or "count:<N>"
+# with N a decimal integer in [1, 999999999] (no leading zero, sign, or
+# whitespace). The strict regex gives each semantic value exactly ONE byte
+# representation, so update_ids and the consensus meta hash stay byte-stable.
+QUORUM_COUNT_RE = re.compile(r"^count:([1-9][0-9]{0,8})$")
+
+
+def quorum_count(policy: str) -> Optional[int]:
+    """Return N for a canonical 'count:N' policy, else None."""
+    if not isinstance(policy, str):
+        return None
+    m = QUORUM_COUNT_RE.match(policy)
+    return int(m.group(1)) if m else None
+
+
+def validate_quorum_policy(policy: Any) -> Optional[str]:
+    """Return an error string if `policy` is not a deployable quorum policy, else
+    None. Accepts 'majority', 'supermajority', and canonical 'count:N'. Rejects
+    the empty string here (it is only legal as the internal 'genesis did not pin'
+    sentinel, never as an authored/activated value)."""
+    if not isinstance(policy, str):
+        return "must be a string"
+    if policy in ("majority", "supermajority"):
+        return None
+    if quorum_count(policy) is not None:
+        return None
+    return (
+        "must be 'majority', 'supermajority', or 'count:N' "
+        "(N a decimal integer 1..999999999, no leading zero)"
+    )
 
 # Network-wide quorum policy used when genesis does not pin one. The consensus
 # tally MUST resolve to a deterministic value here and never read per-node
@@ -210,8 +243,10 @@ class ConsensusLifecycleManager:
         # Quorum policy is pinned by genesis
         # (consensus_meta.mechanism_specific_metadata.vote_quorum) and is "" until
         # that genesis value is loaded, at which point it resolves to
-        # DEFAULT_QUORUM_POLICY. It is NEVER read from per-node config (fork
-        # hazard) and is bound into the consensus state hash.
+        # DEFAULT_QUORUM_POLICY. It is mutable at runtime via an activated
+        # host_contract_patch carrying "vote_quorum" (see apply_host_contract_patch)
+        # and persisted so a reload reproduces it. It is NEVER read from per-node
+        # config (fork hazard) and is bound into the consensus state hash.
         self.quorum_policy: str = ""
         self.recompute_approval_threshold()
 
@@ -224,11 +259,22 @@ class ConsensusLifecycleManager:
     def recompute_approval_threshold(self) -> int:
         policy = self.effective_quorum_policy()
         n_validators = len(self.active_validators)
+        count = quorum_count(policy)
         if not n_validators:
             self.approval_threshold = 1
         elif policy == "majority":
             self.approval_threshold = (n_validators // 2) + 1
+        elif count is not None:
+            # Fixed-count quorum, CLAMPED to the current validator set. An
+            # unreachable threshold (count > validators) would freeze governance
+            # permanently — no proposal could pass to fix it — so degrade to
+            # unanimity; the stored policy string is untouched, so the full count
+            # is automatically restored once the set grows back. Deterministic:
+            # a pure function of the meta-hash-bound (policy, validator set).
+            self.approval_threshold = max(1, min(count, n_validators))
         else:
+            # "supermajority" and any unknown string (admission/genesis validation
+            # makes malformed strings unreachable in consensus state) -> 2/3.
             self.approval_threshold = max(1, (2 * n_validators + 2) // 3)
         return self.approval_threshold
 
@@ -267,13 +313,31 @@ class ConsensusLifecycleManager:
         return next_validators
 
     def apply_host_contract_patch(self, patch: Optional[Dict[str, Any]]) -> None:
-        """Apply activation-time host metadata changes governed by consensus."""
+        """Apply activation-time host metadata changes governed by consensus.
+
+        Ordering: validator delta first, then vote_quorum, then a single
+        recompute. The order is cosmetic for the final threshold (recompute is a
+        pure function of both the resolved policy and the post-delta validator
+        set), but pinned so every node applies the patch identically.
+
+        Effect timing: the new threshold governs promotions AFTER this patch
+        activates. A pending proposal already holding >= the new threshold does
+        NOT auto-promote at the activation boundary — _check_approval_promotion
+        fires only from submit_vote, so it re-evaluates on the next incoming
+        vote. This matches existing validator-delta semantics (a removal that
+        lowers the threshold likewise does not re-scan pending proposals)."""
         if not patch:
             return
         next_validators = self.preview_validator_patch(patch)
         if not next_validators:
             raise ValueError("validator delta would leave no active validators")
         self.active_validators = next_validators
+        if "vote_quorum" in patch:
+            policy = patch["vote_quorum"]
+            err = validate_quorum_policy(policy)
+            if err:
+                raise ValueError(f"vote_quorum: {err}")
+            self.quorum_policy = policy
         self.recompute_approval_threshold()
 
     def knows_update(self, update_id: bytes) -> bool:

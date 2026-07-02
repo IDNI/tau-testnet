@@ -9,7 +9,12 @@ import tau_defs
 from tau_manager import communicate_with_tau
 from consensus.serialization import compute_update_id
 from consensus.facade import TipAdmissionView
-from consensus.governance import normalize_validator_delta, normalize_validator_set
+from consensus.governance import (
+    normalize_validator_delta,
+    normalize_validator_set,
+    validate_quorum_policy,
+    quorum_count,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +166,9 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         return f"Unsupported fork_choice_scheme inside host_contract_patch: {patch['fork_choice_scheme']}"
     if "input_contract_version" in patch and patch["input_contract_version"] != 1:
         return f"Unsupported input_contract_version inside host_contract_patch: {patch['input_contract_version']}"
+    # Compute the post-delta validator set whenever a delta OR a vote_quorum is
+    # present: a fixed-count quorum is bounded against the set it will run under.
+    next_validators = None
     if "validator_additions" in patch or "validator_removals" in patch:
         try:
             additions = set(normalize_validator_delta(patch.get("validator_additions"), "validator_additions"))
@@ -174,6 +182,26 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         next_validators = (validators - removals) | additions
         if not next_validators:
             return "Validator delta would leave no active validators."
+    if "vote_quorum" in patch:
+        policy = patch["vote_quorum"]
+        err = validate_quorum_policy(policy)
+        if err:
+            return f"Unsupported vote_quorum inside host_contract_patch: {err}"
+        # A count larger than the validator set it activates under would be
+        # unreachable; reject early (the runtime also clamps, but flag the
+        # proposer's mistake at admission). Use the post-delta set if this patch
+        # also changes validators, else the current tip set.
+        count = quorum_count(policy)
+        if count is not None:
+            effective_validators = (
+                next_validators if next_validators is not None
+                else normalize_validator_set(active_validators or [])
+            )
+            if count > len(effective_validators):
+                return (
+                    f"vote_quorum count {count} exceeds the "
+                    f"{len(effective_validators)} validator(s) it would activate under."
+                )
     return None
 
 def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:

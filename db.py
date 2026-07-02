@@ -868,7 +868,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
     """
@@ -901,6 +901,16 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 _db_conn.execute(
                     'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
                     ('active_validators', json.dumps(sorted(active_validators)))
+                )
+            if quorum_policy is not None:
+                # Persist the (possibly governance-activated) quorum policy so a
+                # node reloading from disk reproduces the same approval threshold
+                # as a freshly-rebuilt or freshly-synced peer. Stored verbatim,
+                # including "" (genesis did not pin) — get_chain_state_value
+                # returns its default only when the row is absent.
+                _db_conn.execute(
+                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+                    ('quorum_policy', quorum_policy)
                 )
 
             _db_conn.execute('DELETE FROM accounts')

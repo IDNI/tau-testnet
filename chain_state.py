@@ -1336,11 +1336,18 @@ def load_state_from_db() -> bool:
             votes=votes_map,
             active_validators=active_validators
         )
-        # Re-pin the genesis quorum policy (not persisted in the DB) so a node
-        # reloading from disk computes the same threshold as a freshly-rebuilt
-        # or freshly-synced peer; otherwise the two could diverge when genesis
-        # pins a policy different from the local config default.
-        _lifecycle_manager.quorum_policy = _genesis_vote_quorum
+        # Restore the quorum policy from the persisted canonical state so a node
+        # reloading from disk reproduces the same threshold as a freshly-rebuilt
+        # or freshly-synced peer — including a policy changed by an activated
+        # governance patch. Legacy DBs written before quorum was persisted have
+        # no 'quorum_policy' row; fall back to the genesis value (such a DB
+        # cannot contain an activated quorum change, so genesis is correct). A
+        # sentinel default distinguishes "row absent" from a persisted "".
+        _MISSING = "\x00missing"
+        persisted_quorum = db.get_chain_state_value("quorum_policy", _MISSING)
+        _lifecycle_manager.quorum_policy = (
+            _genesis_vote_quorum if persisted_quorum == _MISSING else persisted_quorum
+        )
         _lifecycle_manager.recompute_approval_threshold()
         for p in pending_updates:
             update = ConsensusRuleUpdate(
@@ -1376,13 +1383,15 @@ def commit_state_to_db(block_hash: str, block_number: int):
         scheduled_list = [(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates]
         archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
         active_validators_list = sorted(normalize_validator_set(_lifecycle_manager.active_validators))
-        
+        quorum_policy_snapshot = _lifecycle_manager.quorum_policy
+
     db.save_canonical_state_atomically(
-        block_hash, block_number, 
-        balances_snapshot, sequences_snapshot, 
+        block_hash, block_number,
+        balances_snapshot, sequences_snapshot,
         app_rules_snapshot, cons_rules_snapshot, cons_id_snapshot,
         pending_updates_list, votes_list, scheduled_list, archival_list,
-        active_validators=active_validators_list
+        active_validators=active_validators_list,
+        quorum_policy=quorum_policy_snapshot,
     )
 
 def tick_governance(height: int):
