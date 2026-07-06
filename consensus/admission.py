@@ -122,11 +122,17 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
             return format_error(f"Invalid operation target '{key}'. Streams 6-11 are reserved for consensus ABI inputs.")
         # i12 is the sender pubkey the node injects at apply; a custom
         # operations["12"] would override it in the engine's input merge and
-        # spoof the sender-scoped o5/o8 policy stream. Reject on every ingest
-        # path so the mempool gate matches sendtx and apply. (i2-i5 are already
-        # rejected at apply via RESERVED_STREAMS; i12 is not in that set.)
-        if idx == 12:
-            return format_error(f"Invalid operation target '{key}'. Stream 12 is reserved for the sender public key.")
+        # spoof the sender-scoped o5/o8 policy stream. i14/i15 are consensus
+        # stake/mode inputs fed only at consensus evaluation — a user tx typing
+        # them at a different bv width poisons the process-global stream typing
+        # (Phase 0 spike S5). Reject on every ingest path so the mempool gate
+        # matches sendtx and apply. (i2-i5 are already rejected at apply via
+        # RESERVED_STREAMS; i12/i14/i15 are not in that set.)
+        if idx in tau_defs.EXTRA_RESERVED_OPERATION_KEYS:
+            return format_error(
+                f"Invalid operation target '{key}'. Stream {idx} is reserved "
+                f"(i12 sender pubkey; i14/i15 consensus stake/mode inputs)."
+            )
 
     # Screen user rule TEXT for reserved streams. Comment-stripped and
     # word-boundary matched (so custom streams like i23/o90 are not mistaken
@@ -155,6 +161,14 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
                 f"user_tx rule text references apply-time-mocked input stream "
                 f"'{mocked_in[0]}' (balance): reading i2 diverges the fee between admission "
                 f"and block apply. Scope on i12/i3/i4, gate on i5, compare amount on i1."
+            )
+        typed_reserved_in = _streams_referenced(rule_text, ("i14", "i15"))
+        if typed_reserved_in:
+            return format_error(
+                f"user_tx rule text references reserved consensus input stream "
+                f"'{typed_reserved_in[0]}' (proposer stake / eligibility mode): these are only "
+                f"fed at consensus evaluation steps, and typing them from a user rule can pin a "
+                f"conflicting bitvector width process-wide."
             )
 
     return success()
@@ -293,7 +307,7 @@ def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView)
 
     # Warn if a revision touches reserved consensus-ABI streams. Crude string
     # check; Tau itself enforces strict typing at activation.
-    for stream_idx in ("i6", "i7", "i8", "i9", "i10", "i11", "o6", "o7"):
+    for stream_idx in ("i6", "i7", "i8", "i9", "i10", "i11", "i14", "i15", "o6", "o7"):
         for rev in revisions:
             if stream_idx in rev and "consensus" not in rev:
                 logger.warning(f"Revision potentially shadowing {stream_idx}")

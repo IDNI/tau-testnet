@@ -201,3 +201,60 @@ def test_verify_block_header_rejects_invalid_bls_signature():
         config.set_database_path(original_path)
         if os.path.exists(path):
             os.remove(path)
+
+
+def test_build_consensus_input_streams_feeds_stake_and_mode():
+    """Phase 2 ABI v1.1: i14 (proposer stake, bv[64]) and i15 (eligibility mode,
+    bv[16]) are always fed. Defaults are 0/0; real values pass through; a stake
+    exceeding bv[64] raises (mirrors the block_number width check)."""
+    fd, path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    original_path = config.STRING_DB_PATH
+    try:
+        _reset_db(path)
+        engine = TauConsensusEngine()
+
+        default = engine._build_consensus_input_streams(
+            proposer_pubkey="c" * 96,
+            block_number=1,
+            timestamp=1,
+            previous_hash="d" * 64,
+            proof_ok=True,
+            claims={},
+        )
+        assert default[14] == "0"
+        assert default[15] == "0"
+
+        stake = engine._build_consensus_input_streams(
+            proposer_pubkey="c" * 96,
+            block_number=1,
+            timestamp=1,
+            previous_hash="d" * 64,
+            proof_ok=True,
+            claims={},
+            proposer_stake=200000,
+            stake_mode=True,
+        )
+        assert stake[14] == "200000"
+        assert stake[15] == "1"
+
+        try:
+            engine._build_consensus_input_streams(
+                proposer_pubkey="c" * 96,
+                block_number=1,
+                timestamp=1,
+                previous_hash="d" * 64,
+                proof_ok=True,
+                claims={},
+                proposer_stake=1 << 64,
+            )
+            assert False, "Expected width validation failure for proposer_stake"
+        except ValueError as exc:
+            assert "bv[64]" in str(exc)
+    finally:
+        if db._db_conn:
+            db._db_conn.close()
+            db._db_conn = None
+        config.set_database_path(original_path)
+        if os.path.exists(path):
+            os.remove(path)

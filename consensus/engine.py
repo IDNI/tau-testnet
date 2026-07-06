@@ -142,6 +142,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         previous_hash: str,
         proof_ok: bool,
         claims: Any = None,
+        proposer_stake: Any = 0,
+        stake_mode: bool = False,
     ) -> Dict[int, str]:
         canonical_proposer = canonicalize_proposer_yid(proposer_pubkey)
         canonical_parent_hash = canonicalize_parent_hash_yid(previous_hash)
@@ -154,6 +156,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             9: self._encode_yid(canonical_parent_hash),
             10: self._encode_bv_uint(1 if proof_ok else 0, width_bits=16, field_name="proof_ok"),
             11: self._encode_yid(claims_json),
+            14: self._encode_bv_uint(proposer_stake, width_bits=64, field_name="proposer_stake"),
+            15: self._encode_bv_uint(1 if stake_mode else 0, width_bits=16, field_name="eligibility_mode"),
         }
 
     # --- ConsensusEngine Interface Implementation ---
@@ -709,10 +713,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     # i12 is the sender pubkey the node sets below; a custom
                     # operations["12"] would override it in the merge at
                     # tau_input_stream_values[12] and spoof the sender-scoped
-                    # o5/o8 policy stream. Reject it here (it is not in
-                    # RESERVED_STREAMS, a consensus-shared constant) so apply
-                    # agrees with the sendtx/admission gate. Consensus change.
-                    if idx in tau_defs.RESERVED_STREAMS or idx == 12:
+                    # o5/o8 policy stream. i14/i15 are consensus stake/mode
+                    # inputs fed at consensus evaluation; a user tx typing them
+                    # at another bv width poisons process-global stream typing.
+                    # Reject them here (not in RESERVED_STREAMS, a
+                    # consensus-shared constant) so apply agrees with the
+                    # sendtx/admission gate. Consensus change.
+                    if idx in tau_defs.RESERVED_STREAMS or idx in tau_defs.EXTRA_RESERVED_OPERATION_KEYS:
                          reserved_error = f"Operation key '{k}' matches reserved stream {idx}."
                          break
                     
