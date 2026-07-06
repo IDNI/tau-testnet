@@ -1,0 +1,4 @@
+tau-demo-node1  |   Block: b69295ff02028af6da6d736a138d9edcea981029c693ecaa8770d18a0d6f8543
+tau-demo-node1  |   Computed: e545bfad3c8a3404d5e9dfdbdbdd310545205d6846e22d57179d6ea94764bd08
+tau-demo-node1  | 2026-07-06 16:56:16 INFO [db] Added block #64 to database
+tau-demo-node1  | [ERROR][chain_state] Block #8 state_hash invariant mismatch!

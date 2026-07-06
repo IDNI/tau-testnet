@@ -45,6 +45,10 @@ MagicMock
 !docs/packaging.md
 !docs/demo_stake_switch.md
 
+# Stake-switch demo diagnostics (Phase 8 root-cause verdict + captured evidence)
+!demo/diagnostics/
+!demo/diagnostics/**
+
 # Python
 __pycache__/
 *.pyc
