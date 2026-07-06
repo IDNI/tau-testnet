@@ -106,6 +106,98 @@ def test_gen_genesis_rejects_malformed_vote_quorum():
         assert "vote-quorum" in result.stderr.lower() or "vote_quorum" in result.stderr.lower()
 
 
+def _run_gen_genesis_argv(argv, tmpdir, out_name="genesis.json"):
+    script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "gen_genesis.py"))
+    out_path = os.path.join(tmpdir, out_name)
+    full = [
+        "--genesis-rules-path", "genesis.tau",
+        "--genesis-consensus-path", "genesis_consensus.tau",
+        "--out", out_path,
+    ] + argv
+    result = subprocess.run(
+        [sys.executable, script_path] + full,
+        capture_output=True, text=True, env=os.environ,
+    )
+    return result, out_path
+
+
+def test_gen_genesis_single_key_byte_identical_to_repeat():
+    # Reproducibility: a single --validator-key invocation is deterministic.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        r1, p1 = _run_gen_genesis_argv(["--validator-key", "a" * 96], tmpdir, "g1.json")
+        r2, p2 = _run_gen_genesis_argv(["--validator-key", "a" * 96], tmpdir, "g2.json")
+        assert r1.returncode == 0, r1.stderr
+        assert r2.returncode == 0, r2.stderr
+        with open(p1, "rb") as f:
+            b1 = f.read()
+        with open(p2, "rb") as f:
+            b2 = f.read()
+        assert b1 == b2
+        with open(p1) as f:
+            data = json.load(f)
+        assert data["consensus_meta"]["active_validators"] == ["a" * 96]
+
+
+def test_gen_genesis_three_validator_keys_sorted_and_reproducible():
+    keys = ["c" * 96, "a" * 96, "b" * 96]  # deliberately unsorted
+    argv = []
+    for k in keys:
+        argv += ["--validator-key", k]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        r1, p1 = _run_gen_genesis_argv(argv, tmpdir, "m1.json")
+        r2, p2 = _run_gen_genesis_argv(argv, tmpdir, "m2.json")
+        assert r1.returncode == 0, r1.stderr
+        with open(p1) as f:
+            data = json.load(f)
+        assert data["consensus_meta"]["active_validators"] == sorted(keys)
+        # Reproducible.
+        with open(p1, "rb") as f:
+            b1 = f.read()
+        with open(p2, "rb") as f:
+            b2 = f.read()
+        assert b1 == b2
+        # State hash differs from the single-key artifact.
+        r_single, p_single = _run_gen_genesis_argv(["--validator-key", "a" * 96], tmpdir, "single.json")
+        with open(p_single) as f:
+            single = json.load(f)
+        assert data["block_0"]["header"]["state_hash"] != single["block_0"]["header"]["state_hash"]
+
+
+def test_gen_genesis_mixed_privkey_and_key_deduped_sorted():
+    G2Basic = pytest.importorskip("py_ecc.bls").G2Basic
+    priv = "11" * 32
+    derived = gen_genesis.derive_pubkey_from_privkey(priv)
+    extra_key = "a" * 96
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Pass the derived pubkey explicitly too -> must dedupe to one entry.
+        argv = [
+            "--validator-privkey", priv,
+            "--validator-key", extra_key,
+            "--validator-key", derived,
+        ]
+        result, out_path = _run_gen_genesis_argv(argv, tmpdir)
+        assert result.returncode == 0, result.stderr
+        with open(out_path) as f:
+            data = json.load(f)
+        active = data["consensus_meta"]["active_validators"]
+        assert active == sorted({extra_key.lower(), derived.lower()})
+        assert derived.lower() in active
+
+
+def test_gen_genesis_requires_a_validator_key():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "gen_genesis.py"))
+        result = subprocess.run(
+            [sys.executable, script_path,
+             "--genesis-rules-path", "genesis.tau",
+             "--genesis-consensus-path", "genesis_consensus.tau",
+             "--out", os.path.join(tmpdir, "g.json")],
+            capture_output=True, text=True, env=os.environ,
+        )
+        assert result.returncode != 0
+        assert "validator-key" in result.stderr.lower() or "validator_key" in result.stderr.lower()
+
+
 def test_gen_genesis_eligibility_mode_stake_pinned():
     # --eligibility-mode stake surfaces in mechanism_specific_metadata.
     with tempfile.TemporaryDirectory() as tmpdir:
