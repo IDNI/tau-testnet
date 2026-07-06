@@ -618,7 +618,12 @@ def process_new_block(block: Block) -> bool:
                 votes=[{"update_id": uid.hex() if isinstance(uid, bytes) else uid, "voter_pubkey": p.hex() if isinstance(p, bytes) else p} for uid, ps in _lifecycle_manager.votes.items() for p in ps],
                 scheduled=[(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates],
                 archival=[uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates],
-                active_validators=sorted(normalize_validator_set(_lifecycle_manager.active_validators))
+                active_validators=sorted(normalize_validator_set(_lifecycle_manager.active_validators)),
+                # Persist the governance-mutable consensus params on the block-apply
+                # path too (not just commit_state_to_db); otherwise an activated
+                # quorum_policy / eligibility_mode change is lost on restart.
+                quorum_policy=_lifecycle_manager.quorum_policy,
+                eligibility_mode=_lifecycle_manager.eligibility_mode,
             )
             
             # Optional: mempool eviction triggers could be mapped here using `apply_result.mempool_hints`
@@ -1674,7 +1679,9 @@ def reorg_to(new_head_hash: str):
             votes_list,
             scheduled_list,
             archival_list,
-            active_validators=active_validators_list
+            active_validators=active_validators_list,
+            quorum_policy=_lifecycle_manager.quorum_policy,
+            eligibility_mode=_lifecycle_manager.eligibility_mode,
         )
     
     # Phase 5: Mempool Restore

@@ -49,13 +49,30 @@ Run everything: `venv/bin/python scripts/demo_stake_switch.py e2e` (scenes 1-7).
 | 2 | `--scene 2` | node4 createblock → "not in the active validator set" | Outsiders cannot propose under PoA. |
 | 3 | `--scene 3` | node4 balance == 150000 on all 4 nodes | Treasury stakes the outsider; state gossips network-wide. |
 | 4 | (in `e2e`) | update `pending` on all 4; prints activation height H | Governance proposes the stake rule + `eligibility_mode=stake` patch. |
-| 5 | (in `e2e`) | update `approved-and-scheduled` on all 4 | 2-of-3 supermajority schedules it; a checkpoint is taken. |
-| 6 | (in `e2e`) | mode flips to `stake`; `consensus_rules` == revision on all 4 | The patch applies at block H; first stake-verified block is H+1. |
+| 5 | (in `e2e`) | update `approved-and-scheduled` on all 4 | 2-of-3 supermajority schedules it for height H. |
+| 6 | (in `e2e`) | mode flips to `stake`; `consensus_rules` == revision on all 4; a checkpoint is taken | The patch applies at block H; first stake-verified block is H+1. |
 | 7 | (in `e2e`) | node4 createblock SUCCESS; all 4 accept node4 as proposer | **The money shot:** a non-validator with stake produces a canonical block. |
 | 8 | `--scene 8` | node1 createblock → "Not our turn" | Encore: a validator with 0 stake is now ineligible (o7=0). |
 
 Each scene prints a banner, the raw RPC replies, and an `OK:` line on success;
 any mismatch prints `[FATAL] ...` and exits non-zero.
+
+### Checkpoint timing (important)
+
+The `e2e` checkpoint is taken **after** activation (end of Scene 6), not while
+the update is merely scheduled. Two reasons:
+
+- A consistent snapshot requires stopping the nodes (you cannot safely rsync a
+  live sqlite DB), so `checkpoint.sh snapshot` inherently restarts them.
+- Only the **activated** consensus parameters (`eligibility_mode` + the active
+  `consensus_rules`) are durably persisted. A snapshot taken while the update is
+  still `approved-and-scheduled` would not survive the restart: scheduled (but
+  not-yet-activated) update *payloads* are not persisted, so on reload the node
+  cannot activate them at height H. See "Known limitation" below.
+
+After a governance switch the node's Tau engine reloads the heavier stake spec
+at boot, so the demo raises `TAU_CLIENT_WAIT_TIMEOUT`/`TAU_PROCESS_TIMEOUT` in
+`docker-compose.yml` to give startup enough headroom.
 
 ## Restart determinism
 
@@ -65,9 +82,17 @@ config. Prove it survives a restart:
 ```bash
 docker compose -f demo/docker-compose.yml down
 docker compose -f demo/docker-compose.yml --env-file demo/.env up -d
-venv/bin/python scripts/demo_stake_switch.py --scene 1   # mode still stake, heads agree
-venv/bin/python scripts/demo_stake_switch.py --scene 7   # node4 still mines
+# after boot, every node reloads eligibility_mode=stake from disk:
+for p in 65441 65442 65443 65444; do
+  printf 'getgovernance\r\n' | nc -w3 127.0.0.1 $p \
+    | venv/bin/python -c "import sys,json;d=json.load(sys.stdin)['data'];print(p:=d['eligibility_mode'])"
+done
+venv/bin/python scripts/demo_stake_switch.py --scene 7   # node4 still mines -> mode survived restart
 ```
+
+(`--scene 1` is the *genesis*-state check and asserts `validator_set`; do not
+run it after the switch. The Tau engine reloads the heavier stake spec at boot,
+so give the nodes ~30-60s to become ready before driving Scene 7.)
 
 ## Abort ladder
 
@@ -86,3 +111,15 @@ venv/bin/python scripts/demo_stake_switch.py --scene 7   # node4 still mines
 
 > The detailed operator abort procedures live in
 > `plans/stake-switch/phase-7.md` (rehearsal + failure drills).
+
+## Known limitation
+
+**Scheduled-but-not-yet-activated governance updates are not persisted across a
+node restart.** The canonical-state commit persists payloads only for updates in
+the `pending` set; once an update is approved and moved to `scheduled`, its
+payload (`rule_revisions` + `host_contract_patch`) is no longer written. A node
+restarting between the approving vote and the activation height reloads the
+schedule entry without its payload and archives it at height H instead of
+activating it. This predates the stake-switch feature (it affects a scheduled
+`vote_quorum` change identically) and is why the demo checkpoints only after
+activation. Activated state (mode + rule) persists correctly and is restart-safe.

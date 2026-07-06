@@ -31,18 +31,39 @@ PYEOF
 done
 
 echo "[setup] libp2p identity keys"
+# The identity key lives INSIDE the per-node data dir (which is the /data volume
+# in the container) so we do not nest a second bind mount under /data.
 for n in 1 2 3 4; do
     mkdir -p "$DEMO/node$n/data"
-    if [[ ! -s "$DEMO/node$n/identity.key" ]]; then
-        "$PY" scripts/print_peer_id.py --generate "$DEMO/node$n/identity.key" >/dev/null 2>&1
-        echo "  generated node$n/identity.key"
+    if [[ ! -s "$DEMO/node$n/data/identity.key" ]]; then
+        "$PY" scripts/print_peer_id.py --generate "$DEMO/node$n/data/identity.key" >/dev/null 2>&1
+        echo "  generated node$n/data/identity.key"
     fi
 done
 # print_peer_id emits library log lines on stdout before the id; the id is the
 # last line, so take only that.
-NODE1_PEER_ID="$("$PY" scripts/print_peer_id.py "$DEMO/node1/identity.key" 2>/dev/null | tail -n1)"
-echo "  node1 peer id: $NODE1_PEER_ID"
+declare -a PEER_ID IP
+IP[1]=172.28.0.11; IP[2]=172.28.0.12; IP[3]=172.28.0.13; IP[4]=172.28.0.14
+for n in 1 2 3 4; do
+    PEER_ID[$n]="$("$PY" scripts/print_peer_id.py "$DEMO/node$n/data/identity.key" 2>/dev/null | tail -n1)"
+    echo "  node$n peer id: ${PEER_ID[$n]}"
+done
 
+# Full-mesh bootstrap: each node is seeded with the OTHER three peers, so a
+# block announced by ANY proposer reaches every node directly (the node
+# re-announces only self-produced blocks, so a hub-only topology would strand
+# blocks minted by leaf nodes).
+node_bootstrap() {  # $1 = this node number -> JSON array of the other three
+    local self="$1" out="[" first=1 m
+    for m in 1 2 3 4; do
+        [[ "$m" == "$self" ]] && continue
+        [[ $first -eq 0 ]] && out+=","
+        out+="{\"peer_id\":\"${PEER_ID[$m]}\",\"addrs\":[\"/ip4/${IP[$m]}/tcp/4001\"]}"
+        first=0
+    done
+    out+="]"
+    printf '%s' "$out"
+}
 echo "[setup] render stake revision (threshold 100000)"
 "$PY" "$DEMO/render_revision.py" --stake-threshold 100000 > "$DEMO/stake_consensus_revision.tau"
 
@@ -64,11 +85,12 @@ done
 
 echo "[setup] write demo/.env"
 {
-    echo "NODE1_PRIVKEY=$(cat "$DEMO/keys/node1.priv")"
-    echo "NODE2_PRIVKEY=$(cat "$DEMO/keys/node2.priv")"
-    echo "NODE3_PRIVKEY=$(cat "$DEMO/keys/node3.priv")"
-    echo "NODE4_PRIVKEY=$(cat "$DEMO/keys/node4.priv")"
-    echo "NODE1_PEER_ID=$NODE1_PEER_ID"
+    for n in 1 2 3 4; do
+        echo "NODE${n}_PRIVKEY=$(cat "$DEMO/keys/node$n.priv")"
+        echo "NODE${n}_PUBKEY=$(cat "$DEMO/keys/node$n.pub")"
+        echo "NODE${n}_PEER_ID=${PEER_ID[$n]}"
+        echo "NODE${n}_BOOTSTRAP=$(node_bootstrap "$n")"
+    done
 } > "$DEMO/.env"
 
 echo "[setup] done. Next: docker compose -f demo/docker-compose.yml --env-file demo/.env up -d --build"

@@ -35,13 +35,16 @@ services:
         ipv4_address: 172.28.0.11
     volumes:
       - ./node1/data:/data
-      - ./node1/identity.key:/data/identity.key:ro
       - ./node1/genesis.json:/app/tau-testnet/data/genesis.json:ro
     ports:
       - "127.0.0.1:65441:65432"
     environment:
       TAU_NETWORK_ID: tau-demo-stake
       TAU_MINER_PRIVKEY: ${NODE1_PRIVKEY}
+      TAU_MINER_PUBKEY: ${NODE1_PUBKEY}
+      TAU_BOOTSTRAP_PEERS: ${NODE1_BOOTSTRAP}
+      TAU_CLIENT_WAIT_TIMEOUT: "180"
+      TAU_PROCESS_TIMEOUT: "300"
       TAU_MINING_ENABLED: "false"
       TAU_AUTO_FAUCET: "false"
       TAU_ALLOW_REMOTE_CREATEBLOCK: "true"
@@ -58,20 +61,22 @@ services:
         ipv4_address: 172.28.0.12
     volumes:
       - ./node2/data:/data
-      - ./node2/identity.key:/data/identity.key:ro
       - ./node2/genesis.json:/app/tau-testnet/data/genesis.json:ro
     ports:
       - "127.0.0.1:65442:65432"
     environment:
       TAU_NETWORK_ID: tau-demo-stake
       TAU_MINER_PRIVKEY: ${NODE2_PRIVKEY}
+      TAU_MINER_PUBKEY: ${NODE2_PUBKEY}
+      TAU_BOOTSTRAP_PEERS: ${NODE2_BOOTSTRAP}
+      TAU_CLIENT_WAIT_TIMEOUT: "180"
+      TAU_PROCESS_TIMEOUT: "300"
       TAU_MINING_ENABLED: "false"
       TAU_AUTO_FAUCET: "false"
       TAU_ALLOW_REMOTE_CREATEBLOCK: "true"
       TAU_NETWORK_LISTEN: /ip4/0.0.0.0/tcp/4001
       TAU_IDENTITY_KEY_PATH: /data/identity.key
       TAU_DB_PATH: /data/node.db
-      TAU_BOOTSTRAP_PEERS: '[{"peer_id":"${NODE1_PEER_ID}","addrs":["/ip4/172.28.0.11/tcp/4001"]}]'
 
   node3:
     <<: *node-common
@@ -82,20 +87,22 @@ services:
         ipv4_address: 172.28.0.13
     volumes:
       - ./node3/data:/data
-      - ./node3/identity.key:/data/identity.key:ro
       - ./node3/genesis.json:/app/tau-testnet/data/genesis.json:ro
     ports:
       - "127.0.0.1:65443:65432"
     environment:
       TAU_NETWORK_ID: tau-demo-stake
       TAU_MINER_PRIVKEY: ${NODE3_PRIVKEY}
+      TAU_MINER_PUBKEY: ${NODE3_PUBKEY}
+      TAU_BOOTSTRAP_PEERS: ${NODE3_BOOTSTRAP}
+      TAU_CLIENT_WAIT_TIMEOUT: "180"
+      TAU_PROCESS_TIMEOUT: "300"
       TAU_MINING_ENABLED: "false"
       TAU_AUTO_FAUCET: "false"
       TAU_ALLOW_REMOTE_CREATEBLOCK: "true"
       TAU_NETWORK_LISTEN: /ip4/0.0.0.0/tcp/4001
       TAU_IDENTITY_KEY_PATH: /data/identity.key
       TAU_DB_PATH: /data/node.db
-      TAU_BOOTSTRAP_PEERS: '[{"peer_id":"${NODE1_PEER_ID}","addrs":["/ip4/172.28.0.11/tcp/4001"]}]'
 
   node4:
     <<: *node-common
@@ -106,17 +113,19 @@ services:
         ipv4_address: 172.28.0.14
     volumes:
       - ./node4/data:/data
-      - ./node4/identity.key:/data/identity.key:ro
       - ./node4/genesis.json:/app/tau-testnet/data/genesis.json:ro
     ports:
       - "127.0.0.1:65444:65432"
     environment:
       TAU_NETWORK_ID: tau-demo-stake
       TAU_MINER_PRIVKEY: ${NODE4_PRIVKEY}
+      TAU_MINER_PUBKEY: ${NODE4_PUBKEY}
+      TAU_BOOTSTRAP_PEERS: ${NODE4_BOOTSTRAP}
+      TAU_CLIENT_WAIT_TIMEOUT: "180"
+      TAU_PROCESS_TIMEOUT: "300"
       TAU_MINING_ENABLED: "false"
       TAU_AUTO_FAUCET: "false"
       TAU_ALLOW_REMOTE_CREATEBLOCK: "true"
       TAU_NETWORK_LISTEN: /ip4/0.0.0.0/tcp/4001
       TAU_IDENTITY_KEY_PATH: /data/identity.key
       TAU_DB_PATH: /data/node.db
-      TAU_BOOTSTRAP_PEERS: '[{"peer_id":"${NODE1_PEER_ID}","addrs":["/ip4/172.28.0.11/tcp/4001"]}]'
