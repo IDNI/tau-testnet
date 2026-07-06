@@ -55,13 +55,23 @@ def get_args():
             "an activated governance host_contract_patch."
         ),
     )
+    parser.add_argument(
+        "--eligibility-mode", type=str, default="validator_set",
+        help=(
+            "Proposer-eligibility regime pinned network-wide into genesis "
+            "consensus_meta: 'validator_set' (PoA, default) or 'stake'."
+        ),
+    )
     args = parser.parse_args()
     # Validate with the same grammar the runtime/admission uses so a bad genesis
     # value fails loudly here instead of silently falling back at consensus time.
-    from consensus.governance import validate_quorum_policy
+    from consensus.governance import validate_quorum_policy, validate_eligibility_mode
     _q_err = validate_quorum_policy(args.vote_quorum)
     if _q_err:
         parser.error(f"--vote-quorum {_q_err}")
+    _m_err = validate_eligibility_mode(args.eligibility_mode)
+    if _m_err:
+        parser.error(f"--eligibility-mode {_m_err}")
     return args
 
 def derive_pubkey_from_privkey(privkey_hex: str) -> str:
@@ -196,6 +206,12 @@ def main():
     accounts_hash_bytes = compute_accounts_hash(genesis_accounts, genesis_sequences)
 
     # 2. Consensus Meta Domain
+    # eligibility_mode is included ONLY when non-default so a default genesis is
+    # byte-identical to one produced before this field existed (hash-compat).
+    # This conditional MUST match ConsensusLifecycleManager.consensus_meta_hash.
+    mech_meta = {"vote_quorum": args.vote_quorum}
+    if args.eligibility_mode != "validator_set":
+        mech_meta["eligibility_mode"] = args.eligibility_mode
     consensus_meta = {
         "proof_scheme": "bls_header_sig",
         "fork_choice_scheme": "height_then_hash",
@@ -206,7 +222,7 @@ def main():
         "activation_schedule": [],
         "checkpoint_references": [],
         # vote_quorum pins the governance quorum policy network-wide.
-        "mechanism_specific_metadata": {"vote_quorum": args.vote_quorum}
+        "mechanism_specific_metadata": mech_meta
     }
 
     # The genesis meta hash MUST use the exact same recipe the runtime replays

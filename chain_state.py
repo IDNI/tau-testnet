@@ -413,6 +413,7 @@ _genesis_accounts_state: dict = {}
 # does not end up with an empty validator set.
 _genesis_active_validators: list = []
 _genesis_vote_quorum: str = ""
+_genesis_eligibility_mode: str = ""
 # Genesis rule text, re-seeded on full rebuild so the replayed state hash
 # matches the mined chain (the reorg path replays only the new suffix, not
 # the genesis block, so its rules would otherwise be lost).
@@ -665,6 +666,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                 active_validators=list(_genesis_active_validators)
             )
             _lifecycle_manager.quorum_policy = _genesis_vote_quorum
+            _lifecycle_manager.eligibility_mode = _genesis_eligibility_mode
             _lifecycle_manager.recompute_approval_threshold()
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
@@ -887,6 +889,7 @@ def load_genesis(genesis_json_path: str):
     # Remember the artifact's pre-funded accounts for rebuild/reorg seeding,
     # regardless of whether the DB is fresh or already provisioned.
     global _genesis_accounts_state, _genesis_active_validators, _genesis_vote_quorum
+    global _genesis_eligibility_mode
     global _genesis_application_rules, _genesis_consensus_rules
     _genesis_accounts_state = {
         k: int(v) for k, v in genesis_data.get("accounts_state", {}).items()
@@ -894,6 +897,7 @@ def load_genesis(genesis_json_path: str):
     _gmeta = genesis_data.get("consensus_meta", {}) or {}
     _genesis_active_validators = list(_gmeta.get("active_validators", []) or [])
     _genesis_vote_quorum = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("vote_quorum", "")
+    _genesis_eligibility_mode = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("eligibility_mode", "")
     _genesis_application_rules = genesis_data.get("application_rules", "")
     _genesis_consensus_rules = genesis_data.get("consensus_rules", "")
 
@@ -935,6 +939,7 @@ def load_genesis(genesis_json_path: str):
             _lifecycle_manager.active_validators = normalize_validator_set(meta["active_validators"])
             # Genesis may pin the quorum policy network-wide; overrides the local config knob.
             _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
+            _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
             _lifecycle_manager.recompute_approval_threshold()
 
         commit_state_to_db(genesis_block.block_hash, 0)
@@ -983,6 +988,7 @@ def load_genesis(genesis_json_path: str):
             _lifecycle_manager.active_validators = normalize_validator_set(meta.get("active_validators", []))
             # Genesis may pin the quorum policy network-wide; overrides the local config knob.
             _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
+            _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
             _lifecycle_manager.recompute_approval_threshold()
             commit_state_to_db(_canonical_head_hash, latest["header"]["block_number"] if latest else 0)
         print(f"[INFO][chain_state] State loaded successfully. Last known block hash: '{_canonical_head_hash[:16]}...'")
@@ -1348,6 +1354,10 @@ def load_state_from_db() -> bool:
         _lifecycle_manager.quorum_policy = (
             _genesis_vote_quorum if persisted_quorum == _MISSING else persisted_quorum
         )
+        persisted_mode = db.get_chain_state_value("eligibility_mode", _MISSING)
+        _lifecycle_manager.eligibility_mode = (
+            _genesis_eligibility_mode if persisted_mode == _MISSING else persisted_mode
+        )
         _lifecycle_manager.recompute_approval_threshold()
         for p in pending_updates:
             update = ConsensusRuleUpdate(
@@ -1384,6 +1394,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
         active_validators_list = sorted(normalize_validator_set(_lifecycle_manager.active_validators))
         quorum_policy_snapshot = _lifecycle_manager.quorum_policy
+        eligibility_mode_snapshot = _lifecycle_manager.eligibility_mode
 
     db.save_canonical_state_atomically(
         block_hash, block_number,
@@ -1392,6 +1403,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         pending_updates_list, votes_list, scheduled_list, archival_list,
         active_validators=active_validators_list,
         quorum_policy=quorum_policy_snapshot,
+        eligibility_mode=eligibility_mode_snapshot,
     )
 
 def tick_governance(height: int):

@@ -13,6 +13,7 @@ from consensus.governance import (
     normalize_validator_delta,
     normalize_validator_set,
     validate_quorum_policy,
+    validate_eligibility_mode,
     quorum_count,
 )
 
@@ -202,6 +203,10 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
                     f"vote_quorum count {count} exceeds the "
                     f"{len(effective_validators)} validator(s) it would activate under."
                 )
+    if "eligibility_mode" in patch:
+        err = validate_eligibility_mode(patch["eligibility_mode"])
+        if err:
+            return f"Unsupported eligibility_mode inside host_contract_patch: {err}"
     return None
 
 def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:

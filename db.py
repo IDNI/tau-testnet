@@ -1156,7 +1156,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
     """
@@ -1199,6 +1199,15 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 _db_conn.execute(
                     'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
                     ('quorum_policy', quorum_policy)
+                )
+            if eligibility_mode is not None:
+                # Persist the (possibly governance-activated) eligibility mode so a
+                # node reloading from disk reproduces the same proposer-eligibility
+                # regime as a freshly-rebuilt or freshly-synced peer. Stored
+                # verbatim, including "" (genesis did not pin).
+                _db_conn.execute(
+                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+                    ('eligibility_mode', eligibility_mode)
                 )
 
             _db_conn.execute('DELETE FROM accounts')

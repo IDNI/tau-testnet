@@ -106,6 +106,46 @@ def test_gen_genesis_rejects_malformed_vote_quorum():
         assert "vote-quorum" in result.stderr.lower() or "vote_quorum" in result.stderr.lower()
 
 
+def test_gen_genesis_eligibility_mode_stake_pinned():
+    # --eligibility-mode stake surfaces in mechanism_specific_metadata.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result, out_path = _run_gen_genesis(["--eligibility-mode", "stake"], tmpdir)
+        assert result.returncode == 0, f"gen_genesis failed: {result.stderr}"
+        with open(out_path) as f:
+            genesis_data = json.load(f)
+        meta = genesis_data["consensus_meta"]["mechanism_specific_metadata"]
+        assert meta["eligibility_mode"] == "stake"
+
+
+def test_gen_genesis_default_omits_eligibility_mode_byte_identical():
+    # Hash-compat: the default eligibility mode must NOT appear in the artifact,
+    # and passing the explicit default must produce a byte-identical genesis to
+    # omitting the flag entirely (so pre-existing chains keep their hashes).
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result_a, path_a = _run_gen_genesis([], tmpdir)
+        assert result_a.returncode == 0, f"gen_genesis failed: {result_a.stderr}"
+        with open(path_a) as f:
+            data_a = json.load(f)
+        assert "eligibility_mode" not in data_a["consensus_meta"]["mechanism_specific_metadata"]
+        with open(path_a, "rb") as f:
+            bytes_a = f.read()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result_b, path_b = _run_gen_genesis(["--eligibility-mode", "validator_set"], tmpdir)
+        assert result_b.returncode == 0, f"gen_genesis failed: {result_b.stderr}"
+        with open(path_b, "rb") as f:
+            bytes_b = f.read()
+
+    assert bytes_a == bytes_b
+
+
+def test_gen_genesis_rejects_malformed_eligibility_mode():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result, _ = _run_gen_genesis(["--eligibility-mode", "pos"], tmpdir)
+        assert result.returncode != 0
+        assert "eligibility" in result.stderr.lower()
+
+
 def test_derive_pubkey_privkey_leading_zero():
     """Regression: a privkey whose hex starts with '0' must not have its leading
     zero stripped. The old lstrip("0x") stripped any leading '0'/'x' chars, making

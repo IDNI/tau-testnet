@@ -110,6 +110,7 @@ def execute(raw_command: str, container):
             "next_block_height": next_block_height,
             "active_validator_count": validator_count,
             "approval_threshold": chain_state._lifecycle_manager.approval_threshold,
+            "eligibility_mode": chain_state._lifecycle_manager.effective_eligibility_mode(),
             "active_validators": active_validators,
             "min_activation_height_for_next_update": min_activation_height,
             "active_consensus_id": active_consensus_id,
