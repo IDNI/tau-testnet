@@ -43,6 +43,7 @@ MagicMock
 !docs/CONSENSUS_ARCHITECTURE.md
 !docs/developer_cli.md
 !docs/packaging.md
+!docs/demo_stake_switch.md
 
 # Python
 __pycache__/
