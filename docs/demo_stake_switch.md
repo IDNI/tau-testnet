@@ -94,23 +94,82 @@ venv/bin/python scripts/demo_stake_switch.py --scene 7   # node4 still mines -> 
 run it after the switch. The Tau engine reloads the heavier stake spec at boot,
 so give the nodes ~30-60s to become ready before driving Scene 7.)
 
+## Pre-flight checklist (run before the audience arrives)
+
+- [ ] Image built: `docker images tau-testnet-standalone:demo` shows a recent build.
+- [ ] `bash demo/setup.sh` run; `demo/.env` present with 4 privkeys/pubkeys/peer-ids + 4 bootstrap lists.
+- [ ] Stack up: `docker compose -f demo/docker-compose.yml --env-file demo/.env up -d`.
+- [ ] All 4 nodes share the genesis hash: `venv/bin/python scripts/demo_stake_switch.py --scene 1` prints OK.
+- [ ] Native tests green on this machine: `PYTHONPATH=<tau-lang nanobind> venv/bin/python -m pytest tests/test_stake_switch_spike_native.py tests/test_stake_switch_e2e_native.py -q`.
+- [ ] Checkpoint dir clean: `bash demo/checkpoint.sh status` reports no snapshot (or an intentional one).
+- [ ] **Rehearse the drills:** `--scene drill-abort` and `--scene drill-node-restart` both green.
+- [ ] **Recorded backup:** capture a screen recording of a full clean `e2e` run during rehearsal and keep it offline. Path: `___________` (fill in). This is the final fallback if the live network misbehaves.
+
 ## Abort ladder
 
-1. **A scene fails a soft assertion** (e.g. gossip lag): re-run that scene; the
-   sleeps allow a couple of seconds for propagation.
-2. **State got dirty mid-rehearsal:** roll back to the Scene-5 checkpoint:
-   ```bash
-   bash demo/checkpoint.sh restore
-   ```
-   (`demo/checkpoint.sh snapshot` was taken automatically at the end of Scene 5
-   during `e2e`; `demo/checkpoint.sh status` shows whether one exists.)
-3. **A node is wedged:** `docker compose -f demo/docker-compose.yml restart nodeN`.
-4. **Full reset:** `docker compose ... down` then re-run `bash demo/setup.sh`
-   (existing keys/identities/genesis are reused; delete `demo/node*/data` to wipe
-   chain state) and bring the stack back up.
+| Symptom | Diagnosis | Operator command | Recovery time |
+|---|---|---|---|
+| A scene prints `[FATAL] ... sync` | Gossip lag under host load (a follower trails by a block) | Re-run that single scene (`--scene N`); scenes poll + re-announce to reconverge | seconds–1 min |
+| Proposal never reaches `pending` | Bad rule rejected at admission (isolated compile) | Read the `sendtx` reply for the reject reason; fix the rule text; re-propose | 1 min |
+| Vote short of quorum near the height | Update auto-expired to `archival` when its `activate_at` passed | Re-propose with a far-future height: `--scene propose-spare` (uses current+20) | 1 min |
+| Chain stalls at H-1; `FeeRuleError` in a node's logs | Activation revision was rejected by the live interpreter (would mean the composed spec is UNSAT) | `bash demo/checkpoint.sh restore` (post-activation snapshot) **or** full reset; do NOT improvise a rule live | 1–2 min |
+| One node diverges / wedges | Node lost sync or crashed | `docker compose -f demo/docker-compose.yml restart nodeN`; it reloads mode+rules from disk (see `--scene drill-node-restart`) | ~30–60s |
+| Total loss | Anything unrecoverable | Full reset (below) | < 2 min |
 
-> The detailed operator abort procedures live in
-> `plans/stake-switch/phase-7.md` (rehearsal + failure drills).
+**Full reset:**
+```bash
+docker compose -f demo/docker-compose.yml down
+rm -rf demo/node*/data demo/.checkpoint demo/.env   # wipe chain state (keys/identities regenerate)
+bash demo/setup.sh
+docker compose -f demo/docker-compose.yml --env-file demo/.env up -d
+# wait ~30-60s for boot, then: venv/bin/python scripts/demo_stake_switch.py e2e
+```
+
+> Host load matters: the demo runs 4 native Tau engines on one machine. Under
+> heavy load a follower can trail the miner by a block, so the convergence
+> scenes poll and re-announce. On a constrained laptop, close other heavy apps
+> before the live run, and prefer a freshly-restarted stack (clears accumulated
+> load) over one that has been mining for a long rehearsal.
+
+## Encore — vote the network back to PoA
+
+Intended closing beat: nothing here is a one-way door. With the network in stake
+mode, the validator electorate (still node1/2/3) votes proposer-eligibility back
+to `validator_set`:
+
+```bash
+venv/bin/python scripts/demo_stake_switch.py --scene propose-reverse    # genesis-guarded rule + eligibility_mode=validator_set
+venv/bin/python scripts/demo_stake_switch.py --scene vote-reverse        # node2 + node3 approve
+venv/bin/python scripts/demo_stake_switch.py --scene activate-reverse    # mine to H on node4 -> back to PoA
+```
+
+> **Status / known blocker (do not run this beat live yet).** The reverse
+> revision *compiles and is accepted at admission* — it is not a one-way door at
+> the consensus level. But the reverse cannot complete on this network because of
+> a node propagation gap, described below. Rehearse it and confirm the fix before
+> using it in front of an audience.
+>
+> **Finding — governance updates only register on block *apply*, and header-synced
+> blocks bypass that path.** A `consensus_rule_update` becomes `pending` only when
+> the block carrying it is applied through `engine.apply_block`
+> (`consensus/engine.py` — the sole `submit_update` call site). Blocks that a
+> follower receives via **pubsub broadcast** (the hub node1's own `createblock`
+> broadcasts) take that full path, so forward-flow governance registers on all
+> nodes. Blocks a follower obtains via **header-sync pull** do not, so a
+> governance update carried in a block minted by a *leaf* proposer never becomes
+> `pending` on the followers. In stake mode node4 (an outsider peered as a leaf)
+> is the ONLY eligible proposer, so every reverse-governance block is
+> leaf-proposed and pull-propagated — it registers on node4 alone and the vote
+> never reaches quorum network-wide. Forward activation is unaffected (proposed by
+> the hub) and restart determinism is unaffected (see `drill-node-restart`, green).
+>
+> This is a node-side fix (register governance updates on the header-sync ingest
+> path too, or ensure accepted blocks are re-broadcast), out of scope for the demo
+> scripts. The `--scene propose-reverse/vote-reverse/activate-reverse` code is in
+> place and correct; it will pass once the node registers governance updates from
+> pull-propagated blocks.
+
+The spares and drills are catalogued in `demo/spares/README.md`.
 
 ## Known limitation
 
