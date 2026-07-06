@@ -62,3 +62,37 @@ def test_check_host_contract_patch_admission():
     assert _check_host_contract_patch({"eligibility_mode": "stake"}, validators) is None
     err = _check_host_contract_patch({"eligibility_mode": "pos"}, validators)
     assert err is not None and "eligibility_mode" in err
+
+
+def test_pending_update_with_mode_patch_survives_reload(temp_database):
+    """A PENDING update whose host_contract_patch carries eligibility_mode is
+    persisted and reloaded with the patch dict intact (db already stores
+    arbitrary patch dicts as JSON — this only asserts it)."""
+    import chain_state
+    from consensus.governance import ConsensusRuleUpdate, ConsensusRuleVote
+
+    validators = ["a" * 96, "b" * 96, "c" * 96]  # threshold 2 -> 1 vote stays pending
+    chain_state._balances.clear()
+    chain_state._sequence_numbers.clear()
+    chain_state._application_rules_state = "app rules"
+    chain_state._consensus_rules_state = "consensus rules"
+    chain_state._active_consensus_id = ""
+    lm = ConsensusLifecycleManager(active_validators=validators)
+    chain_state._lifecycle_manager = lm
+
+    update = ConsensusRuleUpdate(
+        ["always ( o6[t]:bv[16] = i10[t]:bv[16] )."], 50,
+        host_contract_patch={"eligibility_mode": "stake"},
+    )
+    assert lm.submit_update(update)
+    assert lm.submit_vote(ConsensusRuleVote(update.update_id, True), validators[0])
+    assert update.update_id in lm.pending_updates  # 1 of 2: still pending
+
+    chain_state.commit_state_to_db("head-hash", 9)
+    chain_state._lifecycle_manager = ConsensusLifecycleManager()
+
+    assert chain_state.load_state_from_db() is True
+    reloaded = chain_state._lifecycle_manager
+    assert update.update_id in reloaded.pending_updates
+    payload = reloaded.update_payloads[update.update_id]
+    assert payload.host_contract_patch == {"eligibility_mode": "stake"}
