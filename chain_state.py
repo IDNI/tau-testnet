@@ -1006,6 +1006,13 @@ def get_balance(address_hex: str) -> int:
             return int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
         return _balances.get(address_hex, 0)
 
+def get_committed_balance(address: str) -> int:
+    """Raw committed balance lookup (no auto-faucet shim). Used for advisory
+    eligibility dry-runs; consensus verification reads parent-snapshot balances
+    instead."""
+    with _balance_lock:
+        return int(_balances.get(address, 0))
+
 def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, amount: int) -> bool:
     """
     Updates balances for a transfer. Assumes validation (including sufficient funds)
@@ -1538,6 +1545,10 @@ def select_best_head(candidates: list[tuple[str, int]]) -> str | None:
 def ingest_block(block: Block) -> IngestResult:
     import db, config
     engine = TauConsensusEngine()
+    # NOTE: legacy verify signature (no active_view): membership/stake gates and
+    # the parent-state stake input do NOT run here. This pre-filter only checks
+    # the Tau o6 verdict; canonical acceptance re-verifies with full parent
+    # state via process_new_block / the rebuild path.
     if not engine.verify_block_header(block):
         return IngestResult('invalid', "Block verification failed")
     

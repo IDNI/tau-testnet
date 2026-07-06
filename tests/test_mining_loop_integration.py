@@ -187,5 +187,51 @@ class TestMiningLoopIntegration(unittest.TestCase):
         self.assertEqual(len(latest['transactions']), 1)
         print("Block created by time threshold:", latest['block_hash'])
 
+class TestShouldMineStakeMode(unittest.TestCase):
+    """Phase 3: in stake mode `_should_mine` must NOT bail at the membership gate
+    when MINER_PUBKEY is outside the active set — Tau o7 (query_eligibility) is
+    the gate instead."""
+
+    def setUp(self):
+        self.original_key = config.MINER_PRIVKEY
+        config.MINER_PRIVKEY = "1" * 64
+
+    def tearDown(self):
+        config.MINER_PRIVKEY = self.original_key
+
+    def test_should_mine_bypasses_membership_gate_in_stake_mode(self):
+        from unittest.mock import patch, Mock
+        from consensus.engine import TauConsensusEngine
+        from consensus.governance import ConsensusLifecycleManager
+
+        miner = SoleMiner(threshold=1, max_block_interval=10.0)
+
+        lm = ConsensusLifecycleManager(active_validators=["a" * 96])  # miner NOT in set
+        lm.eligibility_mode = "stake"
+
+        with patch("db.count_mempool_txs", return_value=1), \
+             patch("db.get_canonical_head_block", return_value={
+                 "header": {"block_number": 4}, "block_hash": "00" * 32}), \
+             patch.object(chain_state, "_lifecycle_manager", lm), \
+             patch.object(config, "MINER_PUBKEY", "b" * 96), \
+             patch.object(TauConsensusEngine, "query_eligibility", return_value=True) as q:
+            assert miner._should_mine() is True
+        q.assert_called()
+
+    def test_should_mine_still_gates_in_validator_mode(self):
+        from unittest.mock import patch
+        from consensus.governance import ConsensusLifecycleManager
+
+        miner = SoleMiner(threshold=1, max_block_interval=10.0)
+        lm = ConsensusLifecycleManager(active_validators=["a" * 96])  # validator_set default
+
+        with patch("db.count_mempool_txs", return_value=1), \
+             patch("db.get_canonical_head_block", return_value={
+                 "header": {"block_number": 4}, "block_hash": "00" * 32}), \
+             patch.object(chain_state, "_lifecycle_manager", lm), \
+             patch.object(config, "MINER_PUBKEY", "b" * 96):
+            assert miner._should_mine() is False
+
+
 if __name__ == '__main__':
     unittest.main()

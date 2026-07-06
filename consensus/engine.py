@@ -34,6 +34,7 @@ class ActiveConsensusView:
     consensus_rules: str
     active_validators: List[bytes]
     mechanism_specific_metadata: Optional[Dict[str, Any]] = None
+    parent_balances: Optional[Dict[str, int]] = None
 
 @dataclass
 class TransactionOutcome:
@@ -167,6 +168,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # In Phase 2, this will traverse the consensus_meta to build the view. 
         # For now, it delegates to PoA parameters.
         validator_hexes = self._active_validator_hexes_from_snapshot(parent_snapshot)
+        # Eligibility mode comes ONLY from the parent snapshot's lifecycle manager
+        # (meta-hash-bound), never from per-node config. In stake mode the host
+        # membership gate is bypassed and Tau's o7 is the eligibility authority,
+        # evaluated against the proposer's PARENT-state balance.
+        lm = parent_snapshot.metadata.get("lifecycle_manager")
+        mode = (
+            lm.effective_eligibility_mode()
+            if lm is not None and hasattr(lm, "effective_eligibility_mode")
+            else "validator_set"
+        )
         # consensus_rules is the CONSENSUS spec (o6/o7), carried in the parent
         # snapshot metadata -- NOT parent_snapshot.tau_bytes, which is the
         # APPLICATION accumulation. Using tau_bytes here meant every non-governance
@@ -176,14 +187,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             target_height=target_height,
             consensus_rules=str(parent_snapshot.metadata.get("consensus_rules_state", "") or ""),
             active_validators=[bytes.fromhex(v) for v in validator_hexes],
-            mechanism_specific_metadata={"poa": True}
+            mechanism_specific_metadata={"poa": mode != "stake", "eligibility_mode": mode},
+            parent_balances=parent_snapshot.metadata.get("balances"),
         )
+
+    @staticmethod
+    def _stake_mode(active_view) -> bool:
+        meta = getattr(active_view, "mechanism_specific_metadata", None) or {}
+        return meta.get("eligibility_mode") == "stake"
 
     def verify_block_header(self, *args, **kwargs) -> bool:
         """
         Verify that the block header meets the consensus proof requirements.
         Supports both Phase 1 legacy signature and new ConsensusEngine signature.
         """
+        active_view = None
+        stake_mode = False
         if len(args) > 0 and isinstance(args[0], ActiveConsensusView) or "active_view" in kwargs:
             # Phase 2+ new signature: (active_view, block, proof_result)
             proof_result = kwargs.get("proof_result") if "proof_result" in kwargs else (args[2] if len(args) > 2 else {})
@@ -191,12 +210,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 return False
             block = kwargs.get("block") if "block" in kwargs else (args[1] if len(args) > 1 else None)
             # PoA: the proposer must be in the active validator set (skip for
-            # genesis, whose proposer is the all-zero sentinel).
+            # genesis, whose proposer is the all-zero sentinel). In stake mode the
+            # membership gate is bypassed -- Tau's o7 (evaluated on the proposer's
+            # parent-state stake) is the eligibility authority instead.
             active_view = args[0] if (args and isinstance(args[0], ActiveConsensusView)) else kwargs.get("active_view")
+            stake_mode = active_view is not None and self._stake_mode(active_view)
             if (
                 block is not None
                 and getattr(block.header, "block_number", None) != 0
                 and active_view is not None
+                and not stake_mode
                 and not getattr(config.settings.authority, "open_governance_admission", False)
             ):
                 try:
@@ -224,6 +247,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             return False
             
         try:
+            proposer_stake = 0
+            if stake_mode:
+                balances = getattr(active_view, "parent_balances", None)
+                if balances is None:
+                    # Stake mode requires deterministic parent-state balances; a
+                    # verify path that cannot supply them must fail closed.
+                    logger.error(
+                        "Consensus: stake-mode verify without parent balances for block #%s",
+                        getattr(getattr(block, "header", None), "block_number", "?"),
+                    )
+                    return False
+                proposer_stake = int(balances.get((block.header.proposer_pubkey or "").lower(), 0))
             tau_inputs = self._build_consensus_input_streams(
                 proposer_pubkey=block.header.proposer_pubkey,
                 block_number=block.header.block_number,
@@ -231,15 +266,38 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 previous_hash=block.header.previous_hash,
                 proof_ok=bool(proof_result.get("proof_ok", False)),
                 claims=proof_result.get("claims"),
+                proposer_stake=proposer_stake,
+                stake_mode=stake_mode,
             )
-            output = tau_manager.communicate_with_tau(
-                target_output_stream_index=6,
-                input_stream_values=tau_inputs,
-                apply_rules_update=False
-            )
-            verdict = tau_manager.parse_tau_output(str(output))
-            if verdict != 0:
-                return True
+            if stake_mode:
+                # Stake mode: both o6 (validity) and o7 (eligibility) must be
+                # nonzero. communicate_with_tau_multi is deliberately lock-free,
+                # so wrap it in tau_comm_lock exactly like the fee path does.
+                # Missing o7 parses to 0 -> fail closed.
+                with tau_manager.tau_comm_lock:
+                    outputs = tau_manager.communicate_with_tau_multi(
+                        input_stream_values=tau_inputs,
+                        source="consensus_verify",
+                        apply_rules_update=False,
+                    )
+                o6_raw = outputs.get(6, "")
+                o7_raw = outputs.get(7, "")
+                output = str(o6_raw)
+                verdict = (
+                    tau_manager.parse_tau_output(str(o6_raw)) != 0
+                    and tau_manager.parse_tau_output(str(o7_raw)) != 0
+                )
+                if verdict:
+                    return True
+            else:
+                output = tau_manager.communicate_with_tau(
+                    target_output_stream_index=6,
+                    input_stream_values=tau_inputs,
+                    apply_rules_update=False
+                )
+                verdict = tau_manager.parse_tau_output(str(output)) != 0
+                if verdict:
+                    return True
             if "require_bls_sig" in output:
                 try:
                     from py_ecc.bls import G2Basic
@@ -460,6 +518,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             return False
             
         try:
+            # Advisory dry-run only (never binds validity), so tip state is
+            # acceptable here. Use committed balance (no auto-faucet shim).
+            import chain_state
+            lm = getattr(chain_state, "_lifecycle_manager", None)
+            stake_mode = bool(
+                lm is not None
+                and getattr(lm, "effective_eligibility_mode", lambda: "validator_set")() == "stake"
+            )
+            my_stake = chain_state.get_committed_balance((my_pubkey or "").lower()) if stake_mode else 0
             tau_inputs = self._build_consensus_input_streams(
                 proposer_pubkey=my_pubkey,
                 block_number=block_number,
@@ -467,6 +534,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 previous_hash=previous_hash,
                 proof_ok=True,
                 claims={},
+                proposer_stake=my_stake,
+                stake_mode=stake_mode,
             )
             output = tau_manager.communicate_with_tau(
                 target_output_stream_index=7,

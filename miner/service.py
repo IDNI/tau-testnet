@@ -54,9 +54,14 @@ class SoleMiner:
         prev_hash = latest_block['block_hash'] if latest_block else db.get_genesis_hash()
 
         # PoA: stop proposing if our key has been removed from the active set.
+        # In stake mode the membership gate is bypassed; query_eligibility below
+        # (Tau o7 on our stake) becomes the gate.
         import chain_state
-        active = getattr(chain_state._lifecycle_manager, "active_validators", set())
-        if active and not getattr(config.settings.authority, "open_governance_admission", False) \
+        lm = chain_state._lifecycle_manager
+        stake_mode = getattr(lm, "effective_eligibility_mode", lambda: "validator_set")() == "stake"
+        active = getattr(lm, "active_validators", set())
+        if active and not stake_mode \
+                and not getattr(config.settings.authority, "open_governance_admission", False) \
                 and (config.MINER_PUBKEY or "").lower() not in active:
             return False
 
