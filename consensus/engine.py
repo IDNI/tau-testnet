@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import config
@@ -471,7 +472,25 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         acc_hash = compute_accounts_hash(t_bals, t_seqs)
         meta_hash = lm.consensus_meta_hash()
         state_hash = compute_consensus_state_hash(next_cons_rules.encode('utf-8'), next_app_rules.encode('utf-8'), acc_hash, meta_hash)
-        
+
+        # Phase 9B instrumentation: dump the four state-hash components so a
+        # mine-vs-replay divergence at a post-activation block can be pinned to
+        # a single component. Zero cost unless TAU_HASH_TRACE is set.
+        if os.environ.get("TAU_HASH_TRACE"):
+            import hashlib as _hl
+            def _h(b):
+                return _hl.sha256(b if isinstance(b, bytes) else str(b).encode()).hexdigest()[:16]
+            logger.warning(
+                "[HASH_TRACE] blk=%s replay=%s state=%s | cons=%s app=%s acc=%s meta=%s "
+                "| newly_active=%s cons_rules_len=%d app_rules_len=%d",
+                block.header.block_number, replay_mode, state_hash[:16],
+                _h(next_cons_rules.encode('utf-8')), _h(next_app_rules.encode('utf-8')),
+                acc_hash[:16] if isinstance(acc_hash, str) else _h(acc_hash),
+                meta_hash.hex()[:16] if isinstance(meta_hash, bytes) else _h(meta_hash),
+                [u.update_id_hex[:12] for u in newly_active],
+                len(next_cons_rules), len(next_app_rules),
+            )
+
         # 4. Construct Next Snapshot
         next_snapshot = TauStateSnapshot(
             state_hash=state_hash,
