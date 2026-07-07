@@ -57,18 +57,25 @@ Run everything: `venv/bin/python scripts/demo_stake_switch.py e2e` (scenes 1-7).
 Each scene prints a banner, the raw RPC replies, and an `OK:` line on success;
 any mismatch prints `[FATAL] ...` and exits non-zero.
 
-### Checkpoint timing (important)
+### Checkpoint timing
 
-The `e2e` checkpoint is taken **after** activation (end of Scene 6), not while
-the update is merely scheduled. Two reasons:
+The `e2e` checkpoint is taken **after** activation (end of Scene 6). A consistent
+snapshot requires stopping the nodes (you cannot safely rsync a live sqlite DB),
+so `checkpoint.sh snapshot` inherently restarts them; the activated consensus
+params reload cleanly.
 
-- A consistent snapshot requires stopping the nodes (you cannot safely rsync a
-  live sqlite DB), so `checkpoint.sh snapshot` inherently restarts them.
-- Only the **activated** consensus parameters (`eligibility_mode` + the active
-  `consensus_rules`) are durably persisted. A snapshot taken while the update is
-  still `approved-and-scheduled` would not survive the restart: scheduled (but
-  not-yet-activated) update *payloads* are not persisted, so on reload the node
-  cannot activate them at height H. See "Known limitation" below.
+Phase 9C removed the original reason this had to be post-activation:
+scheduled-but-not-yet-activated update payloads (`rule_revisions` +
+`host_contract_patch`) are now persisted alongside the schedule entry, so a node
+that restarts while an update is merely `approved-and-scheduled` still activates
+it at height H (proven by `--scene drill-abort` — checkpoint-while-scheduled →
+restore → still `approved-and-scheduled` — and by
+`tests/test_scheduled_payload_persistence.py`). The e2e nonetheless keeps the
+checkpoint post-activation for demo robustness: the eligible proposer flips at
+height H (genesis validators hold 0 stake and become ineligible), so a restart
+placed right before the mine-to-H step can leave a freshly-rebooted leaf follower
+one block short of the activation block with no eligible proposer left to
+re-announce it.
 
 After a governance switch the node's Tau engine reloads the heavier stake spec
 at boot, so the demo raises `TAU_CLIENT_WAIT_TIMEOUT`/`TAU_PROCESS_TIMEOUT` in
@@ -143,42 +150,24 @@ venv/bin/python scripts/demo_stake_switch.py --scene vote-reverse        # node2
 venv/bin/python scripts/demo_stake_switch.py --scene activate-reverse    # mine to H on node4 -> back to PoA
 ```
 
-> **Status / known blocker (do not run this beat live yet).** The reverse
-> revision *compiles and is accepted at admission* — it is not a one-way door at
-> the consensus level. But the reverse cannot complete on this network because of
-> a node propagation gap, described below. Rehearse it and confirm the fix before
-> using it in front of an audience.
->
-> **Finding — governance updates only register on block *apply*, and header-synced
-> blocks bypass that path.** A `consensus_rule_update` becomes `pending` only when
-> the block carrying it is applied through `engine.apply_block`
-> (`consensus/engine.py` — the sole `submit_update` call site). Blocks that a
-> follower receives via **pubsub broadcast** (the hub node1's own `createblock`
-> broadcasts) take that full path, so forward-flow governance registers on all
-> nodes. Blocks a follower obtains via **header-sync pull** do not, so a
-> governance update carried in a block minted by a *leaf* proposer never becomes
-> `pending` on the followers. In stake mode node4 (an outsider peered as a leaf)
-> is the ONLY eligible proposer, so every reverse-governance block is
-> leaf-proposed and pull-propagated — it registers on node4 alone and the vote
-> never reaches quorum network-wide. Forward activation is unaffected (proposed by
-> the hub) and restart determinism is unaffected (see `drill-node-restart`, green).
->
-> This is a node-side fix (register governance updates on the header-sync ingest
-> path too, or ensure accepted blocks are re-broadcast), out of scope for the demo
-> scripts. The `--scene propose-reverse/vote-reverse/activate-reverse` code is in
-> place and correct; it will pass once the node registers governance updates from
-> pull-propagated blocks.
+The reverse encore is a **scripted, green beat** — the door swings both ways:
+`propose-reverse` → `vote-reverse` → `activate-reverse` restores `validator_set`
+on all four nodes, node4 (the stake outsider) is refused again, and a genesis
+validator resumes proposing. The eligible proposer hands off at the activation
+boundary (node4 mines up to H, then a validator takes over to pull followers
+through the activation block), which `scene_activate_reverse` now drives
+automatically.
+
+> **Previously blocked — now fixed.** The iteration-1 note here guessed the
+> reverse was blocked by header-synced blocks bypassing the apply path. Phase 8
+> (`demo/diagnostics/ROOT_CAUSE.md`) refuted that: pulled blocks DO go through
+> `reorg_to → rebuild → engine.apply_block`. The real cause was a **mine-vs-replay
+> state-hash divergence** at the first block a node mined after a restart — a node
+> reloaded a state missing "sequence-only" accounts (validators who voted/proposed
+> but hold no funds), because `save_canonical_state_atomically` persisted accounts
+> keyed on balances only. Followers then rejected that block's hash and their
+> rebuild aborted, freezing the head. Fixed by persisting the union of balance and
+> sequence keys (Phase 9B); reorg aborts are now loud and non-destructive
+> (Phase 9A); scheduled-update payloads persist across restart (Phase 9C).
 
 The spares and drills are catalogued in `demo/spares/README.md`.
-
-## Known limitation
-
-**Scheduled-but-not-yet-activated governance updates are not persisted across a
-node restart.** The canonical-state commit persists payloads only for updates in
-the `pending` set; once an update is approved and moved to `scheduled`, its
-payload (`rule_revisions` + `host_contract_patch`) is no longer written. A node
-restarting between the approving vote and the activation height reloads the
-schedule entry without its payload and archives it at height H instead of
-activating it. This predates the stake-switch feature (it affects a scheduled
-`vote_quorum` change identically) and is why the demo checkpoints only after
-activation. Activated state (mode + rule) persists correctly and is restart-safe.

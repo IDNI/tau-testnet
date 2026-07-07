@@ -280,11 +280,11 @@ def scene5_vote(host, uid):
 
 
 def take_checkpoint(host):
-    """Snapshot the activated chain state as a rollback point. Taken AFTER
-    activation: a consistent snapshot requires stopping the nodes, and only the
-    ACTIVATED consensus params (mode + rule) are durably persisted — a snapshot
-    taken while an update is merely scheduled would not survive the restart
-    (scheduled-update payloads are not persisted; see docs/demo_stake_switch.md)."""
+    """Snapshot the activated (stake-mode) chain state as a rollback point. A
+    consistent snapshot requires stopping the nodes, so this inherently restarts
+    them; the activated consensus params reload cleanly. (Phase 9C also makes a
+    *scheduled* pre-activation checkpoint restart-safe — see `drill-abort` — but
+    the e2e checkpoints post-activation for robustness; see run_e2e.)"""
     _banner("Checkpoint — snapshot the activated (stake-mode) chain state")
     os.system(f"bash {os.path.join(DEMO, 'checkpoint.sh')} snapshot")
     if not _wait_all_ready(host):
@@ -486,11 +486,27 @@ def scene_activate_reverse(host):
     if not target:
         # already activated or scheduled height unknown: derive from head+margin
         target = int(_gov(host, NODE_PORTS[1])["head_number"]) + 1
-    miner = _eligible_miner(host)  # still stake mode -> node4 mines up to H
 
     def _reverted_all():
         return all(_gov(host, p).get("eligibility_mode") == "validator_set" for p in _all_ports())
-    if not _mine_until(host, miner, _reverted_all, rounds=30):
+
+    # The eligible proposer HANDS OFF at the activation boundary: node4 (stake)
+    # mines up to H, but the flip to validator_set at H makes node4 ineligible,
+    # so a genesis validator (node1) must take over to re-announce and pull every
+    # follower THROUGH the activation block. A fixed miner would stall here —
+    # once node4 can no longer propose, a follower still at H-1 never gets pulled
+    # forward. Re-derive the eligible miner each round so the handoff is
+    # automatic, and require all nodes to actually reach validator_set (which a
+    # lagging follower only does once it applies the activation block).
+    reverted = False
+    for _ in range(45):
+        if _wait(_reverted_all, timeout=3, interval=1.0):
+            reverted = True
+            break
+        miner = _eligible_miner(host)  # node4 pre-flip, node1 post-flip
+        createblock(host, miner)
+        _sync_head(host, miner)
+    if not reverted and not _reverted_all():
         for p in _all_ports():
             print(f"  node:{p} mode={_gov(host, p).get('eligibility_mode')}")
         _fail("reverse activation did not restore validator_set on all nodes")
@@ -564,7 +580,16 @@ def run_e2e(host):
     uid, target = scene4_propose(host)
     scene5_vote(host, uid)
     scene6_activate(host, uid, target)
-    take_checkpoint(host)          # rollback point on the activated (stake) state
+    # Checkpoint AFTER activation. Phase 9C makes a *pre*-activation (scheduled)
+    # checkpoint restart-safe too — proven by `--scene drill-abort`
+    # (checkpoint-while-scheduled -> restore -> still approved-and-scheduled) and
+    # by tests/test_scheduled_payload_persistence.py. But the e2e keeps the
+    # checkpoint post-activation for demo robustness: the eligible proposer flips
+    # at height H (genesis validators hold 0 stake and go ineligible), so a
+    # checkpoint restart placed right before the mine-to-H step can leave a
+    # freshly-rebooted leaf follower one block short of the activation block with
+    # no eligible proposer left to re-announce it.
+    take_checkpoint(host)
     scene7_outsider_mines(host)
     print("\n[e2e] scenes 1-7 all green.")
 

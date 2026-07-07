@@ -1,11 +1,18 @@
-"""Phase 9B diagnostic — pinpoint the mine-vs-replay consensus state-hash
-divergence at the FIRST empty block after a PoA->stake governance activation.
+"""Phase 9B — single-process mine-vs-replay state-hash equivalence across a
+PoA->stake governance activation.
 
-Root cause doc: demo/diagnostics/ROOT_CAUSE.md. Observed on the real network:
-an empty block mined immediately after activation (height H) changes the
-miner's consensus state hash again at H+1, but a follower's rebuild/replay of
-that same empty block reproduces the PRE-H+1 (i.e. H) state -- so
-hash_mine(H+1) != hash_replay(H+1) while hash_mine(H) == hash_replay(H).
+Root cause doc: demo/diagnostics/ROOT_CAUSE.md. The real-network divergence was
+ultimately a PERSISTENCE bug (a node reloading after a restart lost
+"sequence-only" accounts, then mined a block whose hash replay rejected — fixed
+by persisting balances∪sequences keys; regression:
+tests/test_account_persistence_determinism.py). It required a restart to bite.
+
+This test does NOT restart: it drives mine (process_new_block) and replay
+(rebuild_state_from_blockchain) in ONE process, and confirms they agree at every
+block including H and the empty blocks after it. It therefore PASSES both before
+and after the persistence fix — it is the standing guard that the in-process
+lifecycle/apply_block math is deterministic across an activation, complementing
+the restart-path regression above.
 
 This test drives BOTH code paths in a single native subprocess (process-global
 per-stream bv-width typing forces one subprocess per case; the native engine
@@ -409,16 +416,12 @@ def test_replay_determinism_across_activation(tmp_path):
     dumping the 4 `compute_consensus_state_hash` inputs. This test compares
     them block-by-block for H-1, H, H+1, H+2.
 
-    Per demo/diagnostics/ROOT_CAUSE.md this is expected to PASS at H-1 and H,
-    and FAIL at H+1 (the first empty block strictly after activation) -- that
-    failure IS the repro, not a test bug. `rebuild_state_from_blockchain`'s own
-    state-hash invariant check aborts the replay as soon as it hits that first
-    mismatch (`replay_ok=False`, `stopped_at=H+1`), matching the "H2: rebuild
-    abort" symptom in ROOT_CAUSE.md -- so this test does NOT require
-    `replay_ok` to be True; a False here alongside a divergence at H+1 is
-    itself part of the repro, not a setup failure. Block H+2 may then have no
-    REPLAY-side trace at all (never reached) -- reported as "unreachable"
-    rather than asserted on.
+    All blocks (H-1, H, H+1, H+2) must agree between the mine and replay paths:
+    the in-process lifecycle/apply_block math is deterministic across an
+    activation and the empty blocks after it. (The real-network divergence was a
+    restart-only persistence bug — this single-process harness never triggered
+    it; see the module docstring and tests/test_account_persistence_determinism.py
+    for that path.) A mismatch here would mean the core apply math regressed.
     """
     proc = _run_child(tmp_path)
     result_line = next(
@@ -470,16 +473,17 @@ def test_replay_determinism_across_activation(tmp_path):
         f"earlier than ROOT_CAUSE.md's reported divergence point (H+1)\n{table}"
     )
 
-    # H+1 (first empty block strictly after activation): THE repro. Expected
-    # to currently FAIL -- this assertion failing IS the reproduction.
+    # H+1 (first empty block strictly after activation): must match — this is
+    # the block that diverged on the real network's restart path, so the
+    # in-process paths agreeing here is the core-determinism guard.
     replay_row = trace.get((H + 1, True))
     assert replay_row is not None, (
         f"no REPLAY HASH_TRACE line for block {H + 1} at all (rebuild aborted before "
         f"even attempting it)\n{table}"
     )
     assert trace[(H + 1, False)] == replay_row, (
-        f"block {H + 1} (H+1): mine vs replay state-hash components diverge -- "
-        f"this is the reported bug (demo/diagnostics/ROOT_CAUSE.md)\n{table}\n"
+        f"block {H + 1} (H+1): mine vs replay state-hash components diverge in-process -- "
+        f"the core apply/lifecycle math regressed\n{table}\n"
         f"mine={trace[(H + 1, False)]}\nreplay={replay_row}"
     )
 
