@@ -269,6 +269,47 @@ class TestAdmissionLimits:
         assert not result.is_valid, "stream i2 not screened"
         assert "i2" in result.error
 
+    # --- Reserved consensus stake/mode operation keys (i14/i15) ---------------
+
+    def test_user_tx_reserved_stake_mode_operation_keys_rejected(self):
+        # operations["14"]/["15"] are consensus stake/mode inputs; a user tx must
+        # not set them (would poison process-global bv-width typing).
+        from consensus.admission import validate_user_tx_reserved_domains
+        for key, val in (("14", "5"), ("15", "1")):
+            result = validate_user_tx_reserved_domains(
+                {"operations": {key: val}}, self._tip_view())
+            assert not result.is_valid, f"stream {key} not screened"
+            assert key in result.error
+
+    def test_user_tx_custom_keys_around_reserved_still_accepted(self):
+        # i13 and i16 are legitimate custom input streams (regression: the new
+        # i14/i15 screen must not widen to its neighbors).
+        from consensus.admission import validate_user_tx_reserved_domains
+        for key in ("13", "16"):
+            result = validate_user_tx_reserved_domains(
+                {"operations": {key: "5"}}, self._tip_view())
+            assert result.is_valid, f"custom stream {key} wrongly screened: {result.error}"
+
+    def test_user_rule_reading_stake_mode_stream_rejected(self):
+        from consensus.admission import validate_user_tx_reserved_domains
+        rule = "always ( o13[t]:bv[16] = i14[t]:bv[16] )."
+        result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+        assert not result.is_valid, "stream i14 not screened in rule text"
+        assert "i14" in result.error
+
+    def test_user_rule_stake_stream_word_boundary_accepted(self):
+        # i140 is a distinct custom stream; the i14 screen is word-boundary safe.
+        from consensus.admission import validate_user_tx_reserved_domains
+        rule = "always ( o13[t]:bv[16] = i140[t]:bv[16] )."
+        result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+        assert result.is_valid, f"i140 mis-screened as i14: {result.error}"
+
+    def test_user_rule_stake_stream_only_in_comment_accepted(self):
+        from consensus.admission import validate_user_tx_reserved_domains
+        rule = "always ( o13[t]:bv[16] = { 0 }:bv[16] ). # not scaled by i14 stake"
+        result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+        assert result.is_valid, f"comment false-positive on i14: {result.error}"
+
     def test_consensus_revision_flat_fee_passes(self):
         from consensus.admission import stage_and_validate_consensus_revisions
         tx = {"rule_revisions": ["always (o9[t]:bv[24] = { #x00000a }:bv[24])."]}

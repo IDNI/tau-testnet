@@ -66,6 +66,23 @@ class IngestResult:
     status: str
     message: str
 
+@dataclass
+class RebuildResult:
+    """Outcome of a state-rebuild replay.
+
+    `ok=False` means the replay aborted before reaching the requested head
+    (state-hash invariant mismatch, header-verification failure, fee-rule
+    failure, or an unexpected error). Callers MUST NOT advance the canonical
+    head on a failed rebuild — the in-memory state is frozen at the last block
+    replayed successfully, so advertising a further head would violate the
+    "advertised head == applied-state head" invariant (Bug B / Phase 9A).
+    """
+    ok: bool
+    stopped_at_block: Optional[int] = None
+    computed_hash: str = ""
+    stored_hash: str = ""
+    reason: str = ""
+
 # Lock for thread-safe access to sequence numbers
 _sequence_lock = threading.Lock()
 
@@ -413,6 +430,7 @@ _genesis_accounts_state: dict = {}
 # does not end up with an empty validator set.
 _genesis_active_validators: list = []
 _genesis_vote_quorum: str = ""
+_genesis_eligibility_mode: str = ""
 # Genesis rule text, re-seeded on full rebuild so the replayed state hash
 # matches the mined chain (the reorg path replays only the new suffix, not
 # the genesis block, so its rules would otherwise be lost).
@@ -607,17 +625,16 @@ def process_new_block(block: Block) -> bool:
                 application_rules=_application_rules_state,
                 consensus_rules=_consensus_rules_state,
                 active_consensus_id=_active_consensus_id,
-                pending_updates=[{
-                    "update_id": uid.hex() if isinstance(uid, bytes) else uid,
-                    "rule_revisions": _lifecycle_manager.update_payloads[uid].rule_revisions,
-                    "activate_at_height": _lifecycle_manager.update_payloads[uid].activate_at_height,
-                    "host_contract_patch": _lifecycle_manager.update_payloads[uid].host_contract_patch,
-                    "proposer_pubkey": _lifecycle_manager.update_payloads[uid].proposer_pubkey
-                } for uid in _lifecycle_manager.pending_updates],
+                pending_updates=_persistable_update_payloads(_lifecycle_manager),
                 votes=[{"update_id": uid.hex() if isinstance(uid, bytes) else uid, "voter_pubkey": p.hex() if isinstance(p, bytes) else p} for uid, ps in _lifecycle_manager.votes.items() for p in ps],
                 scheduled=[(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates],
                 archival=[uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates],
-                active_validators=sorted(normalize_validator_set(_lifecycle_manager.active_validators))
+                active_validators=sorted(normalize_validator_set(_lifecycle_manager.active_validators)),
+                # Persist the governance-mutable consensus params on the block-apply
+                # path too (not just commit_state_to_db); otherwise an activated
+                # quorum_policy / eligibility_mode change is lost on restart.
+                quorum_policy=_lifecycle_manager.quorum_policy,
+                eligibility_mode=_lifecycle_manager.eligibility_mode,
             )
             
             # Optional: mempool eviction triggers could be mapped here using `apply_result.mempool_hints`
@@ -665,6 +682,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                 active_validators=list(_genesis_active_validators)
             )
             _lifecycle_manager.quorum_policy = _genesis_vote_quorum
+            _lifecycle_manager.eligibility_mode = _genesis_eligibility_mode
             _lifecycle_manager.recompute_approval_threshold()
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
@@ -733,11 +751,12 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
     
     if not block_rows:
         print(f"[INFO][chain_state] No new blocks found since block {start_block -1}. State is up to date.")
-        return
-    
+        return RebuildResult(ok=True)
+
     print(f"[INFO][chain_state] Found {len(block_rows)} blocks to replay.")
-    
+
     total_transactions_processed = 0
+    last_block_number = start_block - 1
     
     # Process each block in chronological order
     # Process each block in chronological order
@@ -784,7 +803,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             if tau_manager.tau_ready.is_set():
                 if not engine.verify_block_header(active_view, block, {"proof_ok": True}):
                     print(f"[ERROR][chain_state] Block #{block_number} verification failed. Aborting rebuild!")
-                    return
+                    return RebuildResult(ok=False, stopped_at_block=block_number,
+                                         reason="header verification failed")
             else:
                 print(f"[WARN][chain_state] Tau unavailable during rebuild; skipping header verification for block #{block_number}.")
             
@@ -793,7 +813,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                 apply_result = engine.apply_block(active_view, block, parent_snapshot, replay_mode=True)
             except FeeRuleError as e:
                 print(f"[ERROR][chain_state] Fee rule failure replaying block #{block_number}: {e}")
-                return
+                return RebuildResult(ok=False, stopped_at_block=block_number,
+                                     reason=f"fee rule failure: {e}")
             next_snapshot = apply_result.next_snapshot
             
             # 5. Execute Required Invariant Replay Checks (comparing state hashes)
@@ -810,7 +831,10 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                  # Legacy blocks generated prior to Phase 2 might lack this.
                  print(f"[ERROR][chain_state] Block #{block_number} state_hash invariant mismatch!")
                  print(f"  Computed: {next_snapshot.state_hash}\n  Block: {block.header.state_hash}")
-                 return
+                 return RebuildResult(ok=False, stopped_at_block=block_number,
+                                      computed_hash=next_snapshot.state_hash,
+                                      stored_hash=block.header.state_hash,
+                                      reason="state_hash invariant mismatch")
                  
             # 6. Atomically Replace In-Memory State
             with _balance_lock, _sequence_lock, _rules_lock:
@@ -835,17 +859,21 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                 print(f"[WARN][chain_state]   {len(apply_result.invalid_tx_ids)} transactions logically invalid in block #{block_number}")
             
             print(f"[DEBUG][chain_state]   Processed {len(apply_result.accepted_tx_ids)} accepted transactions")
-            
+            last_block_number = block_number
+
         except json.JSONDecodeError as e:
             print(f"[ERROR][chain_state] Failed to parse block #{block_idx}: {e}")
-            return
+            _bn = (block_data.get('header') or {}).get('block_number') if isinstance(block_data, dict) else None
+            return RebuildResult(ok=False, stopped_at_block=_bn, reason=f"json decode error: {e}")
         except KeyError as e:
             print(f"[ERROR][chain_state] Missing required field in block #{block_idx}: {e}")
-            return
+            _bn = (block_data.get('header') or {}).get('block_number') if isinstance(block_data, dict) else None
+            return RebuildResult(ok=False, stopped_at_block=_bn, reason=f"missing field: {e}")
         except Exception as e:
             print(f"[ERROR][chain_state] Unexpected error processing block #{block_idx}: {e}")
-            return
-        
+            _bn = (block_data.get('header') or {}).get('block_number') if isinstance(block_data, dict) else None
+            return RebuildResult(ok=False, stopped_at_block=_bn, reason=f"unexpected error: {e}")
+
         # Update the last processed block hash after successfully processing a block
         _canonical_head_hash = block_data['block_hash']
     
@@ -866,8 +894,10 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
         for addr, seq in active_sequences.items():
             print(f"[INFO][chain_state]   {addr[:10]}... seq = {seq}")
 
-def rebuild_state_from_blockchain(start_block=0):
-    _rebuild_state_from_blockchain_internal(start_block)
+    return RebuildResult(ok=True, stopped_at_block=last_block_number)
+
+def rebuild_state_from_blockchain(start_block=0) -> RebuildResult:
+    return _rebuild_state_from_blockchain_internal(start_block)
 
 def _hex_bytes(h: str) -> bytes:
     return bytes.fromhex(h)
@@ -887,6 +917,7 @@ def load_genesis(genesis_json_path: str):
     # Remember the artifact's pre-funded accounts for rebuild/reorg seeding,
     # regardless of whether the DB is fresh or already provisioned.
     global _genesis_accounts_state, _genesis_active_validators, _genesis_vote_quorum
+    global _genesis_eligibility_mode
     global _genesis_application_rules, _genesis_consensus_rules
     _genesis_accounts_state = {
         k: int(v) for k, v in genesis_data.get("accounts_state", {}).items()
@@ -894,6 +925,7 @@ def load_genesis(genesis_json_path: str):
     _gmeta = genesis_data.get("consensus_meta", {}) or {}
     _genesis_active_validators = list(_gmeta.get("active_validators", []) or [])
     _genesis_vote_quorum = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("vote_quorum", "")
+    _genesis_eligibility_mode = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("eligibility_mode", "")
     _genesis_application_rules = genesis_data.get("application_rules", "")
     _genesis_consensus_rules = genesis_data.get("consensus_rules", "")
 
@@ -935,6 +967,7 @@ def load_genesis(genesis_json_path: str):
             _lifecycle_manager.active_validators = normalize_validator_set(meta["active_validators"])
             # Genesis may pin the quorum policy network-wide; overrides the local config knob.
             _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
+            _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
             _lifecycle_manager.recompute_approval_threshold()
 
         commit_state_to_db(genesis_block.block_hash, 0)
@@ -983,15 +1016,29 @@ def load_genesis(genesis_json_path: str):
             _lifecycle_manager.active_validators = normalize_validator_set(meta.get("active_validators", []))
             # Genesis may pin the quorum policy network-wide; overrides the local config knob.
             _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
+            _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
             _lifecycle_manager.recompute_approval_threshold()
             commit_state_to_db(_canonical_head_hash, latest["header"]["block_number"] if latest else 0)
         print(f"[INFO][chain_state] State loaded successfully. Last known block hash: '{_canonical_head_hash[:16]}...'")
     else:
         print("[WARN][chain_state] DB has blocks but no canonical state! Rebuilding.")
-        rebuild_state_from_blockchain(start_block=0)
+        rebuild = rebuild_state_from_blockchain(start_block=0)
         latest = db.get_canonical_head_block()
-        if latest:
+        if rebuild.ok and latest:
             commit_state_to_db(latest["block_hash"], latest["block_number"])
+        elif not rebuild.ok:
+            # Preserve "advertised head == applied-state head": commit only the
+            # head we actually replayed (_canonical_head_hash), never the DB tip.
+            good = db.get_block_by_hash(_canonical_head_hash) if _canonical_head_hash else None
+            good_num = good['header']['block_number'] if good else 0
+            logger.error(
+                "[chain_state] Startup rebuild aborted at block #%s (reason=%s); "
+                "committing last-good head %s... (num %s) instead of DB tip.",
+                rebuild.stopped_at_block, rebuild.reason,
+                (_canonical_head_hash or '')[:16], good_num,
+            )
+            if _canonical_head_hash:
+                commit_state_to_db(_canonical_head_hash, good_num)
         
 def get_balance(address_hex: str) -> int:
     """Returns the balance of the given address. Returns 0 if address not found."""
@@ -999,6 +1046,13 @@ def get_balance(address_hex: str) -> int:
         if address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
             return int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
         return _balances.get(address_hex, 0)
+
+def get_committed_balance(address: str) -> int:
+    """Raw committed balance lookup (no auto-faucet shim). Used for advisory
+    eligibility dry-runs; consensus verification reads parent-snapshot balances
+    instead."""
+    with _balance_lock:
+        return int(_balances.get(address, 0))
 
 def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, amount: int) -> bool:
     """
@@ -1254,6 +1308,34 @@ def save_application_rules_state(rules_content: str):
         _application_rules_state = rules_content or ""
 
 
+def _persistable_update_payloads(lm) -> list:
+    """Payload rows for `consensus_updates_v2`: PENDING *and* SCHEDULED updates
+    (Phase 9C / Finding 2).
+
+    Previously only PENDING updates' payloads were persisted. A node restarting
+    in the window between an update being approved-and-scheduled and its
+    activation height reloaded the scheduled (height, uid) entry but NOT the
+    payload, so `process_height_transitions` at H found `uid not in
+    update_payloads` and silently skipped applying the revision/patch -> fork
+    from peers. Persisting scheduled payloads here is node-local durability: the
+    pending vs scheduled *status* is tracked separately (the pending set and the
+    scheduled list), so this does NOT change `consensus_meta_hash`.
+    """
+    uids = set(lm.pending_updates) | {uid for _, uid in lm.scheduled_updates}
+    rows = []
+    for uid in uids:
+        u = lm.update_payloads.get(uid)
+        if u is None:
+            continue
+        rows.append({
+            "update_id": uid.hex() if isinstance(uid, bytes) else uid,
+            "rule_revisions": u.rule_revisions,
+            "activate_at_height": u.activate_at_height,
+            "host_contract_patch": u.host_contract_patch,
+            "proposer_pubkey": u.proposer_pubkey,
+        })
+    return rows
+
 def save_effective_tau_spec(canonical_rule_text: str):
     """
     Append ONE canonical (full-width, pre-shrink) application rule to the raw
@@ -1327,7 +1409,15 @@ def load_state_from_db() -> bool:
 
         scheduled_updates = [(height, _update_id_bytes(uid)) for height, uid in scheduled]
         archival_updates = [_update_id_bytes(uid) for uid in archival]
-        pending_update_ids = [_update_id_bytes(p['update_id']) for p in pending_updates]
+        # `consensus_updates_v2` now stores payloads for pending AND scheduled
+        # updates (Phase 9C). The PENDING *set* must exclude scheduled uids —
+        # they are tracked in `scheduled_updates` and counting them as pending
+        # too would corrupt `consensus_meta_hash` and re-run scheduling logic.
+        _scheduled_uid_set = {uid for _, uid in scheduled_updates}
+        pending_update_ids = [
+            uid for uid in (_update_id_bytes(p['update_id']) for p in pending_updates)
+            if uid not in _scheduled_uid_set
+        ]
 
         _lifecycle_manager = ConsensusLifecycleManager(
             pending_updates=pending_update_ids,
@@ -1347,6 +1437,10 @@ def load_state_from_db() -> bool:
         persisted_quorum = db.get_chain_state_value("quorum_policy", _MISSING)
         _lifecycle_manager.quorum_policy = (
             _genesis_vote_quorum if persisted_quorum == _MISSING else persisted_quorum
+        )
+        persisted_mode = db.get_chain_state_value("eligibility_mode", _MISSING)
+        _lifecycle_manager.eligibility_mode = (
+            _genesis_eligibility_mode if persisted_mode == _MISSING else persisted_mode
         )
         _lifecycle_manager.recompute_approval_threshold()
         for p in pending_updates:
@@ -1378,12 +1472,13 @@ def commit_state_to_db(block_hash: str, block_number: int):
         app_rules_snapshot = _application_rules_state
         cons_rules_snapshot = _consensus_rules_state
         cons_id_snapshot = _active_consensus_id
-        pending_updates_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "rule_revisions": v.rule_revisions, "activate_at_height": v.activate_at_height, "host_contract_patch": v.host_contract_patch, "proposer_pubkey": v.proposer_pubkey} for k, v in _lifecycle_manager.update_payloads.items() if k in _lifecycle_manager.pending_updates]
+        pending_updates_list = _persistable_update_payloads(_lifecycle_manager)
         votes_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "voter_pubkey": pub.hex() if isinstance(pub, bytes) else pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
         scheduled_list = [(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates]
         archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
         active_validators_list = sorted(normalize_validator_set(_lifecycle_manager.active_validators))
         quorum_policy_snapshot = _lifecycle_manager.quorum_policy
+        eligibility_mode_snapshot = _lifecycle_manager.eligibility_mode
 
     db.save_canonical_state_atomically(
         block_hash, block_number,
@@ -1392,6 +1487,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         pending_updates_list, votes_list, scheduled_list, archival_list,
         active_validators=active_validators_list,
         quorum_policy=quorum_policy_snapshot,
+        eligibility_mode=eligibility_mode_snapshot,
     )
 
 def tick_governance(height: int):
@@ -1468,9 +1564,23 @@ def initialize_persistent_state(genesis_json_path: str = "data/genesis.json"):
     if _canonical_head_hash != latest_hash:
         print(f"[WARN][chain_state] State-DB mismatch! State hash: '{_canonical_head_hash[:16]}...', DB hash: '{latest_hash[:16]}...'.")
         print("[INFO][chain_state] Triggering full state rebuild due to mismatch.")
-        rebuild_state_from_blockchain(start_block=0)
-        print(f"[DEBUG][chain_state] Rebuild complete. Committing state with latest block hash: '{latest_hash[:16]}...'")
-        commit_state_to_db(latest_hash, latest_num)
+        rebuild = rebuild_state_from_blockchain(start_block=0)
+        if rebuild.ok:
+            print(f"[DEBUG][chain_state] Rebuild complete. Committing state with latest block hash: '{latest_hash[:16]}...'")
+            commit_state_to_db(latest_hash, latest_num)
+        else:
+            # Do not advertise a head we never applied (Bug B). Commit the head
+            # we actually replayed to keep advertised head == applied state.
+            good = db.get_block_by_hash(_canonical_head_hash) if _canonical_head_hash else None
+            good_num = good['header']['block_number'] if good else 0
+            logger.error(
+                "[chain_state] Startup rebuild aborted at block #%s (reason=%s); "
+                "committing last-good head %s... (num %s) instead of DB tip %s....",
+                rebuild.stopped_at_block, rebuild.reason,
+                (_canonical_head_hash or '')[:16], good_num, (latest_hash or '')[:16],
+            )
+            if _canonical_head_hash:
+                commit_state_to_db(_canonical_head_hash, good_num)
     else:
         print(f"[INFO][chain_state] Persistent state is consistent and up-to-date with the blockchain.")
 
@@ -1526,6 +1636,10 @@ def select_best_head(candidates: list[tuple[str, int]]) -> str | None:
 def ingest_block(block: Block) -> IngestResult:
     import db, config
     engine = TauConsensusEngine()
+    # NOTE: legacy verify signature (no active_view): membership/stake gates and
+    # the parent-state stake input do NOT run here. This pre-filter only checks
+    # the Tau o6 verdict; canonical acceptance re-verifies with full parent
+    # state via process_new_block / the rebuild path.
     if not engine.verify_block_header(block):
         return IngestResult('invalid', "Block verification failed")
     
@@ -1552,41 +1666,56 @@ def ingest_block(block: Block) -> IngestResult:
     db.add_block(block)
     return IngestResult('added', "Block ingested to DB")
 
-def maybe_update_canonical_head():
+def maybe_update_canonical_head() -> Optional[bool]:
+    """Evaluate candidate heads and reorg to the best one if it beats the
+    current canonical head.
+
+    Returns reorg_to's verdict: True if the head advanced, False if a reorg was
+    attempted but ABORTED by a rebuild failure (head unchanged — a later
+    candidate evaluation may retry), or None if there was nothing to do.
+    """
     import db
     candidates = db.get_candidate_heads()
     if not candidates:
-        return
-        
+        return None
+
     valid_cands = []
     for cand_hash, cand_height in candidates:
         if _is_reachable_from_genesis(cand_hash):
             valid_cands.append((cand_hash, cand_height))
-            
+
     best_hash = select_best_head(valid_cands)
     if not best_hash:
-        return
-        
+        return None
+
     with _chain_lock:
         current_head = db.get_canonical_head()
         current_hash = current_head.get('block_hash') if current_head else ''
         if best_hash != current_hash:
-            reorg_to(best_hash)
+            return reorg_to(best_hash)
+    return None
 
-def reorg_to(new_head_hash: str):
+def reorg_to(new_head_hash: str) -> Optional[bool]:
+    """Reorg the canonical head to `new_head_hash`.
+
+    Returns True if the head advanced (state rebuilt + committed), False if the
+    reorg was ABORTED because the rebuild replay failed (canonical head left
+    unchanged; in-memory state restored to the prior head), or None for a no-op
+    (already at target, or the target path is unreachable).
+    """
     import db, config
-    
+
     current_head = db.get_canonical_head()
     old_head_hash = current_head.get('block_hash') if current_head else db.get_genesis_hash()
-    
+
     if old_head_hash == new_head_hash:
-        return
-        
+        return None
+
     try:
         new_path = db.get_chain_path(new_head_hash, db.get_genesis_hash())
     except ValueError:
-        return
-        
+        return None
+
     old_path = []
     if old_head_hash != db.get_genesis_hash():
         try:
@@ -1624,8 +1753,41 @@ def reorg_to(new_head_hash: str):
                 
     # Phase 3: Apply State Rebuild
     db.reset_mempool_reservations()
-    _rebuild_state_from_blockchain_internal(0, path_hashes=new_path)
-    
+    rebuild = _rebuild_state_from_blockchain_internal(0, path_hashes=new_path)
+
+    # Phase 3b: Abort guard (Bug B). If the replay failed, the in-memory state
+    # is frozen at the last block it replayed successfully — NOT at new_head.
+    # Committing new_head here would advertise a head ahead of applied state
+    # (the exact silent inconsistency that masked the mine-vs-replay
+    # divergence). Instead: keep the DB canonical head where it was, restore
+    # in-memory + live-interpreter state to the (known-good) prior head by
+    # replaying it, and report failure. Mempool reservations were unreserved
+    # above; they stay pending (no chain change), so no txs are lost.
+    if rebuild is None or not rebuild.ok:
+        stopped = getattr(rebuild, 'stopped_at_block', None)
+        computed = getattr(rebuild, 'computed_hash', '') or ''
+        stored = getattr(rebuild, 'stored_hash', '') or ''
+        reason = getattr(rebuild, 'reason', 'unknown') if rebuild else 'no result'
+        logger.error(
+            "[chain_state] Reorg to %s... ABORTED: rebuild failed at block #%s "
+            "(reason=%s, computed=%s..., stored=%s...). Canonical head NOT "
+            "advanced; restoring prior head %s...",
+            new_head_hash[:16], stopped, reason, computed[:16], stored[:16],
+            (old_head_hash or '')[:16],
+        )
+        # Restore consistent state at the prior head. old_path==[] (prior head
+        # was genesis) resets to the genesis baseline; a non-empty old_path
+        # replays the known-good canonical chain.
+        restore = _rebuild_state_from_blockchain_internal(0, path_hashes=old_path)
+        if restore is None or not restore.ok:
+            logger.error(
+                "[chain_state] Reorg abort recovery FAILED to restore prior head "
+                "%s... (reason=%s). In-memory state may be inconsistent.",
+                (old_head_hash or '')[:16],
+                getattr(restore, 'reason', 'no result') if restore else 'no result',
+            )
+        return False
+
     # Phase 4: Atomic Commit of Rebuilt State
     with _balance_lock, _sequence_lock, _rules_lock:
         b = dict(_balances)
@@ -1633,7 +1795,7 @@ def reorg_to(new_head_hash: str):
         app_r = _application_rules_state
         cons_r = _consensus_rules_state
         cons_id = _active_consensus_id
-        pending_updates_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "rule_revisions": v.rule_revisions, "activate_at_height": v.activate_at_height, "host_contract_patch": v.host_contract_patch, "proposer_pubkey": v.proposer_pubkey} for k, v in _lifecycle_manager.update_payloads.items() if k in _lifecycle_manager.pending_updates]
+        pending_updates_list = _persistable_update_payloads(_lifecycle_manager)
         votes_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "voter_pubkey": pub.hex() if isinstance(pub, bytes) else pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
         scheduled_list = [(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates]
         archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
@@ -1651,7 +1813,9 @@ def reorg_to(new_head_hash: str):
             votes_list,
             scheduled_list,
             archival_list,
-            active_validators=active_validators_list
+            active_validators=active_validators_list,
+            quorum_policy=_lifecycle_manager.quorum_policy,
+            eligibility_mode=_lifecycle_manager.eligibility_mode,
         )
     
     # Phase 5: Mempool Restore
@@ -1665,4 +1829,6 @@ def reorg_to(new_head_hash: str):
                 db.add_mempool_tx(json.dumps(tx, separators=(",", ":")), tx_id, int(time.time() * 1000))
             except Exception as e:
                 logger.error(f"[chain_state] Failed to restore tx {tx_id} to mempool: {e}")
-    
+
+    return True
+

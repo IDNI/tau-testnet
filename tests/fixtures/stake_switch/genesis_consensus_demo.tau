@@ -1,0 +1,12 @@
+# Tau-Driven Consensus — stake-switch demo genesis (mode-guarded)
+#
+# Identical to the v1 interface (i6..i11 / o6 / o7) plus:
+#   i14: proposer parent-state balance (bv[64])
+#   i15: eligibility mode flag, 0 = validator_set, 1 = stake (bv[16])
+#
+# o7 is constrained ONLY when i15 = 0, so a governance revision that defines
+# stake-based o7 for i15 = 1 composes with this rule without contradiction.
+always (
+    o6[t]:bv[16] = i10[t]:bv[16] &&
+    ( i15[t]:bv[16] != { 0 }:bv[16] || o7[t]:bv[16] = { 1 }:bv[16] )
+)

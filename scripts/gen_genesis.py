@@ -21,9 +21,10 @@ from block import BlockHeader, sha256_hex
 def get_args():
     import argparse
     parser = argparse.ArgumentParser(description="Generate canonical genesis.json artifact.")
-    key_group = parser.add_mutually_exclusive_group(required=True)
-    key_group.add_argument("--validator-key", type=str, help="96-character hex BLS public key (48 bytes, no 0x prefix)")
-    key_group.add_argument("--validator-privkey", type=str, help="64-character hex BLS private key (32 bytes). Public key will be derived automatically.")
+    parser.add_argument("--validator-key", action="append", default=[],
+                        help="96-character hex BLS public key (48 bytes, no 0x prefix). Repeatable.")
+    parser.add_argument("--validator-privkey", action="append", default=[],
+                        help="64-character hex BLS private key (32 bytes); public key derived. Repeatable.")
     parser.add_argument("--genesis-rules-path", type=str, default="genesis.tau", help="Path to genesis.tau")
     parser.add_argument("--genesis-consensus-path", type=str, default="genesis_consensus.tau", help="Path to genesis_consensus.tau")
     parser.add_argument("--genesis-address", type=str, default="f427fbf4cb8cc5ebcfc50add98ba574b94c03b1e32626e2e50cf60ba5e0a6d0c42d3ed702c2e0eeef7fae29bc4f3d2f9", help="Genesis address")
@@ -55,13 +56,25 @@ def get_args():
             "an activated governance host_contract_patch."
         ),
     )
+    parser.add_argument(
+        "--eligibility-mode", type=str, default="validator_set",
+        help=(
+            "Proposer-eligibility regime pinned network-wide into genesis "
+            "consensus_meta: 'validator_set' (PoA, default) or 'stake'."
+        ),
+    )
     args = parser.parse_args()
     # Validate with the same grammar the runtime/admission uses so a bad genesis
     # value fails loudly here instead of silently falling back at consensus time.
-    from consensus.governance import validate_quorum_policy
+    from consensus.governance import validate_quorum_policy, validate_eligibility_mode
     _q_err = validate_quorum_policy(args.vote_quorum)
     if _q_err:
         parser.error(f"--vote-quorum {_q_err}")
+    _m_err = validate_eligibility_mode(args.eligibility_mode)
+    if _m_err:
+        parser.error(f"--eligibility-mode {_m_err}")
+    if not args.validator_key and not args.validator_privkey:
+        parser.error("at least one --validator-key or --validator-privkey is required")
     return args
 
 def derive_pubkey_from_privkey(privkey_hex: str) -> str:
@@ -129,7 +142,19 @@ def validate_consensus_rules(rules: str):
             
             if 6 not in outputs or outputs[6] != "0":
                 raise ValueError(f"Consensus rule ABI violation: evaluating i10=0 (invalid proof) MUST yield o6=0 strictly! Got outputs: {outputs}")
-            
+
+            # Mode-guarded rules: with a valid proof in validator_set mode
+            # (i15=0) the proposer must be eligible (o7=1). Guarded on `7 in
+            # outputs2` because the shipped public rule does not reference i15
+            # and may not emit o7 for these inputs in this harness.
+            inputs2 = {"10": "1", "15": "0"}
+            outputs2 = tau_ctx.communicate_multi(input_stream_values=inputs2)
+            if 7 in outputs2 and outputs2[7] != "1":
+                raise ValueError(
+                    f"Consensus rule ABI violation: with i10=1 and i15=0 (validator_set mode), "
+                    f"o7 MUST be 1. Got outputs: {outputs2}"
+                )
+
             print("[INFO] Validated: consensus_rules static check passed for o6 mapping.")
         finally:
             os.remove(temp_path)
@@ -142,12 +167,16 @@ def validate_consensus_rules(rules: str):
 def main():
     args = get_args()
 
-    # Support --validator-privkey as a convenience: derive the public key
-    if args.validator_privkey:
-        pubkey_hex = derive_pubkey_from_privkey(args.validator_privkey)
-        active_validator_bytes = validate_validator_key(pubkey_hex)
-    else:
-        active_validator_bytes = validate_validator_key(args.validator_key)
+    # Validator set: derive any privkeys, merge with explicit pubkeys, then
+    # dedupe + sort so the artifact is canonical and order-independent.
+    validator_keys = []
+    for priv in args.validator_privkey:
+        validator_keys.append(derive_pubkey_from_privkey(priv))
+    validator_keys.extend(args.validator_key)
+    if not validator_keys:
+        raise ValueError("Provide at least one --validator-key or --validator-privkey")
+    validator_keys = sorted({k.lower() for k in validator_keys})
+    validator_key_bytes = [validate_validator_key(k) for k in validator_keys]
     
     with open(args.genesis_rules_path, "r", encoding="utf-8") as f:
         application_rules = f.read()
@@ -196,17 +225,23 @@ def main():
     accounts_hash_bytes = compute_accounts_hash(genesis_accounts, genesis_sequences)
 
     # 2. Consensus Meta Domain
+    # eligibility_mode is included ONLY when non-default so a default genesis is
+    # byte-identical to one produced before this field existed (hash-compat).
+    # This conditional MUST match ConsensusLifecycleManager.consensus_meta_hash.
+    mech_meta = {"vote_quorum": args.vote_quorum}
+    if args.eligibility_mode != "validator_set":
+        mech_meta["eligibility_mode"] = args.eligibility_mode
     consensus_meta = {
         "proof_scheme": "bls_header_sig",
         "fork_choice_scheme": "height_then_hash",
         "input_contract_version": 1,
-        "active_validators": [args.validator_key],
+        "active_validators": validator_keys,
         "pending_updates": [],
         "vote_records": [],
         "activation_schedule": [],
         "checkpoint_references": [],
         # vote_quorum pins the governance quorum policy network-wide.
-        "mechanism_specific_metadata": {"vote_quorum": args.vote_quorum}
+        "mechanism_specific_metadata": mech_meta
     }
 
     # The genesis meta hash MUST use the exact same recipe the runtime replays
@@ -218,7 +253,7 @@ def main():
     # would make block 0 fail its own state-hash invariant on replay.
     consensus_meta_hash_bytes = compute_consensus_meta_hash(
         host_contract={},
-        active_validators=[active_validator_bytes],
+        active_validators=validator_key_bytes,
         pending_updates=[],
         vote_records=[],
         activation_schedule=[],

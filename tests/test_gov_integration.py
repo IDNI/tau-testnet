@@ -353,6 +353,69 @@ def test_apply_block_activates_vote_quorum_change():
     assert post_lm.approval_threshold == 3
 
 
+def test_apply_block_activates_eligibility_mode_change():
+    """A scheduled host_contract_patch carrying `eligibility_mode` activates
+    through `engine.apply_block`; the post-activation lifecycle manager reflects
+    the new mode (bound into the block state hash via consensus_meta_hash)."""
+    from unittest.mock import patch as _patch
+    from consensus.engine import TauConsensusEngine, ActiveConsensusView
+    from consensus.governance import (
+        ConsensusLifecycleManager,
+        ConsensusRuleUpdate,
+        ConsensusRuleVote,
+    )
+    from consensus.state import TauStateSnapshot
+    from block import Block
+
+    validators_hex = ["a" * 96, "b" * 96, "c" * 96]  # n=3, supermajority threshold 2
+    proposer_hex = validators_hex[0]
+    activate_at = 7
+
+    update = ConsensusRuleUpdate(
+        rule_revisions=["always ( o6[t]:bv[16] = { 0 }:bv[16] )."],
+        activate_at_height=activate_at,
+        host_contract_patch={"eligibility_mode": "stake"},
+    )
+
+    lm = ConsensusLifecycleManager(active_validators=validators_hex)
+    assert lm.submit_update(update)
+    lm.submit_vote(ConsensusRuleVote(update.update_id, True), bytes.fromhex(validators_hex[0]))
+    lm.submit_vote(ConsensusRuleVote(update.update_id, True), bytes.fromhex(validators_hex[1]))
+    assert any(uid == update.update_id for _, uid in lm.scheduled_updates)
+
+    parent_snapshot = TauStateSnapshot(
+        state_hash="0" * 64,
+        tau_bytes=b"always (o0[t]=1).",
+        metadata={
+            "balances": {},
+            "sequence_numbers": {},
+            "lifecycle_manager": lm,
+            "consensus_rules_state": "always (o6[t]:bv[64] = i10[t]:bv[64]).",
+            "active_consensus_id": "",
+        },
+    )
+    active_view = ActiveConsensusView(
+        target_height=activate_at,
+        consensus_rules=parent_snapshot.metadata["consensus_rules_state"],
+        active_validators=[bytes.fromhex(v) for v in validators_hex],
+        mechanism_specific_metadata={"poa": True},
+    )
+    block_obj = Block.create(
+        block_number=activate_at,
+        previous_hash="00" * 32,
+        transactions=[],
+        proposer_pubkey=proposer_hex,
+        timestamp=1234567890,
+    )
+
+    engine = TauConsensusEngine()
+    with _patch("tau_manager.communicate_with_tau", side_effect=lambda **k: "T"):
+        result = engine.apply_block(active_view, block_obj, parent_snapshot)
+
+    post_lm = result.next_snapshot.metadata["lifecycle_manager"]
+    assert post_lm.effective_eligibility_mode() == "stake"
+
+
 def test_apply_block_activates_multiple_updates_in_uid_order():
     """
     Determinism regression: when two updates share an `activate_at_height`,

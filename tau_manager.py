@@ -582,6 +582,10 @@ def communicate_with_tau_multi(
                 result[1] = tau_defs.TRANSACTION_VALIDATION_SUCCESS
         else:
             result[1] = tau_defs.TRANSACTION_VALIDATION_SUCCESS
+        # Consensus verify in stake mode reads o6/o7 from this dict; default
+        # them to "valid/eligible" in test mode like the single-target shim does.
+        result.setdefault(6, "1")
+        result.setdefault(7, "1")
         return result
 
     if not tau_direct_interface:

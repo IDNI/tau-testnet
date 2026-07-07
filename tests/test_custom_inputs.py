@@ -100,6 +100,39 @@ class TestCustomInputs(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("12", result["message"])
 
+    def test_sendtx_reject_keys_14_15_stake_mode(self):
+        """operations["14"]/["15"] (consensus stake/mode inputs) are rejected at
+        admission before they can pin a conflicting bv width process-wide."""
+        for key in ("14", "15"):
+            payload = {
+                "sender_pubkey": "a" * 96,
+                "sequence_number": 1,
+                "expiration_time": 9999999999,
+                "operations": {key: "5"},
+                "fee_limit": 100,
+                "signature": "00" * 48,
+            }
+            with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
+                with patch('commands.sendtx.db.add_mempool_tx'):
+                    result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
+            self.assertFalse(result["ok"], msg=f"key {key} accepted")
+            self.assertIn(key, result["message"])
+
+    def test_engine_apply_rejects_reserved_stake_stream(self):
+        """Apply-time defense: operations["14"]/["15"] are hard-rejected in
+        engine.apply so it agrees with the sendtx/admission gate."""
+        for key in ("14", "15"):
+            mock_store = MagicMock()
+            mock_store.commit.return_value = TauStateSnapshot(b"", b"", {})
+            engine = TauConsensusEngine(state_store=mock_store)
+            snapshot = TauStateSnapshot(b"hash", b"rules", {})
+            tx = {"tx_id": f"tx_{key}", "operations": {key: "5"}}
+            result = engine.apply(snapshot, [tx], 1700000000)
+            self.assertEqual(len(result.rejected_transactions), 1, msg=f"key {key} not rejected")
+            receipt = result.receipts[f"tx_{key}"]
+            self.assertEqual(receipt["status"], "failed")
+            self.assertIn(f"reserved stream {key}", " ".join(receipt["logs"]))
+
     def test_sendtx_accept_custom_keys(self):
         """Test that sendtx accepts keys >= 5 and normalizes values."""
         

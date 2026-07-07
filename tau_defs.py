@@ -115,7 +115,8 @@ TAU_INPUT_STREAM_TIMESTAMP = "i5"
 # NOT in this set: this constant is shared with the engine, which uses it for
 # other purposes, so i12 is screened explicitly at every ingest/apply site
 # (commands/sendtx.py, consensus/admission.py, consensus/engine.py). User custom
-# input streams therefore start at i13.
+# input streams therefore start at i16 (i12/i14/i15 are screened explicitly at
+# every ingest/apply site).
 RESERVED_STREAMS = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
 
 # --- Tau Consensus ABI v1 ---
@@ -132,3 +133,14 @@ TAU_INPUT_STREAM_CLAIMS = "i11"         # Endorsed claims summary (claims_yid, l
 # Outputs
 TAU_OUTPUT_STREAM_BLOCK_VALID = "o6"    # Block validity verdict (1 for accept, 0 for reject)
 TAU_OUTPUT_STREAM_ELIGIBLE = "o7"       # Proposer eligibility verdict (1 for eligible, 0 for ineligible)
+
+# --- Tau Consensus ABI v1.1 additions (stake-eligibility) ---
+TAU_INPUT_STREAM_PROPOSER_STAKE = "i14"   # Proposer parent-state balance (uint64 string)
+TAU_INPUT_STREAM_ELIGIBILITY_MODE = "i15" # 0 = validator_set, 1 = stake (bv[16])
+
+# Operations keys reserved OUTSIDE RESERVED_STREAMS (that set is shared with the
+# engine for other purposes, so these are screened explicitly at every
+# ingest/apply site: commands/sendtx.py, consensus/admission.py,
+# consensus/engine.py). i12 = sender pubkey; i14/i15 = consensus stake/mode
+# inputs. User custom input streams therefore start at i16.
+EXTRA_RESERVED_OPERATION_KEYS = (12, 14, 15)

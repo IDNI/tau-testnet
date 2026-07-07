@@ -42,6 +42,23 @@ def validate_quorum_policy(policy: Any) -> Optional[str]:
         "(N a decimal integer 1..999999999, no leading zero)"
     )
 
+# Eligibility-mode grammar (shared by genesis tooling, admission, and the
+# runtime). Closed set of canonical strings so update_ids and the consensus
+# meta hash stay byte-stable.
+ELIGIBILITY_MODES = ("validator_set", "stake")
+DEFAULT_ELIGIBILITY_MODE = "validator_set"
+
+
+def validate_eligibility_mode(mode: Any) -> Optional[str]:
+    """Return an error string if `mode` is not a deployable eligibility mode,
+    else None. Rejects the empty string here (it is only legal as the internal
+    'genesis did not pin' sentinel, never as an authored/activated value)."""
+    if not isinstance(mode, str):
+        return "must be a string"
+    if mode in ELIGIBILITY_MODES:
+        return None
+    return "must be 'validator_set' or 'stake'"
+
 # Network-wide quorum policy used when genesis does not pin one. The consensus
 # tally MUST resolve to a deterministic value here and never read per-node
 # config: two nodes with different TAU_VALIDATOR_VOTE_QUORUM would otherwise
@@ -248,6 +265,13 @@ class ConsensusLifecycleManager:
         # and persisted so a reload reproduces it. It is NEVER read from per-node
         # config (fork hazard) and is bound into the consensus state hash.
         self.quorum_policy: str = ""
+        # Eligibility mode mirrors quorum_policy exactly: "" until the genesis
+        # value is loaded (then resolves to DEFAULT_ELIGIBILITY_MODE), mutable
+        # at runtime via an activated host_contract_patch carrying
+        # "eligibility_mode", persisted, NEVER read from per-node config, and
+        # bound into the consensus state hash (only when != default, to keep
+        # existing chains' hashes byte-stable).
+        self.eligibility_mode: str = ""
         self.recompute_approval_threshold()
 
     def effective_quorum_policy(self) -> str:
@@ -255,6 +279,11 @@ class ConsensusLifecycleManager:
         the network-wide DEFAULT_QUORUM_POLICY. Never reads per-node config, so
         every node with the same genesis resolves the same threshold."""
         return self.quorum_policy or DEFAULT_QUORUM_POLICY
+
+    def effective_eligibility_mode(self) -> str:
+        """Deterministic resolved eligibility mode: the genesis-pinned value,
+        else DEFAULT_ELIGIBILITY_MODE. Never reads per-node config."""
+        return self.eligibility_mode or DEFAULT_ELIGIBILITY_MODE
 
     def recompute_approval_threshold(self) -> int:
         policy = self.effective_quorum_policy()
@@ -291,6 +320,11 @@ class ConsensusLifecycleManager:
         vote_records = [
             (uid, voter) for uid, voters in self.votes.items() for voter in voters
         ]
+        mech = {"vote_quorum": self.effective_quorum_policy()}
+        # Included ONLY when non-default so every pre-existing chain state
+        # keeps a byte-identical meta hash (hash-compat).
+        if self.effective_eligibility_mode() != DEFAULT_ELIGIBILITY_MODE:
+            mech["eligibility_mode"] = self.effective_eligibility_mode()
         return compute_consensus_meta_hash(
             host_contract={},
             active_validators=list(self.active_validators),
@@ -298,7 +332,7 @@ class ConsensusLifecycleManager:
             vote_records=vote_records,
             activation_schedule=self.scheduled_updates,
             checkpoint_references=[],
-            mechanism_specific_metadata={"vote_quorum": self.effective_quorum_policy()},
+            mechanism_specific_metadata=mech,
         )
 
     def preview_validator_patch(self, patch: Optional[Dict[str, Any]]) -> set[str]:
@@ -338,6 +372,12 @@ class ConsensusLifecycleManager:
             if err:
                 raise ValueError(f"vote_quorum: {err}")
             self.quorum_policy = policy
+        if "eligibility_mode" in patch:
+            mode = patch["eligibility_mode"]
+            err = validate_eligibility_mode(mode)
+            if err:
+                raise ValueError(f"eligibility_mode: {err}")
+            self.eligibility_mode = mode
         self.recompute_approval_threshold()
 
     def knows_update(self, update_id: bytes) -> bool:

@@ -167,3 +167,47 @@ def test_legacy_db_without_quorum_key_falls_back_to_genesis(temp_database, monke
     chain_state._lifecycle_manager = ConsensusLifecycleManager(active_validators=["d" * 96])
     assert chain_state.load_state_from_db() is True
     assert chain_state._lifecycle_manager.quorum_policy == "majority"
+
+
+def test_eligibility_mode_persists_and_reloads(temp_database):
+    # A governance-activated eligibility mode survives a reload rather than
+    # reverting to the genesis value (mirrors quorum_policy).
+    validators = ["a" * 96, "b" * 96, "c" * 96]
+    chain_state._balances.clear()
+    chain_state._sequence_numbers.clear()
+    chain_state._application_rules_state = "app rules"
+    chain_state._consensus_rules_state = "consensus rules"
+    chain_state._active_consensus_id = ""
+    lm = ConsensusLifecycleManager(active_validators=validators)
+    lm.eligibility_mode = "stake"
+    chain_state._lifecycle_manager = lm
+
+    chain_state.commit_state_to_db("head-hash", 11)
+    chain_state._lifecycle_manager = ConsensusLifecycleManager(active_validators=["d" * 96])
+
+    assert chain_state.load_state_from_db() is True
+    assert chain_state._lifecycle_manager.eligibility_mode == "stake"
+
+
+def test_legacy_db_without_eligibility_mode_falls_back_to_genesis(temp_database, monkeypatch):
+    # A DB written before eligibility_mode was persisted has no
+    # 'eligibility_mode' row; the loader must fall back to the genesis value.
+    import db
+    validators = ["a" * 96, "b" * 96, "c" * 96]
+    chain_state._balances.clear()
+    chain_state._sequence_numbers.clear()
+    chain_state._application_rules_state = "app rules"
+    chain_state._consensus_rules_state = "consensus rules"
+    chain_state._active_consensus_id = ""
+    chain_state._lifecycle_manager = ConsensusLifecycleManager(active_validators=validators)
+    chain_state.commit_state_to_db("head-hash", 3)
+
+    # Simulate a legacy DB: drop the persisted eligibility_mode row.
+    with db._db_lock:
+        db._db_conn.execute("DELETE FROM chain_state WHERE key = 'eligibility_mode'")
+        db._db_conn.commit()
+
+    monkeypatch.setattr(chain_state, "_genesis_eligibility_mode", "stake")
+    chain_state._lifecycle_manager = ConsensusLifecycleManager(active_validators=["d" * 96])
+    assert chain_state.load_state_from_db() is True
+    assert chain_state._lifecycle_manager.eligibility_mode == "stake"

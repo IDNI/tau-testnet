@@ -1611,10 +1611,20 @@ class NetworkService:
                     continue
                     
             try:
-                chain_state.maybe_update_canonical_head()
+                head_status = chain_state.maybe_update_canonical_head()
+                if head_status is False:
+                    # A reorg was attempted but the state rebuild aborted (Bug B
+                    # class: mine-vs-replay divergence, verification/fee failure).
+                    # The canonical head was deliberately NOT advanced — do not
+                    # let this hide behind the generic swallow below.
+                    logger.error(
+                        "Canonical head NOT advanced: rebuild aborted during reorg "
+                        "after ingesting %d block(s) from %s (see chain_state error "
+                        "log for the failing block# and hashes)", ingested, peer_id,
+                    )
             except Exception as e:
                 logger.error("Failed to update canonical head after sync: %s", e)
-                
+
             return ingested
 
         try:

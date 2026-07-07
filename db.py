@@ -1156,7 +1156,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
     """
@@ -1200,13 +1200,32 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                     'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
                     ('quorum_policy', quorum_policy)
                 )
+            if eligibility_mode is not None:
+                # Persist the (possibly governance-activated) eligibility mode so a
+                # node reloading from disk reproduces the same proposer-eligibility
+                # regime as a freshly-rebuilt or freshly-synced peer. Stored
+                # verbatim, including "" (genesis did not pin).
+                _db_conn.execute(
+                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+                    ('eligibility_mode', eligibility_mode)
+                )
 
             _db_conn.execute('DELETE FROM accounts')
-            for address, balance in balances.items():
-                seq = sequences.get(address, 0)
+            # Persist a row for EVERY account that has a balance OR a sequence
+            # number. Iterating balances.items() alone dropped "sequence-only"
+            # accounts — validators who submitted a governance tx (proposal or
+            # vote) but hold no funds, so they exist in `sequences` (seq
+            # incremented) but never in `balances`. compute_consensus_state_hash's
+            # accounts_hash keys on balances∪sequences, so losing those rows on
+            # persist made a node reload a state with a SMALLER account set than
+            # a from-genesis replay reconstructs. The node would then mine the
+            # next block against that reduced state, producing a state hash that
+            # every follower's replay rejected (Bug A / Phase 9B: the
+            # mine-vs-replay divergence at the first post-restart block).
+            for address in set(balances.keys()) | set(sequences.keys()):
                 _db_conn.execute(
                     'INSERT INTO accounts (address, balance, sequence_number) VALUES (?, ?, ?)',
-                    (address, balance, seq)
+                    (address, int(balances.get(address, 0)), int(sequences.get(address, 0)))
                 )
                 
             # Full Replace v2 arrays
