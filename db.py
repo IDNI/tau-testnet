@@ -1211,11 +1211,21 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 )
 
             _db_conn.execute('DELETE FROM accounts')
-            for address, balance in balances.items():
-                seq = sequences.get(address, 0)
+            # Persist a row for EVERY account that has a balance OR a sequence
+            # number. Iterating balances.items() alone dropped "sequence-only"
+            # accounts — validators who submitted a governance tx (proposal or
+            # vote) but hold no funds, so they exist in `sequences` (seq
+            # incremented) but never in `balances`. compute_consensus_state_hash's
+            # accounts_hash keys on balances∪sequences, so losing those rows on
+            # persist made a node reload a state with a SMALLER account set than
+            # a from-genesis replay reconstructs. The node would then mine the
+            # next block against that reduced state, producing a state hash that
+            # every follower's replay rejected (Bug A / Phase 9B: the
+            # mine-vs-replay divergence at the first post-restart block).
+            for address in set(balances.keys()) | set(sequences.keys()):
                 _db_conn.execute(
                     'INSERT INTO accounts (address, balance, sequence_number) VALUES (?, ?, ?)',
-                    (address, balance, seq)
+                    (address, int(balances.get(address, 0)), int(sequences.get(address, 0)))
                 )
                 
             # Full Replace v2 arrays

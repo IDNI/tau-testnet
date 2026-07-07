@@ -490,6 +490,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 [u.update_id_hex[:12] for u in newly_active],
                 len(next_cons_rules), len(next_app_rules),
             )
+            if os.environ.get("TAU_HASH_TRACE") == "2":
+                logger.warning(
+                    "[HASH_TRACE_ACC] blk=%s replay=%s accounts=%s",
+                    block.header.block_number, replay_mode,
+                    sorted((a[:12], int(t_bals.get(a, 0)), int(t_seqs.get(a, 0)))
+                           for a in (set(t_bals) | set(t_seqs))),
+                )
 
         # 4. Construct Next Snapshot
         next_snapshot = TauStateSnapshot(
