@@ -156,26 +156,30 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         claims: Any = None,
         proposer_stake: Any = 0,
         stake_mode: bool = False,
+        feed_proposer_pubkey: bool = False,
     ) -> Dict[int, str]:
         canonical_proposer = canonicalize_proposer_yid(proposer_pubkey)
         canonical_parent_hash = canonicalize_parent_hash_yid(previous_hash)
         claims_json = canonical_json(claims if claims is not None else {}).decode("utf-8")
 
-        return {
+        streams = {
             6: self._encode_bv_uint(block_number, width_bits=64, field_name="block_number"),
             7: self._encode_bv_uint(timestamp, width_bits=64, field_name="timestamp"),
             8: self._encode_yid(canonical_proposer),
             9: self._encode_yid(canonical_parent_hash),
             10: self._encode_bv_uint(1 if proof_ok else 0, width_bits=16, field_name="proof_ok"),
             11: self._encode_yid(claims_json),
-            # i13: proposer pubkey as bv[384] so a consensus rule can test set
-            # membership itself (tau_validator_set mode). Fed unconditionally --
-            # rules that never reference i13 simply ignore it (the interpreter only
-            # consumes inputs its spec requires).
-            13: self._encode_bv_pubkey_literal(canonical_proposer),
             14: self._encode_bv_uint(proposer_stake, width_bits=64, field_name="proposer_stake"),
             15: self._encode_bv_uint(1 if stake_mode else 0, width_bits=16, field_name="eligibility_mode"),
         }
+        # i13: proposer pubkey as bv[384], for a rule that tests set membership
+        # itself (tau_validator_set). Fed ONLY when the active rule needs it:
+        # feeding a bv[384] value on every eval otherwise makes each consensus
+        # step pay wide-bitvector cost (~tens of seconds on a loaded host) even
+        # in stake / legacy validator_set mode, where no rule references i13.
+        if feed_proposer_pubkey:
+            streams[13] = self._encode_bv_pubkey_literal(canonical_proposer)
+        return streams
 
     # --- ConsensusEngine Interface Implementation ---
 
@@ -294,6 +298,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 claims=proof_result.get("claims"),
                 proposer_stake=proposer_stake,
                 stake_mode=stake_mode,
+                feed_proposer_pubkey=(active_view is not None
+                                      and self._view_eligibility_mode(active_view) == "tau_validator_set"),
             )
             if tau_bound:
                 # Tau-authoritative modes (stake, tau_validator_set): both o6
@@ -574,10 +580,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # acceptable here. Use committed balance (no auto-faucet shim).
             import chain_state
             lm = getattr(chain_state, "_lifecycle_manager", None)
-            stake_mode = bool(
-                lm is not None
-                and getattr(lm, "effective_eligibility_mode", lambda: "validator_set")() == "stake"
-            )
+            mode = getattr(lm, "effective_eligibility_mode", lambda: "validator_set")() if lm is not None else "validator_set"
+            stake_mode = mode == "stake"
             my_stake = chain_state.get_committed_balance((my_pubkey or "").lower()) if stake_mode else 0
             tau_inputs = self._build_consensus_input_streams(
                 proposer_pubkey=my_pubkey,
@@ -588,6 +592,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 claims={},
                 proposer_stake=my_stake,
                 stake_mode=stake_mode,
+                feed_proposer_pubkey=(mode == "tau_validator_set"),
             )
             output = tau_manager.communicate_with_tau(
                 target_output_stream_index=7,
