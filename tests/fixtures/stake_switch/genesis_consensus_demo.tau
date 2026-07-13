@@ -1,12 +1,28 @@
-# Tau-Driven Consensus — stake-switch demo genesis (mode-guarded)
+# Tau-Driven Consensus — stake-switch demo genesis (validator membership IN TAU)
 #
-# Identical to the v1 interface (i6..i11 / o6 / o7) plus:
-#   i14: proposer parent-state balance (bv[64])
-#   i15: eligibility mode flag, 0 = validator_set, 1 = stake (bv[16])
+# The validator SET is encoded in this rule, not hardcoded in the node. v1
+# interface (i6..i11 / o6 / o7) plus:
+#   i13: proposer BLS pubkey (bv[384])
+#   i15: eligibility mode flag, 0 = tau_validator_set (this rule), 1 = stake
 #
-# o7 is constrained ONLY when i15 = 0, so a governance revision that defines
-# stake-based o7 for i15 = 1 composes with this rule without contradiction.
+# o7 (proposer eligibility) is constrained ONLY when i15 = 0 (mode guard), and is
+# FORCED both ways so the engine always emits a verdict:
+#   proposer pubkey in {V1,V2,V3}  -> o7 = 1  (eligible)
+#   proposer pubkey NOT in the set -> o7 = 0  (refused by Tau, not by host code)
+# In stake mode (i15 != 0) o7 is left free here, so a stake revision that defines
+# o7 for i15 = 1 composes with this rule without contradiction.
+#
+# TEMPLATE: demo/render_revision.py substitutes __VALIDATOR_1/2/3__ with the
+# node1/2/3 BLS pubkeys (96 lowercase hex) AFTER key generation in demo/setup.sh.
 always (
     o6[t]:bv[16] = i10[t]:bv[16] &&
-    ( i15[t]:bv[16] != { 0 }:bv[16] || o7[t]:bv[16] = { 1 }:bv[16] )
+    ( i15[t]:bv[16] != { 0 }:bv[16] ||
+      ( ( ( i13[t]:bv[384] = { #xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa }:bv[384] ||
+            i13[t]:bv[384] = { #xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb }:bv[384] ||
+            i13[t]:bv[384] = { #xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc }:bv[384] ) &&
+          o7[t]:bv[16] = { 1 }:bv[16] ) ||
+        ( i13[t]:bv[384] != { #xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa }:bv[384] &&
+          i13[t]:bv[384] != { #xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb }:bv[384] &&
+          i13[t]:bv[384] != { #xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc }:bv[384] &&
+          o7[t]:bv[16] = { 0 }:bv[16] ) ) )
 )
