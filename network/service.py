@@ -135,6 +135,36 @@ class NetworkService:
             pass
 
     async def _perform_handshake(self, peer_id: Any) -> None:
+        """Handshake with retry. The first attempt races connection setup (the
+        muxer can still be settling: yamux 'Connection is shutting down'), and
+        a peer whose handshake failed used to stay half-deaf to gossip until a
+        container restart. Transient errors back off and retry while the peer
+        remains connected; incompatible peers (network/genesis gate) are
+        handled inside a single attempt and never retried."""
+        import random
+        delay = 1.0
+        for attempt in range(1, 6):
+            try:
+                await self._handshake_once(peer_id)
+                if attempt > 1:
+                    logger.info("Handshake with %s succeeded on attempt %d",
+                                peer_id, attempt)
+                return
+            except Exception:
+                if str(peer_id) not in self._connected_peer_ids:
+                    logger.debug("Handshake retry abandoned; %s disconnected",
+                                 peer_id)
+                    return
+                if attempt == 5:
+                    logger.warning("Handshake failed with %s after %d attempts",
+                                   peer_id, attempt, exc_info=True)
+                    return
+                logger.info("Handshake attempt %d with %s failed; retrying "
+                            "in ~%.0fs", attempt, peer_id, delay)
+                await trio.sleep(delay + random.uniform(0, 1))
+                delay = min(delay * 2, 15.0)
+
+    async def _handshake_once(self, peer_id: Any) -> None:
         from .protocols import TAU_PROTOCOL_HANDSHAKE
         import json
         try:
@@ -255,7 +285,7 @@ class NetworkService:
                 except Exception:
                     logger.debug("Handshake-triggered sync failed to schedule", exc_info=True)
         except Exception:
-            logger.warning("Handshake failed with %s", peer_id, exc_info=True)
+            raise  # retry policy (backoff, attempt cap) lives in _perform_handshake
 
     def _self_advertised_addrs(self) -> List[str]:
         """Addrs we tell peers to dial: configured announce addrs (NAT/public)
@@ -543,6 +573,39 @@ class NetworkService:
         if self._config.peer_advertisement_interval and self._config.peer_advertisement_interval > 0:
             if self._nursery:
                 self._nursery.start_soon(self._peer_advertisement_loop)
+
+        # Head re-announce heartbeat (see _head_reannounce_loop)
+        if self._nursery:
+            self._nursery.start_soon(self._head_reannounce_loop)
+
+    async def _head_reannounce_loop(self) -> None:
+        """Periodically re-announce our canonical head over block gossip.
+
+        Block propagation is pull-on-announce with no other catch-up path: a
+        peer that misses the single announcement of a block (e.g. gossip left
+        half-dead by a failed handshake) stays behind until the NEXT block is
+        announced. The heartbeat closes that gap: it reuses the block's
+        original message id ("block:<hash>"), so every caught-up peer dedupes
+        it silently and only a lagging peer reacts (header sync from the
+        announcing peer). Interval via TAU_HEAD_REANNOUNCE_INTERVAL seconds
+        (default 10; <= 0 disables)."""
+        import os
+        import db
+
+        try:
+            interval = float(os.environ.get("TAU_HEAD_REANNOUNCE_INTERVAL", "10"))
+        except ValueError:
+            interval = 10.0
+        if interval <= 0:
+            return
+        while True:
+            await trio.sleep(interval)
+            try:
+                head = db.get_canonical_head()
+                if isinstance(head, dict) and head.get("block_hash"):
+                    self.broadcast_block(head)
+            except Exception:
+                logger.debug("Head re-announce failed", exc_info=True)
 
     async def _connect_to_bootstrap_peer(self, peer_cfg: Any) -> None:
         """Dial a configured bootstrap peer and seed its addrs into the peerstore."""
