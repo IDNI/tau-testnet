@@ -606,9 +606,19 @@ class NetworkService:
             beat += 1
             try:
                 head = db.get_canonical_head()
-                if isinstance(head, dict) and head.get("block_hash"):
-                    self.broadcast_block(
-                        head, message_id=f"head:{head['block_hash']}:{beat}")
+                if not (isinstance(head, dict) and head.get("block_hash")):
+                    # Pre-first-block there is no canonical head, but the
+                    # heartbeat must still flow: a network idling at genesis
+                    # (measured: ~40 min before a show starts) otherwise sends
+                    # NO gossip at all and the libp2p connections die of
+                    # idleness — the first real block then broadcasts into
+                    # dead streams. Announce the genesis hash as tip;
+                    # receivers skip it via the genesis early-out.
+                    if not self._genesis_hash:
+                        continue
+                    head = {"block_hash": str(self._genesis_hash), "header": {}}
+                self.broadcast_block(
+                    head, message_id=f"head:{head['block_hash']}:{beat}")
             except Exception:
                 logger.debug("Head re-announce failed", exc_info=True)
 
@@ -1558,7 +1568,10 @@ class NetworkService:
 
         # Already have the announced tip (e.g. a head re-announce heartbeat
         # reaching a caught-up peer): nothing to sync, skip the roundtrip.
+        # Genesis-tip announces are pure keepalive — same skip.
         if remote_tip:
+            if self._genesis_hash and str(remote_tip) == str(self._genesis_hash):
+                return
             try:
                 import db
                 if db.get_block_by_hash(str(remote_tip)) is not None:
