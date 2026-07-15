@@ -584,11 +584,13 @@ class NetworkService:
         Block propagation is pull-on-announce with no other catch-up path: a
         peer that misses the single announcement of a block (e.g. gossip left
         half-dead by a failed handshake) stays behind until the NEXT block is
-        announced. The heartbeat closes that gap: it reuses the block's
-        original message id ("block:<hash>"), so every caught-up peer dedupes
-        it silently and only a lagging peer reacts (header sync from the
-        announcing peer). Interval via TAU_HEAD_REANNOUNCE_INTERVAL seconds
-        (default 10; <= 0 disables)."""
+        announced. The heartbeat closes that gap. Each beat carries a UNIQUE
+        message id: a peer that received the original announce but failed to
+        finish the resulting sync would forever dedupe a repeat of the same
+        id. Caught-up receivers skip cheaply instead — _handle_block_gossip
+        returns early when the announced tip is already in the local DB.
+        Interval via TAU_HEAD_REANNOUNCE_INTERVAL seconds (default 10;
+        <= 0 disables)."""
         import os
         import db
 
@@ -598,12 +600,15 @@ class NetworkService:
             interval = 10.0
         if interval <= 0:
             return
+        beat = 0
         while True:
             await trio.sleep(interval)
+            beat += 1
             try:
                 head = db.get_canonical_head()
                 if isinstance(head, dict) and head.get("block_hash"):
-                    self.broadcast_block(head)
+                    self.broadcast_block(
+                        head, message_id=f"head:{head['block_hash']}:{beat}")
             except Exception:
                 logger.debug("Head re-announce failed", exc_info=True)
 
@@ -1301,20 +1306,25 @@ class NetworkService:
         except Exception:
             pass
 
-    def broadcast_block(self, block_data: Dict[str, Any]) -> None:
-        """Thread-safe helper to announce a new block over gossip."""
+    def broadcast_block(self, block_data: Dict[str, Any],
+                        message_id: Optional[str] = None) -> None:
+        """Thread-safe helper to announce a new block over gossip.
+
+        message_id defaults to "block:<hash>" so duplicate announces of the
+        same block dedupe; the head re-announce heartbeat passes a unique id
+        instead, because a peer that RECEIVED the original announce but failed
+        to complete the sync would dedupe every retry forever."""
         from .protocols import TAU_GOSSIP_TOPIC_BLOCKS
 
         if not self._nursery:
             return
 
         payload: Dict[str, Any]
-        message_id: Optional[str] = None
         try:
             header = block_data.get("header") if isinstance(block_data, dict) else None
             header = header if isinstance(header, dict) else {}
             block_hash = block_data.get("block_hash") if isinstance(block_data, dict) else None
-            if block_hash:
+            if block_hash and message_id is None:
                 message_id = f"block:{block_hash}"
             payload = {
                 "headers": [
@@ -1545,6 +1555,16 @@ class NetworkService:
                 remote_tip = headers[-1].get("block_hash")
             except Exception:
                 remote_tip = None
+
+        # Already have the announced tip (e.g. a head re-announce heartbeat
+        # reaching a caught-up peer): nothing to sync, skip the roundtrip.
+        if remote_tip:
+            try:
+                import db
+                if db.get_block_by_hash(str(remote_tip)) is not None:
+                    return
+            except Exception:
+                pass
 
         # Use a locator based on our local chain, and (optionally) stop at the announced tip.
         locator = self._build_block_locator()
