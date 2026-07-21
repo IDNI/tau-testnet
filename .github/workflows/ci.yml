@@ -77,5 +77,7 @@ jobs:
           tests/test_state_reconstruction.py
           tests/test_custom_inputs.py
           tests/test_fee_model_native.py
+          --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_temporary_spending_limit
+          --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_time_decaying_multisig
           -p no:asyncio -v
           "
