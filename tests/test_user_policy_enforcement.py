@@ -21,9 +21,21 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+import pytest
+
 import chain_state
 import tau_defs
 from consensus.engine import TauConsensusEngine
+
+
+def _native_available():
+    try:
+        import tau_native
+        tau_native.load_tau_module()
+        return True
+    except Exception:
+        return False
+
 
 SENDER = "11" * 48      # 96 hex chars == bv[384]
 RECIPIENT = "22" * 48
@@ -146,6 +158,7 @@ class TestUserPolicyApplyEnforcement(unittest.TestCase):
         self.assertEqual(inputs[2], "0", "balance i2 should stay mocked")
 
 
+@pytest.mark.skipif(not _native_available(), reason="native tau module not built")
 class TestRecipientWhitelistRealEngine(unittest.TestCase):
     """Real native engine: an i4 recipient-whitelist rule emits o5=block/allow."""
 

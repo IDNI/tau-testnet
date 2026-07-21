@@ -111,9 +111,16 @@ class TestGhostTxIntegration(unittest.TestCase):
         
         # Reset Chain State (Important for isolation)
         import chain_state
+        from consensus.governance import ConsensusLifecycleManager
         chain_state._balances = {}
         chain_state._sequence_numbers = {}
         chain_state._application_rules_state = ""
+        # A prior test that loaded genesis leaves active_validators populated on
+        # the module-global lifecycle manager; create_block_from_mempool's PoA
+        # gate would then refuse to propose (our dummy miner isn't in the set)
+        # and return {"message": ...} with no 'transactions'. Reset to a fresh
+        # empty manager, matching the module-load default.
+        chain_state._lifecycle_manager = ConsensusLifecycleManager()
         
     def tearDown(self):
         if db._db_conn:

@@ -793,7 +793,15 @@ class TestTauDownGuards(unittest.TestCase):
         reserved = [{"id": 1, "tx_hash": "h1", "payload": user_tx}]
         mock_tau = MagicMock()
         mock_tau.tau_ready.wait.return_value = False  # Tau down
+        # Isolate the Tau-down guard: neutralize the PoA validator-set gate that
+        # otherwise returns early ("not in the active validator set") before we
+        # reach the fee/Tau-availability check under test. An empty active set in
+        # validator_set mode leaves the gate disabled.
+        mock_lm = MagicMock()
+        mock_lm.active_validators = set()
+        mock_lm.effective_eligibility_mode.return_value = "validator_set"
         with patch.object(createblock, "tau_manager", mock_tau), \
+             patch.object(createblock.chain_state, "_lifecycle_manager", mock_lm), \
              patch.object(createblock.config, "MINER_PRIVKEY", "1" * 64), \
              patch.object(createblock.db, "reserve_mempool_txs", return_value=reserved), \
              patch.object(createblock.db, "unreserve_mempool_txs") as mock_unreserve, \

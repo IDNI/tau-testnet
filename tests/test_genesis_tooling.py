@@ -24,7 +24,11 @@ from consensus.serialization import compute_consensus_meta_hash as cmh_serial
 from consensus.state import compute_consensus_state_hash
 from consensus.governance import ConsensusLifecycleManager, normalize_validator_set
 
-GENESIS_PATH = os.path.join(project_root, "data", "genesis.json")
+# Golden vectors pin the committed *canonical* genesis, not the throwaway
+# data/genesis.json that CI regenerates each run with a random miner key
+# (random validator pubkey -> non-deterministic hashes). The determinism the
+# goldens assert is a property of the shipped network artifact.
+GENESIS_PATH = os.path.join(project_root, "networks", "tau-testnet-v2", "genesis.json")
 
 # ─── Golden Vectors (computed deterministically from data/genesis.json) ───
 EXPECTED_BLOCK_HASH = "2da3767f9c3be834919ccb1f7d6fd6f87655dd1e1e611dd17ff8cffa3585afec"

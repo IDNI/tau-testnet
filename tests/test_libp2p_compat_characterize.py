@@ -389,6 +389,10 @@ async def test_gossip_empty_request(service):
 async def test_handshake_valid_minimal(service):
     payload = {
         "network_id": "test-net",
+        # A valid handshake must present our exact genesis_hash: the genesis
+        # gate in _handle_handshake rejects any peer whose genesis_hash is
+        # missing/empty or mismatched once we have one.
+        "genesis_hash": "genesis_char",
         "peer_pubkey": "",
         "dht_peers": [],
         "dht_providers": [],
