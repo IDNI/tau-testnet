@@ -137,3 +137,50 @@ def test_votes_only_counted_for_pending():
         assert v["update_id"] == update1.update_id_hex
         assert v["voter_pubkey"] in [VALIDATOR_1, VALIDATOR_2]
 
+
+def test_scheduled_updates_include_revisions_and_patch():
+    # An approved-and-scheduled update must surface the same full payload as a
+    # pending one (rule text / patch / proposer), not just {activation_height,
+    # update_id}. The payload stays in update_payloads for the whole scheduled
+    # lifetime, so clients can keep showing the rule text after approval.
+    container = MockContainer()
+
+    update = ConsensusRuleUpdate(
+        rule_revisions=["scheduled rule 1", "scheduled rule 2"],
+        activate_at_height=700,
+        host_contract_patch={"proof_scheme": "bls_header_sig"},
+        proposer_pubkey=VALIDATOR_2,
+    )
+    mgr = container.chain_state._lifecycle_manager
+    mgr.update_payloads[update.update_id] = update
+    mgr.scheduled_updates.append((700, update.update_id))
+
+    resp = json.loads(getgov_execute("getgovernance", container))["data"]
+
+    assert len(resp["scheduled_updates"]) == 1
+    su = resp["scheduled_updates"][0]
+
+    assert su["update_id"] == update.update_id_hex
+    assert su["activation_height"] == 700
+    assert su["rule_revisions"] == ["scheduled rule 1", "scheduled rule 2"]
+    assert su["activate_at_height"] == 700
+    assert su["host_contract_patch"] == {"proof_scheme": "bls_header_sig"}
+    assert su["proposer_pubkey"] == VALIDATOR_2
+    assert resp["lifecycle"][update.update_id_hex] == "approved-and-scheduled"
+
+
+def test_scheduled_update_without_retained_payload_degrades_gracefully():
+    # If the payload isn't retained in update_payloads, the entry must fall back
+    # to the legacy two-field shape rather than erroring.
+    container = MockContainer()
+
+    update = ConsensusRuleUpdate(["orphan scheduled"], 800)
+    mgr = container.chain_state._lifecycle_manager
+    mgr.scheduled_updates.append((800, update.update_id))  # no update_payloads entry
+
+    resp = json.loads(getgov_execute("getgovernance", container))["data"]
+
+    assert len(resp["scheduled_updates"]) == 1
+    su = resp["scheduled_updates"][0]
+    assert su == {"activation_height": 800, "update_id": update.update_id_hex}
+
