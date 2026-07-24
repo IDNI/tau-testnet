@@ -28,6 +28,9 @@ from tau_manager import DEFAULT_RULE_BV_WIDTH
 def rpc_command(cmd_str, host, port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.connect((host, port))
+        # The server frames commands by newline; terminate so it dispatches.
+        if not cmd_str.endswith("\n"):
+            cmd_str += "\r\n"
         sock.sendall(cmd_str.encode('utf-8'))
         data = sock.recv(65536)
     return data.decode('utf-8')

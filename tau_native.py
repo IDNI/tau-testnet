@@ -902,8 +902,23 @@ class NativeTauUnavailable(Exception):
     """
     Raised by `compile_revisions_isolated_subprocess` when the isolated compile
     could not run at all (native bindings absent, worker un-spawnable). Distinct
-    from a rule rejection: the caller should degrade to the live validation path
-    rather than rejecting the transaction.
+    from a rule rejection.
+
+    The op-"0" admission caller (`commands/sendtx.py`) maps this to a structured
+    ``ADMISSION_UNAVAILABLE`` rejection and does NOT fall back to an in-process
+    live compile: that fallback (plus its restore) is unbounded and watchdog-blind
+    and was the indefinite-hang vector in issue #24. The activation-height compile
+    in ``apply_block`` re-validates the rule deterministically, so a rare transient
+    admission-time skip is safe.
+    """
+
+
+class RuleCompileTimeout(NativeTauUnavailable):
+    """
+    Raised by `compile_revisions_isolated_subprocess` when the isolated compile
+    overran its wall-clock ``timeout`` (the child was SIGKILLed). Subclasses
+    NativeTauUnavailable so existing ``except NativeTauUnavailable`` sites still
+    catch it, but lets the caller emit a distinct ``ADMISSION_TIMEOUT`` code.
     """
 
 
@@ -918,13 +933,15 @@ def compile_revisions_isolated_subprocess(
 
     Returns:
         None        -- the revisions compiled successfully.
-        str         -- a rejection reason (timeout, native crash, bad rule, or
-                       a worker that died without reporting). The caller must
-                       reject the transaction.
+        str         -- a rejection reason (native crash, bad rule, or a worker
+                       that died without reporting). The caller must reject the
+                       transaction (TX_REJECTED).
     Raises:
+        RuleCompileTimeout   -- the compile overran ``timeout`` (child SIGKILLed);
+                       caller should reject with ADMISSION_TIMEOUT.
         NativeTauUnavailable -- the compile could not run (native bindings
-                       absent / worker un-spawnable); caller should fall back to
-                       live validation.
+                       absent / worker un-spawnable); caller should reject with
+                       ADMISSION_UNAVAILABLE (NOT fall back to live validation).
 
     This is the watchdog-free path's safety net — the in-process classmethod can
     hang indefinitely inside native Tau with no status stamp for the server
@@ -965,13 +982,15 @@ def compile_revisions_isolated_subprocess(
             timeout=timeout,
             env=child_env,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         # subprocess.run already SIGKILLed the child on timeout.
         logger.warning(
             "Isolated rule compile timed out after %.1fs; rejecting transaction.",
             timeout,
         )
-        return f"Rule compile timed out after {timeout:.0f}s."
+        raise RuleCompileTimeout(
+            f"Rule compile timed out after {timeout:.0f}s."
+        ) from exc
     except Exception as exc:
         # Could not spawn the worker at all (e.g. missing interpreter).
         logger.warning("Isolated rule compile worker failed to run: %s", exc)

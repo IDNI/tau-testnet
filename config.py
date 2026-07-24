@@ -27,6 +27,11 @@ class ServerSettings:
     host: str = "127.0.0.1"
     port: int = 65432
     buffer_size: int = 1024
+    # Upper bound on a single newline-delimited RPC command the TCP handler will
+    # buffer before rejecting (anti-DoS: a client that never sends a delimiter
+    # cannot grow the buffer without limit). 4 MiB matches the CLI client's
+    # read-side cap in tau_testnet_cli/rpc.py.
+    max_rpc_command_bytes: int = 4 * 1024 * 1024
 
     def validate(self) -> None:
         if not self.host:
@@ -35,6 +40,10 @@ class ServerSettings:
             raise ConfigurationError(f"Invalid server port: {self.port}")
         if self.buffer_size <= 0:
             raise ConfigurationError("Buffer size must be positive.")
+        if self.max_rpc_command_bytes < self.buffer_size:
+            raise ConfigurationError(
+                "max_rpc_command_bytes must be >= buffer_size."
+            )
 
 
 @dataclass
@@ -310,6 +319,7 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_HOST": ("server", "host", str),
     "TAU_PORT": ("server", "port", int),
     "TAU_BUFFER_SIZE": ("server", "buffer_size", int),
+    "TAU_MAX_RPC_COMMAND_BYTES": ("server", "max_rpc_command_bytes", int),
     "TAU_PROGRAM_FILE": ("tau", "program_file", str),
     "TAU_READY_SIGNAL": ("tau", "ready_signal", str),
     "TAU_COMM_DEBUG_PATH": ("tau", "comm_debug_path", str),
@@ -532,7 +542,7 @@ def load_settings(env: Optional[str] = None, overrides: Optional[Dict[str, Any]]
 
 
 def _sync_legacy_exports(current: Settings) -> None:
-    global HOST, PORT, BUFFER_SIZE
+    global HOST, PORT, BUFFER_SIZE, MAX_RPC_COMMAND_BYTES
     global TAU_PROGRAM_FILE, TAU_READY_SIGNAL, COMM_DEBUG_PATH, TAU_SHRINK_ENABLED, TAU_SHRINK_STREAM_EXCLUDE
     global PROCESS_TIMEOUT, COMM_TIMEOUT, CLIENT_WAIT_TIMEOUT, SHUTDOWN_TIMEOUT
     global STRING_DB_PATH
@@ -547,6 +557,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     HOST = current.server.host
     PORT = current.server.port
     BUFFER_SIZE = current.server.buffer_size
+    MAX_RPC_COMMAND_BYTES = current.server.max_rpc_command_bytes
 
     TAU_PROGRAM_FILE = current.tau.program_file
     TAU_READY_SIGNAL = current.tau.ready_signal
@@ -619,6 +630,7 @@ __all__ = [
     "HOST",
     "PORT",
     "BUFFER_SIZE",
+    "MAX_RPC_COMMAND_BYTES",
     "TAU_PROGRAM_FILE",
     "TAU_READY_SIGNAL",
     "COMM_DEBUG_PATH",

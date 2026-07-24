@@ -73,10 +73,12 @@ def test_bad_rule_returns_error_string(stub_worker, monkeypatch):
     assert err == "rule is garbage"
 
 
-def test_native_unavailable_raises_for_fallback(stub_worker, monkeypatch):
+def test_native_unavailable_raises(stub_worker, monkeypatch):
     monkeypatch.setenv("WF_STUB_MODE", "unavail")
-    # unavailable must NOT reject the tx: it raises so the caller degrades to
-    # the live validation path instead of returning a rejection string.
+    # "unavailable" is distinct from a rule rejection: it raises
+    # NativeTauUnavailable, which the op-"0" caller maps to ADMISSION_UNAVAILABLE
+    # (it does NOT fall back to an in-process live compile -- that path was the
+    # indefinite-hang vector in issue #24).
     with pytest.raises(tau_native.NativeTauUnavailable):
         tau_native.compile_revisions_isolated_subprocess("spec", ["r"], timeout=10)
 
@@ -88,14 +90,20 @@ def test_no_sentinel_is_rejected(stub_worker, monkeypatch):
     assert "no result" in err
 
 
-def test_timeout_is_killed_and_rejected(stub_worker, monkeypatch):
-    """A hung compile is SIGKILLed at the timeout and rejected — the bug that froze the server."""
+def test_timeout_raises_rule_compile_timeout(stub_worker, monkeypatch):
+    """A hung compile is SIGKILLed at the timeout and raises RuleCompileTimeout — the bug that froze the server.
+
+    The caller (commands/sendtx.py) maps this to a distinct ADMISSION_TIMEOUT
+    rejection rather than hanging sendtx.
+    """
     monkeypatch.setenv("WF_STUB_MODE", "sleep")
     start = time.time()
-    err = tau_native.compile_revisions_isolated_subprocess("spec", ["r"], timeout=2)
+    with pytest.raises(tau_native.RuleCompileTimeout) as exc_info:
+        tau_native.compile_revisions_isolated_subprocess("spec", ["r"], timeout=2)
     elapsed = time.time() - start
-    assert err is not None
-    assert "timed out" in err
+    assert "timed out" in str(exc_info.value)
+    # RuleCompileTimeout subclasses NativeTauUnavailable so existing handlers still catch it.
+    assert isinstance(exc_info.value, tau_native.NativeTauUnavailable)
     # killed near the deadline, not after the full 60s sleep
     assert elapsed < 15, f"wrapper did not kill promptly (elapsed={elapsed:.1f}s)"
 

@@ -136,11 +136,22 @@ class TestSendTxMapping(unittest.TestCase):
         self.assertEqual(result["code"], "TX_EXPIRED")
         self.assertEqual(result["details"]["expires_at"], expired)
 
-    # 5. Tau rejection (rule validation)
+    def _drive_isolated_compile(self):
+        """Route op-"0" rule validation through the isolated subprocess (its sole
+        path): engine ready, not in test mode. Returns the tau_native module so the
+        test can stub compile_revisions_isolated_subprocess."""
+        import tau_native
+        patch.object(sendtx.tau_manager.tau_ready, "is_set", lambda: True).start()
+        patch.object(sendtx.tau_manager, "tau_test_mode", False, create=True).start()
+        return tau_native
+
+    # 5. Tau rejection (rule validation) via the isolated subprocess compile
     def test_tau_rejection(self):
-        def reject(*args, **kwargs):
-            return "Error: rejected"
-        patch("commands.sendtx.tau_manager.communicate_with_tau", reject).start()
+        tau_native = self._drive_isolated_compile()
+        patch.object(
+            tau_native, "compile_revisions_isolated_subprocess",
+            lambda *a, **k: "Error: rejected",
+        ).start()
         tx = self._base_tx(operations={"0": "broken_rule."})
         with patch.dict(os.environ, {"TAU_FORCE_TEST": "0"}):
             result = sendtx.queue_transaction(json.dumps(tx))
@@ -180,17 +191,66 @@ class TestSendTxMapping(unittest.TestCase):
         finally:
             sendtx._PY_ECC_AVAILABLE = prev
 
-    # 10. Unexpected exception in queue_transaction (caught by outer try)
+    # 10. Unexpected exception in queue_transaction (caught by outer try).
+    # An unexpected (non-Native) error from the compile propagates to the outer
+    # handler -> INTERNAL_ERROR (distinct from ADMISSION_UNAVAILABLE, which is
+    # reserved for the "compile could not run" NativeTauUnavailable case).
     def test_internal_error_on_unexpected_exception(self):
+        tau_native = self._drive_isolated_compile()
+
         def boom(*args, **kwargs):
             raise RuntimeError("synthetic boom")
-        patch("commands.sendtx.tau_manager.communicate_with_tau", boom).start()
+
+        patch.object(tau_native, "compile_revisions_isolated_subprocess", boom).start()
         tx = self._base_tx(operations={"0": "some_rule."})
-        # Disable TAU_FORCE_TEST so the patched call is actually exercised.
         with patch.dict(os.environ, {"TAU_FORCE_TEST": "0"}):
             result = sendtx.queue_transaction(json.dumps(tx))
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "INTERNAL_ERROR")
+
+    # 11. Admission timeout: the isolated compile overran COMM_TIMEOUT and was
+    # SIGKILLed -> ADMISSION_TIMEOUT (bounded rejection, never a hang).
+    def test_admission_timeout(self):
+        tau_native = self._drive_isolated_compile()
+
+        def timed_out(*args, **kwargs):
+            raise tau_native.RuleCompileTimeout("Rule compile timed out after 60s.")
+
+        patch.object(tau_native, "compile_revisions_isolated_subprocess", timed_out).start()
+        tx = self._base_tx(operations={"0": "expensive_rule."})
+        with patch.dict(os.environ, {"TAU_FORCE_TEST": "0"}):
+            result = sendtx.queue_transaction(json.dumps(tx))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "ADMISSION_TIMEOUT")
+        self.assertEqual(result["details"]["timeout_seconds"], config.COMM_TIMEOUT)
+
+    # 12. Admission unavailable: the isolated compile could not run
+    # (NativeTauUnavailable) -> ADMISSION_UNAVAILABLE. Crucially it must NOT fall
+    # back to an in-process live compile or run the state-restore -- that pair was
+    # the unbounded, watchdog-blind indefinite-hang vector in issue #24.
+    def test_admission_unavailable_no_live_mutation(self):
+        tau_native = self._drive_isolated_compile()
+
+        def unavailable(*args, **kwargs):
+            raise tau_native.NativeTauUnavailable("worker un-spawnable")
+
+        patch.object(tau_native, "compile_revisions_isolated_subprocess", unavailable).start()
+
+        def live_must_not_run(*args, **kwargs):
+            raise AssertionError("communicate_with_tau must not run on ADMISSION_UNAVAILABLE")
+
+        restore_calls = []
+        patch("commands.sendtx.tau_manager.communicate_with_tau", live_must_not_run).start()
+        patch(
+            "commands.sendtx.tau_manager.restore_full_tau_spec",
+            lambda *a, **k: restore_calls.append(1),
+        ).start()
+        tx = self._base_tx(operations={"0": "some_rule."})
+        with patch.dict(os.environ, {"TAU_FORCE_TEST": "0"}):
+            result = sendtx.queue_transaction(json.dumps(tx))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "ADMISSION_UNAVAILABLE")
+        self.assertEqual(restore_calls, [])
 
 
 if __name__ == "__main__":

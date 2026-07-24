@@ -451,347 +451,282 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
 
     tau_force_test = tau_manager.is_force_test_enabled()
 
-    # Set once the isolated subprocess compile has validated the rule. When set,
-    # the live validate-then-restore path below is skipped: it mutates the
-    # global interpreter and the restore rebuilds the full accumulated spec
-    # natively, which can hang for minutes (watchdog kill -> restart loop).
-    rules_validated_isolated = False
-
-    # Snapshot of the live interpreter's composed spec + its shrunk-stream set,
-    # captured immediately before the live validation mutates them (see restore in
-    # the finally below). Both are needed: the spec rebuilds the interpreter, the
-    # shrunk set keeps input normalization consistent with it (TAU_SHRINK_ENABLED).
-    saved_full_spec_for_restore = None
-    saved_shrunk_streams_for_restore = None
-
     try:
         if tx_type == "user_tx":
-            try:
-                # --- Tau Validation (Deterministic Two-Step) ---
+            # --- Tau Validation (Deterministic Two-Step) ---
 
-                # Step 1: Rule Validation (if present)
-                if has_rules:
-                    rule_value = operations.get("0", "")
-                    if not isinstance(rule_value, str):
-                        return _qt_err(
-                            "TX_INVALID",
-                            (
-                                f"Invalid operation '0' (rule). "
-                                f"Must be a string, got {type(rule_value).__name__}."
-                            ),
-                        )
-                    rule_text = rule_value.strip()
-                    if rule_text:
-                        if tau_force_test:
-                            logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")
-                        else:
-                            # Deterministic gate: compile the rule against an
-                            # isolated interpreter seeded from the current
-                            # consensus rules. The live i0 pointwise-revision
-                            # path below compiles the rule lazily on a *later*
-                            # step, so parse/overflow errors (e.g. a constant too
-                            # wide for the target stream's bit-vector type) never
-                            # appear in its returned output and the tx slips into
-                            # the mempool. The isolated compile surfaces them here
-                            # without mutating live interpreter state.
-                            if tau_manager.tau_ready.is_set() and not getattr(
-                                tau_manager, "tau_test_mode", False
-                            ):
-                                import tau_native
-                                try:
-                                    prior_spec = chain_state.get_rules_state()
-                                    # Run in a throwaway subprocess with a hard
-                                    # timeout: the in-process compile can hang
-                                    # indefinitely inside native Tau and the
-                                    # server watchdog can't see it (no status
-                                    # stamp), which freezes the whole server. A
-                                    # compile that overruns the timeout is
-                                    # rejected like any other invalid rule.
-                                    compile_err = tau_native.compile_revisions_isolated_subprocess(
-                                        prior_spec,
-                                        [rule_text],
-                                        timeout=config.COMM_TIMEOUT,
-                                    )
-                                except tau_native.NativeTauUnavailable as compile_exc:
-                                    # Native bindings unavailable (e.g. unbuilt
-                                    # tau-lang): degrade to the live path below.
-                                    # The activation-height compile remains the
-                                    # backstop.
-                                    logger.warning(
-                                        "Isolated rule compile unavailable, "
-                                        "falling back to live validation: %s",
-                                        compile_exc,
-                                    )
-                                except Exception:
-                                    logger.warning(
-                                        "Isolated rule compile errored, "
-                                        "falling back to live validation.",
-                                        exc_info=True,
-                                    )
-                                else:
-                                    if compile_err:
-                                        return _qt_err(
-                                            "TX_REJECTED",
-                                            f"Transaction rejected by Tau (rule validation). {compile_err}",
-                                        )
-                                    # Validated without touching live interpreter
-                                    # state -> skip the live validate-then-restore
-                                    # dance entirely (its restore rebuilds the full
-                                    # accumulated spec natively and can hang the
-                                    # server).
-                                    rules_validated_isolated = True
-                                    logger.info("Tau rule validation successful (isolated compile).")
-
-                            if not rules_validated_isolated:
-                                # Capture the live interpreter's composed spec
-                                # BEFORE the i0 pointwise-revision mutates it. The
-                                # restore (finally) must feed THIS normalized,
-                                # single-formula spec back -- NOT
-                                # chain_state.get_rules_state(), which is the raw
-                                # newline accumulation (genesis conditional with no
-                                # trailing '.', then builtin units) meant for
-                                # one-by-one i0 replay. Feeding that whole blob to
-                                # the interpreter (via i0 OR update_spec) is a parse
-                                # error at the first `) always`. This mirrors the
-                                # snapshot/restore createblock already does.
-                                try:
-                                    _iface = tau_manager.tau_direct_interface
-                                    if _iface is not None and hasattr(_iface, "get_current_spec"):
-                                        saved_full_spec_for_restore = _iface.get_current_spec()
-                                except Exception:
-                                    saved_full_spec_for_restore = None
-                                if saved_full_spec_for_restore is None:
-                                    saved_full_spec_for_restore = tau_manager.last_known_tau_spec
-                                try:
-                                    saved_shrunk_streams_for_restore = tau_manager.get_runtime_shrunk_streams()
-                                except Exception:
-                                    saved_shrunk_streams_for_restore = None
-
-                                logger.info("Validating rule with Tau: '%s...'", rule_text[:50])
-                                tau_output_rules = tau_manager.communicate_with_tau(
-                                    rule_text=rule_text,
-                                    target_output_stream_index=0,
-                                    source=sender_pubkey,
-                                    apply_rules_update=False,
-                                )
-                                if "Error" in tau_output_rules:
-                                    return _qt_err(
-                                        "TX_REJECTED",
-                                        f"Transaction rejected by Tau (rule validation). Output: {tau_output_rules}",
-                                    )
-                                logger.info("Tau rule validation successful (live).")
-
-                # Step 2: Custom Input Validation (transfer-less user_tx only).
-                # For txs WITH transfers the custom streams are merged into the
-                # per-transfer step below (mirrors apply, where the custom-only
-                # step runs only when there are no transfers), so o1/o5/o8/o9 see
-                # i13+ together with the transfer fields. Keeping a separate custom
-                # step for transfer txs would create an admission-only rejection
-                # surface that apply never runs -> divergence and a wasted roundtrip.
-                if custom_tau_inputs and not all_validated_transfers:
+            # Step 1: Rule Validation (if present)
+            if has_rules:
+                rule_value = operations.get("0", "")
+                if not isinstance(rule_value, str):
+                    return _qt_err(
+                        "TX_INVALID",
+                        (
+                            f"Invalid operation '0' (rule). "
+                            f"Must be a string, got {type(rule_value).__name__}."
+                        ),
+                    )
+                rule_text = rule_value.strip()
+                if rule_text:
                     if tau_force_test:
-                        logger.info("TAU_FORCE_TEST=1: skipping Tau custom input validation.")
+                        logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")
                     else:
-                        logger.info("Validating custom inputs with Tau: %s", custom_tau_inputs.keys())
-                        # Send custom inputs targeting o0 (general ack/output)
-                        tau_output_custom = tau_manager.communicate_with_tau(
-                            rule_text=None,
-                            target_output_stream_index=0,
-                            input_stream_values=custom_tau_inputs,
+                        # Deterministic gate: compile the rule against an
+                        # isolated interpreter seeded from the current
+                        # consensus rules. apply_block compiles the rule lazily
+                        # at its activation height, so parse/overflow errors
+                        # (e.g. a constant too wide for the target stream's
+                        # bit-vector type) would otherwise not surface until
+                        # then and the tx would slip into the mempool. The
+                        # isolated compile surfaces them here without mutating
+                        # live interpreter state.
+                        if tau_manager.tau_ready.is_set() and not getattr(
+                            tau_manager, "tau_test_mode", False
+                        ):
+                            import tau_native
+                            try:
+                                prior_spec = chain_state.get_rules_state()
+                                # Compile the rule in a throwaway subprocess
+                                # with a hard timeout. This killable subprocess
+                                # is the SOLE op-"0" rule-validation path -- there
+                                # is deliberately no in-process live fallback.
+                                # The in-process compile can hang indefinitely
+                                # inside native Tau with no status stamp for the
+                                # watchdog to catch, and its state-restore is
+                                # likewise unbounded and watchdog-blind: that was
+                                # the indefinite-hang vector in issue #24.
+                                # apply_block re-compiles every rule
+                                # deterministically at its activation height, so
+                                # a rare admission-time skip cannot let an invalid
+                                # rule take effect.
+                                compile_err = tau_native.compile_revisions_isolated_subprocess(
+                                    prior_spec,
+                                    [rule_text],
+                                    timeout=config.COMM_TIMEOUT,
+                                )
+                            except tau_native.RuleCompileTimeout as compile_exc:
+                                # Bounded rejection: the child overran
+                                # COMM_TIMEOUT and was SIGKILLed. Return a
+                                # distinct code instead of hanging sendtx.
+                                logger.warning(
+                                    "Rule compile timed out at admission: %s",
+                                    compile_exc,
+                                )
+                                return _qt_err(
+                                    "ADMISSION_TIMEOUT",
+                                    (
+                                        f"Rule validation timed out after "
+                                        f"{config.COMM_TIMEOUT}s and was rejected."
+                                    ),
+                                    timeout_seconds=config.COMM_TIMEOUT,
+                                )
+                            except tau_native.NativeTauUnavailable as compile_exc:
+                                # The isolated compile could not run (transient
+                                # worker-spawn failure, e.g. EMFILE/ENOMEM). Do
+                                # NOT fall back to the unbounded, watchdog-blind
+                                # in-process live path; reject promptly so the
+                                # client can resubmit. apply_block remains the
+                                # correctness backstop.
+                                logger.warning(
+                                    "Isolated rule compile unavailable; rejecting: %s",
+                                    compile_exc,
+                                )
+                                return _qt_err(
+                                    "ADMISSION_UNAVAILABLE",
+                                    "Rule validation is temporarily unavailable; please resubmit.",
+                                )
+                            # Any other (unexpected) exception propagates to the
+                            # outer handler -> INTERNAL_ERROR.
+                            if compile_err:
+                                return _qt_err(
+                                    "TX_REJECTED",
+                                    f"Transaction rejected by Tau (rule validation). {compile_err}",
+                                )
+                            logger.info("Tau rule validation successful (isolated compile).")
+
+            # Step 2: Custom Input Validation (transfer-less user_tx only).
+            # For txs WITH transfers the custom streams are merged into the
+            # per-transfer step below (mirrors apply, where the custom-only
+            # step runs only when there are no transfers), so o1/o5/o8/o9 see
+            # i13+ together with the transfer fields. Keeping a separate custom
+            # step for transfer txs would create an admission-only rejection
+            # surface that apply never runs -> divergence and a wasted roundtrip.
+            if custom_tau_inputs and not all_validated_transfers:
+                if tau_force_test:
+                    logger.info("TAU_FORCE_TEST=1: skipping Tau custom input validation.")
+                else:
+                    logger.info("Validating custom inputs with Tau: %s", custom_tau_inputs.keys())
+                    # Send custom inputs targeting o0 (general ack/output)
+                    tau_output_custom = tau_manager.communicate_with_tau(
+                        rule_text=None,
+                        target_output_stream_index=0,
+                        input_stream_values=custom_tau_inputs,
+                        source=sender_pubkey,
+                        apply_rules_update=False,
+                    )
+                    if "Error" in tau_output_custom:
+                        return _qt_err(
+                            "TX_REJECTED",
+                            f"Transaction rejected by Tau (custom input validation). Output: {tau_output_custom}",
+                        )
+                    logger.info("Tau custom input validation successful.")
+
+            # Advisory block timestamp for i5 at admission. Apply re-checks
+            # against the AUTHORITATIVE block timestamp, so this is a soft
+            # pre-check only: a tx may pass admission yet be rejected at
+            # inclusion near a time threshold (and vice versa). Source the
+            # chain tip's timestamp (deterministic across this node's view,
+            # avoids wall-clock skew); fall back to wall-clock if unavailable.
+            admission_ts = None
+            try:
+                _head = db.get_canonical_head_block()
+                if isinstance(_head, dict):
+                    _hdr = _head.get("header")
+                    if isinstance(_hdr, dict):
+                        admission_ts = _hdr.get("timestamp")
+            except Exception:
+                admission_ts = None
+            if admission_ts is None:
+                admission_ts = int(time.time())
+
+            # Step 3: Transfer Validation
+            if has_transfers and all_validated_transfers:
+                if tau_force_test:
+                    logger.info(
+                        "TAU_FORCE_TEST=1: skipping Tau transfer validation for %s transfers.",
+                        len(all_validated_transfers),
+                    )
+                else:
+                    logger.info("Validating %s transfers with Tau...", len(all_validated_transfers))
+                    for i, (tau_input_dict, transfer_details) in enumerate(
+                        zip(transfer_tau_inputs, all_validated_transfers)
+                    ):
+                        logger.debug("Validating transfer #%s: %s", i + 1, transfer_details)
+
+                        # Tau program expects inputs on separate streams for the single-pass validation
+                        # i1: amount, i2: balance, i3: from_id, i4: to_id
+
+                        tau_input_stream_values = {}
+                        tau_input_stream_values[1] = str(tau_input_dict['amount'])
+                        tau_input_stream_values[2] = str(tau_input_dict['balance'])
+                        # i3/i4: full 384-bit from/to pubkeys. The bv-shrink layer
+                        # interns these equality-only address streams to a small bv
+                        # for evaluation; the canonical full-width rule text is hashed.
+                        tau_input_stream_values[3] = "{ #x" + tau_input_dict['from_addr'] + " }:bv[384]"
+                        tau_input_stream_values[4] = "{ #x" + tau_input_dict['to_addr'] + " }:bv[384]"
+                        # i12: full 384-bit sender public key (bv[384]) for user-policy
+                        # rules that scope on the real key.
+                        tau_input_stream_values[12] = "{ #x" + sender_pubkey + " }:bv[384]"
+                        # Custom input streams (i13+). Merged AFTER i12 and BEFORE
+                        # i5, byte-identical to the apply-time overlay order in
+                        # consensus/engine.py, so rules combining i13+ with the
+                        # transfer fields (i1/i3/i4/i5/i12) are enforced the same
+                        # at admission and apply. Keys 2-12 are rejected upstream,
+                        # so custom keys can never clobber a reserved stream.
+                        for k, v in custom_tau_inputs.items():
+                            tau_input_stream_values[k] = v
+                        # i5: advisory block timestamp (see admission_ts above) so
+                        # time-lock o5 rules pre-check at admission; apply is
+                        # authoritative.
+                        tau_input_stream_values[5] = str(admission_ts)
+
+                        logger.info(
+                            "Sending Tau inputs for transfer #%s validation: %s",
+                            i + 1,
+                            tau_input_stream_values,
+                        )
+                        tau_outputs = tau_manager.communicate_with_tau_multi(
+                            input_stream_values=tau_input_stream_values,
                             source=sender_pubkey,
                             apply_rules_update=False,
                         )
-                        if "Error" in tau_output_custom:
+
+                        # --- Built-in Transfer Validation (o1) ---
+                        o1_raw = tau_outputs.get(1)
+                        expected_amount = transfer_details[2]
+                        if not _decode_single_transfer_output(o1_raw or "0", expected_amount):
                             return _qt_err(
                                 "TX_REJECTED",
-                                f"Transaction rejected by Tau (custom input validation). Output: {tau_output_custom}",
-                            )
-                        logger.info("Tau custom input validation successful.")
-
-                # Advisory block timestamp for i5 at admission. Apply re-checks
-                # against the AUTHORITATIVE block timestamp, so this is a soft
-                # pre-check only: a tx may pass admission yet be rejected at
-                # inclusion near a time threshold (and vice versa). Source the
-                # chain tip's timestamp (deterministic across this node's view,
-                # avoids wall-clock skew); fall back to wall-clock if unavailable.
-                admission_ts = None
-                try:
-                    _head = db.get_canonical_head_block()
-                    if isinstance(_head, dict):
-                        _hdr = _head.get("header")
-                        if isinstance(_hdr, dict):
-                            admission_ts = _hdr.get("timestamp")
-                except Exception:
-                    admission_ts = None
-                if admission_ts is None:
-                    admission_ts = int(time.time())
-
-                # Step 3: Transfer Validation
-                if has_transfers and all_validated_transfers:
-                    if tau_force_test:
-                        logger.info(
-                            "TAU_FORCE_TEST=1: skipping Tau transfer validation for %s transfers.",
-                            len(all_validated_transfers),
-                        )
-                    else:
-                        logger.info("Validating %s transfers with Tau...", len(all_validated_transfers))
-                        for i, (tau_input_dict, transfer_details) in enumerate(
-                            zip(transfer_tau_inputs, all_validated_transfers)
-                        ):
-                            logger.debug("Validating transfer #%s: %s", i + 1, transfer_details)
-
-                            # Tau program expects inputs on separate streams for the single-pass validation
-                            # i1: amount, i2: balance, i3: from_id, i4: to_id
-
-                            tau_input_stream_values = {}
-                            tau_input_stream_values[1] = str(tau_input_dict['amount'])
-                            tau_input_stream_values[2] = str(tau_input_dict['balance'])
-                            # i3/i4: full 384-bit from/to pubkeys. The bv-shrink layer
-                            # interns these equality-only address streams to a small bv
-                            # for evaluation; the canonical full-width rule text is hashed.
-                            tau_input_stream_values[3] = "{ #x" + tau_input_dict['from_addr'] + " }:bv[384]"
-                            tau_input_stream_values[4] = "{ #x" + tau_input_dict['to_addr'] + " }:bv[384]"
-                            # i12: full 384-bit sender public key (bv[384]) for user-policy
-                            # rules that scope on the real key.
-                            tau_input_stream_values[12] = "{ #x" + sender_pubkey + " }:bv[384]"
-                            # Custom input streams (i13+). Merged AFTER i12 and BEFORE
-                            # i5, byte-identical to the apply-time overlay order in
-                            # consensus/engine.py, so rules combining i13+ with the
-                            # transfer fields (i1/i3/i4/i5/i12) are enforced the same
-                            # at admission and apply. Keys 2-12 are rejected upstream,
-                            # so custom keys can never clobber a reserved stream.
-                            for k, v in custom_tau_inputs.items():
-                                tau_input_stream_values[k] = v
-                            # i5: advisory block timestamp (see admission_ts above) so
-                            # time-lock o5 rules pre-check at admission; apply is
-                            # authoritative.
-                            tau_input_stream_values[5] = str(admission_ts)
-
-                            logger.info(
-                                "Sending Tau inputs for transfer #%s validation: %s",
-                                i + 1,
-                                tau_input_stream_values,
-                            )
-                            tau_outputs = tau_manager.communicate_with_tau_multi(
-                                input_stream_values=tau_input_stream_values,
-                                source=sender_pubkey,
-                                apply_rules_update=False,
+                                (
+                                    f"Transaction rejected by Tau logic for transfer #{i+1} "
+                                    f"({transfer_details}). Tau output: {o1_raw}"
+                                ),
+                                transfer_index=i + 1,
                             )
 
-                            # --- Built-in Transfer Validation (o1) ---
-                            o1_raw = tau_outputs.get(1)
-                            expected_amount = transfer_details[2]
-                            if not _decode_single_transfer_output(o1_raw or "0", expected_amount):
+                        # --- User Policy Check (o5) ---
+                        o5_raw = tau_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
+                        if o5_raw is not None:
+                            from tau_manager import parse_tau_output as _parse
+                            policy_val = _parse(o5_raw)
+                            if policy_val == tau_defs.USER_POLICY_BLOCK_VALUE:
                                 return _qt_err(
                                     "TX_REJECTED",
                                     (
-                                        f"Transaction rejected by Tau logic for transfer #{i+1} "
-                                        f"({transfer_details}). Tau output: {o1_raw}"
+                                        f"Transaction rejected by user policy (o5) for transfer #{i+1} "
+                                        f"({transfer_details}). Policy output: {o5_raw}"
                                     ),
                                     transfer_index=i + 1,
                                 )
 
-                            # --- User Policy Check (o5) ---
-                            o5_raw = tau_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
-                            if o5_raw is not None:
-                                from tau_manager import parse_tau_output as _parse
-                                policy_val = _parse(o5_raw)
-                                if policy_val == tau_defs.USER_POLICY_BLOCK_VALUE:
-                                    return _qt_err(
-                                        "TX_REJECTED",
-                                        (
-                                            f"Transaction rejected by user policy (o5) for transfer #{i+1} "
-                                            f"({transfer_details}). Policy output: {o5_raw}"
-                                        ),
-                                        transfer_index=i + 1,
-                                    )
-
-                            # --- Fee Estimation (o9 consensus + o8 custom) ---
-                            # Same tau_outputs dict: zero extra roundtrips.
-                            try:
-                                estimated_fee_total += fees.parse_consensus_fee(
-                                    tau_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
-                                    context=f"queue transfer #{i+1}",
-                                ) + fees.parse_custom_fee(
-                                    tau_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
-                                    context=f"queue transfer #{i+1}",
-                                )
-                            except FeeRuleError as fee_exc:
-                                # Voted consensus rules emit garbage on o9:
-                                # the fee is undeterminable -> cannot admit.
-                                return _qt_err(
-                                    "FEE_RULE_ERROR",
-                                    f"Consensus fee rule failure: {fee_exc}",
-                                )
-                        logger.info("All Tau transfer validations successful.")
-
-                # Step 3b: Fee estimate for transfer-less user_tx — one
-                # fee-query step with the canonical mocked transfer inputs
-                # (mirrors the engine's apply-time convention).
-                if (
-                    tx_type == "user_tx"
-                    and not all_validated_transfers
-                    and not tau_force_test
-                    and tau_manager.tau_ready.is_set()
-                ):
-                    try:
-                        fee_query_inputs = {1: "0", 2: "0", 3: "0", 4: "0"}
-                        fee_query_inputs[12] = "{ #x" + sender_pubkey + " }:bv[384]"
-                        fee_query_inputs[5] = str(admission_ts)
-                        # Custom streams (i13+) last, matching the apply-time
-                        # fee-query overlay order in consensus/engine.py.
-                        for k, v in custom_tau_inputs.items():
-                            fee_query_inputs[k] = v
-                        fee_outputs = tau_manager.communicate_with_tau_multi(
-                            input_stream_values=fee_query_inputs,
-                            source=sender_pubkey,
-                            apply_rules_update=False,
-                        )
-                        estimated_fee_total += fees.parse_consensus_fee(
-                            fee_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
-                            context="queue fee-query",
-                        ) + fees.parse_custom_fee(
-                            fee_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
-                            context="queue fee-query",
-                        )
-                    except FeeRuleError as fee_exc:
-                        return _qt_err(
-                            "FEE_RULE_ERROR",
-                            f"Consensus fee rule failure: {fee_exc}",
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Fee-query estimation failed; estimate stays %s (engine is authoritative).",
-                            estimated_fee_total, exc_info=True,
-                        )
-
-            finally:
-                # Cleanup: Restore prior Tau state so sendtx does not mutate
-                # global state. Only needed when the *live* path ran and mutated
-                # the interpreter; the isolated subprocess compile never touches
-                # live state, so skip the restore (it rebuilds the full spec
-                # natively and can hang -> watchdog kill -> restart loop).
-                if has_rules and not rules_validated_isolated:
-                    try:
-                        if saved_full_spec_for_restore:
-                            logger.info("Restoring prior Tau state after validation...")
-                            # Rebuild the interpreter from the pre-validation
-                            # snapshot (normalized single-formula spec). NOT the
-                            # raw get_rules_state() accumulation, which is not a
-                            # parseable standalone spec. Hold tau_comm_lock to
-                            # preserve the mutual exclusion the old reset_tau_state
-                            # (-> communicate_with_tau) provided.
-                            with tau_manager.tau_comm_lock:
-                                tau_manager.restore_full_tau_spec(
-                                    saved_full_spec_for_restore,
-                                    runtime_shrunk_streams=saved_shrunk_streams_for_restore,
-                                )
-                        else:
-                            logger.warning(
-                                "No pre-validation Tau snapshot captured; skipping sendtx-restore."
+                        # --- Fee Estimation (o9 consensus + o8 custom) ---
+                        # Same tau_outputs dict: zero extra roundtrips.
+                        try:
+                            estimated_fee_total += fees.parse_consensus_fee(
+                                tau_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
+                                context=f"queue transfer #{i+1}",
+                            ) + fees.parse_custom_fee(
+                                tau_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
+                                context=f"queue transfer #{i+1}",
                             )
-                    except Exception:
-                        logger.warning("Failed to restore Tau state after rule validation.", exc_info=True)
+                        except FeeRuleError as fee_exc:
+                            # Voted consensus rules emit garbage on o9:
+                            # the fee is undeterminable -> cannot admit.
+                            return _qt_err(
+                                "FEE_RULE_ERROR",
+                                f"Consensus fee rule failure: {fee_exc}",
+                            )
+                    logger.info("All Tau transfer validations successful.")
+
+            # Step 3b: Fee estimate for transfer-less user_tx — one
+            # fee-query step with the canonical mocked transfer inputs
+            # (mirrors the engine's apply-time convention).
+            if (
+                tx_type == "user_tx"
+                and not all_validated_transfers
+                and not tau_force_test
+                and tau_manager.tau_ready.is_set()
+            ):
+                try:
+                    fee_query_inputs = {1: "0", 2: "0", 3: "0", 4: "0"}
+                    fee_query_inputs[12] = "{ #x" + sender_pubkey + " }:bv[384]"
+                    fee_query_inputs[5] = str(admission_ts)
+                    # Custom streams (i13+) last, matching the apply-time
+                    # fee-query overlay order in consensus/engine.py.
+                    for k, v in custom_tau_inputs.items():
+                        fee_query_inputs[k] = v
+                    fee_outputs = tau_manager.communicate_with_tau_multi(
+                        input_stream_values=fee_query_inputs,
+                        source=sender_pubkey,
+                        apply_rules_update=False,
+                    )
+                    estimated_fee_total += fees.parse_consensus_fee(
+                        fee_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
+                        context="queue fee-query",
+                    ) + fees.parse_custom_fee(
+                        fee_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
+                        context="queue fee-query",
+                    )
+                except FeeRuleError as fee_exc:
+                    return _qt_err(
+                        "FEE_RULE_ERROR",
+                        f"Consensus fee rule failure: {fee_exc}",
+                    )
+                except Exception:
+                    logger.warning(
+                        "Fee-query estimation failed; estimate stays %s (engine is authoritative).",
+                        estimated_fee_total, exc_info=True,
+                    )
 
         # --- Post-Tau Processing ---
         # Note: We do NOT increment sequence number or update balances here anymore.

@@ -9,6 +9,10 @@ def send_command(cmd):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((HOST, PORT))
+            # The server frames commands by newline; terminate so it dispatches
+            # instead of waiting for a delimiter that never arrives.
+            if not cmd.endswith("\n"):
+                cmd += "\r\n"
             s.sendall(cmd.encode('utf-8'))
             data = s.recv(4096)
             return data.decode('utf-8')

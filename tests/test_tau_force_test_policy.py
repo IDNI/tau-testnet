@@ -34,11 +34,11 @@ def test_sendtx_ignores_force_test_outside_test_env(monkeypatch):
             "signature": "00" * 48,
         }
 
-        tau_calls = []
+        compile_calls = []
 
-        def mock_communicate_with_tau(**kwargs):
-            tau_calls.append(kwargs)
-            return "Error: syntax"
+        def mock_compile(prior_spec, revisions, timeout):
+            compile_calls.append((prior_spec, revisions, timeout))
+            return "syntax error in rule"  # non-None -> rejection
 
         # Crypto is mandatory now: mock signature verification instead of disabling it.
         monkeypatch.setattr(sendtx.G2Basic, "Verify", lambda *args, **kwargs: True)
@@ -46,10 +46,13 @@ def test_sendtx_ignores_force_test_outside_test_env(monkeypatch):
         monkeypatch.setattr(sendtx.chain_state, "get_sequence_number", lambda *_args, **_kwargs: 0)
         monkeypatch.setattr(sendtx.chain_state, "get_rules_state", lambda: None)
         monkeypatch.setattr(sendtx.db, "get_pending_sequence", lambda *_args, **_kwargs: None)
-        # Force the live validation path (isolated compile is skipped unless the
-        # engine is ready) so the mocked Tau call is the deciding gate.
-        monkeypatch.setattr(sendtx.tau_manager.tau_ready, "is_set", lambda: False)
-        monkeypatch.setattr(sendtx.tau_manager, "communicate_with_tau", mock_communicate_with_tau)
+        # Op-"0" rule validation runs only via the killable isolated subprocess
+        # (the sole rule-validation path). Drive it: engine ready, not in test
+        # mode, and stub the subprocess compile to reject the rule.
+        monkeypatch.setattr(sendtx.tau_manager.tau_ready, "is_set", lambda: True)
+        monkeypatch.setattr(sendtx.tau_manager, "tau_test_mode", False, raising=False)
+        import tau_native
+        monkeypatch.setattr(tau_native, "compile_revisions_isolated_subprocess", mock_compile)
 
         result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
 
@@ -58,7 +61,7 @@ def test_sendtx_ignores_force_test_outside_test_env(monkeypatch):
         assert result["ok"] is False
         assert result["code"] == "TX_REJECTED"
         assert result["message"].startswith("Transaction rejected by Tau (rule validation).")
-        assert len(tau_calls) == 1
-        assert tau_calls[0]["rule_text"] == payload["operations"]["0"]
+        assert len(compile_calls) == 1
+        assert compile_calls[0][1] == [payload["operations"]["0"]]
     finally:
         config.reload_settings(env="test")

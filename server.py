@@ -345,15 +345,58 @@ def _start_websocket_server(container: ServiceContainer) -> None:
 
 
 def handle_client(conn, addr, container: ServiceContainer):
-    """Handles a single client connection, supports multiple commands."""
+    """Handle a single client connection, supporting multiple newline-delimited commands.
+
+    Commands are framed by newline (``\\n``, with an optional preceding ``\\r``).
+    Bytes are accumulated across ``recv()`` calls so a command larger than
+    ``BUFFER_SIZE`` -- e.g. a rule-deploy ``sendtx`` carrying ``bv[384]`` pubkey
+    constants -- is reassembled instead of truncated mid-payload (issue #24).
+    On EOF any unterminated remainder is dispatched as a final command so a legacy
+    client that sends one command without a trailing newline and then closes still
+    gets a response. Splitting on the ``\\n`` byte never splits a UTF-8 multibyte
+    sequence, so each complete line decodes safely.
+    """
     import socket
 
     client_label = f"{addr[0]}:{addr[1]}" if isinstance(addr, tuple) else str(addr)
     is_local = isinstance(addr, tuple) and addr[0] in ("127.0.0.1", "::1")
     logger.info("Connection accepted from %s", client_label)
 
+    def _dispatch(line_bytes: bytes) -> bool:
+        """Process one command line. Return False if the connection should close."""
+        try:
+            raw = line_bytes.decode('utf-8').strip()
+        except UnicodeDecodeError as exc:
+            logger.warning("Invalid UTF-8 from %s: %s", client_label, exc)
+            err = api_response.error_response(
+                "", "Invalid UTF-8 encoding", "INVALID_PARAMS"
+            ) + "\r\n"
+            try:
+                conn.sendall(err.encode('utf-8'))
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return False
+            return True
+
+        if not raw:
+            return True  # blank line (e.g. between commands) -> ignore
+
+        # Use shared process_command logic
+        success, result_message = process_command(raw, container, client_label, is_local=is_local)
+
+        # Append newline for TCP clients if missing (process_command returns raw response)
+        if not result_message.endswith("\n"):
+            result_message += "\r\n"
+
+        try:
+            conn.sendall(result_message.encode('utf-8'))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            logger.info("Client %s disconnected during send", client_label)
+            return False
+        return True
+
     try:
         with conn:
+            buffer = bytearray()
             while True:
                 try:
                     data = conn.recv(config.BUFFER_SIZE)
@@ -366,30 +409,45 @@ def handle_client(conn, addr, container: ServiceContainer):
                     break
 
                 if not data:
+                    # EOF: flush any unterminated remainder as a final command so
+                    # clients that don't newline-terminate their last command (but
+                    # do close/half-close) still get a response.
                     logger.info("Client %s disconnected", client_label)
+                    if buffer.strip():
+                        _dispatch(bytes(buffer))
                     break
 
-                try:
-                    raw = data.decode('utf-8').strip()
-                except UnicodeDecodeError as exc:
-                    logger.warning("Invalid UTF-8 from %s: %s", client_label, exc)
-                    err = api_response.error_response(
-                        "", "Invalid UTF-8 encoding", "INVALID_PARAMS"
-                    ) + "\r\n"
-                    conn.sendall(err.encode('utf-8'))
-                    continue
+                buffer.extend(data)
 
-                # Use shared process_command logic
-                success, result_message = process_command(raw, container, client_label, is_local=is_local)
-                
-                # Append newline for TCP clients if missing (process_command returns raw response)
-                if not result_message.endswith("\n"):
-                    result_message += "\r\n"
-                
-                try:
-                    conn.sendall(result_message.encode('utf-8'))
-                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                    logger.info("Client %s disconnected during send", client_label)
+                # Dispatch every complete newline-delimited command in the buffer.
+                closed = False
+                while True:
+                    nl = buffer.find(b"\n")
+                    if nl == -1:
+                        break
+                    line = bytes(buffer[:nl])
+                    del buffer[:nl + 1]
+                    if not _dispatch(line):
+                        closed = True
+                        break
+                if closed:
+                    break
+
+                # Anti-DoS: a pending (unterminated) command must not grow without
+                # bound. Once the buffered remainder exceeds the cap it cannot be a
+                # single valid command, so reject and close.
+                if len(buffer) > config.MAX_RPC_COMMAND_BYTES:
+                    logger.warning(
+                        "Client %s exceeded max RPC command size (%d bytes); closing.",
+                        client_label, config.MAX_RPC_COMMAND_BYTES,
+                    )
+                    err = api_response.error_response(
+                        "", "RPC command exceeds maximum size", "PARSE_ERROR"
+                    ) + "\r\n"
+                    try:
+                        conn.sendall(err.encode('utf-8'))
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        pass
                     break
     except Exception:
         logger.exception("Unexpected error in handle_client for %s", client_label)
