@@ -533,6 +533,11 @@ def process_new_block(block: Block) -> bool:
                 )
                 return False
 
+            # Snapshot the consensus rule BEFORE apply so we can detect a
+            # governance activation and reload the live interpreter to the single
+            # new revision afterwards (see reload_consensus_interpreter_from_state).
+            _cons_rules_before = _consensus_rules_state
+
             # 4. Pure Apply Block Executor
             if active_view is not None and hasattr(engine, "apply_block"):
                 try:
@@ -637,6 +642,13 @@ def process_new_block(block: Block) -> bool:
                 eligibility_mode=_lifecycle_manager.eligibility_mode,
             )
             
+            # Governance activation just changed the active consensus rule: rebuild
+            # the live interpreter to that single revision (matching a restart)
+            # instead of leaving the i0-accumulated conjunction in place. Done
+            # outside the rule/balance locks; a no-op when the rule is unchanged.
+            if _consensus_rules_state != _cons_rules_before:
+                reload_consensus_interpreter_from_state(source_prefix="activation")
+
             # Optional: mempool eviction triggers could be mapped here using `apply_result.mempool_hints`
             return True
         else:
@@ -1292,6 +1304,39 @@ def replay_tau_restore_plan(plan: List[Dict[str, object]], *, source_prefix: str
         )
         persist_needed = persist_needed or should_persist
     return persist_needed
+
+
+def reload_consensus_interpreter_from_state(*, source_prefix: str = "activation") -> None:
+    """Rebuild the live Tau interpreter from the CURRENT persisted rule state
+    (single active consensus revision + application units + builtin rules),
+    exactly as a freshly-started node does via the restore plan.
+
+    Call this AFTER a governance activation has committed (so the module globals
+    already hold the post-activation `_consensus_rules_state`). The live
+    interpreter otherwise carries the CONJUNCTION of every revision ever routed
+    through i0 by `engine.apply_block`; that accumulation diverges from the
+    restart baseline (which loads only the last revision) and, for a heavy
+    bv[384] membership rule, can wedge the SAT normalizer. Collapsing the live
+    interpreter to the single active revision makes the running node's o6/o7
+    verdicts identical to a restarted node's -- the invariant every consensus
+    read relies on. Must be called with NO rule/balance locks held (the restore
+    plan acquires `_rules_lock` itself)."""
+    if not tau_manager.tau_ready.is_set():
+        return
+    try:
+        with open(config.TAU_PROGRAM_FILE, "r", encoding="utf-8", errors="replace") as f:
+            genesis_spec_text = f.read()
+        tau_manager.restore_full_tau_spec(genesis_spec_text)
+        replay_tau_restore_plan(
+            get_tau_restore_plan(use_persisted_state=True),
+            source_prefix=source_prefix,
+        )
+        logger.info("[chain_state] Reloaded live consensus interpreter to the single "
+                    "active revision after governance activation.")
+    except Exception:
+        logger.exception("[chain_state] Failed to reload consensus interpreter after "
+                         "activation; live o6/o7 verdicts may diverge from a restart "
+                         "until the node is restarted.")
 
 
 def get_application_rules_state() -> str:
