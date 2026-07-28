@@ -221,13 +221,17 @@ def create_block_from_mempool() -> Dict:
     from consensus.engine import TauConsensusEngine
     engine = TauConsensusEngine()
 
-    # PoA: refuse to propose if our key has been removed from the active set.
-    # In stake mode the membership gate is bypassed; query_eligibility below
-    # (Tau o7 on our stake) becomes the gate.
+    # PoA (validator_set): refuse to propose if our key has been removed from the
+    # active set. In tau-authoritative modes (stake, tau_validator_set) the host
+    # membership gate is bypassed; query_eligibility below (Tau o7) becomes the
+    # gate -- on our stake (stake) or our pubkey membership in the rule
+    # (tau_validator_set).
+    from consensus.governance import is_tau_authoritative_eligibility_mode
     lm = chain_state._lifecycle_manager
-    stake_mode = getattr(lm, "effective_eligibility_mode", lambda: "validator_set")() == "stake"
+    mode = getattr(lm, "effective_eligibility_mode", lambda: "validator_set")()
+    tau_bound = is_tau_authoritative_eligibility_mode(mode)
     active = getattr(lm, "active_validators", set())
-    if active and not stake_mode \
+    if active and not tau_bound \
             and not getattr(config.settings.authority, "open_governance_admission", False) \
             and (config.MINER_PUBKEY or "").lower() not in active:
         msg = "Local miner pubkey is not in the active validator set; not proposing."

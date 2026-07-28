@@ -45,8 +45,23 @@ def validate_quorum_policy(policy: Any) -> Optional[str]:
 # Eligibility-mode grammar (shared by genesis tooling, admission, and the
 # runtime). Closed set of canonical strings so update_ids and the consensus
 # meta hash stay byte-stable.
-ELIGIBILITY_MODES = ("validator_set", "stake")
+ELIGIBILITY_MODES = ("validator_set", "tau_validator_set", "stake")
 DEFAULT_ELIGIBILITY_MODE = "validator_set"
+
+# Modes where Tau's o7 is the BINDING proposer-eligibility authority: the host
+# membership gate (proposer must be in active_validators) is bypassed in both the
+# mining dry-run and block verification, and verify consults o7 (not just o6).
+#   - "stake":             o7 evaluated against the proposer's parent-state balance.
+#   - "tau_validator_set": o7 evaluated against the proposer pubkey (i13) tested
+#                          for membership INSIDE the consensus rule itself.
+# "validator_set" (default PoA) is NOT here: it keeps the host-enforced membership
+# gate with o7 pinned to 1 by the rule.
+TAU_AUTHORITATIVE_ELIGIBILITY_MODES = ("stake", "tau_validator_set")
+
+
+def is_tau_authoritative_eligibility_mode(mode: Any) -> bool:
+    """True when Tau o7 binds proposer eligibility (host membership gate off)."""
+    return mode in TAU_AUTHORITATIVE_ELIGIBILITY_MODES
 
 
 def validate_eligibility_mode(mode: Any) -> Optional[str]:
@@ -57,7 +72,7 @@ def validate_eligibility_mode(mode: Any) -> Optional[str]:
         return "must be a string"
     if mode in ELIGIBILITY_MODES:
         return None
-    return "must be 'validator_set' or 'stake'"
+    return "must be one of " + ", ".join(repr(m) for m in ELIGIBILITY_MODES)
 
 # Network-wide quorum policy used when genesis does not pin one. The consensus
 # tally MUST resolve to a deterministic value here and never read per-node
@@ -336,7 +351,16 @@ class ConsensusLifecycleManager:
         )
 
     def preview_validator_patch(self, patch: Optional[Dict[str, Any]]) -> set[str]:
-        """Return the validator set that would result if this host patch activated."""
+        """Return the validator set that would result if this host patch activated.
+
+        NOTE (tau_validator_set mode): this host `active_validators` set is the
+        governance ELECTORATE — who may propose updates, whose votes tally, and
+        the quorum/threshold math. In `tau_validator_set` mode proposer
+        ELIGIBILITY is decided separately by the Tau rule's i13 membership test,
+        whose validator pubkeys are baked into the rule TEXT. A validator delta
+        therefore changes the electorate but NOT who may propose blocks; to
+        change eligible proposers under tau_validator_set you must vote in a new
+        consensus rule revision that lists the new pubkey constants."""
         next_validators = set(self.active_validators)
         if not patch:
             return next_validators

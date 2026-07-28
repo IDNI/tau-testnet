@@ -138,9 +138,16 @@ TAU_OUTPUT_STREAM_ELIGIBLE = "o7"       # Proposer eligibility verdict (1 for el
 TAU_INPUT_STREAM_PROPOSER_STAKE = "i14"   # Proposer parent-state balance (uint64 string)
 TAU_INPUT_STREAM_ELIGIBILITY_MODE = "i15" # 0 = validator_set, 1 = stake (bv[16])
 
+# --- Tau Consensus ABI v1.2 additions (Tau-encoded validator membership) ---
+# Proposer BLS pubkey fed so a consensus rule can test set membership itself
+# (o7 = 1 iff i13 equals one of the validator pubkey constants baked into the
+# rule text). bv[384] = 96 hex chars; fed as a wrapped literal `{ #x.. }:bv[384]`
+# via the engine/shrink path, or bare `#x..` via raw TauInterface (gen_genesis).
+TAU_INPUT_STREAM_PROPOSER_PUBKEY = "i13"
+
 # Operations keys reserved OUTSIDE RESERVED_STREAMS (that set is shared with the
 # engine for other purposes, so these are screened explicitly at every
 # ingest/apply site: commands/sendtx.py, consensus/admission.py,
-# consensus/engine.py). i12 = sender pubkey; i14/i15 = consensus stake/mode
-# inputs. User custom input streams therefore start at i16.
-EXTRA_RESERVED_OPERATION_KEYS = (12, 14, 15)
+# consensus/engine.py). i12 = sender pubkey; i13 = consensus proposer pubkey;
+# i14/i15 = consensus stake/mode inputs. User custom input streams start at i16.
+EXTRA_RESERVED_OPERATION_KEYS = (12, 13, 14, 15)

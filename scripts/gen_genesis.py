@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from dataclasses import dataclass
@@ -115,7 +116,7 @@ def validate_validator_key(key: str) -> bytes:
         raise ValueError("Validator key must be strictly lowercase")
     return raw_bytes
 
-def validate_consensus_rules(rules: str):
+def validate_consensus_rules(rules: str, validator_keys=None):
     try:
         import tau_native
         import tempfile
@@ -124,41 +125,72 @@ def validate_consensus_rules(rules: str):
         print(f"[WARNING] tau_native not available to run static evaluation: {e}")
         return
 
+    # A rule that tests proposer membership reads i13 (proposer pubkey, bv[384]).
+    # The probes below then feed i13 so the ABI check exercises the real branch.
+    references_i13 = bool(re.search(r"\bi13\s*\[", rules))
+    # RAW TauInterface (this path) takes bv[384] input as a BARE `#x<96hex>` value
+    # (NOT the wrapped `{ #x.. }:bv[384]` literal, which the engine path uses).
+    member = ("#x" + validator_keys[0]) if validator_keys else None
+    non_member = None
+    if references_i13:
+        used = set(validator_keys or [])
+        for cand in ("f" * 96, "e" * 96, "d" * 96, "c" * 96):
+            if cand not in used:
+                non_member = "#x" + cand
+                break
+
     # To run a dummy evaluation, we initialize the native engine directly.
     try:
         print("[INFO] Running static test evaluation for consensus_rules...")
+        if references_i13:
+            print("[INFO] Rule constrains o7 by i13 membership; probing member/non-member.")
         clean_lines = [l.strip() for l in rules.splitlines() if l.strip() and not l.strip().startswith('#')]
         content = " ".join(clean_lines)
-        
+
         with tempfile.NamedTemporaryFile("w", delete=False) as f:
             f.write(content)
             temp_path = f.name
-            
+
         try:
             tau_ctx = tau_native.TauInterface(temp_path)
             print("[INFO] Checking constraints on consensus_rules by evaluating i10=0...")
             inputs = {"10": "0"}
             outputs = tau_ctx.communicate_multi(input_stream_values=inputs)
-            
+
             if 6 not in outputs or outputs[6] != "0":
                 raise ValueError(f"Consensus rule ABI violation: evaluating i10=0 (invalid proof) MUST yield o6=0 strictly! Got outputs: {outputs}")
 
-            # Mode-guarded rules: with a valid proof in validator_set mode
-            # (i15=0) the proposer must be eligible (o7=1). Guarded on `7 in
-            # outputs2` because the shipped public rule does not reference i15
-            # and may not emit o7 for these inputs in this harness.
+            # Mode-guarded rules: with a valid proof in validator_set /
+            # tau_validator_set mode (i15=0) an ELIGIBLE proposer must yield o7=1.
+            # For an i13-membership rule "eligible" means a validator pubkey, so
+            # feed the first genesis validator as i13. Guarded on `7 in outputs2`
+            # because the shipped public rule does not reference i15/i13 and may
+            # not emit o7 for these inputs in this harness.
             inputs2 = {"10": "1", "15": "0"}
+            if references_i13 and member is not None:
+                inputs2["13"] = member
             outputs2 = tau_ctx.communicate_multi(input_stream_values=inputs2)
             if 7 in outputs2 and outputs2[7] != "1":
                 raise ValueError(
-                    f"Consensus rule ABI violation: with i10=1 and i15=0 (validator_set mode), "
-                    f"o7 MUST be 1. Got outputs: {outputs2}"
+                    f"Consensus rule ABI violation: with i10=1 and i15=0 (validator mode), "
+                    f"o7 MUST be 1 for an eligible proposer. Got outputs: {outputs2}"
                 )
+
+            # Negative probe: an i13-membership rule MUST refuse a non-member
+            # (o7=0) in validator mode, else the rule would admit any proposer.
+            if references_i13 and non_member is not None:
+                inputs3 = {"10": "1", "15": "0", "13": non_member}
+                outputs3 = tau_ctx.communicate_multi(input_stream_values=inputs3)
+                if 7 in outputs3 and outputs3[7] != "0":
+                    raise ValueError(
+                        f"Consensus rule ABI violation: a non-validator proposer MUST yield "
+                        f"o7=0 in tau_validator_set mode. Got outputs: {outputs3}"
+                    )
 
             print("[INFO] Validated: consensus_rules static check passed for o6 mapping.")
         finally:
             os.remove(temp_path)
-            
+
     except Exception as e:
         if isinstance(e, ValueError):
             raise
@@ -205,7 +237,18 @@ def main():
         fee_term = " &&\n    o9[t]:bv[24] = { #x%06x }:bv[24]\n" % args.base_fee
         consensus_rules = stripped[:closing] + fee_term + stripped[closing:] + "\n"
 
-    validate_consensus_rules(consensus_rules)
+    # tau_validator_set mode makes Tau's o7 the binding proposer gate, so the
+    # rule MUST constrain o7 by proposer identity (i13). A rule that pins o7=1 for
+    # everyone under this mode would admit ANY proposer (host gate is off) — reject
+    # that misconfiguration up front.
+    if args.eligibility_mode == "tau_validator_set" and not re.search(r"\bi13\s*\[", consensus_rules):
+        raise SystemExit(
+            "error: --eligibility-mode tau_validator_set requires a consensus rule that "
+            "constrains o7 by i13 (proposer-pubkey) membership; got a rule that does "
+            "not reference i13."
+        )
+
+    validate_consensus_rules(consensus_rules, validator_keys=validator_keys)
 
     # 1. Accounts Domain
     genesis_accounts = {

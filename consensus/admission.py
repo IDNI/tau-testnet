@@ -131,7 +131,8 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         if idx in tau_defs.EXTRA_RESERVED_OPERATION_KEYS:
             return format_error(
                 f"Invalid operation target '{key}'. Stream {idx} is reserved "
-                f"(i12 sender pubkey; i14/i15 consensus stake/mode inputs)."
+                f"(i12 sender pubkey; i13 consensus proposer pubkey; "
+                f"i14/i15 consensus stake/mode inputs)."
             )
 
     # Screen user rule TEXT for reserved streams. Comment-stripped and
@@ -162,13 +163,13 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
                 f"'{mocked_in[0]}' (balance): reading i2 diverges the fee between admission "
                 f"and block apply. Scope on i12/i3/i4, gate on i5, compare amount on i1."
             )
-        typed_reserved_in = _streams_referenced(rule_text, ("i14", "i15"))
+        typed_reserved_in = _streams_referenced(rule_text, ("i13", "i14", "i15"))
         if typed_reserved_in:
             return format_error(
                 f"user_tx rule text references reserved consensus input stream "
-                f"'{typed_reserved_in[0]}' (proposer stake / eligibility mode): these are only "
-                f"fed at consensus evaluation steps, and typing them from a user rule can pin a "
-                f"conflicting bitvector width process-wide."
+                f"'{typed_reserved_in[0]}' (proposer pubkey / stake / eligibility mode): these are "
+                f"only fed at consensus evaluation steps, and typing them from a user rule can pin a "
+                f"conflicting bitvector width process-wide (e.g. i13 is bv[384])."
             )
 
     return success()
@@ -307,7 +308,7 @@ def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView)
 
     # Warn if a revision touches reserved consensus-ABI streams. Crude string
     # check; Tau itself enforces strict typing at activation.
-    for stream_idx in ("i6", "i7", "i8", "i9", "i10", "i11", "i14", "i15", "o6", "o7"):
+    for stream_idx in ("i6", "i7", "i8", "i9", "i10", "i11", "i13", "i14", "i15", "o6", "o7"):
         for rev in revisions:
             if stream_idx in rev and "consensus" not in rev:
                 logger.warning(f"Revision potentially shadowing {stream_idx}")

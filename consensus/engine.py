@@ -10,7 +10,7 @@ import tau_defs
 from .tau_engine import TauEngine, TauExecutionResult, TauStateSnapshot
 from .serialization import canonical_json, canonicalize_parent_hash_yid, canonicalize_proposer_yid
 from .state import StateStore, compute_state_hash
-from .governance import normalize_validator_set
+from .governance import normalize_validator_set, is_tau_authoritative_eligibility_mode
 from . import fees
 from .fees import FeeRuleError
 from errors import BlockchainBug, TauCommunicationError, TauEngineBug, TauEngineCrash
@@ -135,6 +135,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
     def _encode_yid(text: str) -> str:
         return db.get_string_id(text)
 
+    @staticmethod
+    def _encode_bv_pubkey_literal(pubkey_hex: str) -> str:
+        """A 96-hex BLS pubkey as an in-spec bv[384] literal for stream i13.
+
+        The tau_manager shrink layer interns this to the same node-local id as the
+        equality literal `{ #x<hex> }:bv[384]` written into the consensus rule, so
+        the membership comparison holds. RAW TauInterface callers (gen_genesis) must
+        NOT use this wrapped form -- they feed the bare `#x<hex>` value instead."""
+        return "{ #x" + pubkey_hex + " }:bv[384]"
+
     def _build_consensus_input_streams(
         self,
         *,
@@ -158,6 +168,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             9: self._encode_yid(canonical_parent_hash),
             10: self._encode_bv_uint(1 if proof_ok else 0, width_bits=16, field_name="proof_ok"),
             11: self._encode_yid(claims_json),
+            # i13: proposer pubkey as bv[384] so a consensus rule can test set
+            # membership itself (tau_validator_set mode). Fed unconditionally --
+            # rules that never reference i13 simply ignore it (the interpreter only
+            # consumes inputs its spec requires).
+            13: self._encode_bv_pubkey_literal(canonical_proposer),
             14: self._encode_bv_uint(proposer_stake, width_bits=64, field_name="proposer_stake"),
             15: self._encode_bv_uint(1 if stake_mode else 0, width_bits=16, field_name="eligibility_mode"),
         }
@@ -197,6 +212,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         meta = getattr(active_view, "mechanism_specific_metadata", None) or {}
         return meta.get("eligibility_mode") == "stake"
 
+    @staticmethod
+    def _view_eligibility_mode(active_view) -> str:
+        meta = getattr(active_view, "mechanism_specific_metadata", None) or {}
+        return meta.get("eligibility_mode") or "validator_set"
+
     def verify_block_header(self, *args, **kwargs) -> bool:
         """
         Verify that the block header meets the consensus proof requirements.
@@ -204,23 +224,28 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         """
         active_view = None
         stake_mode = False
+        tau_bound = False
         if len(args) > 0 and isinstance(args[0], ActiveConsensusView) or "active_view" in kwargs:
             # Phase 2+ new signature: (active_view, block, proof_result)
             proof_result = kwargs.get("proof_result") if "proof_result" in kwargs else (args[2] if len(args) > 2 else {})
             if proof_result.get("proof_ok", False) is False:
                 return False
             block = kwargs.get("block") if "block" in kwargs else (args[1] if len(args) > 1 else None)
-            # PoA: the proposer must be in the active validator set (skip for
-            # genesis, whose proposer is the all-zero sentinel). In stake mode the
-            # membership gate is bypassed -- Tau's o7 (evaluated on the proposer's
-            # parent-state stake) is the eligibility authority instead.
+            # PoA (validator_set): the proposer must be in the active validator set
+            # (skip for genesis, whose proposer is the all-zero sentinel). In
+            # tau-authoritative modes (stake, tau_validator_set) the host membership
+            # gate is bypassed -- Tau's o7 is the eligibility authority instead
+            # (stake: evaluated on parent-state balance; tau_validator_set:
+            # evaluated on the proposer pubkey i13 tested inside the rule).
             active_view = args[0] if (args and isinstance(args[0], ActiveConsensusView)) else kwargs.get("active_view")
             stake_mode = active_view is not None and self._stake_mode(active_view)
+            tau_bound = active_view is not None and is_tau_authoritative_eligibility_mode(
+                self._view_eligibility_mode(active_view))
             if (
                 block is not None
                 and getattr(block.header, "block_number", None) != 0
                 and active_view is not None
-                and not stake_mode
+                and not tau_bound
                 and not getattr(config.settings.authority, "open_governance_admission", False)
             ):
                 try:
@@ -270,11 +295,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 proposer_stake=proposer_stake,
                 stake_mode=stake_mode,
             )
-            if stake_mode:
-                # Stake mode: both o6 (validity) and o7 (eligibility) must be
-                # nonzero. communicate_with_tau_multi is deliberately lock-free,
-                # so wrap it in tau_comm_lock exactly like the fee path does.
-                # Missing o7 parses to 0 -> fail closed.
+            if tau_bound:
+                # Tau-authoritative modes (stake, tau_validator_set): both o6
+                # (validity) and o7 (eligibility) must be nonzero.
+                # communicate_with_tau_multi is deliberately lock-free, so wrap it
+                # in tau_comm_lock exactly like the fee path does. Missing o7 parses
+                # to 0 -> fail closed (a non-member's block is rejected).
                 with tau_manager.tau_comm_lock:
                     outputs = tau_manager.communicate_with_tau_multi(
                         input_stream_values=tau_inputs,
