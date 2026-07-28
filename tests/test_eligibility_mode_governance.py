@@ -8,6 +8,7 @@ import pytest
 from consensus.governance import (
     ConsensusLifecycleManager,
     validate_eligibility_mode,
+    is_tau_authoritative_eligibility_mode,
     DEFAULT_ELIGIBILITY_MODE,
 )
 
@@ -15,10 +16,22 @@ from consensus.governance import (
 def test_validate_eligibility_mode_grammar():
     assert validate_eligibility_mode("validator_set") is None
     assert validate_eligibility_mode("stake") is None
+    assert validate_eligibility_mode("tau_validator_set") is None
     # Empty string is only the internal "genesis did not pin" sentinel.
     assert validate_eligibility_mode("") is not None
     assert validate_eligibility_mode("pos") is not None
     assert validate_eligibility_mode(7) is not None
+
+
+def test_tau_authoritative_modes():
+    """Modes where Tau's o7 binds proposer eligibility and the host membership
+    gate is bypassed. validator_set (PoA) must stay host-gated: grouping it here
+    would let any proposer past the gate, since its rule pins o7=1 for everyone."""
+    assert is_tau_authoritative_eligibility_mode("stake") is True
+    assert is_tau_authoritative_eligibility_mode("tau_validator_set") is True
+    assert is_tau_authoritative_eligibility_mode("validator_set") is False
+    assert is_tau_authoritative_eligibility_mode("") is False
+    assert is_tau_authoritative_eligibility_mode(None) is False
 
 
 def test_apply_host_contract_patch_sets_mode():

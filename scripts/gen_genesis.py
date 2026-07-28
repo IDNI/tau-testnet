@@ -61,7 +61,10 @@ def get_args():
         "--eligibility-mode", type=str, default="validator_set",
         help=(
             "Proposer-eligibility regime pinned network-wide into genesis "
-            "consensus_meta: 'validator_set' (PoA, default) or 'stake'."
+            "consensus_meta: 'validator_set' (PoA host gate, default), 'stake' "
+            "(Tau o7 on the proposer's balance), or 'tau_validator_set' (Tau o7 "
+            "on i13 membership tested inside the consensus rule; requires a rule "
+            "that references i13)."
         ),
     )
     args = parser.parse_args()

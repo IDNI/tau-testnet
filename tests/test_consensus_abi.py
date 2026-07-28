@@ -258,3 +258,37 @@ def test_build_consensus_input_streams_feeds_stake_and_mode():
         config.set_database_path(original_path)
         if os.path.exists(path):
             os.remove(path)
+
+
+def test_build_consensus_input_streams_gates_proposer_pubkey():
+    """ABI v1.2: i13 (proposer pubkey, bv[384]) is fed ONLY when the active rule
+    needs it (tau_validator_set mode). Feeding a bv[384] value on every consensus
+    step would make each eval pay wide-bitvector cost in stake / validator_set
+    mode, where no rule references i13. The value is the WRAPPED literal form the
+    shrink layer interns to the same id as the rule's equality constant."""
+    fd, path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    original_path = config.STRING_DB_PATH
+    try:
+        _reset_db(path)
+        engine = TauConsensusEngine()
+        kwargs = dict(
+            proposer_pubkey="c" * 96,
+            block_number=1,
+            timestamp=1,
+            previous_hash="d" * 64,
+            proof_ok=True,
+            claims={},
+        )
+
+        assert 13 not in engine._build_consensus_input_streams(**kwargs)
+
+        fed = engine._build_consensus_input_streams(feed_proposer_pubkey=True, **kwargs)
+        assert fed[13] == "{ #x" + "c" * 96 + " }:bv[384]"
+    finally:
+        if db._db_conn:
+            db._db_conn.close()
+            db._db_conn = None
+        config.set_database_path(original_path)
+        if os.path.exists(path):
+            os.remove(path)

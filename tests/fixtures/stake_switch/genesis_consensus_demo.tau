@@ -12,8 +12,9 @@
 # In stake mode (i15 != 0) o7 is left free here, so a stake revision that defines
 # o7 for i15 = 1 composes with this rule without contradiction.
 #
-# TEMPLATE: demo/render_revision.py substitutes __VALIDATOR_1/2/3__ with the
-# node1/2/3 BLS pubkeys (96 lowercase hex) AFTER key generation in demo/setup.sh.
+# This fixture is the rendered form, carrying the a/b/c *96 validators the native
+# e2e test uses. The demo repo (demo/stake-switch) keeps the .tmpl and the
+# renderer that substitute real node pubkeys after key generation.
 always (
     o6[t]:bv[16] = i10[t]:bv[16] &&
     ( i15[t]:bv[16] != { 0 }:bv[16] ||

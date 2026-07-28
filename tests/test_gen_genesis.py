@@ -238,6 +238,63 @@ def test_gen_genesis_rejects_malformed_eligibility_mode():
         assert "eligibility" in result.stderr.lower()
 
 
+# A minimal tau_validator_set membership rule: o7 is forced both ways off the
+# proposer pubkey (i13), and only under the mode guard i15 = 0, so a stake
+# revision defining o7 for i15 = 1 composes without contradiction.
+_MEMBERSHIP_RULE = """always (
+    o6[t]:bv[16] = i10[t]:bv[16] &&
+    ( i15[t]:bv[16] != { 0 }:bv[16] ||
+      ( ( i13[t]:bv[384] = { #x%s }:bv[384] && o7[t]:bv[16] = { 1 }:bv[16] ) ||
+        ( i13[t]:bv[384] != { #x%s }:bv[384] && o7[t]:bv[16] = { 0 }:bv[16] ) ) )
+)
+""" % ("a" * 96, "a" * 96)
+
+
+def _run_gen_genesis_with_rule(argv, tmpdir, consensus_rules):
+    """gen_genesis against a caller-supplied consensus rule file."""
+    script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "gen_genesis.py"))
+    rule_path = os.path.join(tmpdir, "consensus.tau")
+    with open(rule_path, "w", encoding="utf-8") as f:
+        f.write(consensus_rules)
+    out_path = os.path.join(tmpdir, "genesis.json")
+    result = subprocess.run(
+        [sys.executable, script_path,
+         "--genesis-rules-path", "genesis.tau",
+         "--genesis-consensus-path", rule_path,
+         "--out", out_path] + argv,
+        capture_output=True, text=True, env=os.environ,
+    )
+    return result, out_path
+
+
+def test_gen_genesis_tau_validator_set_requires_i13_rule():
+    """tau_validator_set makes Tau o7 the binding proposer gate (host membership
+    gate off), so a rule that never reads i13 would admit ANY proposer. The
+    coupling must fail at genesis-build time, not at the first foreign block."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result, _ = _run_gen_genesis(
+            ["--eligibility-mode", "tau_validator_set", "--validator-key", "a" * 96], tmpdir
+        )
+        assert result.returncode != 0
+        assert "i13" in (result.stderr + result.stdout)
+
+
+def test_gen_genesis_tau_validator_set_pins_mode_with_membership_rule():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result, out_path = _run_gen_genesis_with_rule(
+            ["--eligibility-mode", "tau_validator_set", "--validator-key", "a" * 96],
+            tmpdir, _MEMBERSHIP_RULE,
+        )
+        assert result.returncode == 0, f"gen_genesis failed: {result.stderr}"
+        with open(out_path) as f:
+            genesis_data = json.load(f)
+        meta = genesis_data["consensus_meta"]["mechanism_specific_metadata"]
+        assert meta["eligibility_mode"] == "tau_validator_set"
+        # The i13 membership constants must survive fee injection into the rule.
+        assert "i13" in genesis_data["consensus_rules"]
+        assert "o9" in genesis_data["consensus_rules"]
+
+
 def test_derive_pubkey_privkey_leading_zero():
     """Regression: a privkey whose hex starts with '0' must not have its leading
     zero stripped. The old lstrip("0x") stripped any leading '0'/'x' chars, making

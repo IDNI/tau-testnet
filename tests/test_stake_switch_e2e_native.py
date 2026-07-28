@@ -101,6 +101,9 @@ tau_manager.communicate_with_tau(rule_text=GENESIS_DEMO, target_output_stream_in
 
 H = 5
 lm = ConsensusLifecycleManager(active_validators=[V1, V2, V3])
+# Genesis runs in tau_validator_set mode: the membership rule (fixture) decides
+# proposer eligibility via i13, so Tau o7 binds in verify from block 1.
+lm.eligibility_mode = "tau_validator_set"
 update = ConsensusRuleUpdate(
     rule_revisions=[REVISION],
     activate_at_height=H,
@@ -123,6 +126,12 @@ parent = TauStateSnapshot(
     },
 )
 active_view = engine.derive_active_consensus(parent, H)
+# Pre-switch (tau_validator_set): the genesis membership rule admits a validator
+# (V1) and refuses a non-member (OUTSIDER) via Tau o7 -- host gate is bypassed.
+def _pre_verify(proposer):
+    return engine.verify_block_header(active_view, _mk_block(H, proposer), {"proof_ok": True})
+pre_member = _pre_verify(V1)
+pre_outsider = _pre_verify(OUTSIDER)
 block = _mk_block(H, V1)
 result = engine.apply_block(active_view, block, parent)
 
@@ -137,6 +146,9 @@ def verify(proposer):
 emit({
     "scheduled": scheduled,
     "activated": update.update_id_hex in result.governance_changes["activated_updates"],
+    "pre_mode": active_view.mechanism_specific_metadata.get("eligibility_mode"),
+    "pre_member": pre_member,
+    "pre_outsider": pre_outsider,
     "mode": post_lm.effective_eligibility_mode(),
     "cons_rules_ok": next_snap.metadata["consensus_rules_state"] == REVISION,
     "hash_differs": post_lm.consensus_meta_hash() != twin.consensus_meta_hash(),
@@ -207,6 +219,9 @@ def test_stake_switch_live_e2e(tmp_path):
     r = _run_child(tmp_path, "live", _LIVE_BODY)
     assert r["scheduled"] is True, r
     assert r["activated"] is True, r
+    assert r["pre_mode"] == "tau_validator_set", r
+    assert r["pre_member"] is True, f"genesis membership rule must admit a validator: {r}"
+    assert r["pre_outsider"] is False, f"genesis membership rule must refuse a non-member: {r}"
     assert r["mode"] == "stake", r
     assert r["cons_rules_ok"] is True, r
     assert r["hash_differs"] is True, r
