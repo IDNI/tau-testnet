@@ -148,6 +148,24 @@ TAU_INPUT_STREAM_PROPOSER_PUBKEY = "i13"
 # Operations keys reserved OUTSIDE RESERVED_STREAMS (that set is shared with the
 # engine for other purposes, so these are screened explicitly at every
 # ingest/apply site: commands/sendtx.py, consensus/admission.py,
-# consensus/engine.py). i12 = sender pubkey; i13 = consensus proposer pubkey;
-# i14/i15 = consensus stake/mode inputs. User custom input streams start at i16.
-EXTRA_RESERVED_OPERATION_KEYS = (12, 13, 14, 15)
+# consensus/engine.py). i12 = sender pubkey; i14/i15 = consensus stake/mode
+# inputs. User custom input streams start at i13 (issue #16).
+EXTRA_RESERVED_OPERATION_KEYS = (12, 14, 15)
+
+# i13 is the proposer pubkey ONLY while the network runs eligibility_mode
+# tau_validator_set: that is the one mode where the engine actually feeds i13
+# (see TauConsensusEngine._build_consensus_input_streams), so it is the only mode
+# where a user rule typing i13 at another width could poison process-global
+# stream typing. Under validator_set / stake nothing feeds i13 and it stays an
+# ordinary custom stream, so pre-existing user rules keep working.
+TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS = (13,)
+
+
+def reserved_operation_keys(eligibility_mode: str = "") -> tuple:
+    """Operation keys a user_tx may not target, for the given eligibility mode.
+
+    Every ingest/apply site must derive the set through this helper so admission,
+    sendtx and block apply agree — a disagreement here is a consensus split."""
+    if eligibility_mode == "tau_validator_set":
+        return EXTRA_RESERVED_OPERATION_KEYS + TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS
+    return EXTRA_RESERVED_OPERATION_KEYS

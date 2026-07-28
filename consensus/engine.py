@@ -842,10 +842,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     # o5/o8 policy stream. i14/i15 are consensus stake/mode
                     # inputs fed at consensus evaluation; a user tx typing them
                     # at another bv width poisons process-global stream typing.
+                    # i13 joins them only under tau_validator_set, the one mode
+                    # that feeds it — derived from the SAME helper admission and
+                    # sendtx use, since a disagreement here is a consensus split.
                     # Reject them here (not in RESERVED_STREAMS, a
                     # consensus-shared constant) so apply agrees with the
                     # sendtx/admission gate. Consensus change.
-                    if idx in tau_defs.RESERVED_STREAMS or idx in tau_defs.EXTRA_RESERVED_OPERATION_KEYS:
+                    if idx in tau_defs.RESERVED_STREAMS or idx in tau_defs.reserved_operation_keys(
+                            getattr(lifecycle_mgr, "effective_eligibility_mode", lambda: "")()):
                          reserved_error = f"Operation key '{k}' matches reserved stream {idx}."
                          break
                     

@@ -113,6 +113,11 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
             f"user_tx exceeds MAX_CUSTOM_INPUT_STREAMS ({custom_stream_count} > {MAX_CUSTOM_INPUT_STREAMS})."
         )
 
+    # Which operation keys are reserved depends on the eligibility mode in force
+    # (i13 only under tau_validator_set). getattr keeps the legacy contract where
+    # callers that only exercise the static screens may pass no tip view at all.
+    reserved_ops = tau_defs.reserved_operation_keys(getattr(tip_view, "eligibility_mode", ""))
+
     for key, val in operations.items():
         if not str(key).isdigit():
             continue
@@ -125,14 +130,15 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         # spoof the sender-scoped o5/o8 policy stream. i14/i15 are consensus
         # stake/mode inputs fed only at consensus evaluation — a user tx typing
         # them at a different bv width poisons the process-global stream typing
-        # (Phase 0 spike S5). Reject on every ingest path so the mempool gate
+        # (Phase 0 spike S5). i13 joins them only under tau_validator_set, the
+        # one mode that feeds it. Reject on every ingest path so the mempool gate
         # matches sendtx and apply. (i2-i5 are already rejected at apply via
         # RESERVED_STREAMS; i12/i14/i15 are not in that set.)
-        if idx in tau_defs.EXTRA_RESERVED_OPERATION_KEYS:
+        if idx in reserved_ops:
             return format_error(
                 f"Invalid operation target '{key}'. Stream {idx} is reserved "
-                f"(i12 sender pubkey; i13 consensus proposer pubkey; "
-                f"i14/i15 consensus stake/mode inputs)."
+                f"(i12 sender pubkey; i14/i15 consensus stake/mode inputs; "
+                f"i13 consensus proposer pubkey under tau_validator_set)."
             )
 
     # Screen user rule TEXT for reserved streams. Comment-stripped and
@@ -163,7 +169,11 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
                 f"'{mocked_in[0]}' (balance): reading i2 diverges the fee between admission "
                 f"and block apply. Scope on i12/i3/i4, gate on i5, compare amount on i1."
             )
-        typed_reserved_in = _streams_referenced(rule_text, ("i13", "i14", "i15"))
+        # Same reserved set as the operations screen above, minus i12: READING the
+        # sender pubkey is how a policy rule scopes itself, only WRITING it as an
+        # operation is forbidden.
+        typed_reserved = tuple(f"i{idx}" for idx in reserved_ops if idx != 12)
+        typed_reserved_in = _streams_referenced(rule_text, typed_reserved)
         if typed_reserved_in:
             return format_error(
                 f"user_tx rule text references reserved consensus input stream "
