@@ -412,15 +412,18 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                 # Reject ALL reserved streams uniformly: i2-i5 are transfer
                 # context / clock, i6-i11 are consensus ABI inputs the node injects,
                 # i12 is the sender pubkey the node sets at apply, i14/i15 are the
-                # consensus stake/mode inputs fed at consensus evaluation. Matches
-                # the authoritative gate (admission.validate_user_tx_reserved_domains)
-                # and the apply-time check (consensus/engine.py). User custom inputs
-                # start at i16. i12/i14/i15 are screened explicitly (not via
+                # consensus stake/mode inputs fed at consensus evaluation, and i13
+                # joins them only under tau_validator_set (the one mode that feeds
+                # it). Matches the authoritative gate
+                # (admission.validate_user_tx_reserved_domains) and the apply-time
+                # check (consensus/engine.py). User custom inputs
+                # start at i13. i12/i14/i15 are screened explicitly (not via
                 # RESERVED_STREAMS, a consensus-shared constant the engine reads
                 # elsewhere) so a crafted operations["12"] cannot spoof the
                 # sender-pubkey stream i12-scoped o5/o8 policy rules rely on, and
                 # operations["14"/"15"] cannot pin a conflicting bv width process-wide.
-                if idx in tau_defs.RESERVED_STREAMS or idx in tau_defs.EXTRA_RESERVED_OPERATION_KEYS:
+                if idx in tau_defs.RESERVED_STREAMS \
+                        or idx in tau_defs.reserved_operation_keys(tip_view.eligibility_mode):
                     return _qt_err(
                         "TX_INVALID",
                         f"Invalid operation key '{key}'. Stream {idx} is reserved.",

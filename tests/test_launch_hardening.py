@@ -290,6 +290,51 @@ class TestAdmissionLimits:
                 {"operations": {key: "5"}}, self._tip_view())
             assert result.is_valid, f"custom stream {key} wrongly screened: {result.error}"
 
+    def _tau_validator_set_tip_view(self):
+        """A tip view for a network running eligibility_mode tau_validator_set."""
+        from consensus.facade import TipAdmissionView
+
+        class _TauValidatorSetTipView(TipAdmissionView):
+            @property
+            def eligibility_mode(self):
+                return "tau_validator_set"
+
+        return _TauValidatorSetTipView()
+
+    def test_user_tx_i13_reserved_only_under_tau_validator_set(self):
+        """i13 is the proposer pubkey (bv[384]) only while tau_validator_set is in
+        force — that is the only mode the engine feeds it in, so it is the only mode
+        where a user tx typing i13 could pin a conflicting width process-wide.
+        Under validator_set / stake it must stay an ordinary custom stream, or every
+        already-deployed i13 rule would start failing admission."""
+        from consensus.admission import validate_user_tx_reserved_domains
+        assert validate_user_tx_reserved_domains(
+            {"operations": {"13": "5"}}, self._tip_view()).is_valid
+
+        result = validate_user_tx_reserved_domains(
+            {"operations": {"13": "5"}}, self._tau_validator_set_tip_view())
+        assert not result.is_valid
+        assert "13" in result.error
+
+    def test_user_rule_reading_i13_reserved_only_under_tau_validator_set(self):
+        from consensus.admission import validate_user_tx_reserved_domains
+        rule = "always ( o13[t]:bv[16] = i13[t]:bv[16] )."
+        assert validate_user_tx_reserved_domains(
+            {"operations": {"0": rule}}, self._tip_view()).is_valid
+
+        result = validate_user_tx_reserved_domains(
+            {"operations": {"0": rule}}, self._tau_validator_set_tip_view())
+        assert not result.is_valid
+        assert "i13" in result.error
+
+    def test_user_rule_scoping_on_i12_still_accepted_under_tau_validator_set(self):
+        # Reading i12 is how a policy rule scopes itself to its own sender; the
+        # reserved-set reuse for rule TEXT must keep excluding it.
+        from consensus.admission import validate_user_tx_reserved_domains
+        rule = "always ( o5[t]:bv[16] = { 1 }:bv[16] || i12[t]:bv[384] != i12[t]:bv[384] )."
+        assert validate_user_tx_reserved_domains(
+            {"operations": {"0": rule}}, self._tau_validator_set_tip_view()).is_valid
+
     def test_user_rule_reading_stake_mode_stream_rejected(self):
         from consensus.admission import validate_user_tx_reserved_domains
         rule = "always ( o13[t]:bv[16] = i14[t]:bv[16] )."

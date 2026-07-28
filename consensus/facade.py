@@ -32,6 +32,18 @@ class TipAdmissionView:
         return set(validators)
 
     @property
+    def eligibility_mode(self) -> str:
+        """Proposer-eligibility regime in force at canonical tip.
+
+        Admission needs it because i13 is a reserved consensus stream only under
+        tau_validator_set (the sole mode that feeds it) and an ordinary custom
+        stream otherwise."""
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        if lm is None:
+            return ""
+        return getattr(lm, "effective_eligibility_mode", lambda: "")()
+
+    @property
     def next_block_height(self) -> int:
         """Returns the height that the next block would receive (tip + 1)."""
         latest_block = db.get_canonical_head_block()
