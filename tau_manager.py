@@ -85,8 +85,16 @@ def normalize_rule_bitvector_sizes(rule_text: str, default_width: int = DEFAULT_
     return normalized.replace(sentinel, ":bv[384]")
 
 # --- Global State ---
+# Guards the `tau_direct_interface` global itself (rebinding it during
+# restart/shutdown). NOT a comm lock: `kill_tau_process` holds it across a full
+# TauInterface construction, so serializing evaluations on it would let a hung
+# evaluation block engine recovery.
 tau_process_lock = threading.Lock()
-tau_comm_lock = threading.Lock()
+# Serializes every evaluation against the live interpreter. REENTRANT: callers
+# (consensus/engine.py) already wrap multi-output evaluations in this lock to get
+# a wider atomic region, and the rule-exec path can re-enter the comm helpers
+# underneath it -- a plain Lock would self-deadlock there.
+tau_comm_lock = threading.RLock()
 tau_ready = threading.Event()
 tau_process_ready = threading.Event()
 restart_in_progress = threading.Event()
@@ -593,10 +601,18 @@ def communicate_with_tau_multi(
         filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
         raise TauEngineCrash(msg)
 
-    # NOTE: deliberately lock-free, mirroring the pre-shrink behavior. This path
-    # can be entered while tau_comm_lock is already held elsewhere (e.g. nested
-    # under the rule-exec path in apply_block), so acquiring it here would
-    # self-deadlock on the non-reentrant lock.
+    # Serialize on tau_comm_lock like the single-output path. This used to be
+    # deliberately lock-free because the lock was non-reentrant and this path can
+    # be entered while it is already held (consensus/engine.py wraps its calls;
+    # the rule-exec path in apply_block nests) -- tau_comm_lock is now an RLock,
+    # so nesting is safe and the admission path (commands/sendtx.py) no longer
+    # races the block producer inside the native engine. Two threads in
+    # `tau.step` at once corrupt each other's StdOutCapture fd-1 redirect
+    # ("[Errno 9] Bad file descriptor" -> valid txs rejected, sender sequence
+    # then drifts) and interleave inputs into the one stateful interpreter.
+    # Acquire BEFORE _write_status so queueing time is not charged to the
+    # watchdog's in-flight comm window (config.COMM_TIMEOUT).
+    tau_comm_lock.acquire()
     _write_status(start=True, source=source)
     try:
         i0_stream_preps = _collect_i0_prepared(input_stream_values)
@@ -632,6 +648,7 @@ def communicate_with_tau_multi(
         _handle_width_overflow(wexc)  # re-execs (or re-raises in test mode)
     finally:
         _write_status(start=False)
+        tau_comm_lock.release()
 
     # Optional disk logging of the multi-response (best-effort)
     try:
@@ -703,29 +720,34 @@ def restore_full_tau_spec(spec_text: str, *, runtime_shrunk_streams: "frozenset 
     if not tau_direct_interface:
         raise TauEngineCrash("Cannot restore Tau spec before direct interface initialization.")
 
-    # Feed the interpreter the shrunk runtime form (matching the i0 path) so
-    # runtime stream values stay consistent post-recovery. When shrink is off
-    # (default) runtime == canonical and this is identical to the pre-shrink path.
-    canonical = tau_direct_interface.preprocess_spec_text(spec_text or "")
-    if getattr(config, "TAU_SHRINK_ENABLED", False):
-        # Re-pick the process width from the (now-restored) intern table first.
-        tau_shrink.set_shrink_width_from_db()
-        prepared = tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
-    else:
-        prepared = tau_shrink.PreparedTauSpec(canonical, canonical, False, frozenset())
-    _print_tau_send("restore_full_tau_spec update_spec", prepared.runtime_text)
-    tau_direct_interface.update_spec(prepared.runtime_text)
-    _commit_runtime_spec(prepared)
-    if runtime_shrunk_streams is not None:
-        # Re-pin the caller-supplied set: _commit_runtime_spec just set it from the
-        # re-prepared (already-shrunk -> empty) spec, which is wrong here.
-        _runtime_shrunk_streams = frozenset(runtime_shrunk_streams)
-    try:
-        last_known_tau_spec = tau_direct_interface.get_current_spec() or canonical
-    except Exception:
-        last_known_tau_spec = canonical
-    # Full composed interpreter spec (== canonical when shrink is off).
-    last_known_tau_spec = tau_direct_interface.get_current_spec() or prepared.canonical_text
+    # `update_spec` is an engine entry (it rebuilds the interpreter), so it has to
+    # be serialized against evaluations exactly like the comm paths -- otherwise a
+    # concurrent admission evaluation both corrupts the fd-1 capture and reads a
+    # half-replaced interpreter. Reentrant: callers may already hold the lock.
+    with tau_comm_lock:
+        # Feed the interpreter the shrunk runtime form (matching the i0 path) so
+        # runtime stream values stay consistent post-recovery. When shrink is off
+        # (default) runtime == canonical and this is identical to the pre-shrink path.
+        canonical = tau_direct_interface.preprocess_spec_text(spec_text or "")
+        if getattr(config, "TAU_SHRINK_ENABLED", False):
+            # Re-pick the process width from the (now-restored) intern table first.
+            tau_shrink.set_shrink_width_from_db()
+            prepared = tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
+        else:
+            prepared = tau_shrink.PreparedTauSpec(canonical, canonical, False, frozenset())
+        _print_tau_send("restore_full_tau_spec update_spec", prepared.runtime_text)
+        tau_direct_interface.update_spec(prepared.runtime_text)
+        _commit_runtime_spec(prepared)
+        if runtime_shrunk_streams is not None:
+            # Re-pin the caller-supplied set: _commit_runtime_spec just set it from the
+            # re-prepared (already-shrunk -> empty) spec, which is wrong here.
+            _runtime_shrunk_streams = frozenset(runtime_shrunk_streams)
+        try:
+            last_known_tau_spec = tau_direct_interface.get_current_spec() or canonical
+        except Exception:
+            last_known_tau_spec = canonical
+        # Full composed interpreter spec (== canonical when shrink is off).
+        last_known_tau_spec = tau_direct_interface.get_current_spec() or prepared.canonical_text
 
 
 def get_tau_process_status():
@@ -754,6 +776,15 @@ def request_shutdown():
 
 
 def kill_tau_process():
+    """Rebuild the interpreter after a failure.
+
+    Deliberately does NOT take tau_comm_lock: an evaluation that hung inside the
+    engine still holds it, and recovery must not queue behind it (the external
+    watchdog SIGKILLs the process on COMM_TIMEOUT, but in-process callers --
+    server.py's shutdown path -- would block). FD-1 safety across the concurrent
+    interpreter construction comes from `tau_native._stdout_capture_lock`, whose
+    critical section is one `tau.step` and therefore always short.
+    """
     global tau_ready, tau_process_ready, tau_direct_interface, restart_in_progress
     logger.warning("Resetting direct Tau interface after failure.")
     tau_ready.clear()

@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from collections import deque
 
 from errors import TauEngineBug, TauEngineCrash
@@ -126,20 +127,37 @@ def load_tau_module():
             logger.error("Could not find native tau module in candidates or PYTHONPATH")
             raise ImportError("Native tau module not found. Ensure tau-lang is built and accessible.")
 
+# FD 1 is process-global, so StdOutCapture's save/redirect/restore cycle is a
+# process-wide critical section: two threads inside it at once leak each other's
+# pipe write end into the saved fd, which ends with stdout wired to a closed pipe
+# ("[Errno 9] Bad file descriptor" out of the next native call) or a reader
+# blocking forever on a pipe whose write end still lives on fd 1. Reentrant so a
+# nested capture on the same thread (e.g. interpreter rebuild inside a step)
+# still works. This is a safety net for engine entries that do NOT go through
+# `tau_manager.tau_comm_lock` (interpreter construction, update_spec); the
+# whole-call serialization that keeps the stateful interpreter coherent lives in
+# tau_manager.
+_stdout_capture_lock = threading.RLock()
+
+
 class StdOutCapture:
     """
     Context manager to capture C-level stdout/stderr output.
-    Required because nanobind/C++ prints directly to file descriptors, 
+    Required because nanobind/C++ prints directly to file descriptors,
     bypassing sys.stdout.
+
+    Mutually exclusive across threads: `__enter__` holds `_stdout_capture_lock`
+    until `__exit__`. Only usable as a context manager -- the fd bookkeeping is
+    set up in `__enter__`, not in `__init__`, so it stays inside the lock.
     """
     def __init__(self):
         # Always use FD 1 (STDOUT_FILENO) because C++ std::cout writes directly to it
         # regardless of whether sys.stdout has been redirected by pytest/CaptureIO.
         self._stdout_fd = 1
-        self._saved_stdout_fd = os.dup(self._stdout_fd)
-        self._r, self._w = os.pipe()
+        self._saved_stdout_fd = None
+        self._r = self._w = None
         self.output = ""
-        
+
         # Load C standard library for flushing
         try:
             self.libc = ctypes.CDLL(None)
@@ -147,33 +165,61 @@ class StdOutCapture:
             self.libc = None
 
     def __enter__(self):
-        # Flush Python's stdout buffer before redirecting
-        sys.stdout.flush()
-        if self.libc:
-            self.libc.fflush(None)
-            
-        # Redirect stdout to the write end of the pipe
-        os.dup2(self._w, self._stdout_fd)
+        _stdout_capture_lock.acquire()
+        try:
+            # Flush Python's stdout buffer before redirecting
+            sys.stdout.flush()
+            if self.libc:
+                self.libc.fflush(None)
+
+            self._saved_stdout_fd = os.dup(self._stdout_fd)
+            self._r, self._w = os.pipe()
+
+            # Redirect stdout to the write end of the pipe
+            os.dup2(self._w, self._stdout_fd)
+        except BaseException:
+            # Never hold the lock if the redirect never took effect.
+            self._close_fds()
+            _stdout_capture_lock.release()
+            raise
         return self
 
+    def _close_fds(self):
+        for attr in ("_w", "_r", "_saved_stdout_fd"):
+            fd = getattr(self, attr)
+            if fd is None:
+                continue
+            setattr(self, attr, None)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # Flush Python's stdout
-        sys.stdout.flush()
-        
-        # Flush C-level stdout to ensure buffered content goes to pipe
-        if self.libc:
-            self.libc.fflush(None)
-            
-        # Closing the write end signals EOF to the reader
-        os.close(self._w)
-        
-        # Restore original stdout
-        os.dup2(self._saved_stdout_fd, self._stdout_fd)
-        os.close(self._saved_stdout_fd)
-        
-        # Read from the read end of the pipe
-        with os.fdopen(self._r, 'r') as f:
-            self.output = f.read()
+        try:
+            # Flush Python's stdout
+            sys.stdout.flush()
+
+            # Flush C-level stdout to ensure buffered content goes to pipe
+            if self.libc:
+                self.libc.fflush(None)
+
+            # Closing the write end signals EOF to the reader
+            os.close(self._w)
+            self._w = None
+
+            # Restore original stdout
+            os.dup2(self._saved_stdout_fd, self._stdout_fd)
+            os.close(self._saved_stdout_fd)
+            self._saved_stdout_fd = None
+
+            # Read from the read end of the pipe
+            r, self._r = self._r, None
+            with os.fdopen(r, 'r') as f:
+                self.output = f.read()
+        finally:
+            self._close_fds()
+            _stdout_capture_lock.release()
 
 
 
