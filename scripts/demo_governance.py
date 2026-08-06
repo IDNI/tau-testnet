@@ -252,7 +252,9 @@ def run_e2e_scenario(host, port, privkey):
     while current_height < target_activation:
         next_height = current_height + 1
         print(f"Mining Block {next_height}...")
-        resp = rpc_command("createblock\r\n", host, port)
+        # allow-empty: these delay blocks carry no transactions, and createblock
+        # refuses to seal an empty block unless explicitly asked.
+        resp = rpc_command("createblock allow-empty\r\n", host, port)
         print(f"[BLOCK] {resp.strip()}")
         assert_success(resp, f"Mine Delay Block {next_height}")
         current_height = int(get_governance_state(host, port)["head_number"])
@@ -328,7 +330,8 @@ if __name__ == "__main__":
     elif args.cmd == "vote":
         submit_vote(args.host, args.port, args.privkey, args.update_id)
     elif args.cmd == "mine":
-        resp = rpc_command("createblock\r\n", args.host, args.port)
+        # allow-empty: `mine` is used to advance height, mempool or not.
+        resp = rpc_command("createblock allow-empty\r\n", args.host, args.port)
         print(f"[BLOCK] {resp.strip()}")
         assert_success(resp, "Mine Block")
     elif args.cmd == "state":

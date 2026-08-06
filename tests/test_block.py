@@ -195,17 +195,35 @@ class TestBlockCreation(unittest.TestCase):
         self.assertEqual(latest_block['transactions'][0], json.loads(self.tx2_json))
         self.assertEqual(latest_block['block_hash'], next_block_data['block_hash'])
 
-    def test_create_block_with_empty_mempool(self):
-        """Test that an empty block is created if the mempool is empty."""
+    def test_empty_mempool_produces_no_block_by_default(self):
+        """An empty mempool is refused: a polling caller must not mint empties."""
+        clear_mempool()
+        head_before = get_canonical_head_block()
+
+        result = createblock.create_block_from_mempool()
+
+        self.assertNotIn("block_hash", result)
+        code, _ = createblock._classify_createblock_error(result)
+        self.assertEqual(code, "MEMPOOL_EMPTY")
+
+        head_after = get_canonical_head_block()
+        self.assertEqual(
+            (head_before or {}).get('block_hash'),
+            (head_after or {}).get('block_hash'),
+            "refused round must not advance the head",
+        )
+
+    def test_create_block_with_empty_mempool_when_allowed(self):
+        """`allow_empty` still seals an empty block (used to advance height)."""
         # Ensure mempool is empty
         clear_mempool()
-        
+
         # Attempt to create a block
-        result = createblock.create_block_from_mempool()
-        
+        result = createblock.create_block_from_mempool(allow_empty=True)
+
         # Verify block was created
         self.assertIn("block_hash", result)
-        
+
         # Verify database has the empty block
         latest_block = get_canonical_head_block()
         self.assertIsNotNone(latest_block)

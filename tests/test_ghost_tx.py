@@ -195,28 +195,41 @@ class TestGhostTxIntegration(unittest.TestCase):
         # Insert TX with bad sequence (100 vs expected 0 for new user)
         payload_bad = json.dumps({
             "sender_pubkey": "UserBad",
-            "sequence_number": 100, 
+            "sequence_number": 100,
             "expiration_time": int(time.time() + 3600),
             "operations": {"1": [["UserBad", "UserX", "10"]]}
         })
         db.add_mempool_tx(payload_bad, "hash_bad", 2000)
-        
-        # Run Mining
-        block_res = createblock.create_block_from_mempool()
-        
+
+        # Run Mining. This must stay inside the patch context: a tx rejected at
+        # apply is only disposed of once the block carrying that verdict is
+        # actually persisted. If the block does not land, the verdict belongs to
+        # a parent state the chain never adopted, so the mempool is left intact.
+        with patch('consensus.engine.TauConsensusEngine.query_eligibility', return_value=True), \
+             patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True), \
+             patch('consensus.engine.tau_manager.tau_ready.is_set', return_value=True), \
+             patch('consensus.engine.tau_manager.communicate_with_tau', side_effect=tau_side_effect), \
+             patch('consensus.engine.tau_manager.communicate_with_tau_multi', return_value={}), \
+             patch('chain_state.tau_manager.tau_ready.wait', return_value=True):
+            block_res = createblock.create_block_from_mempool()
+
         # Verify Block (Should be empty or contain message)
         # Our logic returns dict with "message" if empty block is created/skipped
         if "transactions" in block_res:
              self.assertEqual(len(block_res['transactions']), 0, "Bad TX should be rejected")
         else:
              self.assertIn("message", block_res)
-             
+
         # Verify Mempool is clean (Rejected TX should be removed)
         cur = db._db_conn.cursor()
         cur.execute("SELECT count(*) FROM mempool")
         count = cur.fetchone()[0]
         self.assertEqual(count, 0, "Rejected TX should be removed from mempool")
-        
+        self.assertEqual(
+            (db.get_dropped_tx("hash_bad") or {}).get("reason"), "rejected",
+            "a tx disposed with a persisted block must be recorded as rejected",
+        )
+
         print("[TEST] Rejected TX was correctly removed.")
 
 if __name__ == '__main__':

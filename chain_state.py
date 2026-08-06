@@ -49,8 +49,55 @@ def compute_accounts_hash(balances: Dict[str, int], sequences: Dict[str, int]) -
 
 logger = logging.getLogger(__name__)
 
-# Lock for thread-safe reorg/fork-choice processing
+# Serializes every writer that can advance or rewrite the canonical chain:
+# local block production (commands/createblock.py), `process_new_block`, network
+# sync ingest (network/service.py) and reorg/fork choice. Without it two
+# producers read the same head and build competing blocks at one height; the
+# loser then fails to persist and (pre-fix) destroyed its own transactions.
+#
+# MUST STAY AN RLock: one producer nests it three deep on a single thread --
+# create_block_from_mempool -> process_new_block -> maybe_update_canonical_head
+# -> reorg_to.
+#
+# This is the OUTERMOST application lock. Order is
+#   _chain_lock -> tau_comm_lock -> _stdout_capture_lock
+#   _chain_lock -> _balance_lock -> _sequence_lock -> _rules_lock -> _db_lock
+# Never acquire it below tau_comm_lock, and never add it to the Tau
+# restore/replay path: a producer holding it can block on `tau_ready`, so a
+# restart thread that needed the lock would close a real cycle.
 _chain_lock = threading.RLock()
+
+
+def chain_write_lock(timeout: float = -1):
+    """Context manager over `_chain_lock` for callers outside this module.
+
+    ``timeout`` is passed straight to ``acquire`` (-1 blocks). Yields True when
+    the lock was taken and False when it timed out, so a caller that has nothing
+    useful to do while another writer holds the chain can bail out instead of
+    parking a thread:
+
+        with chain_write_lock(timeout=0) as acquired:
+            if not acquired:
+                return "busy"
+    """
+    return _ChainWriteLock(timeout)
+
+
+class _ChainWriteLock:
+    __slots__ = ("_timeout", "_acquired")
+
+    def __init__(self, timeout: float) -> None:
+        self._timeout = timeout
+        self._acquired = False
+
+    def __enter__(self) -> bool:
+        self._acquired = _chain_lock.acquire(timeout=self._timeout)
+        return self._acquired
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._acquired:
+            _chain_lock.release()
+        return False
 
 # Lock for thread-safe access to balances
 _balance_lock = threading.Lock()
@@ -460,7 +507,19 @@ def process_new_block(block: Block) -> bool:
     """
     Standard network/import block ingestion path.
     Enforces strict derivation, verification, and pure simulation before persistence.
+
+    Holds `_chain_lock` for the whole attempt: the head read, `db.add_block`, the
+    in-memory state swap and the canonical-state write must be one critical
+    section, or a second writer slips in between them and both blocks claim the
+    same height. Reentrant, so the local producer (which already holds it for the
+    whole round) passes straight through.
     """
+    with _chain_lock:
+        return _process_new_block_locked(block)
+
+
+def _process_new_block_locked(block: Block) -> bool:
+    """`process_new_block` body. Callers must hold `_chain_lock`."""
     global _lifecycle_manager, _application_rules_state, _consensus_rules_state, _tau_engine_state_hash, _canonical_head_hash, _active_consensus_id
     from errors import TauTestnetError, BlockchainBug
     import db
@@ -1720,20 +1779,23 @@ def maybe_update_canonical_head() -> Optional[bool]:
     candidate evaluation may retry), or None if there was nothing to do.
     """
     import db
-    candidates = db.get_candidate_heads()
-    if not candidates:
-        return None
-
-    valid_cands = []
-    for cand_hash, cand_height in candidates:
-        if _is_reachable_from_genesis(cand_hash):
-            valid_cands.append((cand_hash, cand_height))
-
-    best_hash = select_best_head(valid_cands)
-    if not best_hash:
-        return None
-
+    # The candidate scan is inside the lock too: reading candidates, picking the
+    # best and comparing it against the head is a decision about the current
+    # chain, and a writer landing a block mid-scan makes that decision stale.
     with _chain_lock:
+        candidates = db.get_candidate_heads()
+        if not candidates:
+            return None
+
+        valid_cands = []
+        for cand_hash, cand_height in candidates:
+            if _is_reachable_from_genesis(cand_hash):
+                valid_cands.append((cand_hash, cand_height))
+
+        best_hash = select_best_head(valid_cands)
+        if not best_hash:
+            return None
+
         current_head = db.get_canonical_head()
         current_hash = current_head.get('block_hash') if current_head else ''
         if best_hash != current_hash:
@@ -1742,6 +1804,9 @@ def maybe_update_canonical_head() -> Optional[bool]:
 
 def reorg_to(new_head_hash: str) -> Optional[bool]:
     """Reorg the canonical head to `new_head_hash`.
+
+    Callers must hold `_chain_lock` (`maybe_update_canonical_head` does). That is
+    deliberately not asserted: tests drive `reorg_to` directly.
 
     Returns True if the head advanced (state rebuilt + committed), False if the
     reorg was ABORTED because the rebuild replay failed (canonical head left

@@ -529,8 +529,15 @@ Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSoc
 
 - `status` is `"ok"` or `"error"`; `command` echoes the request; `data` on success, `error.code`/`error.message`(+`details`) on failure.
 - Types: addresses/hashes/IDs and token amounts are **strings** (overflow-safe); counts/heights/sequence numbers are integers; timestamps are ISO 8601 strings.
-- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `BLS_UNAVAILABLE`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `MINING_NOT_ELIGIBLE`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
+- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `BLS_UNAVAILABLE`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
 - The `hello version=N` handshake stays plain text (versions 1 and 2).
+
+**`createblock`** takes one optional argument: `createblock allow-empty`. Block production is
+serialized node-wide (one round at a time; a concurrent caller gets `MINING_BUSY` rather than
+building a competing block at the same height), and an empty mempool is refused with
+`MEMPOOL_EMPTY` unless `allow-empty` is passed — that flag exists for advancing height, e.g. to a
+governance activation boundary. Tune the waits with `TAU_BLOCK_PRODUCTION_LOCK_TIMEOUT` (default
+`0`, try-lock) and `TAU_CHAIN_INGEST_LOCK_TIMEOUT` (default `30`).
 
 ### Pending-aware wallet queries
 
