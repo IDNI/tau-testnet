@@ -7,9 +7,15 @@ view — outgoing/incoming amounts and the pending tx list — without changing
 
 Amount fields are decimal STRINGS: transfer amounts can exceed a JS Number's
 safe integer range, and `getbalance` already returns `str(balance)`.
-`pending_outgoing` includes the node's own admission fee estimate, mirroring
-the balance check `sendtx` enforces (balance >= transfers + estimated_fee), so
-`available_balance` never invites a wallet to queue a doomed transfer.
+
+`pending_outgoing` is the transfer total ONLY; the sender's admission fee
+estimate is reported separately in `pending_fees`. The two are summed internally
+into `total_out`, which mirrors the balance check `sendtx` enforces
+(balance >= transfers + estimated_fee), so `available_balance` never invites a
+wallet to queue a doomed transfer. `total_out` is not serialized: clients read
+the split fields, or `chain_balance - available_balance` for the authoritative
+"not currently spendable" amount.
+
 Unconfirmed `pending_incoming` is reported but never treated as spendable.
 """
 import logging

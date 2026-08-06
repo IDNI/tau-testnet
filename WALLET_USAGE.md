@@ -30,10 +30,13 @@ commands give a wallet the mempool view:
 
 - `getaccountstate <address>` — `chain_balance`, `pending_outgoing`,
   `pending_incoming`, `pending_fees`, `available_balance`, and a `pending_txs`
-  list. `pending_outgoing` includes the node's fee estimate (matching admission),
-  and `available_balance = max(0, chain_balance − pending_outgoing −
-  pending_fees)`; unconfirmed incoming is reported but not spendable. All amounts
-  are decimal strings.
+  list. `pending_outgoing` is the transfer total only; the sender's admission fee
+  estimate is reported separately in `pending_fees`. `available_balance = max(0,
+  chain_balance − pending_outgoing − pending_fees)`; unconfirmed incoming is
+  reported but not spendable. All amounts are decimal strings.
+  `chain_balance − available_balance` is the authoritative "not currently
+  spendable" amount — it stays correct regardless of how the constituent fields
+  are split, so prefer it over summing them yourself.
 - `gettxstatus <tx_hash>` — `queued` | `confirmed` | `expired` | `evicted` |
   `rejected` | `unknown`. `sendtx` returns the `tx_hash` on success, so a wallet
   can poll status right after queuing.

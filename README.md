@@ -548,18 +548,22 @@ view that accounts for queued sends, use the additive commands (both read-only):
 
   ```json
   {"status":"ok","command":"getaccountstate","data":{
-    "address":"a63b...ea73","chain_balance":"1000","pending_outgoing":"103",
+    "address":"a63b...ea73","chain_balance":"1000","pending_outgoing":"101",
     "pending_incoming":"0","pending_fees":"2","available_balance":"897",
     "pending_txs":[{"hash":"…","direction":"outgoing","amount":"101","fee":"2",
                     "status":"queued","sequence_number":3,"tx_type":"user_tx",
                     "received_at":"…","expires_at":"…"}]}}
   ```
 
-  `pending_outgoing` and `pending_fees` mirror the admission check
+  `pending_outgoing` is the transfer total only and `pending_fees` the sender's
+  admission fee estimate; together they mirror the admission check
   (`balance >= transfers + estimated_fee`), and `available_balance =
-  max(0, chain_balance − pending_outgoing − pending_fees)`. Unconfirmed
-  `pending_incoming` is reported but never counted as spendable. Amounts are
-  strings; `direction` is `outgoing` / `incoming` / `self`.
+  max(0, chain_balance − pending_outgoing − pending_fees)`. Prefer
+  `chain_balance − available_balance` as the authoritative "not currently
+  spendable" amount — it is stable regardless of how the constituent fields are
+  split. Unconfirmed `pending_incoming` is reported but never counted as
+  spendable. Amounts are strings; `direction` is `outgoing` / `incoming` /
+  `self`.
 
 - **`gettxstatus <tx_hash>`** — lifecycle of a transaction by hash. `data.status`
   is one of `queued` (in the mempool, incl. reserved-for-mining), `confirmed`

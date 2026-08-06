@@ -557,7 +557,10 @@ def get_pending_sequence(sender_pubkey: str) -> Optional[int]:
     max_seq = None
     with _db_lock:
         cur = _db_conn.cursor()
-        # Only check 'pending' or 'reserved' (not yet mined) transactions
+        # Every mempool row counts. Today the table only ever holds 'pending' and
+        # 'reserved' (both not-yet-mined), so no status filter is needed — but a
+        # future status that is NOT admission-validated must be excluded here, or
+        # it would bump a sender's expected sequence number.
         cur.execute('SELECT payload FROM mempool')
         
         for (payload,) in cur.fetchall():

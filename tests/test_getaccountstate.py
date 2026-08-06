@@ -133,3 +133,46 @@ def test_usage_error(temp_database, container):
     resp = json.loads(getaccountstate.execute("getaccountstate", container))
     assert resp["status"] == "error"
     assert resp["error"]["code"] == "INVALID_PARAMS"
+
+
+# --- Issue #28: field-split contract ---------------------------------------
+# The tests above pin exact literals, so they would still pass if the semantics
+# flipped to a fee-INCLUSIVE `pending_outgoing` and the literals were updated to
+# match. These name the intent instead: the fee lives in `pending_fees` and
+# nowhere else, and `chain_balance - available_balance` is the authoritative
+# unspendable amount whatever the split.
+
+def test_pending_outgoing_excludes_fees(temp_database, container):
+    chain_state._balances[SENDER] = 1000
+    _add_tx("ba" * 32, SENDER, [[SENDER, RECIP, "40"]], seq=0, estimated_fee=10)
+    _add_tx("bb" * 32, SENDER, [[SENDER, OTHER, "5"], [SENDER, RECIP, "3"]],
+            seq=1, estimated_fee=7)
+    data = _state(container, SENDER)
+    # Transfer amounts only: 40 + 5 + 3. Fees (10 + 7) are NOT folded in here.
+    assert data["pending_outgoing"] == "48"
+    assert data["pending_fees"] == "17"
+
+
+def test_unspendable_equals_chain_minus_available(temp_database, container):
+    chain_state._balances[SENDER] = 1000
+    _add_tx("ca" * 32, SENDER, [[SENDER, RECIP, "40"]], seq=0, estimated_fee=10)
+    _add_tx("cb" * 32, SENDER, [[SENDER, OTHER, "60"]], seq=1, estimated_fee=15)
+    data = _state(container, SENDER)
+    held = int(data["chain_balance"]) - int(data["available_balance"])
+    assert held == int(data["pending_outgoing"]) + int(data["pending_fees"])
+    assert held == 125  # 40 + 60 transfers, 10 + 15 fees
+
+
+def test_unspendable_identity_holds_when_clamped(temp_database, container):
+    # Pending exceeds the balance (possible after a reorg or a stale mempool):
+    # available_balance clamps at 0, so the identity degrades to chain_balance
+    # rather than going negative.
+    chain_state._balances[SENDER] = 50
+    _add_tx("da" * 32, SENDER, [[SENDER, RECIP, "200"]], estimated_fee=10)
+    data = _state(container, SENDER)
+    assert data["available_balance"] == "0"
+    held = int(data["chain_balance"]) - int(data["available_balance"])
+    assert held == min(
+        int(data["chain_balance"]),
+        int(data["pending_outgoing"]) + int(data["pending_fees"]),
+    )
