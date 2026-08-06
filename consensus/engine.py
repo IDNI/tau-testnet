@@ -304,9 +304,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if tau_bound:
                 # Tau-authoritative modes (stake, tau_validator_set): both o6
                 # (validity) and o7 (eligibility) must be nonzero.
-                # communicate_with_tau_multi is deliberately lock-free, so wrap it
-                # in tau_comm_lock exactly like the fee path does. Missing o7 parses
-                # to 0 -> fail closed (a non-member's block is rejected).
+                # tau_comm_lock is taken inside communicate_with_tau_multi too; it
+                # is an RLock, so this outer hold is a (harmless) wider atomic
+                # region. Missing o7 parses to 0 -> fail closed (a non-member's
+                # block is rejected).
                 with tau_manager.tau_comm_lock:
                     outputs = tau_manager.communicate_with_tau_multi(
                         input_stream_values=tau_inputs,
