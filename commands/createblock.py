@@ -191,10 +191,24 @@ def _restore_per_sender_sequence_order(transactions, execution_transactions, res
             reserved_ids[slot] = rid
 
 
-def create_block_from_mempool() -> Dict:
+def create_block_from_mempool(allow_empty: bool = False) -> Dict:
     """
     Creates a new block from all transactions currently in the mempool,
     saves it to the database, and clears the mempool.
+
+    The whole round -- head read, eligibility, mempool reservation, Tau
+    simulation, signing and persistence -- runs under `chain_state._chain_lock`.
+    Two producers that each read the same head build competing blocks at one
+    height, and the loser cannot persist: it collides on the block-hash primary
+    key, trips the state-hash invariant, or is routed to the orphan path. The
+    lock is taken with `config.BLOCK_PRODUCTION_LOCK_TIMEOUT` (0 = try-lock), so
+    a second producer returns MINING_BUSY immediately instead of parking an RPC
+    connection thread for the length of a round.
+
+    `allow_empty` opts in to sealing a block with no transactions, which is how
+    callers advance height to a governance activation boundary. It is off by
+    default: a caller polling `createblock` would otherwise mint an unbounded
+    run of empty blocks.
     """
     print(f"[INFO][createblock] Starting block creation process...")
 
@@ -207,7 +221,19 @@ def create_block_from_mempool() -> Dict:
         print("[ERROR][createblock] BLS signing not available; cannot sign PoA block.")
         msg = "BLS signing is required for PoA blocks."
         return {"error": msg, "message": msg}
-    
+
+    with chain_state.chain_write_lock(
+        timeout=getattr(config, "BLOCK_PRODUCTION_LOCK_TIMEOUT", 0.0)
+    ) as acquired:
+        if not acquired:
+            msg = f"{_BUSY_PREFIX}; skipping this round."
+            print(f"[INFO][createblock] {msg}")
+            return {"message": msg}
+        return _create_block_locked(allow_empty=allow_empty)
+
+
+def _create_block_locked(allow_empty: bool = False) -> Dict:
+    """`create_block_from_mempool` body. Callers must hold the chain-write lock."""
     # Ensure early turn-check and block number logic happens BEFORE reserving mempool
     latest_block = db.get_canonical_head_block()
     if latest_block:
@@ -244,15 +270,17 @@ def create_block_from_mempool() -> Dict:
         print(f"[INFO][createblock] {msg}")
         return {"message": msg}
 
-    from chain_state import _chain_lock
-    with _chain_lock:
-        # Get batch of reserved transactions from mempool
-        reserved_txs = db.reserve_mempool_txs(limit=1000)
-        print(f"[INFO][createblock] Reserved {len(reserved_txs)} entries from mempool")
+    # Get batch of reserved transactions from mempool. The chain-write lock is
+    # already held for the whole round, so no second producer can sweep or
+    # re-reserve this batch while we build on it.
+    reserved_txs = db.reserve_mempool_txs(limit=1000)
+    print(f"[INFO][createblock] Reserved {len(reserved_txs)} entries from mempool")
 
-        if not reserved_txs:
-            print("[INFO][createblock] Mempool is empty (no pending txs). Proceeding to create an empty block.")
-    
+    if not reserved_txs and not allow_empty:
+        msg = "Mempool is empty (no pending txs); no block produced."
+        print(f"[INFO][createblock] {msg}")
+        return {"message": msg}
+
     # Extract data
     mempool_txs = [rtx['payload'] for rtx in reserved_txs]
     reserved_ids = [rtx['id'] for rtx in reserved_txs]
@@ -286,18 +314,33 @@ def create_block_from_mempool() -> Dict:
         except json.JSONDecodeError as e:
             print(f"[WARN][createblock] Skipping invalid JSON transaction #{i+1}: {e}")
             skipped_count += 1
-            # We do NOT add to filtered lists, so align remains correct
-            # But we might want to delete this invalid row? 
-            # For now, just skip inclusion. It will be deleted if we delete all reserved_ids?
-            # Yes, `reserved_ids` (original list) is used for cleanup.
-            
+            # Not added to the filtered lists, so they stay aligned. Disposal
+            # happens right below, not via `reserved_ids`.
+
     if skipped_count > 0:
         print(f"[WARN][createblock] Skipped {skipped_count} invalid transactions")
 
-    if reserved_ids and not transactions:
-        print("[INFO][createblock] No valid transactions parsed. Cleared reserved.")
-        import db as _db
-        _db.remove_transactions(reserved_ids)
+    # Drop the unparseable rows now. Unlike the engine's accept/reject verdicts
+    # (which depend on the parent state and so do not survive a lost race), "this
+    # payload is not JSON" is final. Left in place they would sit `reserved`,
+    # recycle through the 60s stale sweep forever, and consume a slot in every
+    # reservation batch. Record them first so gettxstatus reports `rejected`
+    # rather than `unknown`.
+    _malformed = set(reserved_ids) - set(filtered_reserved_ids)
+    if _malformed:
+        malformed_ids = [i for i in reserved_ids if i in _malformed]
+        malformed_hashes = [
+            h for i, h in zip(reserved_ids, reserved_hashes) if i in _malformed and h
+        ]
+        if malformed_hashes:
+            db.record_dropped_txs(malformed_hashes, "rejected")
+        db.remove_transactions(malformed_ids)
+        reserved_ids = [i for i in reserved_ids if i not in _malformed]
+
+    if not transactions and not allow_empty:
+        msg = "Mempool is empty (no valid pending txs); no block produced."
+        print(f"[INFO][createblock] {msg}")
+        return {"message": msg}
 
     # Fee-priority reservation can reorder a sender's transactions out of
     # sequence order; restore per-sender ascending sequence within the
@@ -318,7 +361,10 @@ def create_block_from_mempool() -> Dict:
 
     print(f"[INFO][createblock] Validating and Executing Batch Natively...")
     block_timestamp = int(time.time())
-    
+
+    # Flips once the candidate is canonical; gates the reclaim in `except`.
+    persisted = False
+
     try:
         from consensus.engine import TauConsensusEngine
         from consensus.state import TauStateSnapshot, compute_consensus_state_hash
@@ -436,11 +482,9 @@ def create_block_from_mempool() -> Dict:
              if tx_id in apply_result.invalid_tx_ids:
                  rejected_hashes.append(tx_id)
 
-        # Record rejected-at-apply txs so gettxstatus can report "rejected"
-        # rather than "unknown" once they leave the mempool. (tx_id == tx_hash;
-        # see the assignment when the block body is formed.)
-        if rejected_hashes:
-            db.record_dropped_txs(rejected_hashes, "rejected")
+        # NOTE: the apply verdicts above are recorded/disposed only after the
+        # block actually persists (step 6). They are relative to THIS parent
+        # state -- if the block never lands, "invalid" is not a durable verdict.
 
         print(f"[INFO][createblock] Execution Result: {len(final_txs)}/{len(transactions)} logically valid")
         # Removed check to allow creation of empty block
@@ -474,25 +518,41 @@ def create_block_from_mempool() -> Dict:
         # This guarantees path equivalence.
         if not chain_state.process_new_block(candidate_block):
              import db as _db
-             # Return the full reserved batch to pending first, then drop any txs
-             # we determined are safe to dispose (invalid/skipped/accepted) to avoid
-             # poisoning the mempool with permanently-invalid transactions.
+             # No block was persisted, so NOTHING may be disposed of: the batch
+             # goes back to pending exactly as it was. The engine's accept/skip/
+             # reject verdicts were computed against a parent that this block did
+             # not extend, so they are not durable -- deleting the accepted txs
+             # here (the old behaviour) destroyed valid transactions and stalled
+             # their senders' sequences forever.
              _db.unreserve_mempool_txs(reserved_ids)
-             if final_reserved_ids:
-                 _db.remove_transactions(final_reserved_ids)
              msg = "Failed to persist new canonical block"
              return {"error": msg, "message": msg}
-             
-        # 6. Mempool Disposition
+
+        persisted = True
+
+        # 6. Mempool Disposition (only now that the block is canonical)
+        import db as _db
+        # Record before removing: a tx that is in neither `mempool` nor
+        # `mempool_dropped` reads as "unknown" to gettxstatus.
+        if rejected_hashes:
+            _db.record_dropped_txs(rejected_hashes, "rejected")
         if final_reserved_ids:
-             import db as _db
              _db.remove_transactions(final_reserved_ids)
-             
+        # Parsed but claimed by no verdict: return them to pending instead of
+        # leaving them `reserved` until the 60s stale sweep.
+        leftover = [i for i in filtered_reserved_ids if i not in set(final_reserved_ids)]
+        if leftover:
+            _db.unreserve_mempool_txs(leftover)
+
         new_block = candidate_block # map for existing return variable
     except Exception as e:
         print(f"[ERROR][createblock] Block creation failed during native simulation: {e}")
         import db as _db
-        _db.unreserve_mempool_txs(reserved_ids)
+        # Only reclaim the batch if the block never landed. Once
+        # process_new_block has committed it, its transactions belong to that
+        # block; unreserving them here would re-mine them into a later one.
+        if not persisted:
+            _db.unreserve_mempool_txs(reserved_ids)
         msg = str(e)
         return {"error": msg, "message": msg}
         
@@ -502,6 +562,9 @@ def create_block_from_mempool() -> Dict:
 
 _CONFIG_ERROR_PREFIXES = ("PoA mining requires", "BLS signing is required")
 _MINING_FAILED_PREFIXES = ("Failed to sign block", "Failed to persist")
+# Must not collide with the prefixes above, or a lost lock race would be
+# reported as a mining failure.
+_BUSY_PREFIX = "Block production already in progress"
 
 
 def _classify_createblock_error(block_data: Dict) -> tuple[str, str]:
@@ -513,6 +576,8 @@ def _classify_createblock_error(block_data: Dict) -> tuple[str, str]:
         return "MINING_FAILED", msg
     if msg.startswith("Not our turn"):
         return "MINING_NOT_ELIGIBLE", msg
+    if msg.startswith(_BUSY_PREFIX):
+        return "MINING_BUSY", msg
     if "Mempool is empty" in msg:
         return "MEMPOOL_EMPTY", msg
     if err:
@@ -523,10 +588,27 @@ def _classify_createblock_error(block_data: Dict) -> tuple[str, str]:
 def execute(raw_command: str, container):
     """
     Executes the createblock command.
+
+    Usage: ``createblock [allow-empty]``. Without the flag an empty mempool
+    yields MEMPOOL_EMPTY instead of a signed empty block; ``allow-empty`` is for
+    callers that need to advance height (e.g. to a governance activation).
     """
     logger.info("Create block requested")
+
+    args = raw_command.split()[1:]
+    allow_empty = False
+    for arg in args:
+        if arg.lower() in ("allow-empty", "allow_empty"):
+            allow_empty = True
+        else:
+            return api_response.error_response(
+                "createblock",
+                f"Unknown argument '{arg}'. Usage: createblock [allow-empty]",
+                "INVALID_PARAMS",
+            )
+
     try:
-        block_data = create_block_from_mempool()
+        block_data = create_block_from_mempool(allow_empty=allow_empty)
     except Exception as exc:
         logger.exception("Block creation failed")
         return api_response.error_response(

@@ -58,12 +58,17 @@ plain-text handshake reply directly.
 
 Error codes emitted by the node: `INVALID_PARAMS`, `PARSE_ERROR`,
 `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`,
-`TX_INVALID`, `BLS_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MEMPOOL_EMPTY`,
-`MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`,
+`TX_INVALID`, `BLS_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`,
+`MEMPOOL_EMPTY`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`,
 `GOVERNANCE_ERROR`, `NOT_FOUND`, `TAU_NOT_READY`, `TIMEOUT`,
 `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`. Structured context (e.g.
 `{"expected":5,"received":4}` on `INVALID_SEQUENCE`) lives under
 `error.details`.
+
+`rpc createblock` accepts one optional argument, `allow-empty`. By default an
+empty mempool is refused with `MEMPOOL_EMPTY`; pass the flag when the point is
+to advance height (e.g. reaching a governance activation). Rounds are
+serialized node-wide, so a caller racing the miner gets `MINING_BUSY`.
 
 ## Commands
 

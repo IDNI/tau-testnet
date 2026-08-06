@@ -660,6 +660,20 @@ __all__ = [
     "TESTNET_AUTO_FAUCET",
     "TESTNET_AUTO_FAUCET_AMOUNT",
     "MAX_BLOCK_FUTURE_DRIFT_SECONDS",
+    "BLOCK_PRODUCTION_LOCK_TIMEOUT",
+    "CHAIN_INGEST_LOCK_TIMEOUT",
 ]
 
 MAX_BLOCK_FUTURE_DRIFT_SECONDS = int(os.environ.get('TAU_MAX_BLOCK_FUTURE_DRIFT', '120'))
+
+# Seconds a block producer waits for chain_state._chain_lock before giving up.
+# 0 = try-lock. The server runs a thread per RPC connection, so queueing
+# producers would pin one thread each for a multi-second round, and a producer
+# that lost the race has nothing useful to contribute: it returns MINING_BUSY and
+# the caller (or the miner's next tick) retries against the new head.
+BLOCK_PRODUCTION_LOCK_TIMEOUT = float(os.environ.get('TAU_BLOCK_PRODUCTION_LOCK_TIMEOUT', '0'))
+
+# Seconds the network sync ingest waits for the same lock. Bounded so a long
+# reorg cannot park trio's worker-thread pool; on timeout the batch is skipped
+# and the next gossip announce re-drives the sync.
+CHAIN_INGEST_LOCK_TIMEOUT = float(os.environ.get('TAU_CHAIN_INGEST_LOCK_TIMEOUT', '30'))

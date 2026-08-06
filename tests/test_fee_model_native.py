@@ -247,7 +247,9 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
     i0 update, exactly like the startup restore plan does."""
 
     def _mine(self, expect_txs):
-        block_res = createblock.create_block_from_mempool()
+        # expect_txs == 0 means this round is an activation-boundary filler:
+        # createblock only seals an empty block when asked to.
+        block_res = createblock.create_block_from_mempool(allow_empty=expect_txs == 0)
         self.assertNotIn("error", block_res, block_res)
         self.assertEqual(len(block_res.get("transactions", [])), expect_txs, block_res)
         return block_res

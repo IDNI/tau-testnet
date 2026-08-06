@@ -104,81 +104,9 @@ def test_stdout_capture_is_reentrant_on_one_thread():
 # Layer 2: tau_manager serializes whole evaluations.
 # --------------------------------------------------------------------------
 
-class FakeEngine:
-    """Stand-in for `tau_native.TauInterface` that fails on concurrent entry.
-
-    Mimics the FD-1 corruption: whoever finds another thread already inside
-    raises the exact OSError the real capture produced.
-    """
-
-    def __init__(self, dwell: float = 0.02):
-        self._dwell = dwell
-        self._counter_lock = threading.Lock()
-        self._inside = 0
-        self.max_concurrent = 0
-        self.calls = 0
-        self.overlaps: list[str] = []
-        self.sources: list[str] = []
-
-    def _enter(self, what: str) -> None:
-        with self._counter_lock:
-            self._inside += 1
-            self.calls += 1
-            self.max_concurrent = max(self.max_concurrent, self._inside)
-            overlapping = self._inside > 1
-        if overlapping:
-            self.overlaps.append(what)
-            with self._counter_lock:
-                self._inside -= 1
-            raise OSError(errno.EBADF, "Bad file descriptor")
-
-    def _exit(self) -> None:
-        with self._counter_lock:
-            self._inside -= 1
-
-    def _run(self, what: str, source: str = "-"):
-        self.sources.append(source)
-        self._enter(what)
-        try:
-            time.sleep(self._dwell)  # widen the race window
-        finally:
-            self._exit()
-
-    # --- TauInterface surface used by tau_manager ---
-    def communicate(self, rule_text=None, target_output_stream_index=0,
-                    input_stream_values=None, source="unknown",
-                    apply_rules_update=True):
-        self._run(f"communicate(o{target_output_stream_index})", source)
-        return "1"
-
-    def communicate_multi(self, rule_text=None, input_stream_values=None,
-                          source="unknown", apply_rules_update=True):
-        self._run("communicate_multi", source)
-        return {1: "1", 6: "1", 7: "1"}
-
-    def update_spec(self, new_spec):
-        self._run("update_spec")
-
-    def get_current_spec(self):
-        return "always o0[t] = 1."
-
-    @staticmethod
-    def preprocess_spec_text(spec_text: str) -> str:
-        return (spec_text or "").replace("\n", " ")
-
-
-@pytest.fixture
-def fake_engine(monkeypatch):
-    """Install a FakeEngine under tau_manager's real (locking) comm paths."""
-    engine = FakeEngine()
-    monkeypatch.setattr(tau_manager, "tau_direct_interface", engine)
-    monkeypatch.setattr(tau_manager, "tau_test_mode", False)
-    monkeypatch.setattr(tau_manager, "_rules_handler", None)
-    was_ready = tau_manager.tau_ready.is_set()
-    tau_manager.tau_ready.set()
-    yield engine
-    if not was_ready:
-        tau_manager.tau_ready.clear()
+# `FakeEngine` and the `fake_engine` / `node_state` fixtures live in
+# tests/conftest.py -- tests/test_block_production_serialization.py needs the
+# same in-process node.
 
 
 def _run_threads(targets, timeout=60):
@@ -318,53 +246,6 @@ def _sign_tx(tx_dict: dict, sk) -> str:
     msg_hash = hashlib.sha256(_get_signing_message_bytes(tx_dict)).digest()
     tx_dict["signature"] = bls.Sign(sk, msg_hash).hex()
     return json.dumps(tx_dict)
-
-
-@pytest.fixture
-def node_state(tmp_path, monkeypatch, fake_engine):
-    """Minimal in-process node: temp DB, genesis, dummy miner key, fake engine."""
-    prev_db_path = config.STRING_DB_PATH
-    prev_conn = db._db_conn
-    prev_privkey = config.MINER_PRIVKEY
-    prev_chain_globals = (
-        chain_state._balances,
-        chain_state._sequence_numbers,
-        chain_state._application_rules_state,
-        chain_state._lifecycle_manager,
-    )
-
-    config.set_database_path(str(tmp_path / "engine_concurrency.sqlite"))
-    db._db_conn = None
-    db.init_db()
-    db.clear_mempool()
-    config.MINER_PRIVKEY = "0" * 63 + "1"
-    # conftest defaults the suite to the mock validator; this test needs the real
-    # admission path (which is what raced) so it must actually call Tau.
-    monkeypatch.setenv("TAU_FORCE_TEST", "0")
-
-    from consensus.governance import ConsensusLifecycleManager
-    chain_state._balances = {}
-    chain_state._sequence_numbers = {}
-    chain_state._application_rules_state = ""
-    # A prior test that loaded genesis leaves active_validators populated, which
-    # makes the PoA gate refuse to propose for our dummy miner.
-    chain_state._lifecycle_manager = ConsensusLifecycleManager()
-    chain_state.load_genesis("data/genesis.json")
-    chain_state._lifecycle_manager = ConsensusLifecycleManager()
-
-    yield fake_engine
-
-    if db._db_conn is not None:
-        db._db_conn.close()
-    db._db_conn = prev_conn
-    config.set_database_path(prev_db_path)
-    config.MINER_PRIVKEY = prev_privkey
-    (
-        chain_state._balances,
-        chain_state._sequence_numbers,
-        chain_state._application_rules_state,
-        chain_state._lifecycle_manager,
-    ) = prev_chain_globals
 
 
 def test_concurrent_sendtx_and_createblock(node_state):

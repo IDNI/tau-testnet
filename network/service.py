@@ -1689,11 +1689,52 @@ class NetworkService:
             return 0
 
         # 4) Ingest blocks in order (avoid blocking Trio with Tau/DB work)
-        def _ingest(sorted_blocks: List[Dict[str, Any]]) -> int:
-            import chain_state
-            from block import Block
-            import logging
-            logger = logging.getLogger(__name__)
+        try:
+            blocks_sorted = sorted(
+                [b for b in blocks if isinstance(b, dict) and b.get("header")],
+                key=lambda b: int((b.get("header") or {}).get("block_number", 0)),
+            )
+        except Exception:
+            blocks_sorted = [b for b in blocks if isinstance(b, dict)]
+
+        try:
+            ingested = await trio.to_thread.run_sync(
+                self._ingest_blocks, blocks_sorted, peer_id
+            )
+            if ingested:
+                logger.info("Ingested %d blocks from %s", ingested, peer_id)
+            return ingested
+        except Exception:
+            logger.warning("Failed to ingest blocks from %s", peer_id, exc_info=True)
+            return 0
+
+    @staticmethod
+    def _ingest_blocks(sorted_blocks: List[Dict[str, Any]], peer_id: Any) -> int:
+        """Apply a synced batch of blocks and re-run fork choice.
+
+        Runs on a Trio worker thread (Tau + SQLite work must stay off the event
+        loop). Takes the chain-write lock for the WHOLE batch: ingesting blocks
+        and then choosing a head is one decision, and a local block producer
+        must not land a block in the middle of it. Bounded by
+        `config.CHAIN_INGEST_LOCK_TIMEOUT` so a long reorg elsewhere cannot park
+        Trio's worker pool -- on timeout the batch is skipped and the next
+        gossip announce re-drives the sync.
+        """
+        import chain_state
+        import config as _config
+        from block import Block
+        import logging
+        logger = logging.getLogger(__name__)
+
+        timeout = getattr(_config, "CHAIN_INGEST_LOCK_TIMEOUT", 30.0)
+        with chain_state.chain_write_lock(timeout=timeout) as acquired:
+            if not acquired:
+                logger.warning(
+                    "Skipping ingest of %d block(s) from %s: chain busy for %ss "
+                    "(a later announce will re-drive the sync)",
+                    len(sorted_blocks), peer_id, timeout,
+                )
+                return 0
 
             ingested = 0
             for b in sorted_blocks:
@@ -1705,7 +1746,7 @@ class NetworkService:
                 except Exception as e:
                     logger.debug("Ingest error for block: %s", e)
                     continue
-                    
+
             try:
                 head_status = chain_state.maybe_update_canonical_head()
                 if head_status is False:
@@ -1722,23 +1763,6 @@ class NetworkService:
                 logger.error("Failed to update canonical head after sync: %s", e)
 
             return ingested
-
-        try:
-            blocks_sorted = sorted(
-                [b for b in blocks if isinstance(b, dict) and b.get("header")],
-                key=lambda b: int((b.get("header") or {}).get("block_number", 0)),
-            )
-        except Exception:
-            blocks_sorted = [b for b in blocks if isinstance(b, dict)]
-
-        try:
-            ingested = await trio.to_thread.run_sync(_ingest, blocks_sorted)
-            if ingested:
-                logger.info("Ingested %d blocks from %s", ingested, peer_id)
-            return ingested
-        except Exception:
-            logger.warning("Failed to ingest blocks from %s", peer_id, exc_info=True)
-            return 0
 
     def get_metrics_snapshot(self) -> Dict[str, Any]:
         # Stub for test_gossip_metrics_snapshot
