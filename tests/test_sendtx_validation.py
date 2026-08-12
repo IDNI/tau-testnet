@@ -185,3 +185,34 @@ class TestSendTxValidation(unittest.TestCase):
         self.assertEqual(result["code"], "TX_INVALID")
         self.assertIn("operation '0'", result["message"])
         self.assertIn("string", result["message"])
+
+
+class TestTransferValueCeiling(unittest.TestCase):
+    """The host must not accept a transfer value the shipped rules cannot hold.
+
+    rules/01|03|04 type i1 (amount) and i2 (balance) as bv[24], so 16777215 is
+    the ceiling. The host used to range-check against bv[64], so a value in
+    between was admitted here and then truncated mod 2^24 inside Tau.
+    """
+
+    def test_ceiling_matches_the_width_the_rules_declare(self):
+        import tau_defs
+        self.assertEqual(tau_defs.TRANSFER_VALUE_BV_WIDTH, 24)
+        self.assertEqual(tau_defs.MAX_TRANSFER_VALUE, 16777215)
+
+    def test_amount_at_the_ceiling_is_accepted(self):
+        from commands.sendtx import _validate_tau_bv_range
+        _validate_tau_bv_range(16777215, "Amount")  # must not raise
+
+    def test_amount_above_the_ceiling_is_rejected(self):
+        from commands.sendtx import _validate_tau_bv_range
+        with self.assertRaises(ValueError) as ctx:
+            _validate_tau_bv_range(16777216, "Amount")
+        self.assertIn("24", str(ctx.exception))
+
+    def test_wallet_client_uses_the_same_ceiling(self):
+        import wallet
+        import tau_defs
+        self.assertEqual(wallet.MAX_TAU_TRANSFER_AMOUNT, tau_defs.MAX_TRANSFER_VALUE)
+        with self.assertRaises(ValueError):
+            wallet._validate_transfer_amount(tau_defs.MAX_TRANSFER_VALUE + 1)

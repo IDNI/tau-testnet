@@ -35,13 +35,16 @@ def _qt_err(code: str, message: str, **details) -> dict:
         out["details"] = details
     return out
 
-_MAX_TAU_BV_VALUE = (1 << tau_manager.DEFAULT_RULE_BV_WIDTH) - 1
+# Matches the width the shipped rules actually declare for i1/i2 (bv[24]), not
+# the 64 the host used to check against — a value in between was accepted here
+# and then truncated mod 2^24 inside Tau. See tau_defs.TRANSFER_VALUE_BV_WIDTH.
+_MAX_TAU_BV_VALUE = tau_defs.MAX_TRANSFER_VALUE
 
 
 def _validate_tau_bv_range(value: int, name: str) -> None:
     if value < 0 or value > _MAX_TAU_BV_VALUE:
         raise ValueError(
-            f"{name} exceeds Tau bitvector width {tau_manager.DEFAULT_RULE_BV_WIDTH} "
+            f"{name} exceeds Tau bitvector width {tau_defs.TRANSFER_VALUE_BV_WIDTH} "
             f"(max {_MAX_TAU_BV_VALUE})."
         )
 

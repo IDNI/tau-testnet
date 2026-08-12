@@ -22,7 +22,7 @@ from tau_testnet_cli import rpc
 # network's active fee rule. See README: Transaction Fees.
 DEFAULT_FEE_LIMIT = 10
 import config
-from tau_manager import DEFAULT_RULE_BV_WIDTH
+import tau_defs
 
 
 def rpc_command(cmd_str, host, port):
@@ -37,14 +37,16 @@ def rpc_command(cmd_str, host, port):
     return rpc.send_command(cmd_str, host, port)
 
 
-MAX_TAU_TRANSFER_AMOUNT = (1 << DEFAULT_RULE_BV_WIDTH) - 1
+# The shipped rules type i1/i2 as bv[24]; the node enforces the same ceiling at
+# admission. Checking here too just fails faster and with a clearer message.
+MAX_TAU_TRANSFER_AMOUNT = tau_defs.MAX_TRANSFER_VALUE
 
 
 def _validate_transfer_amount(amount: int) -> None:
     if amount < 0 or amount > MAX_TAU_TRANSFER_AMOUNT:
         raise ValueError(
             f"Amount must be between 0 and {MAX_TAU_TRANSFER_AMOUNT} "
-            f"(bv[{DEFAULT_RULE_BV_WIDTH}])."
+            f"(bv[{tau_defs.TRANSFER_VALUE_BV_WIDTH}])."
         )
 
 

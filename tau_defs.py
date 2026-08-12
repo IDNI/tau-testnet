@@ -27,6 +27,22 @@ FAIL_ZERO_AMOUNT_SBF = TAU_VALUE_ZERO
 FAIL_INVALID_FORMAT_SBF = TAU_VALUE_ZERO
 FAIL_INVALID_SBF = TAU_VALUE_ZERO
 
+# --- Transfer value width ---
+# i1 (amount) and i2 (balance) are typed bv[24] by the SHIPPED application rules
+# (rules/01, rules/03, rules/04), so 16777215 is the largest value they can carry.
+# The host used to range-check both against DEFAULT_RULE_BV_WIDTH (64) instead,
+# accepting amounts the rules then silently truncated mod 2^24 —
+# tau_manager.normalize_rule_bitvector_sizes would have rewritten the widths, but
+# it is short-circuited in production by preprocess_spec_text.
+#
+# Narrowing the HOST to match the rules is the safe direction: it is pure
+# admission tightening, with no rule text, no vote and no state-hash effect.
+# Widening the RULES to bv[64] is the unsafe one — rule files are replayed through
+# i0 and accumulate into _application_rules_state, which is hashed into every
+# block, so editing them diverges a restarted node from a running one.
+TRANSFER_VALUE_BV_WIDTH = 24
+MAX_TRANSFER_VALUE = (1 << TRANSFER_VALUE_BV_WIDTH) - 1
+
 # --- Tau Pin/Stream Names (Symbolic, for clarity in wrapper logic) ---
 # Inputs
 TAU_INPUT_STREAM_RULES = "i0"
