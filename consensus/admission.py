@@ -206,6 +206,38 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
                 f"conflicting bitvector width process-wide (e.g. i13 is bv[384])."
             )
 
+        #  (c) o5/o8 are SHARED streams: Tau composes every deployed user rule
+        #      into one constraint, so a rule that writes them without gating on
+        #      its author's identity applies to EVERY sender. `always (o5[t] = 0)`
+        #      from any account is then a one-transaction network freeze, and
+        #      `always (o8[t] = 3)` taxes every user_tx on the network — both for
+        #      the price of a single deploy (issue #24, observation 1).
+        #
+        #      Sender-scoping was already the documented contract (tau_defs.py,
+        #      README) and every shipped wallet template already complies; this
+        #      only makes it enforced. i12 (sender pubkey) or i3 (from address)
+        #      both count as a scope.
+        #
+        #      Admission-only, so it is NOT retroactive: rules already accumulated
+        #      on chain keep evaluating, and apply never re-runs this screen.
+        #      Deliberate limit: a reference is not proof the rule is really gated
+        #      by it — `always (o5[t] = 1 || i12[t] != i12[t])` passes. Catching
+        #      that needs formula analysis, not text screening. The target here is
+        #      the accidental global rule, not a determined attacker (who can only
+        #      author a rule that also blocks their own transfers).
+        policy_out = _streams_referenced(rule_text, ("o5", "o8"))
+        if policy_out and not _streams_referenced(rule_text, ("i12", "i3")):
+            return format_error(
+                f"user_tx rule text writes shared policy stream '{policy_out[0]}' "
+                f"without a sender scope: it would apply to every account on the "
+                f"network. Guard the rule on your own identity — reference i12 "
+                f"(sender pubkey) or i3 (from address), e.g. "
+                f"always ((i12[t]:bv[384] = {{ #x<your pubkey> }}:bv[384]) -> "
+                f"{policy_out[0]}[t]:bv[24] = {{ #x000000 }}:bv[24]).",
+                code="UNSCOPED_USER_RULE",
+                stream=policy_out[0],
+            )
+
     return success()
 
 def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = None) -> Optional[str]:

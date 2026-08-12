@@ -375,6 +375,7 @@ When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker)
 - `o7` — proposer eligibility.
 - `o9` — consensus base fee (strict); `o8` — optional user fee (lenient).
 - `o5` — user policy on a transfer (`0` = block, `1`/absent = allow). User-deployed, sender-scoped rules; **consensus-enforced** at both admission and block apply. A block on any transfer rejects the whole `user_tx`. Lets users express recipient whitelists (`i4`), time-locks (`i5`), and spending limits (`i1`). See [WALLET_USAGE.md](WALLET_USAGE.md).
+  **Sender scope is enforced at admission** (`UNSCOPED_USER_RULE`): `o5`/`o8` are shared streams composed across every deployed rule, so rule text writing them must reference `i12` (sender pubkey) or `i3` (from address). Without that, one `always (o5[t] = 0)` deploy would block every account on the network. The screen is textual — a reference is not proof the rule is genuinely gated by it — and applies at admission only, so rules already on chain are unaffected.
 
 **Python host enforces _before_ Tau** (the inputs Tau trusts):
 - Transaction BLS signature verification + canonical decoding (`commands/sendtx.py`).
@@ -454,7 +455,7 @@ state_hash = BLAKE3(
 Fees are sourced from the Tau consensus rules and votable by validators — no separate fee machinery.
 
 - **Consensus fee (`o9`, strict).** Active consensus rules emit the base fee on stream `o9` (genesis default `always (o9[t]:bv[24] = { #x00000a }:bv[24]).` → 10/step). Change it via a `consensus_rule_update` carrying the full new consensus spec, voted to its activation height. Absent `o9` → fee model inactive (0). A present-but-invalid `o9` is a consensus failure: proposers abort the round and validators defer the block rather than guess.
-- **User custom fee (`o8`, lenient).** User application rules may add a per-transfer fee on `o8`. Absent → 0 silently; invalid → 0 with a node-side warning.
+- **User custom fee (`o8`, lenient).** User application rules may add a per-transfer fee on `o8`. Absent → 0 silently; invalid → 0 with a node-side warning. **Must be sender-scoped** (reference `i12` or `i3`), enforced at admission as `UNSCOPED_USER_RULE`: `o8` is composed across all deployed rules, so a flat unconditional `always (o8[t] = 3).` would levy a fee on every user_tx on the network, not just the author's.
 - **Total:** `total_fee = Σ over the tx's Tau steps of (o9 + o8)` — one step per transfer; a transfer-less `user_tx` is charged one fee-query step. Multi-transfer txs pay N× by design.
 - **`fee_limit` is a cap.** Rejected (at admission and in-block) if `total_fee > fee_limit`; the sender pays `total_fee`, not the cap. Every tx carries a valid `fee_limit`; **only `user_tx` is charged** (validators never need funds to govern).
 - **Credited to** `block.header.proposer_pubkey`. **Charge-on-inclusion:** a fee-rejected tx pays nothing (no writes, no nonce bump). Sender must cover `Σ transfers + total_fee`.
@@ -529,7 +530,7 @@ Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSoc
 
 - `status` is `"ok"` or `"error"`; `command` echoes the request; `data` on success, `error.code`/`error.message`(+`details`) on failure.
 - Types: addresses/hashes/IDs and token amounts are **strings** (overflow-safe); counts/heights/sequence numbers are integers; timestamps are ISO 8601 strings.
-- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `BLS_UNAVAILABLE`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `DUPLICATE_UPDATE`, `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
+- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `BLS_UNAVAILABLE`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `DUPLICATE_UPDATE`, `UNSCOPED_USER_RULE`, `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
 - `DUPLICATE_UPDATE` carries `details.update_id` and `details.lifecycle_state`, so a
   wallet retrying a `consensus_rule_update` can tell "already landed" from a real
   rejection. `ADMISSION_TIMEOUT` / `ADMISSION_UNAVAILABLE` mean the isolated rule

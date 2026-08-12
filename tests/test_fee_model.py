@@ -490,8 +490,16 @@ class TestAdmissionFees(unittest.TestCase):
             self.assertFalse(result["ok"], msg=f"stream {stream} not screened")
             self.assertIn(stream, result["message"])
 
+    # o5/o8 rule text must carry a sender scope (#24 ask 3). These tests target
+    # the other screens, so they wrap their body in the guard; the unscoped form
+    # is covered by TestUserRuleSenderScope in test_launch_hardening.py.
+    _SCOPE = "i12[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]"
+
+    def _scoped(self, body: str) -> str:
+        return f"always (({self._SCOPE}) -> ({body}))."
+
     def test_benign_rule_text_passes_screen(self):
-        rule = "always (o5[t]:bv[16] = { #x0001 }:bv[16])."
+        rule = self._scoped("o5[t]:bv[16] = { #x0001 }:bv[16]")
         result, _ = self.queue(self.payload(operations={"0": rule}))
         self.assertTrue(result["ok"], msg=f"benign rule rejected: {result}")
 
@@ -511,16 +519,16 @@ class TestAdmissionFees(unittest.TestCase):
         # permitted (o5 recipient whitelist; commit 09d54d4). They must pass the
         # admission screen even though they read input streams.
         for stream in ("i3", "i4"):
-            rule = f"always (o8[t]:bv[24] = {stream}[t]:bv[24])."
+            rule = self._scoped(f"o8[t]:bv[24] = {stream}[t]:bv[24]")
             result, _ = self.queue(self.payload(operations={"0": rule}))
             self.assertTrue(result["ok"], msg=f"stream {stream} wrongly screened: {result}")
 
     def test_flat_fee_and_ladder_rules_pass_screen(self):
-        flat = "always (o8[t]:bv[24] = { #x000003 }:bv[24])."
+        flat = self._scoped("o8[t]:bv[24] = { #x000003 }:bv[24]")
         # Comparison-ladder tier keyed on the real amount stream i1.
-        ladder = (
-            "always ((i1[t]:bv[24] > { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000005 }:bv[24]) "
-            "|| (i1[t]:bv[24] <= { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000001 }:bv[24]))."
+        ladder = self._scoped(
+            "(i1[t]:bv[24] > { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000005 }:bv[24]) "
+            "|| (i1[t]:bv[24] <= { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000001 }:bv[24])"
         )
         for rule in (flat, ladder):
             result, _ = self.queue(self.payload(operations={"0": rule}))

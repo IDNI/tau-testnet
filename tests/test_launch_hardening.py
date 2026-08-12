@@ -170,6 +170,15 @@ class TestAdmissionLimits:
         from consensus.facade import TipAdmissionView
         return TipAdmissionView()
 
+    # o5/o8 rule text must carry a sender scope to be admissible (#24 ask 3).
+    # These tests are about the OTHER screens, so they wrap their body in the
+    # guard rather than assert the unscoped form — the unscoped form has its own
+    # tests in TestUserRuleSenderScope below.
+    _SCOPE = "i12[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]"
+
+    def _scoped(self, body: str) -> str:
+        return f"always (({self._SCOPE}) -> ({body}))."
+
     def test_too_many_transfers_rejected(self):
         from consensus.admission import validate_user_tx_reserved_domains, MAX_TRANSFERS_PER_TX
         tx = {"operations": {"1": [["a", "b", "1"]] * (MAX_TRANSFERS_PER_TX + 1)}}
@@ -227,21 +236,22 @@ class TestAdmissionLimits:
 
     def test_user_rule_reading_recipient_and_time_now_allowed(self):
         # i3/i4 (from/to) and i5 (timestamp) are deterministic at admission and
-        # apply -> recipient/time policy rules are now admissible.
+        # apply -> recipient/time policy rules are now admissible. Sender-scoped,
+        # which o5 rules must be regardless of which inputs they read.
         from consensus.admission import validate_user_tx_reserved_domains
         for stream in ("i3", "i4", "i5"):
-            rule = f"always (o5[t]:bv[24] = {stream}[t]:bv[24])."
+            rule = self._scoped(f"o5[t]:bv[24] = {stream}[t]:bv[24]")
             result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
             assert result.is_valid, f"stream {stream} wrongly screened: {result.error}"
 
     def test_user_flat_fee_and_ladder_rules_pass(self):
         from consensus.admission import validate_user_tx_reserved_domains
-        flat = "always (o8[t]:bv[24] = { #x000003 }:bv[24])."
+        flat = self._scoped("o8[t]:bv[24] = { #x000003 }:bv[24]")
         # Tiered fee on the real amount stream i1 (fed at apply) — the supported
         # alternative to rules keyed on a mocked stream.
-        ladder = (
-            "always ((i1[t]:bv[24] > { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000005 }:bv[24]) "
-            "|| (i1[t]:bv[24] <= { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000001 }:bv[24]))."
+        ladder = self._scoped(
+            "(i1[t]:bv[24] > { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000005 }:bv[24]) "
+            "|| (i1[t]:bv[24] <= { #x0003e8 }:bv[24] && o8[t]:bv[24] = { #x000001 }:bv[24])"
         )
         for rule in (flat, ladder):
             result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
@@ -250,14 +260,15 @@ class TestAdmissionLimits:
     def test_user_rule_mocked_stream_only_in_comment_passes(self):
         # A mocked stream named only in a '#' comment must not trip the screen.
         from consensus.admission import validate_user_tx_reserved_domains
-        rule = "always (o8[t]:bv[24] = { #x000003 }:bv[24]). # flat fee, not scaled by i2 balance"
+        rule = (self._scoped("o8[t]:bv[24] = { #x000003 }:bv[24]")
+                + " # flat fee, not scaled by i2 balance")
         result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
         assert result.is_valid, f"comment false-positive: {result.error}"
 
     def test_user_rule_custom_stream_not_mistaken_for_mocked(self):
         # Custom input stream i23 must not be screened as i2 (word boundary).
         from consensus.admission import validate_user_tx_reserved_domains
-        rule = "always (o8[t]:bv[24] = i23[t]:bv[24])."
+        rule = self._scoped("o8[t]:bv[24] = i23[t]:bv[24]")
         result = validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
         assert result.is_valid, f"i23 mis-screened as i2: {result.error}"
 
@@ -460,3 +471,88 @@ class TestAdmissionLimits:
         import tau_native
         from tau_testnet_cli import rpc
         assert tau_native.admission_compile_timeout() < rpc.DEFAULT_TIMEOUT
+
+
+class TestUserRuleSenderScope:
+    """Issue #24 ask 3: o5/o8 rule text must be scoped to its author.
+
+    Tau composes every deployed user rule into one constraint, so an unscoped
+    rule applies to every sender: `always (o5[t] = 0)` is a one-transaction
+    network freeze and `always (o8[t] = 3)` taxes the whole network. Scoping was
+    already the documented contract; this makes it enforced.
+    """
+
+    def _tip_view(self):
+        from consensus.facade import TipAdmissionView
+        return TipAdmissionView()
+
+    def _screen(self, rule):
+        from consensus.admission import validate_user_tx_reserved_domains
+        return validate_user_tx_reserved_domains({"operations": {"0": rule}}, self._tip_view())
+
+    PUBKEY = "{ #x" + "ab" * 48 + " }:bv[384]"
+
+    def test_unscoped_o5_deny_all_rejected(self):
+        result = self._screen("always (o5[t]:bv[24] = { #x000000 }:bv[24]).")
+        assert not result.is_valid, "the network-freeze rule was admitted"
+        assert result.code == "UNSCOPED_USER_RULE"
+        assert result.details["stream"] == "o5"
+
+    def test_unscoped_o8_flat_fee_rejected(self):
+        """Deliberate semantic change: a flat unconditional user fee is no longer
+        admissible, because it levies on every user_tx, not just the author's."""
+        result = self._screen("always (o8[t]:bv[24] = { #x000003 }:bv[24]).")
+        assert not result.is_valid
+        assert result.code == "UNSCOPED_USER_RULE"
+        assert result.details["stream"] == "o8"
+
+    def test_scoped_on_i12_accepted(self):
+        result = self._screen(
+            f"always ((i12[t]:bv[384] = {self.PUBKEY}) -> o5[t]:bv[24] = {{ #x000000 }}:bv[24])."
+        )
+        assert result.is_valid, result.error
+
+    def test_scoped_on_i3_accepted(self):
+        """i3 (from address) is the documented alternative to i12."""
+        result = self._screen(
+            f"always ((i3[t]:bv[384] = {self.PUBKEY}) -> o5[t]:bv[24] = {{ #x000000 }}:bv[24])."
+        )
+        assert result.is_valid, result.error
+
+    def test_scope_named_only_in_a_comment_does_not_count(self):
+        """A comment scopes nothing, so it must not satisfy the screen — the
+        inverse of the comment false-positive cases above."""
+        result = self._screen(
+            "always (o5[t]:bv[24] = { #x000000 }:bv[24]). # scoped to i12 honest, promise"
+        )
+        assert not result.is_valid
+        assert result.code == "UNSCOPED_USER_RULE"
+
+    def test_o50_not_mistaken_for_o5(self):
+        """Word-boundary matching: a custom output stream o50 is not the shared
+        policy stream and needs no scope."""
+        result = self._screen("always (o50[t]:bv[24] = { #x000001 }:bv[24]).")
+        assert result.is_valid, result.error
+
+    def test_i120_does_not_satisfy_the_scope(self):
+        result = self._screen(
+            "always ((i120[t]:bv[24] = { #x000001 }:bv[24]) -> o5[t]:bv[24] = { #x000000 }:bv[24])."
+        )
+        assert not result.is_valid
+        assert result.code == "UNSCOPED_USER_RULE"
+
+    def test_rule_not_touching_policy_streams_needs_no_scope(self):
+        result = self._screen("always (o13[t]:bv[16] = { #x0001 }:bv[16]).")
+        assert result.is_valid, result.error
+
+    def test_known_gap_reference_is_not_proof_of_gating(self):
+        """Documented limitation, asserted so it is a known state rather than a
+        surprise: the screen is textual, so a rule that merely mentions i12
+        without gating on it passes. Catching this needs formula analysis."""
+        result = self._screen(
+            "always (o5[t]:bv[24] = { #x000000 }:bv[24] || i12[t]:bv[384] != i12[t]:bv[384])."
+        )
+        assert result.is_valid, (
+            "if this now fails, the screen gained real scope analysis — good, "
+            "update the docs in tau_defs.py and README that call it textual"
+        )
