@@ -968,6 +968,23 @@ class RuleCompileTimeout(NativeTauUnavailable):
     """
 
 
+def admission_compile_timeout() -> float:
+    """Wall-clock ceiling for an isolated compile run on the admission path.
+
+    Shared by every admission caller so the bound cannot drift between the
+    user op-"0" path and the consensus-revision path. `admission_budget` sits
+    below the shipped client's socket timeout, so the structured
+    ADMISSION_TIMEOUT actually reaches the caller instead of the client giving
+    up first; `comm_timeout` still caps it, so lowering that lowers this too.
+
+    Imported lazily: this module is also loaded inside the compile worker child,
+    which must not need the parent's config.
+    """
+    import config
+    budget = getattr(config, "ADMISSION_BUDGET", None) or config.COMM_TIMEOUT
+    return float(min(budget, config.COMM_TIMEOUT))
+
+
 def compile_revisions_isolated_subprocess(
     consensus_rules_text: str,
     revisions,

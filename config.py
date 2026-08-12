@@ -73,6 +73,14 @@ class TimeoutSettings:
     comm_timeout: int = 60
     client_wait_timeout: int = 10
     shutdown_timeout: int = 1
+    # Ceiling for a single isolated rule/revision compile on the ADMISSION path,
+    # deliberately below the shipped client's own socket timeout
+    # (tau_testnet_cli.rpc.DEFAULT_TIMEOUT = 10s). comm_timeout (60s) is far
+    # above it, so a compile bounded only by that would still outlive the caller:
+    # the client gives up first and never sees the structured ADMISSION_TIMEOUT,
+    # which is the symptom reported in issue #23. Block apply is not bounded by
+    # this — the activation-height compile there must run to completion.
+    admission_budget: int = 8
 
     def validate(self) -> None:
         for name, value in asdict(self).items():
@@ -331,6 +339,7 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     ),
     "TAU_PROCESS_TIMEOUT": ("timeouts", "process_timeout", int),
     "TAU_COMM_TIMEOUT": ("timeouts", "comm_timeout", int),
+    "TAU_ADMISSION_BUDGET": ("timeouts", "admission_budget", int),
     "TAU_CLIENT_WAIT_TIMEOUT": ("timeouts", "client_wait_timeout", int),
     "TAU_SHUTDOWN_TIMEOUT": ("timeouts", "shutdown_timeout", int),
     "TAU_DB_PATH": ("database", "path", str),
@@ -544,7 +553,7 @@ def load_settings(env: Optional[str] = None, overrides: Optional[Dict[str, Any]]
 def _sync_legacy_exports(current: Settings) -> None:
     global HOST, PORT, BUFFER_SIZE, MAX_RPC_COMMAND_BYTES
     global TAU_PROGRAM_FILE, TAU_READY_SIGNAL, COMM_DEBUG_PATH, TAU_SHRINK_ENABLED, TAU_SHRINK_STREAM_EXCLUDE
-    global PROCESS_TIMEOUT, COMM_TIMEOUT, CLIENT_WAIT_TIMEOUT, SHUTDOWN_TIMEOUT
+    global PROCESS_TIMEOUT, COMM_TIMEOUT, CLIENT_WAIT_TIMEOUT, SHUTDOWN_TIMEOUT, ADMISSION_BUDGET
     global STRING_DB_PATH
     global BOOTSTRAP_PEERS, NETWORK_ID, NETWORK_LISTEN, PEERSTORE_PATH, peerstore_path
     global DHT_RECORD_TTL, DHT_VALIDATOR_NAMESPACES, DHT_BOOTSTRAP_PEERS
@@ -569,6 +578,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     COMM_TIMEOUT = current.timeouts.comm_timeout
     CLIENT_WAIT_TIMEOUT = current.timeouts.client_wait_timeout
     SHUTDOWN_TIMEOUT = current.timeouts.shutdown_timeout
+    ADMISSION_BUDGET = current.timeouts.admission_budget
 
     STRING_DB_PATH = current.database.path
 
@@ -640,6 +650,7 @@ __all__ = [
     "COMM_TIMEOUT",
     "CLIENT_WAIT_TIMEOUT",
     "SHUTDOWN_TIMEOUT",
+    "ADMISSION_BUDGET",
     "STRING_DB_PATH",
     "BOOTSTRAP_PEERS",
     "NETWORK_ID",

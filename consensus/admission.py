@@ -378,15 +378,44 @@ def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView)
     except Exception as e:
         return format_error(f"Internal compiler failure natively: {e}")
 
-    # Isolated staging compile. Skip if the live Tau interpreter isn't ready
-    # (early boot, test fixtures without native bindings) — admission stays
-    # available and the activation-height compile remains the backstop.
+    # Isolated staging compile, in a SIGKILL-able subprocess with a hard
+    # wall-clock bound. The in-process classmethod this replaced had no timeout
+    # and wrote no watchdog status stamp, so a pathological revision could spin
+    # forever and hang the governance submit — the same vector issue #24 fixed
+    # for user op-"0" rules, which had been left live on this path.
+    #
+    # Skip if the live Tau interpreter isn't ready (early boot, test fixtures
+    # without native bindings): admission stays available and the
+    # activation-height compile in apply_block remains the correctness backstop.
     import tau_manager
     if tau_manager.tau_ready.is_set():
+        timeout = tau_native.admission_compile_timeout()
         try:
-            err = tau_native.TauInterface.compile_revisions_isolated(
+            err = tau_native.compile_revisions_isolated_subprocess(
                 tip_view.current_consensus_rules,
                 revisions,
+                timeout=timeout,
+            )
+        # RuleCompileTimeout subclasses NativeTauUnavailable, which subclasses
+        # Exception -- so these three must stay in this order. A bare
+        # `except Exception` first (as before) collapses a bounded timeout and a
+        # transient worker-spawn failure into an indistinguishable rejection.
+        except tau_native.RuleCompileTimeout as exc:
+            logger.warning("Consensus staging compile timed out: %s", exc)
+            return format_error(
+                f"Consensus update staging compile timed out after {timeout}s "
+                f"and was rejected.",
+                code="ADMISSION_TIMEOUT",
+                timeout_seconds=timeout,
+            )
+        except tau_native.NativeTauUnavailable as exc:
+            # Cannot run the isolated compile (e.g. EMFILE/ENOMEM on spawn). Do
+            # NOT fall back to the unbounded in-process path; reject promptly so
+            # the proposer can resubmit.
+            logger.warning("Consensus staging compile unavailable: %s", exc)
+            return format_error(
+                f"Consensus update staging compile could not be run: {exc}",
+                code="ADMISSION_UNAVAILABLE",
             )
         except Exception as e:
             return format_error(f"Consensus update staging compile failed: {e}")

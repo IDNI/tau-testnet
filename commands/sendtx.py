@@ -510,14 +510,20 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                                 # deterministically at its activation height, so
                                 # a rare admission-time skip cannot let an invalid
                                 # rule take effect.
+                                # Shared bound with the consensus-revision path
+                                # (consensus/admission.py), below the shipped
+                                # client's socket timeout so the structured
+                                # rejection below actually reaches the caller
+                                # instead of the client giving up first.
+                                compile_timeout = tau_native.admission_compile_timeout()
                                 compile_err = tau_native.compile_revisions_isolated_subprocess(
                                     prior_spec,
                                     [rule_text],
-                                    timeout=config.COMM_TIMEOUT,
+                                    timeout=compile_timeout,
                                 )
                             except tau_native.RuleCompileTimeout as compile_exc:
-                                # Bounded rejection: the child overran
-                                # COMM_TIMEOUT and was SIGKILLed. Return a
+                                # Bounded rejection: the child overran the
+                                # admission budget and was SIGKILLed. Return a
                                 # distinct code instead of hanging sendtx.
                                 logger.warning(
                                     "Rule compile timed out at admission: %s",
@@ -527,9 +533,9 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                                     "ADMISSION_TIMEOUT",
                                     (
                                         f"Rule validation timed out after "
-                                        f"{config.COMM_TIMEOUT}s and was rejected."
+                                        f"{compile_timeout}s and was rejected."
                                     ),
-                                    timeout_seconds=config.COMM_TIMEOUT,
+                                    timeout_seconds=compile_timeout,
                                 )
                             except tau_native.NativeTauUnavailable as compile_exc:
                                 # The isolated compile could not run (transient

@@ -364,3 +364,99 @@ class TestAdmissionLimits:
             ready.is_set.return_value = False
             result = stage_and_validate_consensus_revisions(tx, self._tip_view())
         assert result.is_valid, f"flat consensus fee rejected: {result.error}"
+
+    # --- Issue #24 ask 2 / #23: the staging compile is bounded ---------------
+    # The consensus-revision path kept calling the in-process
+    # TauInterface.compile_revisions_isolated, which has no timeout and writes no
+    # watchdog status stamp — the indefinite-hang vector #24 fixed for user op-"0"
+    # rules but left live here. It now runs in the same SIGKILL-able subprocess.
+
+    def _staging_tx(self):
+        return {"rule_revisions": ["always (o9[t]:bv[24] = { #x00000a }:bv[24])."]}
+
+    def test_staging_compile_uses_the_bounded_subprocess(self):
+        import tau_native
+        from consensus.admission import stage_and_validate_consensus_revisions
+
+        seen = {}
+
+        def fake_subprocess(rules, revisions, timeout=None):
+            seen["timeout"] = timeout
+            return None
+
+        def in_process_must_not_run(*a, **k):
+            raise AssertionError("in-process compile must not run at admission")
+
+        with patch("tau_manager.tau_ready") as ready:
+            ready.is_set.return_value = True
+            with patch.object(tau_native, "compile_revisions_isolated_subprocess",
+                              fake_subprocess), \
+                 patch.object(tau_native.TauInterface, "compile_revisions_isolated",
+                              in_process_must_not_run):
+                result = stage_and_validate_consensus_revisions(
+                    self._staging_tx(), self._tip_view())
+
+        assert result.is_valid, result.error
+        # Bounded below the shipped client's 10s socket timeout, or the caller
+        # gives up before the structured error can reach it.
+        assert seen["timeout"] <= 10
+
+    def test_staging_compile_timeout_maps_to_admission_timeout(self):
+        import tau_native
+        from consensus.admission import stage_and_validate_consensus_revisions
+
+        def timed_out(*a, **k):
+            raise tau_native.RuleCompileTimeout("child SIGKILLed after 8s")
+
+        with patch("tau_manager.tau_ready") as ready:
+            ready.is_set.return_value = True
+            with patch.object(tau_native, "compile_revisions_isolated_subprocess", timed_out):
+                result = stage_and_validate_consensus_revisions(
+                    self._staging_tx(), self._tip_view())
+
+        assert not result.is_valid
+        assert result.code == "ADMISSION_TIMEOUT"
+        assert result.details["timeout_seconds"] > 0
+
+    def test_staging_compile_unavailable_is_distinct_from_timeout(self):
+        """A transient worker-spawn failure must not read as 'your rule is bad',
+        and must not fall back to the unbounded in-process path."""
+        import tau_native
+        from consensus.admission import stage_and_validate_consensus_revisions
+
+        def unavailable(*a, **k):
+            raise tau_native.NativeTauUnavailable("cannot spawn worker: EMFILE")
+
+        def in_process_must_not_run(*a, **k):
+            raise AssertionError("must not fall back to the in-process compile")
+
+        with patch("tau_manager.tau_ready") as ready:
+            ready.is_set.return_value = True
+            with patch.object(tau_native, "compile_revisions_isolated_subprocess", unavailable), \
+                 patch.object(tau_native.TauInterface, "compile_revisions_isolated",
+                              in_process_must_not_run):
+                result = stage_and_validate_consensus_revisions(
+                    self._staging_tx(), self._tip_view())
+
+        assert not result.is_valid
+        assert result.code == "ADMISSION_UNAVAILABLE"
+
+    def test_staging_compile_rejection_still_reads_as_tx_rejected(self):
+        import tau_native
+        from consensus.admission import stage_and_validate_consensus_revisions
+
+        with patch("tau_manager.tau_ready") as ready:
+            ready.is_set.return_value = True
+            with patch.object(tau_native, "compile_revisions_isolated_subprocess",
+                              lambda *a, **k: "Error: unsatisfiable"):
+                result = stage_and_validate_consensus_revisions(
+                    self._staging_tx(), self._tip_view())
+
+        assert not result.is_valid
+        assert result.code == "TX_REJECTED"
+        assert "unsatisfiable" in result.error
+
+    def test_admission_budget_is_below_the_client_socket_timeout(self):
+        import tau_native
+        from tau_testnet_cli import rpc
+        assert tau_native.admission_compile_timeout() < rpc.DEFAULT_TIMEOUT

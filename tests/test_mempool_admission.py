@@ -279,17 +279,18 @@ class TestMempoolAdmission:
         """
         Fix 6: admission's isolated staging compile must reject syntactically
         broken revisions before they reach the proposer's apply_block. The
-        compile runs against a throwaway Tau interpreter so live mining state
-        is never touched; here we simulate a Tau parse error.
+        compile runs in a throwaway SIGKILL-able subprocess so live mining state
+        is never touched and it cannot hang admission; here we simulate a Tau
+        parse error.
         """
         import tau_manager
         import tau_native
 
         monkeypatch.setattr(tau_manager.tau_ready, "is_set", lambda: True)
         monkeypatch.setattr(
-            tau_native.TauInterface,
-            "compile_revisions_isolated",
-            classmethod(lambda cls, rules, revs: "Tau staging compile error: parse failure at offset 12"),
+            tau_native,
+            "compile_revisions_isolated_subprocess",
+            lambda rules, revs, timeout=None: "Tau staging compile error: parse failure at offset 12",
         )
 
         tx = get_update_tx(revisions=["always ( o6[t]:bv[16] = "])  # truncated
