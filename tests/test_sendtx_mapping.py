@@ -287,6 +287,61 @@ class TestSendTxMapping(unittest.TestCase):
         self.assertEqual(result["code"], "TX_REJECTED")
         self.assertNotIn("details", result)
 
+    # --- Issue #23 part 3: update_id in the success envelope ----------------
+    # Admission already derives it (the same compute_update_id getupdateid uses)
+    # and returns it on the result; sendtx was discarding it, so a wallet had to
+    # make a second round trip to learn what it had just proposed.
+
+    def _update_tx(self, revisions=None, activate_at=100000):
+        tx = {
+            "tx_type": "consensus_rule_update",
+            "sender_pubkey": SENDER,
+            "sequence_number": chain_state.get_sequence_number(SENDER),
+            "expiration_time": int(time.time()) + 1000,
+            "rule_revisions": revisions or ["always (o9[t]:bv[24] = {#x000005}:bv[24])."],
+            "activate_at_height": activate_at,
+            "fee_limit": "0",
+        }
+        msg = sendtx._get_signing_message_bytes(tx)
+        tx["signature"] = _bls.Sign(SK_SENDER, _hashlib.sha256(msg).digest()).hex()
+        return tx
+
+    def test_update_id_returned_and_matches_canonical_derivation(self):
+        from consensus.serialization import compute_update_id
+        patch("consensus.admission._open_governance_admission", lambda: True).start()
+
+        tx = self._update_tx()
+        result = sendtx.queue_transaction(json.dumps(tx))
+        self.assertTrue(result["ok"], msg=str(result))
+
+        expected = compute_update_id(tx["rule_revisions"], tx["activate_at_height"], None).hex()
+        self.assertEqual(result["update_id"], expected)
+
+    def test_update_id_reaches_the_wire_envelope(self):
+        patch("consensus.admission._open_governance_admission", lambda: True).start()
+        tx = self._update_tx()
+
+        raw = sendtx.execute(f"sendtx {json.dumps(tx)}", None)
+        envelope = json.loads(raw)
+
+        self.assertEqual(envelope["status"], "ok", msg=raw)
+        self.assertEqual(len(envelope["data"]["update_id"]), 64)
+        self.assertEqual(len(envelope["data"]["tx_hash"]), 64)
+
+    def test_user_tx_success_has_no_update_id(self):
+        result = sendtx.queue_transaction(json.dumps(self._base_tx()))
+        self.assertTrue(result["ok"], msg=str(result))
+        self.assertNotIn("update_id", result)
+
+    def test_user_tx_envelope_has_no_update_id(self):
+        # Separate test rather than a second submission in the one above: the
+        # sequence number is already consumed by then, so a resubmit would fail
+        # on INVALID_SEQUENCE and assert nothing about update_id.
+        raw = sendtx.execute(f"sendtx {json.dumps(self._base_tx())}", None)
+        envelope = json.loads(raw)
+        self.assertEqual(envelope["status"], "ok", msg=raw)
+        self.assertNotIn("update_id", envelope["data"])
+
 
 if __name__ == "__main__":
     unittest.main()

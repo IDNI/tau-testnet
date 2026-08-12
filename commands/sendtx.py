@@ -23,8 +23,10 @@ import api_response
 logger = logging.getLogger(__name__)
 
 
-def _qt_ok(tx_hash: str, message: str = "Transaction queued.") -> dict:
-    return {"ok": True, "tx_hash": tx_hash, "message": message}
+def _qt_ok(tx_hash: str, message: str = "Transaction queued.", **extra) -> dict:
+    out = {"ok": True, "tx_hash": tx_hash, "message": message}
+    out.update(extra)
+    return out
 
 
 def _qt_err(code: str, message: str, **details) -> dict:
@@ -808,7 +810,15 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
             if empty_transfer_list
             else "Transaction queued."
         )
-        return _qt_ok(tx_message_id, message=msg)
+        # Admission already derived the update_id for a consensus_rule_update
+        # (via the same compute_update_id getupdateid uses) and returned it on
+        # the result; hand it back so a wallet can track the proposal without a
+        # second round trip (issue #23).
+        extra = {}
+        update_id = admission_eval.data.get("update_id")
+        if update_id:
+            extra["update_id"] = update_id
+        return _qt_ok(tx_message_id, message=msg, **extra)
 
     except ValueError as e:
         return _qt_err("INVALID_PARAMS", f"Could not process transaction. {e}")
@@ -851,10 +861,15 @@ def execute(raw_command: str, container):
         return api_response.error_response("sendtx", str(exc), "INTERNAL_ERROR")
 
     if result.get("ok"):
-        return api_response.success_response(
-            "sendtx",
-            {"message": result.get("message", "Transaction queued."), "tx_hash": result["tx_hash"]},
-        )
+        # Explicit allowlist, never dict(result): an internal key added to the
+        # queue_transaction return must not leak into the wire envelope.
+        data = {
+            "message": result.get("message", "Transaction queued."),
+            "tx_hash": result["tx_hash"],
+        }
+        if result.get("update_id"):
+            data["update_id"] = result["update_id"]
+        return api_response.success_response("sendtx", data)
     return api_response.error_response(
         "sendtx",
         result.get("message", "Transaction rejected."),

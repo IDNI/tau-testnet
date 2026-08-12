@@ -184,3 +184,78 @@ def test_scheduled_update_without_retained_payload_degrades_gracefully():
     su = resp["scheduled_updates"][0]
     assert su == {"activation_height": 800, "update_id": update.update_id_hex}
 
+
+
+# --- Issue #23 part 4: live host-contract params and activated payloads ------
+
+def test_getgovernance_exposes_vote_quorum():
+    """approval_threshold is the derived integer; the policy string is what a
+    client needs to confirm an activated vote_quorum patch. At N=3, 'majority'
+    and 'count:2' both yield 2, so the integer alone is ambiguous."""
+    container = MockContainer()
+    resp = json.loads(getgov_execute("getgovernance", container))["data"]
+
+    assert resp["vote_quorum"] == container.chain_state._lifecycle_manager.effective_quorum_policy()
+    assert resp["approval_threshold"] == 2
+
+
+def test_vote_quorum_reflects_an_activated_patch():
+    container = MockContainer()
+    mgr = container.chain_state._lifecycle_manager
+    mgr.apply_host_contract_patch({"vote_quorum": "count:3"})
+
+    resp = json.loads(getgov_execute("getgovernance", container))["data"]
+
+    assert resp["vote_quorum"] == "count:3"
+    assert resp["approval_threshold"] == 3
+
+
+def test_activated_update_payload_surfaced():
+    """An archived/activated proposal's rule text is readable, so a passed change
+    can be shown. It previously dropped out of the response entirely."""
+    container = MockContainer()
+    mgr = container.chain_state._lifecycle_manager
+
+    activated = ConsensusRuleUpdate(["always (o9[t] = 5)."], 500)
+    mgr.update_payloads[activated.update_id] = activated
+    mgr.archival_updates.add(activated.update_id)
+
+    resp = json.loads(getgov_execute("getgovernance", container))["data"]
+
+    details = {e["update_id"]: e for e in resp["archival_update_details"]}
+    entry = details[activated.update_id_hex]
+    assert entry["payload_available"] is True
+    assert entry["rule_revisions"] == ["always (o9[t] = 5)."]
+    assert entry["activate_at_height"] == 500
+
+
+def test_archival_details_report_missing_payload_honestly():
+    """Only pending|scheduled payloads are persisted, so after a restart an
+    activated update has an id and no text. That must be visible, not implied by
+    an absent key."""
+    container = MockContainer()
+    mgr = container.chain_state._lifecycle_manager
+    forgotten = ConsensusRuleUpdate(["gone after restart"], 500)
+    mgr.archival_updates.add(forgotten.update_id)  # id retained, payload not
+
+    resp = json.loads(getgov_execute("getgovernance", container))["data"]
+
+    entry = {e["update_id"]: e for e in resp["archival_update_details"]}[forgotten.update_id_hex]
+    assert entry["payload_available"] is False
+    assert "rule_revisions" not in entry
+
+
+def test_archival_updates_stays_a_list_of_strings():
+    """Regression lock: archival_updates is documented as bare hex strings and
+    the CLI's `gov list` consumes it. The new detail field is a sibling, not a
+    shape change."""
+    container = MockContainer()
+    mgr = container.chain_state._lifecycle_manager
+    update = ConsensusRuleUpdate(["archived"], 500)
+    mgr.update_payloads[update.update_id] = update
+    mgr.archival_updates.add(update.update_id)
+
+    resp = json.loads(getgov_execute("getgovernance", container))["data"]
+
+    assert all(isinstance(uid, str) for uid in resp["archival_updates"])
+    assert resp["archival_updates"] == [update.update_id_hex]

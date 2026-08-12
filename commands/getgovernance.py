@@ -114,12 +114,45 @@ def execute(raw_command: str, container):
             elif lifecycle.get(uid_hex) not in ("pending", "approved-and-scheduled"):
                 lifecycle[uid_hex] = "archived"
 
+        # Payload of updates that already activated/archived. `archival_updates`
+        # stays a list of bare hex strings — it is documented that way and the
+        # CLI's `gov list` consumes it — so this is a parallel field rather than
+        # a shape change (issue #23).
+        #
+        # `payload_available` is honest about a real limitation: activation does
+        # not delete from update_payloads, but only pending|scheduled payloads are
+        # persisted, so a node restart loses the text of everything already
+        # activated. Widening the persistence set would grow without bound.
+        archival_update_details = []
+        for uid_hex in archival_updates:
+            payload_obj = None
+            for uid, obj in chain_state._lifecycle_manager.update_payloads.items():
+                if _normalize_hexish(uid) == uid_hex:
+                    payload_obj = obj
+                    break
+            entry = {
+                "update_id": uid_hex,
+                "lifecycle": lifecycle.get(uid_hex, "archived"),
+                "payload_available": payload_obj is not None,
+            }
+            if payload_obj is not None:
+                entry["rule_revisions"] = list(payload_obj.rule_revisions)
+                entry["activate_at_height"] = int(payload_obj.activate_at_height)
+                entry["host_contract_patch"] = payload_obj.host_contract_patch
+                entry["proposer_pubkey"] = payload_obj.proposer_pubkey
+            archival_update_details.append(entry)
+
         payload = {
             "head_hash": head_hash,
             "head_number": head_number,
             "next_block_height": next_block_height,
             "active_validator_count": validator_count,
             "approval_threshold": chain_state._lifecycle_manager.approval_threshold,
+            # The resolved policy string, not just the integer it derives: at
+            # N=4 validators, 'count:3' and 'supermajority' both yield 3, so the
+            # threshold alone cannot tell a client which policy is active, nor
+            # confirm that an activated vote_quorum patch took effect (#23).
+            "vote_quorum": chain_state._lifecycle_manager.effective_quorum_policy(),
             "eligibility_mode": chain_state._lifecycle_manager.effective_eligibility_mode(),
             "active_validators": active_validators,
             "min_activation_height_for_next_update": min_activation_height,
@@ -129,6 +162,7 @@ def execute(raw_command: str, container):
             "pending_updates": pending_updates,
             "scheduled_updates": scheduled_updates,
             "archival_updates": archival_updates,
+            "archival_update_details": archival_update_details,
             "votes": sorted(votes, key=lambda entry: (entry["update_id"], entry["voter_pubkey"])),
             "lifecycle": lifecycle,
         }
