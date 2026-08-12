@@ -188,12 +188,26 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
             return format_error(
                 f"user_tx rule text references reserved consensus output stream '{forbidden_out[0]}'."
             )
+        # i2 (balance) is now fed from the parent-block snapshot at apply, frozen
+        # for the whole block, so proposer and verifier agree and a POLICY rule
+        # reading it is deterministic (issue #20). What remains is
+        # admission-estimate drift: admission evaluates against the current head,
+        # and the tx may land several blocks later.
+        #
+        # That drift only has teeth on the FEE streams. A wrong fee estimate is
+        # shown to the user as required_fee and then re-charged differently at
+        # inclusion, so the tx is dropped at block build after the wallet
+        # promised a number. A flipped o5 verdict just rejects the transfer,
+        # which is what a policy rule is for. So the screen now applies only to
+        # rules that write o8.
         mocked_in = _streams_referenced(rule_text, APPLY_MOCKED_INPUT_STREAMS)
-        if mocked_in:
+        if mocked_in and _streams_referenced(rule_text, ("o8",)):
             return format_error(
-                f"user_tx rule text references apply-time-mocked input stream "
-                f"'{mocked_in[0]}' (balance): reading i2 diverges the fee between admission "
-                f"and block apply. Scope on i12/i3/i4, gate on i5, compare amount on i1."
+                f"user_tx FEE rule (o8) references input stream '{mocked_in[0]}' "
+                f"(balance): admission estimates it against the current head while "
+                f"apply uses the parent block, so the fee charged could differ from "
+                f"the estimate quoted to the sender. Balance-reading POLICY rules "
+                f"(o5) are permitted; for fees, tier on i1 instead."
             )
         # Same reserved set as the operations screen above, minus i12: READING the
         # sender pubkey is how a policy rule scopes itself, only WRITING it as an

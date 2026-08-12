@@ -556,3 +556,52 @@ class TestUserRuleSenderScope:
             "if this now fails, the screen gained real scope analysis — good, "
             "update the docs in tau_defs.py and README that call it textual"
         )
+
+
+class TestBalanceReadingPolicyRules:
+    """Issue #20: i2 is deterministic at apply, so POLICY rules may read it.
+
+    The screen narrowed rather than opened: a FEE rule reading i2 is still
+    rejected, because admission estimates against the head while apply uses the
+    parent block, and a wrong fee estimate is quoted to the sender and then
+    charged differently at inclusion.
+    """
+
+    def _screen(self, rule):
+        from consensus.admission import validate_user_tx_reserved_domains
+        from consensus.facade import TipAdmissionView
+        return validate_user_tx_reserved_domains(
+            {"operations": {"0": rule}}, TipAdmissionView())
+
+    SCOPE = "i12[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]"
+
+    def test_min_balance_floor_policy_rule_is_admissible(self):
+        """The exact template issue #20 asked for."""
+        rule = (f"always (({self.SCOPE}) -> "
+                f"(((i2[t]:bv[24] - i1[t]:bv[24]) < {{ #x0003e8 }}:bv[24]) "
+                f"? o5[t]:bv[24] = {{ #x000000 }}:bv[24] "
+                f": o5[t]:bv[24] = {{ #x000001 }}:bv[24])).")
+        result = self._screen(rule)
+        assert result.is_valid, f"min-balance policy rule rejected: {result.error}"
+
+    def test_fee_rule_reading_balance_is_still_rejected(self):
+        rule = f"always (({self.SCOPE}) -> (o8[t]:bv[24] = i2[t]:bv[24]))."
+        result = self._screen(rule)
+        assert not result.is_valid
+        assert "i2" in result.error
+        assert "o8" in result.error
+
+    def test_rejection_names_the_supported_alternative(self):
+        rule = f"always (({self.SCOPE}) -> (o8[t]:bv[24] = i2[t]:bv[24]))."
+        assert "i1" in self._screen(rule).error
+
+    def test_policy_and_fee_in_one_rule_is_rejected(self):
+        """A rule writing both cannot have the fee half exempted."""
+        rule = (f"always (({self.SCOPE}) -> "
+                f"(o5[t]:bv[24] = {{ #x000001 }}:bv[24] && o8[t]:bv[24] = i2[t]:bv[24])).")
+        assert not self._screen(rule).is_valid
+
+    def test_i2_only_in_a_comment_does_not_trip_the_fee_screen(self):
+        rule = (f"always (({self.SCOPE}) -> (o8[t]:bv[24] = {{ #x000003 }}:bv[24])). "
+                f"# flat, not scaled by i2")
+        assert self._screen(rule).is_valid

@@ -933,3 +933,81 @@ class TestFeeBeneficiaryRouting(EngineFeeBase):
                                   [self.transfer_tx()], balances)
         logs = " ".join(result.receipts["tx1"]["logs"])
         self.assertIn("beneficiary", logs)
+
+
+class TestParentSnapshotBalanceInput(EngineFeeBase):
+    """Issue #20: i2 is the sender's balance at the PARENT block.
+
+    Frozen for the whole block, so proposer and verifier read the same value and
+    a balance-reading policy rule is deterministic across both. The mock records
+    what was fed rather than asserting a Tau verdict.
+    """
+
+    def _fed_i2(self, calls):
+        return [c.kwargs["input_stream_values"][2] for c in calls
+                if 2 in c.kwargs.get("input_stream_values", {})]
+
+    def test_parent_balance_is_fed_not_zero(self):
+        self.mock_multi.return_value = {1: "1", 9: "10"}
+        balances = {SENDER: 1000}
+        self.engine.apply(
+            self.snapshot, [self.transfer_tx()], 1700000000,
+            target_balances=balances, target_sequences={},
+            proposer_pubkey=PROPOSER, block_height=1,
+            parent_balances={SENDER: 777},
+        )
+        self.assertIn("777", self._fed_i2(self.mock_multi.call_args_list))
+
+    def test_two_transfers_in_one_tx_see_the_same_pre_block_balance(self):
+        """Parent-snapshot semantics: a min-balance floor does not compound
+        within a block. Stated explicitly because it is the observable
+        difference from sequential-balance semantics."""
+        self.mock_multi.return_value = {1: "1"}
+        balances = {SENDER: 1000}
+        tx = self.transfer_tx(fee_limit="0", transfers=[
+            [SENDER, RECIPIENT, 100], [SENDER, RECIPIENT, 200]])
+        self.engine.apply(
+            self.snapshot, [tx], 1700000000,
+            target_balances=balances, target_sequences={},
+            proposer_pubkey=PROPOSER, block_height=1,
+            parent_balances={SENDER: 1000},
+        )
+        fed = self._fed_i2(self.mock_multi.call_args_list)
+        self.assertEqual(fed, ["1000", "1000"], "i2 must not decrement within the block")
+
+    def test_absent_parent_balances_feeds_zero_not_the_mutable_overlay(self):
+        """Legacy direct-apply callers pass no parent map. Feeding the live
+        overlay would make i2 depend on transaction order."""
+        self.mock_multi.return_value = {1: "1"}
+        balances = {SENDER: 1000}
+        self.engine.apply(
+            self.snapshot, [self.transfer_tx(fee_limit="0")], 1700000000,
+            target_balances=balances, target_sequences={},
+            proposer_pubkey=PROPOSER, block_height=1,
+        )
+        self.assertEqual(self._fed_i2(self.mock_multi.call_args_list), ["0"])
+
+    def test_parent_map_is_not_mutated_by_apply(self):
+        """It is chain_state._balances on every production path."""
+        self.mock_multi.return_value = {1: "1", 9: "10"}
+        parent = {SENDER: 1000}
+        balances = {SENDER: 1000}
+        self.engine.apply(
+            self.snapshot, [self.transfer_tx()], 1700000000,
+            target_balances=balances, target_sequences={},
+            proposer_pubkey=PROPOSER, block_height=1,
+            parent_balances=parent,
+        )
+        self.assertEqual(parent, {SENDER: 1000})
+
+    def test_i2_is_clamped_to_the_declared_rule_width(self):
+        self.mock_multi.return_value = {1: "1"}
+        balances = {SENDER: 1000}
+        self.engine.apply(
+            self.snapshot, [self.transfer_tx(fee_limit="0")], 1700000000,
+            target_balances=balances, target_sequences={},
+            proposer_pubkey=PROPOSER, block_height=1,
+            parent_balances={SENDER: tau_defs.MAX_TRANSFER_VALUE + 5000},
+        )
+        self.assertEqual(self._fed_i2(self.mock_multi.call_args_list),
+                         [str(tau_defs.MAX_TRANSFER_VALUE)])

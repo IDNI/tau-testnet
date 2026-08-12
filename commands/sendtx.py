@@ -41,6 +41,21 @@ def _qt_err(code: str, message: str, **details) -> dict:
 _MAX_TAU_BV_VALUE = tau_defs.MAX_TRANSFER_VALUE
 
 
+def _admission_i2(address: str) -> str:
+    """i2 (sender balance) for the admission-time Tau steps.
+
+    The head balance, clamped to the width the rules declare. Mirrors
+    consensus.engine's parent-snapshot `_parent_bal` so admission and apply feed
+    the same shape; admission's value is an estimate (the tx may be included
+    several blocks later), exactly like the advisory i5 timestamp.
+    """
+    try:
+        value = int(chain_state.get_balance(address))
+    except (TypeError, ValueError):
+        value = 0
+    return str(max(0, min(value, tau_defs.MAX_TRANSFER_VALUE)))
+
+
 def _validate_tau_bv_range(value: int, name: str) -> None:
     if value < 0 or value > _MAX_TAU_BV_VALUE:
         raise ValueError(
@@ -647,7 +662,18 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
 
                         tau_input_stream_values = {}
                         tau_input_stream_values[1] = str(tau_input_dict['amount'])
-                        tau_input_stream_values[2] = str(tau_input_dict['balance'])
+                        # i2: the sender's balance at the current HEAD, identical
+                        # for every transfer in this tx — matching the engine,
+                        # which feeds the parent-block snapshot frozen for the
+                        # whole block (issue #20). Deliberately NOT the intra-tx
+                        # decremented `tau_input_dict['balance']`: that is more
+                        # accurate locally but diverges from what apply will feed,
+                        # and agreeing with apply is what makes a balance-reading
+                        # rule deterministic. Advisory in the same sense as i5 —
+                        # the tx may land a few blocks later; apply is
+                        # authoritative. `remaining_balances` still drives the
+                        # affordability pre-check below.
+                        tau_input_stream_values[2] = _admission_i2(sender_pubkey)
                         # i3/i4: full 384-bit from/to pubkeys. The bv-shrink layer
                         # interns these equality-only address streams to a small bv
                         # for evaluation; the canonical full-width rule text is hashed.
@@ -738,9 +764,12 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                 and tau_manager.tau_ready.is_set()
             ):
                 try:
-                    fee_query_inputs = {1: "0", 2: "0", 3: "0", 4: "0"}
-                    fee_query_inputs[12] = "{ #x" + sender_pubkey + " }:bv[384]"
+                    # i2 is the sender's head balance here too, matching the
+                    # engine's transfer-less fee-query step (issue #20).
+                    fee_query_inputs = {1: "0", 2: _admission_i2(sender_pubkey),
+                                        3: "0", 4: "0"}
                     fee_query_inputs[5] = str(admission_ts)
+                    fee_query_inputs[12] = "{ #x" + sender_pubkey + " }:bv[384]"
                     # Custom streams (i13+) last, matching the apply-time
                     # fee-query overlay order in consensus/engine.py.
                     for k, v in custom_tau_inputs.items():

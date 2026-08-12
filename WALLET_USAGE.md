@@ -134,7 +134,7 @@ An operation key `N` maps to Tau input stream `iN`. The wallet supports:
 
 | Stream | Meaning |
 |--------|---------|
-| `i2` | balance (mocked to "0" at apply — not readable by rules) |
+| `i2` | sender balance at the **parent block**, frozen for the whole block. Readable by policy (`o5`) rules — e.g. a min-balance floor. Rejected in **fee** (`o8`) rules, since admission estimates against the head and the charge would differ from the quote. |
 | `i3` / `i4` | sender / recipient pubkey (`bv[384]`, real at admission and apply) |
 | `i5` | block timestamp (consensus clock) |
 | `i6`–`i11` | consensus ABI (block height, ts, proposer, parent hash, proof, claims) |
@@ -177,8 +177,16 @@ apply. Examples expressible today:
 - **Time-lock:** block transfers while `i5[t] < {unlock_ts}:bv[64]`.
 - **Spending limit:** block when `i1[t]` exceeds a per-tier cap.
 
-Rules must NOT read `i2` (balance): it is mocked at apply, so a rule reading it
-would diverge between admission and inclusion — such rule text is rejected.
+Policy rules **may** read `i2` (balance): it is the sender's balance at the
+parent block, frozen for the whole block, so admission and apply agree. A
+min-balance floor is expressible:
+
+- **Balance floor:** block when `(i2[t] - i1[t])` falls below your minimum.
+
+Note two transfers from the same sender in one block both see the same pre-block
+balance, so a floor does not compound within a block. **Fee** rules (`o8`) still
+may not read `i2`: admission estimates it against the current head, so the fee
+charged at inclusion could differ from the estimate quoted to the sender.
 
 ## Examples
 

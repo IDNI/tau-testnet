@@ -407,6 +407,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             replay_mode=replay_mode,
             proposer_pubkey=block.header.proposer_pubkey,
             block_height=block.header.block_number,
+            # i2 (sender balance) is fed from the PARENT snapshot, so proposer
+            # and verifier read the same map and agree exactly (issue #20).
+            # metadata['balances'] is the pre-block state; t_bals above is the
+            # mutable copy apply() debits, and must NOT be used for i2.
+            parent_balances=metadata.get('balances'),
         )
 
         # Conservation invariant: the native fee model debits the sender and
@@ -621,6 +626,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         replay_mode: bool = False,
         proposer_pubkey: Optional[str] = None,
         block_height: Optional[int] = None,
+        parent_balances: Optional[Dict[str, int]] = None,
     ) -> TauExecutionResult:
         """
         Apply transactions to the current state.
@@ -673,6 +679,41 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # governs H+1 onward and never retroactively redirects H's own fees.
         # "" means credit the proposer.
         fee_beneficiary = getattr(lifecycle_mgr, "effective_fee_beneficiary", lambda: "")()
+
+        # i2 (sender balance) source for this block: the PARENT snapshot, frozen
+        # for the whole block (issue #20). Shallow-copied because the caller's
+        # dict IS chain_state._balances on every production path, and that global
+        # is cleared/rebuilt under lock elsewhere — reading it lazily inside the
+        # tx loop would make i2 depend on another thread's timing.
+        #
+        # Consequence to know: two transfers from the same sender in one block
+        # both see the same pre-block balance, so a min-balance floor does not
+        # compound within a block. The block-build re-check remains the backstop.
+        parent_bals = dict(parent_balances or {})
+        if parent_balances is None and target_balances is not None:
+            # Legacy direct-apply callers (tests) that never pass a parent map.
+            # Feed 0 rather than guessing from the mutable overlay, which would
+            # make i2 depend on transaction order within the block.
+            logger.debug("apply() without parent_balances; i2 will be fed as 0.")
+
+        def _parent_bal(addr: Optional[str]) -> str:
+            """i2 for `addr`, clamped to the width the rules declare for it.
+
+            Applies the same TESTNET_AUTO_FAUCET substitution the debit path uses
+            further down. Without it Tau would see 0 for a faucet-funded account
+            while the transfer succeeded against a synthetic 100000, so a
+            min-balance rule would reject a send that then went through. This does
+            make i2 depend on a per-node flag — but that flag already has to match
+            network-wide (it also exempts the supply-conservation invariant), and
+            being inconsistent *within* one node is the worse, silent failure.
+            """
+            try:
+                value = int(parent_bals.get(addr, 0)) if addr else 0
+            except (TypeError, ValueError):
+                value = 0
+            if value == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
+                value = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+            return str(max(0, min(value, tau_defs.MAX_TRANSFER_VALUE)))
 
         for i, tx in enumerate(transactions):
             tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
@@ -970,11 +1011,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
                                 tau_input_stream_values = {
                                     1: str(amount),
-                                    # i2 (balance) is the ONLY stream that genuinely
-                                    # diverges queue-time vs apply-time (other txs in
-                                    # the block may debit the account); it stays mocked
-                                    # and rule text reading it is rejected at admission.
-                                    2: "0",
+                                    # i2 (balance) at the PARENT snapshot: frozen for
+                                    # the whole block, so proposer and verifier read
+                                    # the same value and a balance-reading policy rule
+                                    # is deterministic across both (issue #20).
+                                    2: _parent_bal(from_addr),
                                     # i3/i4 are the real from/to pubkeys (immutable in
                                     # the transfer tuple -> identical at admission and
                                     # apply), so recipient-aware policy/fee rules are
@@ -1095,7 +1136,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     
                                     tau_input_stream_values = {
                                         1: str(amount),
-                                        2: "0",  # Mock balance for replay
+                                        # Same parent-snapshot i2 as the fee-era
+                                        # path above: this is the replay path for
+                                        # pre-fee-era blocks, and a different value
+                                        # here would diverge replay from mining.
+                                        2: _parent_bal(from_addr),
                                         # Real from/to pubkeys for eval/width parity
                                         # with the fee-era path.
                                         3: "{ #x" + str(from_addr) + " }:bv[384]",
@@ -1194,7 +1239,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if charge_fee and accepted_in_block and not hard_reject and not transfers_op_data:
                 try:
                     fee_query_inputs = {
-                        1: "0", 2: "0", 3: "0", 4: "0",
+                        1: "0", 2: _parent_bal(sender), 3: "0", 4: "0",
+                        # NOTE: key order here (5 before 12) intentionally
+                        # matches commands/sendtx.py's transfer-less fee query,
+                        # since insertion order is what the shrink layer sees.
                         5: str(block_timestamp),
                         12: "{ #x" + str(sender) + " }:bv[384]",
                     }

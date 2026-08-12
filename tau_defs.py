@@ -112,12 +112,19 @@ USER_POLICY_ALLOW_VALUE = 1
 # custom stream (i13+) with the transfer fields (i1/i3/i4/i5/i12) is enforced
 # identically at admission and apply — passphrase confirmation, 2FA flags,
 # escrow conditions and multi-party approval all gate `sendtx`, not just apply.
-# ONLY i2 (balance) is mocked to "0": other txs in the same block may debit the
-# account, so i2 genuinely differs between queue time and apply time. A fee rule
-# depending on i2 would compute a different fee at queue time than at apply time
-# and desync admission estimates from consensus charging. This is ENFORCED: rule
-# text referencing i2 is hard-rejected at mempool admission for both user o8
-# rules and consensus o9 revisions (see consensus/admission.py
+# i2 (balance) is the sender's balance at the PARENT block, frozen for the whole
+# block (issue #20), so proposer and verifier feed the same value and a
+# balance-reading POLICY rule (o5) is deterministic across both. Two transfers
+# from one sender in a block therefore see the SAME pre-block balance: a
+# min-balance floor does not compound within a block, and the fee/balance
+# re-check at block build remains the backstop.
+#
+# What remains is admission-estimate drift: admission evaluates i2 against the
+# current head, and the tx may land several blocks later — the same advisory
+# relationship i5 has. That drift only matters for FEES, where a wrong estimate
+# is quoted to the sender and then charged differently at inclusion. So rule text
+# reading i2 is rejected only when it also writes o8 (user fee), and consensus o9
+# revisions reading i2 remain hard-rejected (see consensus/admission.py
 # APPLY_MOCKED_INPUT_STREAMS). i3/i4/i5 are immutable per-transfer / consensus-
 # injected, hence identical at admission and apply, and may be read freely
 # (recipient whitelists on i4, time-locks on i5). Wallets cannot know the final
