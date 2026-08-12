@@ -58,6 +58,34 @@ DEFAULT_ELIGIBILITY_MODE = "validator_set"
 # gate with o7 pinned to 1 by the rule.
 TAU_AUTHORITATIVE_ELIGIBILITY_MODES = ("stake", "tau_validator_set")
 
+# Every key a host_contract_patch may carry. Single source of truth: admission
+# screens against this, and apply_host_contract_patch below reads exactly these.
+#
+# An unrecognised key used to be admitted, folded into the update_id, voted on,
+# activated — and then silently ignored, because apply only reads known keys. So
+# a proposal could look like it passed while doing nothing. There is no
+# forward-compat argument for keeping that: a newer client's key would be honoured
+# by upgraded nodes and ignored by older ones, which is a silent divergence with
+# no hash mismatch to catch it. input_contract_version is equality-checked
+# against 1 and has never been bumped, so there is no negotiation to lean on.
+#
+# NOTE: this is screened at ADMISSION only (one caller,
+# consensus/admission._check_host_contract_patch). Block apply uses
+# can_admit_update, which validates no patch — so an unknown key inside an
+# already-scheduled update still activates-and-does-nothing, and a block carrying
+# such a tx is still accepted. Closing that needs a symmetric check inside
+# apply_host_contract_patch, which IS consensus-binding and needs an activation
+# height. Tracked separately; deliberately not bundled here.
+HOST_CONTRACT_PATCH_KEYS = frozenset({
+    "proof_scheme",
+    "fork_choice_scheme",
+    "input_contract_version",
+    "validator_additions",
+    "validator_removals",
+    "vote_quorum",
+    "eligibility_mode",
+})
+
 
 def is_tau_authoritative_eligibility_mode(mode: Any) -> bool:
     """True when Tau o7 binds proposer eligibility (host membership gate off)."""

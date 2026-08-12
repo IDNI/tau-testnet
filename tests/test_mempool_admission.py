@@ -392,3 +392,50 @@ class TestStructuredRejections:
         from consensus.admission import format_error
         with pytest.raises(ValueError, match="shadow envelope keys"):
             format_error("boom", code="X", message="sneaky")
+
+
+class TestHostContractPatchKeys:
+    """A patch key the runtime does not read must be rejected at admission.
+
+    Before this, an unknown key was admitted, folded into the update_id, voted
+    on, activated — and then ignored, because apply_host_contract_patch only
+    reads known keys. The proposal looked like it passed while changing nothing.
+    """
+
+    def test_unknown_key_rejected(self, tip_view):
+        tx = get_update_tx(patch={"fee_beneficiary": "a" * 96})
+        res = validate_mempool_admission(tx, tip_view)
+        assert not res.is_valid
+        assert "Unknown host_contract_patch key" in res.error
+        assert "fee_beneficiary" in res.error
+
+    def test_error_lists_the_supported_keys(self, tip_view):
+        res = validate_mempool_admission(get_update_tx(patch={"nonsense": 1}), tip_view)
+        assert "vote_quorum" in res.error and "eligibility_mode" in res.error
+
+    def test_every_known_key_is_still_accepted(self, tip_view):
+        for patch in (
+            {"proof_scheme": "bls_header_sig"},
+            {"fork_choice_scheme": "height_then_hash"},
+            {"input_contract_version": 1},
+            {"vote_quorum": "majority"},
+            {"eligibility_mode": "stake"},
+            {"validator_additions": ["b" * 96]},
+            {"validator_removals": []},
+        ):
+            res = validate_mempool_admission(get_update_tx(patch=patch), tip_view)
+            assert res.is_valid, f"{patch} wrongly rejected: {res.error}"
+
+    def test_allowlist_matches_what_apply_actually_reads(self):
+        """Lock the two halves together: a key added to the allowlist without
+        wiring it into apply_host_contract_patch would re-open the exact hole
+        this closes."""
+        import inspect
+        from consensus.governance import ConsensusLifecycleManager, HOST_CONTRACT_PATCH_KEYS
+
+        src = inspect.getsource(ConsensusLifecycleManager.apply_host_contract_patch)
+        src += inspect.getsource(ConsensusLifecycleManager.preview_validator_patch)
+        for key in HOST_CONTRACT_PATCH_KEYS:
+            if key in ("proof_scheme", "fork_choice_scheme", "input_contract_version"):
+                continue  # declared-and-validated only; no runtime effect by design
+            assert key in src, f"{key} is allowlisted but never read at activation"

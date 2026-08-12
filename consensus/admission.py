@@ -15,6 +15,7 @@ from consensus.governance import (
     validate_quorum_policy,
     validate_eligibility_mode,
     quorum_count,
+    HOST_CONTRACT_PATCH_KEYS,
 )
 
 logger = logging.getLogger(__name__)
@@ -292,6 +293,16 @@ def precheck_scheduled_update(update: Any, active_validators: Optional[Any] = No
 
 def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = None) -> Optional[str]:
     """Static checks for host contract parameters to ensure future-proofing definitions."""
+    # Reject anything apply_host_contract_patch would not read. Without this an
+    # unknown key rides through the whole lifecycle — admitted, bound into the
+    # update_id, voted on, activated — and then does nothing, so the proposal
+    # reads as passed while having no effect.
+    unknown = sorted(set(patch) - HOST_CONTRACT_PATCH_KEYS)
+    if unknown:
+        return (
+            f"Unknown host_contract_patch key(s): {', '.join(unknown)}. "
+            f"Supported: {', '.join(sorted(HOST_CONTRACT_PATCH_KEYS))}."
+        )
     if "proof_scheme" in patch and patch["proof_scheme"] != "bls_header_sig":
         return f"Unsupported proof_scheme inside host_contract_patch: {patch['proof_scheme']}"
     if "fork_choice_scheme" in patch and patch["fork_choice_scheme"] != "height_then_hash":
