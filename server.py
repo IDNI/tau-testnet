@@ -34,6 +34,77 @@ NETWORK_STOP_FLAG = threading.Event()
 SUPPORTED_HANDSHAKE_VERSIONS = {"1", "2"}
 
 
+# --- RPC rate limiting -------------------------------------------------------
+# One bucket pair per connection. The WebSocket loop had an inline bucket; the
+# raw-TCP path had none at all, so anything exposed over TCP was unmetered.
+#
+# Two tiers, because the commands differ by orders of magnitude in cost:
+#   general   — ordinary reads/writes
+#   expensive — commands that spawn a native compile subprocess per call and
+#               cost the caller nothing. sendtx is deliberately NOT in this tier:
+#               it consumes a sequence number, is capped by the mempool limit and
+#               carries a fee_limit, so it is already self-deterring. checktx has
+#               none of those brakes.
+_RPC_BURST = 10.0
+_RPC_REFILL_PER_SEC = 5.0
+_EXPENSIVE_BURST = 2.0
+_EXPENSIVE_REFILL_PER_SEC = 0.5
+_EXPENSIVE_COMMANDS = frozenset({"checktx"})
+
+
+class _TokenBucket:
+    """Token bucket over an injected clock.
+
+    The clock is a parameter because the two transports measure time
+    differently: the WebSocket loop runs under trio and must use
+    `trio.current_time()`, while the TCP handler is a plain thread using
+    `time.monotonic()`. Not thread-safe — one instance per connection.
+    """
+
+    __slots__ = ("capacity", "refill_per_second", "_tokens", "_last")
+
+    def __init__(self, capacity: float, refill_per_second: float, now: float):
+        self.capacity = capacity
+        self.refill_per_second = refill_per_second
+        self._tokens = capacity
+        self._last = now
+
+    def take(self, now: float) -> bool:
+        """Consume one token. False when the caller is over budget."""
+        elapsed = max(0.0, now - self._last)
+        self._last = now
+        self._tokens = min(self.capacity, self._tokens + elapsed * self.refill_per_second)
+        if self._tokens < 1.0:
+            return False
+        self._tokens -= 1.0
+        return True
+
+
+class _RpcLimiter:
+    """The general + expensive bucket pair for one connection."""
+
+    __slots__ = ("_general", "_expensive")
+
+    def __init__(self, now: float):
+        self._general = _TokenBucket(_RPC_BURST, _RPC_REFILL_PER_SEC, now)
+        self._expensive = _TokenBucket(_EXPENSIVE_BURST, _EXPENSIVE_REFILL_PER_SEC, now)
+
+    def allow(self, command_name: str, now: float) -> bool:
+        # Charge the general bucket for every command, so an expensive one cannot
+        # be used to dodge the overall rate.
+        if not self._general.take(now):
+            return False
+        if command_name in _EXPENSIVE_COMMANDS:
+            return self._expensive.take(now)
+        return True
+
+
+def _rate_limited_response() -> str:
+    return api_response.error_response(
+        "rate_limit", "Rate limit exceeded", "RATE_LIMITED"
+    )
+
+
 def process_command(raw_command: str, container: ServiceContainer, client_label: str, *, is_local: bool = False) -> tuple[bool, str]:
     """
     Process a single command string from any source (TCP or WS).
@@ -187,35 +258,23 @@ async def websocket_handler(request):
     client_label = f"WS:{id(ws)}"
     logger.info("WS Connection accepted: %s (Origin: %s)", client_label, origin)
 
-    # Rate Limiting State (Basic Token Bucket)
-    # Rate: 5 req/sec, Burst: 10
-    bucket_tokens = 10.0
-    last_check = trio.current_time()
-    
+    # Shared limiter with the TCP path (_RpcLimiter), on trio's clock.
+    limiter = _RpcLimiter(trio.current_time())
+
     try:
         while True:
             try:
                 message = await ws.get_message()
             except trio_websocket.ConnectionClosed:
                 break
-                
-            # Rate Limit Check
-            now = trio.current_time()
-            elapsed = now - last_check
-            last_check = now
-            bucket_tokens = min(10.0, bucket_tokens + elapsed * 5.0)
-            
-            if bucket_tokens < 1.0:
-                 logger.warning("Rate limit exceeded for %s", client_label)
-                 await ws.send_message(
-                     api_response.error_response(
-                         "rate_limit", "Rate limit exceeded", "RATE_LIMITED"
-                     )
-                 )
-                 # Optionally close, or just drop
-                 continue
-            bucket_tokens -= 1.0
-            
+
+            command_name = message.split()[0].lower() if message.split() else ""
+            if not limiter.allow(command_name, trio.current_time()):
+                logger.warning("Rate limit exceeded for %s (%s)", client_label, command_name)
+                await ws.send_message(_rate_limited_response())
+                # Drop this command, keep the connection.
+                continue
+
             # Process in a worker thread to avoid blocking the Trio event loop
             success, response = await trio.to_thread.run_sync(
                 process_command, message, container, client_label
@@ -362,6 +421,10 @@ def handle_client(conn, addr, container: ServiceContainer):
     is_local = isinstance(addr, tuple) and addr[0] in ("127.0.0.1", "::1")
     logger.info("Connection accepted from %s", client_label)
 
+    # Same limiter the WebSocket path uses. This path had none, so a pipelined
+    # stream of commands on one TCP connection was unmetered.
+    limiter = _RpcLimiter(time.monotonic())
+
     def _dispatch(line_bytes: bytes) -> bool:
         """Process one command line. Return False if the connection should close."""
         try:
@@ -379,6 +442,15 @@ def handle_client(conn, addr, container: ServiceContainer):
 
         if not raw:
             return True  # blank line (e.g. between commands) -> ignore
+
+        command_name = raw.split()[0].lower()
+        if not limiter.allow(command_name, time.monotonic()):
+            logger.warning("Rate limit exceeded for %s (%s)", client_label, command_name)
+            try:
+                conn.sendall((_rate_limited_response() + "\r\n").encode("utf-8"))
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return False
+            return True
 
         # Use shared process_command logic
         success, result_message = process_command(raw, container, client_label, is_local=is_local)

@@ -328,3 +328,77 @@ class TestClientReadsFullResponse(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRpcRateLimiting(unittest.TestCase):
+    """Issue #26 prerequisite: the TCP path had no limiter at all, so a pipelined
+    stream of commands on one connection was unmetered. checktx will spawn a
+    native compile subprocess per call with no fee and no sequence cost, so it
+    must not ship before this."""
+
+    def _bucket(self, capacity=10.0, refill=5.0):
+        from server import _TokenBucket
+        return _TokenBucket(capacity, refill, now=0.0)
+
+    def test_burst_is_capped_then_refills(self):
+        bucket = self._bucket(capacity=3.0, refill=1.0)
+        assert [bucket.take(0.0) for _ in range(4)] == [True, True, True, False]
+        # One second later exactly one token is back.
+        assert bucket.take(1.0) is True
+        assert bucket.take(1.0) is False
+
+    def test_refill_never_exceeds_capacity(self):
+        bucket = self._bucket(capacity=2.0, refill=1.0)
+        assert bucket.take(0.0) and bucket.take(0.0)
+        assert bucket.take(0.0) is False
+        # A long idle period must not bank unlimited tokens.
+        assert [bucket.take(10_000.0) for _ in range(3)] == [True, True, False]
+
+    def test_expensive_command_is_throttled_harder(self):
+        from server import _RpcLimiter
+        limiter = _RpcLimiter(now=0.0)
+        # checktx: 2 burst, well under the general 10.
+        verdicts = [limiter.allow("checktx", 0.0) for _ in range(4)]
+        assert verdicts == [True, True, False, False]
+
+    def test_expensive_command_also_charges_the_general_bucket(self):
+        """Otherwise an expensive command would be a way to dodge the overall
+        rate rather than an extra restriction on top of it."""
+        from server import _RpcLimiter
+        limiter = _RpcLimiter(now=0.0)
+        limiter.allow("checktx", 0.0)
+        limiter.allow("checktx", 0.0)
+        # Two general tokens are gone even though only the expensive bucket capped.
+        allowed = sum(1 for _ in range(20) if limiter.allow("gettimestamp", 0.0))
+        assert allowed == 8
+
+    def test_ordinary_command_is_not_throttled_to_the_expensive_rate(self):
+        from server import _RpcLimiter
+        limiter = _RpcLimiter(now=0.0)
+        assert sum(1 for _ in range(20) if limiter.allow("gettimestamp", 0.0)) == 10
+
+    def test_sendtx_is_not_in_the_expensive_tier(self):
+        """It consumes a sequence number, is capped by the mempool limit and
+        carries a fee_limit, so it is self-deterring. Throttling it to 0.5/s
+        would break ordinary transfer flow."""
+        from server import _EXPENSIVE_COMMANDS
+        assert "sendtx" not in _EXPENSIVE_COMMANDS
+        assert "checktx" in _EXPENSIVE_COMMANDS
+
+    def test_tcp_dispatch_emits_rate_limited_envelope(self):
+        from server import handle_client
+        handler = _handler()
+        container = _make_container({"gettimestamp": handler})
+
+        wire = b"".join(b"gettimestamp\r\n" for _ in range(20))
+        conn = MagicMock()
+        conn.recv.side_effect = [wire, b""]
+        sent = []
+        conn.sendall.side_effect = lambda payload: sent.append(payload)
+
+        handle_client(conn, ("203.0.113.9", 5555), container)
+
+        replies = b"".join(sent).decode()
+        assert "RATE_LIMITED" in replies, "TCP path accepted 20 pipelined commands unmetered"
+        # The general burst is 10, so roughly half should survive.
+        assert handler.execute.call_count == 10
