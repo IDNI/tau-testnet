@@ -196,25 +196,43 @@ class _FakeClientSocket:
     def shutdown(self, how):
         pass
 
+    def settimeout(self, _timeout):
+        pass
+
+    def close(self):
+        pass
+
 
 class TestLegacyClientFraming(unittest.TestCase):
     """The legacy raw-TCP senders must newline-terminate their command so the
     newline-framed server dispatches instead of waiting for a delimiter that
-    never arrives (verify_server did not before issue #24's fix)."""
+    never arrives (verify_server did not before issue #24's fix).
+
+    wallet and verify_server now reach the wire through
+    ``tau_testnet_cli.rpc.send_command`` (which uses ``socket.create_connection``)
+    so that a response larger than one recv is not truncated; they are patched at
+    that layer. demo_governance still opens its own socket. The assertion is
+    unchanged in all three cases: whatever the transport, the command leaves
+    newline-terminated.
+    """
 
     def _last_sent(self):
         return _FakeClientSocket.instances[-1].sent
 
+    @staticmethod
+    def _fake_connection(*_args, **_kwargs):
+        return _FakeClientSocket()
+
     def test_wallet_rpc_command_newline_terminates(self):
         import wallet
-        with patch("socket.socket", _FakeClientSocket):
+        with patch("socket.create_connection", self._fake_connection):
             _FakeClientSocket.instances.clear()
             wallet.rpc_command("getbalance abc", "127.0.0.1", 65432)
         self.assertTrue(self._last_sent().endswith(b"\n"))
 
     def test_verify_server_send_command_newline_terminates(self):
         from scripts import verify_server
-        with patch("socket.socket", _FakeClientSocket):
+        with patch("socket.create_connection", self._fake_connection):
             _FakeClientSocket.instances.clear()
             verify_server.send_command("gettimestamp")
         self.assertTrue(self._last_sent().endswith(b"\n"))
@@ -225,6 +243,87 @@ class TestLegacyClientFraming(unittest.TestCase):
             _FakeClientSocket.instances.clear()
             demo_governance.rpc_command("getgovernance", "127.0.0.1", 65432)
         self.assertTrue(self._last_sent().endswith(b"\n"))
+
+
+def _serve_once(payload: bytes, ready: threading.Event) -> int:
+    """Bind a loopback listener that answers one command with `payload`.
+
+    Returns the bound port. The thread reads one newline-framed command (like
+    the real server does) and then writes the payload in small chunks, closing
+    to signal end-of-response.
+
+    Reading to the newline rather than to EOF matters: a client that does not
+    half-close its write side — which is exactly the pre-fix behaviour — would
+    otherwise deadlock here and hang the suite instead of failing.
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    srv.settimeout(10)
+    port = srv.getsockname()[1]
+
+    def run():
+        ready.set()
+        try:
+            conn, _ = srv.accept()
+            conn.settimeout(10)
+            with conn:
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                view = memoryview(payload)
+                for off in range(0, len(view), 8192):
+                    conn.sendall(view[off:off + 8192])
+        except OSError:
+            pass
+        finally:
+            srv.close()
+
+    threading.Thread(target=run, daemon=True).start()
+    return port
+
+
+class TestClientReadsFullResponse(unittest.TestCase):
+    """Issue #24, client side: the legacy senders did a single ``recv`` (64 KiB
+    in wallet, 4 KiB in verify_server) and returned whatever arrived in it, so a
+    larger response — a `getgovernance` carrying scheduled rule text, or a
+    `history` on a busy account — came back truncated mid-payload and failed to
+    parse. Both now read until the server closes.
+    """
+
+    # Comfortably past wallet's old 64 KiB recv and verify_server's old 4 KiB.
+    PAYLOAD = json.dumps({
+        "status": "ok",
+        "command": "getgovernance",
+        "data": {"scheduled_updates": [{"rule": "x" * 200} for _ in range(500)]},
+    }).encode("utf-8") + b"\r\n"
+
+    def setUp(self):
+        self.assertGreater(len(self.PAYLOAD), 100 * 1024, "payload must exceed one recv")
+
+    def test_wallet_rpc_command_reads_large_response(self):
+        import wallet
+        ready = threading.Event()
+        port = _serve_once(self.PAYLOAD, ready)
+        ready.wait(5)
+        res = wallet.rpc_command("getgovernance", "127.0.0.1", port)
+        # Whole payload, and still valid JSON — the truncated read produced a
+        # JSONDecodeError here.
+        self.assertEqual(len(res), len(self.PAYLOAD) - 2)  # trailing CRLF stripped
+        parsed = json.loads(res)
+        self.assertEqual(len(parsed["data"]["scheduled_updates"]), 500)
+
+    def test_verify_server_send_command_reads_large_response(self):
+        from scripts import verify_server
+        ready = threading.Event()
+        port = _serve_once(self.PAYLOAD, ready)
+        ready.wait(5)
+        res = verify_server.send_command("getgovernance", "127.0.0.1", port)
+        self.assertEqual(len(json.loads(res)["data"]["scheduled_updates"]), 500)
 
 
 if __name__ == "__main__":

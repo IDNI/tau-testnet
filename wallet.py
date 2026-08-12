@@ -10,13 +10,13 @@ Features:
 """
 
 import argparse
-import socket
 import json
 import time
 import secrets
 import hashlib
 from py_ecc.bls import G2Basic
 from commands.sendtx import _get_signing_message_bytes
+from tau_testnet_cli import rpc
 
 # Matches the genesis consensus fee rule (o9); keep in sync with the
 # network's active fee rule. See README: Transaction Fees.
@@ -26,14 +26,15 @@ from tau_manager import DEFAULT_RULE_BV_WIDTH
 
 
 def rpc_command(cmd_str, host, port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.connect((host, port))
-        # The server frames commands by newline; terminate so it dispatches.
-        if not cmd_str.endswith("\n"):
-            cmd_str += "\r\n"
-        sock.sendall(cmd_str.encode('utf-8'))
-        data = sock.recv(65536)
-    return data.decode('utf-8')
+    """Send one command and return the server's full response.
+
+    Delegates to the CLI's RPC client, which sends, half-closes the write side
+    and then reads until the server closes. The single ``recv(65536)`` this
+    replaced truncated any larger response mid-payload — a `getgovernance` with
+    a few scheduled proposals, or a `history` on a busy account, came back as
+    unparseable JSON (issue #24).
+    """
+    return rpc.send_command(cmd_str, host, port)
 
 
 MAX_TAU_TRANSFER_AMOUNT = (1 << DEFAULT_RULE_BV_WIDTH) - 1
