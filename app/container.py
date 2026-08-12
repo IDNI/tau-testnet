@@ -14,7 +14,7 @@ import chain_state
 import config
 import db
 import tau_manager
-from commands import createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks, getallaccounts, gettaustate, getgovernance, getupdateid, getaccountstate, gettxstatus
+from commands import checktx, createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks, getallaccounts, gettaustate, getgovernance, getupdateid, getaccountstate, gettxstatus
 from errors import DependencyError
 from network import BootstrapPeer, NetworkConfig
 from network.identity import IDENTITY_SEED_SIZE
@@ -51,6 +51,7 @@ class ServiceContainer:
             "getcurrenttimestamp": gettimestamp,
             "gettimestamp": gettimestamp,
             "createblock": createblock,
+            "checktx": checktx,
             "getbalance": getbalance,
             "getaccountstate": getaccountstate,
             "gettxstatus": gettxstatus,

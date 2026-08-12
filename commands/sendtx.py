@@ -273,7 +273,26 @@ def _process_transfers_operation(transfers, sender_pubkey):
     return True, {"transfers": validated_transfers, "tau_inputs": tau_inputs}, None
 
 
-def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
+def queue_transaction(json_blob: str, propagate: bool = True, *,
+                      dry_run: bool = False, skip_tau_eval: bool = False) -> dict:
+    """Validate a transaction and (unless dry_run) queue it in the mempool.
+
+    `dry_run` returns the verdict just before the two mutations
+    (db.add_mempool_tx, broadcast_transaction), so checktx (#26) answers "would
+    this be admitted?" with byte-identical codes and details to what sendtx would
+    have produced. It is a flag on this function rather than an extracted pure
+    copy deliberately: there are 34 distinct error returns and three outer
+    exception handlers here, so verdict parity is worth guaranteeing by
+    construction instead of by test.
+
+    `skip_tau_eval` additionally skips Tau steps 2/3/3b. Those are NOT
+    side-effect-free — they intern addresses into SQLite, advance the live
+    interpreter's logical time by up to 100 steps per call (up to 64 transfers
+    per tx), can rebuild the interpreter from stdout, and on intern-width
+    overflow re-exec the process. An unauthenticated, fee-free RPC must not
+    reach them. The rule-compile step is unaffected: it already runs in a
+    SIGKILL-able subprocess and is genuinely pure.
+    """
     blob = json_blob.strip()
     if len(blob) >= 2 and ((blob[0] == '"' and blob[-1] == '"') or (blob[0] == "'" and blob[-1] == "'")):
         blob = blob[1:-1]
@@ -571,7 +590,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
             # i13+ together with the transfer fields. Keeping a separate custom
             # step for transfer txs would create an admission-only rejection
             # surface that apply never runs -> divergence and a wasted roundtrip.
-            if custom_tau_inputs and not all_validated_transfers:
+            if custom_tau_inputs and not all_validated_transfers and not skip_tau_eval:
                 if tau_force_test:
                     logger.info("TAU_FORCE_TEST=1: skipping Tau custom input validation.")
                 else:
@@ -610,7 +629,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                 admission_ts = int(time.time())
 
             # Step 3: Transfer Validation
-            if has_transfers and all_validated_transfers:
+            if has_transfers and all_validated_transfers and not skip_tau_eval:
                 if tau_force_test:
                     logger.info(
                         "TAU_FORCE_TEST=1: skipping Tau transfer validation for %s transfers.",
@@ -715,6 +734,7 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                 tx_type == "user_tx"
                 and not all_validated_transfers
                 and not tau_force_test
+                and not skip_tau_eval
                 and tau_manager.tau_ready.is_set()
             ):
                 try:
@@ -793,6 +813,27 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
                 )
 
         tx_message_id, tx_canonical_blob = _compute_transaction_message_id(payload)
+
+        # --- Evaluation ends here; everything below mutates state. -----------
+        # A dry run returns the verdict now: before the mempool-capacity check
+        # (a capacity fact about the node, not a verdict about this tx) and
+        # before the two mutations.
+        if dry_run:
+            verdict = {
+                "ok": True,
+                "tx_hash": tx_message_id,
+                "message": "Transaction would be admitted.",
+                "admissible": True,
+                "tx_type": tx_type,
+                "tau_evaluated": not skip_tau_eval,
+            }
+            if not skip_tau_eval and tx_type == "user_tx":
+                verdict["estimated_fee"] = str(estimated_fee_total)
+            update_id = admission_eval.data.get("update_id")
+            if update_id:
+                verdict["update_id"] = update_id
+            return verdict
+
         if db.count_mempool_txs() >= config.MAX_MEMPOOL_TXS:
             return _qt_err(
                 "MEMPOOL_FULL",

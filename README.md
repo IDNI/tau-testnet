@@ -579,6 +579,15 @@ view that accounts for queued sends, use the additive commands (both read-only):
 `sendtx` returns the computed `tx_hash` in its success `data`, so a wallet can
 poll `gettxstatus` immediately after queuing.
 
+- **`checktx <json_payload>`** — read-only admission dry-run: would `sendtx`
+  accept this? Nothing enters the mempool, nothing is broadcast, nothing is
+  charged. Rejections carry the identical `code`/`details` `sendtx` would have
+  returned. Tau evaluation is **not** performed (`tau_evaluated: false`), so
+  there is no `estimated_fee` and no `o5` policy verdict — those steps mutate
+  interpreter and intern state, which a free unauthenticated RPC must not do.
+  Use it as the pre-flight before asking a user to sign; `gettxstatus` is the
+  post-flight.
+
 ## Block structure
 
 A block header carries `block_number` (0-indexed height), `previous_hash`, `timestamp`, `merkle_root`, `state_hash` (the full post-state commitment — see [State hash & canonical encoding](#state-hash--canonical-encoding)), and `state_locator` (a DHT lookup hint, **not** consensus data). The body carries the ordered `transactions` and their `tx_ids`. Consensus is attested by `consensus_proof` — the proposer's BLS signature over the canonical header, verified by `Block.verify_consensus_proof()` and gated by the `o6 = i10` rule. There is **no proof-of-work**; validity and proposer eligibility are decided by the Tau consensus program at each height. See `block.py` (`Block`, `BlockHeader`, `compute_tx_hash`, `compute_merkle_root`).
