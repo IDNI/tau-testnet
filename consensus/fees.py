@@ -17,7 +17,10 @@ Model (consensus-critical — every node must agree):
   * fee_limit (signed tx field) is a CAP: if total_fee > fee_limit the tx
     is hard-rejected (never included, pays nothing). The sender pays
     total_fee, not fee_limit.
-  * The fee is credited to block.header.proposer_pubkey.
+  * The fee is credited to block.header.proposer_pubkey by default, or to the
+    governance-set fee_beneficiary when one is active (host_contract_patch,
+    issue #25). A patch activating at height H governs H+1 onward, since height
+    transitions run after apply().
   * ALL transactions (governance included) must carry a syntactically valid
     fee_limit; only user_tx is charged. Governance txs are exempt so that
     validators never need funds to govern.

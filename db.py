@@ -1159,7 +1159,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
     """
@@ -1211,6 +1211,15 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 _db_conn.execute(
                     'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
                     ('eligibility_mode', eligibility_mode)
+                )
+            if fee_beneficiary is not None:
+                # Same reasoning as eligibility_mode: a node reloading from disk
+                # must route the levy exactly as a freshly-synced peer does, or
+                # the two compute different balances. Stored verbatim, including
+                # "" (no beneficiary pinned -> credit the proposer).
+                _db_conn.execute(
+                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+                    ('fee_beneficiary', fee_beneficiary)
                 )
 
             _db_conn.execute('DELETE FROM accounts')

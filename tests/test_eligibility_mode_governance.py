@@ -109,3 +109,88 @@ def test_pending_update_with_mode_patch_survives_reload(temp_database):
     assert update.update_id in reloaded.pending_updates
     payload = reloaded.update_payloads[update.update_id]
     assert payload.host_contract_patch == {"eligibility_mode": "stake"}
+
+
+class TestFeeBeneficiary:
+    """Issue #25: the o9 levy can be routed to a named account by governance.
+
+    The credit site was hard-wired to block.header.proposer_pubkey, so a proposal
+    of the shape "N AGRS of every transfer goes to <address>" could not be
+    authored at all -- the percentage half is #19, this is the routing half.
+    """
+
+    def _mgr(self):
+        from consensus.governance import ConsensusLifecycleManager
+        return ConsensusLifecycleManager(active_validators=["a" * 96, "b" * 96, "c" * 96])
+
+    # --- grammar ---------------------------------------------------------
+    def test_proposer_literal_is_valid_and_normalizes_to_empty(self):
+        from consensus.governance import validate_fee_beneficiary, normalize_fee_beneficiary
+        assert validate_fee_beneficiary("proposer") is None
+        assert normalize_fee_beneficiary("proposer") == ""
+
+    def test_pubkey_is_valid_and_kept_verbatim(self):
+        from consensus.governance import validate_fee_beneficiary, normalize_fee_beneficiary
+        pk = "ab" * 48
+        assert validate_fee_beneficiary(pk) is None
+        assert normalize_fee_beneficiary(pk) == pk
+
+    def test_malformed_values_rejected(self):
+        from consensus.governance import validate_fee_beneficiary
+        for bad in ("", "0x" + "ab" * 47, "AB" * 48, "ab" * 47, "zz" * 48, 123, None):
+            assert validate_fee_beneficiary(bad) is not None, f"{bad!r} wrongly accepted"
+
+    def test_empty_string_rejected_as_an_authored_value(self):
+        """"" is the internal 'not set' marker; authors say 'proposer'. Allowing
+        both spellings would give one semantics two stored forms, and the value
+        is bound into update_id and the meta hash."""
+        from consensus.governance import validate_fee_beneficiary
+        assert "proposer" in validate_fee_beneficiary("")
+
+    # --- activation ------------------------------------------------------
+    def test_patch_sets_and_normalizes(self):
+        mgr = self._mgr()
+        mgr.apply_host_contract_patch({"fee_beneficiary": "cd" * 48})
+        assert mgr.effective_fee_beneficiary() == "cd" * 48
+        mgr.apply_host_contract_patch({"fee_beneficiary": "proposer"})
+        assert mgr.effective_fee_beneficiary() == ""
+
+    def test_activation_validates_completely(self):
+        """This raise is the only consensus-binding validation: admission runs on
+        one path, block apply reaches activation without it."""
+        import pytest
+        mgr = self._mgr()
+        with pytest.raises(ValueError, match="fee_beneficiary"):
+            mgr.apply_host_contract_patch({"fee_beneficiary": "not-a-pubkey"})
+
+    # --- hash compat -----------------------------------------------------
+    def test_default_leaves_the_meta_hash_byte_identical(self):
+        """The whole point of the non-default gate: a network that never sets a
+        beneficiary must hash exactly as it did before this field existed."""
+        mgr = self._mgr()
+        before = mgr.consensus_meta_hash()
+        mgr.apply_host_contract_patch({"fee_beneficiary": "proposer"})
+        assert mgr.consensus_meta_hash() == before
+
+    def test_non_default_changes_the_meta_hash(self):
+        mgr = self._mgr()
+        before = mgr.consensus_meta_hash()
+        mgr.apply_host_contract_patch({"fee_beneficiary": "ef" * 48})
+        assert mgr.consensus_meta_hash() != before
+
+    def test_genesis_generator_and_runtime_build_identical_metadata(self):
+        """gen_genesis and the runtime hash used to carry two copies of this
+        conditional with a 'MUST match' comment; they now share one function, so
+        block 0 cannot fail its own state-hash invariant on replay."""
+        from consensus.governance import build_mechanism_metadata
+        mgr = self._mgr()
+        mgr.apply_host_contract_patch({"fee_beneficiary": "ab" * 48})
+        assert build_mechanism_metadata(
+            mgr.effective_quorum_policy(),
+            mgr.effective_eligibility_mode(),
+            mgr.effective_fee_beneficiary(),
+        ) == {"vote_quorum": mgr.effective_quorum_policy(), "fee_beneficiary": "ab" * 48}
+
+    def test_default_metadata_omits_the_field_entirely(self):
+        from consensus.governance import build_mechanism_metadata
+        assert build_mechanism_metadata("supermajority") == {"vote_quorum": "supermajority"}

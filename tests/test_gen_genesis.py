@@ -327,3 +327,52 @@ def test_derive_pubkey_rejects_wrong_length():
     with pytest.raises(ValueError, match="64 hex chars"):
         gen_genesis.derive_pubkey_from_privkey("00" + "11" * 30)  # 62 chars
 
+
+
+def test_fee_beneficiary_default_is_byte_identical_to_omitting_it():
+    """Issue #25 hash-compat: passing the default explicitly must produce the
+    same artifact as not passing it, or every pre-existing chain's block-0 state
+    hash changes."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result_a, path_a = _run_gen_genesis([], tmpdir)
+        assert result_a.returncode == 0, f"gen_genesis failed: {result_a.stderr}"
+        with open(path_a) as f:
+            data_a = json.load(f)
+        assert "fee_beneficiary" not in data_a["consensus_meta"]["mechanism_specific_metadata"]
+        with open(path_a, "rb") as f:
+            bytes_a = f.read()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result_b, path_b = _run_gen_genesis(["--fee-beneficiary", "proposer"], tmpdir)
+        assert result_b.returncode == 0, f"gen_genesis failed: {result_b.stderr}"
+        with open(path_b, "rb") as f:
+            bytes_b = f.read()
+
+    assert bytes_a == bytes_b
+
+
+def test_fee_beneficiary_pubkey_surfaces_and_changes_the_state_hash():
+    beneficiary = "be" * 48
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result, path = _run_gen_genesis(["--fee-beneficiary", beneficiary], tmpdir)
+        assert result.returncode == 0, f"gen_genesis failed: {result.stderr}"
+        with open(path) as f:
+            data = json.load(f)
+        meta = data["consensus_meta"]["mechanism_specific_metadata"]
+        assert meta["fee_beneficiary"] == beneficiary
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result_default, path_default = _run_gen_genesis([], tmpdir)
+        with open(path_default) as f:
+            default_data = json.load(f)
+
+    # A pinned beneficiary is bound into the state hash, not cosmetic metadata.
+    assert (data["block_0"]["header"]["state_hash"]
+            != default_data["block_0"]["header"]["state_hash"])
+
+
+def test_malformed_fee_beneficiary_fails_loudly():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result, _ = _run_gen_genesis(["--fee-beneficiary", "not-a-pubkey"], tmpdir)
+        assert result.returncode != 0
+        assert "fee-beneficiary" in (result.stderr + result.stdout)

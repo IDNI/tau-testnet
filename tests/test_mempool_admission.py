@@ -403,11 +403,11 @@ class TestHostContractPatchKeys:
     """
 
     def test_unknown_key_rejected(self, tip_view):
-        tx = get_update_tx(patch={"fee_beneficiary": "a" * 96})
+        tx = get_update_tx(patch={"block_reward": "1000"})
         res = validate_mempool_admission(tx, tip_view)
         assert not res.is_valid
         assert "Unknown host_contract_patch key" in res.error
-        assert "fee_beneficiary" in res.error
+        assert "block_reward" in res.error
 
     def test_error_lists_the_supported_keys(self, tip_view):
         res = validate_mempool_admission(get_update_tx(patch={"nonsense": 1}), tip_view)

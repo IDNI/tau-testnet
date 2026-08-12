@@ -166,6 +166,8 @@ def execute(raw_command: str, container):
             # confirm that an activated vote_quorum patch took effect (#23).
             "vote_quorum": chain_state._lifecycle_manager.effective_quorum_policy(),
             "eligibility_mode": chain_state._lifecycle_manager.effective_eligibility_mode(),
+            # "" means the levy goes to each block's proposer (the default).
+            "fee_beneficiary": chain_state._lifecycle_manager.effective_fee_beneficiary(),
             "active_validators": active_validators,
             "min_activation_height_for_next_update": min_activation_height,
             "active_consensus_id": active_consensus_id,

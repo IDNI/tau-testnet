@@ -16,6 +16,7 @@ from consensus.governance import (
     validate_eligibility_mode,
     quorum_count,
     HOST_CONTRACT_PATCH_KEYS,
+    validate_fee_beneficiary,
 )
 
 logger = logging.getLogger(__name__)
@@ -349,6 +350,10 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         err = validate_eligibility_mode(patch["eligibility_mode"])
         if err:
             return f"Unsupported eligibility_mode inside host_contract_patch: {err}"
+    if "fee_beneficiary" in patch:
+        err = validate_fee_beneficiary(patch["fee_beneficiary"])
+        if err:
+            return f"Unsupported fee_beneficiary inside host_contract_patch: {err}"
     return None
 
 def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:

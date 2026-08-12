@@ -67,10 +67,28 @@ def get_args():
             "that references i13)."
         ),
     )
+    parser.add_argument(
+        "--fee-beneficiary", type=str, default="proposer",
+        help=(
+            "Where the o9 consensus levy is credited: 'proposer' (default, the "
+            "block producer) or a 96-char lowercase hex pubkey to route it to a "
+            "fixed treasury account. Changeable later by governance via a "
+            "host_contract_patch."
+        ),
+    )
     args = parser.parse_args()
     # Validate with the same grammar the runtime/admission uses so a bad genesis
     # value fails loudly here instead of silently falling back at consensus time.
-    from consensus.governance import validate_quorum_policy, validate_eligibility_mode
+    from consensus.governance import (
+        validate_quorum_policy, validate_eligibility_mode, validate_fee_beneficiary,
+        normalize_fee_beneficiary,
+    )
+    _b_err = validate_fee_beneficiary(args.fee_beneficiary)
+    if _b_err:
+        parser.error(f"--fee-beneficiary {_b_err}")
+    # Store the canonical form ("" for the proposer default) so the genesis
+    # artifact and the runtime agree on one representation per semantics.
+    args.fee_beneficiary = normalize_fee_beneficiary(args.fee_beneficiary)
     _q_err = validate_quorum_policy(args.vote_quorum)
     if _q_err:
         parser.error(f"--vote-quorum {_q_err}")
@@ -271,12 +289,13 @@ def main():
     accounts_hash_bytes = compute_accounts_hash(genesis_accounts, genesis_sequences)
 
     # 2. Consensus Meta Domain
-    # eligibility_mode is included ONLY when non-default so a default genesis is
-    # byte-identical to one produced before this field existed (hash-compat).
-    # This conditional MUST match ConsensusLifecycleManager.consensus_meta_hash.
-    mech_meta = {"vote_quorum": args.vote_quorum}
-    if args.eligibility_mode != "validator_set":
-        mech_meta["eligibility_mode"] = args.eligibility_mode
+    # Built by the SAME function the runtime hash uses, so the two cannot drift.
+    # Non-default fields are omitted, keeping a default genesis byte-identical to
+    # one produced before those fields existed (hash-compat).
+    from consensus.governance import build_mechanism_metadata
+    mech_meta = build_mechanism_metadata(
+        args.vote_quorum, args.eligibility_mode, args.fee_beneficiary
+    )
     consensus_meta = {
         "proof_scheme": "bls_header_sig",
         "fork_choice_scheme": "height_then_hash",

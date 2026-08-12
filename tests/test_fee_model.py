@@ -854,3 +854,82 @@ class TestTauDownGuards(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFeeBeneficiaryRouting(EngineFeeBase):
+    """Issue #25: governance can route the o9 levy to a named account.
+
+    apply() reads the beneficiary off the lifecycle manager it is given, which
+    during block apply is the PARENT's -- height transitions run after apply
+    returns, so a patch activating at H governs H+1 and never retroactively
+    redirects H's own fees.
+    """
+
+    BENEFICIARY = "be" * 48
+
+    def _lifecycle(self, beneficiary=None):
+        from consensus.governance import ConsensusLifecycleManager
+        mgr = ConsensusLifecycleManager(active_validators=[PROPOSER])
+        if beneficiary is not None:
+            mgr.apply_host_contract_patch({"fee_beneficiary": beneficiary})
+        return mgr
+
+    def _apply_with(self, lifecycle, txs, balances, seqs=None):
+        return self.engine.apply(
+            self.snapshot, txs, 1700000000,
+            target_balances=balances,
+            target_sequences=seqs if seqs is not None else {},
+            target_lifecycle=lifecycle,
+            proposer_pubkey=PROPOSER,
+            block_height=1,
+        )
+
+    def test_levy_lands_on_the_named_beneficiary_not_the_proposer(self):
+        self.mock_multi.return_value = {1: "1", 9: "10"}
+        balances = {SENDER: 1000}
+        self._apply_with(self._lifecycle(self.BENEFICIARY),
+                         [self.transfer_tx()], balances)
+        self.assertEqual(balances[self.BENEFICIARY], 10)
+        self.assertNotIn(PROPOSER, balances)
+
+    def test_default_still_credits_the_proposer(self):
+        """The shipped behaviour must be untouched when no patch is active."""
+        self.mock_multi.return_value = {1: "1", 9: "10"}
+        balances = {SENDER: 1000}
+        self._apply_with(self._lifecycle(), [self.transfer_tx()], balances)
+        self.assertEqual(balances[PROPOSER], 10)
+
+    def test_supply_is_conserved(self):
+        """engine.apply_block asserts this globally; assert it here too, since a
+        beneficiary that silently dropped the levy would burn coins."""
+        self.mock_multi.return_value = {1: "1", 9: "10"}
+        balances = {SENDER: 1000}
+        before = sum(balances.values())
+        self._apply_with(self._lifecycle(self.BENEFICIARY),
+                         [self.transfer_tx()], balances)
+        self.assertEqual(sum(balances.values()), before)
+
+    def test_sender_equals_beneficiary_nets_to_zero(self):
+        """Third aliasing case the credit site must survive (the other two are
+        sender == proposer and beneficiary == proposer)."""
+        self.mock_multi.return_value = {1: "1", 9: "10"}
+        balances = {SENDER: 1000}
+        self._apply_with(self._lifecycle(SENDER),
+                         [self.transfer_tx(recipient=RECIPIENT, amount=100)], balances)
+        # 1000 - 100 transferred - 10 fee + 10 fee back = 900
+        self.assertEqual(balances[SENDER], 900)
+        self.assertEqual(sum(balances.values()), 1000)
+
+    def test_beneficiary_equals_proposer_is_credited_once(self):
+        self.mock_multi.return_value = {1: "1", 9: "10"}
+        balances = {SENDER: 1000}
+        self._apply_with(self._lifecycle(PROPOSER), [self.transfer_tx()], balances)
+        self.assertEqual(balances[PROPOSER], 10)
+
+    def test_receipt_names_the_destination(self):
+        self.mock_multi.return_value = {1: "1", 9: "10"}
+        balances = {SENDER: 1000}
+        result = self._apply_with(self._lifecycle(self.BENEFICIARY),
+                                  [self.transfer_tx()], balances)
+        logs = " ".join(result.receipts["tx1"]["logs"])
+        self.assertIn("beneficiary", logs)

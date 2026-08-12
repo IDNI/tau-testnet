@@ -84,6 +84,7 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "validator_removals",
     "vote_quorum",
     "eligibility_mode",
+    "fee_beneficiary",
 })
 
 
@@ -101,6 +102,70 @@ def validate_eligibility_mode(mode: Any) -> Optional[str]:
     if mode in ELIGIBILITY_MODES:
         return None
     return "must be one of " + ", ".join(repr(m) for m in ELIGIBILITY_MODES)
+
+
+# --- Fee beneficiary (issue #25) ---------------------------------------------
+# Where the o9 consensus levy is credited. Absence means "the block proposer",
+# which is what the engine has always hard-wired, so the default is the empty
+# string and a default network's state hash is unchanged (see
+# consensus_meta_hash below).
+#
+# The literal "proposer" is accepted as an explicit way to revert to the default
+# and is normalized back to "" at activation, so one semantics has exactly one
+# stored representation — the value is bound into update_id and the meta hash,
+# where two spellings of the same thing would produce two different hashes.
+DEFAULT_FEE_BENEFICIARY = ""
+FEE_BENEFICIARY_PROPOSER = "proposer"
+
+
+def validate_fee_beneficiary(value: Any) -> Optional[str]:
+    """Return an error string if `value` is not a deployable fee beneficiary.
+
+    Rejects the empty string: like eligibility_mode's sentinel, "" is only legal
+    as the internal 'not set' marker, never as an authored value. Callers wanting
+    the default spell it "proposer".
+    """
+    if not isinstance(value, str):
+        return "must be a string"
+    if value == FEE_BENEFICIARY_PROPOSER:
+        return None
+    if not value:
+        return "must not be empty (use 'proposer' for the default)"
+    try:
+        normalize_validator_pubkey(value)
+    except ValueError as exc:
+        return f"must be 'proposer' or a 96-char lowercase hex pubkey ({exc})"
+    return None
+
+
+def normalize_fee_beneficiary(value: str) -> str:
+    """Canonical stored form: "" for the proposer default, else the pubkey."""
+    return "" if value == FEE_BENEFICIARY_PROPOSER else value
+
+
+def build_mechanism_metadata(
+    vote_quorum: str,
+    eligibility_mode: str = DEFAULT_ELIGIBILITY_MODE,
+    fee_beneficiary: str = DEFAULT_FEE_BENEFICIARY,
+) -> dict:
+    """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
+
+    ONE implementation, called by both the runtime hash
+    (ConsensusLifecycleManager.consensus_meta_hash) and the genesis generator.
+    They must agree byte-for-byte or block 0 fails its own state-hash invariant
+    on replay; this used to be two copies of the conditional carrying a
+    "MUST match" comment, with gen_genesis hardcoding the default value instead
+    of importing it.
+
+    Non-default fields are included ONLY when set, so a network that never
+    touches them hashes exactly as it did before the field existed.
+    """
+    mech = {"vote_quorum": vote_quorum}
+    if eligibility_mode != DEFAULT_ELIGIBILITY_MODE:
+        mech["eligibility_mode"] = eligibility_mode
+    if fee_beneficiary != DEFAULT_FEE_BENEFICIARY:
+        mech["fee_beneficiary"] = fee_beneficiary
+    return mech
 
 # Network-wide quorum policy used when genesis does not pin one. The consensus
 # tally MUST resolve to a deterministic value here and never read per-node
@@ -315,6 +380,12 @@ class ConsensusLifecycleManager:
         # bound into the consensus state hash (only when != default, to keep
         # existing chains' hashes byte-stable).
         self.eligibility_mode: str = ""
+        # Fee beneficiary mirrors eligibility_mode exactly: "" until genesis pins
+        # one (then resolves to the proposer), mutable at runtime via an activated
+        # host_contract_patch, persisted, NEVER read from per-node config, and
+        # bound into the consensus state hash only when non-default so existing
+        # chains keep byte-identical hashes.
+        self.fee_beneficiary: str = ""
         self.recompute_approval_threshold()
 
     def effective_quorum_policy(self) -> str:
@@ -327,6 +398,14 @@ class ConsensusLifecycleManager:
         """Deterministic resolved eligibility mode: the genesis-pinned value,
         else DEFAULT_ELIGIBILITY_MODE. Never reads per-node config."""
         return self.eligibility_mode or DEFAULT_ELIGIBILITY_MODE
+
+    def effective_fee_beneficiary(self) -> str:
+        """Resolved levy destination, or "" meaning 'credit the block proposer'.
+
+        Deliberately does NOT resolve to a proposer pubkey: this manager has no
+        proposer, and only the engine's per-block context knows one. The engine
+        reads this and falls back."""
+        return self.fee_beneficiary or DEFAULT_FEE_BENEFICIARY
 
     def recompute_approval_threshold(self) -> int:
         policy = self.effective_quorum_policy()
@@ -363,11 +442,13 @@ class ConsensusLifecycleManager:
         vote_records = [
             (uid, voter) for uid, voters in self.votes.items() for voter in voters
         ]
-        mech = {"vote_quorum": self.effective_quorum_policy()}
-        # Included ONLY when non-default so every pre-existing chain state
-        # keeps a byte-identical meta hash (hash-compat).
-        if self.effective_eligibility_mode() != DEFAULT_ELIGIBILITY_MODE:
-            mech["eligibility_mode"] = self.effective_eligibility_mode()
+        # Shared with scripts/gen_genesis.py so the two cannot drift apart; the
+        # non-default gating lives there (hash-compat).
+        mech = build_mechanism_metadata(
+            self.effective_quorum_policy(),
+            self.effective_eligibility_mode(),
+            self.effective_fee_beneficiary(),
+        )
         return compute_consensus_meta_hash(
             host_contract={},
             active_validators=list(self.active_validators),
@@ -430,6 +511,16 @@ class ConsensusLifecycleManager:
             if err:
                 raise ValueError(f"eligibility_mode: {err}")
             self.eligibility_mode = mode
+        if "fee_beneficiary" in patch:
+            beneficiary = patch["fee_beneficiary"]
+            # This raise is the ONLY consensus-binding validation of the value:
+            # _check_host_contract_patch runs at mempool admission only, and block
+            # apply reaches here without it. So validate completely, not as a
+            # duplicate-for-nicety of the admission screen.
+            err = validate_fee_beneficiary(beneficiary)
+            if err:
+                raise ValueError(f"fee_beneficiary: {err}")
+            self.fee_beneficiary = normalize_fee_beneficiary(beneficiary)
         self.recompute_approval_threshold()
 
     def knows_update(self, update_id: bytes) -> bool:

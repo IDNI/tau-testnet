@@ -667,6 +667,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "Fee charging requested without target_balances overlay; fees skipped (legacy path)."
             )
 
+        # Levy destination for this block. Read from the PARENT lifecycle manager,
+        # which is what `lifecycle_mgr` holds during apply: height transitions run
+        # after apply() returns, so a beneficiary patch activating at height H
+        # governs H+1 onward and never retroactively redirects H's own fees.
+        # "" means credit the proposer.
+        fee_beneficiary = getattr(lifecycle_mgr, "effective_fee_beneficiary", lambda: "")()
+
         for i, tx in enumerate(transactions):
             tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
             operations = tx.get('operations', {})
@@ -1268,15 +1275,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 f"Insufficient balance for fee: need {total_fee}, have {sender_bal}"
                             )
                     else:
+                        # Governance may route the levy to a named account
+                        # instead of the proposer (issue #25). Absent a patch
+                        # this resolves to "" and the proposer is credited, which
+                        # is the behaviour that shipped.
+                        beneficiary = fee_beneficiary or proposer_pubkey
                         # Aliasing-safe ordering: deduct the sender first,
-                        # then credit the proposer THROUGH the staged view —
-                        # sender == proposer nets to zero because the credit
-                        # reads the already-deducted value.
+                        # then credit the beneficiary THROUGH the staged view —
+                        # sender == beneficiary nets to zero because the credit
+                        # reads the already-deducted value. That now covers three
+                        # cases, not two: sender == proposer, sender ==
+                        # beneficiary, and beneficiary == proposer.
                         staged_writes[sender] = sender_bal - total_fee
-                        staged_writes[proposer_pubkey] = _read_bal(proposer_pubkey) + total_fee
+                        staged_writes[beneficiary] = _read_bal(beneficiary) + total_fee
                         tx_receipt["fee_charged"] = total_fee
                         tx_receipt["logs"].append(
-                            f"Fee charged: {total_fee} -> proposer {str(proposer_pubkey)[:10]}..."
+                            f"Fee charged: {total_fee} -> "
+                            f"{'beneficiary' if fee_beneficiary else 'proposer'} "
+                            f"{str(beneficiary)[:10]}..."
                         )
 
             # Commit staged balance writes only for txs that stay accepted.
