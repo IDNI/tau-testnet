@@ -252,6 +252,41 @@ class TestSendTxMapping(unittest.TestCase):
         self.assertEqual(result["code"], "ADMISSION_UNAVAILABLE")
         self.assertEqual(restore_calls, [])
 
+    # --- Issue #23 part 2: admission codes survive to the envelope ---------
+
+    def test_admission_code_and_details_reach_the_client(self):
+        """A structured admission rejection is forwarded verbatim, not flattened
+        into the blanket TX_REJECTED that every admission failure used to get."""
+        from consensus.admission import AdmissionResult
+
+        rejection = AdmissionResult(
+            False,
+            error="update_id abc already exists in lifecycle state: pending",
+            code="DUPLICATE_UPDATE",
+            details={"update_id": "d" * 64, "lifecycle_state": "pending"},
+        )
+        patch("consensus.admission.validate_mempool_admission",
+              lambda *a, **k: rejection).start()
+
+        result = sendtx.queue_transaction(json.dumps(self._base_tx()))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DUPLICATE_UPDATE")
+        self.assertEqual(result["details"]["update_id"], "d" * 64)
+        self.assertEqual(result["details"]["lifecycle_state"], "pending")
+
+    def test_unmarked_admission_rejection_still_maps_to_tx_rejected(self):
+        from consensus.admission import AdmissionResult
+
+        patch("consensus.admission.validate_mempool_admission",
+              lambda *a, **k: AdmissionResult(False, error="nope")).start()
+
+        result = sendtx.queue_transaction(json.dumps(self._base_tx()))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TX_REJECTED")
+        self.assertNotIn("details", result)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -379,7 +379,13 @@ def queue_transaction(json_blob: str, propagate: bool = True) -> dict:
     
     admission_eval = validate_mempool_admission(payload, tip_view)
     if not admission_eval.is_valid:
-        return _qt_err("TX_REJECTED", admission_eval.error)
+        # Forward the admission layer's own code/details when it set them;
+        # everything else still collapses to TX_REJECTED as before (issue #23).
+        return _qt_err(
+            admission_eval.code or "TX_REJECTED",
+            admission_eval.error,
+            **admission_eval.details,
+        )
 
     if tx_type == "user_tx":
         operations = payload.get("operations", {})

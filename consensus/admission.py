@@ -76,13 +76,37 @@ def _streams_referenced(rule_text: str, tokens) -> List[str]:
 
 
 class AdmissionResult:
-    def __init__(self, is_valid: bool, error: Optional[str] = None, data: Optional[Dict] = None):
+    def __init__(self, is_valid: bool, error: Optional[str] = None, data: Optional[Dict] = None,
+                 code: Optional[str] = None, details: Optional[Dict] = None):
         self.is_valid = is_valid
         self.error = error
         self.data = data or {}
+        # Machine-readable rejection reason, forwarded verbatim into the sendtx
+        # error envelope (issue #23). `code` defaults to None here and to
+        # TX_REJECTED in format_error, so a caller that never opts in behaves
+        # exactly as before.
+        self.code = code
+        self.details = details or {}
 
-def format_error(msg: str) -> AdmissionResult:
-    return AdmissionResult(False, error=msg)
+
+# Keys the envelope already owns; a details kwarg using one would silently
+# shadow it rather than reach the client (api_response.error_response).
+_RESERVED_DETAIL_KEYS = frozenset({"code", "message"})
+
+
+def format_error(msg: str, *, code: str = "TX_REJECTED", **details) -> AdmissionResult:
+    """Rejection with an optional machine-readable code and detail payload.
+
+    Both are additive: the ~30 call sites that pass only a message keep emitting
+    TX_REJECTED, which is what sendtx applied to all of them before. Opt in per
+    site where a client can actually act on the distinction.
+    """
+    clashing = sorted(_RESERVED_DETAIL_KEYS.intersection(details))
+    if clashing:
+        raise ValueError(
+            f"format_error details may not shadow envelope keys: {clashing}"
+        )
+    return AdmissionResult(False, error=msg, code=code, details=details)
 
 def success(data: Optional[Dict] = None) -> AdmissionResult:
     return AdmissionResult(True, data=data)
@@ -278,7 +302,15 @@ def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView)
         
     state = tip_view.get_update_lifecycle_state(update_id.hex())
     if state is not None:
-        return format_error(f"update_id {update_id.hex()[:10]} already exists in lifecycle state: {state}")
+        # Structured so a wallet can treat a retry of a proposal that already
+        # landed as success instead of parsing prose (issue #23). The lifecycle
+        # state is already in hand, so it costs nothing to hand it over.
+        return format_error(
+            f"update_id {update_id.hex()[:10]} already exists in lifecycle state: {state}",
+            code="DUPLICATE_UPDATE",
+            update_id=update_id.hex(),
+            lifecycle_state=state,
+        )
 
     return success({"update_id": update_id.hex()})
 

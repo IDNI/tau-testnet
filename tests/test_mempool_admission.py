@@ -347,3 +347,47 @@ class TestMempoolAdmission:
         assert res.is_valid
         # The fact that it succeeds when tip_view is the only contextual argument
         # demonstrates it does not mutate state or query external DB directly.
+
+
+class TestStructuredRejections:
+    """Issue #23 part 2: admission rejections carry a machine-readable code.
+
+    Before this, sendtx collapsed every admission failure into a prose
+    TX_REJECTED, so a wallet could not tell a proposal that had already landed
+    from one that was genuinely refused — and a blind retry duplicated it.
+    """
+
+    def test_duplicate_update_carries_structured_code(self, tip_view):
+        tip_view.get_update_lifecycle_state.return_value = "pending"
+        res = validate_mempool_admission(get_update_tx(), tip_view)
+        assert not res.is_valid
+        assert res.code == "DUPLICATE_UPDATE"
+        assert res.details["lifecycle_state"] == "pending"
+        # The full id, not the 10-char prefix the prose message carries, so the
+        # client can match it against getupdateid without reparsing.
+        assert len(res.details["update_id"]) == 64
+        assert res.details["update_id"] not in res.error
+
+    def test_duplicate_update_reports_the_actual_lifecycle_state(self, tip_view):
+        tip_view.get_update_lifecycle_state.return_value = "approved-and-scheduled"
+        res = validate_mempool_admission(get_update_tx(), tip_view)
+        assert res.details["lifecycle_state"] == "approved-and-scheduled"
+
+    def test_unmarked_rejections_still_default_to_tx_rejected(self, tip_view):
+        # An unknown tx_type takes a plain format_error path; it must keep the
+        # blanket code so nothing that did not opt in changes shape.
+        res = validate_mempool_admission({"tx_type": "nonsense"}, tip_view)
+        assert not res.is_valid
+        assert res.code == "TX_REJECTED"
+        assert res.details == {}
+
+    def test_success_carries_no_error_code(self, tip_view):
+        res = validate_mempool_admission(get_update_tx(), tip_view)
+        assert res.is_valid
+        assert res.code is None
+        assert res.details == {}
+
+    def test_details_may_not_shadow_envelope_keys(self):
+        from consensus.admission import format_error
+        with pytest.raises(ValueError, match="shadow envelope keys"):
+            format_error("boom", code="X", message="sneaky")
