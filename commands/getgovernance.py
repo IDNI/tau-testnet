@@ -1,6 +1,7 @@
 import json
 
 import api_response
+from consensus.admission import precheck_scheduled_update
 
 
 def _normalize_hexish(value):
@@ -95,6 +96,17 @@ def execute(raw_command: str, container):
                 entry["activate_at_height"] = int(payload_obj.activate_at_height)
                 entry["host_contract_patch"] = payload_obj.host_contract_patch
                 entry["proposer_pubkey"] = payload_obj.proposer_pubkey
+            # Advisory re-validation against the CURRENT validator set: an update
+            # is checked when submitted, but activates later, and the tip moves in
+            # between (issue #24 ask 4). Informational only — consensus never
+            # reads it, so an operator gets a warning window while the terminal
+            # behaviour of a bad activation is unchanged.
+            precheck = precheck_scheduled_update(
+                payload_obj, chain_state._lifecycle_manager.active_validators
+            )
+            entry["precheck"] = precheck["status"]
+            if precheck["error"]:
+                entry["precheck_error"] = precheck["error"]
             scheduled_updates.append(entry)
 
         for uid, voter_set in chain_state._lifecycle_manager.votes.items():

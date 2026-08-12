@@ -182,7 +182,14 @@ def test_scheduled_update_without_retained_payload_degrades_gracefully():
 
     assert len(resp["scheduled_updates"]) == 1
     su = resp["scheduled_updates"][0]
-    assert su == {"activation_height": 800, "update_id": update.update_id_hex}
+    assert su["activation_height"] == 800
+    assert su["update_id"] == update.update_id_hex
+    # No payload fields invented for an entry whose payload is gone.
+    for key in ("rule_revisions", "activate_at_height", "host_contract_patch",
+                "proposer_pubkey"):
+        assert key not in su
+    # The advisory precheck reports the absence rather than a pass (#24 ask 4).
+    assert su["precheck"] == "skipped"
 
 
 
@@ -259,3 +266,97 @@ def test_archival_updates_stays_a_list_of_strings():
 
     assert all(isinstance(uid, str) for uid in resp["archival_updates"])
     assert resp["archival_updates"] == [update.update_id_hex]
+
+
+# --- Issue #24 ask 4: advisory precheck on scheduled updates -----------------
+
+def _schedule(mgr, update, height=500):
+    mgr.update_payloads[update.update_id] = update
+    mgr.scheduled_updates.append((height, update.update_id))
+
+
+def test_scheduled_update_reports_precheck_ok():
+    container = MockContainer()
+    mgr = container.chain_state._lifecycle_manager
+    _schedule(mgr, ConsensusRuleUpdate(["always (o9[t]:bv[24] = { #x00000a }:bv[24])."], 500))
+
+    resp = json.loads(getgov_execute("getgovernance", container))["data"]
+
+    entry = resp["scheduled_updates"][0]
+    assert entry["precheck"] == "ok"
+    assert "precheck_error" not in entry
+
+
+def test_precheck_flags_quorum_patch_gone_stale():
+    """The staleness that actually happens: a count:N quorum was bounded against
+    the validator set at submission time, and validators have since been removed
+    so N is no longer reachable."""
+    container = MockContainer()
+    mgr = container.chain_state._lifecycle_manager
+    _schedule(mgr, ConsensusRuleUpdate(["always (o6[t] = 1)."], 500,
+                                       host_contract_patch={"vote_quorum": "count:3"}))
+    # Set shrinks from 3 to 1 after the update was approved and scheduled.
+    mgr.active_validators = type(mgr.active_validators)([VALIDATOR_1])
+
+    resp = json.loads(getgov_execute("getgovernance", container))["data"]
+
+    entry = resp["scheduled_updates"][0]
+    assert entry["precheck"] == "fail"
+    assert "vote_quorum" in entry["precheck_error"]
+
+
+def test_precheck_flags_revision_reading_mocked_stream():
+    container = MockContainer()
+    mgr = container.chain_state._lifecycle_manager
+    _schedule(mgr, ConsensusRuleUpdate(["always (o9[t]:bv[24] = i2[t]:bv[24])."], 500))
+
+    resp = json.loads(getgov_execute("getgovernance", container))["data"]
+
+    entry = resp["scheduled_updates"][0]
+    assert entry["precheck"] == "fail"
+    assert "i2" in entry["precheck_error"]
+
+
+def test_precheck_is_skipped_when_payload_not_retained():
+    """After a restart a scheduled id can outlive its text. That must read as
+    'no verdict', never as a pass."""
+    container = MockContainer()
+    mgr = container.chain_state._lifecycle_manager
+    orphan = ConsensusRuleUpdate(["never persisted"], 500)
+    mgr.scheduled_updates.append((500, orphan.update_id))  # id only, no payload
+
+    resp = json.loads(getgov_execute("getgovernance", container))["data"]
+
+    entry = resp["scheduled_updates"][0]
+    assert entry["precheck"] == "skipped"
+    assert "not retained" in entry["precheck_error"]
+
+
+def test_precheck_does_not_affect_consensus_meta_hash():
+    """The critical lock. If a precheck verdict could reach consensus state, two
+    nodes disagreeing about it would compute different state hashes and fork.
+    The verdict is derived at serialization time and must touch nothing."""
+    container = MockContainer()
+    mgr = container.chain_state._lifecycle_manager
+    _schedule(mgr, ConsensusRuleUpdate(["always (o9[t]:bv[24] = i2[t]:bv[24])."], 500))
+
+    before = mgr.consensus_meta_hash()
+    resp = json.loads(getgov_execute("getgovernance", container))["data"]
+    after = mgr.consensus_meta_hash()
+
+    assert resp["scheduled_updates"][0]["precheck"] == "fail"
+    assert before == after
+
+
+def test_precheck_does_not_unschedule_anything():
+    """A failing precheck must not drop the update: skipping an activation is a
+    consensus decision, and a wall-clock/environment-dependent skip forks."""
+    container = MockContainer()
+    mgr = container.chain_state._lifecycle_manager
+    bad = ConsensusRuleUpdate(["always (o9[t]:bv[24] = i2[t]:bv[24])."], 500)
+    _schedule(mgr, bad)
+
+    getgov_execute("getgovernance", container)
+
+    assert (500, bad.update_id) in mgr.scheduled_updates
+    assert bad.update_id in mgr.update_payloads

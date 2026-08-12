@@ -240,6 +240,56 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
 
     return success()
 
+def precheck_scheduled_update(update: Any, active_validators: Optional[Any] = None) -> Dict[str, Optional[str]]:
+    """Advisory re-validation of an ALREADY-SCHEDULED update against the current tip.
+
+    An update is validated when it is submitted, but it activates later — and the
+    tip moves in between. The staleness that actually bites is a host contract
+    patch: a `count:N` quorum bounded against 5 validators when 2 are removed
+    before it fires. This surfaces that while there is still time to act
+    (issue #24, ask 4).
+
+    STRICTLY INFORMATIONAL. Nothing here is read by consensus: no caller may skip,
+    drop or reorder an activation on the strength of this verdict. That is not a
+    style preference — the skip criterion would have to be identical on every node
+    at every replay, and a node disagreeing about whether an update activates
+    computes a different consensus_meta_hash and forks the chain. The terminal
+    behaviour of a bad activation is unchanged: apply raises and the block is
+    rejected network-wide. What this buys is a warning window, not a different
+    outcome.
+
+    Deliberately cheap: static Python re-checks only, no interpreter and no
+    subprocess compile. A compile per scheduled update per poll would turn a read
+    RPC into a process fork bomb, and it still could not prove satisfiability at
+    the activation height, since the application rules accumulated between now and
+    then depend on every intervening user_tx. So "ok" means "nothing statically
+    wrong today", never "this will activate cleanly".
+    """
+    if update is None:
+        # Only pending|scheduled payloads are persisted, so a restart can leave a
+        # scheduled id with no text to check. Absence of a verdict, not a pass.
+        return {"status": "skipped", "error": "payload not retained on this node"}
+
+    patch = getattr(update, "host_contract_patch", None)
+    if isinstance(patch, dict) and patch:
+        err = _check_host_contract_patch(patch, active_validators)
+        if err:
+            return {"status": "fail", "error": err}
+
+    for rev in (getattr(update, "rule_revisions", None) or []):
+        if not isinstance(rev, str):
+            return {"status": "fail", "error": "rule_revisions must be strings"}
+        mocked_in = _streams_referenced(rev, APPLY_MOCKED_INPUT_STREAMS)
+        if mocked_in:
+            return {
+                "status": "fail",
+                "error": (f"revision references apply-time-mocked input stream "
+                          f"'{mocked_in[0]}' (balance)"),
+            }
+
+    return {"status": "ok", "error": None}
+
+
 def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = None) -> Optional[str]:
     """Static checks for host contract parameters to ensure future-proofing definitions."""
     if "proof_scheme" in patch and patch["proof_scheme"] != "bls_header_sig":
