@@ -605,3 +605,58 @@ class TestBalanceReadingPolicyRules:
         rule = (f"always (({self.SCOPE}) -> (o8[t]:bv[24] = {{ #x000003 }}:bv[24])). "
                 f"# flat, not scaled by i2")
         assert self._screen(rule).is_valid
+
+
+class TestLastTransferTsPersistence:
+    """Issue #21 storage: the per-account history survives a restart.
+
+    Ships ahead of the stream feed, so by the time the feed is switched on the
+    history is already accumulated rather than starting from zero.
+    """
+
+    def test_column_is_added_to_an_existing_database(self, tmp_path):
+        """Additive migration: an older DB gains the column with 0 defaults, and
+        0 reads as 'never sent', so a cooldown rule admits the first send."""
+        import sqlite3
+        path = str(tmp_path / "legacy_accounts.sqlite")
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE blocks (block_hash TEXT PRIMARY KEY, block_number INTEGER, "
+                     "previous_hash TEXT, block_data TEXT)")
+        conn.execute("CREATE TABLE accounts (address TEXT PRIMARY KEY, balance INTEGER NOT NULL, "
+                     "sequence_number INTEGER NOT NULL DEFAULT 0)")
+        conn.execute("INSERT INTO accounts VALUES ('aa', 500, 3)")
+        conn.commit()
+        conn.close()
+
+        prev_path, prev_conn = config.STRING_DB_PATH, db._db_conn
+        config.STRING_DB_PATH = path
+        db._db_conn = None
+        try:
+            db.init_db()
+            cols = {r[1] for r in db._db_conn.execute("PRAGMA table_info(accounts)").fetchall()}
+            assert "last_transfer_ts" in cols
+            row = db._db_conn.execute(
+                "SELECT balance, last_transfer_ts FROM accounts WHERE address='aa'").fetchone()
+            assert row == (500, 0), "existing balances must survive the migration"
+        finally:
+            if db._db_conn is not None:
+                db._db_conn.close()
+            config.STRING_DB_PATH = prev_path
+            db._db_conn = prev_conn
+
+    def test_round_trips_through_save_and_load(self, temp_db):
+        db.save_canonical_state_atomically(
+            "h" * 64, 7, {"aa": 100, "bb": 200}, {"aa": 1}, "app", "cons", "cid",
+            [], [], [], [], last_transfer_ts={"aa": 1700000000},
+        )
+        loaded = db.load_last_transfer_ts()
+        assert loaded == {"aa": 1700000000}
+
+    def test_account_present_only_in_the_history_map_is_not_dropped(self, temp_db):
+        """The key union must cover every per-account map — the Bug A class,
+        where an account in one map but not another vanishes on restart."""
+        db.save_canonical_state_atomically(
+            "h" * 64, 7, {}, {}, "app", "cons", "cid", [], [], [], [],
+            last_transfer_ts={"cc": 1700000123},
+        )
+        assert db.load_last_transfer_ts() == {"cc": 1700000123}

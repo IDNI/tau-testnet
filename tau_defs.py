@@ -144,8 +144,8 @@ TAU_INPUT_STREAM_TIMESTAMP = "i5"
 # NOT in this set: this constant is shared with the engine, which uses it for
 # other purposes, so i12 is screened explicitly at every ingest/apply site
 # (commands/sendtx.py, consensus/admission.py, consensus/engine.py). User custom
-# input streams therefore start at i16 (i12/i14/i15 are screened explicitly at
-# every ingest/apply site).
+# input streams therefore start at i13 (i12/i14/i15/i16 are screened explicitly
+# at every ingest/apply site; i13 only under tau_validator_set).
 RESERVED_STREAMS = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
 
 # --- Tau Consensus ABI v1 ---
@@ -166,6 +166,38 @@ TAU_OUTPUT_STREAM_ELIGIBLE = "o7"       # Proposer eligibility verdict (1 for el
 # --- Tau Consensus ABI v1.1 additions (stake-eligibility) ---
 TAU_INPUT_STREAM_PROPOSER_STAKE = "i14"   # Proposer parent-state balance (uint64 string)
 TAU_INPUT_STREAM_ELIGIBILITY_MODE = "i15" # 0 = validator_set, 1 = stake (bv[16])
+
+# --- Per-account transfer history (issue #21) ---
+# i16: seconds since this sender's previous transfer, host-computed from the
+# PARENT snapshot (bv[64]). Host-computed rather than the raw previous timestamp
+# so a cooldown rule is a single comparison -- no bv subtraction, no underflow
+# question, and no special case for "never sent":
+#
+#   always ((i12[t]:bv[384] = ME) -> (i16[t]:bv[64] < {900}:bv[64] -> o5[t] = 0)).
+#
+# COOLDOWN_NEVER_SENT is fed when the account has never sent, so any cooldown
+# comparison passes. It also saturates a non-monotonic block timestamp, which
+# would otherwise go negative and wrap to a huge value.
+#
+# Like i2 this is per-account mutable state, so a FEE rule reading it would
+# compute a different fee at admission than at inclusion; it is screened out of
+# o8/o9 rules for exactly the reason i2 is.
+TAU_INPUT_STREAM_SINCE_LAST_TRANSFER = "i16"
+COOLDOWN_STREAM_INDEX = 16
+COOLDOWN_NEVER_SENT = (1 << 63) - 1
+
+# OFF by default, and flipping it is a CONSENSUS CHANGE requiring coordinated
+# activation across the network -- same class as editing a rules/ file, not a
+# per-node preference. Two things change together when it goes on:
+#   1. the engine starts feeding i16, which can change an o5 verdict, and
+#   2. i16 becomes a reserved operations key.
+# Until then i16 stays an ordinary user custom stream, so rules already deployed
+# against it keep working. This mirrors the "reserve i13 only under
+# tau_validator_set" precedent: reserve a stream exactly when the node feeds it.
+#
+# Storage, persistence and the accounts column ship unconditionally ahead of the
+# feed, so by the time this is switched on the history is already accumulated.
+COOLDOWN_STREAM_ACTIVE = False
 
 # --- Tau Consensus ABI v1.2 additions (Tau-encoded validator membership) ---
 # Proposer BLS pubkey fed so a consensus rule can test set membership itself
@@ -195,6 +227,11 @@ def reserved_operation_keys(eligibility_mode: str = "") -> tuple:
 
     Every ingest/apply site must derive the set through this helper so admission,
     sendtx and block apply agree — a disagreement here is a consensus split."""
+    keys = EXTRA_RESERVED_OPERATION_KEYS
     if eligibility_mode == "tau_validator_set":
-        return EXTRA_RESERVED_OPERATION_KEYS + TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS
-    return EXTRA_RESERVED_OPERATION_KEYS
+        keys = keys + TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS
+    if COOLDOWN_STREAM_ACTIVE:
+        # Reserved only while the node actually feeds i16 (see above), so
+        # pre-existing user rules using it keep working until activation.
+        keys = keys + (COOLDOWN_STREAM_INDEX,)
+    return keys

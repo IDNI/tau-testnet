@@ -1011,3 +1011,79 @@ class TestParentSnapshotBalanceInput(EngineFeeBase):
         )
         self.assertEqual(self._fed_i2(self.mock_multi.call_args_list),
                          [str(tau_defs.MAX_TRANSFER_VALUE)])
+
+
+class TestCooldownStream(EngineFeeBase):
+    """Issue #21: seconds since the sender's previous transfer, on i16.
+
+    Host-computed from the parent snapshot so a cooldown rule is one comparison.
+    Gated OFF by default — switching it on is a coordinated consensus change,
+    because it both changes o5 verdicts and reserves i16.
+    """
+
+    def _fed(self, key):
+        return [c.kwargs["input_stream_values"].get(key)
+                for c in self.mock_multi.call_args_list
+                if key in c.kwargs.get("input_stream_values", {})]
+
+    def _apply(self, parent_lts=None, target_lts=None, ts=1700000000):
+        self.mock_multi.return_value = {1: "1"}
+        return self.engine.apply(
+            self.snapshot, [self.transfer_tx(fee_limit="0")], ts,
+            target_balances={SENDER: 1000}, target_sequences={},
+            proposer_pubkey=PROPOSER, block_height=1,
+            parent_balances={SENDER: 1000},
+            parent_last_transfer_ts=parent_lts,
+            target_last_transfer_ts=target_lts if target_lts is not None else {},
+        )
+
+    def test_not_fed_while_the_feature_is_off(self):
+        """Default state: i16 stays an ordinary custom stream, so rules already
+        deployed against it are unaffected."""
+        self._apply(parent_lts={SENDER: 1699999000})
+        self.assertEqual(self._fed(16), [])
+
+    def test_elapsed_seconds_are_fed_when_active(self):
+        with patch.object(tau_defs, "COOLDOWN_STREAM_ACTIVE", True):
+            self._apply(parent_lts={SENDER: 1699999100}, ts=1700000000)
+        self.assertEqual(self._fed(16), ["900"])
+
+    def test_never_sent_uses_the_sentinel(self):
+        """A first-ever send must satisfy any cooldown, without a special case
+        in the rule."""
+        with patch.object(tau_defs, "COOLDOWN_STREAM_ACTIVE", True):
+            self._apply(parent_lts={})
+        self.assertEqual(self._fed(16), [str(tau_defs.COOLDOWN_NEVER_SENT)])
+
+    def test_non_monotonic_timestamp_clamps_to_zero(self):
+        """A backwards clock must not wrap to a huge value and silently satisfy
+        the cooldown."""
+        with patch.object(tau_defs, "COOLDOWN_STREAM_ACTIVE", True):
+            self._apply(parent_lts={SENDER: 1700000500}, ts=1700000000)
+        self.assertEqual(self._fed(16), ["0"])
+
+    def test_transfer_records_the_send_time(self):
+        target = {}
+        self._apply(parent_lts={}, target_lts=target, ts=1700000000)
+        self.assertEqual(target[SENDER], 1700000000)
+
+    def test_rule_only_tx_does_not_count_as_a_send(self):
+        """The issue asks about transfers; a rule deploy is not one."""
+        self.mock_multi.return_value = {1: "1"}
+        target = {}
+        self.engine.apply(
+            self.snapshot,
+            [{"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
+              "sequence_number": 0, "fee_limit": "0",
+              "operations": {"0": "always (o13[t]:bv[16] = { #x0001 }:bv[16])."}}],
+            1700000000,
+            target_balances={SENDER: 1000}, target_sequences={},
+            proposer_pubkey=PROPOSER, block_height=1,
+            target_last_transfer_ts=target,
+        )
+        self.assertEqual(target, {})
+
+    def test_i16_is_reserved_only_while_active(self):
+        self.assertNotIn(16, tau_defs.reserved_operation_keys(""))
+        with patch.object(tau_defs, "COOLDOWN_STREAM_ACTIVE", True):
+            self.assertIn(16, tau_defs.reserved_operation_keys(""))

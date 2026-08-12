@@ -139,6 +139,7 @@ An operation key `N` maps to Tau input stream `iN`. The wallet supports:
 | `i5` | block timestamp (consensus clock) |
 | `i6`–`i11` | consensus ABI (block height, ts, proposer, parent hash, proof, claims) |
 | `i12` | sender pubkey (`bv[384]`, set by the node) |
+| `i16` | seconds since the sender's previous transfer (`bv[64]`), for cooldown rules. Reserved **only while the network feeds it**; until then it is an ordinary custom stream. |
 
 So user-controllable custom input streams start at **`i13`**. Attempting to set
 any reserved stream (`2`–`12`) as an operation key is rejected at admission (and
@@ -176,6 +177,10 @@ apply. Examples expressible today:
 - **Recipient whitelist:** `always ( (i4[t] = {#x…}:bv[384]) ? o5[t] = {1}:bv[16] : o5[t] = {0}:bv[16] ).`
 - **Time-lock:** block transfers while `i5[t] < {unlock_ts}:bv[64]`.
 - **Spending limit:** block when `i1[t]` exceeds a per-tier cap.
+- **Cooldown** (once the network enables `i16`): block when
+  `i16[t]:bv[64] < {900}:bv[64]` — at least 15 minutes between your sends. The
+  node computes the elapsed seconds, so the rule is one comparison and a
+  first-ever send always passes.
 
 Policy rules **may** read `i2` (balance): it is the sender's balance at the
 parent block, frozen for the whole block, so admission and apply agree. A

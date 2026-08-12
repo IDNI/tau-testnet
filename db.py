@@ -221,9 +221,18 @@ def init_db():
             
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS accounts (
-                    address         TEXT PRIMARY KEY,
-                    balance         INTEGER NOT NULL,
-                    sequence_number INTEGER NOT NULL DEFAULT 0
+                    address           TEXT PRIMARY KEY,
+                    balance           INTEGER NOT NULL,
+                    sequence_number   INTEGER NOT NULL DEFAULT 0,
+                    -- Block timestamp of this account's previous transfer, 0 if
+                    -- it has never sent one (issue #21). Deliberately NOT part
+                    -- of compute_accounts_hash: it is derived from the accepted
+                    -- transfer history, so any node whose value diverged must
+                    -- already have accepted a different transfer set, which
+                    -- diverges balance/sequence and trips the existing accounts
+                    -- hash. Including it would be a coordinated fork for at most
+                    -- one block of earlier detection.
+                    last_transfer_ts  INTEGER NOT NULL DEFAULT 0
                 );
             ''')
             conn.execute('''
@@ -241,6 +250,14 @@ def init_db():
                     proposer_pubkey TEXT
                 );
             ''')
+            cur = conn.execute("PRAGMA table_info(accounts);")
+            account_cols = {row[1] for row in cur.fetchall()}
+            if account_cols and "last_transfer_ts" not in account_cols:
+                # Additive: existing rows default to 0, which reads as "never
+                # sent", so a cooldown rule admits the first send after upgrade.
+                conn.execute(
+                    "ALTER TABLE accounts ADD COLUMN last_transfer_ts INTEGER NOT NULL DEFAULT 0;"
+                )
             cur = conn.execute("PRAGMA table_info(consensus_updates_v2);")
             consensus_update_cols = {row[1] for row in cur.fetchall()}
             if "proposer_pubkey" not in consensus_update_cols:
@@ -1066,6 +1083,25 @@ def get_canonical_blocks_at_or_after_height(block_number: int) -> List[Dict]:
                     continue
     return out
 
+def load_last_transfer_ts() -> Dict[str, int]:
+    """Per-account timestamp of the previous transfer (issue #21).
+
+    Loaded separately rather than widening load_chain_state's 10-tuple, which
+    every caller unpacks positionally. Absent rows read as 0 = "never sent", so
+    a cooldown rule admits the first send after an upgrade.
+    """
+    if _db_conn is None:
+        init_db()
+    out: Dict[str, int] = {}
+    with _db_lock:
+        cur = _db_conn.execute(
+            'SELECT address, last_transfer_ts FROM accounts WHERE last_transfer_ts > 0'
+        )
+        for address, ts in cur.fetchall():
+            out[address] = int(ts or 0)
+    return out
+
+
 def load_chain_state() -> tuple[Dict[str, int], Dict[str, int], str, str, str, str, List[Dict], List[Dict], List[tuple[int, str]], List[str]]:
     """
     Loads the persisted chain state.
@@ -1159,7 +1195,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
     """
@@ -1234,10 +1270,15 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
             # next block against that reduced state, producing a state hash that
             # every follower's replay rejected (Bug A / Phase 9B: the
             # mine-vs-replay divergence at the first post-restart block).
-            for address in set(balances.keys()) | set(sequences.keys()):
+            # The key union must cover every per-account map, or an account
+            # present in only one of them is dropped on restart (Bug A above).
+            _lts = last_transfer_ts or {}
+            for address in set(balances.keys()) | set(sequences.keys()) | set(_lts.keys()):
                 _db_conn.execute(
-                    'INSERT INTO accounts (address, balance, sequence_number) VALUES (?, ?, ?)',
-                    (address, int(balances.get(address, 0)), int(sequences.get(address, 0)))
+                    'INSERT INTO accounts (address, balance, sequence_number, last_transfer_ts) '
+                    'VALUES (?, ?, ?, ?)',
+                    (address, int(balances.get(address, 0)), int(sequences.get(address, 0)),
+                     int(_lts.get(address, 0)))
                 )
                 
             # Full Replace v2 arrays

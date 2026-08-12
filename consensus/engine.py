@@ -380,6 +380,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # 1. State Extraction
         metadata = parent_snapshot.metadata
         t_bals = copy.deepcopy(metadata.get('balances', {}))
+        # Third per-account overlay, same commit-on-accept discipline (issue #21).
+        t_lts = copy.deepcopy(metadata.get('last_transfer_ts', {}) or {})
         t_seqs = copy.deepcopy(metadata.get('sequence_numbers', {}))
         # Pre-block total supply, captured before apply mutates t_bals.
         parent_total = sum(int(v) for v in t_bals.values())
@@ -412,6 +414,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # metadata['balances'] is the pre-block state; t_bals above is the
             # mutable copy apply() debits, and must NOT be used for i2.
             parent_balances=metadata.get('balances'),
+            parent_last_transfer_ts=metadata.get('last_transfer_ts'),
+            target_last_transfer_ts=t_lts,
         )
 
         # Conservation invariant: the native fee model debits the sender and
@@ -544,6 +548,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "source": "engine_apply_block",
                 "balances": t_bals,
                 "sequence_numbers": t_seqs,
+                "last_transfer_ts": t_lts,
                 "lifecycle_manager": lm,
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id
@@ -627,6 +632,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         proposer_pubkey: Optional[str] = None,
         block_height: Optional[int] = None,
         parent_balances: Optional[Dict[str, int]] = None,
+        parent_last_transfer_ts: Optional[Dict[str, int]] = None,
+        target_last_transfer_ts: Optional[Dict[str, int]] = None,
     ) -> TauExecutionResult:
         """
         Apply transactions to the current state.
@@ -714,6 +721,28 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if value == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
                 value = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
             return str(max(0, min(value, tau_defs.MAX_TRANSFER_VALUE)))
+
+        # i16: seconds since this sender's previous transfer, read from the
+        # PARENT snapshot like i2 (issue #21). Host-computed rather than exposing
+        # the raw timestamp, so a cooldown rule is a single comparison with no bv
+        # subtraction and no underflow question at "never sent".
+        parent_lts = dict(parent_last_transfer_ts or {})
+
+        cooldown_active = getattr(tau_defs, "COOLDOWN_STREAM_ACTIVE", False)
+
+        def _since_last_transfer(addr: Optional[str]) -> str:
+            """bv[64] seconds since `addr` last sent, sentinel when never."""
+            try:
+                previous = int(parent_lts.get(addr, 0)) if addr else 0
+            except (TypeError, ValueError):
+                previous = 0
+            if previous <= 0:
+                # Never sent: any cooldown must pass. Saturate rather than wrap.
+                return str(tau_defs.COOLDOWN_NEVER_SENT)
+            elapsed = int(block_timestamp or 0) - previous
+            # A non-monotonic block timestamp must not produce a negative (which
+            # would wrap to a huge bv value and silently satisfy the cooldown).
+            return str(max(0, min(elapsed, tau_defs.COOLDOWN_NEVER_SENT)))
 
         for i, tx in enumerate(transactions):
             tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
@@ -1016,6 +1045,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     # the same value and a balance-reading policy rule
                                     # is deterministic across both (issue #20).
                                     2: _parent_bal(from_addr),
+                                    **({16: _since_last_transfer(from_addr)} if cooldown_active else {}),
                                     # i3/i4 are the real from/to pubkeys (immutable in
                                     # the transfer tuple -> identical at admission and
                                     # apply), so recipient-aware policy/fee rules are
@@ -1141,6 +1171,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         # pre-fee-era blocks, and a different value
                                         # here would diverge replay from mining.
                                         2: _parent_bal(from_addr),
+                                        **({16: _since_last_transfer(from_addr)} if cooldown_active else {}),
                                         # Real from/to pubkeys for eval/width parity
                                         # with the fee-era path.
                                         3: "{ #x" + str(from_addr) + " }:bv[384]",
@@ -1240,6 +1271,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 try:
                     fee_query_inputs = {
                         1: "0", 2: _parent_bal(sender), 3: "0", 4: "0",
+                        **({16: _since_last_transfer(sender)} if cooldown_active else {}),
                         # NOTE: key order here (5 before 12) intentionally
                         # matches commands/sendtx.py's transfer-less fee query,
                         # since insertion order is what the shrink layer sees.
@@ -1350,6 +1382,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 target_balances.update(staged_writes)
 
             if accepted_in_block and not hard_reject:
+                # Record this sender's transfer time for the cooldown stream
+                # (issue #21). Only transfers count -- a rule-only user_tx is not
+                # a send -- and only for txs that stay accepted, mirroring the
+                # staged-balance commit rule.
+                if sender and transfers_op_data and target_last_transfer_ts is not None:
+                    target_last_transfer_ts[sender] = int(block_timestamp or 0)
+
                 if should_increment_seq and sender:
                     try:
                         if target_sequences is not None:

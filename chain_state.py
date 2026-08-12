@@ -136,6 +136,13 @@ _sequence_lock = threading.Lock()
 # In-memory sequence numbers table: maps address to sequence number
 _sequence_numbers = {}
 
+# Block timestamp of each account's previous transfer, 0/absent = never sent
+# (issue #21). Guarded by _sequence_lock rather than a fourth lock: it is written
+# in the same commit paths, and adding another lock to the
+# _balance_lock/_sequence_lock/_rules_lock ordering at 7 sites is a deadlock
+# surface for no concurrency gain.
+_last_transfer_ts: dict = {}
+
 # Lock for thread-safe access to rules state
 _rules_lock = threading.Lock()
 
@@ -549,6 +556,7 @@ def _process_new_block_locked(block: Block) -> bool:
                     "source": "chain_state",
                     "balances": _balances,
                     "sequence_numbers": _sequence_numbers,
+                    "last_transfer_ts": _last_transfer_ts,
                     "lifecycle_manager": _lifecycle_manager,
                     "active_consensus_id": _active_consensus_id,
                     "consensus_rules_state": _consensus_rules_state,
@@ -645,6 +653,7 @@ def _process_new_block_locked(block: Block) -> bool:
                     metadata={
                         "balances": temp_balances,
                         "sequence_numbers": temp_sequences,
+                        "last_transfer_ts": dict(_last_transfer_ts),
                         "lifecycle_manager": _lifecycle_manager,
                         "consensus_rules_state": next_cons_rules,
                     },
@@ -664,6 +673,7 @@ def _process_new_block_locked(block: Block) -> bool:
                 _balances.update(next_snapshot.metadata["balances"])
                 _sequence_numbers.clear()
                 _sequence_numbers.update(next_snapshot.metadata["sequence_numbers"])
+                _last_transfer_ts.update(next_snapshot.metadata.get("last_transfer_ts", {}) or {})
                 
                 _lifecycle_manager = next_snapshot.metadata["lifecycle_manager"]
                 
@@ -701,6 +711,7 @@ def _process_new_block_locked(block: Block) -> bool:
                 quorum_policy=_lifecycle_manager.quorum_policy,
                 eligibility_mode=_lifecycle_manager.eligibility_mode,
                 fee_beneficiary=_lifecycle_manager.fee_beneficiary,
+                last_transfer_ts=dict(_last_transfer_ts),
             )
 
             # Governance activation just changed the active consensus rule: rebuild
@@ -861,6 +872,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                     "source": "chain_state",
                     "balances": _balances,
                     "sequence_numbers": _sequence_numbers,
+                    "last_transfer_ts": _last_transfer_ts,
                     "lifecycle_manager": _lifecycle_manager,
                     "active_consensus_id": _active_consensus_id,
                     "consensus_rules_state": _consensus_rules_state,
@@ -916,6 +928,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                 _balances.update(next_snapshot.metadata["balances"])
                 _sequence_numbers.clear()
                 _sequence_numbers.update(next_snapshot.metadata["sequence_numbers"])
+                _last_transfer_ts.update(next_snapshot.metadata.get("last_transfer_ts", {}) or {})
                 
                 _lifecycle_manager = next_snapshot.metadata["lifecycle_manager"]
                 
@@ -1552,6 +1565,8 @@ def load_state_from_db() -> bool:
         _lifecycle_manager.eligibility_mode = (
             _genesis_eligibility_mode if persisted_mode == _MISSING else persisted_mode
         )
+        _last_transfer_ts.clear()
+        _last_transfer_ts.update(db.load_last_transfer_ts())
         persisted_beneficiary = db.get_chain_state_value("fee_beneficiary", _MISSING)
         _lifecycle_manager.fee_beneficiary = (
             _genesis_fee_beneficiary if persisted_beneficiary == _MISSING else persisted_beneficiary
@@ -1594,6 +1609,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         quorum_policy_snapshot = _lifecycle_manager.quorum_policy
         eligibility_mode_snapshot = _lifecycle_manager.eligibility_mode
         fee_beneficiary_snapshot = _lifecycle_manager.fee_beneficiary
+        last_transfer_ts_snapshot = dict(_last_transfer_ts)
 
     db.save_canonical_state_atomically(
         block_hash, block_number,
@@ -1604,6 +1620,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         quorum_policy=quorum_policy_snapshot,
         eligibility_mode=eligibility_mode_snapshot,
         fee_beneficiary=fee_beneficiary_snapshot,
+        last_transfer_ts=last_transfer_ts_snapshot,
     )
 
 def tick_governance(height: int):
@@ -1939,6 +1956,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
             quorum_policy=_lifecycle_manager.quorum_policy,
             eligibility_mode=_lifecycle_manager.eligibility_mode,
             fee_beneficiary=_lifecycle_manager.fee_beneficiary,
+            last_transfer_ts=dict(_last_transfer_ts),
         )
 
     # Phase 5: Mempool Restore
