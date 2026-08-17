@@ -13,8 +13,8 @@
 # o7 for i15 = 1 composes with this rule without contradiction.
 #
 # This fixture is the rendered form, carrying the a/b/c *96 validators the native
-# e2e test uses. The demo repo (demo/stake-switch) keeps the .tmpl and the
-# renderer that substitute real node pubkeys after key generation.
+# e2e test uses. The placeholders are fixed hex so membership comparisons stay
+# deterministic without generating real node keys.
 always (
     o6[t]:bv[16] = i10[t]:bv[16] &&
     ( i15[t]:bv[16] != { 0 }:bv[16] ||
