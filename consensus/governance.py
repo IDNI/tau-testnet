@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 
 from consensus.serialization import compute_update_id
+from consensus.rule_offers import RuleOfferLifecycleManager
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,29 @@ def validate_eligibility_mode(mode: Any) -> Optional[str]:
     if mode in ELIGIBILITY_MODES:
         return None
     return "must be one of " + ", ".join(repr(m) for m in ELIGIBILITY_MODES)
+
+# Rule-bearing transactions permitted per block. Bounds how many interpreter
+# rebuilds a validator must pay to verify one block: rebuild cost climbs
+# steeply with specification complexity, and an unbounded count would let a
+# proposer author a block that every validator times out on (COMM_TIMEOUT,
+# then a watchdog kill). Governance-patchable via host_contract_patch, and
+# bound into the consensus state hash only when non-default so pre-existing
+# chains keep a byte-identical hash.
+DEFAULT_MAX_RULE_TXS_PER_BLOCK = 8
+MAX_MAX_RULE_TXS_PER_BLOCK = 1024
+
+
+def validate_max_rule_txs_per_block(value: Any) -> Optional[str]:
+    """Return an error string if `value` is not a deployable per-block rule
+    budget, else None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "must be an integer"
+    if value < 1:
+        return "must be at least 1"
+    if value > MAX_MAX_RULE_TXS_PER_BLOCK:
+        return f"must be at most {MAX_MAX_RULE_TXS_PER_BLOCK}"
+    return None
+
 
 # Network-wide quorum policy used when genesis does not pin one. The consensus
 # tally MUST resolve to a deterministic value here and never read per-node
@@ -287,6 +311,16 @@ class ConsensusLifecycleManager:
         # bound into the consensus state hash (only when != default, to keep
         # existing chains' hashes byte-stable).
         self.eligibility_mode: str = ""
+        # Rule sharing lives here as a FIELD rather than a sibling object so
+        # consensus_meta_hash() picks it up automatically. There are three
+        # state-hash call sites (chain_state, engine, createblock); a sibling
+        # would have to be threaded through all of them, and a missed one is a
+        # silent fork.
+        self.rule_offers = RuleOfferLifecycleManager()
+        # Caps rule-bearing transactions per block, bounding how many
+        # interpreter rebuilds a validator must pay to verify one block.
+        # Governance-patchable; bound into the meta hash only when non-default.
+        self.max_rule_txs_per_block: int = DEFAULT_MAX_RULE_TXS_PER_BLOCK
         self.recompute_approval_threshold()
 
     def effective_quorum_policy(self) -> str:
@@ -340,6 +374,17 @@ class ConsensusLifecycleManager:
         # keeps a byte-identical meta hash (hash-compat).
         if self.effective_eligibility_mode() != DEFAULT_ELIGIBILITY_MODE:
             mech["eligibility_mode"] = self.effective_eligibility_mode()
+        # Same hash-compat gate for rule sharing: while nothing has ever been
+        # offered or accepted, no key is emitted, so every chain that predates
+        # the feature keeps a byte-identical meta hash and needs no regenesis.
+        # Once the first offer lands the keys appear, and a node still running
+        # the old binary diverges loudly (state-hash mismatch -> block
+        # rejected) rather than silently.
+        if not self.rule_offers.is_empty():
+            mech["rule_offers_root"] = self.rule_offers.offers_root().hex()
+            mech["rule_clauses_root"] = self.rule_offers.clauses_root().hex()
+        if self.max_rule_txs_per_block != DEFAULT_MAX_RULE_TXS_PER_BLOCK:
+            mech["max_rule_txs_per_block"] = self.max_rule_txs_per_block
         return compute_consensus_meta_hash(
             host_contract={},
             active_validators=list(self.active_validators),
@@ -402,6 +447,12 @@ class ConsensusLifecycleManager:
             if err:
                 raise ValueError(f"eligibility_mode: {err}")
             self.eligibility_mode = mode
+        if "max_rule_txs_per_block" in patch:
+            budget = patch["max_rule_txs_per_block"]
+            err = validate_max_rule_txs_per_block(budget)
+            if err:
+                raise ValueError(f"max_rule_txs_per_block: {err}")
+            self.max_rule_txs_per_block = int(budget)
         self.recompute_approval_threshold()
 
     def knows_update(self, update_id: bytes) -> bool:
@@ -543,7 +594,12 @@ class ConsensusLifecycleManager:
         Returns the list of updates that just activated (to apply to Tau).
         """
         newly_active = []
-        
+
+        # 0. Expire rule offers whose window has closed. Runs first and
+        # unconditionally, at exactly one point per block on every node, so the
+        # offer book is settled before the state hash is computed.
+        self.rule_offers.expire_at_height(current_height)
+
         # 1. Expire pending updates that missed their activation height
         expired_uids = []
         for uid in self.pending_updates:

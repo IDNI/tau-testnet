@@ -345,3 +345,60 @@ emit(res)
     assert str(seq["C"]) == "1", seq   # third party unaffected -> allowed
     # The unrelated base rule still applies: o1 echoes the amount unchanged.
     assert str(parsed["sequential_o1"]) == "100", parsed["sequential_o1"]
+
+
+# ---------------------------------------------------------------------------
+# 5. The real emitter output, on the real engine
+# ---------------------------------------------------------------------------
+
+@requires_native
+def test_emitted_composite_isolates_acceptors_on_the_engine(tmp_path):
+    """End-to-end check of `compose_stream_rule`'s actual output.
+
+    The cases above use hand-written text to characterize the engine. This one
+    closes the loop: it feeds exactly what the production emitter produces and
+    asserts each acceptor's policy applies to that acceptor only.
+
+    The composite is built in the parent (which has the repo's dependencies)
+    and passed to the child as text, so the child needs nothing but the
+    nanobind module on PYTHONPATH.
+    """
+    from consensus.rule_offers import compose_stream_rule, normalize_offer_rule_text
+
+    block_body, target = normalize_offer_rule_text(
+        "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
+    )
+    allow_body, _ = normalize_offer_rule_text(
+        "always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."
+    )
+    # A blocks itself, B explicitly allows itself, C has no clause at all.
+    composite = compose_stream_rule(target, {A: block_body, B: allow_body})
+    solo = compose_stream_rule(target, {A: block_body})
+
+    body = (
+        "COMPOSITE = " + json.dumps(composite) + "\n"
+        "SOLO = " + json.dumps(solo) + "\n"
+        + r'''
+def probe(composite):
+    iface = new_iface()
+    iface.communicate(rule_text="always ( " + BASE + " ).", target_output_stream_index=0)
+    iface.communicate(rule_text=composite, target_output_stream_index=0)
+    return {who: sender_step(iface, pk).get(5) for who, pk in (("A", A), ("B", B), ("C", C))}
+
+emit({"multi": probe(COMPOSITE), "solo": probe(SOLO)})
+'''
+    )
+    proc, parsed = _run_child(tmp_path, "emitted_composite", body)
+    _assert_ok(proc, parsed)
+
+    multi = parsed["multi"]
+    assert str(multi["A"]) == "0", multi   # A's own block clause
+    assert str(multi["B"]) == "1", multi   # B's own allow clause
+    assert str(multi["C"]) == "1", multi   # no clause -> neutral (allow)
+
+    solo_res = parsed["solo"]
+    assert str(solo_res["A"]) == "0", solo_res
+    # With only A's clause registered, B falls through to neutral rather than
+    # inheriting A's policy.
+    assert str(solo_res["B"]) == "1", solo_res
+    assert str(solo_res["C"]) == "1", solo_res

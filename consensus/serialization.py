@@ -314,3 +314,143 @@ def compute_consensus_meta_hash(
         mechanism_specific_metadata
     )
     return blake3(meta_bytes).digest()
+
+
+# --- Rule Sharing Object Serialization ---
+#
+# Canonical encodings for the rule-offer book and the accepted-clause registry.
+# Both roots are folded into consensus_meta.mechanism_specific_metadata, so
+# these functions are CONSENSUS-FROZEN: changing any of them changes the state
+# hash of every chain that carries a rule offer.
+
+def encode_rule_offer(
+    offerer_pubkey: Union[bytes, str],
+    recipient_pubkey: Union[bytes, str],
+    rule_text: str,
+    expire_at_height: int,
+) -> bytes:
+    """Canonical serialization of a rule offer's identifying content.
+
+    Excludes sequence_number, expiration_time, fee_limit and signature, exactly
+    as compute_update_id does for governance updates, so the id is a property
+    of the offer rather than of the transaction that carried it.
+    """
+    out = bytearray()
+    out.extend(encode_pubkey48(offerer_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_string(rule_text))
+    out.extend(encode_uint64(expire_at_height))
+    return bytes(out)
+
+
+def compute_offer_id(
+    offerer_pubkey: Union[bytes, str],
+    recipient_pubkey: Union[bytes, str],
+    rule_text: str,
+    expire_at_height: int,
+) -> bytes:
+    """Derive offer_id as BLAKE3(encode_rule_offer(...)). Returns 32 bytes."""
+    return blake3(
+        encode_rule_offer(
+            offerer_pubkey=offerer_pubkey,
+            recipient_pubkey=recipient_pubkey,
+            rule_text=rule_text,
+            expire_at_height=expire_at_height,
+        )
+    ).digest()
+
+
+def encode_rule_offer_entry(
+    offer_id: Union[bytes, str],
+    offerer_pubkey: Union[bytes, str],
+    recipient_pubkey: Union[bytes, str],
+    expire_at_height: int,
+) -> bytes:
+    """One outstanding-offer entry as bound into the state hash.
+
+    Carries offerer/recipient/expiry even though offer_id already commits to
+    them: it makes the bound book self-describing, so expiry and recipient
+    authorization are decidable from hashed state alone rather than from a
+    node-local payload store that may not have the row.
+    """
+    out = bytearray()
+    out.extend(encode_hash32(offer_id))
+    out.extend(encode_pubkey48(offerer_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(expire_at_height))
+    return bytes(out)
+
+
+def encode_rule_offer_book(
+    offered: List[tuple],
+    resolved: List[Union[bytes, str]],
+) -> bytes:
+    """Canonical serialization of the whole offer book.
+
+    `offered` holds (offer_id, offerer, recipient, expire_at_height) tuples,
+    sorted here by raw offer_id bytes. `resolved` holds bare offer ids: the
+    terminal status is deliberately NOT hashed, because the observable effect
+    of an acceptance is the clause registry and the application-rules state,
+    both of which are already bound.
+    """
+    entries = sorted(
+        (
+            _coerce_fixed_bytes(offer_id, 32, "offer_id"),
+            offerer,
+            recipient,
+            expire_at,
+        )
+        for offer_id, offerer, recipient, expire_at in offered
+    )
+    out = bytearray()
+    out.extend(encode_uint32(len(entries)))
+    for offer_id, offerer, recipient, expire_at in entries:
+        out.extend(
+            encode_rule_offer_entry(offer_id, offerer, recipient, expire_at)
+        )
+
+    resolved_ids = sorted(
+        _coerce_fixed_bytes(item, 32, "offer_id") for item in resolved
+    )
+    out.extend(encode_uint32(len(resolved_ids)))
+    for offer_id in resolved_ids:
+        out.extend(encode_hash32(offer_id))
+    return bytes(out)
+
+
+def compute_rule_offer_book_root(
+    offered: List[tuple],
+    resolved: List[Union[bytes, str]],
+) -> bytes:
+    """BLAKE3 of the canonical offer book. Returns 32 bytes."""
+    return blake3(encode_rule_offer_book(offered, resolved)).digest()
+
+
+def encode_clause_registry(clauses: Dict[tuple, str]) -> bytes:
+    """Canonical serialization of the accepted-clause registry.
+
+    `clauses` maps (acceptor_pubkey_hex, target_output_stream) -> clause body.
+    Sorted by raw public-key bytes then stream index, matching the order the
+    composite emitter uses, so the registry root and the emitted rule text can
+    never disagree about ordering.
+    """
+    items = sorted(
+        (
+            _coerce_fixed_bytes(acceptor, 48, "acceptor_pubkey"),
+            int(stream),
+            body,
+        )
+        for (acceptor, stream), body in clauses.items()
+    )
+    out = bytearray()
+    out.extend(encode_uint32(len(items)))
+    for acceptor, stream, body in items:
+        out.extend(encode_pubkey48(acceptor))
+        out.extend(encode_uint32(stream))
+        out.extend(encode_string(body))
+    return bytes(out)
+
+
+def compute_clause_registry_root(clauses: Dict[tuple, str]) -> bytes:
+    """BLAKE3 of the canonical clause registry. Returns 32 bytes."""
+    return blake3(encode_clause_registry(clauses)).digest()
