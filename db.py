@@ -8,6 +8,7 @@ from contextlib import contextmanager
 
 import config
 import block as block_module
+from consensus.lanes import LANE_FAST, LANE_SLOW, classify_lane_payload
 from errors import DatabaseError
 
 
@@ -392,10 +393,37 @@ def init_db():
                         conn.execute(
                             f"ALTER TABLE mempool ADD COLUMN {fee_col} INTEGER NOT NULL DEFAULT 0;"
                         )
+
+            # Lane separation. `lane` is a materialised cache of the pure
+            # function consensus.lanes.classify_lane, used only for indexing
+            # and quotas; `sender_pubkey` turns get_pending_sequence from a
+            # full-table scan with a json.loads per row into an index lookup.
+            cols_info = {row[1] for row in conn.execute("PRAGMA table_info(mempool);").fetchall()}
+            lane_added = "lane" not in cols_info
+            if lane_added:
+                conn.execute(
+                    "ALTER TABLE mempool ADD COLUMN lane INTEGER NOT NULL DEFAULT 0;"
+                )
+            sender_added = "sender_pubkey" not in cols_info
+            if sender_added:
+                conn.execute("ALTER TABLE mempool ADD COLUMN sender_pubkey TEXT;")
+            if lane_added or sender_added:
+                # One-shot backfill. DEFAULT 0 alone would misfile every
+                # pre-existing rule transaction into the fast lane, letting it
+                # keep competing with transfers for the same slots.
+                _backfill_mempool_lanes(conn)
+
             conn.execute('''
                 CREATE INDEX IF NOT EXISTS idx_mempool_pending_order
                 ON mempool(status, estimated_fee DESC, received_at ASC);
             ''')
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_mempool_lane_order
+                ON mempool(status, lane, estimated_fee DESC, received_at ASC);
+            ''')
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mempool_sender ON mempool(sender_pubkey);"
+            )
 
             conn.execute('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);')
             row = conn.execute('SELECT version FROM schema_version LIMIT 1').fetchone()
@@ -489,8 +517,41 @@ def get_text_by_id(yid: str) -> str:
         else:
             raise KeyError(f"No text found for Tau ID: {yid}")
 
+def _sender_of_payload(payload: str) -> Optional[str]:
+    """Sender public key from a mempool payload, or None if unreadable."""
+    try:
+        sender = json.loads(payload).get("sender_pubkey")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return sender if isinstance(sender, str) else None
+
+
+def _backfill_mempool_lanes(conn) -> None:
+    """Populate `lane`/`sender_pubkey` for rows written before the columns
+    existed. Exception-safe: this runs inside init_db, so a failure here must
+    not stop the node from starting -- a mis-filed row costs a quota slot, not
+    correctness.
+    """
+    try:
+        rows = conn.execute("SELECT id, payload FROM mempool").fetchall()
+    except sqlite3.Error:
+        logger.warning("Could not read mempool for lane backfill", exc_info=True)
+        return
+    for row_id, payload in rows:
+        try:
+            conn.execute(
+                "UPDATE mempool SET lane = ?, sender_pubkey = ? WHERE id = ?",
+                (classify_lane_payload(payload), _sender_of_payload(payload), row_id),
+            )
+        except sqlite3.Error:
+            logger.warning("Skipping lane backfill for mempool row %s", row_id, exc_info=True)
+    if rows:
+        logger.info("Backfilled transaction lanes for %d mempool rows", len(rows))
+
+
 def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
-                   fee_limit: int = 0, estimated_fee: int = 0):
+                   fee_limit: int = 0, estimated_fee: int = 0,
+                   lane: int | None = None):
     """Adds data to the mempool. Prefixes with 'json:' if it looks like JSON."""
     if _db_conn is None:
         init_db()
@@ -505,6 +566,11 @@ def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
     payload = tx_data
     if payload.startswith("json:"):
         payload = payload[5:]
+
+    # Derived here as well as passed in, so any caller that predates lanes
+    # still files its row correctly rather than defaulting into the fast lane.
+    row_lane = classify_lane_payload(payload) if lane is None else int(lane)
+    row_sender = _sender_of_payload(payload)
 
     with _db_lock:
         cur = _db_conn.cursor()
@@ -570,9 +636,10 @@ def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
 
         # Idempotency: INSERT OR IGNORE
         cur.execute('''
-            INSERT OR IGNORE INTO mempool (tx_hash, payload, received_at, status, fee_limit, estimated_fee)
-            VALUES (?, ?, ?, 'pending', ?, ?)
-        ''', (tx_hash, payload, received_at, int(fee_limit), int(estimated_fee)))
+            INSERT OR IGNORE INTO mempool (tx_hash, payload, received_at, status, fee_limit, estimated_fee, lane, sender_pubkey)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
+        ''', (tx_hash, payload, received_at, int(fee_limit), int(estimated_fee),
+              int(row_lane), row_sender))
         _db_conn.commit()
         
 def count_mempool_txs() -> int:
