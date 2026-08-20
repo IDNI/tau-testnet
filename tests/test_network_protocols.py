@@ -231,12 +231,14 @@ async def test_mempool_snapshot_sent_on_connect(two_nodes, monkeypatch):
     svc1, svc2, _ = two_nodes
 
     # Patch queue_transaction so we can observe gossip ingestion without Tau/BLS.
+    # Plain list + polling rather than a trio.Event: transaction admission is
+    # dispatched with trio.to_thread.run_sync (so a slow Tau/compile step can
+    # never park the network event loop), and trio primitives may not be
+    # touched from a worker thread.
     received: List[Dict[str, Any]] = []
-    call_event = trio.Event()
 
     def fake_submit(payload: str, propagate: bool = True) -> str:
         received.append({"payload": payload, "propagate": propagate})
-        call_event.set()
         return "queued"
 
     monkeypatch.setattr(svc2, "_submit_tx", fake_submit)
@@ -269,7 +271,8 @@ async def test_mempool_snapshot_sent_on_connect(two_nodes, monkeypatch):
         pytest.fail("Failed to connect after 5 attempts")
 
     with trio.fail_after(5):
-        await call_event.wait()
+        while not received:
+            await trio.sleep(0.05)
 
     assert received, "Expected mempool transaction to be replayed to the new peer"
     replay = received[0]

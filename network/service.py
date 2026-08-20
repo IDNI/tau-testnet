@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 import sys
 import trio
@@ -749,7 +750,15 @@ class NetworkService:
                 return
                 
         try:
-            self._queue_tx(payload_str, propagate=False)
+            # Offloaded to a worker thread: _queue_tx runs the full synchronous
+            # admission path, which takes the process-global Tau lock and, for
+            # rule-bearing transactions, spawns a compile subprocess bounded
+            # only by COMM_TIMEOUT. Running that inline would park this trio
+            # event loop -- and with it block gossip, tx gossip, sync and peer
+            # discovery -- for as long as admission takes.
+            await trio.to_thread.run_sync(
+                functools.partial(self._queue_tx, payload_str, propagate=False)
+            )
         except Exception:
             logger.warning("Failed to process gossip tx_type %s", tx_type, exc_info=True)
 
@@ -1142,8 +1151,11 @@ class NetworkService:
         try:
             data = await bounded_stream_read(stream, 65535)
             req = json.loads(data.decode())
-            # Submit tx
-            res = self._queue_tx(req.get("tx"))
+            # Submit tx off the event loop -- see the note in
+            # _process_gossip_payload; admission can block for seconds.
+            res = await trio.to_thread.run_sync(
+                functools.partial(self._queue_tx, req.get("tx"))
+            )
             resp = {"ok": True, "result": res}
             await stream.write(json.dumps(resp).encode())
         except Exception:
