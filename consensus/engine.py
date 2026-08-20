@@ -13,6 +13,19 @@ from .state import StateStore, compute_state_hash
 from .governance import normalize_validator_set, is_tau_authoritative_eligibility_mode
 from . import fees
 from .fees import FeeRuleError
+from .rule_offers import (
+    RULE_OFFER_TX_TYPES,
+    TX_TYPE_RULE_OFFER,
+    TX_TYPE_RULE_OFFER_ACCEPT,
+    parse_rule_offer,
+    parse_rule_offer_accept,
+    parse_rule_offer_reject,
+)
+
+# Transaction types that pay a fee. Governance types are exempt so validators
+# never need funds to govern; rule sharing is user-initiated and expensive, so
+# exempting it would make rule spam free.
+FEE_BEARING_TX_TYPES = frozenset({"user_tx"} | set(RULE_OFFER_TX_TYPES))
 from errors import BlockchainBug, TauCommunicationError, TauEngineBug, TauEngineCrash
 
 # We need to import chain_state and tau_manager, but we must be careful about circular imports.
@@ -100,6 +113,46 @@ class ConsensusEngine(ABC):
         and time, according to Tau policy (o7).
         """
         pass
+
+def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict) -> Tuple[bool, str]:
+    """Route a regenerated composite rule through i0, as an op-"0" rule would.
+
+    Returns (ok, detail). `composite` is None only when the acceptor's clause
+    was the last one for that stream, which cannot happen on an accept, so a
+    None here is a programming error rather than a chain condition.
+
+    A rejection is deterministic: every node applying this block composes the
+    same text from the same registry and feeds it to the same engine, so all of
+    them either accept or hard-reject the transaction identically.
+    """
+    if not composite:
+        return False, "composite is empty"
+
+    if not tau_manager.tau_ready.is_set():
+        tau_manager.tau_ready.wait(timeout=5)
+    if not tau_manager.tau_ready.is_set():
+        # Soft failure shape is not available here: the clause is already
+        # registered in the manager, so refusing the tx is the only way to keep
+        # the emitted spec and the registry consistent.
+        return False, "Tau not ready"
+
+    try:
+        output = tau_manager.communicate_with_tau(
+            rule_text=composite,
+            target_output_stream_index=0,
+            apply_rules_update=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - deliberately broad, see below
+        # A deterministic parse/compile failure surfaces as an engine error in
+        # the exception text. Anything else (transient outage) is equally fatal
+        # for this transaction, because the registry has already moved.
+        return False, str(exc)
+
+    tx_receipt["logs"].append(f"Tau(composite) o0: {output}")
+    if "error" in str(output).lower() and "x1001" not in str(output).lower():
+        return False, str(output)
+    return True, ""
+
 
 class TauConsensusEngine(TauEngine, ConsensusEngine):
     """
@@ -727,9 +780,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             tx_type = tx.get('tx_type', 'user_tx')
 
-            # --- Fee preamble (user_tx only; governance txs are exempt by
-            # design so validators never need funds to govern) ---
-            charge_fee = fees_enabled and tx_type == 'user_tx'
+            # --- Fee preamble ---
+            # Governance txs are exempt by design so validators never need
+            # funds to govern. The rule-sharing types are NOT exempt: they are
+            # user-initiated and expensive, and exempting them would make rule
+            # spam free. They carry no transfers, so the transfer-less
+            # fee-query step below covers them.
+            charge_fee = fees_enabled and tx_type in FEE_BEARING_TX_TYPES
             fee_limit_int: Optional[int] = None
             fee_components: List[int] = []
             staged_writes: Dict[str, int] = {}
@@ -810,6 +867,92 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 else:
                     tx_receipt["logs"].append("Invalid update format")
                     accepted_in_block = False # Structural invalidity rejects entirely in most chains
+
+            elif tx_type in RULE_OFFER_TX_TYPES:
+                # Bounds and cap breaches are SOFT no-ops with a receipt log,
+                # matching the activation-delay handling above: the block stays
+                # valid and the offer simply is not recorded, so replay is
+                # deterministic regardless of tip state. Only a Tau failure on
+                # the composed rule hard-rejects, because that means the text
+                # could not have entered the specification at all.
+                offers = lifecycle_mgr.rule_offers
+
+                if tx_type == TX_TYPE_RULE_OFFER:
+                    offer = parse_rule_offer(tx)
+                    if offer is None:
+                        tx_receipt["logs"].append("Invalid rule offer format")
+                        accepted_in_block = False
+                    elif not isinstance(sender, str) or sender.lower() != offer.offerer_pubkey:
+                        tx_receipt["logs"].append("Rule offer offerer is not the sender")
+                        accepted_in_block = False
+                    else:
+                        # The reference height is the INCLUSION height, which
+                        # is what admission's tip_view.next_block_height()
+                        # resolved to for this same transaction. Using anything
+                        # else would let admission and apply disagree about
+                        # whether an offer is still in its window.
+                        ok, reason = offers.can_admit_offer(
+                            offer,
+                            next_height=block_height if block_height is not None else 0,
+                        )
+                        if not ok:
+                            tx_receipt["logs"].append(f"Offer ignored ({reason})")
+                        elif offers.submit_offer(offer):
+                            tx_receipt["logs"].append("Offer submitted: " + offer.offer_id_hex)
+                        else:
+                            tx_receipt["logs"].append(
+                                "Duplicate offer ignored: " + offer.offer_id_hex
+                            )
+                else:
+                    accept = tx_type == TX_TYPE_RULE_OFFER_ACCEPT
+                    decision = (
+                        parse_rule_offer_accept(tx) if accept
+                        else parse_rule_offer_reject(tx)
+                    )
+                    if decision is None:
+                        tx_receipt["logs"].append("Invalid rule offer decision format")
+                        accepted_in_block = False
+                    elif not isinstance(sender, str) or sender.lower() != decision.actor_pubkey:
+                        tx_receipt["logs"].append("Rule offer decision actor is not the sender")
+                        accepted_in_block = False
+                    else:
+                        ok, reason = offers.can_admit_decision(decision)
+                        if not ok:
+                            tx_receipt["logs"].append(
+                                f"Offer decision ignored ({reason})"
+                            )
+                        else:
+                            target_stream = offers.submit_decision(decision)
+                            if target_stream is None:
+                                tx_receipt["logs"].append(
+                                    "Offer resolved: " + decision.offer_id_hex
+                                )
+                            else:
+                                # Re-emit the whole composite for the stream.
+                                # Individually guarded units cannot be appended:
+                                # an unconstrained stream materializes with an
+                                # arbitrary witness, and two total-form rules on
+                                # one stream either fail to conjoin or supersede
+                                # each other. See tests/test_rule_scoping_native.
+                                composite = offers.composite_for_stream(target_stream)
+                                ok_apply, detail = _apply_composite_rule(
+                                    composite, tx_receipt
+                                )
+                                if not ok_apply:
+                                    accepted_in_block = False
+                                    hard_reject = True
+                                    execution_success = False
+                                    tx_receipt["logs"].append(
+                                        f"Error: composite rule rejected: {detail}"
+                                    )
+                                else:
+                                    rules_text = chain_state.get_rules_state()
+                                    if isinstance(rules_text, str):
+                                        current_tau_bytes = rules_text.encode("utf-8")
+                                    tx_receipt["logs"].append(
+                                        f"Offer accepted, o{target_stream} composite applied: "
+                                        + decision.offer_id_hex
+                                    )
 
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
