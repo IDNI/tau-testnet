@@ -263,6 +263,45 @@ def init_db():
                     update_id TEXT PRIMARY KEY
                 );
             ''')
+            # Rule sharing. Additive tables: SCHEMA_VERSION stays put, since a
+            # bump makes init_db refuse to start and forces every live node to
+            # delete its database.
+            #
+            # The consensus-bound part of an offer is (offer_id, offerer,
+            # recipient, expire_at_height) plus membership of the resolved set.
+            # `rule_text` and `status` are node-local durability for the RPC
+            # surface: they are re-derivable by replay and are NOT folded into
+            # consensus_meta_hash, mirroring how governance update payloads are
+            # persisted.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_offers_v1 (
+                    offer_id           TEXT PRIMARY KEY,
+                    offerer_pubkey     TEXT NOT NULL,
+                    recipient_pubkey   TEXT NOT NULL,
+                    rule_text          TEXT NOT NULL,
+                    expire_at_height   INTEGER NOT NULL,
+                    status             TEXT NOT NULL DEFAULT 'offered'
+                );
+            ''')
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rule_offers_recipient_status "
+                "ON rule_offers_v1(recipient_pubkey, status);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rule_offers_offerer_status "
+                "ON rule_offers_v1(offerer_pubkey, status);"
+            )
+            # The accepted-clause registry: this IS the per-user specification,
+            # and its root is bound into the state hash. One clause per
+            # (acceptor, target stream); accepting again replaces it.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_clauses_v1 (
+                    acceptor_pubkey TEXT NOT NULL,
+                    target_stream   INTEGER NOT NULL,
+                    clause_body     TEXT NOT NULL,
+                    PRIMARY KEY (acceptor_pubkey, target_stream)
+                );
+            ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -1156,7 +1195,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
     """
@@ -1262,6 +1301,95 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                     'INSERT INTO consensus_archival (update_id) VALUES (?)',
                     (uid,)
                 )
+
+            # Rule sharing, same full-replace semantics and same transaction as
+            # accounts. Both must be written here: the offer book and clause
+            # registry are bound into consensus_meta_hash, so a node whose
+            # in-memory managers disagree with disk computes a different state
+            # hash after a restart than a peer replaying from genesis.
+            if rule_offers is not None:
+                _db_conn.execute('DELETE FROM rule_offers_v1')
+                for offer in rule_offers:
+                    _db_conn.execute(
+                        'INSERT OR REPLACE INTO rule_offers_v1 '
+                        '(offer_id, offerer_pubkey, recipient_pubkey, rule_text, '
+                        'expire_at_height, status) VALUES (?, ?, ?, ?, ?, ?)',
+                        (
+                            offer['offer_id'],
+                            offer.get('offerer_pubkey', ''),
+                            offer.get('recipient_pubkey', ''),
+                            offer.get('rule_text', ''),
+                            int(offer.get('expire_at_height', 0)),
+                            offer.get('status', 'offered'),
+                        )
+                    )
+
+            if rule_clauses is not None:
+                _db_conn.execute('DELETE FROM rule_clauses_v1')
+                for clause in rule_clauses:
+                    _db_conn.execute(
+                        'INSERT OR REPLACE INTO rule_clauses_v1 '
+                        '(acceptor_pubkey, target_stream, clause_body) VALUES (?, ?, ?)',
+                        (
+                            clause['acceptor_pubkey'],
+                            int(clause['target_stream']),
+                            clause['clause_body'],
+                        )
+                    )
+
+            if max_rule_txs_per_block is not None:
+                # Governance-activated value; persisted verbatim so a reload
+                # reproduces the same per-block budget as a from-genesis replay.
+                _db_conn.execute(
+                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+                    ('max_rule_txs_per_block', str(int(max_rule_txs_per_block)))
+                )
+
+
+def load_rule_offers() -> List[Dict]:
+    """Rows of the persisted offer book, newest-status agnostic.
+
+    Deliberately a standalone loader rather than another element of
+    load_chain_state's already-wide tuple return.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT offer_id, offerer_pubkey, recipient_pubkey, rule_text, '
+            'expire_at_height, status FROM rule_offers_v1'
+        )
+        return [
+            {
+                'offer_id': row[0],
+                'offerer_pubkey': row[1],
+                'recipient_pubkey': row[2],
+                'rule_text': row[3],
+                'expire_at_height': int(row[4] or 0),
+                'status': row[5],
+            }
+            for row in cur.fetchall()
+        ]
+
+
+def load_rule_clauses() -> List[Dict]:
+    """Rows of the persisted accepted-clause registry."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT acceptor_pubkey, target_stream, clause_body FROM rule_clauses_v1'
+        )
+        return [
+            {
+                'acceptor_pubkey': row[0],
+                'target_stream': int(row[1]),
+                'clause_body': row[2],
+            }
+            for row in cur.fetchall()
+        ]
 
 def get_candidate_heads() -> List[tuple[str, int]]:
     """
