@@ -219,9 +219,12 @@ def test_accept_registers_the_clause_and_applies_the_composite():
     composites = [c for c in rule_calls if "i12" in c["rule_text"]]
     assert len(composites) == 1, [c["rule_text"] for c in rule_calls]
     composite = composites[0]
-    # Applied exactly like an op-"0" rule, so the rules handler persists it.
     assert composite["target_output_stream_index"] == 0
-    assert composite["apply_rules_update"] is True
+    # Fed to the interpreter but NOT accumulated: save_effective_tau_spec only
+    # dedups exact units, so appending would leave every earlier composite in
+    # place. The clause registry is the source of truth and chain_state's
+    # restore plan rebuilds the composite from it.
+    assert composite["apply_rules_update"] is False
     assert B in composite["rule_text"]
     assert "composite applied" in _logs(result)
 

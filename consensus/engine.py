@@ -144,7 +144,15 @@ def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict) -> Tuple[b
         output = tau_manager.communicate_with_tau(
             rule_text=composite,
             target_output_stream_index=0,
-            apply_rules_update=True,
+            # NOT accumulated: apply_rules_update=False feeds the interpreter
+            # but skips the rules handler, so the composite never enters the
+            # application-rules accumulation. save_effective_tau_spec only
+            # dedups EXACT units, so appending left every earlier composite in
+            # place -- several per stream, net effect dependent on replay order,
+            # and the spec growing with every acceptance. The clause registry is
+            # the consensus-bound source of truth and chain_state's restore plan
+            # rebuilds the composite from it.
+            apply_rules_update=False,
         )
     except Exception as exc:  # noqa: BLE001 - deliberately broad, see below
         # A deterministic parse/compile failure surfaces as an engine error in
@@ -1003,16 +1011,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         f"Error: composite rule rejected: {detail}"
                                     )
                                 else:
-                                    rules_text = chain_state.get_rules_state()
-                                    if isinstance(rules_text, str):
-                                        current_tau_bytes = rules_text.encode("utf-8")
-                                    else:
-                                        # Same fallback shape as the op-"0" path
-                                        # below: never leave current_tau_bytes
-                                        # behind the state the composite just
-                                        # established, or the block's state hash
-                                        # is computed against stale rules.
-                                        current_tau_bytes += composite.encode("utf-8")
+                                    # current_tau_bytes deliberately unchanged:
+                                    # the composite is not part of the
+                                    # application-rules accumulation. What binds
+                                    # it into the state hash is the clause
+                                    # registry root in consensus_meta.
                                     tx_receipt["logs"].append(
                                         f"Offer accepted, o{target_stream} composite applied: "
                                         + decision.offer_id_hex

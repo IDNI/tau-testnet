@@ -1340,7 +1340,45 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
             "persist": True,
         })
 
+    # Rule-sharing composites are DERIVED, never accumulated. The clause
+    # registry is the consensus-bound source of truth (rule_clauses_root), and
+    # the composite is a pure function of it, so it is rebuilt here instead of
+    # being appended to the application accumulation.
+    #
+    # Appending was tried first and is wrong: `save_effective_tau_spec` only
+    # dedups EXACT units, so every acceptance left the previous composite in
+    # place too. The stream then had several composites whose net effect
+    # depended on replay order, and the spec grew with every accept -- which
+    # feeds straight into the interpreter-rebuild cost.
+    if use_persisted_state:
+        for label, text in _rule_composite_plan_entries():
+            plan.append({"label": label, "text": text, "persist": False})
+
     return plan
+
+
+def _rule_composite_plan_entries() -> List[tuple]:
+    """(label, text) for one composite per output stream with accepted clauses.
+
+    Ordered by stream index so every node replays them identically.
+    """
+    from consensus.rule_offers import ALLOWED_TARGET_STREAMS
+
+    entries: List[tuple] = []
+    manager = getattr(_lifecycle_manager, "rule_offers", None)
+    if manager is None:
+        return entries
+    for stream in sorted(ALLOWED_TARGET_STREAMS):
+        try:
+            composite = manager.composite_for_stream(stream)
+        except Exception:
+            logger.warning(
+                "Could not compose the rule for o%s during restore", stream, exc_info=True
+            )
+            continue
+        if composite:
+            entries.append((f"rule_composite_o{stream}", composite))
+    return entries
 
 
 def replay_tau_restore_plan(plan: List[Dict[str, object]], *, source_prefix: str = "restore") -> bool:

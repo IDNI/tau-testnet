@@ -251,3 +251,65 @@ def test_every_commit_site_persists_rule_offers():
             f"chain_state.py:{call.lineno} omits {sorted(missing)} when persisting "
             "canonical state; a restart would rehydrate a stale rule-offer book"
         )
+
+
+def test_composites_are_derived_not_accumulated(temp_database):
+    """The application-rules accumulation must NOT grow with acceptances.
+
+    `save_effective_tau_spec` only dedups EXACT units, so appending each
+    regenerated composite left every earlier one in place: the stream ended up
+    with several composites whose net effect depended on replay order, and the
+    spec grew with every accept -- straight into the interpreter-rebuild cost.
+    A real-node run showed three composites for o5 after three acceptances.
+
+    The clause registry is the consensus-bound source of truth, so the composite
+    is rebuilt from it by the restore plan instead.
+    """
+    lm = _seed_state(ConsensusLifecycleManager(active_validators=[A]))
+    chain_state._application_rules_state = "always ( o1[t]:bv[24] = i1[t]:bv[24] )."
+    baseline_units = len(chain_state._application_rules_state.split("\n"))
+
+    for recipient, expire in ((B, 500), (C, 501)):
+        offer = _offer(recipient=recipient, expire=expire)
+        lm.rule_offers.submit_offer(offer)
+        lm.rule_offers.submit_decision(RuleOfferDecision(
+            offer_id=offer.offer_id, actor_pubkey=recipient, accept=True,
+            rule_text=BLOCK_RULE))
+
+    # Two acceptances, and the accumulation is untouched.
+    assert len(chain_state._application_rules_state.split("\n")) == baseline_units
+    assert "i12" not in chain_state._application_rules_state
+
+    # The restore plan supplies exactly ONE composite for the stream, carrying
+    # both acceptors.
+    plan = chain_state.get_tau_restore_plan()
+    composites = [e for e in plan if str(e["label"]).startswith("rule_composite_")]
+    assert len(composites) == 1, [e["label"] for e in plan]
+    assert composites[0]["label"] == f"rule_composite_o{TARGET}"
+    assert B in composites[0]["text"] and C in composites[0]["text"]
+    assert composites[0]["text"].count("always") == 1
+
+
+def test_no_composite_entry_when_nothing_is_accepted(temp_database):
+    lm = _seed_state(ConsensusLifecycleManager(active_validators=[A]))
+    plan = chain_state.get_tau_restore_plan()
+    assert not [e for e in plan if str(e["label"]).startswith("rule_composite_")]
+
+
+def test_derived_composite_survives_a_reload(temp_database):
+    """After a restart the composite must be rebuilt identically from the
+    persisted registry, since it is no longer stored as text anywhere."""
+    lm = _seed_state(ConsensusLifecycleManager(active_validators=[A]))
+    offer = _offer()
+    lm.rule_offers.submit_offer(offer)
+    lm.rule_offers.submit_decision(RuleOfferDecision(
+        offer_id=offer.offer_id, actor_pubkey=B, accept=True, rule_text=BLOCK_RULE))
+    before = [e["text"] for e in chain_state.get_tau_restore_plan()
+              if str(e["label"]).startswith("rule_composite_")]
+
+    reloaded = _reload()
+    after = [e["text"] for e in chain_state.get_tau_restore_plan()
+             if str(e["label"]).startswith("rule_composite_")]
+
+    assert before and after == before
+    assert reloaded.rule_offers.clause_for(B, TARGET) is not None
