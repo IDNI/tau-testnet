@@ -28,6 +28,13 @@ class TestInvalidRuleRegression(unittest.TestCase):
         # Don't leak the global readiness events into other tests.
         tau_manager.tau_ready.clear()
         tau_manager.tau_process_ready.clear()
+        # This test reloads commands.sendtx while sys.modules holds mocks for
+        # chain_state/db/py_ecc. patch.dict restores sys.modules on exit, but
+        # the already-reloaded module object keeps its bound MOCK references
+        # forever, so every later test that drives the real sendtx path saw a
+        # MagicMock chain_state (its balance check then raised TypeError).
+        # Reload once more, now against the real modules, to rebind them.
+        importlib.reload(commands.sendtx)
 
     def test_sendtx_with_invalid_rule_fails(self):
         # Mock dependencies that would otherwise trigger DB/Network/crypto work.

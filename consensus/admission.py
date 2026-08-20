@@ -439,7 +439,7 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
             f"{MAX_OFFER_RULE_BYTES} byte limit."
         )
 
-    next_height = tip_view.next_block_height()
+    next_height = tip_view.next_block_height
     if offer.expire_at_height <= next_height:
         return format_error(
             f"expire_at_height {offer.expire_at_height} must be beyond the next "
@@ -583,7 +583,7 @@ def validate_rule_offer_decision_payload(
     if row["recipient_pubkey"].lower() != decision.actor_pubkey:
         return format_error("Only the offer recipient may accept or reject it.")
 
-    next_height = tip_view.next_block_height()
+    next_height = tip_view.next_block_height
     if row["expire_at_height"] <= next_height:
         return format_error(
             f"Rule offer {offer_id_hex[:16]} expires at height "

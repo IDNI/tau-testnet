@@ -39,7 +39,8 @@ EXPIRE = 500
 def tip_view():
     view = MagicMock(spec=TipAdmissionView)
     view.active_validators = {A}
-    view.next_block_height.return_value = NEXT_HEIGHT
+    # A property on the real TipAdmissionView, not a method.
+    view.next_block_height = NEXT_HEIGHT
     view.eligibility_mode = ""
     view.get_offer_lifecycle_state.return_value = None
     view.get_offer.return_value = None
