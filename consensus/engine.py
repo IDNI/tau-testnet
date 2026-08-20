@@ -1006,6 +1006,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     rules_text = chain_state.get_rules_state()
                                     if isinstance(rules_text, str):
                                         current_tau_bytes = rules_text.encode("utf-8")
+                                    else:
+                                        # Same fallback shape as the op-"0" path
+                                        # below: never leave current_tau_bytes
+                                        # behind the state the composite just
+                                        # established, or the block's state hash
+                                        # is computed against stale rules.
+                                        current_tau_bytes += composite.encode("utf-8")
                                     tx_receipt["logs"].append(
                                         f"Offer accepted, o{target_stream} composite applied: "
                                         + decision.offer_id_hex
