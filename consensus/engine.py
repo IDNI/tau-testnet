@@ -10,7 +10,11 @@ import tau_defs
 from .tau_engine import TauEngine, TauExecutionResult, TauStateSnapshot
 from .serialization import canonical_json, canonicalize_parent_hash_yid, canonicalize_proposer_yid
 from .state import StateStore, compute_state_hash
-from .governance import normalize_validator_set, is_tau_authoritative_eligibility_mode
+from .governance import (
+    DEFAULT_MAX_RULE_TXS_PER_BLOCK,
+    normalize_validator_set,
+    is_tau_authoritative_eligibility_mode,
+)
 from . import fees
 from .fees import FeeRuleError
 from .rule_offers import (
@@ -256,11 +260,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # APPLICATION accumulation. Using tau_bytes here meant every non-governance
         # block wrote the application spec into consensus_rules_state, which then
         # failed to parse when replayed via i0 on restart ("Unexpected 'a'").
+        # The per-block rule budget travels on the view so proposer and
+        # verifier read one authority -- the same governance-patchable value
+        # that is bound into consensus_meta_hash.
+        rule_tx_budget = getattr(lm, "max_rule_txs_per_block", None)
+        if isinstance(rule_tx_budget, bool) or not isinstance(rule_tx_budget, int):
+            rule_tx_budget = DEFAULT_MAX_RULE_TXS_PER_BLOCK
         return ActiveConsensusView(
             target_height=target_height,
             consensus_rules=str(parent_snapshot.metadata.get("consensus_rules_state", "") or ""),
             active_validators=[bytes.fromhex(v) for v in validator_hexes],
-            mechanism_specific_metadata={"poa": mode != "stake", "eligibility_mode": mode},
+            mechanism_specific_metadata={
+                "poa": mode != "stake",
+                "eligibility_mode": mode,
+                "max_rule_txs_per_block": rule_tx_budget,
+            },
             parent_balances=parent_snapshot.metadata.get("balances"),
         )
 
@@ -273,6 +287,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
     def _view_eligibility_mode(active_view) -> str:
         meta = getattr(active_view, "mechanism_specific_metadata", None) or {}
         return meta.get("eligibility_mode") or "validator_set"
+
+    @staticmethod
+    def _view_rule_tx_budget(active_view) -> Optional[int]:
+        """Per-block rule-transaction ceiling carried by the active view.
+
+        Sourced from consensus_meta.mechanism_specific_metadata, which is the
+        same place the governance-patchable value is bound into the state hash,
+        so proposer and verifier read one authority. Absent means the default
+        is in force; a non-integer means the view predates the field and the
+        check is skipped rather than failing every block closed.
+        """
+        meta = getattr(active_view, "mechanism_specific_metadata", None) or {}
+        if "max_rule_txs_per_block" not in meta:
+            return DEFAULT_MAX_RULE_TXS_PER_BLOCK
+        value = meta.get("max_rule_txs_per_block")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            return None
+        return value
 
     def verify_block_header(self, *args, **kwargs) -> bool:
         """
@@ -324,6 +356,31 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         if block and not block.consensus_proof:
             logger.warning("Consensus: Block #%s has no consensus proof", block.header.block_number)
             return False
+
+        # Per-block rule-transaction budget. Applying a rule regenerates and
+        # recompiles a composite, whose cost climbs steeply with specification
+        # complexity; without a ceiling a proposer could author a block that
+        # every validator times out on (COMM_TIMEOUT, then a watchdog kill).
+        # This is consensus, not policy: over-budget blocks are invalid.
+        #
+        # Counts ONLY the rule-sharing types. Legacy operations["0"] user_tx
+        # rules are deliberately excluded, because existing chains may already
+        # contain blocks carrying many of them and counting those would break
+        # replay of history. That flood vector is pre-existing and separate.
+        if block is not None and active_view is not None:
+            budget = self._view_rule_tx_budget(active_view)
+            if budget is not None:
+                rule_txs = sum(
+                    1 for tx in (getattr(block, "transactions", None) or [])
+                    if isinstance(tx, dict) and tx.get("tx_type") in RULE_OFFER_TX_TYPES
+                )
+                if rule_txs > budget:
+                    logger.warning(
+                        "Consensus: block #%s carries %d rule txs, over the "
+                        "per-block budget of %d",
+                        getattr(block.header, "block_number", "?"), rule_txs, budget,
+                    )
+                    return False
 
         if not tau_manager.tau_ready.is_set():
             logger.error("Consensus: Tau not ready for block verification.")

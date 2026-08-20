@@ -517,6 +517,22 @@ def get_text_by_id(yid: str) -> str:
         else:
             raise KeyError(f"No text found for Tau ID: {yid}")
 
+def _slow_lane_cap(total_cap: int) -> int:
+    """How many pending slow-lane transactions the mempool will hold.
+
+    A fraction of the total cap rather than an absolute count, so it tracks
+    however the operator sized the mempool. At least 1, so the slow lane is
+    never completely closed.
+    """
+    fraction = getattr(config, "MEMPOOL_RULE_LANE_MAX_FRACTION", 0.1)
+    try:
+        fraction = float(fraction)
+    except (TypeError, ValueError):
+        fraction = 0.1
+    fraction = min(max(fraction, 0.0), 1.0)
+    return max(1, int(total_cap * fraction))
+
+
 def _sender_of_payload(payload: str) -> Optional[str]:
     """Sender public key from a mempool payload, or None if unreadable."""
     try:
@@ -617,22 +633,58 @@ def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
         # Count pending-only (matching count_mempool_txs / the soft sendtx pre-check) so the
         # configured limit means the same thing on both the soft and hard paths.
         cap = _configured_mempool_max()
+        def _evict(overflow: int, lane: Optional[int]) -> None:
+            """Drop `overflow` oldest pending rows, optionally within one lane."""
+            if overflow <= 0:
+                return
+            lane_clause = "" if lane is None else " AND lane = ?"
+            params = (lane, overflow) if lane is not None else (overflow,)
+            evicted_hashes = [
+                r[0] for r in cur.execute(
+                    "SELECT tx_hash FROM mempool WHERE status='pending'"
+                    + lane_clause + " ORDER BY received_at ASC LIMIT ?",
+                    params,
+                ).fetchall()
+            ]
+            if not evicted_hashes:
+                return
+            cur.execute(
+                "DELETE FROM mempool WHERE id IN ("
+                "SELECT id FROM mempool WHERE status='pending'" + lane_clause
+                + " ORDER BY received_at ASC LIMIT ?)",
+                params,
+            )
+            _record_dropped_locked(cur, evicted_hashes, "evicted", now_ms)
+
+        # Quota-first eviction. The slow lane gets a bounded share of the
+        # mempool, and overflow inside it is evicted from ITS OWN rows. Plain
+        # global FIFO would let a burst of rule transactions evict queued,
+        # fee-paying transfers -- the exact starvation the lanes exist to
+        # prevent.
+        slow_cap = _slow_lane_cap(cap)
+        slow_pending = cur.execute(
+            "SELECT COUNT(*) FROM mempool WHERE status='pending' AND lane = ?",
+            (LANE_SLOW,),
+        ).fetchone()[0]
+        if row_lane == LANE_SLOW and slow_pending >= slow_cap:
+            _evict(slow_pending - slow_cap + 1, LANE_SLOW)
+        elif slow_pending > slow_cap:
+            # Cap lowered under an existing backlog: trim it before considering
+            # the global cap, so the slow lane cannot hold the fast lane out.
+            _evict(slow_pending - slow_cap, LANE_SLOW)
+
         pending = cur.execute("SELECT COUNT(*) FROM mempool WHERE status='pending'").fetchone()[0]
         if pending >= cap:
             overflow = pending - cap + 1
-            evicted_hashes = [
-                r[0] for r in cur.execute(
-                    "SELECT tx_hash FROM mempool WHERE status='pending' "
-                    "ORDER BY received_at ASC LIMIT ?",
-                    (overflow,),
-                ).fetchall()
-            ]
-            cur.execute(
-                "DELETE FROM mempool WHERE id IN ("
-                "SELECT id FROM mempool WHERE status='pending' ORDER BY received_at ASC LIMIT ?)",
-                (overflow,),
-            )
-            _record_dropped_locked(cur, evicted_hashes, "evicted", now_ms)
+            # Prefer trimming the slow lane if it is over quota; otherwise fall
+            # back to global oldest-first, matching the historical behaviour.
+            slow_pending = cur.execute(
+                "SELECT COUNT(*) FROM mempool WHERE status='pending' AND lane = ?",
+                (LANE_SLOW,),
+            ).fetchone()[0]
+            slow_excess = min(overflow, max(0, slow_pending - slow_cap))
+            _evict(slow_excess, LANE_SLOW)
+            _evict(overflow - slow_excess, None)
 
         # Idempotency: INSERT OR IGNORE
         cur.execute('''
@@ -663,10 +715,25 @@ def get_pending_sequence(sender_pubkey: str) -> Optional[int]:
     max_seq = None
     with _db_lock:
         cur = _db_conn.cursor()
-        # Only check 'pending' or 'reserved' (not yet mined) transactions
-        cur.execute('SELECT payload FROM mempool')
-        
-        for (payload,) in cur.fetchall():
+        # Narrowed by the indexed sender_pubkey column instead of scanning the
+        # whole table and json.loads-ing every row. That scan ran once per
+        # sendtx while holding the single global DB lock, and cost tens of
+        # milliseconds at a full mempool -- more with large rule payloads.
+        #
+        # Rows written before the column existed have it NULL; they are picked
+        # up by the fallback below so the answer stays correct on an upgraded
+        # database whose backfill could not run.
+        rows = cur.execute(
+            'SELECT payload FROM mempool WHERE sender_pubkey = ?',
+            (sender_pubkey,),
+        ).fetchall()
+        legacy = cur.execute(
+            'SELECT payload FROM mempool WHERE sender_pubkey IS NULL'
+        ).fetchall()
+
+        # Deliberately covers every status: a tx already reserved for a block,
+        # or awaiting validation, still owns its sequence number.
+        for (payload,) in list(rows) + list(legacy):
             try:
                 data = json.loads(payload)
                 if data.get('sender_pubkey') == sender_pubkey:
@@ -676,8 +743,38 @@ def get_pending_sequence(sender_pubkey: str) -> Optional[int]:
                             max_seq = seq
             except Exception:
                 continue
-                
+
     return max_seq
+
+
+def get_min_pending_sequence(sender_pubkey: str) -> Optional[int]:
+    """Lowest sequence number this sender has waiting in the mempool.
+
+    Used by the block builder to detect a sequence GAP: lane quotas can leave a
+    sender's lower-numbered transaction behind while including a higher one,
+    which the engine then hard-rejects for a sequence mismatch.
+    """
+    if _db_conn is None:
+        init_db()
+
+    min_seq = None
+    with _db_lock:
+        cur = _db_conn.cursor()
+        rows = cur.execute(
+            'SELECT payload FROM mempool WHERE sender_pubkey = ? OR sender_pubkey IS NULL',
+            (sender_pubkey,),
+        ).fetchall()
+        for (payload,) in rows:
+            try:
+                data = json.loads(payload)
+                if data.get('sender_pubkey') != sender_pubkey:
+                    continue
+                seq = data.get('sequence_number')
+                if isinstance(seq, int) and (min_seq is None or seq < min_seq):
+                    min_seq = seq
+            except Exception:
+                continue
+    return min_seq
 
 # --- Dropped-tx audit (issue #11: gettxstatus) ---
 _DROPPED_TTL_MS = 24 * 60 * 60 * 1000  # keep drop records ~24h
@@ -917,12 +1014,25 @@ def get_mempool_entries() -> List[Dict]:
             for row in cur.fetchall()
         ]
 
-def reserve_mempool_txs(limit: int = 1000, max_age_seconds: int = 60) -> List[Dict]:
+def reserve_mempool_txs(limit: int = 1000, max_age_seconds: int = 60,
+                        slow_limit: int | None = None) -> List[Dict]:
     """
-    Selects pending transactions from the mempool (FIFO by received_at)
-    AND releases stale reservations (older than max_age_seconds).
-    
-    Returns a list of dicts: {'id': int, 'tx_hash': str, 'payload': str}
+    Selects pending transactions from the mempool AND releases stale
+    reservations (older than max_age_seconds).
+
+    Selection is LANE-AWARE. The fast lane (coin transfers) is filled first,
+    then the slow lane (rule-bearing transactions) up to `slow_limit`. Without
+    a quota a burst of rule work occupies the whole block and every queued
+    transfer waits for it -- and fee priority cannot fix that, because a rule
+    emits its own o8 user fee and can therefore price itself to the front of
+    the queue. Ordering WITHIN each lane is unchanged, so the existing
+    determinism and fee-priority properties still hold.
+
+    `slow_limit=None` means no cap, preserving the pre-lane behaviour for
+    callers that have no per-block budget of their own.
+
+    Returns a list of dicts: {'id': int, 'tx_hash': str, 'payload': str},
+    fast-lane rows first, at most `limit` in total.
     """
     import uuid
     import time
@@ -949,18 +1059,36 @@ def reserve_mempool_txs(limit: int = 1000, max_age_seconds: int = 60) -> List[Di
         if released > 0:
             logger.info("Released %s stale mempool reservations", released)
 
-        # 2. Select pending
+        # 2. Select pending, fast lane first.
         # Fee priority: highest admission-time fee estimate first (declared
         # fee_limit alone is free to inflate, so it only tie-breaks), then
         # arrival order, then id for full determinism.
-        cur.execute('''
-            SELECT id, tx_hash, payload FROM mempool
-            WHERE status = 'pending'
-            ORDER BY estimated_fee DESC, fee_limit DESC, received_at ASC, id ASC
-            LIMIT ?
-        ''', (limit,))
-        rows = cur.fetchall()
-        
+        _LANE_ORDER = (
+            "ORDER BY estimated_fee DESC, fee_limit DESC, received_at ASC, id ASC"
+        )
+
+        def _select(lane: int, count: int):
+            if count <= 0:
+                return []
+            return cur.execute(
+                "SELECT id, tx_hash, payload FROM mempool "
+                "WHERE status = 'pending' AND lane = ? " + _LANE_ORDER + " LIMIT ?",
+                (lane, count),
+            ).fetchall()
+
+        fast_rows = _select(LANE_FAST, limit)
+        slow_budget = limit - len(fast_rows)
+        if slow_limit is not None:
+            slow_budget = min(slow_budget, int(slow_limit))
+        slow_rows = _select(LANE_SLOW, slow_budget)
+
+        # Fast lane first so the block body puts transfers ahead of rule work.
+        # Selection is proposer-local policy -- validators replay the stored
+        # body order -- so this cannot fork; it is the same kind of choice as
+        # fee ordering. commands/createblock then restores per-sender sequence
+        # order within the slots each sender occupies.
+        rows = list(fast_rows) + list(slow_rows)
+
         if not rows:
             return []
             

@@ -177,6 +177,16 @@ class AuthoritySettings:
     # validators mine via the internal SoleMiner loop, never via remote RPC).
     allow_remote_createblock: bool = False
     max_mempool_txs: int = 5000
+    # Share of the mempool the slow (rule-bearing) lane may occupy. Bounds how
+    # much of the queue rule work can hold, so a burst of it cannot crowd out
+    # fee-paying transfers. Node-local policy: it affects which transactions
+    # this node keeps, never whether a block is valid.
+    mempool_rule_lane_max_fraction: float = 0.1
+    # Rule-bearing transactions the block builder will pack. Only a proposer
+    # hint -- the consensus-enforced ceiling is the governance-patchable
+    # max_rule_txs_per_block bound into the state hash. Kept separate so an
+    # operator can be more conservative than consensus requires.
+    block_max_rule_txs: int = 8
     # Credit unseen accounts with this balance on first use (testnet convenience).
     auto_faucet: bool = True
     auto_faucet_amount: int = 100000
@@ -345,6 +355,8 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_CONN_GRACE_PERIOD": ("network", "conn_grace_period", float),
     "TAU_MAX_CONNECTIONS": ("network", "max_connections", int),
     "TAU_MAX_MEMPOOL_TXS": ("authority", "max_mempool_txs", int),
+    "TAU_MEMPOOL_RULE_LANE_MAX_FRACTION": ("authority", "mempool_rule_lane_max_fraction", float),
+    "TAU_BLOCK_MAX_RULE_TXS": ("authority", "block_max_rule_txs", int),
     "TAU_RATE_LIMIT_PER_PEER": ("network", "rate_limit_per_peer", float),
     "TAU_BURST_PER_PEER": ("network", "burst_per_peer", float),
     "TAU_DHT_TTL": ("dht", "record_ttl", int),
@@ -551,7 +563,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     global LOGGING
     global MINER_PUBKEY, MINER_PUBKEYS, MINER_PRIVKEY, BLOCK_SIGNATURE_SCHEME, STATE_LOCATOR_NAMESPACE
     global OPEN_GOVERNANCE_ADMISSION
-    global MAX_MEMPOOL_TXS
+    global MAX_MEMPOOL_TXS, MEMPOOL_RULE_LANE_MAX_FRACTION, BLOCK_MAX_RULE_TXS
     global TESTNET_AUTO_FAUCET, TESTNET_AUTO_FAUCET_AMOUNT
 
     HOST = current.server.host
@@ -590,6 +602,8 @@ def _sync_legacy_exports(current: Settings) -> None:
     STATE_LOCATOR_NAMESPACE = current.authority.state_locator_namespace
     OPEN_GOVERNANCE_ADMISSION = current.authority.open_governance_admission
     MAX_MEMPOOL_TXS = current.authority.max_mempool_txs
+    MEMPOOL_RULE_LANE_MAX_FRACTION = current.authority.mempool_rule_lane_max_fraction
+    BLOCK_MAX_RULE_TXS = current.authority.block_max_rule_txs
     TESTNET_AUTO_FAUCET = current.authority.auto_faucet
     TESTNET_AUTO_FAUCET_AMOUNT = current.authority.auto_faucet_amount
 
@@ -657,6 +671,8 @@ __all__ = [
     "STATE_LOCATOR_NAMESPACE",
     "OPEN_GOVERNANCE_ADMISSION",
     "MAX_MEMPOOL_TXS",
+    "MEMPOOL_RULE_LANE_MAX_FRACTION",
+    "BLOCK_MAX_RULE_TXS",
     "TESTNET_AUTO_FAUCET",
     "TESTNET_AUTO_FAUCET_AMOUNT",
     "MAX_BLOCK_FUTURE_DRIFT_SECONDS",
