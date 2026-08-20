@@ -28,6 +28,17 @@ from .libp2p_compat import apply_quic_cleanup_shim  # noqa: E402
 
 apply_quic_cleanup_shim()
 
+# Transaction types a mempool snapshot will replay to a newly connected peer.
+_SNAPSHOT_TX_TYPES = frozenset({
+    "user_tx",
+    "consensus_rule_update",
+    "consensus_rule_vote",
+    "rule_offer",
+    "rule_offer_accept",
+    "rule_offer_reject",
+})
+
+
 class NetworkService:
     def __init__(
         self,
@@ -455,6 +466,7 @@ class NetworkService:
             TAU_MEMPOOL_SNAPSHOT_MAX_TOTAL,
             TAU_MEMPOOL_SNAPSHOT_MAX_UPDATES,
             TAU_MEMPOOL_SNAPSHOT_MAX_VOTES,
+            TAU_MEMPOOL_SNAPSHOT_MAX_RULE_TXS,
             TAU_GOSSIP_MAX_RAW_TX_BYTES
         )
         try:
@@ -464,7 +476,8 @@ class NetworkService:
             updates_count = 0
             votes_count = 0
             total_count = 0
-            
+            rule_txs_count = 0
+
             for tx in txs:
                 if total_count >= TAU_MEMPOOL_SNAPSHOT_MAX_TOTAL:
                     break
@@ -482,22 +495,25 @@ class NetworkService:
                 tx_type = m.group(1) if m else "user_tx"
                 
                 # Legacy / Invalid drops
-                if tx_type in ("consensus_proposal", "consensus_vote") or tx_type not in ("user_tx", "consensus_rule_update", "consensus_rule_vote"):
+                if tx_type in ("consensus_proposal", "consensus_vote") or tx_type not in _SNAPSHOT_TX_TYPES:
                     continue
-                    
+
                 # 3. Typified restrictions
                 if tx_type == "consensus_rule_update":
                     if updates_count >= TAU_MEMPOOL_SNAPSHOT_MAX_UPDATES:
                         continue
                     updates_count += 1
-                    topic = TAU_GOSSIP_TOPIC_GOVERNANCE
                 elif tx_type == "consensus_rule_vote":
                     if votes_count >= TAU_MEMPOOL_SNAPSHOT_MAX_VOTES:
                         continue
                     votes_count += 1
-                    topic = TAU_GOSSIP_TOPIC_GOVERNANCE
-                else:
-                    topic = TAU_GOSSIP_TOPIC_TRANSACTIONS
+                elif tx_type in ("rule_offer", "rule_offer_accept", "rule_offer_reject"):
+                    # Sub-quota so a rule backlog cannot become the whole
+                    # snapshot a peer receives on connect.
+                    if rule_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_RULE_TXS:
+                        continue
+                    rule_txs_count += 1
+                topic = self.topic_for_tx_type(tx_type)
                     
                 # 4. Optional partial decode
                 try:
@@ -521,12 +537,14 @@ class NetworkService:
         from .protocols import (
             TAU_GOSSIP_TOPIC_TRANSACTIONS,
             TAU_GOSSIP_TOPIC_GOVERNANCE,
+            TAU_GOSSIP_TOPIC_RULES,
             TAU_GOSSIP_TOPIC_BLOCKS,
             TAU_GOSSIP_TOPIC_PEERS,
         )
         # Track our interests so we can forward them on connect.
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_TRANSACTIONS, self._on_transaction_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_GOVERNANCE, self._on_governance_gossip)
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_RULES, self._on_rule_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PEERS, self._on_peer_advertisement)
 
@@ -686,6 +704,22 @@ class NetworkService:
             }
         )
 
+    async def _on_rule_gossip(self, envelope: Dict[str, Any]) -> None:
+        from .protocols import (
+            TAU_MAX_RULE_OFFER_ACCEPT_BYTES,
+            TAU_MAX_RULE_OFFER_BYTES,
+            TAU_MAX_RULE_OFFER_REJECT_BYTES,
+        )
+        await self._process_gossip_payload(
+            envelope,
+            allowed_types={"rule_offer", "rule_offer_accept", "rule_offer_reject"},
+            type_limits={
+                "rule_offer": TAU_MAX_RULE_OFFER_BYTES,
+                "rule_offer_accept": TAU_MAX_RULE_OFFER_ACCEPT_BYTES,
+                "rule_offer_reject": TAU_MAX_RULE_OFFER_REJECT_BYTES,
+            },
+        )
+
     async def _process_gossip_payload(self, envelope: Dict[str, Any], allowed_types: set, type_limits: dict) -> None:
         import json
         from .protocols import TAU_GOSSIP_MAX_RAW_TX_BYTES
@@ -716,7 +750,7 @@ class NetworkService:
             tx_type = m.group(1)
             
         # Network Edge: explicit drop of legacy/unknown objects globally 
-        if tx_type in ("consensus_proposal", "consensus_vote") or tx_type not in ("user_tx", "consensus_rule_update", "consensus_rule_vote"):
+        if tx_type in ("consensus_proposal", "consensus_vote") or tx_type not in _SNAPSHOT_TX_TYPES:
             logger.debug("Gossip payload rejected: legacy or unknown tx_type '%s'", tx_type)
             return
             
@@ -748,7 +782,21 @@ class NetworkService:
             if p_dict.get("approve") is False:
                 logger.debug("Gossip rejected: consensus_rule_vote approve attribute must be true")
                 return
-                
+        elif tx_type == "rule_offer":
+            if not all(k in p_dict for k in ("recipient_pubkey", "rule_text", "expire_at_height")):
+                logger.debug("Gossip rejected: rule_offer missing required structural fields")
+                return
+        elif tx_type == "rule_offer_accept":
+            # The text is required: apply recomputes the offer digest from the
+            # accept's own copy, so an accept without it can never be applied.
+            if "offer_id" not in p_dict or "rule_text" not in p_dict:
+                logger.debug("Gossip rejected: rule_offer_accept missing required structural fields")
+                return
+        elif tx_type == "rule_offer_reject":
+            if "offer_id" not in p_dict:
+                logger.debug("Gossip rejected: rule_offer_reject missing offer_id")
+                return
+
         try:
             # Offloaded to a worker thread: _queue_tx runs the full synchronous
             # admission path, which takes the process-global Tau lock and, for
@@ -1292,9 +1340,31 @@ class NetworkService:
             await self._ensure_peer_route(peer)
         return await self._gossip_manager.publish(topic, payload, **kwargs)
 
+    @staticmethod
+    def topic_for_tx_type(tx_type: Optional[str]) -> str:
+        """Gossip topic a transaction type belongs on.
+
+        Each topic's handler enforces its own allow-list, so publishing to the
+        wrong one silently drops the transaction at every peer. That is exactly
+        what used to happen to consensus_rule_vote: only consensus_rule_update
+        was routed to the governance topic, so votes went out on
+        tau/transactions, whose handler accepts user_tx alone. They propagated
+        only via the mempool snapshot on a new connection.
+        """
+        from .protocols import (
+            TAU_GOSSIP_TOPIC_GOVERNANCE,
+            TAU_GOSSIP_TOPIC_RULES,
+            TAU_GOSSIP_TOPIC_TRANSACTIONS,
+        )
+        if tx_type in ("consensus_rule_update", "consensus_rule_vote"):
+            return TAU_GOSSIP_TOPIC_GOVERNANCE
+        if tx_type in ("rule_offer", "rule_offer_accept", "rule_offer_reject"):
+            return TAU_GOSSIP_TOPIC_RULES
+        return TAU_GOSSIP_TOPIC_TRANSACTIONS
+
     def broadcast_transaction(self, payload: str, message_id: str) -> None:
         """Thread-safe helper to broadcast a transaction envelope over gossip."""
-        from .protocols import TAU_GOSSIP_TOPIC_TRANSACTIONS, TAU_GOSSIP_TOPIC_GOVERNANCE
+        from .protocols import TAU_GOSSIP_TOPIC_TRANSACTIONS
         import json
 
         if not self._nursery:
@@ -1303,8 +1373,7 @@ class NetworkService:
         topic = TAU_GOSSIP_TOPIC_TRANSACTIONS
         try:
             p_dict = json.loads(payload)
-            if p_dict.get("tx_type") == "consensus_rule_update":
-                topic = TAU_GOSSIP_TOPIC_GOVERNANCE
+            topic = self.topic_for_tx_type(p_dict.get("tx_type"))
         except Exception:
             pass
 
@@ -1324,7 +1393,11 @@ class NetworkService:
                 pass
 
         try:
-            self._nursery.start_soon(self._gossip_manager.publish, TAU_GOSSIP_TOPIC_TRANSACTIONS, payload, message_id)
+            # `topic`, not the transactions topic: this fallback used to publish
+            # everything to tau/transactions regardless of the routing decided
+            # above, so any non-user_tx taking this path was dropped by every
+            # peer's handler.
+            self._nursery.start_soon(self._gossip_manager.publish, topic, payload, message_id)
         except Exception:
             pass
 

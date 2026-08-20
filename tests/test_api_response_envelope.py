@@ -194,6 +194,10 @@ class TestRegisteredHandlersHaveExecute(unittest.TestCase):
             gettaustate,
             gettimestamp,
             getupdateid,
+            getofferid,
+            getruleoffers,
+            getruleoffer,
+            getruleconflict,
             history,
             sendtx,
         )
@@ -211,6 +215,10 @@ class TestRegisteredHandlersHaveExecute(unittest.TestCase):
             "gettaustate": gettaustate,
             "getgovernance": getgovernance,
             "getupdateid": getupdateid,
+            "getofferid": getofferid,
+            "getruleoffers": getruleoffers,
+            "getruleoffer": getruleoffer,
+            "getruleconflict": getruleconflict,
         }
         for name, handler in registered.items():
             self.assertTrue(

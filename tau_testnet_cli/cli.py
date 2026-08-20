@@ -633,6 +633,218 @@ def cmd_gov_vote(args: argparse.Namespace) -> int:
     return EXIT_APP_ERROR if rpc_mod.is_error_response(response) else EXIT_OK
 
 
+# --------------------------------------------------------------------------- #
+# Rule sharing handlers
+# --------------------------------------------------------------------------- #
+
+
+def _read_rule_text(args: argparse.Namespace) -> str:
+    """Rule text from --rule or --rule-file.
+
+    Read verbatim: an accept must repeat the offered text byte-for-byte because
+    the node recomputes the offer id from it, so no reformatting happens here.
+    """
+    if getattr(args, "rule", None):
+        return args.rule
+    path = getattr(args, "rule_file", None)
+    if not path:
+        raise _PayloadError("one of --rule or --rule-file is required")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise _PayloadError(f"cannot read {path}: {exc}") from exc
+
+
+def _submit_rule_tx(args: argparse.Namespace, build) -> int:
+    """Shared build -> sign -> submit path for the three rule-sharing types."""
+    try:
+        sk_int, sender_pubkey = _resolve_signing_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+
+    try:
+        sequence_number = tx_mod.get_sequence(
+            sender_pubkey, host=args.host, port=args.port, timeout=args.timeout
+        )
+    except RuntimeError as exc:
+        print_error(str(exc))
+        return EXIT_APP_ERROR
+
+    try:
+        payload = build(sender_pubkey, sequence_number)
+    except (_PayloadError, ValueError) as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+
+    tx_mod.sign_tx(payload, sk_int)
+    response = tx_mod.submit_tx(
+        payload, host=args.host, port=args.port, timeout=args.timeout
+    )
+    if args.json:
+        print_result(
+            {"submitted": payload, "response": parse_json_response(response)},
+            json_mode=True,
+        )
+    else:
+        print(response)
+    return EXIT_APP_ERROR if rpc_mod.is_error_response(response) else EXIT_OK
+
+
+def cmd_rule_offer(args: argparse.Namespace) -> int:
+    try:
+        rule_text = _read_rule_text(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+
+    expire_at = args.expire_at_height
+    if expire_at is None:
+        # Resolve --expire-in against the node's current height so the caller
+        # does not have to look the tip up first.
+        response = _send(args, "getblocks")
+        try:
+            blocks = parse_json_response(response)["data"]["blocks"]
+            tip = max(int(b["header"]["block_number"]) for b in blocks)
+        except Exception:
+            print_error(
+                "could not determine chain height; pass --expire-at-height explicitly"
+            )
+            return EXIT_APP_ERROR
+        expire_at = tip + 1 + int(args.expire_in)
+
+    return _submit_rule_tx(
+        args,
+        lambda pubkey, seq: tx_mod.build_rule_offer_tx(
+            sender_pubkey=pubkey,
+            sequence_number=seq,
+            expiration_time=int(_now()) + args.expiry,
+            recipient_pubkey=args.to,
+            rule_text=rule_text,
+            expire_at_height=expire_at,
+            fee_limit=args.fee,
+        ),
+    )
+
+
+def cmd_rule_list(args: argparse.Namespace) -> int:
+    address = args.address
+    if not address:
+        try:
+            _sk, address = _resolve_signing_key(args)
+        except _PayloadError as exc:
+            print_error(str(exc))
+            return EXIT_LOCAL
+    role = getattr(args, "role", "all")
+    return _simple_query(args, f"getruleoffers {address} {role}")
+
+
+def cmd_rule_show(args: argparse.Namespace) -> int:
+    return _simple_query(args, f"getruleoffer {args.offer_id}")
+
+
+def cmd_rule_check(args: argparse.Namespace) -> int:
+    return _simple_query(args, f"getruleconflict {args.offer_id}")
+
+
+def cmd_rule_accept(args: argparse.Namespace) -> int:
+    """Accept an offer, after showing its conflict report.
+
+    The rule text is fetched from the node rather than retyped, so the accept
+    carries the offered bytes exactly; the node recomputes the offer digest from
+    them and refuses anything that does not match.
+    """
+    detail_raw = _send(args, f"getruleoffer {args.offer_id}")
+    if rpc_mod.is_error_response(detail_raw):
+        print(detail_raw)
+        return EXIT_APP_ERROR
+    try:
+        offer = parse_json_response(detail_raw)["data"]
+        rule_text = offer["rule_text"]
+    except Exception:
+        print_error("node returned an unreadable offer")
+        return EXIT_APP_ERROR
+    if not rule_text:
+        print_error(
+            "this node no longer has the offer text (it is node-local); accept "
+            "from a node that does, or pass --rule-file with the exact bytes"
+        )
+        return EXIT_APP_ERROR
+
+    if getattr(args, "rule_file", None):
+        try:
+            rule_text = _read_rule_text(args)
+        except _PayloadError as exc:
+            print_error(str(exc))
+            return EXIT_LOCAL
+
+    verdict = None
+    conflict_raw = _send(args, f"getruleconflict {args.offer_id}")
+    if not rpc_mod.is_error_response(conflict_raw):
+        try:
+            report = parse_json_response(conflict_raw)["data"]
+            verdict = report.get("verdict")
+            if not args.json:
+                print(f"conflict check: {verdict}")
+                for layer in report.get("layers", []):
+                    line = f"  {layer['layer']}: {layer['status']}"
+                    if layer.get("detail"):
+                        line += f" -- {layer['detail']}"
+                    print(line)
+        except Exception:
+            verdict = None
+
+    if verdict in ("warn", "conflict") and not args.yes:
+        print_error(
+            f"conflict check returned '{verdict}'; re-run with --yes to accept anyway"
+        )
+        return EXIT_APP_ERROR
+
+    return _submit_rule_tx(
+        args,
+        lambda pubkey, seq: tx_mod.build_rule_offer_accept_tx(
+            sender_pubkey=pubkey,
+            sequence_number=seq,
+            expiration_time=int(_now()) + args.expiry,
+            offer_id=args.offer_id,
+            rule_text=rule_text,
+            fee_limit=args.fee,
+        ),
+    )
+
+
+def cmd_rule_reject(args: argparse.Namespace) -> int:
+    return _submit_rule_tx(
+        args,
+        lambda pubkey, seq: tx_mod.build_rule_offer_reject_tx(
+            sender_pubkey=pubkey,
+            sequence_number=seq,
+            expiration_time=int(_now()) + args.expiry,
+            offer_id=args.offer_id,
+            fee_limit=args.fee,
+        ),
+    )
+
+
+def cmd_rule_offer_id(args: argparse.Namespace) -> int:
+    import json as _json
+
+    try:
+        rule_text = _read_rule_text(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    payload = {
+        "sender_pubkey": args.from_pubkey,
+        "recipient_pubkey": args.to,
+        "rule_text": rule_text,
+        "expire_at_height": args.expire_at_height,
+    }
+    blob = _json.dumps(payload, separators=(",", ":"))
+    return _simple_query(args, f"getofferid '{blob}'")
+
+
 def _now() -> float:
     import time
 
@@ -968,6 +1180,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_keys_subparsers(sub)
     _add_tx_subparsers(sub)
     _add_gov_subparsers(sub)
+    _add_rule_subparsers(sub)
     _add_node_subparsers(sub)
 
     return parser
@@ -1247,6 +1460,123 @@ def _add_tx_subparsers(sub) -> None:
     )
     p_ru.add_argument("--file", required=True, help="Path to the signed JSON payload")
     p_ru.set_defaults(func=cmd_tx_raw_submit)
+
+
+def _add_rule_subparsers(sub) -> None:
+    """`tau-testnet rule ...` -- send, review, accept or reject shared rules."""
+    p_rule = sub.add_parser(
+        "rule",
+        parents=[_GLOBAL_PARENT],
+        help="Share Tau rules with other users (send, check, accept, reject)",
+    )
+    rsub = p_rule.add_subparsers(dest="rule_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser):
+        src = parser.add_mutually_exclusive_group(required=True)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _rule_source(parser):
+        src = parser.add_mutually_exclusive_group(required=True)
+        src.add_argument("--rule", help="Tau rule text")
+        src.add_argument("--rule-file", help="File containing the Tau rule text")
+
+    def _tx_flags(parser):
+        parser.add_argument("--fee", default="0", help="Fee limit (default '0')")
+        parser.add_argument(
+            "--expiry",
+            type=int,
+            default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+
+    # --- offer ---
+    p_offer = rsub.add_parser(
+        "offer", parents=common, help="Send a rule to another user for review"
+    )
+    _key_group(p_offer)
+    _rule_source(p_offer)
+    p_offer.add_argument("--to", required=True, help="Recipient public key (96 hex)")
+    window = p_offer.add_mutually_exclusive_group()
+    window.add_argument(
+        "--expire-in",
+        type=int,
+        default=1000,
+        help="Blocks from the current tip until the offer expires (default: %(default)s)",
+    )
+    window.add_argument(
+        "--expire-at-height", type=int, help="Absolute height at which the offer expires"
+    )
+    _tx_flags(p_offer)
+    p_offer.set_defaults(func=cmd_rule_offer)
+
+    # --- list ---
+    p_list = rsub.add_parser(
+        "list", parents=common, help="List rule offers involving an address"
+    )
+    p_list.add_argument(
+        "address", nargs="?", help="Address to inspect (defaults to --key/--privkey owner)"
+    )
+    p_list.add_argument("--key", help="Logical name of a saved key")
+    p_list.add_argument("--privkey", help="Private key (hex or decimal)")
+    p_list.add_argument(
+        "--role", choices=["in", "out", "all"], default="all",
+        help="Show incoming, outgoing, or both (default: %(default)s)",
+    )
+    p_list.set_defaults(func=cmd_rule_list)
+
+    # --- show ---
+    p_show = rsub.add_parser(
+        "show", parents=common, help="Show one offer in full, including its rule text"
+    )
+    p_show.add_argument("offer_id", help="Offer id (64 hex)")
+    p_show.set_defaults(func=cmd_rule_show)
+
+    # --- check ---
+    p_check = rsub.add_parser(
+        "check", parents=common,
+        help="Conflict status for an offer (advisory, node-local)",
+    )
+    p_check.add_argument("offer_id", help="Offer id (64 hex)")
+    p_check.set_defaults(func=cmd_rule_check)
+
+    # --- accept ---
+    p_accept = rsub.add_parser(
+        "accept", parents=common,
+        help="Accept an offer into your specification (prints the conflict report first)",
+    )
+    _key_group(p_accept)
+    p_accept.add_argument("offer_id", help="Offer id (64 hex)")
+    p_accept.add_argument(
+        "--rule-file",
+        help="Override the rule text (must match the offered bytes exactly)",
+    )
+    p_accept.add_argument(
+        "--yes", action="store_true",
+        help="Accept even when the conflict check reports warn or conflict",
+    )
+    _tx_flags(p_accept)
+    p_accept.set_defaults(func=cmd_rule_accept)
+
+    # --- reject ---
+    p_reject = rsub.add_parser("reject", parents=common, help="Reject an offer")
+    _key_group(p_reject)
+    p_reject.add_argument("offer_id", help="Offer id (64 hex)")
+    _tx_flags(p_reject)
+    p_reject.set_defaults(func=cmd_rule_reject)
+
+    # --- offer-id ---
+    p_oid = rsub.add_parser(
+        "offer-id", parents=common, help="Derive an offer id without submitting"
+    )
+    _rule_source(p_oid)
+    p_oid.add_argument("--from-pubkey", required=True, dest="from_pubkey",
+                       help="Offerer public key (96 hex)")
+    p_oid.add_argument("--to", required=True, help="Recipient public key (96 hex)")
+    p_oid.add_argument("--expire-at-height", type=int, required=True,
+                       help="Absolute height at which the offer expires")
+    p_oid.set_defaults(func=cmd_rule_offer_id)
 
 
 def _add_gov_subparsers(sub) -> None:
