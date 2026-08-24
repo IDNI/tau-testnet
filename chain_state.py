@@ -709,6 +709,14 @@ def _process_new_block_locked(block: Block) -> bool:
                 # path too (not just commit_state_to_db); otherwise an activated
                 # quorum_policy / eligibility_mode change is lost on restart.
                 quorum_policy=_lifecycle_manager.quorum_policy,
+                # Rule sharing on the block-apply path too. Omitting these
+                # would leave the offer/clause tables holding the PREVIOUS
+                # block's rows while memory moved on, so a restart would
+                # rehydrate a stale book and compute a state hash no peer
+                # agrees with.
+                rule_offers=_lifecycle_manager.rule_offers.snapshot_offers(),
+                rule_clauses=_lifecycle_manager.rule_offers.snapshot_clauses(),
+                max_rule_txs_per_block=_lifecycle_manager.max_rule_txs_per_block,
                 eligibility_mode=_lifecycle_manager.eligibility_mode,
                 fee_beneficiary=_lifecycle_manager.fee_beneficiary,
                 last_transfer_ts=dict(_last_transfer_ts),
@@ -1351,7 +1359,45 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
             "persist": True,
         })
 
+    # Rule-sharing composites are DERIVED, never accumulated. The clause
+    # registry is the consensus-bound source of truth (rule_clauses_root), and
+    # the composite is a pure function of it, so it is rebuilt here instead of
+    # being appended to the application accumulation.
+    #
+    # Appending was tried first and is wrong: `save_effective_tau_spec` only
+    # dedups EXACT units, so every acceptance left the previous composite in
+    # place too. The stream then had several composites whose net effect
+    # depended on replay order, and the spec grew with every accept -- which
+    # feeds straight into the interpreter-rebuild cost.
+    if use_persisted_state:
+        for label, text in _rule_composite_plan_entries():
+            plan.append({"label": label, "text": text, "persist": False})
+
     return plan
+
+
+def _rule_composite_plan_entries() -> List[tuple]:
+    """(label, text) for one composite per output stream with accepted clauses.
+
+    Ordered by stream index so every node replays them identically.
+    """
+    from consensus.rule_offers import ALLOWED_TARGET_STREAMS
+
+    entries: List[tuple] = []
+    manager = getattr(_lifecycle_manager, "rule_offers", None)
+    if manager is None:
+        return entries
+    for stream in sorted(ALLOWED_TARGET_STREAMS):
+        try:
+            composite = manager.composite_for_stream(stream)
+        except Exception:
+            logger.warning(
+                "Could not compose the rule for o%s during restore", stream, exc_info=True
+            )
+            continue
+        if composite:
+            entries.append((f"rule_composite_o{stream}", composite))
+    return entries
 
 
 def replay_tau_restore_plan(plan: List[Dict[str, object]], *, source_prefix: str = "restore") -> bool:
@@ -1458,6 +1504,55 @@ def _persistable_update_payloads(lm) -> list:
             "proposer_pubkey": u.proposer_pubkey,
         })
     return rows
+
+def _restore_rule_offers(lm) -> None:
+    """Rebuild the rule-offer book and clause registry from the database.
+
+    Split by status: `offered` rows go back into the live book (their
+    offerer/recipient/expiry are consensus-bound), while every terminal row is
+    replayed as a bare id in `resolved`, which is the part the state hash binds.
+    The resolved set is never pruned -- see RuleOfferLifecycleManager.is_empty,
+    where shrinking back to empty would silently revert the meta hash to the
+    pre-feature preimage and fork the chain.
+    """
+    from consensus.rule_offers import STATUS_OFFERED, OfferEntry
+
+    offered = {}
+    resolved = set()
+    payloads = {}
+    statuses = {}
+    for row in db.load_rule_offers():
+        try:
+            offer_id = bytes.fromhex(row["offer_id"])
+        except (TypeError, ValueError):
+            logger.warning("Skipping malformed rule offer id %r", row.get("offer_id"))
+            continue
+        if len(offer_id) != 32:
+            logger.warning("Skipping rule offer id of wrong width %r", row.get("offer_id"))
+            continue
+        status = row.get("status") or STATUS_OFFERED
+        statuses[offer_id] = status
+        if row.get("rule_text"):
+            payloads[offer_id] = row["rule_text"]
+        if status == STATUS_OFFERED:
+            offered[offer_id] = OfferEntry(
+                offerer_pubkey=row["offerer_pubkey"],
+                recipient_pubkey=row["recipient_pubkey"],
+                expire_at_height=int(row.get("expire_at_height") or 0),
+            )
+        else:
+            resolved.add(offer_id)
+
+    clauses = {}
+    for row in db.load_rule_clauses():
+        clauses[(row["acceptor_pubkey"], int(row["target_stream"]))] = row["clause_body"]
+
+    lm.rule_offers.offered = offered
+    lm.rule_offers.resolved = resolved
+    lm.rule_offers.accepted_clauses = clauses
+    lm.rule_offers.terminal_status = statuses
+    lm.rule_offers.offer_payloads = payloads
+
 
 def save_effective_tau_spec(canonical_rule_text: str):
     """
@@ -1571,7 +1666,22 @@ def load_state_from_db() -> bool:
         _lifecycle_manager.fee_beneficiary = (
             _genesis_fee_beneficiary if persisted_beneficiary == _MISSING else persisted_beneficiary
         )
+        persisted_budget = db.get_chain_state_value("max_rule_txs_per_block", _MISSING)
+        if persisted_budget != _MISSING:
+            try:
+                _lifecycle_manager.max_rule_txs_per_block = int(persisted_budget)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignoring malformed max_rule_txs_per_block chain_state entry %r",
+                    persisted_budget,
+                )
         _lifecycle_manager.recompute_approval_threshold()
+
+        # Rehydrate rule sharing. Both structures are bound into
+        # consensus_meta_hash, so a miss here shows up as a state-hash mismatch
+        # on the first block after a restart.
+        _restore_rule_offers(_lifecycle_manager)
+
         for p in pending_updates:
             update = ConsensusRuleUpdate(
                 rule_revisions=p['rule_revisions'],
@@ -1610,6 +1720,13 @@ def commit_state_to_db(block_hash: str, block_number: int):
         eligibility_mode_snapshot = _lifecycle_manager.eligibility_mode
         fee_beneficiary_snapshot = _lifecycle_manager.fee_beneficiary
         last_transfer_ts_snapshot = dict(_last_transfer_ts)
+        # Rule sharing. The offer book and clause registry are bound into
+        # consensus_meta_hash, so they must be persisted in the SAME atomic
+        # write as accounts: a node whose reloaded managers disagree with disk
+        # computes a different state hash than a peer replaying from genesis.
+        rule_offers_list = _lifecycle_manager.rule_offers.snapshot_offers()
+        rule_clauses_list = _lifecycle_manager.rule_offers.snapshot_clauses()
+        max_rule_txs_snapshot = _lifecycle_manager.max_rule_txs_per_block
 
     db.save_canonical_state_atomically(
         block_hash, block_number,
@@ -1621,6 +1738,9 @@ def commit_state_to_db(block_hash: str, block_number: int):
         eligibility_mode=eligibility_mode_snapshot,
         fee_beneficiary=fee_beneficiary_snapshot,
         last_transfer_ts=last_transfer_ts_snapshot,
+        rule_offers=rule_offers_list,
+        rule_clauses=rule_clauses_list,
+        max_rule_txs_per_block=max_rule_txs_snapshot,
     )
 
 def tick_governance(height: int):
@@ -1939,6 +2059,8 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
         scheduled_list = [(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates]
         archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
         active_validators_list = sorted(normalize_validator_set(_lifecycle_manager.active_validators))
+        rule_offers_list = _lifecycle_manager.rule_offers.snapshot_offers()
+        rule_clauses_list = _lifecycle_manager.rule_offers.snapshot_clauses()
         head_num = db.get_block_by_hash(new_head_hash)['header']['block_number']
         db.save_canonical_state_atomically(
             new_head_hash,
@@ -1957,6 +2079,9 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
             eligibility_mode=_lifecycle_manager.eligibility_mode,
             fee_beneficiary=_lifecycle_manager.fee_beneficiary,
             last_transfer_ts=dict(_last_transfer_ts),
+            rule_offers=rule_offers_list,
+            rule_clauses=rule_clauses_list,
+            max_rule_txs_per_block=_lifecycle_manager.max_rule_txs_per_block,
         )
 
     # Phase 5: Mempool Restore

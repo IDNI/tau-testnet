@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import sys
 import threading
 from collections import deque
@@ -142,21 +143,35 @@ _stdout_capture_lock = threading.RLock()
 
 class StdOutCapture:
     """
-    Context manager to capture C-level stdout/stderr output.
+    Context manager to capture C-level stdout AND stderr output.
     Required because nanobind/C++ prints directly to file descriptors,
-    bypassing sys.stdout.
+    bypassing sys.stdout / sys.stderr.
+
+    Both fds matter: the native engine routes its `(Error)` diagnostics to
+    fd 2, so a capture of fd 1 alone silently loses every engine error and
+    makes the rule-validation gates no-ops. `output` is the concatenation of
+    both streams so callers can screen it with `tau_reports_error()`.
+
+    Backed by temp files rather than pipes: a pipe's ~64 KiB kernel buffer
+    deadlocks the engine mid-call as soon as it prints a large normalized
+    spec, because nothing drains the read end until __exit__.
 
     Mutually exclusive across threads: `__enter__` holds `_stdout_capture_lock`
     until `__exit__`. Only usable as a context manager -- the fd bookkeeping is
     set up in `__enter__`, not in `__init__`, so it stays inside the lock.
     """
+
+    # (fd, attribute holding the captured text)
+    _CAPTURED_FDS = ((1, "stdout_output"), (2, "stderr_output"))
+
     def __init__(self):
-        # Always use FD 1 (STDOUT_FILENO) because C++ std::cout writes directly to it
-        # regardless of whether sys.stdout has been redirected by pytest/CaptureIO.
-        self._stdout_fd = 1
-        self._saved_stdout_fd = None
-        self._r = self._w = None
+        # FD 1/2 are used directly because C++ std::cout / boost::log write to
+        # them regardless of any sys.stdout redirection by pytest/CaptureIO.
+        self._saved = {}   # fd -> dup'd original fd
+        self._files = {}   # fd -> temp file object
         self.output = ""
+        self.stdout_output = ""
+        self.stderr_output = ""
 
         # Load C standard library for flushing
         try:
@@ -164,63 +179,97 @@ class StdOutCapture:
         except Exception:
             self.libc = None
 
+    def _flush_all(self):
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        if self.libc:
+            self.libc.fflush(None)
+
     def __enter__(self):
         _stdout_capture_lock.acquire()
         try:
-            # Flush Python's stdout buffer before redirecting
-            sys.stdout.flush()
-            if self.libc:
-                self.libc.fflush(None)
-
-            self._saved_stdout_fd = os.dup(self._stdout_fd)
-            self._r, self._w = os.pipe()
-
-            # Redirect stdout to the write end of the pipe
-            os.dup2(self._w, self._stdout_fd)
+            self._flush_all()
+            for fd, _attr in self._CAPTURED_FDS:
+                tmp = tempfile.TemporaryFile(mode="w+b")
+                self._files[fd] = tmp
+                self._saved[fd] = os.dup(fd)
+                os.dup2(tmp.fileno(), fd)
         except BaseException:
             # Never hold the lock if the redirect never took effect.
-            self._close_fds()
+            self._restore_and_close()
             _stdout_capture_lock.release()
             raise
         return self
 
-    def _close_fds(self):
-        for attr in ("_w", "_r", "_saved_stdout_fd"):
-            fd = getattr(self, attr)
-            if fd is None:
-                continue
-            setattr(self, attr, None)
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+    def _restore_and_close(self):
+        for fd, _attr in self._CAPTURED_FDS:
+            saved = self._saved.pop(fd, None)
+            if saved is not None:
+                try:
+                    os.dup2(saved, fd)
+                except OSError:
+                    pass
+                try:
+                    os.close(saved)
+                except OSError:
+                    pass
+            tmp = self._files.pop(fd, None)
+            if tmp is not None:
+                try:
+                    tmp.close()
+                except OSError:
+                    pass
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
-            # Flush Python's stdout
-            sys.stdout.flush()
-
-            # Flush C-level stdout to ensure buffered content goes to pipe
-            if self.libc:
-                self.libc.fflush(None)
-
-            # Closing the write end signals EOF to the reader
-            os.close(self._w)
-            self._w = None
-
-            # Restore original stdout
-            os.dup2(self._saved_stdout_fd, self._stdout_fd)
-            os.close(self._saved_stdout_fd)
-            self._saved_stdout_fd = None
-
-            # Read from the read end of the pipe
-            r, self._r = self._r, None
-            with os.fdopen(r, 'r') as f:
-                self.output = f.read()
+            self._flush_all()
+            texts = []
+            for fd, attr in self._CAPTURED_FDS:
+                text = ""
+                tmp = self._files.get(fd)
+                saved = self._saved.get(fd)
+                if tmp is not None:
+                    try:
+                        # Restore first so any read error still leaves the fd sane.
+                        if saved is not None:
+                            os.dup2(saved, fd)
+                        tmp.seek(0)
+                        text = tmp.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        text = ""
+                setattr(self, attr, text)
+                texts.append(text)
+            self.output = "".join(texts)
         finally:
-            self._close_fds()
+            self._restore_and_close()
             _stdout_capture_lock.release()
 
+
+# The native engine ALWAYS ANSI-colours its severity marker (see tau-lang
+# src/logging.h: `"(" << LOG_ERROR_COLOR << "Error" << TC.CLEAR() << ") "`),
+# so a literal `"(Error)" in output` screen never matches and every rule
+# validation gate built on it silently passes. Match the marker with the
+# escape sequences allowed anywhere inside it.
+_TAU_ERROR_RE = re.compile(r"\(\s*(?:\x1b\[[0-9;]*m)*\s*Error\s*(?:\x1b\[[0-9;]*m)*\s*\)")
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text) -> str:
+    """Drop ANSI colour escapes so captured engine output is greppable."""
+    if not text:
+        return ""
+    return _ANSI_ESCAPE_RE.sub("", str(text))
+
+
+def tau_reports_error(text) -> bool:
+    """True when captured native output carries an engine `(Error)` marker."""
+    if not text:
+        return False
+    return bool(_TAU_ERROR_RE.search(str(text)))
 
 
 class TauInterface:
@@ -604,7 +653,7 @@ class TauInterface:
             if outputs is not None:
                 break # We have outputs, step is fully finished
                 
-            if "(Error)" in capture.output:
+            if tau_reports_error(capture.output):
                 break # Native engine reported a parsing/logic error, don't loop forever
 
         # Re-print accumulated captured output to real stdout so logs are visible
@@ -612,7 +661,7 @@ class TauInterface:
             print(captured_output, end='')
             tau_io_logger.log_native_stdout(captured_output)
             
-            if "(Error)" in captured_output:
+            if tau_reports_error(captured_output):
                 msg = f"Tau native step reported an error: {captured_output.strip()}"
                 filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
                 if filepath:
@@ -761,7 +810,7 @@ class TauInterface:
             if outputs is not None:
                 break
 
-            if "(Error)" in capture.output:
+            if tau_reports_error(capture.output):
                 break
 
         # Re-print captured output for log visibility
@@ -769,7 +818,7 @@ class TauInterface:
             print(captured_output, end='')
             tau_io_logger.log_native_stdout(captured_output)
 
-            if "(Error)" in captured_output:
+            if tau_reports_error(captured_output):
                 msg = f"Tau native step reported an error: {captured_output.strip()}"
                 filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
                 if filepath:
@@ -885,7 +934,7 @@ class TauInterface:
                 if err
                 else "Failed to construct staging Tau interpreter from current consensus rules."
             )
-        if "(Error)" in (init_capture.output or ""):
+        if tau_reports_error(init_capture.output):
             return f"Tau staging compile error: {init_capture.output.strip()}"
 
         # Replay the remaining accumulated units (joined via i0 -> u like the
@@ -904,19 +953,30 @@ class TauInterface:
             # Bounded lazy-prompt loop matching communicate()'s shape: keep
             # feeding required inputs (rev for the first i0, fallbacks for
             # everything else) until tau.step yields outputs or we hit the
-            # iteration cap. (Error) in captured stdout short-circuits.
+            # iteration cap. An engine error marker short-circuits.
+            #
+            # `get_inputs_for_step` is captured too: the engine defers type
+            # errors to the *next* prompt, so a bv-width conflict introduced by
+            # `rev` surfaces there rather than out of `step`.
             for _ in range(100):
                 try:
-                    required_inputs = tau_module.get_inputs_for_step(interpreter)
+                    with StdOutCapture() as prompt_capture:
+                        required_inputs = tau_module.get_inputs_for_step(interpreter)
+                    captured_output += prompt_capture.output
                 except Exception as e:
                     return f"Tau staging compile error: {e}"
 
+                if tau_reports_error(prompt_capture.output):
+                    return f"Tau staging compile error: {prompt_capture.output.strip()}"
+
                 assignments = {}
+                consumed_this_iteration = False
                 for input_obj in required_inputs:
                     name = input_obj.name
                     if name == "i0" and not rev_consumed:
                         assignments[input_obj] = prepared_rev
                         rev_consumed = True
+                        consumed_this_iteration = True
                     else:
                         assignments[input_obj] = cls._fallback_value_for_stream(name)
 
@@ -927,14 +987,36 @@ class TauInterface:
                 except Exception as e:
                     return f"Tau staging compile error: {e}"
 
-                if "(Error)" in capture.output:
+                if tau_reports_error(capture.output):
                     return f"Tau staging compile error: {capture.output.strip()}"
 
                 if outputs is not None:
                     break
 
-            if "(Error)" in captured_output:
+                if consumed_this_iteration:
+                    # The engine refused the revision itself: it returned no
+                    # outputs for the very step that fed it. Continuing would
+                    # re-prompt i0, feed the benign "F" fallback, succeed, and
+                    # report the malformed rule as clean.
+                    detail = strip_ansi(captured_output).strip()
+                    return (
+                        f"Tau staging compile error: engine rejected revision: {detail}"
+                        if detail
+                        else "Tau staging compile error: engine rejected revision (no outputs)"
+                    )
+
+            if tau_reports_error(captured_output):
                 return f"Tau staging compile error: {captured_output.strip()}"
+
+        # Drain one more prompt so a type error deferred past the final
+        # revision's step still surfaces instead of going unobserved.
+        try:
+            with StdOutCapture() as tail_capture:
+                tau_module.get_inputs_for_step(interpreter)
+        except Exception as e:
+            return f"Tau staging compile error: {e}"
+        if tau_reports_error(tail_capture.output):
+            return f"Tau staging compile error: {tail_capture.output.strip()}"
 
         # `interpreter` falls out of scope here and is reclaimed; no live state touched.
         return None

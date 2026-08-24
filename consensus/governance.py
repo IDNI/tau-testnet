@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 
 from consensus.serialization import compute_update_id
+from consensus.rule_offers import RuleOfferLifecycleManager
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "vote_quorum",
     "eligibility_mode",
     "fee_beneficiary",
+    "max_rule_txs_per_block",
 })
 
 
@@ -143,10 +145,36 @@ def normalize_fee_beneficiary(value: str) -> str:
     return "" if value == FEE_BENEFICIARY_PROPOSER else value
 
 
+# Rule-bearing transactions permitted per block. Bounds how many interpreter
+# rebuilds a validator must pay to verify one block: rebuild cost climbs
+# steeply with specification complexity, and an unbounded count would let a
+# proposer author a block that every validator times out on (COMM_TIMEOUT,
+# then a watchdog kill). Governance-patchable via host_contract_patch, and
+# bound into the consensus state hash only when non-default so pre-existing
+# chains keep a byte-identical hash.
+DEFAULT_MAX_RULE_TXS_PER_BLOCK = 8
+MAX_MAX_RULE_TXS_PER_BLOCK = 1024
+
+
+def validate_max_rule_txs_per_block(value: Any) -> Optional[str]:
+    """Return an error string if `value` is not a deployable per-block rule
+    budget, else None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "must be an integer"
+    if value < 1:
+        return "must be at least 1"
+    if value > MAX_MAX_RULE_TXS_PER_BLOCK:
+        return f"must be at most {MAX_MAX_RULE_TXS_PER_BLOCK}"
+    return None
+
+
 def build_mechanism_metadata(
     vote_quorum: str,
     eligibility_mode: str = DEFAULT_ELIGIBILITY_MODE,
     fee_beneficiary: str = DEFAULT_FEE_BENEFICIARY,
+    rule_offers_root: str = "",
+    rule_clauses_root: str = "",
+    max_rule_txs_per_block: int = DEFAULT_MAX_RULE_TXS_PER_BLOCK,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -165,7 +193,19 @@ def build_mechanism_metadata(
         mech["eligibility_mode"] = eligibility_mode
     if fee_beneficiary != DEFAULT_FEE_BENEFICIARY:
         mech["fee_beneficiary"] = fee_beneficiary
+    # Rule sharing: emitted ONLY once something has been offered or accepted, so
+    # a chain that predates the feature keeps a byte-identical meta hash and
+    # needs no regenesis. Once the first offer lands the keys appear, and a node
+    # still running the old binary diverges loudly (state-hash mismatch -> block
+    # rejected) rather than silently. gen_genesis calls this without them, so
+    # block 0 is unaffected.
+    if rule_offers_root:
+        mech["rule_offers_root"] = rule_offers_root
+        mech["rule_clauses_root"] = rule_clauses_root
+    if max_rule_txs_per_block != DEFAULT_MAX_RULE_TXS_PER_BLOCK:
+        mech["max_rule_txs_per_block"] = max_rule_txs_per_block
     return mech
+
 
 # Network-wide quorum policy used when genesis does not pin one. The consensus
 # tally MUST resolve to a deterministic value here and never read per-node
@@ -386,6 +426,17 @@ class ConsensusLifecycleManager:
         # bound into the consensus state hash only when non-default so existing
         # chains keep byte-identical hashes.
         self.fee_beneficiary: str = ""
+
+        # Rule sharing lives here as a FIELD rather than a sibling object so
+        # consensus_meta_hash() picks it up automatically. There are three
+        # state-hash call sites (chain_state, engine, createblock); a sibling
+        # would have to be threaded through all of them, and a missed one is a
+        # silent fork.
+        self.rule_offers = RuleOfferLifecycleManager()
+        # Caps rule-bearing transactions per block, bounding how many
+        # interpreter rebuilds a validator must pay to verify one block.
+        # Governance-patchable; bound into the meta hash only when non-default.
+        self.max_rule_txs_per_block: int = DEFAULT_MAX_RULE_TXS_PER_BLOCK
         self.recompute_approval_threshold()
 
     def effective_quorum_policy(self) -> str:
@@ -444,10 +495,16 @@ class ConsensusLifecycleManager:
         ]
         # Shared with scripts/gen_genesis.py so the two cannot drift apart; the
         # non-default gating lives there (hash-compat).
+        # Shared with scripts/gen_genesis.py so the two cannot drift apart; the
+        # non-default gating lives there (hash-compat).
+        empty_book = self.rule_offers.is_empty()
         mech = build_mechanism_metadata(
             self.effective_quorum_policy(),
             self.effective_eligibility_mode(),
             self.effective_fee_beneficiary(),
+            rule_offers_root=("" if empty_book else self.rule_offers.offers_root().hex()),
+            rule_clauses_root=("" if empty_book else self.rule_offers.clauses_root().hex()),
+            max_rule_txs_per_block=self.max_rule_txs_per_block,
         )
         return compute_consensus_meta_hash(
             host_contract={},
@@ -521,6 +578,13 @@ class ConsensusLifecycleManager:
             if err:
                 raise ValueError(f"fee_beneficiary: {err}")
             self.fee_beneficiary = normalize_fee_beneficiary(beneficiary)
+
+        if "max_rule_txs_per_block" in patch:
+            budget = patch["max_rule_txs_per_block"]
+            err = validate_max_rule_txs_per_block(budget)
+            if err:
+                raise ValueError(f"max_rule_txs_per_block: {err}")
+            self.max_rule_txs_per_block = int(budget)
         self.recompute_approval_threshold()
 
     def knows_update(self, update_id: bytes) -> bool:
@@ -662,7 +726,12 @@ class ConsensusLifecycleManager:
         Returns the list of updates that just activated (to apply to Tau).
         """
         newly_active = []
-        
+
+        # 0. Expire rule offers whose window has closed. Runs first and
+        # unconditionally, at exactly one point per block on every node, so the
+        # offer book is settled before the state hash is computed.
+        self.rule_offers.expire_at_height(current_height)
+
         # 1. Expire pending updates that missed their activation height
         expired_uids = []
         for uid in self.pending_updates:

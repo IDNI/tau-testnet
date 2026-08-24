@@ -222,6 +222,90 @@ def submit_tx(
     )
 
 
+def build_rule_offer_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    recipient_pubkey: str,
+    rule_text: str,
+    expire_at_height: int,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='rule_offer'`` payload (without signature)."""
+    if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
+        raise ValueError("recipient_pubkey must be a 96-character hex public key")
+    if recipient_pubkey.lower() == (sender_pubkey or "").lower():
+        raise ValueError("recipient_pubkey must differ from the sender")
+    if not isinstance(rule_text, str) or not rule_text.strip():
+        raise ValueError("rule_text must be a non-empty string")
+    if not isinstance(expire_at_height, int) or expire_at_height < 1:
+        raise ValueError("expire_at_height must be a positive integer")
+
+    return {
+        "tx_type": "rule_offer",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "fee_limit": str(fee_limit),
+        "recipient_pubkey": recipient_pubkey.lower(),
+        "rule_text": rule_text,
+        "expire_at_height": expire_at_height,
+    }
+
+
+def build_rule_offer_accept_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    offer_id: str,
+    rule_text: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='rule_offer_accept'`` payload (without signature).
+
+    ``rule_text`` must be the offered text VERBATIM: the node recomputes the
+    offer id from it, so any reformatting makes the accept unapplicable.
+    """
+    if not isinstance(offer_id, str) or len(offer_id) != 64:
+        raise ValueError("offer_id must be a 64-character hex string")
+    if not isinstance(rule_text, str) or not rule_text.strip():
+        raise ValueError("rule_text must be a non-empty string")
+
+    return {
+        "tx_type": "rule_offer_accept",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "fee_limit": str(fee_limit),
+        "offer_id": offer_id.lower(),
+        "rule_text": rule_text,
+    }
+
+
+def build_rule_offer_reject_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    offer_id: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='rule_offer_reject'`` payload (without signature)."""
+    if not isinstance(offer_id, str) or len(offer_id) != 64:
+        raise ValueError("offer_id must be a 64-character hex string")
+
+    return {
+        "tx_type": "rule_offer_reject",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "fee_limit": str(fee_limit),
+        "offer_id": offer_id.lower(),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Higher-level user-tx assembly (used by `tau-testnet tx send`)
 # --------------------------------------------------------------------------- #

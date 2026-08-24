@@ -7,7 +7,24 @@ import logging
 import config
 import tau_defs
 from tau_manager import communicate_with_tau
-from consensus.serialization import compute_update_id
+from consensus.serialization import compute_update_id, compute_offer_id
+from consensus.rule_offers import (
+    MAX_ACCEPTORS_PER_STREAM,
+    MAX_OFFER_RULE_BYTES,
+    MAX_OFFER_WINDOW_BLOCKS,
+    MAX_PENDING_OFFERS_PER_OFFERER,
+    MAX_PENDING_OFFERS_PER_RECIPIENT,
+    STATUS_OFFERED,
+    TX_TYPE_RULE_OFFER,
+    TX_TYPE_RULE_OFFER_ACCEPT,
+    TX_TYPE_RULE_OFFER_REJECT,
+    RuleOfferShapeError,
+    compose_stream_rule,
+    normalize_offer_rule_text,
+    parse_rule_offer,
+    parse_rule_offer_accept,
+    parse_rule_offer_reject,
+)
 from consensus.facade import TipAdmissionView
 from consensus.governance import (
     normalize_validator_delta,
@@ -565,6 +582,226 @@ def validate_consensus_rule_vote_payload(tx: Dict, tip_view: TipAdmissionView) -
 
     return success()
 
+
+# --- Rule sharing -----------------------------------------------------------
+
+def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+    """Static + tip-state checks for a `rule_offer`.
+
+    Everything here is a deterministic function of the transaction and the tip
+    tables, so admission and apply reach the same verdict on the same inputs.
+    The expensive compile of the composed rule happens separately (see
+    stage_and_validate_offer_clause) so a spammer cannot get a subprocess
+    spawned for free on a payload that fails a cheap check.
+    """
+    offer = parse_rule_offer(tx)
+    if offer is None:
+        return format_error("Malformed rule_offer payload.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender.lower() != offer.offerer_pubkey:
+        return format_error("rule_offer offerer must be the transaction sender.")
+
+    if offer.offerer_pubkey == offer.recipient_pubkey:
+        return format_error("rule_offer recipient must differ from the offerer.")
+
+    rule_bytes = len(offer.rule_text.encode("utf-8"))
+    if rule_bytes > MAX_OFFER_RULE_BYTES:
+        return format_error(
+            f"Offered rule text is {rule_bytes} bytes, over the "
+            f"{MAX_OFFER_RULE_BYTES} byte limit."
+        )
+
+    next_height = tip_view.next_block_height
+    if offer.expire_at_height <= next_height:
+        return format_error(
+            f"expire_at_height {offer.expire_at_height} must be beyond the next "
+            f"block height {next_height}."
+        )
+    if offer.expire_at_height > next_height + MAX_OFFER_WINDOW_BLOCKS:
+        return format_error(
+            f"expire_at_height {offer.expire_at_height} is more than "
+            f"{MAX_OFFER_WINDOW_BLOCKS} blocks ahead."
+        )
+
+    offer_id_hex = offer.offer_id_hex
+    if tip_view.get_offer_lifecycle_state(offer_id_hex) is not None:
+        return format_error(f"Duplicate rule offer {offer_id_hex[:16]}.")
+
+    if tip_view.pending_offers_for_recipient(offer.recipient_pubkey) >= MAX_PENDING_OFFERS_PER_RECIPIENT:
+        return format_error(
+            "Recipient already has the maximum "
+            f"{MAX_PENDING_OFFERS_PER_RECIPIENT} pending rule offers."
+        )
+    if tip_view.pending_offers_for_offerer(offer.offerer_pubkey) >= MAX_PENDING_OFFERS_PER_OFFERER:
+        return format_error(
+            "Offerer already has the maximum "
+            f"{MAX_PENDING_OFFERS_PER_OFFERER} pending rule offers."
+        )
+
+    # Shape screen. Rejecting here rather than at accept time means a recipient
+    # never sees an offer that could not have been accepted anyway.
+    try:
+        body, target_stream = normalize_offer_rule_text(offer.rule_text)
+    except RuleOfferShapeError as exc:
+        return format_error(f"Offered rule has an unsupported shape: {exc}")
+
+    domain_error = _screen_clause_domains(body)
+    if domain_error:
+        return format_error(domain_error)
+
+    # Compose the rule as it WOULD look if the recipient accepted, so an offer
+    # that could never be accepted is rejected at the source rather than
+    # wasting the recipient's inbox slot and review time.
+    composite, compose_error = _compose_with_clause(
+        tip_view, target_stream, offer.recipient_pubkey, body
+    )
+    if compose_error:
+        return format_error(compose_error)
+
+    return success({
+        "offer_id": offer_id_hex,
+        "clause_body": body,
+        "target_stream": target_stream,
+        "composite_rule": composite,
+    })
+
+
+def _compose_with_clause(tip_view, target_stream: int, acceptor: str, body: str):
+    """Composite for `target_stream` with `acceptor`'s clause set to `body`.
+
+    Returns (composite_text, error). An acceptor REPLACING their own clause
+    does not grow the composite, so the acceptor cap only applies to a
+    genuinely new one.
+    """
+    clauses = dict(tip_view.clauses_for_stream(target_stream))
+    if acceptor not in clauses and len(clauses) >= MAX_ACCEPTORS_PER_STREAM:
+        return None, (
+            f"o{target_stream} already has the maximum "
+            f"{MAX_ACCEPTORS_PER_STREAM} accepted clauses."
+        )
+    clauses[acceptor] = body
+    try:
+        return compose_stream_rule(target_stream, clauses), None
+    except RuleOfferShapeError as exc:
+        return None, f"Composed rule for o{target_stream} is invalid: {exc}"
+
+
+def _screen_clause_domains(body: str) -> Optional[str]:
+    """Reserved-domain screens for a clause body, shared by offer and accept.
+
+    Same screens as a user_tx rule op: a clause must not write the
+    consensus-owned verdict/fee streams, must not read an input the apply path
+    mocks, and must not type a reserved input stream.
+    """
+    writes = _streams_referenced(body, ("o6", "o7", "o9"))
+    if writes:
+        return (
+            "Shared rules may not write consensus-owned streams: "
+            + ", ".join(writes)
+        )
+
+    mocked = _streams_referenced(body, APPLY_MOCKED_INPUT_STREAMS)
+    if mocked:
+        return (
+            "Shared rules may not read apply-time-mocked streams: "
+            + ", ".join(mocked)
+            + " (its value differs between admission and block apply)"
+        )
+
+    # i12 is excluded: the node supplies the sender guard, and clause_body_v1
+    # already rejects a clause that references it itself.
+    #
+    # The widest reserved set is screened regardless of the tip's current
+    # eligibility mode. A clause outlives the mode that was active when it was
+    # accepted, so admitting one that types i13 under validator_set would turn
+    # into a reserved-stream collision the moment governance switches to
+    # tau_validator_set.
+    reserved_inputs = tuple(
+        f"i{idx}" for idx in tau_defs.reserved_operation_keys("tau_validator_set")
+        if idx != 12
+    )
+    typed = _streams_referenced(body, reserved_inputs)
+    if typed:
+        return (
+            "Shared rules may not reference reserved input streams: "
+            + ", ".join(typed)
+        )
+    return None
+
+
+def validate_rule_offer_decision_payload(
+    tx: Dict, tip_view: TipAdmissionView, *, accept: bool
+) -> AdmissionResult:
+    """Static + tip-state checks for `rule_offer_accept` / `rule_offer_reject`."""
+    decision = (
+        parse_rule_offer_accept(tx) if accept else parse_rule_offer_reject(tx)
+    )
+    if decision is None:
+        kind = "rule_offer_accept" if accept else "rule_offer_reject"
+        return format_error(f"Malformed {kind} payload.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender.lower() != decision.actor_pubkey:
+        return format_error("Rule offer decision actor must be the transaction sender.")
+
+    offer_id_hex = decision.offer_id_hex
+    row = tip_view.get_offer(offer_id_hex)
+    if row is None:
+        return format_error(f"Unknown rule offer {offer_id_hex[:16]}.")
+    if row["status"] != STATUS_OFFERED:
+        return format_error(
+            f"Rule offer {offer_id_hex[:16]} is already {row['status']}."
+        )
+    if row["recipient_pubkey"].lower() != decision.actor_pubkey:
+        return format_error("Only the offer recipient may accept or reject it.")
+
+    next_height = tip_view.next_block_height
+    if row["expire_at_height"] <= next_height:
+        return format_error(
+            f"Rule offer {offer_id_hex[:16]} expires at height "
+            f"{row['expire_at_height']}, at or before the next block."
+        )
+
+    if not accept:
+        return success({"offer_id": offer_id_hex})
+
+    # The accept carries its own copy of the text; the id must re-derive from
+    # it, which is what lets apply validate without the payload store.
+    rebuilt = compute_offer_id(
+        offerer_pubkey=row["offerer_pubkey"],
+        recipient_pubkey=row["recipient_pubkey"],
+        rule_text=decision.rule_text or "",
+        expire_at_height=row["expire_at_height"],
+    )
+    if rebuilt != decision.offer_id:
+        return format_error(
+            "Accepted rule text does not match the offer digest."
+        )
+
+    try:
+        body, target_stream = normalize_offer_rule_text(decision.rule_text or "")
+    except RuleOfferShapeError as exc:
+        return format_error(f"Accepted rule has an unsupported shape: {exc}")
+
+    domain_error = _screen_clause_domains(body)
+    if domain_error:
+        return format_error(domain_error)
+
+    composite, compose_error = _compose_with_clause(
+        tip_view, target_stream, decision.actor_pubkey, body
+    )
+    if compose_error:
+        return format_error(compose_error)
+
+    return success({
+        "offer_id": offer_id_hex,
+        "clause_body": body,
+        "target_stream": target_stream,
+        "composite_rule": composite,
+    })
+
+
 def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """
     Primary Orchestrator Endpoint for Network Admission logic.
@@ -592,6 +829,15 @@ def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> Adm
 
     elif tx_type == "consensus_rule_vote":
          return validate_consensus_rule_vote_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_RULE_OFFER:
+         return validate_rule_offer_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_RULE_OFFER_ACCEPT:
+         return validate_rule_offer_decision_payload(payload, tip_view, accept=True)
+
+    elif tx_type == TX_TYPE_RULE_OFFER_REJECT:
+         return validate_rule_offer_decision_payload(payload, tip_view, accept=False)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

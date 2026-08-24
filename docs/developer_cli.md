@@ -151,7 +151,7 @@ and optionally `host_contract_patch` (object or `null`/omitted).
 > The inline payload flag is named `--inline` (not `--json`) to avoid
 > colliding with the global `--json` output-mode flag.
 
-## Keys (Phase 2)
+## Keys
 
 Keys are stored under `~/.tau-testnet/keys/<name>.json`. On POSIX the files are
 chmod `0600`. `keys list` and `keys show <name>` (without `--private`) never
@@ -210,6 +210,51 @@ tau-testnet tx raw-submit --file signed_tx.json
 envelope (any `error.code`, e.g. `INVALID_SIGNATURE`, `INVALID_SEQUENCE`,
 `TX_REJECTED`), `4` for bad amounts/empty operations/missing inputs, `3` on
 connection/timeout errors.
+
+## Rule sharing
+
+Send a Tau rule to another user; they check its conflict status and then accept
+it into their own specification or reject it.
+
+```bash
+# Offer a rule. --expire-in is resolved against the node's current tip;
+# --expire-at-height sets an absolute height instead.
+tau-testnet rule offer --key alice --to <bob_pubkey> --rule-file policy.tau
+tau-testnet rule offer --key alice --to <bob_pubkey> --rule 'always ( o5[t]:bv[24] = { #x000000 }:bv[24] ).' \
+    --expire-at-height 5000
+
+# Inspect. `list` defaults to the --key owner's address; --role filters direction.
+tau-testnet rule list --key bob --role in
+tau-testnet --json rule list <pubkey> | jq '.data.incoming'
+tau-testnet rule show <offer_id>          # full rule text
+tau-testnet rule check <offer_id>         # layered conflict report
+
+# Decide. `accept` prints the conflict report first and refuses on a
+# warn/conflict verdict unless --yes is given.
+tau-testnet rule accept --key bob <offer_id>
+tau-testnet rule accept --key bob <offer_id> --yes
+tau-testnet rule reject --key bob <offer_id>
+
+# Derive an offer id without submitting anything
+tau-testnet rule offer-id --rule-file policy.tau \
+    --from-pubkey <alice_pubkey> --to <bob_pubkey> --expire-at-height 5000
+```
+
+`accept` fetches the offered text from the node rather than having you retype
+it: the node recomputes `offer_id` from the accept's own copy of the text, so
+any reformatting makes the accept unapplicable. `--rule-file` on `accept` is an
+escape hatch for the case where the node no longer has the text (it is
+node-local durability, not consensus state).
+
+Underlying RPCs: `getruleoffers <address> [in|out|all]`, `getruleoffer <offer_id>`,
+`getruleconflict <offer_id>`, `getofferid '<json>'`.
+
+The conflict report is **advisory and node-local** and never gates a
+transaction. It does not check satisfiability — tau-lang exposes
+`sat`/`unsat`/`valid`/`unrealizable` in C++ but not through its Python
+bindings — so a clean result means no conflict was *observed*. See the
+[Rule sharing](../README.md#rule-sharing) section for the composite-rule model
+and why an accepted rule is composed rather than appended.
 
 ## Governance
 

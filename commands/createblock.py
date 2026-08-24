@@ -164,6 +164,63 @@ def execute_batch(transactions: List[Dict], reserved_ids: List[int], block_times
     return final_txs, final_reserved_ids, final_rules, working_balances, working_sequences
 
 
+def _drop_sequence_gap_orphans(transactions, execution_transactions, reserved_ids):
+    """Remove txs whose sender has a LOWER-sequence tx still waiting outside
+    this batch.
+
+    Lane quotas make this reachable: seq 5 is rule-bearing and sits in the
+    capped slow lane while seq 6 is a transfer and gets selected. The engine's
+    per-sender sequence check then hard-rejects seq 6 and it is disposed with
+    the block, i.e. silently destroyed rather than retried. Dropping it here
+    leaves it in the mempool to be mined once its predecessor lands.
+
+    Returns the reserved ids that were dropped, so the caller can unreserve
+    them. All three lists are mutated in lockstep.
+    """
+    min_included: Dict[str, int] = {}
+    for tx in transactions:
+        if not isinstance(tx, dict):
+            continue
+        sender = tx.get("sender_pubkey")
+        seq = tx.get("sequence_number")
+        if not sender or not isinstance(seq, int):
+            continue
+        if sender not in min_included or seq < min_included[sender]:
+            min_included[sender] = seq
+
+    orphan_senders = set()
+    for sender, included_min in min_included.items():
+        try:
+            pending_min = db.get_min_pending_sequence(sender)
+        except Exception:
+            continue
+        if pending_min is not None and pending_min < included_min:
+            orphan_senders.add(sender)
+
+    if not orphan_senders:
+        return []
+
+    dropped_ids = []
+    for i in range(len(transactions) - 1, -1, -1):
+        tx = transactions[i]
+        if isinstance(tx, dict) and tx.get("sender_pubkey") in orphan_senders:
+            dropped_ids.append(reserved_ids[i])
+            del transactions[i]
+            del execution_transactions[i]
+            del reserved_ids[i]
+
+    if dropped_ids:
+        print(
+            f"[INFO][createblock] Deferred {len(dropped_ids)} tx(s) from "
+            f"{len(orphan_senders)} sender(s) with an earlier sequence still queued"
+        )
+        try:
+            db.unreserve_mempool_txs(dropped_ids)
+        except Exception:
+            pass
+    return dropped_ids
+
+
 def _restore_per_sender_sequence_order(transactions, execution_transactions, reserved_ids):
     """
     reserve_mempool_txs orders by fee priority, which can place a sender's
@@ -273,7 +330,28 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
     # Get batch of reserved transactions from mempool. The chain-write lock is
     # already held for the whole round, so no second producer can sweep or
     # re-reserve this batch while we build on it.
-    reserved_txs = db.reserve_mempool_txs(limit=1000)
+    # Lane-aware selection: transfers first, then a bounded number of
+    # rule-bearing transactions. The slow-lane budget is the tighter of the
+    # operator's own hint and the consensus-enforced, governance-patchable
+    # ceiling, so a proposer can be more conservative than consensus requires
+    # but never more permissive (a block over the consensus budget is invalid).
+    consensus_rule_budget = getattr(
+        chain_state._lifecycle_manager, "max_rule_txs_per_block", None
+    )
+    # isinstance rather than a None check: a stubbed lifecycle manager hands
+    # back a mock attribute, and silently comparing that against an int would
+    # break the round rather than the budget.
+    if not isinstance(consensus_rule_budget, int) or isinstance(consensus_rule_budget, bool):
+        consensus_rule_budget = None
+    slow_limit = getattr(config, "BLOCK_MAX_RULE_TXS", None)
+    if not isinstance(slow_limit, int) or isinstance(slow_limit, bool):
+        slow_limit = None
+    if consensus_rule_budget is not None:
+        slow_limit = (
+            consensus_rule_budget if slow_limit is None
+            else min(slow_limit, consensus_rule_budget)
+        )
+    reserved_txs = db.reserve_mempool_txs(limit=1000, slow_limit=slow_limit)
     print(f"[INFO][createblock] Reserved {len(reserved_txs)} entries from mempool")
 
     if not reserved_txs and not allow_empty:
@@ -346,6 +424,20 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
     # sequence order; restore per-sender ascending sequence within the
     # slots that sender occupies (global priority assignment preserved).
     _restore_per_sender_sequence_order(transactions, execution_transactions, filtered_reserved_ids)
+
+    # Lane quotas can leave a sender's LOWER-numbered transaction behind while
+    # including a higher one -- the fast lane takes seq 6 while seq 5 sits in
+    # the capped slow lane. The engine hard-rejects the gap
+    # (consensus/engine.py sequence check) and the transaction is disposed with
+    # the block, so drop such orphans here and let them wait for their
+    # predecessor instead.
+    _drop_sequence_gap_orphans(transactions, execution_transactions, filtered_reserved_ids)
+
+    if not transactions and not allow_empty:
+        msg = "Mempool has no contiguous-sequence txs; no block produced."
+        print(f"[INFO][createblock] {msg}")
+        db.unreserve_mempool_txs(reserved_ids)
+        return {"message": msg}
 
     # Fee model: the fee value is unknowable without Tau (consensus rules
     # emit it on o9). Never build a user_tx block on guessed fees.

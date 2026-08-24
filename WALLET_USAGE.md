@@ -193,6 +193,83 @@ balance, so a floor does not compound within a block. **Fee** rules (`o8`) still
 may not read `i2`: admission estimates it against the current head, so the fee
 charged at inclusion could differ from the estimate quoted to the sender.
 
+## Sharing Rules With Another User
+
+Besides deploying a rule on your own transaction (operation `"0"`), you can
+**send a rule to someone else**, who reviews it and either accepts it into their
+own specification or rejects it.
+
+```bash
+# Alice offers Bob a policy rule (expires 1000 blocks from the current tip)
+tau-testnet rule offer --key alice --to <bob_pubkey> --rule-file policy.tau
+
+# Bob lists what has been sent to him
+tau-testnet rule list --key bob --role in
+
+# Bob reads the full text, then checks conflict status
+tau-testnet rule show <offer_id>
+tau-testnet rule check <offer_id>
+
+# Bob accepts (the conflict report is printed first; --yes is required if it
+# reports warn or conflict) -- or rejects
+tau-testnet rule accept --key bob <offer_id>
+tau-testnet rule reject --key bob <offer_id>
+```
+
+### What an offered rule may contain
+
+An offered rule must be exactly one `always ( ... ).` unit that writes exactly
+one permitted output stream — `o5` (user policy) today. It must not:
+
+- reference `i12` — the node supplies your sender guard when it composes the
+  rule, and a rule that guards itself does not actually isolate you (see below);
+- write consensus-owned streams (`o0`–`o4`, `o6`–`o9`);
+- read `i2` (balance), which is mocked at apply time;
+- reference reserved input streams (`i13`–`i15`);
+- nest `always` / `sometimes`, or pack more than one unit.
+
+Size and rate bounds are fixed by consensus, not configuration: 8 KiB per rule,
+32 pending offers per recipient, 16 per offerer, and a 100 000-block maximum
+offer window.
+
+### How acceptance actually works
+
+Accepted rules do not simply get appended. The node keeps a registry of
+`(acceptor, target stream) -> clause` and re-emits **one composite rule per
+stream**, with each acceptor's clause behind a guard on their own public key and
+a neutral value (for `o5`: allow) for everyone else.
+
+This is not a stylistic choice. On the real engine an output stream that no
+clause constrains for a given sender still materializes with an arbitrary value
+— observed as `0`, which for `o5` means **block**. So a rule of the form
+`always ( (i12 = you) -> (o5 = 1) ).` would grant you your policy and block
+every *other* user's transfers. And two independently guarded rules on one
+stream do not compose: conjoined they are unsatisfiable, and applied one after
+another the later silently supersedes the earlier. The composite is the only
+shape that keeps each acceptor's policy in force without affecting anyone else.
+
+Practical consequences:
+
+- **Accepting replaces your own clause** on that stream. There is no separate
+  retraction; to change an accepted rule, accept a different offer.
+- An accept transaction repeats the offered `rule_text` **verbatim**. The node
+  recomputes the offer id from it, so reformatting the text invalidates the
+  accept. The CLI fetches the text from the node rather than retyping it.
+- Offers and accepts are fee-bearing.
+
+### Reading the conflict report
+
+`tau-testnet rule check <offer_id>` reports per layer: `shape`,
+`reserved_domains`, `registry_collision` (do you already have a clause on this
+stream, and who else does), `bv_widths`, and `compile` (does the *composed* rule
+parse and step).
+
+The report is **advisory and node-local** — it never gates a transaction. And
+satisfiability is **not** checked: tau-lang exposes `sat`/`unsat`/`valid` in C++
+but not through its Python bindings, so a logical contradiction cannot be
+detected at all. A clean report means *no conflict was observed*, not that none
+exists. Read the rule text before accepting it.
+
 ## Examples
 
 ### Example 1: User's Transaction with Rule and Transfer

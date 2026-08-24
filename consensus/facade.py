@@ -104,3 +104,85 @@ class TipAdmissionView:
                 (update_id, voter_pubkey)
             )
             return cur.fetchone() is not None
+
+    # --- Rule sharing -----------------------------------------------------
+    #
+    # Read from the persisted tables rather than the in-memory lifecycle
+    # manager: admission runs on RPC/gossip threads while block apply mutates
+    # the manager, and the tip tables are the same view every node has.
+
+    def get_offer_lifecycle_state(self, offer_id: str) -> Optional[str]:
+        """'offered', a terminal status, or None when the offer is unknown."""
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT status FROM rule_offers_v1 WHERE offer_id = ?", (offer_id,)
+            )
+            row = cur.fetchone()
+        return row[0] if row else None
+
+    def get_offer(self, offer_id: str) -> Optional[dict]:
+        """The full offer row, or None. Includes the node-local rule text."""
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT offer_id, offerer_pubkey, recipient_pubkey, rule_text, "
+                "expire_at_height, status FROM rule_offers_v1 WHERE offer_id = ?",
+                (offer_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "offer_id": row[0],
+            "offerer_pubkey": row[1],
+            "recipient_pubkey": row[2],
+            "rule_text": row[3],
+            "expire_at_height": int(row[4] or 0),
+            "status": row[5],
+        }
+
+    def pending_offers_for_recipient(self, recipient_pubkey: str) -> int:
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM rule_offers_v1 "
+                "WHERE recipient_pubkey = ? AND status = 'offered'",
+                (recipient_pubkey.lower(),),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def pending_offers_for_offerer(self, offerer_pubkey: str) -> int:
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM rule_offers_v1 "
+                "WHERE offerer_pubkey = ? AND status = 'offered'",
+                (offerer_pubkey.lower(),),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def clause_for(self, acceptor_pubkey: str, target_stream: int) -> Optional[str]:
+        """The acceptor's currently registered clause body for a stream."""
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT clause_body FROM rule_clauses_v1 "
+                "WHERE acceptor_pubkey = ? AND target_stream = ?",
+                (acceptor_pubkey.lower(), int(target_stream)),
+            )
+            row = cur.fetchone()
+        return row[0] if row else None
+
+    def clauses_for_stream(self, target_stream: int) -> dict:
+        """acceptor pubkey -> clause body, for composing a stream's rule."""
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT acceptor_pubkey, clause_body FROM rule_clauses_v1 "
+                "WHERE target_stream = ?",
+                (int(target_stream),),
+            )
+            return {row[0]: row[1] for row in cur.fetchall()}

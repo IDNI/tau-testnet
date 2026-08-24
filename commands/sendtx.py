@@ -15,6 +15,21 @@ import utils
 from errors import TauCommunicationError
 from consensus import fees
 from consensus.fees import FeeRuleError
+from consensus.lanes import classify_lane
+from consensus.rule_offers import (
+    TX_TYPE_RULE_OFFER,
+    TX_TYPE_RULE_OFFER_ACCEPT,
+    TX_TYPE_RULE_OFFER_REJECT,
+    RULE_OFFER_TX_TYPES,
+)
+
+# Every transaction type the node will admit. Governance types are fee-exempt
+# so validators never need funds to govern; the rule-sharing types are
+# user-initiated and expensive, so they pay like a user_tx does.
+KNOWN_TX_TYPES = frozenset(
+    {"user_tx", "consensus_rule_update", "consensus_rule_vote"} | set(RULE_OFFER_TX_TYPES)
+)
+FEE_BEARING_TX_TYPES = frozenset({"user_tx"} | set(RULE_OFFER_TX_TYPES))
 from db import add_mempool_tx
 from network import bus as network_bus
 import api_response
@@ -237,7 +252,18 @@ def _get_signing_message_bytes(payload: dict) -> bytes:
     elif tx_type == "consensus_rule_vote":
         signing_dict["update_id"] = payload.get("update_id")
         signing_dict["approve"] = payload.get("approve", True)
-        
+    elif tx_type == TX_TYPE_RULE_OFFER:
+        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
+        signing_dict["rule_text"] = payload.get("rule_text")
+        signing_dict["expire_at_height"] = payload.get("expire_at_height")
+    elif tx_type == TX_TYPE_RULE_OFFER_ACCEPT:
+        signing_dict["offer_id"] = payload.get("offer_id")
+        # The accepted text is signed: it is what actually enters the acceptor's
+        # specification, and the apply path re-derives offer_id from it.
+        signing_dict["rule_text"] = payload.get("rule_text")
+    elif tx_type == TX_TYPE_RULE_OFFER_REJECT:
+        signing_dict["offer_id"] = payload.get("offer_id")
+
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 
 
@@ -358,7 +384,7 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
         )
 
     tx_type = payload.get("tx_type", "user_tx")
-    if tx_type not in ("user_tx", "consensus_rule_update", "consensus_rule_vote"):
+    if tx_type not in KNOWN_TX_TYPES:
         return _qt_err(
             "TX_REJECTED",
             f"Unknown or legacy tx_type explicitly rejected natively: {tx_type}",
@@ -500,7 +526,62 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
     tau_force_test = tau_manager.is_force_test_enabled()
 
     try:
-        if tx_type == "user_tx":
+        if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RULE_OFFER_ACCEPT):
+            # Compile the COMPOSED rule, not the offered clause on its own.
+            # What actually enters the specification is the composite for the
+            # target stream with this acceptor's clause folded in, so that is
+            # the only text whose compilability tells us anything. Admission
+            # already built it (see consensus/admission._compose_with_clause).
+            composite_rule = (admission_eval.data or {}).get("composite_rule")
+            if composite_rule and not tau_force_test:
+                if tau_manager.tau_ready.is_set() and not getattr(
+                    tau_manager, "tau_test_mode", False
+                ):
+                    import tau_native
+                    try:
+                        # Same killable-subprocess gate as the op-"0" path
+                        # below, and for the same reason: the in-process
+                        # compile can hang inside native Tau with no status
+                        # stamp for the watchdog (issue #24). apply_block
+                        # re-compiles deterministically, so a rare skip here
+                        # cannot let an invalid rule take effect.
+                        compile_err = tau_native.compile_revisions_isolated_subprocess(
+                            chain_state.get_rules_state(),
+                            [composite_rule],
+                            timeout=config.COMM_TIMEOUT,
+                        )
+                    except tau_native.RuleCompileTimeout as compile_exc:
+                        logger.warning(
+                            "Rule offer compile timed out at admission: %s", compile_exc
+                        )
+                        return _qt_err(
+                            "ADMISSION_TIMEOUT",
+                            (
+                                f"Rule validation timed out after "
+                                f"{config.COMM_TIMEOUT}s and was rejected."
+                            ),
+                            timeout_seconds=config.COMM_TIMEOUT,
+                        )
+                    except tau_native.NativeTauUnavailable as compile_exc:
+                        logger.warning(
+                            "Isolated rule offer compile unavailable; rejecting: %s",
+                            compile_exc,
+                        )
+                        return _qt_err(
+                            "ADMISSION_UNAVAILABLE",
+                            "Rule validation is temporarily unavailable; please resubmit.",
+                        )
+                    if compile_err:
+                        return _qt_err(
+                            "TX_REJECTED",
+                            f"Transaction rejected by Tau (rule validation). {compile_err}",
+                        )
+                    logger.info(
+                        "Rule offer composite validated for o%s (isolated compile).",
+                        (admission_eval.data or {}).get("target_stream"),
+                    )
+
+        elif tx_type == "user_tx":
             # --- Tau Validation (Deterministic Two-Step) ---
 
             # Step 1: Rule Validation (if present)
@@ -753,11 +834,13 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                             )
                     logger.info("All Tau transfer validations successful.")
 
-            # Step 3b: Fee estimate for transfer-less user_tx — one
-            # fee-query step with the canonical mocked transfer inputs
-            # (mirrors the engine's apply-time convention).
+            # Step 3b: Fee estimate for any fee-bearing tx with no transfers —
+            # one fee-query step with the canonical mocked transfer inputs
+            # (mirrors the engine's apply-time convention). Covers the
+            # rule-sharing types, which are user-initiated and expensive and so
+            # pay like a user_tx, unlike the fee-exempt governance types.
             if (
-                tx_type == "user_tx"
+                tx_type in FEE_BEARING_TX_TYPES
                 and not all_validated_transfers
                 and not tau_force_test
                 and not skip_tau_eval
@@ -820,7 +903,7 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
         # block application; this layer is anti-spam. The estimate can
         # diverge only for fee rules that violate the documented
         # determinism constraint (i2/i3/i4 are mocked at apply time).
-        if tx_type == "user_tx":
+        if tx_type in FEE_BEARING_TX_TYPES:
             if estimated_fee_total > fee_limit_int:
                 return _qt_err(
                     "FEE_LIMIT_TOO_LOW",
@@ -876,7 +959,8 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
         db.add_mempool_tx(
             tx_canonical_blob, tx_message_id, received_at,
             fee_limit=fee_limit_int,
-            estimated_fee=estimated_fee_total if tx_type == "user_tx" else 0,
+            estimated_fee=estimated_fee_total if tx_type in FEE_BEARING_TX_TYPES else 0,
+            lane=classify_lane(payload),
         )
         logger.info("Transaction successfully queued in mempool.")
         if propagate:

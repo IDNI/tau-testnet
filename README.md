@@ -263,6 +263,14 @@ tau-testnet tx send --key alice --transfer <pk1>:5 --transfer <pk2>:3 --fee 10
 tau-testnet gov propose --key alice --file consensus_update.json
 tau-testnet gov vote --key alice --update-id <update_id_hex>
 
+# rule sharing (send a rule to another user; they review, then accept or reject)
+tau-testnet rule offer --key alice --to <recipient_pubkey> --rule-file policy.tau
+tau-testnet rule list --key bob --role in
+tau-testnet rule show <offer_id>
+tau-testnet rule check <offer_id>
+tau-testnet rule accept --key bob <offer_id>
+tau-testnet rule reject --key bob <offer_id>
+
 # target a remote node
 tau-testnet --host testnet.tau.net --port 65432 status
 ```
@@ -354,7 +362,7 @@ Defaults shown; set via environment or `tau-testnet node run` flags. **Bold** va
 | **`TAU_BLOCK_SIGNATURE_SCHEME`** | `bls_g2` | Block signature algorithm. |
 | `TAU_GOVERNANCE_OPEN_ADMISSION` | `false` | Allow non-validators into governance (keep off in public). |
 
-Operational extras: `TAU_MAX_MEMPOOL_TXS` (5000), `TAU_MAX_CONNECTIONS` (200), `TAU_RATE_LIMIT_PER_PEER` (2.0/s), `TAU_COMM_TIMEOUT` (60s; watchdog kills a stalled Tau), `TAU_WS_ALLOWED_ORIGINS`, `TAU_WS_CERT_PATH`/`TAU_WS_KEY_PATH` (WSS), `TAU_FORCE_FRESH_START` (crash recovery). See `config.py` for the full list.
+Operational extras: `TAU_MAX_MEMPOOL_TXS` (5000), `TAU_MEMPOOL_RULE_LANE_MAX_FRACTION` (0.1; slow-lane share of the mempool), `TAU_BLOCK_MAX_RULE_TXS` (8; proposer-side rule budget, never above the consensus ceiling), `TAU_MAX_CONNECTIONS` (200), `TAU_RATE_LIMIT_PER_PEER` (2.0/s), `TAU_COMM_TIMEOUT` (60s; watchdog kills a stalled Tau), `TAU_WS_ALLOWED_ORIGINS`, `TAU_WS_CERT_PATH`/`TAU_WS_KEY_PATH` (WSS), `TAU_FORCE_FRESH_START` (crash recovery). See `config.py` for the full list.
 
 ---
 
@@ -482,12 +490,82 @@ submitted ──(quorum reached)──> scheduled ──(height ≥ activate_at_
 - **Expiry** — a pending update whose `activate_at_height` arrives before quorum is archived, not activated.
 - **Safety** — a revision that fails to compile is rejected at admission (isolated staging compile) and again at activation; an activated rule emitting an invalid `o9` halts progress until further governance (see [Security & risk model](#security--risk-model)). Governance txs still require a valid signature, sequence, and expiration; they carry fee 0 and therefore sort **below** any paid user tx.
 
+## Rule sharing
+
+A user can send a Tau rule to another user, who reviews it and either accepts it into their own specification or rejects it. Three transaction types carry the lifecycle:
+
+| type | fields beyond the common five | lane |
+|---|---|---|
+| `rule_offer` | `recipient_pubkey`, `rule_text`, `expire_at_height` | slow |
+| `rule_offer_accept` | `offer_id`, `rule_text` (repeated verbatim) | slow |
+| `rule_offer_reject` | `offer_id` | fast |
+
+Offer identity is `offer_id = BLAKE3(offerer, recipient, rule_text, expire_at_height)` — sequence, fee and signature excluded, so the id is a property of the offer rather than of the transaction that carried it. All three types **pay fees** (governance's exemption exists so validators never need funds to govern, which does not apply here; the alternative is free rule spam).
+
+```
+                       ┌──────────────────────────────────────────┐
+   rule_offer          │                                          │
+  ────────────────▶ offered ──rule_offer_accept──▶ accepted ───────┤
+                       │                                          │ resolved set
+                       ├──rule_offer_reject──────▶ rejected  ──────┤ (bound into
+                       │                                          │  the state hash)
+                       └──height ≥ expire_at_height──▶ expired ────┘
+```
+
+### Whose specification does an accepted rule join?
+
+There is no per-user specification in the engine: accepted rules land in one global rule accumulation. The documented convention was that a user "scopes" a rule by guarding it on their own sender identity (`i12`). **That convention does not hold**, and measurements on the real engine (pinned by `tests/test_rule_scoping_native.py`) say why:
+
+1. An output stream that no clause constrains for a given input still **materializes**, with an arbitrary witness — observed as `0`, which for `o5` is exactly `USER_POLICY_BLOCK_VALUE`. So `always ( (i12 = A) -> (o5 = 1) ).` gives A its intended value and gives **everyone else** a materialized block. An implication guard is a network-wide transfer block, not isolation.
+2. Two total-form rules on the same stream do not compose: conjoined the spec is unsatisfiable and the interpreter fails to build; fed sequentially through `i0` the later one silently **supersedes** the earlier. So appending one guarded unit per user cannot work either.
+3. A single nested total-form unit does work, and applying it through `i0` is equivalent to building it conjoined — which is what makes a replaying node match a live one.
+
+So the **accepted-clause registry is the per-user specification**, and the node deterministically emits one composite rule unit per shared output stream:
+
+```
+always ( (i12[t]:bv[384] = { #x<acceptor_1> }:bv[384]) ? ( <body_1> )
+       : ( (i12[t]:bv[384] = { #x<acceptor_2> }:bv[384]) ? ( <body_2> )
+       : ( o5[t]:bv[24] = { #x000001 }:bv[24] ) ) ).
+```
+
+Acceptors are ordered by raw public-key bytes; the innermost else-branch is the stream's neutral value (`o5` → allow). Each composite **replaces** the previous one, so the live spec keeps exactly one unit per stream, and an empty registry emits nothing at all — so the stream is never mentioned and never materializes for anybody.
+
+Offered rules must therefore be exactly one `always ( ... ).` unit, with balanced parentheses, no nested temporal operator, no reference to `i12` (the node supplies the guard), and exactly one target output stream drawn from a permitted set (`o5` today). Consensus-owned streams (`o0`–`o4`, `o6`–`o9`), apply-time-mocked inputs (`i2`), and reserved input streams are refused.
+
+**Caveats.** There is no retraction: an acceptor changes an accepted rule by accepting a different offer on the same stream, which replaces their clause. Accepting is irreversible otherwise. Caps are frozen constants, not config, because a per-node value would let honest nodes disagree about admissibility: 8 KiB per rule, 32 pending offers per recipient, 16 per offerer, a 100 000-block maximum offer window, and 64 acceptors per stream.
+
+### Checking conflict status
+
+`getruleconflict <offer_id>` returns a layered report. It is **advisory and node-local** and never gates a transaction: it depends on process-local state (per-stream bitvector typing is process-global and sticky, and the shrink width derives from the node's own intern table), the engine build is explicitly unstable, and the cost is unbounded — binding it to block validity would turn a heavy rule into a chain halt.
+
+| layer | what it proves |
+|---|---|
+| `shape` | one `always` unit writing one permitted stream |
+| `reserved_domains` | does not write consensus-owned streams, read mocked inputs, or touch reserved inputs |
+| `registry_collision` | whether you already hold a clause on this stream (accepting **replaces** it), and who else holds one |
+| `bv_widths` | the same stream declared at two bitvector widths, compared statically so the live interpreter's typing is never touched |
+| `compile` | the **composed** rule parses and steps, in a killable subprocess |
+| `unrealizable` | **unavailable** — see below |
+
+Because each acceptor gets its own guarded branch of one composite, cross-user conflict is removed by construction, which is what makes `registry_collision` a decidable question rather than a guess.
+
+**Satisfiability is not checked.** tau-lang exposes `sat`/`unsat`/`valid`/`unrealizable` in its C++ API but not through its Python bindings, so a logical contradiction cannot be detected at all. A clean report means *no conflict was observed*, never *no conflict exists*.
+
+### State-hash binding
+
+The offer book and clause registry are folded into `consensus_meta.mechanism_specific_metadata` as `rule_offers_root` and `rule_clauses_root`, emitted **only while the book is non-empty** — the same hash-compat gate `eligibility_mode` uses. So genesis stays byte-identical and **no regenesis is required**; the first offer makes an un-upgraded node diverge loudly (state-hash mismatch, block rejected) rather than silently. The only coordination requirement is that nodes upgrade before the first offer lands. `rule_text` and an offer's terminal status are node-local durability for the read RPCs and are deliberately **not** hashed.
+
+Bounds and cap breaches at block apply are **soft no-ops** with a receipt log, so block validity stays a function of the block alone; only a Tau failure on the composed rule hard-rejects the transaction.
+
 ## Mempool policy
 
-- **Selection order** — `estimated_fee DESC, fee_limit DESC, received_at ASC`. Inflating `fee_limit` does not outrank a higher estimate.
+- **Lanes** — every tx is classified `fast` (coin transfers) or `slow` (anything carrying Tau rule text: `rule_offer`, `rule_offer_accept`, `consensus_rule_update`, or a `user_tx` with a non-empty `operations["0"]`). A `user_tx` carrying both a rule and transfers is `slow` — the signature covers the whole payload, so it cannot be split. Applying a rule recompiles a composite, whose cost climbs steeply with specification complexity, while a transfer is one cheap step; without separation a burst of rule work delays every queued transfer. Fee priority cannot express the split, because a rule emits its own `o8` user fee and can therefore price itself to the front of the queue.
+- **Selection order** — the fast lane is filled first, then the slow lane up to a quota. Within each lane the order is unchanged: `estimated_fee DESC, fee_limit DESC, received_at ASC`. Inflating `fee_limit` does not outrank a higher estimate. Selection is proposer-local policy — validators replay the stored block body order — so lane ordering cannot fork.
 - **Sequences** — admission checks projected (confirmed + pending) state; a sender may stack contiguous sequences, but a **gap is rejected**. There is **no replacement / RBF** — a stuck low-fee tx must expire or be evicted, not be replaced.
 - **Duplicates** — a repeat `tx_id` is idempotently ignored.
-- **Capacity & eviction** — at the cap the **oldest pending** tx is evicted (FIFO, fee-blind; reserved txs are never evicted). The cap is `TAU_MAX_MEMPOOL_TXS` (default 5000), enforced consistently on both the soft admission pre-check and the DB-layer eviction, each counting pending rows only.
+- **Capacity & eviction** — the cap is `TAU_MAX_MEMPOOL_TXS` (default 5000), enforced on both the soft admission pre-check and the DB-layer eviction, each counting pending rows only. Eviction is **quota-first**: the slow lane may hold at most `TAU_MEMPOOL_RULE_LANE_MAX_FRACTION` of the cap (default 0.1) and overflow inside it is evicted from its own rows, so a burst of rule transactions cannot evict queued fee-paying transfers. Otherwise the **oldest pending** tx is evicted (FIFO, fee-blind; reserved txs are never evicted).
+- **Per-block rule budget** — a block may carry at most `max_rule_txs_per_block` rule-sharing transactions (default 8, governance-patchable, bound into the state hash when non-default). This is **block validity**, not policy: without it a proposer could author a block every validator times out on. Legacy `operations["0"]` `user_tx` rules are deliberately not counted, so historical blocks still replay. A proposer may be more conservative via `TAU_BLOCK_MAX_RULE_TXS`, never more permissive.
+- **Sequence contiguity under quotas** — lane quotas can leave a sender's lower-numbered tx behind while including a higher one. The engine hard-rejects such a gap and the tx would be disposed with the block, so the builder defers the whole sender instead and it waits for its predecessor.
 - **Expiry** — expired txs are pruned opportunistically on insert (no background reaper).
 - **Persistence** — the mempool survives restart (same SQLite file) and is not re-validated on boot.
 - **Re-validation** — the proposer fully re-executes and re-validates every tx at block-build time, so admission is best-effort, not authoritative.
@@ -499,7 +577,9 @@ submitted ──(quorum reached)──> scheduled ──(height ≥ activate_at_
 - **Persistent blockchain & fork choice** — SQLite-backed chain, multiple competing tips, heaviest-valid-branch fork choice with deterministic tie-break, seamless reorgs (revert/re-apply state).
 - **P2P networking (libp2p)** — protocols: `handshake`, `ping`, `sync`, `blocks`, `tx`, `gossip`; gossip topics `tau/blocks/1.0.0` and `tau/transactions/1.0.0`; genesis-hash handshake gate; bootstrap retry/backoff; NAT announce addresses; DHT-backed state/provider records. Block numbers are **0-indexed**; sync decisions use `head_hash`, not just `head_number`.
 - **Authenticated transactions & blocks** — BLS12-381 signatures over canonical payloads ([details](#cryptography--signatures)); transactions carry per-account sequence numbers (replay protection) and expiration; blocks carry a proposer signature verified before they affect the head. Signatures are **not yet domain-separated across networks** — see the replay-risk note in [Cryptography & signatures](#cryptography--signatures).
-- **Typed transactions** — `user_tx`, `consensus_rule_update`, `consensus_rule_vote`; common fields `sender_pubkey`, `sequence_number`, `expiration_time`, `fee_limit`, `signature`.
+- **Typed transactions** — `user_tx`, `consensus_rule_update`, `consensus_rule_vote`, `rule_offer`, `rule_offer_accept`, `rule_offer_reject`; common fields `sender_pubkey`, `sequence_number`, `expiration_time`, `fee_limit`, `signature`.
+- **Rule sharing** — send a Tau rule to another user, who checks its conflict status and then accepts it into their own specification or rejects it. See [Rule sharing](#rule-sharing).
+- **Transaction lanes** — coin transfers and rule-bearing transactions are selected, evicted and gossiped under separate quotas, so rule work cannot delay transfers. See [Mempool policy](#mempool-policy).
 - **Hardening** — block proposer-signature verification, governance vote-quorum bound into the state hash, consensus-enforced activation delay, genesis-hash handshake gate; SQLite WAL + busy timeout, refuse-to-start on schema drift (no silent data loss), mempool size cap + expiry pruning, admission size limits, production guards on dev/test flags.
 
 ### DHT configuration & gossip health
@@ -530,7 +610,7 @@ Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSoc
 
 - `status` is `"ok"` or `"error"`; `command` echoes the request; `data` on success, `error.code`/`error.message`(+`details`) on failure.
 - Types: addresses/hashes/IDs and token amounts are **strings** (overflow-safe); counts/heights/sequence numbers are integers; timestamps are ISO 8601 strings.
-- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `BLS_UNAVAILABLE`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `DUPLICATE_UPDATE`, `UNSCOPED_USER_RULE`, `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
+- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `BLS_UNAVAILABLE`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `DUPLICATE_UPDATE`, `UNSCOPED_USER_RULE`, `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
 - `DUPLICATE_UPDATE` carries `details.update_id` and `details.lifecycle_state`, so a
   wallet retrying a `consensus_rule_update` can tell "already landed" from a real
   rejection. `ADMISSION_TIMEOUT` / `ADMISSION_UNAVAILABLE` mean the isolated rule

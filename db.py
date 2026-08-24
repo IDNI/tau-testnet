@@ -8,6 +8,7 @@ from contextlib import contextmanager
 
 import config
 import block as block_module
+from consensus.lanes import LANE_FAST, LANE_SLOW, classify_lane_payload
 from errors import DatabaseError
 
 
@@ -280,6 +281,45 @@ def init_db():
                     update_id TEXT PRIMARY KEY
                 );
             ''')
+            # Rule sharing. Additive tables: SCHEMA_VERSION stays put, since a
+            # bump makes init_db refuse to start and forces every live node to
+            # delete its database.
+            #
+            # The consensus-bound part of an offer is (offer_id, offerer,
+            # recipient, expire_at_height) plus membership of the resolved set.
+            # `rule_text` and `status` are node-local durability for the RPC
+            # surface: they are re-derivable by replay and are NOT folded into
+            # consensus_meta_hash, mirroring how governance update payloads are
+            # persisted.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_offers_v1 (
+                    offer_id           TEXT PRIMARY KEY,
+                    offerer_pubkey     TEXT NOT NULL,
+                    recipient_pubkey   TEXT NOT NULL,
+                    rule_text          TEXT NOT NULL,
+                    expire_at_height   INTEGER NOT NULL,
+                    status             TEXT NOT NULL DEFAULT 'offered'
+                );
+            ''')
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rule_offers_recipient_status "
+                "ON rule_offers_v1(recipient_pubkey, status);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rule_offers_offerer_status "
+                "ON rule_offers_v1(offerer_pubkey, status);"
+            )
+            # The accepted-clause registry: this IS the per-user specification,
+            # and its root is bound into the state hash. One clause per
+            # (acceptor, target stream); accepting again replaces it.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_clauses_v1 (
+                    acceptor_pubkey TEXT NOT NULL,
+                    target_stream   INTEGER NOT NULL,
+                    clause_body     TEXT NOT NULL,
+                    PRIMARY KEY (acceptor_pubkey, target_stream)
+                );
+            ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -370,10 +410,37 @@ def init_db():
                         conn.execute(
                             f"ALTER TABLE mempool ADD COLUMN {fee_col} INTEGER NOT NULL DEFAULT 0;"
                         )
+
+            # Lane separation. `lane` is a materialised cache of the pure
+            # function consensus.lanes.classify_lane, used only for indexing
+            # and quotas; `sender_pubkey` turns get_pending_sequence from a
+            # full-table scan with a json.loads per row into an index lookup.
+            cols_info = {row[1] for row in conn.execute("PRAGMA table_info(mempool);").fetchall()}
+            lane_added = "lane" not in cols_info
+            if lane_added:
+                conn.execute(
+                    "ALTER TABLE mempool ADD COLUMN lane INTEGER NOT NULL DEFAULT 0;"
+                )
+            sender_added = "sender_pubkey" not in cols_info
+            if sender_added:
+                conn.execute("ALTER TABLE mempool ADD COLUMN sender_pubkey TEXT;")
+            if lane_added or sender_added:
+                # One-shot backfill. DEFAULT 0 alone would misfile every
+                # pre-existing rule transaction into the fast lane, letting it
+                # keep competing with transfers for the same slots.
+                _backfill_mempool_lanes(conn)
+
             conn.execute('''
                 CREATE INDEX IF NOT EXISTS idx_mempool_pending_order
                 ON mempool(status, estimated_fee DESC, received_at ASC);
             ''')
+            conn.execute('''
+                CREATE INDEX IF NOT EXISTS idx_mempool_lane_order
+                ON mempool(status, lane, estimated_fee DESC, received_at ASC);
+            ''')
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mempool_sender ON mempool(sender_pubkey);"
+            )
 
             conn.execute('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);')
             row = conn.execute('SELECT version FROM schema_version LIMIT 1').fetchone()
@@ -467,8 +534,57 @@ def get_text_by_id(yid: str) -> str:
         else:
             raise KeyError(f"No text found for Tau ID: {yid}")
 
+def _slow_lane_cap(total_cap: int) -> int:
+    """How many pending slow-lane transactions the mempool will hold.
+
+    A fraction of the total cap rather than an absolute count, so it tracks
+    however the operator sized the mempool. At least 1, so the slow lane is
+    never completely closed.
+    """
+    fraction = getattr(config, "MEMPOOL_RULE_LANE_MAX_FRACTION", 0.1)
+    try:
+        fraction = float(fraction)
+    except (TypeError, ValueError):
+        fraction = 0.1
+    fraction = min(max(fraction, 0.0), 1.0)
+    return max(1, int(total_cap * fraction))
+
+
+def _sender_of_payload(payload: str) -> Optional[str]:
+    """Sender public key from a mempool payload, or None if unreadable."""
+    try:
+        sender = json.loads(payload).get("sender_pubkey")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return sender if isinstance(sender, str) else None
+
+
+def _backfill_mempool_lanes(conn) -> None:
+    """Populate `lane`/`sender_pubkey` for rows written before the columns
+    existed. Exception-safe: this runs inside init_db, so a failure here must
+    not stop the node from starting -- a mis-filed row costs a quota slot, not
+    correctness.
+    """
+    try:
+        rows = conn.execute("SELECT id, payload FROM mempool").fetchall()
+    except sqlite3.Error:
+        logger.warning("Could not read mempool for lane backfill", exc_info=True)
+        return
+    for row_id, payload in rows:
+        try:
+            conn.execute(
+                "UPDATE mempool SET lane = ?, sender_pubkey = ? WHERE id = ?",
+                (classify_lane_payload(payload), _sender_of_payload(payload), row_id),
+            )
+        except sqlite3.Error:
+            logger.warning("Skipping lane backfill for mempool row %s", row_id, exc_info=True)
+    if rows:
+        logger.info("Backfilled transaction lanes for %d mempool rows", len(rows))
+
+
 def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
-                   fee_limit: int = 0, estimated_fee: int = 0):
+                   fee_limit: int = 0, estimated_fee: int = 0,
+                   lane: int | None = None):
     """Adds data to the mempool. Prefixes with 'json:' if it looks like JSON."""
     if _db_conn is None:
         init_db()
@@ -483,6 +599,11 @@ def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
     payload = tx_data
     if payload.startswith("json:"):
         payload = payload[5:]
+
+    # Derived here as well as passed in, so any caller that predates lanes
+    # still files its row correctly rather than defaulting into the fast lane.
+    row_lane = classify_lane_payload(payload) if lane is None else int(lane)
+    row_sender = _sender_of_payload(payload)
 
     with _db_lock:
         cur = _db_conn.cursor()
@@ -529,28 +650,65 @@ def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
         # Count pending-only (matching count_mempool_txs / the soft sendtx pre-check) so the
         # configured limit means the same thing on both the soft and hard paths.
         cap = _configured_mempool_max()
-        pending = cur.execute("SELECT COUNT(*) FROM mempool WHERE status='pending'").fetchone()[0]
-        if pending >= cap:
-            overflow = pending - cap + 1
+        def _evict(overflow: int, lane: Optional[int]) -> None:
+            """Drop `overflow` oldest pending rows, optionally within one lane."""
+            if overflow <= 0:
+                return
+            lane_clause = "" if lane is None else " AND lane = ?"
+            params = (lane, overflow) if lane is not None else (overflow,)
             evicted_hashes = [
                 r[0] for r in cur.execute(
-                    "SELECT tx_hash FROM mempool WHERE status='pending' "
-                    "ORDER BY received_at ASC LIMIT ?",
-                    (overflow,),
+                    "SELECT tx_hash FROM mempool WHERE status='pending'"
+                    + lane_clause + " ORDER BY received_at ASC LIMIT ?",
+                    params,
                 ).fetchall()
             ]
+            if not evicted_hashes:
+                return
             cur.execute(
                 "DELETE FROM mempool WHERE id IN ("
-                "SELECT id FROM mempool WHERE status='pending' ORDER BY received_at ASC LIMIT ?)",
-                (overflow,),
+                "SELECT id FROM mempool WHERE status='pending'" + lane_clause
+                + " ORDER BY received_at ASC LIMIT ?)",
+                params,
             )
             _record_dropped_locked(cur, evicted_hashes, "evicted", now_ms)
 
+        # Quota-first eviction. The slow lane gets a bounded share of the
+        # mempool, and overflow inside it is evicted from ITS OWN rows. Plain
+        # global FIFO would let a burst of rule transactions evict queued,
+        # fee-paying transfers -- the exact starvation the lanes exist to
+        # prevent.
+        slow_cap = _slow_lane_cap(cap)
+        slow_pending = cur.execute(
+            "SELECT COUNT(*) FROM mempool WHERE status='pending' AND lane = ?",
+            (LANE_SLOW,),
+        ).fetchone()[0]
+        if row_lane == LANE_SLOW and slow_pending >= slow_cap:
+            _evict(slow_pending - slow_cap + 1, LANE_SLOW)
+        elif slow_pending > slow_cap:
+            # Cap lowered under an existing backlog: trim it before considering
+            # the global cap, so the slow lane cannot hold the fast lane out.
+            _evict(slow_pending - slow_cap, LANE_SLOW)
+
+        pending = cur.execute("SELECT COUNT(*) FROM mempool WHERE status='pending'").fetchone()[0]
+        if pending >= cap:
+            overflow = pending - cap + 1
+            # Prefer trimming the slow lane if it is over quota; otherwise fall
+            # back to global oldest-first, matching the historical behaviour.
+            slow_pending = cur.execute(
+                "SELECT COUNT(*) FROM mempool WHERE status='pending' AND lane = ?",
+                (LANE_SLOW,),
+            ).fetchone()[0]
+            slow_excess = min(overflow, max(0, slow_pending - slow_cap))
+            _evict(slow_excess, LANE_SLOW)
+            _evict(overflow - slow_excess, None)
+
         # Idempotency: INSERT OR IGNORE
         cur.execute('''
-            INSERT OR IGNORE INTO mempool (tx_hash, payload, received_at, status, fee_limit, estimated_fee)
-            VALUES (?, ?, ?, 'pending', ?, ?)
-        ''', (tx_hash, payload, received_at, int(fee_limit), int(estimated_fee)))
+            INSERT OR IGNORE INTO mempool (tx_hash, payload, received_at, status, fee_limit, estimated_fee, lane, sender_pubkey)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
+        ''', (tx_hash, payload, received_at, int(fee_limit), int(estimated_fee),
+              int(row_lane), row_sender))
         _db_conn.commit()
         
 def count_mempool_txs() -> int:
@@ -574,13 +732,27 @@ def get_pending_sequence(sender_pubkey: str) -> Optional[int]:
     max_seq = None
     with _db_lock:
         cur = _db_conn.cursor()
-        # Every mempool row counts. Today the table only ever holds 'pending' and
-        # 'reserved' (both not-yet-mined), so no status filter is needed — but a
-        # future status that is NOT admission-validated must be excluded here, or
-        # it would bump a sender's expected sequence number.
-        cur.execute('SELECT payload FROM mempool')
-        
-        for (payload,) in cur.fetchall():
+        # Narrowed by the indexed sender_pubkey column instead of scanning the
+        # whole table and json.loads-ing every row. That scan ran once per
+        # sendtx while holding the single global DB lock, and cost tens of
+        # milliseconds at a full mempool -- more with large rule payloads.
+        #
+        # Rows written before the column existed have it NULL; they are picked
+        # up by the fallback below so the answer stays correct on an upgraded
+        # database whose backfill could not run.
+        rows = cur.execute(
+            'SELECT payload FROM mempool WHERE sender_pubkey = ?',
+            (sender_pubkey,),
+        ).fetchall()
+        legacy = cur.execute(
+            'SELECT payload FROM mempool WHERE sender_pubkey IS NULL'
+        ).fetchall()
+
+        # Deliberately covers every status: a tx already reserved for a block,
+        # or awaiting validation, still owns its sequence number. A future
+        # status that is NOT admission-validated must be excluded here, or it
+        # would bump a sender's expected sequence number.
+        for (payload,) in list(rows) + list(legacy):
             try:
                 data = json.loads(payload)
                 if data.get('sender_pubkey') == sender_pubkey:
@@ -590,8 +762,38 @@ def get_pending_sequence(sender_pubkey: str) -> Optional[int]:
                             max_seq = seq
             except Exception:
                 continue
-                
+
     return max_seq
+
+
+def get_min_pending_sequence(sender_pubkey: str) -> Optional[int]:
+    """Lowest sequence number this sender has waiting in the mempool.
+
+    Used by the block builder to detect a sequence GAP: lane quotas can leave a
+    sender's lower-numbered transaction behind while including a higher one,
+    which the engine then hard-rejects for a sequence mismatch.
+    """
+    if _db_conn is None:
+        init_db()
+
+    min_seq = None
+    with _db_lock:
+        cur = _db_conn.cursor()
+        rows = cur.execute(
+            'SELECT payload FROM mempool WHERE sender_pubkey = ? OR sender_pubkey IS NULL',
+            (sender_pubkey,),
+        ).fetchall()
+        for (payload,) in rows:
+            try:
+                data = json.loads(payload)
+                if data.get('sender_pubkey') != sender_pubkey:
+                    continue
+                seq = data.get('sequence_number')
+                if isinstance(seq, int) and (min_seq is None or seq < min_seq):
+                    min_seq = seq
+            except Exception:
+                continue
+    return min_seq
 
 # --- Dropped-tx audit (issue #11: gettxstatus) ---
 _DROPPED_TTL_MS = 24 * 60 * 60 * 1000  # keep drop records ~24h
@@ -831,12 +1033,25 @@ def get_mempool_entries() -> List[Dict]:
             for row in cur.fetchall()
         ]
 
-def reserve_mempool_txs(limit: int = 1000, max_age_seconds: int = 60) -> List[Dict]:
+def reserve_mempool_txs(limit: int = 1000, max_age_seconds: int = 60,
+                        slow_limit: int | None = None) -> List[Dict]:
     """
-    Selects pending transactions from the mempool (FIFO by received_at)
-    AND releases stale reservations (older than max_age_seconds).
-    
-    Returns a list of dicts: {'id': int, 'tx_hash': str, 'payload': str}
+    Selects pending transactions from the mempool AND releases stale
+    reservations (older than max_age_seconds).
+
+    Selection is LANE-AWARE. The fast lane (coin transfers) is filled first,
+    then the slow lane (rule-bearing transactions) up to `slow_limit`. Without
+    a quota a burst of rule work occupies the whole block and every queued
+    transfer waits for it -- and fee priority cannot fix that, because a rule
+    emits its own o8 user fee and can therefore price itself to the front of
+    the queue. Ordering WITHIN each lane is unchanged, so the existing
+    determinism and fee-priority properties still hold.
+
+    `slow_limit=None` means no cap, preserving the pre-lane behaviour for
+    callers that have no per-block budget of their own.
+
+    Returns a list of dicts: {'id': int, 'tx_hash': str, 'payload': str},
+    fast-lane rows first, at most `limit` in total.
     """
     import uuid
     import time
@@ -863,18 +1078,36 @@ def reserve_mempool_txs(limit: int = 1000, max_age_seconds: int = 60) -> List[Di
         if released > 0:
             logger.info("Released %s stale mempool reservations", released)
 
-        # 2. Select pending
+        # 2. Select pending, fast lane first.
         # Fee priority: highest admission-time fee estimate first (declared
         # fee_limit alone is free to inflate, so it only tie-breaks), then
         # arrival order, then id for full determinism.
-        cur.execute('''
-            SELECT id, tx_hash, payload FROM mempool
-            WHERE status = 'pending'
-            ORDER BY estimated_fee DESC, fee_limit DESC, received_at ASC, id ASC
-            LIMIT ?
-        ''', (limit,))
-        rows = cur.fetchall()
-        
+        _LANE_ORDER = (
+            "ORDER BY estimated_fee DESC, fee_limit DESC, received_at ASC, id ASC"
+        )
+
+        def _select(lane: int, count: int):
+            if count <= 0:
+                return []
+            return cur.execute(
+                "SELECT id, tx_hash, payload FROM mempool "
+                "WHERE status = 'pending' AND lane = ? " + _LANE_ORDER + " LIMIT ?",
+                (lane, count),
+            ).fetchall()
+
+        fast_rows = _select(LANE_FAST, limit)
+        slow_budget = limit - len(fast_rows)
+        if slow_limit is not None:
+            slow_budget = min(slow_budget, int(slow_limit))
+        slow_rows = _select(LANE_SLOW, slow_budget)
+
+        # Fast lane first so the block body puts transfers ahead of rule work.
+        # Selection is proposer-local policy -- validators replay the stored
+        # body order -- so this cannot fork; it is the same kind of choice as
+        # fee ordering. commands/createblock then restores per-sender sequence
+        # order within the slots each sender occupies.
+        rows = list(fast_rows) + list(slow_rows)
+
         if not rows:
             return []
             
@@ -1195,7 +1428,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
     """
@@ -1315,6 +1548,95 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                     'INSERT INTO consensus_archival (update_id) VALUES (?)',
                     (uid,)
                 )
+
+            # Rule sharing, same full-replace semantics and same transaction as
+            # accounts. Both must be written here: the offer book and clause
+            # registry are bound into consensus_meta_hash, so a node whose
+            # in-memory managers disagree with disk computes a different state
+            # hash after a restart than a peer replaying from genesis.
+            if rule_offers is not None:
+                _db_conn.execute('DELETE FROM rule_offers_v1')
+                for offer in rule_offers:
+                    _db_conn.execute(
+                        'INSERT OR REPLACE INTO rule_offers_v1 '
+                        '(offer_id, offerer_pubkey, recipient_pubkey, rule_text, '
+                        'expire_at_height, status) VALUES (?, ?, ?, ?, ?, ?)',
+                        (
+                            offer['offer_id'],
+                            offer.get('offerer_pubkey', ''),
+                            offer.get('recipient_pubkey', ''),
+                            offer.get('rule_text', ''),
+                            int(offer.get('expire_at_height', 0)),
+                            offer.get('status', 'offered'),
+                        )
+                    )
+
+            if rule_clauses is not None:
+                _db_conn.execute('DELETE FROM rule_clauses_v1')
+                for clause in rule_clauses:
+                    _db_conn.execute(
+                        'INSERT OR REPLACE INTO rule_clauses_v1 '
+                        '(acceptor_pubkey, target_stream, clause_body) VALUES (?, ?, ?)',
+                        (
+                            clause['acceptor_pubkey'],
+                            int(clause['target_stream']),
+                            clause['clause_body'],
+                        )
+                    )
+
+            if max_rule_txs_per_block is not None:
+                # Governance-activated value; persisted verbatim so a reload
+                # reproduces the same per-block budget as a from-genesis replay.
+                _db_conn.execute(
+                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+                    ('max_rule_txs_per_block', str(int(max_rule_txs_per_block)))
+                )
+
+
+def load_rule_offers() -> List[Dict]:
+    """Rows of the persisted offer book, newest-status agnostic.
+
+    Deliberately a standalone loader rather than another element of
+    load_chain_state's already-wide tuple return.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT offer_id, offerer_pubkey, recipient_pubkey, rule_text, '
+            'expire_at_height, status FROM rule_offers_v1'
+        )
+        return [
+            {
+                'offer_id': row[0],
+                'offerer_pubkey': row[1],
+                'recipient_pubkey': row[2],
+                'rule_text': row[3],
+                'expire_at_height': int(row[4] or 0),
+                'status': row[5],
+            }
+            for row in cur.fetchall()
+        ]
+
+
+def load_rule_clauses() -> List[Dict]:
+    """Rows of the persisted accepted-clause registry."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT acceptor_pubkey, target_stream, clause_body FROM rule_clauses_v1'
+        )
+        return [
+            {
+                'acceptor_pubkey': row[0],
+                'target_stream': int(row[1]),
+                'clause_body': row[2],
+            }
+            for row in cur.fetchall()
+        ]
 
 def get_candidate_heads() -> List[tuple[str, int]]:
     """
