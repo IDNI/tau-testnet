@@ -26,6 +26,18 @@ from consensus.rule_offers import (
     parse_rule_offer_reject,
 )
 from consensus.facade import TipAdmissionView
+from consensus.approvals import (
+    MAX_PENDING_REQUESTS_PER_APPROVER,
+    approval_slots_active,
+    MAX_PENDING_REQUESTS_PER_SENDER,
+    STATUS_OPEN,
+    TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_TRANSFER_VOTE,
+    parse_approval_request,
+    parse_transfer_vote,
+    screen_slot_widths,
+    validate_request_shape,
+)
 from consensus.governance import (
     normalize_validator_delta,
     normalize_validator_set,
@@ -157,9 +169,17 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         )
 
     # Which operation keys are reserved depends on the eligibility mode in force
-    # (i13 only under tau_validator_set). getattr keeps the legacy contract where
+    # (i13 only under tau_validator_set) and on whether approval slots have been
+    # activated (i18..i25 only then). getattr keeps the legacy contract where
     # callers that only exercise the static screens may pass no tip view at all.
-    reserved_ops = tau_defs.reserved_operation_keys(getattr(tip_view, "eligibility_mode", ""))
+    #
+    # The slot reservation is what makes a co-signature unforgeable: without it a
+    # sender could put "18" in `operations` and write their own approval.
+    slots_active = approval_slots_active(tip_view)
+    reserved_ops = tau_defs.reserved_operation_keys(
+        getattr(tip_view, "eligibility_mode", ""),
+        approval_slots_active=slots_active,
+    )
 
     for key, val in operations.items():
         if not str(key).isdigit():
@@ -181,7 +201,9 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
             return format_error(
                 f"Invalid operation target '{key}'. Stream {idx} is reserved "
                 f"(i12 sender pubkey; i14/i15 consensus stake/mode inputs; "
-                f"i13 consensus proposer pubkey under tau_validator_set)."
+                f"i13 consensus proposer pubkey under tau_validator_set; "
+                f"i18-i25 co-signature approval slots, which only the node may "
+                f"write)."
             )
 
     # Screen user rule TEXT for reserved streams. Comment-stripped and
@@ -228,8 +250,14 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
             )
         # Same reserved set as the operations screen above, minus i12: READING the
         # sender pubkey is how a policy rule scopes itself, only WRITING it as an
-        # operation is forbidden.
-        typed_reserved = tuple(f"i{idx}" for idx in reserved_ops if idx != 12)
+        # operation is forbidden. Approval slots stay forbidden here -- a plain
+        # user_tx rule is not a registered o5 clause, and letting one type a slot
+        # would pin a width process-wide outside the clause screen's control.
+        typed_reserved = tau_defs.rule_text_forbidden_input_streams(
+            tau_defs.RULE_TEXT_CONTEXT_USER,
+            tip_view.eligibility_mode,
+            approval_slots_active=slots_active,
+        )
         typed_reserved_in = _streams_referenced(rule_text, typed_reserved)
         if typed_reserved_in:
             return format_error(
@@ -710,16 +738,19 @@ def _screen_clause_domains(body: str) -> Optional[str]:
         )
 
     # i12 is excluded: the node supplies the sender guard, and clause_body_v1
-    # already rejects a clause that references it itself.
+    # already rejects a clause that references it itself. Approval slots are
+    # excluded too -- reading them is the whole point of a co-signature policy --
+    # but they get a stricter width check instead, below.
     #
     # The widest reserved set is screened regardless of the tip's current
-    # eligibility mode. A clause outlives the mode that was active when it was
-    # accepted, so admitting one that types i13 under validator_set would turn
-    # into a reserved-stream collision the moment governance switches to
-    # tau_validator_set.
-    reserved_inputs = tuple(
-        f"i{idx}" for idx in tau_defs.reserved_operation_keys("tau_validator_set")
-        if idx != 12
+    # eligibility mode, AND regardless of whether approval slots are active. A
+    # clause outlives the mode that was active when it was accepted, so admitting
+    # one that types i13 under validator_set would turn into a reserved-stream
+    # collision the moment governance switches to tau_validator_set.
+    reserved_inputs = tau_defs.rule_text_forbidden_input_streams(
+        tau_defs.RULE_TEXT_CONTEXT_O5_CLAUSE,
+        "tau_validator_set",
+        approval_slots_active=True,
     )
     typed = _streams_referenced(body, reserved_inputs)
     if typed:
@@ -727,6 +758,15 @@ def _screen_clause_domains(body: str) -> Optional[str]:
             "Shared rules may not reference reserved input streams: "
             + ", ".join(typed)
         )
+
+    # Approval slots may be read, but every occurrence must be typed bv[384].
+    # Per-stream bitvector typing is process-global and sticky, so one clause
+    # typing i18 at bv[384] and another at bv[24] leaves get_interpreter
+    # returning None for everyone. Reject-unless-annotated, because an
+    # unannotated mention is exactly what lets the engine infer another width.
+    slot_error = screen_slot_widths(body)
+    if slot_error:
+        return "Shared rules: " + slot_error
     return None
 
 
@@ -802,6 +842,143 @@ def validate_rule_offer_decision_payload(
     })
 
 
+
+# --- Co-signature approvals --------------------------------------------------
+
+def _approvals_inactive_error() -> AdmissionResult:
+    return format_error(
+        "Co-signature approval requests are not active on this chain. The "
+        "feature activates by governance patch (approval_slots_active), which "
+        "reserves the i18-i25 approval slots.",
+        code="FEATURE_INACTIVE",
+    )
+
+
+def validate_approval_request_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for parking a transfer pending co-signatures.
+
+    Deliberately does NOT decide whether the sender's own o5 clause actually
+    blocks this amount: that needs a Tau evaluation, which happens on the sendtx
+    path where the per-transfer step already runs. This function is the
+    deterministic, Tau-free part, and it is shared with block apply through
+    `validate_request_shape`.
+    """
+    if not approval_slots_active(tip_view):
+        return _approvals_inactive_error()
+
+    request = parse_approval_request(tx)
+    if request is None:
+        return format_error(
+            "Malformed approval_request: needs recipient_pubkey, amount, "
+            "expire_at_height, and an approvers map of slot -> 96-hex pubkey."
+        )
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender.strip().lower() != request.sender_pubkey:
+        return format_error("approval_request sender_pubkey must match the signer.")
+
+    # Stateless shape, byte-identical to what block apply applies.
+    shape_error = validate_request_shape(request, tip_view.next_block_height)
+    if shape_error:
+        return format_error(f"approval_request rejected: {shape_error}")
+
+    request_id_hex = request.request_id_hex
+    if tip_view.get_approval_request(request_id_hex) is not None:
+        return format_error(
+            "Duplicate approval_request (same sender, recipient, amount, "
+            "sequence, expiry and approver set).",
+            code="DUPLICATE_REQUEST",
+        )
+
+    if tip_view.open_requests_for_sender(request.sender_pubkey) >= MAX_PENDING_REQUESTS_PER_SENDER:
+        return format_error(
+            f"Sender already has {MAX_PENDING_REQUESTS_PER_SENDER} open approval "
+            "requests.",
+            code="TOO_MANY_REQUESTS",
+        )
+    for approver in sorted(request.approvers.values()):
+        if tip_view.open_requests_for_approver(approver) >= MAX_PENDING_REQUESTS_PER_APPROVER:
+            return format_error(
+                f"Approver {approver[:10]}... already has "
+                f"{MAX_PENDING_REQUESTS_PER_APPROVER} open approval requests.",
+                code="TOO_MANY_REQUESTS",
+            )
+
+    return success({
+        "request_id": request_id_hex,
+        "amount": request.amount,
+        "recipient_pubkey": request.recipient_pubkey,
+        "approvers": dict(request.approvers),
+        "custom_inputs": dict(request.custom_inputs),
+        "expire_at_height": request.expire_at_height,
+    })
+
+
+def validate_transfer_vote_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for one approver's vote on a parked transfer.
+
+    Feeless like a governance vote, so the bounds here are the whole defence:
+    the request must be open, the signer must be one of ITS declared approvers,
+    and each approver votes at most once.
+    """
+    if not approval_slots_active(tip_view):
+        return _approvals_inactive_error()
+
+    vote = parse_transfer_vote(tx)
+    if vote is None:
+        return format_error(
+            "Malformed transfer_vote: needs a 32-byte hex request_id and a "
+            "boolean approve (1/0 is rejected: a wallet bug must not turn a "
+            "decline into an approval)."
+        )
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender.strip().lower() != vote.voter_pubkey:
+        return format_error("transfer_vote sender_pubkey must match the signer.")
+
+    row = tip_view.get_approval_request(vote.request_id_hex)
+    if row is None:
+        return format_error("Unknown approval request.", code="UNKNOWN_REQUEST")
+    if int(row.get("status", STATUS_OPEN)) != STATUS_OPEN:
+        return format_error(
+            "Approval request is already resolved.", code="REQUEST_RESOLVED"
+        )
+
+    # Checked here AND in the apply branch: process_height_transitions runs after
+    # the transaction loop, so the expiry sweep cannot be relied on to stop a
+    # vote included at exactly the expiry height.
+    if int(row.get("expire_at_height", 0)) <= tip_view.next_block_height:
+        return format_error("Approval request has expired.", code="REQUEST_EXPIRED")
+
+    approvers = {int(k): str(v).lower() for k, v in (row.get("approvers") or {}).items()}
+    slot = next((s for s, pk in sorted(approvers.items()) if pk == vote.voter_pubkey), None)
+    if slot is None:
+        # The declared approver list IS the tier scoping: an account the sender
+        # did not name for this amount has nothing to say about it.
+        return format_error(
+            "Only an approver declared on this request may vote on it.",
+            code="NOT_AN_APPROVER",
+        )
+
+    voted = {int(k) for k in (row.get("voted") or {})}
+    declined = {int(d) for d in (row.get("declined") or [])}
+    if slot in voted or slot in declined:
+        return format_error(
+            "This approver has already voted on this request.",
+            code="ALREADY_VOTED",
+        )
+
+    return success({
+        "request_id": vote.request_id_hex,
+        "slot": slot,
+        "approve": vote.approve,
+    })
+
+
 def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """
     Primary Orchestrator Endpoint for Network Admission logic.
@@ -838,6 +1015,12 @@ def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> Adm
 
     elif tx_type == TX_TYPE_RULE_OFFER_REJECT:
          return validate_rule_offer_decision_payload(payload, tip_view, accept=False)
+
+    elif tx_type == TX_TYPE_APPROVAL_REQUEST:
+         return validate_approval_request_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_TRANSFER_VOTE:
+         return validate_transfer_vote_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

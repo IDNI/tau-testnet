@@ -99,6 +99,20 @@ class ApprovalShapeError(ValueError):
     """A request or vote does not have a shape the node can safely record."""
 
 
+def approval_slots_active(tip_view) -> bool:
+    """Whether the co-signature approval slots are reserved at the tip.
+
+    Requires a genuine `True`, not merely a truthy value. The real
+    TipAdmissionView property returns a bool, so production is unaffected, but a
+    partial or mocked view returns something truthy for any attribute it was
+    never given -- and silently running as if a consensus feature were activated
+    is the kind of thing that passes every test and then diverges on a live
+    chain. Absent or non-bool therefore reads as "not activated", which is also
+    the pre-activation behaviour of every existing chain.
+    """
+    return getattr(tip_view, "approval_slots_active", False) is True
+
+
 # --- Slot width screening ---------------------------------------------------
 #
 # Per-stream bitvector typing is process-global and sticky: one rule typing i18
@@ -378,6 +392,60 @@ class ApprovalRequestEntry:
         return answered >= set(self.approvers)
 
 
+def validate_request_shape(
+    request: "ApprovalRequest", next_height: int
+) -> Optional[str]:
+    """Stateless admissibility of a parked transfer. None when acceptable.
+
+    Shared verbatim by mempool admission (which reads the tip tables) and block
+    apply (which holds the manager), because the two must reject exactly the same
+    inputs -- a disagreement is a consensus split. Everything here is a pure
+    function of the transaction plus the target height; anything needing the book
+    (duplicates, per-account caps) lives in the caller.
+    """
+    slots = set(tau_defs.approval_slot_indices())
+
+    if not request.approvers:
+        return "a request must name at least one approver"
+    if len(request.approvers) > MAX_APPROVERS_PER_REQUEST:
+        return f"more than {MAX_APPROVERS_PER_REQUEST} approvers"
+    bad_slot = next((s for s in sorted(request.approvers) if s not in slots), None)
+    if bad_slot is not None:
+        return (
+            f"i{bad_slot} is not an approval slot; slots are "
+            f"i{min(slots)}..i{max(slots)}"
+        )
+
+    approver_keys = list(request.approvers.values())
+    if len(set(approver_keys)) != len(approver_keys):
+        return "approvers must be distinct accounts"
+    if request.sender_pubkey in approver_keys:
+        return "the sender may not be their own approver"
+
+    if not (1 <= request.amount <= tau_defs.MAX_TRANSFER_VALUE):
+        return f"amount must be in 1..{tau_defs.MAX_TRANSFER_VALUE}"
+
+    if len(request.custom_inputs) > MAX_CUSTOM_INPUTS_PER_REQUEST:
+        return f"more than {MAX_CUSTOM_INPUTS_PER_REQUEST} custom inputs"
+    for idx, val in sorted(request.custom_inputs.items()):
+        if idx < tau_defs.REQUEST_CUSTOM_INPUT_MIN:
+            return (
+                f"custom input i{idx} is below i{tau_defs.REQUEST_CUSTOM_INPUT_MIN}; "
+                "lower streams are reserved or are approval slots"
+            )
+        if len(str(val).encode("utf-8")) > MAX_CUSTOM_INPUT_BYTES:
+            return f"custom input i{idx} exceeds {MAX_CUSTOM_INPUT_BYTES} bytes"
+
+    if request.expire_at_height <= next_height:
+        return "expire_at_height must be in the future"
+    if request.expire_at_height > next_height + MAX_APPROVAL_WINDOW_BLOCKS:
+        return (
+            f"expire_at_height is more than {MAX_APPROVAL_WINDOW_BLOCKS} "
+            "blocks ahead"
+        )
+    return None
+
+
 class ApprovalRequestLifecycleManager:
     """open -> executed | expired | failed, plus the recorded votes.
 
@@ -483,56 +551,23 @@ class ApprovalRequestLifecycleManager:
     ) -> Tuple[bool, str]:
         """Deterministic admissibility. Returns (ok, reason).
 
+        Stateless checks are delegated to the module-level
+        `validate_request_shape` so the mempool path (which reads the tip tables,
+        not this manager) applies byte-identical rules. Admission and apply
+        disagreeing about what is admissible is a consensus split.
+
         Deliberately excludes the "does the sender's clause actually block this?"
-        question: that needs a Tau evaluation, so it lives at the admission call
-        site, not in this pure check.
+        question: that needs a Tau evaluation, so it lives at the call site.
         """
-        slots = set(tau_defs.approval_slot_indices())
-
-        if not request.approvers:
-            return False, "a request must name at least one approver"
-        if len(request.approvers) > MAX_APPROVERS_PER_REQUEST:
-            return False, f"more than {MAX_APPROVERS_PER_REQUEST} approvers"
-        bad_slot = next((s for s in request.approvers if s not in slots), None)
-        if bad_slot is not None:
-            return False, (
-                f"i{bad_slot} is not an approval slot; slots are "
-                f"i{min(slots)}..i{max(slots)}"
-            )
-
-        approver_keys = list(request.approvers.values())
-        if len(set(approver_keys)) != len(approver_keys):
-            return False, "approvers must be distinct accounts"
-        if request.sender_pubkey in approver_keys:
-            return False, "the sender may not be their own approver"
-
-        if not (1 <= request.amount <= tau_defs.MAX_TRANSFER_VALUE):
-            return False, f"amount must be in 1..{tau_defs.MAX_TRANSFER_VALUE}"
-
-        if len(request.custom_inputs) > MAX_CUSTOM_INPUTS_PER_REQUEST:
-            return False, f"more than {MAX_CUSTOM_INPUTS_PER_REQUEST} custom inputs"
-        for idx, val in request.custom_inputs.items():
-            if idx < tau_defs.REQUEST_CUSTOM_INPUT_MIN:
-                return False, (
-                    f"custom input i{idx} is below i{tau_defs.REQUEST_CUSTOM_INPUT_MIN}; "
-                    "lower streams are reserved or are approval slots"
-                )
-            if len(str(val).encode("utf-8")) > MAX_CUSTOM_INPUT_BYTES:
-                return False, f"custom input i{idx} exceeds {MAX_CUSTOM_INPUT_BYTES} bytes"
-
-        if request.expire_at_height <= next_height:
-            return False, "expire_at_height must be in the future"
-        if request.expire_at_height > next_height + MAX_APPROVAL_WINDOW_BLOCKS:
-            return False, (
-                f"expire_at_height is more than {MAX_APPROVAL_WINDOW_BLOCKS} "
-                "blocks ahead"
-            )
+        shape_error = validate_request_shape(request, next_height)
+        if shape_error:
+            return False, shape_error
 
         if self.knows_request(request.request_id):
             return False, "duplicate request"
         if self.pending_count_for_sender(request.sender_pubkey) >= MAX_PENDING_REQUESTS_PER_SENDER:
             return False, "sender has too many open requests"
-        for approver in approver_keys:
+        for approver in sorted(request.approvers.values()):
             if self.pending_count_for_approver(approver) >= MAX_PENDING_REQUESTS_PER_APPROVER:
                 return False, "an approver has too many open requests"
 

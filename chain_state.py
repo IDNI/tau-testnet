@@ -8,6 +8,7 @@ import tau_manager
 import config
 import tau_native
 from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
+from consensus.lanes import TAU_EVALUATING_TX_TYPES
 from consensus.fees import FeeRuleError
 from block import Block
 import hashlib
@@ -591,7 +592,8 @@ def _process_new_block_locked(block: Block) -> bool:
             # stream o9 — unknowable without Tau. Defer (retry/resync
             # later) rather than validate user_tx blocks on guessed fees.
             has_user_tx = any(
-                isinstance(tx, dict) and tx.get("tx_type", "user_tx") == "user_tx"
+                isinstance(tx, dict)
+            and tx.get("tx_type", "user_tx") in TAU_EVALUATING_TX_TYPES
                 for tx in (block.transactions or [])
             )
             if has_user_tx and not tau_manager.tau_ready.wait(timeout=5):

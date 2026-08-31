@@ -12,6 +12,7 @@ import block
 import chain_state
 import config
 from consensus.state import compute_state_hash
+from consensus.lanes import TAU_EVALUATING_TX_TYPES
 
 
 import tau_manager
@@ -442,7 +443,8 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
     # Fee model: the fee value is unknowable without Tau (consensus rules
     # emit it on o9). Never build a user_tx block on guessed fees.
     if any(
-        isinstance(tx, dict) and tx.get("tx_type", "user_tx") == "user_tx"
+        isinstance(tx, dict)
+        and tx.get("tx_type", "user_tx") in TAU_EVALUATING_TX_TYPES
         for tx in transactions
     ) and not tau_manager.tau_ready.wait(timeout=5):
         msg = "Tau unavailable; aborting block round (cannot evaluate fees for user transactions)."

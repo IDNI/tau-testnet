@@ -23,14 +23,29 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_REJECT,
     RULE_OFFER_TX_TYPES,
 )
+from consensus.approvals import (
+    APPROVAL_TX_TYPES,
+    approval_slots_active,
+    TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_TRANSFER_VOTE,
+)
 
 # Every transaction type the node will admit. Governance types are fee-exempt
 # so validators never need funds to govern; the rule-sharing types are
 # user-initiated and expensive, so they pay like a user_tx does.
 KNOWN_TX_TYPES = frozenset(
-    {"user_tx", "consensus_rule_update", "consensus_rule_vote"} | set(RULE_OFFER_TX_TYPES)
+    {"user_tx", "consensus_rule_update", "consensus_rule_vote"}
+    | set(RULE_OFFER_TX_TYPES)
+    | set(APPROVAL_TX_TYPES)
 )
-FEE_BEARING_TX_TYPES = frozenset({"user_tx"} | set(RULE_OFFER_TX_TYPES))
+# `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
+# execution later is free and there is no second fee to drift. `transfer_vote` is
+# exempt like a governance vote -- approver bots would otherwise all need funding
+# and a fee strategy, and the vote is bounded by the request's declared approver
+# set instead.
+FEE_BEARING_TX_TYPES = frozenset(
+    {"user_tx", TX_TYPE_APPROVAL_REQUEST} | set(RULE_OFFER_TX_TYPES)
+)
 from db import add_mempool_tx
 from network import bus as network_bus
 import api_response
@@ -229,6 +244,17 @@ def _decode_single_transfer_output(output_bv_str: str, expected_amount_int: int)
         expected_amount_int,
     )
     return False
+
+
+def _approval_slot_feed(tip_view) -> tuple:
+    """Approval slot indices to feed, or empty while the feature is inactive.
+
+    Feeding them only when active keeps a pre-activation node byte-identical:
+    nothing references the slots, so nothing is fed, so no evaluation changes.
+    """
+    if not approval_slots_active(tip_view):
+        return ()
+    return tau_defs.approval_slot_indices()
 
 
 def _get_signing_message_bytes(payload: dict) -> bytes:
@@ -463,8 +489,13 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                 # elsewhere) so a crafted operations["12"] cannot spoof the
                 # sender-pubkey stream i12-scoped o5/o8 policy rules rely on, and
                 # operations["14"/"15"] cannot pin a conflicting bv width process-wide.
+                # i18-i25 join under approval-slot activation: only the node may
+                # write a co-signature slot, or a sender forges their own approval.
                 if idx in tau_defs.RESERVED_STREAMS \
-                        or idx in tau_defs.reserved_operation_keys(tip_view.eligibility_mode):
+                        or idx in tau_defs.reserved_operation_keys(
+                            tip_view.eligibility_mode,
+                            approval_slots_active=approval_slots_active(tip_view),
+                        ):
                     return _qt_err(
                         "TX_INVALID",
                         f"Invalid operation key '{key}'. Stream {idx} is reserved.",
@@ -741,6 +772,14 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                         # so custom keys can never clobber a reserved stream.
                         for k, v in custom_tau_inputs.items():
                             tau_input_stream_values[k] = v
+                        # Approval slots (i18..i25). An ORDINARY transfer always
+                        # feeds 0 on every slot, which equals no approver pubkey,
+                        # so a co-signature policy clause keeps blocking until the
+                        # parked-request path supplies real votes. Fed after the
+                        # custom merge and before i5, byte-identically at apply.
+                        # Reserved upstream, so a sender cannot pre-fill one.
+                        for slot in _approval_slot_feed(tip_view):
+                            tau_input_stream_values[slot] = "0"
                         # i5: advisory block timestamp (see admission_ts above) so
                         # time-lock o5 rules pre-check at admission; apply is
                         # authoritative.
