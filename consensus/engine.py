@@ -912,6 +912,29 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
         cooldown_active = getattr(tau_defs, "COOLDOWN_STREAM_ACTIVE", False)
 
+        # Co-signature approval slots. Read from the lifecycle manager this apply
+        # is mutating -- which is the deep copy of the PARENT manager, so an
+        # activation recorded in block H governs H+1 onward and never changes the
+        # meaning of the block that carried it.
+        approval_slots_on = getattr(lifecycle_mgr, "approval_slots_active", False) is True
+
+        def _approval_slot_values(overlay=None):
+            """The i18..i25 feed for one transfer, or None while inactive.
+
+            Inactive returns None so nothing extra is fed and a pre-activation
+            node evaluates byte-identical inputs. Active returns 0 on every slot
+            unless `overlay` names an approver who actually voted -- and 0 equals
+            no pubkey, so a co-signature clause keeps blocking until real votes
+            arrive.
+            """
+            if not approval_slots_on:
+                return None
+            values = {idx: "0" for idx in tau_defs.approval_slot_indices()}
+            if overlay:
+                for slot, pubkey in overlay.items():
+                    values[int(slot)] = str(pubkey)
+            return values
+
         def _since_last_transfer(addr: Optional[str]) -> str:
             """bv[64] seconds since `addr` last sent, sentinel when never."""
             try:
@@ -1004,6 +1027,149 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if target_balances is not None and addr in target_balances:
                     return target_balances[addr]
                 return chain_state.get_balance(addr)
+
+            def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
+                                          slot_values=None):
+                """Execute ONE transfer under the fee model. True to continue.
+
+                Extracted verbatim from the user_tx transfer loop so the
+                approval-completion path can execute a parked transfer through
+                exactly the same gates -- o1, o5, the fee steps and the balance
+                check -- instead of a second implementation that drifts.
+
+                Deliberately a closure rather than a module-level function: the
+                body reads a dozen per-transaction locals (staged_writes,
+                fee_components, tx_receipt, custom_tau_inputs, the _read_bal and
+                _parent_bal helpers, the replay_mode and cooldown flags) and
+                rebinds three verdict flags. Threading all of that through a
+                signature would be a larger change than the one being made.
+
+                `slot_values` overlays the co-signature approval slots
+                (i18..i25). The ordinary path passes the all-zero map, so no
+                approver pubkey ever matches and a policy clause keeps blocking;
+                the vote path passes the pubkeys of approvers who actually voted.
+                """
+                nonlocal accepted_in_block, hard_reject, execution_success
+                try:
+                    amount = int(amount_val)
+
+                    tau_input_stream_values = {
+                        1: str(amount),
+                        # i2 (balance) at the PARENT snapshot: frozen for
+                        # the whole block, so proposer and verifier read
+                        # the same value and a balance-reading policy rule
+                        # is deterministic across both (issue #20).
+                        2: _parent_bal(from_addr),
+                        **({16: _since_last_transfer(from_addr)} if cooldown_active else {}),
+                        # i3/i4 are the real from/to pubkeys (immutable in
+                        # the transfer tuple -> identical at admission and
+                        # apply), so recipient-aware policy/fee rules are
+                        # deterministic across the two.
+                        3: "{ #x" + str(from_addr) + " }:bv[384]",
+                        4: "{ #x" + str(to_addr) + " }:bv[384]",
+                    }
+                    tau_input_stream_values[12] = "{ #x" + str(from_addr) + " }:bv[384]"
+                    for k, v in custom_tau_inputs.items():
+                        tau_input_stream_values[k] = v
+                    # Approval slots, fed after the custom merge and before i5,
+                    # byte-identically to the admission overlay order in
+                    # commands/sendtx.py. Reserved, so a sender cannot pre-fill one.
+                    for _slot, _slot_val in (slot_values or {}).items():
+                        tau_input_stream_values[_slot] = _slot_val
+                    tau_input_stream_values[5] = str(block_timestamp)
+
+                    if not tau_manager.tau_ready.is_set():
+                        tau_manager.tau_ready.wait(timeout=5)
+                    if not tau_manager.tau_ready.is_set():
+                        if replay_mode:
+                            # Tau-less replay is supported for
+                            # pre-fee chains (fee 0 matches).
+                            # For fee-era chains the state-hash
+                            # invariant catches the divergence.
+                            logger.warning(
+                                "Replay without Tau: fee step assumed 0 for tx %s.",
+                                tx_id,
+                            )
+                            fee_components.append(0)
+                        else:
+                            # The fee value is unknowable without
+                            # Tau; "pretend 0" would be a locally-
+                            # valid divergent transition. Strict.
+                            raise FeeRuleError(
+                                f"Tau unavailable during fee-era transfer execution (tx {tx_id})"
+                            )
+                    else:
+                        with tau_manager.tau_comm_lock:
+                            tau_outputs = tau_manager.communicate_with_tau_multi(
+                                input_stream_values=tau_input_stream_values,
+                                apply_rules_update=False,
+                            )
+                        tx_receipt["logs"].append(
+                            f"Tau(transfer) o1: {tau_outputs.get(1)}"
+                        )
+                        step_fee = fees.parse_consensus_fee(
+                            tau_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
+                            context=f"tx {tx_id}",
+                        ) + fees.parse_custom_fee(
+                            tau_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
+                            context=f"tx {tx_id}",
+                        )
+                        fee_components.append(step_fee)
+                        if step_fee:
+                            tx_receipt["logs"].append(f"Tau fee step: {step_fee}")
+
+                        # --- User policy (o5) — consensus-enforced ---
+                        # Read from the SAME multi result (no extra
+                        # roundtrip, no perturbation), mirroring admission
+                        # (commands/sendtx.py). Semantics: o5 absent -> allow;
+                        # present and == BLOCK (0) -> reject the WHOLE tx
+                        # (a policy block on any transfer invalidates the
+                        # user_tx — staged writes never commit, so no partial
+                        # execution). parse_tau_output maps unparseable -> 0,
+                        # so a malformed policy output fails closed (reject).
+                        o5_raw = tau_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
+                        if o5_raw is not None and \
+                                tau_manager.parse_tau_output(o5_raw) == tau_defs.USER_POLICY_BLOCK_VALUE:
+                            logger.info(
+                                "Transfer rejected by user policy (o5) for %s->%s (o5=%s)",
+                                str(from_addr)[:10], str(to_addr)[:10], o5_raw,
+                            )
+                            if not replay_mode:
+                                accepted_in_block = False
+                                hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = "user_policy_block"
+                            tx_receipt["logs"].append(
+                                f"Transfer rejected by user policy (o5={o5_raw})"
+                            )
+                            return False
+
+                    current_from = _read_bal(from_addr)
+                    if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
+                        current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+                    if current_from < amount:
+                        logger.error(
+                            "Insufficient funds for %s to send %s. Has: %s.",
+                            from_addr[:10], amount, current_from,
+                        )
+                        if not replay_mode:
+                            accepted_in_block = False
+                            hard_reject = True
+                        execution_success = False
+                        tx_receipt["logs"].append("Transfer balance state failed (insufficient)")
+                        return False
+                    staged_writes[from_addr] = current_from - amount
+                    staged_writes[to_addr] = _read_bal(to_addr) + amount
+                except FeeRuleError:
+                    raise
+                except Exception as e:
+                    logger.error("Error applying transfer: %s", e)
+                    if not replay_mode:
+                        accepted_in_block = False
+                        hard_reject = True
+                    execution_success = False
+                    return False
+                return True
 
             if charge_fee:
                 # Absent field -> cap 0: legacy/feeless txs stay valid while
@@ -1309,119 +1475,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             if not (isinstance(transfer, (list, tuple)) and len(transfer) == 3):
                                 continue
                             from_addr, to_addr, amount_val = transfer
-                            try:
-                                amount = int(amount_val)
-
-                                tau_input_stream_values = {
-                                    1: str(amount),
-                                    # i2 (balance) at the PARENT snapshot: frozen for
-                                    # the whole block, so proposer and verifier read
-                                    # the same value and a balance-reading policy rule
-                                    # is deterministic across both (issue #20).
-                                    2: _parent_bal(from_addr),
-                                    **({16: _since_last_transfer(from_addr)} if cooldown_active else {}),
-                                    # i3/i4 are the real from/to pubkeys (immutable in
-                                    # the transfer tuple -> identical at admission and
-                                    # apply), so recipient-aware policy/fee rules are
-                                    # deterministic across the two.
-                                    3: "{ #x" + str(from_addr) + " }:bv[384]",
-                                    4: "{ #x" + str(to_addr) + " }:bv[384]",
-                                }
-                                tau_input_stream_values[12] = "{ #x" + str(from_addr) + " }:bv[384]"
-                                for k, v in custom_tau_inputs.items():
-                                    tau_input_stream_values[k] = v
-                                tau_input_stream_values[5] = str(block_timestamp)
-
-                                if not tau_manager.tau_ready.is_set():
-                                    tau_manager.tau_ready.wait(timeout=5)
-                                if not tau_manager.tau_ready.is_set():
-                                    if replay_mode:
-                                        # Tau-less replay is supported for
-                                        # pre-fee chains (fee 0 matches).
-                                        # For fee-era chains the state-hash
-                                        # invariant catches the divergence.
-                                        logger.warning(
-                                            "Replay without Tau: fee step assumed 0 for tx %s.",
-                                            tx_id,
-                                        )
-                                        fee_components.append(0)
-                                    else:
-                                        # The fee value is unknowable without
-                                        # Tau; "pretend 0" would be a locally-
-                                        # valid divergent transition. Strict.
-                                        raise FeeRuleError(
-                                            f"Tau unavailable during fee-era transfer execution (tx {tx_id})"
-                                        )
-                                else:
-                                    with tau_manager.tau_comm_lock:
-                                        tau_outputs = tau_manager.communicate_with_tau_multi(
-                                            input_stream_values=tau_input_stream_values,
-                                            apply_rules_update=False,
-                                        )
-                                    tx_receipt["logs"].append(
-                                        f"Tau(transfer) o1: {tau_outputs.get(1)}"
-                                    )
-                                    step_fee = fees.parse_consensus_fee(
-                                        tau_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
-                                        context=f"tx {tx_id}",
-                                    ) + fees.parse_custom_fee(
-                                        tau_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
-                                        context=f"tx {tx_id}",
-                                    )
-                                    fee_components.append(step_fee)
-                                    if step_fee:
-                                        tx_receipt["logs"].append(f"Tau fee step: {step_fee}")
-
-                                    # --- User policy (o5) — consensus-enforced ---
-                                    # Read from the SAME multi result (no extra
-                                    # roundtrip, no perturbation), mirroring admission
-                                    # (commands/sendtx.py). Semantics: o5 absent -> allow;
-                                    # present and == BLOCK (0) -> reject the WHOLE tx
-                                    # (a policy block on any transfer invalidates the
-                                    # user_tx — staged writes never commit, so no partial
-                                    # execution). parse_tau_output maps unparseable -> 0,
-                                    # so a malformed policy output fails closed (reject).
-                                    o5_raw = tau_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
-                                    if o5_raw is not None and \
-                                            tau_manager.parse_tau_output(o5_raw) == tau_defs.USER_POLICY_BLOCK_VALUE:
-                                        logger.info(
-                                            "Transfer rejected by user policy (o5) for %s->%s (o5=%s)",
-                                            str(from_addr)[:10], str(to_addr)[:10], o5_raw,
-                                        )
-                                        if not replay_mode:
-                                            accepted_in_block = False
-                                            hard_reject = True
-                                        execution_success = False
-                                        tx_receipt["reason"] = "user_policy_block"
-                                        tx_receipt["logs"].append(
-                                            f"Transfer rejected by user policy (o5={o5_raw})"
-                                        )
-                                        break
-
-                                current_from = _read_bal(from_addr)
-                                if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                                    current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
-                                if current_from < amount:
-                                    logger.error(
-                                        "Insufficient funds for %s to send %s. Has: %s.",
-                                        from_addr[:10], amount, current_from,
-                                    )
-                                    if not replay_mode:
-                                        accepted_in_block = False
-                                        hard_reject = True
-                                    execution_success = False
-                                    tx_receipt["logs"].append("Transfer balance state failed (insufficient)")
-                                    break
-                                staged_writes[from_addr] = current_from - amount
-                                staged_writes[to_addr] = _read_bal(to_addr) + amount
-                            except FeeRuleError:
-                                raise
-                            except Exception as e:
-                                logger.error("Error applying transfer: %s", e)
-                                if not replay_mode:
-                                    accepted_in_block = False
-                                    hard_reject = True
-                                execution_success = False
+                            if not _execute_fee_era_transfer(
+                                from_addr, to_addr, amount_val,
+                                slot_values=_approval_slot_values(),
+                            ):
                                 break
                     elif isinstance(transfers_op_data, list):
                         for transfer in transfers_op_data:
