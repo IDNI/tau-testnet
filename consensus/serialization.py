@@ -454,3 +454,124 @@ def encode_clause_registry(clauses: Dict[tuple, str]) -> bytes:
 def compute_clause_registry_root(clauses: Dict[tuple, str]) -> bytes:
     """BLAKE3 of the canonical clause registry. Returns 32 bytes."""
     return blake3(encode_clause_registry(clauses)).digest()
+
+
+# --- Co-signature approval requests ------------------------------------------
+#
+# CONSENSUS-FROZEN. Every preimage here carries an explicit domain tag, so a
+# request id can never collide with an offer id or an update id even if the
+# remaining bytes happen to line up. Maps are serialized in ascending NUMERIC
+# key order -- string order would put stream 10 before stream 9 and two nodes
+# using different orders would compute different ids.
+
+DOMAIN_APPROVAL_REQUEST_V1 = b"tau.approval.request.v1"
+DOMAIN_APPROVAL_VOTE_V1 = b"tau.approval.vote.v1"
+
+
+def _encode_index_map(mapping: Dict[Any, Any], value_encoder) -> bytes:
+    """uint32 count, then (uint32 index, encoded value) in ascending index order."""
+    items = sorted((int(k), v) for k, v in (mapping or {}).items())
+    out = bytearray()
+    out.extend(encode_uint32(len(items)))
+    for idx, val in items:
+        out.extend(encode_uint32(idx))
+        out.extend(value_encoder(val))
+    return bytes(out)
+
+
+def encode_approval_request(
+    *,
+    sender_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    sequence_number: int,
+    expire_at_height: int,
+    approvers: Dict[Any, Any],
+    custom_inputs: Dict[Any, Any],
+) -> bytes:
+    """Canonical bytes a request id commits to.
+
+    `sequence_number` is included so two otherwise identical transfers from the
+    same sender get distinct ids instead of colliding on the second one.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_APPROVAL_REQUEST_V1.decode()))
+    out.extend(encode_pubkey48(sender_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(encode_uint64(int(expire_at_height)))
+    out.extend(_encode_index_map(approvers, encode_pubkey48))
+    out.extend(_encode_index_map(custom_inputs, lambda v: encode_string(str(v))))
+    return bytes(out)
+
+
+def compute_request_id(**kwargs) -> bytes:
+    """BLAKE3 of the canonical approval request. Returns 32 bytes."""
+    return blake3(encode_approval_request(**kwargs)).digest()
+
+
+def encode_approval_request_entry(
+    request_id: Any,
+    entry_sender: Any,
+    entry_recipient: Any,
+    amount: int,
+    expire_at_height: int,
+    approvers: Dict[Any, Any],
+    custom_inputs: Dict[Any, Any],
+    voted: Dict[Any, Any],
+    declined: Any,
+    status: int,
+) -> bytes:
+    """One open-or-resolved request, as the state root sees it.
+
+    `voted` is in here because it is what decides whether the transfer executes:
+    it must be hash-bound or a node could disagree about which approvers have
+    signed. The vote `reason` is NOT here -- it is signed and inside the block
+    merkle root via `block.compute_tx_hash`, but it carries no consensus meaning.
+    """
+    out = bytearray()
+    out.extend(encode_hash32(request_id))
+    out.extend(encode_pubkey48(entry_sender))
+    out.extend(encode_pubkey48(entry_recipient))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(expire_at_height)))
+    out.extend(_encode_index_map(approvers, encode_pubkey48))
+    out.extend(_encode_index_map(custom_inputs, lambda v: encode_string(str(v))))
+    out.extend(_encode_index_map(voted, encode_pubkey48))
+    declined_sorted = sorted(int(d) for d in (declined or ()))
+    out.extend(encode_uint32(len(declined_sorted)))
+    for slot in declined_sorted:
+        out.extend(encode_uint32(slot))
+    out.extend(bytes([int(status) & 0xFF]))
+    return bytes(out)
+
+
+def encode_approval_request_book(open_entries: list, resolved: list) -> bytes:
+    """Canonical serialization of the whole request book.
+
+    Open entries sorted by raw request id; resolved contributes bare ids only,
+    also sorted. Terminal status of a resolved request is deliberately absent:
+    node-local, re-derivable by replay, and hashing it would make the root
+    depend on colour rather than consensus meaning -- the same choice
+    `encode_rule_offer_book` makes.
+    """
+    encoded_open = sorted(
+        encode_approval_request_entry(*entry) for entry in (open_entries or [])
+    )
+    resolved_ids = sorted(
+        _coerce_fixed_bytes(r, 32, "request_id") for r in (resolved or [])
+    )
+    out = bytearray()
+    out.extend(encode_uint32(len(encoded_open)))
+    for blob in encoded_open:
+        out.extend(blob)
+    out.extend(encode_uint32(len(resolved_ids)))
+    for rid in resolved_ids:
+        out.extend(encode_hash32(rid))
+    return bytes(out)
+
+
+def compute_approval_request_book_root(open_entries: list, resolved: list) -> bytes:
+    """BLAKE3 of the canonical request book. Returns 32 bytes."""
+    return blake3(encode_approval_request_book(open_entries, resolved)).digest()

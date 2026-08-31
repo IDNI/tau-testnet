@@ -242,11 +242,18 @@ def test_every_commit_site_persists_rule_offers():
 
     assert len(calls) == 3, (
         f"expected 3 commit sites in chain_state, found {len(calls)}; a new one "
-        "must also pass rule_offers/rule_clauses/max_rule_txs_per_block"
+        "must also pass every hash-bound snapshot argument"
     )
+    required = {
+        "rule_offers", "rule_clauses", "max_rule_txs_per_block",
+        # Co-signature approvals: the request book root (including which
+        # approvers have voted) is bound into consensus_meta_hash, so a path
+        # that omits it rehydrates a stale book after a restart.
+        "approval_requests", "approval_slots_active",
+    }
     for call in calls:
         kwargs = {kw.arg for kw in call.keywords}
-        missing = {"rule_offers", "rule_clauses", "max_rule_txs_per_block"} - kwargs
+        missing = required - kwargs
         assert not missing, (
             f"chain_state.py:{call.lineno} omits {sorted(missing)} when persisting "
             "canonical state; a restart would rehydrate a stale rule-offer book"
