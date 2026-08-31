@@ -61,6 +61,12 @@ MAX_PENDING_REQUESTS_PER_SENDER = 8
 MAX_PENDING_REQUESTS_PER_APPROVER = 64
 MAX_APPROVAL_WINDOW_BLOCKS = 10_000
 MAX_CUSTOM_INPUTS_PER_REQUEST = 8
+
+# How many candidate slots `getapprovalpreview` will enumerate subsets over.
+# 2**6 = 64 engine steps, each single-digit milliseconds and none of them a
+# rebuild. Above this the RPC reports `unavailable` instead of returning a
+# partial search dressed up as an answer.
+MAX_PREVIEW_SLOTS = 6
 MAX_CUSTOM_INPUT_BYTES = 256
 
 # Signed and inside the block merkle root (it is part of the transaction, so

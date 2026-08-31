@@ -386,3 +386,107 @@ def build_and_sign_user_tx(
         fee_limit=fee_limit,
     )
     return sign_tx(payload, private_key)
+
+
+def build_approval_request_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    recipient_pubkey: str,
+    amount: int,
+    expire_at_height: int,
+    approvers: dict,
+    custom_inputs: dict | None = None,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='approval_request'`` payload (without signature).
+
+    `approvers` maps an approval slot index (18..25) to a 96-hex pubkey, and it
+    should name ONLY the approvers this amount actually requires: the declaration
+    is what fills approvers' inboxes, so naming extras notifies people whose
+    signature the sender's policy never asks for.
+
+    `custom_inputs` (streams >= 26) is sender data the approvers can read -- a
+    comment to a partner, or a 2FA code. Anything here is PUBLIC and permanent.
+    """
+    if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
+        raise ValueError("recipient_pubkey must be a 96-character hex public key")
+    if not isinstance(amount, int) or amount < 1:
+        raise ValueError("amount must be a positive integer")
+    if not isinstance(expire_at_height, int) or expire_at_height < 1:
+        raise ValueError("expire_at_height must be a positive integer")
+    if not isinstance(approvers, dict) or not approvers:
+        raise ValueError("at least one approver must be declared")
+
+    normalized = {}
+    for slot, pubkey in approvers.items():
+        try:
+            idx = int(slot)
+        except (TypeError, ValueError):
+            raise ValueError(f"approver slot {slot!r} is not a stream index")
+        if not isinstance(pubkey, str) or len(pubkey) != 96:
+            raise ValueError(f"approver for slot {idx} must be a 96-hex public key")
+        normalized[str(idx)] = pubkey.lower()
+    if len(set(normalized.values())) != len(normalized):
+        raise ValueError("approvers must be distinct accounts")
+    if (sender_pubkey or "").lower() in set(normalized.values()):
+        raise ValueError("the sender may not be their own approver")
+
+    customs = {}
+    for stream, value in (custom_inputs or {}).items():
+        try:
+            idx = int(stream)
+        except (TypeError, ValueError):
+            raise ValueError(f"custom input {stream!r} is not a stream index")
+        customs[str(idx)] = str(value)
+
+    return {
+        "tx_type": "approval_request",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "fee_limit": str(fee_limit),
+        "recipient_pubkey": recipient_pubkey.lower(),
+        "amount": amount,
+        "expire_at_height": expire_at_height,
+        "approvers": normalized,
+        "custom_inputs": customs,
+    }
+
+
+def build_transfer_vote_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    request_id: str,
+    approve: bool = True,
+    reason: str = "",
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='transfer_vote'`` payload (without signature).
+
+    Feeless, so an approver bot needs no funded account. A decline does not kill
+    the request -- it records a refusal to fill one slot, and the transfer still
+    goes through if the sender's policy did not need that slot.
+    """
+    if not isinstance(request_id, str) or len(request_id) != 64:
+        raise ValueError("request_id must be a 64-character hex string")
+    if not isinstance(approve, bool):
+        raise ValueError("approve must be a boolean")
+    if not isinstance(reason, str):
+        raise ValueError("reason must be a string")
+
+    tx = {
+        "tx_type": "transfer_vote",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "fee_limit": str(fee_limit),
+        "request_id": request_id.lower(),
+        "approve": approve,
+    }
+    if reason:
+        tx["reason"] = reason
+    return tx

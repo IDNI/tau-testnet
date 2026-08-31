@@ -16,6 +16,13 @@ import db
 import tau_manager
 from commands import checktx, createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks, getallaccounts, gettaustate, getgovernance, getupdateid, getaccountstate, gettxstatus
 from commands import getofferid, getruleoffers, getruleoffer, getruleconflict
+from commands import (
+    getapprovalpreview,
+    getapprovalrequest,
+    getapprovalrequests,
+    getapprovalslots,
+    getrequestid,
+)
 from errors import DependencyError
 from network import BootstrapPeer, NetworkConfig
 from network.identity import IDENTITY_SEED_SIZE
@@ -67,6 +74,16 @@ class ServiceContainer:
             "getruleoffers": getruleoffers,
             "getruleoffer": getruleoffer,
             "getruleconflict": getruleconflict,
+        # Co-signature approvals. `getapprovalrequests` is the approver inbox,
+        # and its emptiness is meaningful: a request names only the approvers its
+        # amount requires, so an approver who sees nothing is not needed.
+        "getapprovalrequests": getapprovalrequests,
+        "getapprovalrequest": getapprovalrequest,
+        "getrequestid": getrequestid,
+        # Advisory, node-local, and engine-driving -- rate-limited accordingly
+        # in server.py.
+        "getapprovalslots": getapprovalslots,
+        "getapprovalpreview": getapprovalpreview,
         }
 
         mempool = override_map.get("mempool") or []
