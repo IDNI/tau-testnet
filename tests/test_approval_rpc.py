@@ -335,3 +335,61 @@ def test_the_preview_needs_the_engine(temp_database):
         assert _err(getapprovalpreview.execute(
             "getapprovalpreview " + _draft(5000, {18: AUTH}), None))["code"] \
             == "TAU_UNAVAILABLE"
+
+
+# --- gossip routing ---------------------------------------------------------
+#
+# Publishing to the wrong topic silently drops the transaction at EVERY peer,
+# because each topic's handler enforces its own allow-list. That is exactly what
+# used to happen to consensus_rule_vote. So the routing table and the snapshot
+# set are asserted rather than assumed.
+
+def test_approval_types_route_to_their_own_topic():
+    from network.protocols import TAU_GOSSIP_TOPIC_APPROVALS
+    from network.service import NetworkService
+
+    for tx_type in ("approval_request", "transfer_vote"):
+        assert NetworkService.topic_for_tx_type(tx_type) == TAU_GOSSIP_TOPIC_APPROVALS
+
+
+def test_existing_routing_is_unchanged():
+    from network.protocols import (
+        TAU_GOSSIP_TOPIC_GOVERNANCE,
+        TAU_GOSSIP_TOPIC_RULES,
+        TAU_GOSSIP_TOPIC_TRANSACTIONS,
+    )
+    from network.service import NetworkService
+
+    assert NetworkService.topic_for_tx_type("user_tx") == TAU_GOSSIP_TOPIC_TRANSACTIONS
+    assert NetworkService.topic_for_tx_type("rule_offer") == TAU_GOSSIP_TOPIC_RULES
+    assert NetworkService.topic_for_tx_type("consensus_rule_vote") == TAU_GOSSIP_TOPIC_GOVERNANCE
+    assert NetworkService.topic_for_tx_type(None) == TAU_GOSSIP_TOPIC_TRANSACTIONS
+
+
+def test_approval_types_are_in_the_mempool_snapshot_set():
+    """Missing from here and a newly connected peer never learns about a parked
+    request until it is mined -- which for a vote is too late to matter."""
+    from network.service import _SNAPSHOT_TX_TYPES
+
+    assert {"approval_request", "transfer_vote"} <= _SNAPSHOT_TX_TYPES
+
+
+def test_the_approvals_topic_has_its_own_byte_caps_and_quota():
+    from network import protocols
+
+    assert protocols.TAU_MAX_APPROVAL_REQUEST_BYTES > 0
+    assert protocols.TAU_MAX_TRANSFER_VOTE_BYTES > 0
+    # A vote is small; a request carries an approver map and custom inputs.
+    assert protocols.TAU_MAX_TRANSFER_VOTE_BYTES < protocols.TAU_MAX_APPROVAL_REQUEST_BYTES
+    assert protocols.TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS > 0
+
+
+def test_the_gossip_handler_exists_and_is_bound_to_the_topic():
+    import inspect
+
+    from network.service import NetworkService
+
+    assert hasattr(NetworkService, "_on_approval_gossip")
+    src = inspect.getsource(NetworkService)
+    # Joined at startup, or the node publishes to a topic nobody listens on.
+    assert "join_topic(TAU_GOSSIP_TOPIC_APPROVALS, self._on_approval_gossip)" in src

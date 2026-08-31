@@ -36,6 +36,8 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "rule_offer",
     "rule_offer_accept",
     "rule_offer_reject",
+    "approval_request",
+    "transfer_vote",
 })
 
 
@@ -467,6 +469,7 @@ class NetworkService:
             TAU_MEMPOOL_SNAPSHOT_MAX_UPDATES,
             TAU_MEMPOOL_SNAPSHOT_MAX_VOTES,
             TAU_MEMPOOL_SNAPSHOT_MAX_RULE_TXS,
+            TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS,
             TAU_GOSSIP_MAX_RAW_TX_BYTES
         )
         try:
@@ -477,6 +480,7 @@ class NetworkService:
             votes_count = 0
             total_count = 0
             rule_txs_count = 0
+            approval_txs_count = 0
 
             for tx in txs:
                 if total_count >= TAU_MEMPOOL_SNAPSHOT_MAX_TOTAL:
@@ -513,6 +517,13 @@ class NetworkService:
                     if rule_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_RULE_TXS:
                         continue
                     rule_txs_count += 1
+                elif tx_type in ("approval_request", "transfer_vote"):
+                    # Same reasoning, own quota: parked requests accumulate while
+                    # they wait for signatures, so they are exactly the kind of
+                    # backlog that could swallow a snapshot.
+                    if approval_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS:
+                        continue
+                    approval_txs_count += 1
                 topic = self.topic_for_tx_type(tx_type)
                     
                 # 4. Optional partial decode
@@ -538,6 +549,7 @@ class NetworkService:
             TAU_GOSSIP_TOPIC_TRANSACTIONS,
             TAU_GOSSIP_TOPIC_GOVERNANCE,
             TAU_GOSSIP_TOPIC_RULES,
+            TAU_GOSSIP_TOPIC_APPROVALS,
             TAU_GOSSIP_TOPIC_BLOCKS,
             TAU_GOSSIP_TOPIC_PEERS,
         )
@@ -545,6 +557,7 @@ class NetworkService:
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_TRANSACTIONS, self._on_transaction_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_GOVERNANCE, self._on_governance_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_RULES, self._on_rule_gossip)
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_APPROVALS, self._on_approval_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PEERS, self._on_peer_advertisement)
 
@@ -720,6 +733,20 @@ class NetworkService:
             },
         )
 
+    async def _on_approval_gossip(self, envelope: Dict[str, Any]) -> None:
+        from .protocols import (
+            TAU_MAX_APPROVAL_REQUEST_BYTES,
+            TAU_MAX_TRANSFER_VOTE_BYTES,
+        )
+        await self._process_gossip_payload(
+            envelope,
+            allowed_types={"approval_request", "transfer_vote"},
+            type_limits={
+                "approval_request": TAU_MAX_APPROVAL_REQUEST_BYTES,
+                "transfer_vote": TAU_MAX_TRANSFER_VOTE_BYTES,
+            },
+        )
+
     async def _process_gossip_payload(self, envelope: Dict[str, Any], allowed_types: set, type_limits: dict) -> None:
         import json
         from .protocols import TAU_GOSSIP_MAX_RAW_TX_BYTES
@@ -795,6 +822,18 @@ class NetworkService:
         elif tx_type == "rule_offer_reject":
             if "offer_id" not in p_dict:
                 logger.debug("Gossip rejected: rule_offer_reject missing offer_id")
+                return
+        elif tx_type == "approval_request":
+            # Every one of these is signed and decides what the parked transfer
+            # does, so a payload missing any of them can never be applied.
+            missing = [f for f in ("recipient_pubkey", "amount", "expire_at_height",
+                                   "approvers") if f not in p_dict]
+            if missing:
+                logger.debug("Gossip rejected: approval_request missing %s", missing)
+                return
+        elif tx_type == "transfer_vote":
+            if "request_id" not in p_dict:
+                logger.debug("Gossip rejected: transfer_vote missing request_id")
                 return
 
         try:
@@ -1352,6 +1391,7 @@ class NetworkService:
         only via the mempool snapshot on a new connection.
         """
         from .protocols import (
+            TAU_GOSSIP_TOPIC_APPROVALS,
             TAU_GOSSIP_TOPIC_GOVERNANCE,
             TAU_GOSSIP_TOPIC_RULES,
             TAU_GOSSIP_TOPIC_TRANSACTIONS,
@@ -1360,6 +1400,8 @@ class NetworkService:
             return TAU_GOSSIP_TOPIC_GOVERNANCE
         if tx_type in ("rule_offer", "rule_offer_accept", "rule_offer_reject"):
             return TAU_GOSSIP_TOPIC_RULES
+        if tx_type in ("approval_request", "transfer_vote"):
+            return TAU_GOSSIP_TOPIC_APPROVALS
         return TAU_GOSSIP_TOPIC_TRANSACTIONS
 
     def broadcast_transaction(self, payload: str, message_id: str) -> None:
