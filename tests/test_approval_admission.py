@@ -318,3 +318,57 @@ def test_admission_and_apply_agree_on_the_shape_corpus():
         apply_ok = manager.can_admit_request(req, NEXT_HEIGHT)[0]
         assert shape_ok == apply_ok, f"divergence on {req.approvers} {req.amount}"
     assert validate_request_shape(SHAPE_CORPUS[-1], NEXT_HEIGHT) is None
+
+
+# --- the signing preimage ---------------------------------------------------
+#
+# These transactions are applied LATER, from hash-bound state, by a DIFFERENT
+# transaction. So any field omitted from the preimage is a field a proposer can
+# rewrite between submission and execution -- redirecting funds the sender never
+# agreed to send. The first version of this feature omitted all of them.
+
+def test_every_request_field_is_signed():
+    from consensus.tx_signing import signing_message_bytes
+
+    req = {"sender_pubkey": A, "sequence_number": 1, "expiration_time": 1,
+           "fee_limit": "0", "tx_type": "approval_request", "recipient_pubkey": B,
+           "amount": 5000, "expire_at_height": 900,
+           "approvers": {"18": AUTH}, "custom_inputs": {"26": "rent"}}
+    base = signing_message_bytes(req)
+    for field, tampered in [
+        ("amount", 999999),
+        ("recipient_pubkey", STRANGER),
+        ("expire_at_height", 5),
+        ("approvers", {"18": SCAN}),
+        ("custom_inputs", {"26": "something else"}),
+    ]:
+        assert signing_message_bytes(dict(req, **{field: tampered})) != base, (
+            f"{field} is not covered by the signature; a proposer could rewrite it"
+        )
+
+
+def test_request_approver_map_keys_sign_identically_as_int_or_str():
+    """Wallets differ on whether JSON object keys come back as ints; the
+    signature must not depend on which."""
+    from consensus.tx_signing import signing_message_bytes
+
+    req = {"sender_pubkey": A, "sequence_number": 1, "expiration_time": 1,
+           "fee_limit": "0", "tx_type": "approval_request", "recipient_pubkey": B,
+           "amount": 5000, "expire_at_height": 900, "approvers": {"18": AUTH},
+           "custom_inputs": {}}
+    assert (signing_message_bytes(req)
+            == signing_message_bytes(dict(req, approvers={18: AUTH})))
+
+
+def test_every_vote_field_is_signed():
+    from consensus.tx_signing import signing_message_bytes
+
+    vote = {"sender_pubkey": AUTH, "sequence_number": 0, "expiration_time": 1,
+            "fee_limit": "0", "tx_type": "transfer_vote", "request_id": "ab" * 32,
+            "approve": True, "reason": "looks fine"}
+    base = signing_message_bytes(vote)
+    for field, tampered in [("request_id", "cd" * 32), ("approve", False),
+                            ("reason", "words the approver never wrote")]:
+        assert signing_message_bytes(dict(vote, **{field: tampered})) != base, (
+            f"{field} is not covered by the signature"
+        )

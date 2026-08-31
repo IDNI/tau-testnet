@@ -34,6 +34,10 @@ import json
 import logging
 from typing import Any, Dict, Optional, Tuple
 
+from consensus.approvals import (
+    TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_TRANSFER_VOTE,
+)
 from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
     TX_TYPE_RULE_OFFER_ACCEPT,
@@ -91,6 +95,24 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["rule_text"] = payload.get("rule_text")
     elif tx_type == TX_TYPE_RULE_OFFER_REJECT:
         signing_dict["offer_id"] = payload.get("offer_id")
+    elif tx_type == TX_TYPE_APPROVAL_REQUEST:
+        # EVERY field that decides what the parked transfer will do must be in
+        # here. Anything omitted is unauthenticated, and this transaction is
+        # applied LATER, from hash-bound state, by a different transaction --
+        # so a proposer who could rewrite the recipient or the amount would be
+        # redirecting funds the sender never agreed to send.
+        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
+        signing_dict["amount"] = payload.get("amount")
+        signing_dict["expire_at_height"] = payload.get("expire_at_height")
+        signing_dict["approvers"] = payload.get("approvers", {})
+        signing_dict["custom_inputs"] = payload.get("custom_inputs", {})
+    elif tx_type == TX_TYPE_TRANSFER_VOTE:
+        signing_dict["request_id"] = payload.get("request_id")
+        signing_dict["approve"] = payload.get("approve", True)
+        # Signed even though it carries no consensus meaning: it rides in the
+        # block merkle root via block.compute_tx_hash either way, so leaving it
+        # unsigned would let a proposer put words in an approver's mouth.
+        signing_dict["reason"] = payload.get("reason", "")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 
