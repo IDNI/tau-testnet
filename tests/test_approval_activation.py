@@ -216,3 +216,173 @@ def test_a_clause_may_read_slots_but_a_user_rule_may_not():
 
 def test_request_custom_inputs_start_above_the_slot_block():
     assert tau_defs.REQUEST_CUSTOM_INPUT_MIN == max(tau_defs.approval_slot_indices()) + 1
+
+
+# --- the activation audit ----------------------------------------------------
+#
+# Reserving i18..i25 and routing o5 rules are consensus-visible changes, and a
+# source grep proves nothing about a LIVE chain: before activation the slots were
+# ordinary custom streams any rule could type at any width, and o5 rules were
+# appended raw. Both collisions are fatal, so the audit reports rather than
+# tolerates.
+
+from consensus.approvals import audit_stream_collisions
+
+_CLEAN = [
+    ("consensus_rules", "always ( o6[t]:bv[16] = i10[t]:bv[16] )."),
+    ("builtin_rule_0", "always ( o1[t]:bv[24] = i1[t]:bv[24] )."),
+    ("application_rules", "always ( o12[t]:bv[24] = i1[t]:bv[24] )."),
+]
+
+
+def test_a_clean_spec_passes_the_audit():
+    assert audit_stream_collisions(_CLEAN) == []
+
+
+@pytest.mark.parametrize("label", ["consensus_rules", "application_rules", "builtin_rule_7",
+                                   "clause_aaaaaaaaaa_o5"])
+def test_a_slot_already_typed_anywhere_blocks_activation(label):
+    """Auditing the application rules alone would miss a collision hiding in a
+    consensus revision, a builtin, or a stored clause body."""
+    texts = _CLEAN + [(label, "always ( (i18[t]:bv[24] = { #x01 }:bv[24]) -> "
+                              "(o13[t]:bv[24] = { #x01 }:bv[24]) ).")]
+    findings = audit_stream_collisions(texts)
+    assert len(findings) == 1
+    assert label in findings[0] and "i18" in findings[0]
+
+
+@pytest.mark.parametrize("slot", [18, 25])
+def test_every_slot_in_the_block_is_audited(slot):
+    texts = [("application_rules", "always ( (i%d[t]:bv[64] = { 1 }:bv[64]) -> "
+                                   "(o13[t]:bv[24] = { #x01 }:bv[24]) )." % slot)]
+    assert audit_stream_collisions(texts) != []
+
+
+def test_a_neighbouring_stream_is_not_a_false_positive():
+    """Word-boundary matched, so i1/i17/i180 are not mistaken for a slot."""
+    for stream in ("i1", "i17", "i26", "i180"):
+        texts = [("application_rules", "always ( (%s[t]:bv[24] = { #x01 }:bv[24]) -> "
+                                       "(o13[t]:bv[24] = { #x01 }:bv[24]) )." % stream)]
+        assert audit_stream_collisions(texts) == [], stream
+
+
+def test_a_slot_named_only_in_a_comment_is_not_a_collision():
+    texts = [("application_rules", "# i18 is the auth slot\n"
+                                   "always ( o12[t]:bv[24] = i1[t]:bv[24] ).")]
+    assert audit_stream_collisions(texts) == []
+
+
+def test_a_legacy_raw_o5_writer_blocks_activation():
+    """The first derived composite would be a second total-form unit on o5
+    beside it, and two of those either fail to conjoin or supersede each other."""
+    texts = [("application_rules",
+              "always ( (i12[t]:bv[384] = { #x" + A + " }:bv[384]) -> "
+              "(o5[t]:bv[24] = { #x000000 }:bv[24]) ).")]
+    findings = audit_stream_collisions(texts)
+    assert len(findings) == 1 and "raw o5 policy rule" in findings[0]
+
+
+def test_a_clause_body_writing_o5_is_not_a_legacy_writer():
+    """Only the raw accumulation can hold one: a registered clause is fed with
+    apply_rules_update=False and never enters it."""
+    texts = [("clause_aaaaaaaaaa_o5", "(o5[t]:bv[24] = { #x000000 }:bv[24])")]
+    assert audit_stream_collisions(texts) == []
+
+
+# --- phase 2: a refused activation must not halt the chain -------------------
+
+def test_a_collision_leaves_the_flag_false_without_raising():
+    """Raising at the activation height would invalidate every block from there
+    on and freeze the chain permanently, so the second phase can only decline."""
+    lm = ConsensusLifecycleManager(active_validators=[A])
+    colliding = [("application_rules",
+                  "always ( (i18[t]:bv[24] = { #x01 }:bv[24]) -> "
+                  "(o13[t]:bv[24] = { #x01 }:bv[24]) ).")]
+    lm.apply_host_contract_patch({"approval_slots_active": True},
+                                 effective_spec_texts=colliding)
+    assert lm.approval_slots_active is False
+
+
+def test_a_clean_spec_activates_at_the_height():
+    lm = ConsensusLifecycleManager(active_validators=[A])
+    lm.apply_host_contract_patch({"approval_slots_active": True},
+                                 effective_spec_texts=_CLEAN)
+    assert lm.approval_slots_active is True
+
+
+def test_the_audit_verdict_is_deterministic_across_nodes():
+    """No extra hash key is needed to make a refused activation agree: the audit
+    reads only hash-bound state, so every node computes the same findings and the
+    flag -- which IS hash-bound -- stays False on all of them."""
+    colliding = [("consensus_rules",
+                  "always ( (i19[t]:bv[64] = { 1 }:bv[64]) -> (o6[t]:bv[16] = { 1 }:bv[16]) ).")]
+    node_a = ConsensusLifecycleManager(active_validators=[A])
+    node_b = ConsensusLifecycleManager(active_validators=[A])
+    for lm in (node_a, node_b):
+        lm.apply_host_contract_patch({"approval_slots_active": True},
+                                     effective_spec_texts=colliding)
+    assert node_a.approval_slots_active is node_b.approval_slots_active is False
+    assert node_a.consensus_meta_hash() == node_b.consensus_meta_hash()
+
+
+# --- a fresh chain can ship with it on ---------------------------------------
+
+def test_genesis_metadata_omits_the_flag_by_default():
+    """A genesis generated without --approval-slots stays byte-identical."""
+    assert "approval_slots_active" not in build_mechanism_metadata("supermajority")
+
+
+def test_genesis_metadata_carries_the_flag_when_asked():
+    mech = build_mechanism_metadata("supermajority", approval_slots_active=True)
+    assert mech["approval_slots_active"] is True
+
+
+# --- phase 1: the proposal is refused at admission --------------------------
+#
+# This is the ONLY place a collision can be reported loudly. At the activation
+# height the second phase can merely decline, so an operator who never sees this
+# error would just watch the flag silently fail to flip.
+
+def test_the_proposal_is_refused_when_the_tip_spec_collides(temp_database):
+    import chain_state
+    from consensus.admission import _check_host_contract_patch
+
+    chain_state._consensus_rules_state = "always ( o6[t]:bv[16] = i10[t]:bv[16] )."
+    chain_state._application_rules_state = "always ( o12[t]:bv[24] = i1[t]:bv[24] )."
+    assert _check_host_contract_patch({"approval_slots_active": True}) is None
+
+    chain_state._application_rules_state = (
+        "always ( (i18[t]:bv[24] = { #x01 }:bv[24]) -> "
+        "(o13[t]:bv[24] = { #x01 }:bv[24]) )."
+    )
+    err = _check_host_contract_patch({"approval_slots_active": True})
+    assert err is not None and "cannot be activated on this chain" in err
+    assert "application_rules" in err
+
+
+def test_the_proposal_audit_reads_consensus_rules_not_the_accumulation(temp_database):
+    """chain_state.get_rules_state() returns the APPLICATION accumulation (it
+    prefers `app` because `u` state retention makes that a whole restoreable
+    spec). Using it here audited the application rules twice and never looked at
+    a consensus revision at all."""
+    import chain_state
+    from consensus.admission import _tip_effective_spec_texts, _check_host_contract_patch
+
+    chain_state._application_rules_state = "always ( o12[t]:bv[24] = i1[t]:bv[24] )."
+    chain_state._consensus_rules_state = (
+        "always ( (i19[t]:bv[64] = { 1 }:bv[64]) -> (o6[t]:bv[16] = { 1 }:bv[16]) )."
+    )
+    labels = [label for label, _ in _tip_effective_spec_texts()]
+    assert labels[:2] == ["consensus_rules", "application_rules"]
+    corpus = dict(_tip_effective_spec_texts())
+    assert corpus["consensus_rules"] != corpus["application_rules"]
+
+    err = _check_host_contract_patch({"approval_slots_active": True})
+    assert err is not None and "consensus_rules" in err
+
+
+def test_deactivation_is_refused_at_admission(temp_database):
+    from consensus.admission import _check_host_contract_patch
+
+    err = _check_host_contract_patch({"approval_slots_active": False})
+    assert err is not None and "cannot be deactivated" in err

@@ -8,7 +8,10 @@ from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 
 logger = logging.getLogger(__name__)
-from consensus.approvals import ApprovalRequestLifecycleManager
+from consensus.approvals import (
+    ApprovalRequestLifecycleManager,
+    audit_stream_collisions,
+)
 
 VALIDATOR_DELTA_FIELDS = ("validator_additions", "validator_removals")
 
@@ -576,7 +579,9 @@ class ConsensusLifecycleManager:
         next_validators.update(additions)
         return next_validators
 
-    def apply_host_contract_patch(self, patch: Optional[Dict[str, Any]]) -> None:
+    def apply_host_contract_patch(
+        self, patch: Optional[Dict[str, Any]], effective_spec_texts=None
+    ) -> None:
         """Apply activation-time host metadata changes governed by consensus.
 
         Ordering: validator delta first, then vote_quorum, then a single
@@ -633,7 +638,26 @@ class ConsensusLifecycleManager:
             err = validate_approval_slots_active(patch["approval_slots_active"])
             if err:
                 raise ValueError(f"approval_slots_active: {err}")
-            self.activate_approval_slots()
+
+            # Second phase of a two-phase activation. Raising here would make
+            # EVERY block at and after the activation height invalid, which
+            # freezes the chain permanently -- so a collision leaves the flag
+            # False and the chain running, unactivated.
+            #
+            # No extra hash key is needed to make that agree across nodes: the
+            # audit reads only hash-bound state (consensus rules, the
+            # application-rules accumulation, the clause registry), so every node
+            # computes the same findings and the flag -- which IS hash-bound --
+            # stays False on all of them identically.
+            findings = audit_stream_collisions(effective_spec_texts or ())
+            if findings:
+                logger.error(
+                    "approval_slots_active activation REFUSED at this height; the "
+                    "effective spec already collides: %s",
+                    "; ".join(findings),
+                )
+            else:
+                self.activate_approval_slots()
         self.recompute_approval_threshold()
 
     def activate_approval_slots(self) -> None:
@@ -776,7 +800,9 @@ class ConsensusLifecycleManager:
                 # Keep sorted by activation height ensuring deterministic order
                 self.scheduled_updates.sort(key=lambda x: (x[0], x[1]))
 
-    def process_height_transitions(self, current_height: int) -> List[ConsensusRuleUpdate]:
+    def process_height_transitions(
+        self, current_height: int, effective_spec_texts=None
+    ) -> List[ConsensusRuleUpdate]:
         """
         Perform precise lifecycles evaluations at a block boundary.
         Pending -> Expired
@@ -817,7 +843,10 @@ class ConsensusLifecycleManager:
                 # Activate
                 if uid in self.update_payloads:
                     update = self.update_payloads[uid]
-                    self.apply_host_contract_patch(update.host_contract_patch)
+                    self.apply_host_contract_patch(
+                        update.host_contract_patch,
+                        effective_spec_texts=effective_spec_texts,
+                    )
                     newly_active.append(update)
                 self.archival_updates.add(uid)
                 if uid in self.votes:

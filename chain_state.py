@@ -1069,6 +1069,11 @@ def load_genesis(genesis_json_path: str):
             _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
             _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
             _lifecycle_manager.fee_beneficiary = meta.get("mechanism_specific_metadata", {}).get("fee_beneficiary", "")
+            # A fresh chain may ship with co-signature approval slots already
+            # reserved (scripts/gen_genesis.py --approval-slots). One-way, so
+            # this only ever turns it on.
+            if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
+                _lifecycle_manager.activate_approval_slots()
             _lifecycle_manager.recompute_approval_threshold()
 
         commit_state_to_db(genesis_block.block_hash, 0)
@@ -1119,6 +1124,11 @@ def load_genesis(genesis_json_path: str):
             _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
             _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
             _lifecycle_manager.fee_beneficiary = meta.get("mechanism_specific_metadata", {}).get("fee_beneficiary", "")
+            # A fresh chain may ship with co-signature approval slots already
+            # reserved (scripts/gen_genesis.py --approval-slots). One-way, so
+            # this only ever turns it on.
+            if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
+                _lifecycle_manager.activate_approval_slots()
             _lifecycle_manager.recompute_approval_threshold()
             commit_state_to_db(_canonical_head_hash, latest["header"]["block_number"] if latest else 0)
         print(f"[INFO][chain_state] State loaded successfully. Last known block hash: '{_canonical_head_hash[:16]}...'")

@@ -648,8 +648,33 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # The rules are updated by self.apply (it returns a generic snapshot with tau_bytes).
         next_app_rules = exec_result.snapshot.tau_bytes.decode('utf-8', errors='ignore')
         
-        # Governance Height Transitions
-        newly_active = lm.process_height_transitions(block.header.block_number)
+        # Governance Height Transitions.
+        #
+        # The effective spec is handed down so an approval-slot activation can
+        # audit it before flipping the flag: reserving i18..i25 and routing o5
+        # rules are consensus-visible changes, and a rule already typing a slot
+        # (or a legacy raw o5 writer) would poison process-global stream typing.
+        # Everything in this corpus is hash-bound state, so every node computes
+        # the same verdict.
+        effective_spec_texts = [
+            ("consensus_rules", active_view.consensus_rules or ""),
+            ("application_rules", next_app_rules or ""),
+        ]
+        try:
+            effective_spec_texts.extend(
+                ("builtin_rule_%d" % n, text)
+                for n, text in enumerate(chain_state.load_builtin_rules_from_disk() or [])
+            )
+        except Exception:  # noqa: BLE001 - the audit is best-effort on disk reads
+            logger.warning("Could not read builtin rules for the activation audit")
+        effective_spec_texts.extend(
+            ("clause_%s_o%d" % (acceptor[:10], stream), body)
+            for (acceptor, stream), body in
+            sorted(getattr(lm.rule_offers, "accepted_clauses", {}).items())
+        )
+        newly_active = lm.process_height_transitions(
+            block.header.block_number, effective_spec_texts=effective_spec_texts
+        )
         next_cons_rules = active_view.consensus_rules
         next_active_consensus_id = parent_snapshot.metadata.get("active_consensus_id", "")
         if newly_active:

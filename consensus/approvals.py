@@ -167,6 +167,65 @@ def screen_slot_widths(body: str) -> Optional[str]:
     return None
 
 
+# --- Activation audit -------------------------------------------------------
+
+def audit_stream_collisions(spec_texts) -> List[str]:
+    """Reasons the approval slots cannot safely be activated. Empty means clear.
+
+    Reserving i18..i25 and routing o5 rules into the clause registry are both
+    consensus-visible changes, and a source grep proves nothing about a LIVE
+    chain: before activation the slots were ordinary custom input streams that
+    any user rule could type at any width, and o5 rules were appended raw.
+
+    Two collisions matter, and both are fatal rather than untidy:
+
+    1. **A slot already typed somewhere in the effective spec.** Per-stream
+       bitvector typing is process-global and sticky, so a deployed rule typing
+       i18 at, say, bv[24] means the first co-signature clause typing it bv[384]
+       leaves `get_interpreter` returning None -- for everyone, until restart.
+
+    2. **A legacy raw o5 writer.** The first derived composite becomes a second
+       total-form unit on o5 beside it, and two of those either fail to conjoin
+       (unsatisfiable) or silently supersede one another. Grandfathering them is
+       not safe, which is why this reports rather than tolerates.
+
+    `spec_texts` is an iterable of (label, text) pairs covering the COMPLETE
+    effective spec: consensus rules, genesis/builtin rules, the application-rules
+    accumulation and every stored clause body. Auditing the application rules
+    alone would miss a collision hiding in a consensus revision.
+    """
+    from consensus.rule_offers import clause_output_streams, strip_clause_comments
+
+    findings: List[str] = []
+    slots = tau_defs.approval_slot_indices()
+
+    for label, text in spec_texts or ():
+        if not isinstance(text, str) or not text.strip():
+            continue
+        scrubbed = strip_clause_comments(text)
+
+        hit = [f"i{idx}" for idx in slots
+               if re.search(r"\bi%d\b" % idx, scrubbed)]
+        if hit:
+            findings.append(
+                f"{label} already references approval slot(s) {', '.join(hit)}; "
+                f"activating would let a bv[{tau_defs.APPROVAL_SLOT_BV_WIDTH}] "
+                f"clause collide with it and poison process-global stream typing"
+            )
+
+        # Only the raw accumulation can hold a legacy o5 writer: a registered
+        # clause is fed with apply_rules_update=False and never enters it.
+        if label.startswith("application_rules") and \
+                tau_defs.USER_POLICY_STREAM_INDEX in clause_output_streams(text):
+            findings.append(
+                f"{label} contains a raw o5 policy rule; the first derived "
+                f"composite would be a second total-form unit on o5 beside it, "
+                f"which either fails to conjoin or silently supersedes it. Clear "
+                f"it or start from fresh state before activating."
+            )
+    return findings
+
+
 # --- Payload parsing --------------------------------------------------------
 
 def _payload_of(tx: Dict[str, Any]) -> Dict[str, Any]:

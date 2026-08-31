@@ -32,6 +32,7 @@ from consensus.rule_offers import (
 from consensus.facade import TipAdmissionView
 from consensus.approvals import (
     MAX_TIER_AUTHORS,
+    audit_stream_collisions,
     MAX_PENDING_REQUESTS_PER_APPROVER,
     approval_slots_active,
     MAX_PENDING_REQUESTS_PER_SENDER,
@@ -51,6 +52,7 @@ from consensus.governance import (
     quorum_count,
     HOST_CONTRACT_PATCH_KEYS,
     validate_fee_beneficiary,
+    validate_approval_slots_active,
 )
 
 logger = logging.getLogger(__name__)
@@ -364,6 +366,47 @@ def precheck_scheduled_update(update: Any, active_validators: Optional[Any] = No
     return {"status": "ok", "error": None}
 
 
+def _tip_effective_spec_texts():
+    """The complete effective spec at the tip, for the activation audit.
+
+    Consensus rules, the application-rules accumulation, the builtin rules on
+    disk and every stored clause body. Auditing the application rules alone would
+    miss a collision hiding in a consensus revision or a builtin.
+    """
+    import chain_state
+    import db
+
+    texts = []
+    try:
+        # get_consensus_rules_state, NOT get_rules_state: the latter returns the
+        # application accumulation (it prefers `app` because the `u` state
+        # retention makes it a restoreable whole spec), so using it here audited
+        # the application rules twice and never looked at a consensus revision.
+        texts.append(("consensus_rules", chain_state.get_consensus_rules_state() or ""))
+    except Exception:  # noqa: BLE001 - advisory read
+        pass
+    try:
+        texts.append(("application_rules", chain_state.get_application_rules_state() or ""))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        texts.extend(
+            ("builtin_rule_%d" % n, text)
+            for n, text in enumerate(chain_state.load_builtin_rules_from_disk() or [])
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for row in db.load_rule_clauses() or []:
+            texts.append(
+                ("clause_%s_o%s" % (str(row["acceptor_pubkey"])[:10], row["target_stream"]),
+                 row["clause_body"])
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    return texts
+
+
 def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = None) -> Optional[str]:
     """Static checks for host contract parameters to ensure future-proofing definitions."""
     # Reject anything apply_host_contract_patch would not read. Without this an
@@ -398,6 +441,20 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         next_validators = (validators - removals) | additions
         if not next_validators:
             return "Validator delta would leave no active validators."
+    if "approval_slots_active" in patch:
+        err = validate_approval_slots_active(patch["approval_slots_active"])
+        if err:
+            return f"approval_slots_active: {err}"
+        # First phase of the two-phase activation. Refusing the PROPOSAL is the
+        # only place a collision can be reported loudly: at the activation height
+        # a raise would invalidate every block from there on and freeze the
+        # chain, so the second phase can only decline to flip the flag.
+        findings = audit_stream_collisions(_tip_effective_spec_texts())
+        if findings:
+            return (
+                "approval_slots_active cannot be activated on this chain: "
+                + "; ".join(findings)
+            )
     if "vote_quorum" in patch:
         policy = patch["vote_quorum"]
         err = validate_quorum_policy(policy)
