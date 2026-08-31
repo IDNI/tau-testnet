@@ -327,3 +327,18 @@ class TipAdmissionView:
                 if row:
                     out.append(row)
         return out
+
+    def clause_author_count(self, target_stream: int) -> int:
+        """How many principals hold a registered clause on this stream.
+
+        Bounds the derived composite, and with it interpreter rebuild cost: every
+        additional author multiplies it by roughly eight.
+        """
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM rule_clauses_v1 WHERE target_stream = ?",
+                (int(target_stream),),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0

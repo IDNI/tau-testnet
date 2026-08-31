@@ -18,8 +18,12 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
     TX_TYPE_RULE_OFFER_ACCEPT,
     TX_TYPE_RULE_OFFER_REJECT,
+    NEUTRAL_O5_CLAUSE_BODY,
     RuleOfferShapeError,
+    clause_body_v1,
+    clause_output_streams,
     compose_stream_rule,
+    is_neutral_clause_body,
     normalize_offer_rule_text,
     parse_rule_offer,
     parse_rule_offer_accept,
@@ -27,6 +31,7 @@ from consensus.rule_offers import (
 )
 from consensus.facade import TipAdmissionView
 from consensus.approvals import (
+    MAX_TIER_AUTHORS,
     MAX_PENDING_REQUESTS_PER_APPROVER,
     approval_slots_active,
     MAX_PENDING_REQUESTS_PER_SENDER,
@@ -286,6 +291,14 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         #      that needs formula analysis, not text screening. The target here is
         #      the accidental global rule, not a determined attacker (who can only
         #      author a rule that also blocks their own transfers).
+        # Once approval slots are active, an o5 rule becomes a registered clause
+        # instead of raw accumulated text. The routing screens replace the
+        # sender-scope screen below: the composite supplies the guard, so a
+        # routed clause must NOT carry one, which is the exact inverse.
+        routing = validate_o5_clause_routing(tx, tip_view, rule_text)
+        if routing is not None:
+            return routing
+
         policy_out = _streams_referenced(rule_text, ("o5", "o8"))
         if policy_out and not _streams_referenced(rule_text, ("i12", "i3")):
             return format_error(
@@ -841,6 +854,111 @@ def validate_rule_offer_decision_payload(
         "composite_rule": composite,
     })
 
+
+
+
+# --- Routing an o5 policy rule into the clause registry ----------------------
+
+def validate_o5_clause_routing(
+    tx: Dict, tip_view: TipAdmissionView, rule_text: str
+) -> Optional[AdmissionResult]:
+    """Screens for a user rule that writes o5, once approval slots are active.
+
+    Returns None when the rule is not an o5 policy rule, so it takes the ordinary
+    accumulation path unchanged. Otherwise returns the verdict, and on success
+    the clause body the apply path should register.
+
+    WHY ROUTE AT ALL
+    ----------------
+    `operations["0"]` rules are appended into one accumulated spec. Rule sharing
+    measured what that does on a shared stream: two guarded total-form rules on
+    o5 conjoin to unsatisfiable, and fed sequentially through i0 the later one
+    silently supersedes the earlier. So the second user to deploy a policy rule
+    knocks out the first. The accepted-clause registry plus the derived composite
+    exists to fix exactly that, but its only door was someone else offering you a
+    rule. This is the missing self-service door: the sender still sends an
+    ordinary user rule, and "user rules are automatically scoped by user and
+    added to the state" becomes literally true instead of approximately true.
+    """
+    if not approval_slots_active(tip_view):
+        return None
+
+    streams = clause_output_streams(rule_text)
+    if tau_defs.USER_POLICY_STREAM_INDEX not in streams:
+        return None
+
+    if len(streams) > 1:
+        others = ", ".join(f"o{s}" for s in streams if s != tau_defs.USER_POLICY_STREAM_INDEX)
+        return format_error(
+            f"A rule writing o5 is registered as your policy clause and may write "
+            f"o5 only; this one also writes {others}. Split it into separate "
+            f"transactions.",
+            code="MIXED_OUTPUT_RULE",
+        )
+
+    # A routed rule replaces the policy that would judge the transfers, so the
+    # two cannot share a transaction: admission compiles the rule separately and
+    # evaluates transfers against the EXISTING live policy, which would judge
+    # them by the very clause being replaced.
+    operations = tx.get("operations") or {}
+    transfers = operations.get("1")
+    if isinstance(transfers, (list, tuple)) and len(transfers) > 0:
+        return format_error(
+            "A policy rule (o5) and transfers cannot share one transaction: the "
+            "transfers would be judged by the policy this rule replaces. Send the "
+            "rule first, then the transfers.",
+            code="RULE_WITH_TRANSFERS",
+        )
+
+    try:
+        body = clause_body_v1(rule_text)
+    except RuleOfferShapeError as exc:
+        return format_error(
+            f"o5 policy rule cannot be registered as a clause: {exc}. The node "
+            f"supplies the sender guard when composing, so submit the body "
+            f"UNGUARDED — drop the `i12 = <your pubkey>` wrapper and write only "
+            f"the policy itself.",
+            code="CLAUSE_SHAPE",
+        )
+
+    domain_error = _screen_clause_domains(body)
+    if domain_error:
+        return format_error(f"o5 policy rule rejected: {domain_error}")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str):
+        return format_error("o5 policy rule needs a sender_pubkey.")
+    sender_n = sender.strip().lower()
+
+    if is_neutral_clause_body(body, tau_defs.USER_POLICY_STREAM_INDEX):
+        # Revocation. Always allowed, never capped: it can only shrink the
+        # composite, and refusing it would make the author cap a permanent
+        # land-grab.
+        return success({
+            "o5_clause_action": "revoke",
+            "o5_clause_body": body,
+        })
+
+    existing = tip_view.clause_for(sender_n, tau_defs.USER_POLICY_STREAM_INDEX)
+    if existing is None:
+        authors = tip_view.clause_author_count(tau_defs.USER_POLICY_STREAM_INDEX)
+        if authors >= MAX_TIER_AUTHORS:
+            return format_error(
+                f"The o5 policy registry is full: {authors} of "
+                f"{MAX_TIER_AUTHORS} author slots are taken. This is a MEASURED "
+                f"ceiling, not a quota — interpreter rebuild time grows about "
+                f"eightfold per additional author (about 2.5s at one, 13-22s at "
+                f"two, 110s at four) against a 60s COMM_TIMEOUT with a watchdog "
+                f"kill past it. An existing author can free a slot by submitting "
+                f"the neutral clause "
+                f"`always ( {NEUTRAL_O5_CLAUSE_BODY} ).`",
+                code="CLAUSE_REGISTRY_FULL",
+            )
+
+    return success({
+        "o5_clause_action": "declare",
+        "o5_clause_body": body,
+    })
 
 
 # --- Co-signature approvals --------------------------------------------------

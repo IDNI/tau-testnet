@@ -17,6 +17,15 @@ from .governance import (
 )
 from . import fees
 from .fees import FeeRuleError
+from .approvals import (
+    STATUS_EXECUTED,
+    STATUS_FAILED,
+    STATUS_OPEN,
+    TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_TRANSFER_VOTE,
+    parse_approval_request,
+    parse_transfer_vote,
+)
 from .rule_offers import (
     RULE_OFFER_TX_TYPES,
     TX_TYPE_RULE_OFFER,
@@ -24,12 +33,25 @@ from .rule_offers import (
     parse_rule_offer,
     parse_rule_offer_accept,
     parse_rule_offer_reject,
+    clause_output_streams,
 )
 
 # Transaction types that pay a fee. Governance types are exempt so validators
 # never need funds to govern; rule sharing is user-initiated and expensive, so
 # exempting it would make rule spam free.
-FEE_BEARING_TX_TYPES = frozenset({"user_tx"} | set(RULE_OFFER_TX_TYPES))
+#
+# `approval_request` pays because it is the ONLY charge for a parked transfer:
+# executing it later is free, so there is no second fee to drift against a fee
+# rule that changed while the request sat open. `transfer_vote` is exempt like a
+# governance vote, so approver bots need no funding.
+#
+# MUST stay in step with commands.sendtx.FEE_BEARING_TX_TYPES -- the same
+# constant is deliberately duplicated there to keep the admission path free of
+# an engine import, and a divergence charges a different fee at admission than
+# at inclusion.
+FEE_BEARING_TX_TYPES = frozenset(
+    {"user_tx", TX_TYPE_APPROVAL_REQUEST} | set(RULE_OFFER_TX_TYPES)
+)
 from errors import BlockchainBug, TauCommunicationError, TauEngineBug, TauEngineCrash
 
 # We need to import chain_state and tau_manager, but we must be careful about circular imports.
@@ -282,6 +304,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "poa": mode != "stake",
                 "eligibility_mode": mode,
                 "max_rule_txs_per_block": rule_tx_budget,
+                # Whether i18..i25 are reserved and fed. Read from the PARENT
+                # snapshot's manager, so an activation recorded in block H
+                # governs H+1 onward and never changes the meaning of the block
+                # that carried it.
+                "approval_slots_active": bool(
+                    getattr(lm, "approval_slots_active", False)
+                ),
             },
             parent_balances=parent_snapshot.metadata.get("balances"),
         )
@@ -313,6 +342,39 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             return None
         return value
+
+    @staticmethod
+    def _view_approval_slots_active(active_view) -> bool:
+        meta = getattr(active_view, "mechanism_specific_metadata", None) or {}
+        return meta.get("approval_slots_active") is True
+
+    @classmethod
+    def _counts_against_rule_budget(cls, tx: dict, slots_active: bool) -> bool:
+        """Whether this transaction costs an interpreter rebuild.
+
+        The rule-sharing types always do. A user_tx carrying an o5 policy rule
+        does too ONCE routing is active, because it re-derives the composite --
+        and not counting it would leave the flood vector wide open on the one
+        path this feature adds.
+
+        Legacy `operations["0"]` rules stay excluded, for the reason the comment
+        at the call site gives: existing chains already contain blocks carrying
+        many of them, and counting those retroactively would break replay of
+        history. Post-activation routed rules are new, so counting them breaks
+        nothing.
+        """
+        tx_type = tx.get("tx_type", "user_tx")
+        if tx_type in RULE_OFFER_TX_TYPES:
+            return True
+        if not slots_active or tx_type != "user_tx":
+            return False
+        operations = tx.get("operations")
+        if not isinstance(operations, dict):
+            return False
+        rule_text = operations.get("0")
+        if not isinstance(rule_text, str) or not rule_text.strip():
+            return False
+        return tau_defs.USER_POLICY_STREAM_INDEX in clause_output_streams(rule_text)
 
     def verify_block_header(self, *args, **kwargs) -> bool:
         """
@@ -378,9 +440,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         if block is not None and active_view is not None:
             budget = self._view_rule_tx_budget(active_view)
             if budget is not None:
+                slots_active = self._view_approval_slots_active(active_view)
                 rule_txs = sum(
                     1 for tx in (getattr(block, "transactions", None) or [])
-                    if isinstance(tx, dict) and tx.get("tx_type") in RULE_OFFER_TX_TYPES
+                    if isinstance(tx, dict)
+                    and self._counts_against_rule_budget(tx, slots_active)
                 )
                 if rule_txs > budget:
                     logger.warning(
