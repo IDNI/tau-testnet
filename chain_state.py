@@ -1074,6 +1074,17 @@ def load_genesis(genesis_json_path: str):
             # this only ever turns it on.
             if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
                 _lifecycle_manager.activate_approval_slots()
+                # Persist immediately. TipAdmissionView reads this key, not the
+                # manager, so without it admission treats a genesis-activated
+                # chain as INACTIVE until the first block commits -- and rejects
+                # every co-signature policy in the meantime. Found by the
+                # live-node e2e.
+                try:
+                    db.set_chain_state_value("approval_slots_active", "1")
+                except Exception:
+                    logger.warning(
+                        "could not persist approval_slots_active from genesis",
+                        exc_info=True)
             _lifecycle_manager.recompute_approval_threshold()
 
         commit_state_to_db(genesis_block.block_hash, 0)
@@ -1129,6 +1140,17 @@ def load_genesis(genesis_json_path: str):
             # this only ever turns it on.
             if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
                 _lifecycle_manager.activate_approval_slots()
+                # Persist immediately. TipAdmissionView reads this key, not the
+                # manager, so without it admission treats a genesis-activated
+                # chain as INACTIVE until the first block commits -- and rejects
+                # every co-signature policy in the meantime. Found by the
+                # live-node e2e.
+                try:
+                    db.set_chain_state_value("approval_slots_active", "1")
+                except Exception:
+                    logger.warning(
+                        "could not persist approval_slots_active from genesis",
+                        exc_info=True)
             _lifecycle_manager.recompute_approval_threshold()
             commit_state_to_db(_canonical_head_hash, latest["header"]["block_number"] if latest else 0)
         print(f"[INFO][chain_state] State loaded successfully. Last known block hash: '{_canonical_head_hash[:16]}...'")

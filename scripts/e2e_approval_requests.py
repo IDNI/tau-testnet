@@ -157,8 +157,50 @@ class Node:
             raise RuntimeError(json.dumps(res)[:400])
         return res
 
-    def mine(self):
-        return self.rpc("createblock")
+    def mine(self, tries=8):
+        """Mine, retrying MINING_BUSY.
+
+        The node's own SoleMiner holds the chain lock on its 30s round, so an
+        explicit createblock frequently returns MINING_BUSY. Treating one call as
+        "a block happened" is how this script first reported a vote as never
+        applied when it was simply still in the mempool.
+        """
+        last = None
+        for _ in range(tries):
+            last = self.rpc("createblock")
+            err = (last.get("error") or {})
+            msg = str(err.get("code", "")) + str(err.get("message", "")) + str(last.get("message", ""))
+            if "BUSY" not in msg.upper():
+                return last
+            time.sleep(3)
+        return last
+
+    def wait_for(self, predicate, what, tries=20, delay=3.0):
+        """Mine and poll until `predicate()` holds. Returns True if it did.
+
+        Asserting against the CHAIN rather than one createblock response is the
+        discipline the rule-sharing e2e had to learn: the node's own miner races
+        every explicit mine.
+        """
+        for _ in range(tries):
+            if predicate():
+                return True
+            self.mine()
+            time.sleep(delay)
+        say(f"  (timed out waiting for {what})")
+        return predicate()
+
+    def await_status(self, request_id, expected, **kw):
+        def _ok():
+            row = self.request_row(request_id)
+            return bool(row) and row.get("status") == expected
+        return self.wait_for(_ok, f"request {request_id[:12]} -> {expected}", **kw)
+
+    def await_mempool_drain(self, **kw):
+        def _empty():
+            data = self.rpc("getmempool")["data"]
+            return not (data.get("transactions") or [])
+        return self.wait_for(_empty, "the mempool to drain", **kw)
 
     def height(self):
         blocks = self.rpc("getblocks")["data"].get("blocks") or []
@@ -235,7 +277,8 @@ class Node:
 def scenario_policy(node):
     say("Deploying Alice's tiered policy")
     node.deploy_policy()
-    node.mine()
+    node.wait_for(lambda: node.clauses().get("has_clause") is True,
+                  "the policy clause to register")
     slots = node.clauses()
     check("policy registered as a clause", slots.get("has_clause") is True, slots)
     check("slots readable: 18=auth 19=scan 20=partner",
@@ -249,7 +292,7 @@ def scenario_below_tier_one(node):
     res = node.transfer(TIER_1 - 500, expect_ok=True)
     check("below tier 1 is admitted as an ordinary transfer",
           res.get("status") == "ok", json.dumps(res)[:200])
-    node.mine()
+    node.await_mempool_drain()
     for who in ("authbot", "scanbot", "partner"):
         check(f"{who} inbox empty", node.inbox(who) == [])
 
@@ -263,7 +306,7 @@ def scenario_tier_one(node):
           blocked.get("status") == "error", json.dumps(blocked)[:200])
 
     _res, payload = node.request(amount, {18: node.pk("authbot")})
-    node.mine()
+    node.await_mempool_drain()
     rid = node.rpc("getrequestid '" + json.dumps({
         "sender_pubkey": node.pk("alice"),
         "recipient_pubkey": payload["recipient_pubkey"],
@@ -280,10 +323,10 @@ def scenario_tier_one(node):
     check("partner is NOT notified", node.inbox("partner") == [])
 
     node.vote("authbot", rid, approve=True)
-    node.mine()
+    node.await_status(rid, "executed")
     row = node.request_row(rid)
     check("released by the auth bot alone",
-          (row or {}).get("status") == "executed", json.dumps(row)[:200])
+          (row or {}).get("status") == "executed", json.dumps(row)[:300])
 
 
 def scenario_tier_two(node):
@@ -291,7 +334,7 @@ def scenario_tier_two(node):
     say(f"A transfer of {amount} needs auth AND scanner")
     _res, payload = node.request(
         amount, {18: node.pk("authbot"), 19: node.pk("scanbot")})
-    node.mine()
+    node.await_mempool_drain()
     rid = _request_id(node, payload)
 
     check("auth bot notified", len(node.inbox("authbot")) == 1)
@@ -299,16 +342,16 @@ def scenario_tier_two(node):
     check("partner still NOT notified", node.inbox("partner") == [])
 
     node.vote("authbot", rid, approve=True)
-    node.mine()
+    node.await_mempool_drain()
     row = node.request_row(rid)
     check("one signature is not enough at tier 2",
-          (row or {}).get("status") == "open", json.dumps(row)[:200])
+          (row or {}).get("status") == "open", json.dumps(row)[:300])
 
     node.vote("scanbot", rid, approve=True)
-    node.mine()
+    node.await_status(rid, "executed")
     row = node.request_row(rid)
     check("released once the scanner signs too",
-          (row or {}).get("status") == "executed", json.dumps(row)[:200])
+          (row or {}).get("status") == "executed", json.dumps(row)[:300])
 
 
 def scenario_tier_three_and_decline(node):
@@ -316,19 +359,19 @@ def scenario_tier_three_and_decline(node):
     say(f"A transfer of {amount} needs all three; the partner declines")
     _res, payload = node.request(amount, {
         18: node.pk("authbot"), 19: node.pk("scanbot"), 20: node.pk("partner")})
-    node.mine()
+    node.await_mempool_drain()
     rid = _request_id(node, payload)
     for who in ("authbot", "scanbot", "partner"):
         check(f"{who} notified at tier 3", len(node.inbox(who)) == 1)
 
     node.vote("authbot", rid, approve=True)
     node.vote("scanbot", rid, approve=True)
-    node.mine()
+    node.await_mempool_drain()
     node.vote("partner", rid, approve=False, reason="not this quarter")
-    node.mine()
+    node.await_status(rid, "failed")
     row = node.request_row(rid)
     check("a needed approver's decline leaves it unreleased",
-          (row or {}).get("status") == "failed", json.dumps(row)[:200])
+          (row or {}).get("status") == "failed", json.dumps(row)[:300])
 
 
 def scenario_over_declared_approver_cannot_veto(node):
@@ -336,27 +379,27 @@ def scenario_over_declared_approver_cannot_veto(node):
     say("An over-declared approver declines; the transfer should still go")
     _res, payload = node.request(amount, {
         18: node.pk("authbot"), 19: node.pk("scanbot")})
-    node.mine()
+    node.await_mempool_drain()
     rid = _request_id(node, payload)
 
     node.vote("scanbot", rid, approve=False, reason="not my business")
-    node.mine()
+    node.await_mempool_drain()
     row = node.request_row(rid)
     check("a decline from an unneeded approver does not resolve it",
-          (row or {}).get("status") == "open", json.dumps(row)[:200])
+          (row or {}).get("status") == "open", json.dumps(row)[:300])
 
     node.vote("authbot", rid, approve=True)
-    node.mine()
+    node.await_status(rid, "executed")
     row = node.request_row(rid)
     check("the needed approver still releases it",
-          (row or {}).get("status") == "executed", json.dumps(row)[:200])
+          (row or {}).get("status") == "executed", json.dumps(row)[:300])
 
 
 def scenario_custom_input_reaches_the_approver(node):
     say("The sender's comment reaches the partner")
     _res, payload = node.request(
         TIER_1 + 1, {18: node.pk("authbot")}, customs={26: "rent for Q3"})
-    node.mine()
+    node.await_mempool_drain()
     inbox = node.inbox("authbot")
     check("comment visible to the approver",
           any((r.get("custom_inputs") or {}).get("26") == "rent for Q3"

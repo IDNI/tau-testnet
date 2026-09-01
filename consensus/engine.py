@@ -964,7 +964,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             values = {idx: "0" for idx in tau_defs.approval_slot_indices()}
             if overlay:
                 for slot, pubkey in overlay.items():
-                    values[int(slot)] = str(pubkey)
+                    text = str(pubkey or "")
+                    # WRAPPED literal, exactly as i3/i4/i12 are fed. tau_shrink
+                    # interns the bv[384] pubkey literals inside a clause down to
+                    # bv[8] ids, and it recognises a value to intern by this
+                    # `{ #x.. }:bv[384]` shape. Fed as bare hex the value skips
+                    # interning and a 384-bit constant lands on a bv[8] stream:
+                    # "overflow in bit-vector construction", the whole block
+                    # fails simulation, and block production wedges. Only a live
+                    # node with shrink ON shows this -- a mocked engine does not
+                    # care how the value is spelled.
+                    values[int(slot)] = (
+                        "{ #x" + text + " }:bv[%d]" % tau_defs.APPROVAL_SLOT_BV_WIDTH
+                        if text and text != "0" else "0"
+                    )
             return values
 
         def _since_last_transfer(addr: Optional[str]) -> str:
@@ -1649,9 +1662,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 # NOT roll back lifecycle mutations, so a Tau
                                 # failure here must not leave a recorded vote
                                 # behind.
-                                prospective = approvals.prospective_slot_values(
+                                # The manager returns raw pubkeys (the right
+                                # domain value); _approval_slot_values formats
+                                # them for the wire as `{ #x.. }:bv[384]`, which
+                                # is the shape tau_shrink interns. Feeding the
+                                # raw map straight through overflowed the
+                                # interned bv[8] slot stream and wedged block
+                                # production.
+                                prospective_raw = approvals.prospective_slot_values(
                                     vote.request_id, vote
                                 )
+                                prospective = _approval_slot_values(prospective_raw)
                                 allows, _released_fee = _measure_parked_transfer(
                                     entry.sender_pubkey, entry.recipient_pubkey,
                                     entry.amount, entry.custom_inputs, prospective,

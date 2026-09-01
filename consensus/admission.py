@@ -229,6 +229,18 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
     # revision screen, which still hard-rejects (b)).
     rule_text = operations.get("0")
     if isinstance(rule_text, str) and rule_text:
+        # DECIDED FIRST, before any user-rule screen. Once approval slots are
+        # active an o5 rule is a registered clause, not accumulated text, and the
+        # two are screened by OPPOSITE rules: the user context forbids reading
+        # the approval slots that a clause exists to read, and requires an i12
+        # guard that a clause must not carry. Running the user screens first
+        # rejected every co-signature policy with "references reserved consensus
+        # input stream 'i18'" -- found by the live-node e2e, invisible to a unit
+        # test that called the routing validator directly.
+        routing = validate_o5_clause_routing(tx, tip_view, rule_text)
+        if routing is not None:
+            return routing
+
         forbidden_out = _streams_referenced(rule_text, ("o6", "o7", "o9"))
         if forbidden_out:
             return format_error(
@@ -293,14 +305,6 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         #      that needs formula analysis, not text screening. The target here is
         #      the accidental global rule, not a determined attacker (who can only
         #      author a rule that also blocks their own transfers).
-        # Once approval slots are active, an o5 rule becomes a registered clause
-        # instead of raw accumulated text. The routing screens replace the
-        # sender-scope screen below: the composite supplies the guard, so a
-        # routed clause must NOT carry one, which is the exact inverse.
-        routing = validate_o5_clause_routing(tx, tip_view, rule_text)
-        if routing is not None:
-            return routing
-
         policy_out = _streams_referenced(rule_text, ("o5", "o8"))
         if policy_out and not _streams_referenced(rule_text, ("i12", "i3")):
             return format_error(

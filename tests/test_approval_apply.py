@@ -504,3 +504,46 @@ def test_routing_is_inactive_before_activation():
     result, lm, _ = _apply([rule_tx(GUARDED_RULE)], lm=_lm(active=False))
     assert lm.rule_offers.clause_for(ALICE, 5) is None
     assert "Rule applied" in _logs(result), "the ordinary accumulation path runs"
+
+
+def test_slot_values_are_fed_as_wrapped_bv384_literals():
+    """The WIRE SHAPE matters, and a mocked engine cannot tell you so.
+
+    tau_shrink interns the bv[384] pubkey literals inside a clause down to bv[8]
+    ids, and it recognises a value to intern by the `{ #x.. }:bv[384]` shape that
+    i3/i4/i12 are fed in. Fed as bare hex, an approver's key skips interning and a
+    384-bit constant lands on a bv[8] stream: "overflow in bit-vector
+    construction", the block fails simulation, and block production wedges with
+    MINING_BUSY forever.
+
+    The substring-matching fake in this file passes either way, which is exactly
+    how the bug survived to a live node.
+    """
+    req = _request()
+    lm = _seeded(req)
+    _result, _post, calls = _apply([vote_tx(req)], lm=lm)
+
+    slot_feeds = [
+        (k, v)
+        for c in calls
+        for k, v in (c.get("input_stream_values") or {}).items()
+        if isinstance(k, int) and 18 <= k <= 25 and str(v) != "0"
+    ]
+    assert slot_feeds, "a voted slot should have been fed"
+    for slot, value in slot_feeds:
+        assert value.startswith("{ #x"), (slot, value)
+        assert value.endswith("}:bv[384]"), (slot, value)
+        assert AUTH in value
+
+
+def test_unvoted_slots_are_fed_as_plain_zero():
+    """0 is the intern store's reserved 'empty' id, and it needs no wrapper."""
+    req = _request()
+    lm = _seeded(req)
+    _result, _post, calls = _apply([vote_tx(req)], lm=lm)
+    zeros = [
+        v for c in calls
+        for k, v in (c.get("input_stream_values") or {}).items()
+        if isinstance(k, int) and 18 <= k <= 25 and str(v) == "0"
+    ]
+    assert zeros, "unvoted slots should be fed 0"

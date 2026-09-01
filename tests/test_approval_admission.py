@@ -283,13 +283,43 @@ def test_slots_are_writable_before_activation(tip_view):
     assert validate_user_tx_reserved_domains(tx, tip_view).is_valid is True
 
 
-def test_a_plain_user_rule_may_not_type_a_slot(tip_view):
+def test_a_non_policy_rule_may_not_type_a_slot(tip_view):
+    """A rule that is NOT an o5 policy is never routed, so it hits the ordinary
+    reserved-input screen. Only a registered clause may read a slot."""
+    rule = ("always ( (i18[t]:bv[384] = { #x" + AUTH + " }:bv[384]) -> "
+            "(o12[t]:bv[24] = { #x000001 }:bv[24]) ).")
+    result = validate_user_tx_reserved_domains(_user_tx(operations={"0": rule}), tip_view)
+    assert result.is_valid is False
+    assert "reserved consensus input stream" in result.error
+
+
+def test_a_guarded_o5_rule_is_refused_by_routing_not_by_the_slot_screen(tip_view):
+    """Ordering matters here and a live node proved it. An o5 rule is ROUTED
+    before any user-rule screen runs, because the two are screened by opposite
+    rules: the user context forbids reading the slots a clause exists to read,
+    and demands an i12 guard a clause must not carry. With the screens first,
+    every co-signature policy was rejected as "references reserved consensus
+    input stream 'i18'" -- which is both wrong and unactionable."""
     rule = ("always ( (i12[t]:bv[384] = { #x" + A + " }:bv[384] && "
             "i18[t]:bv[384] = { #x" + AUTH + " }:bv[384]) -> "
             "(o5[t]:bv[24] = { #x000001 }:bv[24]) ).")
     result = validate_user_tx_reserved_domains(_user_tx(operations={"0": rule}), tip_view)
     assert result.is_valid is False
-    assert "reserved consensus input stream" in result.error
+    assert result.code == "CLAUSE_SHAPE", result.error
+    assert "UNGUARDED" in result.error
+
+
+def test_an_unguarded_o5_clause_reading_a_slot_is_accepted(tip_view):
+    """The case the whole feature needs to work."""
+    rule = ("always ( ( (i1[t]:bv[24] > { #x0003e8 }:bv[24] && "
+            "!(i18[t]:bv[384] = { #x" + AUTH + " }:bv[384])) "
+            "? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
+            ": (o5[t]:bv[24] = { #x000001 }:bv[24]) ) ).")
+    tip_view.clause_for.return_value = None
+    tip_view.clause_author_count.return_value = 0
+    result = validate_user_tx_reserved_domains(_user_tx(operations={"0": rule}), tip_view)
+    assert result.is_valid is True, result.error
+    assert result.data["o5_clause_action"] == "declare"
 
 
 # --- admission and apply must reject the same inputs ------------------------

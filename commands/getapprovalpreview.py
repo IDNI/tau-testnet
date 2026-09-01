@@ -120,7 +120,15 @@ def execute(raw_command: str, container):
                 for idx in tau_defs.approval_slot_indices():
                     inputs[idx] = "0"
                 for idx in subset:
-                    inputs[idx] = candidates[idx]
+                    # WRAPPED, exactly as i3/i4/i12 above. tau_shrink interns the
+                    # bv[384] pubkey literals in a clause down to bv[8] ids and
+                    # recognises a value to intern by this shape; bare hex skips
+                    # interning and overflows the interned slot stream
+                    # ("bit-vector size 8 too small to hold value ...").
+                    inputs[idx] = (
+                        "{ #x" + candidates[idx] + " }:bv[%d]"
+                        % tau_defs.APPROVAL_SLOT_BV_WIDTH
+                    )
                 try:
                     allows = _step(inputs)
                 except Exception as exc:
