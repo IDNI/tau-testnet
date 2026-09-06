@@ -199,3 +199,26 @@ def test_application_rules_state_canonical_and_width_independent(temp_database, 
     assert on_state == off_state                      # width-independent
     assert f"#x{HEX96}" in on_state and "bv[384]" in on_state   # canonical full-width
     assert "{ 1 }:bv[8]" in on_iface.received_rules[-1]  # interpreter got the shrunk form
+
+
+def test_restore_never_repicks_the_process_shrink_width(direct_mode, monkeypatch):
+    """Regression: `restore_full_tau_spec` used to recompute the shrink width.
+
+    Restores run mid-process (createblock does one per block) while the shared
+    `tau_strings` sequence grows every block, so the recompute eventually widened
+    a live interpreter's rules from bv[8] to bv[16] -- and the engine, which types
+    each stream once and never re-types it, rejected everything after that with
+    "Incompatible type information in i12:untyped, expected :bv[8], found :bv[16]".
+    """
+    iface = direct_mode
+    # Unpinned on purpose: if the recompute comes back, this widens to bv[16].
+    monkeypatch.setattr(ts, "_width_pinned", False)
+    monkeypatch.setattr(db, "get_max_string_id", lambda: 300)   # table grew since boot
+
+    tau_manager.restore_full_tau_spec(EQ_RULE)
+
+    assert ts.current_shrink_width() == 8
+    assert "i12[t]:bv[8]" in iface.spec and "bv[16]" not in iface.spec
+    # ... and a rule prepared AFTER the restore still matches that typing.
+    tau_manager.communicate_with_tau(rule_text=EQ_RULE, target_output_stream_index=0)
+    assert "i12[t]:bv[8]" in iface.received_rules[-1]

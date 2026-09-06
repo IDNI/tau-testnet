@@ -55,6 +55,13 @@ MIN_SHRINK_WIDTH = 128
 # fresh process re-types at the next width); see ShrinkWidthOverflow.
 DEFAULT_SHRINK_WIDTH = 8
 _current_shrink_width: int = DEFAULT_SHRINK_WIDTH
+# True once the width has been chosen for this process. A later recompute is
+# REFUSED, not applied: the engine types each stream on first use and never
+# re-types it, so widening in-process makes every subsequent rule
+# (`i12[t]:bv[16]`) clash with the interpreter's existing bv[8] typing --
+# "Incompatible type information in i12:untyped, expected :bv[8], found :bv[16]".
+# Growth is handled by re-exec (ShrinkWidthOverflow) instead.
+_width_pinned: bool = False
 
 # Output stream indices whose values are boolean verdicts, never addresses.
 # Used by the (deferred) output-expansion guard to avoid false alarms on 0/1.
@@ -77,19 +84,45 @@ def current_shrink_width() -> int:
     return _current_shrink_width
 
 
-def set_shrink_width(width: int) -> None:
-    global _current_shrink_width
+def set_shrink_width(width: int, *, pin: bool = False) -> None:
+    global _current_shrink_width, _width_pinned
     _current_shrink_width = max(DEFAULT_SHRINK_WIDTH, int(width))
+    if pin:
+        _width_pinned = True
+
+
+def reset_shrink_width(width: int = DEFAULT_SHRINK_WIDTH) -> None:
+    """Drop the process pin so a fresh width can be chosen. Tests only -- a live
+    node grows its width by re-exec, never by resetting the pin in place."""
+    global _width_pinned
+    _width_pinned = False
+    set_shrink_width(width)
 
 
 def set_shrink_width_from_db() -> int:
-    """Recompute the process shrink width from the current intern-table max id.
-    Call once at interpreter init/restore (process start)."""
+    """Pick the process shrink width from the current intern-table max id.
+
+    Call ONCE at interpreter init (process start). Later calls are REFUSED: the
+    engine's per-stream bv typing is sticky, so recomputing mid-process (restores
+    run per block) would emit rules at a width the live interpreter cannot type.
+    A wider recomputed value only means the next NEW interned id will overflow,
+    and `tau_manager._handle_width_overflow` re-execs -- the one safe way to grow.
+    """
     try:
         max_id = db.get_max_string_id()
     except Exception:
         max_id = 0
-    set_shrink_width(width_for_count(max_id or 0))
+    width = width_for_count(max_id or 0)
+    if _width_pinned:
+        if width != _current_shrink_width:
+            logger.warning(
+                "tau_shrink: refusing shrink width bv[%d] -> bv[%d] mid-process "
+                "(max interned id=%s); per-stream typing is sticky, so growth "
+                "waits for the next re-exec.",
+                _current_shrink_width, width, max_id,
+            )
+        return _current_shrink_width
+    set_shrink_width(width, pin=True)
     logger.info("tau_shrink: shrink width set to bv[%d] (max interned id=%s)",
                 _current_shrink_width, max_id)
     return _current_shrink_width

@@ -501,7 +501,15 @@ def get_string_id(text: str) -> str:
 
 def get_max_string_id() -> int:
     """Largest assigned tau_strings id (0 if empty). Used to pick the smallest
-    bv shrink width that covers the current interned-address count."""
+    bv shrink width that covers the current interned-address count.
+
+    Deliberately unfiltered. The table's id sequence is SHARED: shrink keys
+    (`bv<width>:<hex>`) and the consensus yids of TauConsensusEngine._encode_yid
+    (proposer, parent hash, claims json -- at least one new row per block) draw
+    from the same autoincrement. So an address can be handed an id far above the
+    address count, and the shrink width has to cover assigned id VALUES, not the
+    number of addresses. Narrowing this to `text LIKE 'bv%'` would pick a width
+    too small for the ids actually in use."""
     global _db_conn
     if _db_conn is None:
         init_db()

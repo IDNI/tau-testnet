@@ -730,8 +730,15 @@ def restore_full_tau_spec(spec_text: str, *, runtime_shrunk_streams: "frozenset 
         # (default) runtime == canonical and this is identical to the pre-shrink path.
         canonical = tau_direct_interface.preprocess_spec_text(spec_text or "")
         if getattr(config, "TAU_SHRINK_ENABLED", False):
-            # Re-pick the process width from the (now-restored) intern table first.
-            tau_shrink.set_shrink_width_from_db()
+            # Do NOT re-pick the shrink width here. It is chosen ONCE per process
+            # (start_and_manage_tau_process, before this callback runs). Restores
+            # happen mid-process -- createblock does one per block -- while the
+            # intern table grows every block (consensus yids for parent hash /
+            # proposer / claims share the tau_strings sequence). Re-picking widened
+            # bv[8] -> bv[16] in a live process, after which every prepared rule
+            # carried `i12[t]:bv[16]` into an interpreter that had already typed
+            # i12 as bv[8]: "Incompatible type information in i12:untyped,
+            # expected :bv[8], found :bv[16]". Widening is only safe via re-exec.
             prepared = tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
         else:
             prepared = tau_shrink.PreparedTauSpec(canonical, canonical, False, frozenset())

@@ -37,6 +37,25 @@ def test_width_for_count_boundaries():
     assert [ts.width_for_count(n) for n in (0, 254, 255, 65534, 65535)] == [8, 8, 16, 16, 24]
 
 
+def test_width_is_pinned_after_the_first_pick(temp_database, monkeypatch):
+    # The width is chosen ONCE per process. Recomputing it later widened a LIVE
+    # node bv[8] -> bv[16] (the tau_strings sequence grows every block), after
+    # which every prepared rule carried `i12[t]:bv[16]` into an interpreter that
+    # had already typed i12 as bv[8] -- the engine then rejected the whole spec
+    # with "Incompatible type information in i12:untyped, expected :bv[8]".
+    monkeypatch.setattr(ts, "_width_pinned", False)
+    monkeypatch.setattr(ts, "_current_shrink_width", ts.DEFAULT_SHRINK_WIDTH)
+    monkeypatch.setattr(db, "get_max_string_id", lambda: 10)
+    assert ts.set_shrink_width_from_db() == 8
+
+    monkeypatch.setattr(db, "get_max_string_id", lambda: 300)   # ~300 blocks later
+    assert ts.set_shrink_width_from_db() == 8                   # refused, not applied
+    assert ts.current_shrink_width() == 8
+    # Growth is a re-exec: a fresh process unpins and picks the wider width.
+    ts.reset_shrink_width()
+    assert ts.set_shrink_width_from_db() == 16
+
+
 def test_overflow_raises_widthoverflow(temp_database, monkeypatch):
     # An interned id beyond the current process width (default bv[8], usable<=254)
     # raises ShrinkWidthOverflow -> the node must re-exec to widen (not fail-closed).
