@@ -383,6 +383,7 @@ When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker)
 - `o7` — proposer eligibility.
 - `o9` — consensus base fee (strict); `o8` — optional user fee (lenient).
 - `o5` — user policy on a transfer (`0` = block, `1`/absent = allow). User-deployed, sender-scoped rules; **consensus-enforced** at both admission and block apply. A block on any transfer rejects the whole `user_tx`. Lets users express recipient whitelists (`i4`), time-locks (`i5`), and spending limits (`i1`). See [WALLET_USAGE.md](WALLET_USAGE.md).
+  Tiered co-signature approvals build on `o5`: a sender requires an approver's signature above an amount threshold, and the transfer parks on-chain until the rule is satisfied. See [docs/approvals.md](docs/approvals.md).
   **Sender scope is enforced at admission** (`UNSCOPED_USER_RULE`): `o5`/`o8` are shared streams composed across every deployed rule, so rule text writing them must reference `i12` (sender pubkey) or `i3` (from address). Without that, one `always (o5[t] = 0)` deploy would block every account on the network. The screen is textual — a reference is not proof the rule is genuinely gated by it — and applies at admission only, so rules already on chain are unaffected.
 
 **Python host enforces _before_ Tau** (the inputs Tau trusts):
