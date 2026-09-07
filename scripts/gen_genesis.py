@@ -35,6 +35,15 @@ def get_args():
         help="Extra pre-funded account as ADDR:BALANCE (repeatable; ADDR is 96 lowercase hex chars)",
     )
     parser.add_argument("--network-id", type=str, default="tau-testnet-v2", help="Network ID")
+    parser.add_argument(
+        "--approval-slots", action="store_true",
+        help=(
+            "Activate co-signature approval slots (i18-i25) from block 0. For a "
+            "FRESH chain only: on an existing chain this is a governance patch, "
+            "which audits the live spec first. Off by default so a genesis "
+            "generated without it stays byte-identical."
+        ),
+    )
     parser.add_argument("--out", type=str, default="data/genesis.json", help="Output path for genesis.json")
     parser.add_argument(
         "--base-fee", type=int, default=10,
@@ -294,7 +303,8 @@ def main():
     # one produced before those fields existed (hash-compat).
     from consensus.governance import build_mechanism_metadata
     mech_meta = build_mechanism_metadata(
-        args.vote_quorum, args.eligibility_mode, args.fee_beneficiary
+        args.vote_quorum, args.eligibility_mode, args.fee_beneficiary,
+        approval_slots_active=bool(getattr(args, "approval_slots", False)),
     )
     consensus_meta = {
         "proof_scheme": "bls_header_sig",

@@ -37,6 +37,30 @@ SLOW_TX_TYPES = frozenset({
     "consensus_rule_update",
 })
 
+# `approval_request` and `transfer_vote` are deliberately absent, i.e. FAST.
+# Neither routes text through i0, so neither rebuilds the interpreter: a request
+# costs one cheap Tau step like a transfer, and a vote costs one more only when
+# it completes the set and releases the parked transfer. The expensive half of
+# the co-signature feature is the POLICY rule, which arrives as an ordinary
+# rule-bearing user_tx and is already classified slow below.
+
+
+# Transaction types whose validity depends on a Tau evaluation, so a proposer
+# must not build them and a validator must not verify them while the engine is
+# unavailable -- it would have to guess a fee or a policy verdict, and a guess is
+# a locally-valid divergent transition.
+#
+# ONE definition, imported by both guards (chain_state.process_new_block and
+# commands.createblock), which previously each hardcoded `== "user_tx"`.
+# `approval_request` belongs here because it is fee-bearing and runs the full
+# per-transfer step; `transfer_vote` belongs because completing a request
+# executes the parked transfer, which needs o1/o5 too.
+TAU_EVALUATING_TX_TYPES = frozenset({
+    "user_tx",
+    "approval_request",
+    "transfer_vote",
+})
+
 
 def classify_lane(tx: Optional[Dict[str, Any]]) -> int:
     """Lane for a parsed transaction dict.

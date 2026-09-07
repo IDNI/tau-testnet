@@ -49,7 +49,10 @@ _RPC_BURST = 10.0
 _RPC_REFILL_PER_SEC = 5.0
 _EXPENSIVE_BURST = 2.0
 _EXPENSIVE_REFILL_PER_SEC = 0.5
-_EXPENSIVE_COMMANDS = frozenset({"checktx"})
+# getapprovalpreview enumerates up to 64 engine steps under the global Tau lock,
+# and getapprovalslots is unauthenticated text inspection; both are advisory
+# conveniences, so neither should be able to crowd out real traffic.
+_EXPENSIVE_COMMANDS = frozenset({"checktx", "getapprovalpreview", "getapprovalslots"})
 
 
 class _TokenBucket:

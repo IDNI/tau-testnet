@@ -40,7 +40,20 @@ COLOR_GREEN = "\033[92m"
 COLOR_MAGENTA = "\033[95m"
 COLOR_RESET = "\033[0m"
 _INPUT_STREAM_NAME_RE = re.compile(r"^i\d+$")
-_UPDATED_SPEC_LINE_RE = re.compile(r"^Updated\s*specification\:\s*(.*)$")
+# tau-lang prints the size in the marker now -- "Updated specification (1110
+# chars): always ..." -- so the old `specification:` form matched nothing on
+# current builds. `_extract_latest_updated_spec` then never rebuilt the
+# interpreter from the printed spec, `get_current_spec()` stayed at the boot
+# router, and `createblock`'s post-simulation restore replaced the live spec with
+# that router, wiping o6/o7: every block carrying a transaction was rejected with
+# "o6: 0" and no block ever landed.
+#
+# The optional group must NOT swallow the sibling warning
+# "Updated specification size N chars exceeds ...", which has no colon after the
+# marker -- there is a test for exactly that.
+_UPDATED_SPEC_LINE_RE = re.compile(
+    r"^Updated\s*specification\s*(?:\([^)]*\))?\s*\:\s*(.*)$"
+)
 _HEX_LITERAL_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 def get_memory_rss_mb() -> float:

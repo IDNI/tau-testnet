@@ -8,6 +8,10 @@ from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 
 logger = logging.getLogger(__name__)
+from consensus.approvals import (
+    ApprovalRequestLifecycleManager,
+    audit_stream_collisions,
+)
 
 VALIDATOR_DELTA_FIELDS = ("validator_additions", "validator_removals")
 
@@ -87,7 +91,21 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "eligibility_mode",
     "fee_beneficiary",
     "max_rule_txs_per_block",
+    "approval_slots_active",
 })
+
+
+def validate_approval_slots_active(value: Any) -> Optional[str]:
+    """Approval-slot activation is a ONE-WAY switch to True.
+
+    Turning it back off would un-reserve i18..i25 while requests and policy
+    clauses still depend on them: a sender could then write their own approval
+    slots and self-approve a parked transfer. So only `True` is a legal patch
+    value, and `apply_host_contract_patch` additionally refuses a downgrade.
+    """
+    if value is not True:
+        return "must be true; approval slots cannot be deactivated once active"
+    return None
 
 
 def is_tau_authoritative_eligibility_mode(mode: Any) -> bool:
@@ -175,6 +193,8 @@ def build_mechanism_metadata(
     rule_offers_root: str = "",
     rule_clauses_root: str = "",
     max_rule_txs_per_block: int = DEFAULT_MAX_RULE_TXS_PER_BLOCK,
+    approval_requests_root: str = "",
+    approval_slots_active: bool = False,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -204,6 +224,15 @@ def build_mechanism_metadata(
         mech["rule_clauses_root"] = rule_clauses_root
     if max_rule_txs_per_block != DEFAULT_MAX_RULE_TXS_PER_BLOCK:
         mech["max_rule_txs_per_block"] = max_rule_txs_per_block
+    # Co-signature approvals: same non-default gate, same reasoning. The flag is
+    # emitted only once activated and the root only once a request exists, so a
+    # chain that never turns the feature on hashes exactly as it did before the
+    # fields existed, and gen_genesis (which calls this without them) is
+    # unaffected.
+    if approval_slots_active:
+        mech["approval_slots_active"] = True
+    if approval_requests_root:
+        mech["approval_requests_root"] = approval_requests_root
     return mech
 
 
@@ -437,6 +466,15 @@ class ConsensusLifecycleManager:
         # interpreter rebuilds a validator must pay to verify one block.
         # Governance-patchable; bound into the meta hash only when non-default.
         self.max_rule_txs_per_block: int = DEFAULT_MAX_RULE_TXS_PER_BLOCK
+
+        # Co-signature approvals. A FIELD for the same reason rule_offers is.
+        self.approval_requests = ApprovalRequestLifecycleManager()
+        # ONE-WAY activation, held in consensus state rather than as a module
+        # global: block apply deep-copies this manager per candidate block
+        # (engine.py:511), so a global would leak across candidate simulation,
+        # rollback, reorg and competing branches. Read from the PARENT snapshot,
+        # so an activation recorded in block H governs H+1 onward.
+        self.approval_slots_active: bool = False
         self.recompute_approval_threshold()
 
     def effective_quorum_policy(self) -> str:
@@ -505,6 +543,11 @@ class ConsensusLifecycleManager:
             rule_offers_root=("" if empty_book else self.rule_offers.offers_root().hex()),
             rule_clauses_root=("" if empty_book else self.rule_offers.clauses_root().hex()),
             max_rule_txs_per_block=self.max_rule_txs_per_block,
+            approval_requests_root=(
+                "" if self.approval_requests.is_empty()
+                else self.approval_requests.requests_root().hex()
+            ),
+            approval_slots_active=self.approval_slots_active,
         )
         return compute_consensus_meta_hash(
             host_contract={},
@@ -536,7 +579,9 @@ class ConsensusLifecycleManager:
         next_validators.update(additions)
         return next_validators
 
-    def apply_host_contract_patch(self, patch: Optional[Dict[str, Any]]) -> None:
+    def apply_host_contract_patch(
+        self, patch: Optional[Dict[str, Any]], effective_spec_texts=None
+    ) -> None:
         """Apply activation-time host metadata changes governed by consensus.
 
         Ordering: validator delta first, then vote_quorum, then a single
@@ -585,7 +630,44 @@ class ConsensusLifecycleManager:
             if err:
                 raise ValueError(f"max_rule_txs_per_block: {err}")
             self.max_rule_txs_per_block = int(budget)
+
+        if "approval_slots_active" in patch:
+            # Same "only consensus-binding validation" reasoning as
+            # fee_beneficiary above: _check_host_contract_patch runs at mempool
+            # admission only and block apply reaches here without it.
+            err = validate_approval_slots_active(patch["approval_slots_active"])
+            if err:
+                raise ValueError(f"approval_slots_active: {err}")
+
+            # Second phase of a two-phase activation. Raising here would make
+            # EVERY block at and after the activation height invalid, which
+            # freezes the chain permanently -- so a collision leaves the flag
+            # False and the chain running, unactivated.
+            #
+            # No extra hash key is needed to make that agree across nodes: the
+            # audit reads only hash-bound state (consensus rules, the
+            # application-rules accumulation, the clause registry), so every node
+            # computes the same findings and the flag -- which IS hash-bound --
+            # stays False on all of them identically.
+            findings = audit_stream_collisions(effective_spec_texts or ())
+            if findings:
+                logger.error(
+                    "approval_slots_active activation REFUSED at this height; the "
+                    "effective spec already collides: %s",
+                    "; ".join(findings),
+                )
+            else:
+                self.activate_approval_slots()
         self.recompute_approval_threshold()
+
+    def activate_approval_slots(self) -> None:
+        """Turn approval slots on. Idempotent, and there is no way back.
+
+        Deactivation is unrepresentable on purpose: it would un-reserve
+        i18..i25 while parked requests and registered policy clauses still
+        depend on them, letting a sender write their own approval slots.
+        """
+        self.approval_slots_active = True
 
     def knows_update(self, update_id: bytes) -> bool:
         """Check if an update is currently known in any state."""
@@ -718,7 +800,9 @@ class ConsensusLifecycleManager:
                 # Keep sorted by activation height ensuring deterministic order
                 self.scheduled_updates.sort(key=lambda x: (x[0], x[1]))
 
-    def process_height_transitions(self, current_height: int) -> List[ConsensusRuleUpdate]:
+    def process_height_transitions(
+        self, current_height: int, effective_spec_texts=None
+    ) -> List[ConsensusRuleUpdate]:
         """
         Perform precise lifecycles evaluations at a block boundary.
         Pending -> Expired
@@ -731,6 +815,12 @@ class ConsensusLifecycleManager:
         # unconditionally, at exactly one point per block on every node, so the
         # offer book is settled before the state hash is computed.
         self.rule_offers.expire_at_height(current_height)
+
+        # 0b. Same for parked approval requests. NOTE this runs AFTER the
+        # transaction loop in engine.apply, so it is a backstop only: the vote
+        # apply branch must check expire_at_height itself or a vote included at
+        # exactly the expiry height would execute before this sweep sees it.
+        self.approval_requests.expire_at_height(current_height)
 
         # 1. Expire pending updates that missed their activation height
         expired_uids = []
@@ -753,7 +843,10 @@ class ConsensusLifecycleManager:
                 # Activate
                 if uid in self.update_payloads:
                     update = self.update_payloads[uid]
-                    self.apply_host_contract_patch(update.host_contract_patch)
+                    self.apply_host_contract_patch(
+                        update.host_contract_patch,
+                        effective_spec_texts=effective_spec_texts,
+                    )
                     newly_active.append(update)
                 self.archival_updates.add(uid)
                 if uid in self.votes:

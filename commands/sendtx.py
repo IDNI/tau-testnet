@@ -16,20 +16,36 @@ from errors import TauCommunicationError
 from consensus import fees
 from consensus.fees import FeeRuleError
 from consensus.lanes import classify_lane
+from consensus.tx_signing import signing_message_bytes, verify_tx_signature
 from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
     TX_TYPE_RULE_OFFER_ACCEPT,
     TX_TYPE_RULE_OFFER_REJECT,
     RULE_OFFER_TX_TYPES,
 )
+from consensus.approvals import (
+    APPROVAL_TX_TYPES,
+    approval_slots_active,
+    TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_TRANSFER_VOTE,
+)
 
 # Every transaction type the node will admit. Governance types are fee-exempt
 # so validators never need funds to govern; the rule-sharing types are
 # user-initiated and expensive, so they pay like a user_tx does.
 KNOWN_TX_TYPES = frozenset(
-    {"user_tx", "consensus_rule_update", "consensus_rule_vote"} | set(RULE_OFFER_TX_TYPES)
+    {"user_tx", "consensus_rule_update", "consensus_rule_vote"}
+    | set(RULE_OFFER_TX_TYPES)
+    | set(APPROVAL_TX_TYPES)
 )
-FEE_BEARING_TX_TYPES = frozenset({"user_tx"} | set(RULE_OFFER_TX_TYPES))
+# `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
+# execution later is free and there is no second fee to drift. `transfer_vote` is
+# exempt like a governance vote -- approver bots would otherwise all need funding
+# and a fee strategy, and the vote is bounded by the request's declared approver
+# set instead.
+FEE_BEARING_TX_TYPES = frozenset(
+    {"user_tx", TX_TYPE_APPROVAL_REQUEST} | set(RULE_OFFER_TX_TYPES)
+)
 from db import add_mempool_tx
 from network import bus as network_bus
 import api_response
@@ -230,41 +246,24 @@ def _decode_single_transfer_output(output_bv_str: str, expected_amount_int: int)
     return False
 
 
-def _get_signing_message_bytes(payload: dict) -> bytes:
-    """
-    Construct canonical bytes over transaction fields for BLS signing/verifying.
-    """
-    tx_type = payload.get("tx_type", "user_tx")
-    signing_dict = {
-        "sender_pubkey": payload["sender_pubkey"],
-        "sequence_number": payload["sequence_number"],
-        "expiration_time": payload["expiration_time"],
-        "fee_limit": payload["fee_limit"],
-        "tx_type": tx_type
-    }
-    if tx_type == "user_tx":
-        signing_dict["operations"] = payload.get("operations", {})
-    elif tx_type == "consensus_rule_update":
-        signing_dict["rule_revisions"] = payload.get("rule_revisions", [])
-        signing_dict["activate_at_height"] = payload.get("activate_at_height")
-        if "host_contract_patch" in payload:
-            signing_dict["host_contract_patch"] = payload["host_contract_patch"]
-    elif tx_type == "consensus_rule_vote":
-        signing_dict["update_id"] = payload.get("update_id")
-        signing_dict["approve"] = payload.get("approve", True)
-    elif tx_type == TX_TYPE_RULE_OFFER:
-        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
-        signing_dict["rule_text"] = payload.get("rule_text")
-        signing_dict["expire_at_height"] = payload.get("expire_at_height")
-    elif tx_type == TX_TYPE_RULE_OFFER_ACCEPT:
-        signing_dict["offer_id"] = payload.get("offer_id")
-        # The accepted text is signed: it is what actually enters the acceptor's
-        # specification, and the apply path re-derives offer_id from it.
-        signing_dict["rule_text"] = payload.get("rule_text")
-    elif tx_type == TX_TYPE_RULE_OFFER_REJECT:
-        signing_dict["offer_id"] = payload.get("offer_id")
+def _approval_slot_feed(tip_view) -> tuple:
+    """Approval slot indices to feed, or empty while the feature is inactive.
 
-    return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
+    Feeding them only when active keeps a pre-activation node byte-identical:
+    nothing references the slots, so nothing is fed, so no evaluation changes.
+    """
+    if not approval_slots_active(tip_view):
+        return ()
+    return tau_defs.approval_slot_indices()
+
+
+def _get_signing_message_bytes(payload: dict) -> bytes:
+    """Canonical signing preimage. Kept as a module-level name because wallets,
+    the CLI and a dozen tests import it from here; the implementation is
+    `consensus.tx_signing.signing_message_bytes`, shared with block apply so the
+    two paths cannot drift.
+    """
+    return signing_message_bytes(payload)
 
 
 def _process_transfers_operation(transfers, sender_pubkey):
@@ -404,15 +403,12 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
     if not (_PY_ECC_AVAILABLE and _PY_ECC_BLS):
         return _qt_err("BLS_UNAVAILABLE", "BLS signatures are required but py_ecc is missing.")
 
-    msg_bytes = _get_signing_message_bytes(payload)
-    msg_hash = hashlib.sha256(msg_bytes).digest()
-    try:
-        sig_bytes = bytes.fromhex(signature)
-        pubkey_bytes = bytes.fromhex(sender_pubkey)
-        if not G2Basic.Verify(pubkey_bytes, msg_hash, sig_bytes):
-            return _qt_err("INVALID_SIGNATURE", "Invalid signature.")
-    except Exception as e:
-        return _qt_err("INVALID_SIGNATURE", f"Invalid signature format or cryptographic error: {e}")
+    # One verifier, shared with block apply (consensus/tx_signing.py). G2Basic is
+    # read from this module's globals at call time so the many tests that
+    # patch("commands.sendtx.G2Basic") keep working.
+    sig_ok, sig_reason = verify_tx_signature(payload, g2=globals().get("G2Basic"))
+    if not sig_ok:
+        return _qt_err("INVALID_SIGNATURE", f"Invalid signature: {sig_reason}")
 
     expected_seq = chain_state.get_sequence_number(sender_pubkey)
 
@@ -493,8 +489,13 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                 # elsewhere) so a crafted operations["12"] cannot spoof the
                 # sender-pubkey stream i12-scoped o5/o8 policy rules rely on, and
                 # operations["14"/"15"] cannot pin a conflicting bv width process-wide.
+                # i18-i25 join under approval-slot activation: only the node may
+                # write a co-signature slot, or a sender forges their own approval.
                 if idx in tau_defs.RESERVED_STREAMS \
-                        or idx in tau_defs.reserved_operation_keys(tip_view.eligibility_mode):
+                        or idx in tau_defs.reserved_operation_keys(
+                            tip_view.eligibility_mode,
+                            approval_slots_active=approval_slots_active(tip_view),
+                        ):
                     return _qt_err(
                         "TX_INVALID",
                         f"Invalid operation key '{key}'. Stream {idx} is reserved.",
@@ -771,6 +772,14 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                         # so custom keys can never clobber a reserved stream.
                         for k, v in custom_tau_inputs.items():
                             tau_input_stream_values[k] = v
+                        # Approval slots (i18..i25). An ORDINARY transfer always
+                        # feeds 0 on every slot, which equals no approver pubkey,
+                        # so a co-signature policy clause keeps blocking until the
+                        # parked-request path supplies real votes. Fed after the
+                        # custom merge and before i5, byte-identically at apply.
+                        # Reserved upstream, so a sender cannot pre-fill one.
+                        for slot in _approval_slot_feed(tip_view):
+                            tau_input_stream_values[slot] = "0"
                         # i5: advisory block timestamp (see admission_ts above) so
                         # time-lock o5 rules pre-check at admission; apply is
                         # authoritative.

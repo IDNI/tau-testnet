@@ -1181,6 +1181,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_tx_subparsers(sub)
     _add_gov_subparsers(sub)
     _add_rule_subparsers(sub)
+    _add_approval_subparsers(sub)
     _add_node_subparsers(sub)
 
     return parser
@@ -1460,6 +1461,354 @@ def _add_tx_subparsers(sub) -> None:
     )
     p_ru.add_argument("--file", required=True, help="Path to the signed JSON payload")
     p_ru.set_defaults(func=cmd_tx_raw_submit)
+
+
+
+# --- Co-signature approvals -------------------------------------------------
+
+
+def _parse_kv_pairs(values, what, sep="="):
+    """`--approver 18=<pubkey>` / `--input 26=text` -> {18: "<pubkey>"}."""
+    out = {}
+    for raw in values or []:
+        if sep not in raw:
+            raise _PayloadError(f"--{what} expects <stream>{sep}<value>, got {raw!r}")
+        key, _, value = raw.partition(sep)
+        try:
+            idx = int(key.strip())
+        except ValueError:
+            raise _PayloadError(f"--{what}: {key!r} is not a stream index")
+        if idx in out:
+            raise _PayloadError(f"--{what}: stream {idx} given twice")
+        out[idx] = value
+    return out
+
+
+def _resolve_expire_at_height(args) -> int:
+    """--expire-at-height wins; otherwise tip + --expire-in."""
+    explicit = getattr(args, "expire_at_height", None)
+    if explicit:
+        return int(explicit)
+    response = rpc_mod.send_command(
+        "getblocks", host=args.host, port=args.port, timeout=args.timeout
+    )
+    parsed = parse_json_response(response)
+    blocks = ((parsed or {}).get("data") or {}).get("blocks") or []
+    tip = 0
+    for block in blocks:
+        try:
+            tip = max(tip, int(block["header"]["block_number"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return tip + int(getattr(args, "expire_in", 1000) or 1000)
+
+
+def _auto_discover_approvers(args, sender_pubkey, amount, recipient) -> dict:
+    """Ask the node which approvers this amount actually needs.
+
+    Advisory, and that is the point: the wallet that wrote the policy knows the
+    answer, but a fresh CLI does not, and guessing means over-declaring -- which
+    notifies people whose signature the policy never asks for.
+    """
+    slots_resp = rpc_mod.send_command(
+        f"getapprovalslots {sender_pubkey}",
+        host=args.host, port=args.port, timeout=args.timeout,
+    )
+    slots_data = ((parse_json_response(slots_resp) or {}).get("data") or {})
+    candidates = slots_data.get("slots") or {}
+    if not candidates:
+        raise _PayloadError(
+            "Could not read your policy clause, so --auto has nothing to work "
+            "from. Declare approvers explicitly with --approver <slot>=<pubkey>."
+        )
+
+    draft = json.dumps({
+        "sender_pubkey": sender_pubkey,
+        "recipient_pubkey": recipient,
+        "amount": amount,
+        "approvers": candidates,
+    })
+    preview = rpc_mod.send_command(
+        f"getapprovalpreview {draft}",
+        host=args.host, port=args.port, timeout=args.timeout,
+    )
+    data = ((parse_json_response(preview) or {}).get("data") or {})
+    if not data.get("available", False):
+        raise _PayloadError(
+            "Node could not determine the required approvers "
+            f"({data.get('reason', 'unavailable')}). Declare them explicitly."
+        )
+    if data.get("needs_no_approval"):
+        raise _PayloadError(
+            "Your policy allows this transfer with no votes, so it needs no "
+            "approval request -- send it with `tx send`."
+        )
+    if not data.get("satisfiable", False):
+        raise _PayloadError(
+            "Your own policy would never allow this transfer, whoever signs. "
+            "Nothing would be gained by parking it."
+        )
+    required = data.get("required_approvers") or {}
+    if not required:
+        raise _PayloadError("Node returned no required approvers.")
+    return {int(k): v for k, v in required.items()}
+
+
+def cmd_approval_request(args: argparse.Namespace) -> int:
+    explicit = None
+    try:
+        explicit = _parse_kv_pairs(getattr(args, "approver", None), "approver")
+        customs = _parse_kv_pairs(getattr(args, "input", None), "input")
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+
+    if customs and not args.yes:
+        # Anything in a custom input is on-chain and public forever. A TOTP code
+        # there is readable by everyone for its whole validity window, which is
+        # why the bot also accepts codes over its own endpoint.
+        print_error(
+            "Custom inputs are PUBLIC and permanent on chain. A one-time code "
+            "placed here is readable by anyone for its validity window -- prefer "
+            "sending it to the bot's own endpoint. Re-run with --yes to confirm."
+        )
+        return EXIT_LOCAL
+
+    def _build(sender_pubkey, sequence_number):
+        approvers = explicit
+        if not approvers:
+            if not getattr(args, "auto", False):
+                raise _PayloadError(
+                    "Declare approvers with --approver <slot>=<pubkey>, or pass "
+                    "--auto to ask the node which ones this amount needs."
+                )
+            approvers = _auto_discover_approvers(
+                args, sender_pubkey, int(args.amount), args.to.lower()
+            )
+        return tx_mod.build_approval_request_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            recipient_pubkey=args.to,
+            amount=int(args.amount),
+            expire_at_height=_resolve_expire_at_height(args),
+            approvers=approvers,
+            custom_inputs=customs,
+            fee_limit=args.fee,
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_approval_vote(args: argparse.Namespace, approve: bool) -> int:
+    def _build(sender_pubkey, sequence_number):
+        return tx_mod.build_transfer_vote_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            request_id=args.request_id,
+            approve=approve,
+            reason=getattr(args, "reason", "") or "",
+        )
+
+    if approve and getattr(args, "code", None):
+        # The code never goes on chain: six digits is brute-forceable from any
+        # on-chain form. It goes to the bot, which verifies it and then signs its
+        # own vote -- so this CLI has nothing to submit.
+        print_error(
+            "A --code is verified by the auth bot, not by the chain. Send it to "
+            "the bot's endpoint (scripts/approval_bot_totp.py --help); it will "
+            "cast its own vote."
+        )
+        return EXIT_LOCAL
+    return _submit_rule_tx(args, _build)
+
+
+def _address_or_key(args):
+    """Explicit address, else the address of the signing key."""
+    if getattr(args, "address", None):
+        return args.address
+    _sk, address = _resolve_signing_key(args)
+    return address
+
+
+def cmd_approval_list(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    role = getattr(args, "role", "all")
+    return _simple_query(args, f"getapprovalrequests {address} {role}")
+
+
+def cmd_approval_show(args: argparse.Namespace) -> int:
+    return _simple_query(args, f"getapprovalrequest {args.request_id}")
+
+
+def cmd_approval_slots(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getapprovalslots {address}")
+
+
+def cmd_approval_preview(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    slots_resp = rpc_mod.send_command(
+        f"getapprovalslots {address}",
+        host=args.host, port=args.port, timeout=args.timeout,
+    )
+    candidates = (((parse_json_response(slots_resp) or {}).get("data") or {})
+                  .get("slots") or {})
+    draft = json.dumps({
+        "sender_pubkey": address,
+        "recipient_pubkey": args.to,
+        "amount": int(args.amount),
+        "approvers": candidates,
+    })
+    return _simple_query(args, f"getapprovalpreview {draft}")
+
+
+def cmd_approval_request_id(args: argparse.Namespace) -> int:
+    payload = json.dumps({
+        "sender_pubkey": args.from_pubkey,
+        "recipient_pubkey": args.to,
+        "amount": int(args.amount),
+        "sequence_number": int(args.sequence),
+        "expire_at_height": int(args.expire_at_height),
+        "approvers": _parse_kv_pairs(getattr(args, "approver", None), "approver"),
+    })
+    return _simple_query(args, f"getrequestid {payload}")
+
+
+def _add_approval_subparsers(sub) -> None:
+    """`tau-testnet approval ...` -- park a transfer, vote on one, inspect them.
+
+    The inbox commands are the ones an approver bot polls; `request --auto` is
+    for a client that does not know which approvers an amount needs and would
+    otherwise over-declare, notifying people the policy never asks for.
+    """
+    p_appr = sub.add_parser(
+        "approval",
+        parents=[_GLOBAL_PARENT],
+        help="Co-signature approvals (park a transfer, vote, inspect)",
+    )
+    asub = p_appr.add_subparsers(dest="approval_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser):
+        parser.add_argument("--fee", default="0", help="Fee limit (default '0')")
+        parser.add_argument(
+            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+
+    # --- request ---
+    p_req = asub.add_parser(
+        "request", parents=common,
+        help="Park a transfer that needs co-signatures",
+    )
+    _key_group(p_req)
+    p_req.add_argument("--to", required=True, help="Recipient public key (96 hex)")
+    p_req.add_argument("--amount", required=True, type=int, help="Amount to transfer")
+    p_req.add_argument(
+        "--approver", action="append", metavar="SLOT=PUBKEY",
+        help=(
+            "Approver for one slot, e.g. --approver 18=<pubkey>. Declare ONLY "
+            "the approvers this amount needs: the declaration is what fills "
+            "inboxes. Repeatable."
+        ),
+    )
+    p_req.add_argument(
+        "--auto", action="store_true",
+        help="Ask the node which approvers this amount requires (advisory).",
+    )
+    p_req.add_argument(
+        "--input", action="append", metavar="STREAM=VALUE",
+        help=(
+            "Sender data an approver can read, stream >= 26, e.g. "
+            "--input 26='rent for Q3'. PUBLIC and permanent. Repeatable."
+        ),
+    )
+    p_req.add_argument("--expire-in", type=int, default=1000,
+                       help="Blocks from the tip until the request expires")
+    p_req.add_argument("--expire-at-height", type=int,
+                       help="Absolute expiry height (overrides --expire-in)")
+    p_req.add_argument("--yes", action="store_true",
+                       help="Confirm putting data in a PUBLIC custom input")
+    _tx_flags(p_req)
+    p_req.set_defaults(func=cmd_approval_request)
+
+    # --- approve / decline ---
+    p_ok = asub.add_parser("approve", parents=common,
+                           help="Approve a parked transfer")
+    _key_group(p_ok)
+    p_ok.add_argument("request_id", help="Request id (64 hex)")
+    p_ok.add_argument("--code", help="TOTP code -- goes to the BOT, never on chain")
+    _tx_flags(p_ok)
+    p_ok.set_defaults(func=lambda a: cmd_approval_vote(a, approve=True))
+
+    p_no = asub.add_parser(
+        "decline", parents=common,
+        help="Decline to sign (does NOT cancel the request)",
+    )
+    _key_group(p_no)
+    p_no.add_argument("request_id", help="Request id (64 hex)")
+    p_no.add_argument("--reason", default="", help="Note for the sender (<=256 bytes)")
+    _tx_flags(p_no)
+    p_no.set_defaults(func=lambda a: cmd_approval_vote(a, approve=False))
+
+    # --- reads ---
+    p_list = asub.add_parser("list", parents=common,
+                             help="Requests involving an address (the inbox)")
+    p_list.add_argument("address", nargs="?", help="Address (default: your key's)")
+    _key_group(p_list, required=False)
+    p_list.add_argument("--role", choices=["in", "out", "all"], default="all")
+    p_list.set_defaults(func=cmd_approval_list)
+
+    p_show = asub.add_parser("show", parents=common, help="One request in full")
+    p_show.add_argument("request_id", help="Request id (64 hex)")
+    p_show.set_defaults(func=cmd_approval_show)
+
+    p_slots = asub.add_parser(
+        "slots", parents=common,
+        help="Which approver sits in which slot of a policy (advisory)",
+    )
+    p_slots.add_argument("address", nargs="?", help="Address (default: your key's)")
+    _key_group(p_slots, required=False)
+    p_slots.set_defaults(func=cmd_approval_slots)
+
+    p_prev = asub.add_parser(
+        "preview", parents=common,
+        help="Which approvers would this transfer need? (advisory)",
+    )
+    p_prev.add_argument("address", nargs="?", help="Address (default: your key's)")
+    _key_group(p_prev, required=False)
+    p_prev.add_argument("--to", required=True, help="Recipient public key (96 hex)")
+    p_prev.add_argument("--amount", required=True, type=int, help="Amount")
+    p_prev.set_defaults(func=cmd_approval_preview)
+
+    p_rid = asub.add_parser("request-id", parents=common,
+                            help="Derive a request id without submitting")
+    p_rid.add_argument("--from-pubkey", required=True, help="Sender public key")
+    p_rid.add_argument("--to", required=True, help="Recipient public key")
+    p_rid.add_argument("--amount", required=True, type=int)
+    p_rid.add_argument("--sequence", required=True, type=int)
+    p_rid.add_argument("--expire-at-height", required=True, type=int)
+    p_rid.add_argument("--approver", action="append", metavar="SLOT=PUBKEY")
+    p_rid.set_defaults(func=cmd_approval_request_id)
 
 
 def _add_rule_subparsers(sub) -> None:

@@ -18,14 +18,32 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
     TX_TYPE_RULE_OFFER_ACCEPT,
     TX_TYPE_RULE_OFFER_REJECT,
+    NEUTRAL_O5_CLAUSE_BODY,
     RuleOfferShapeError,
+    clause_body_v1,
+    clause_output_streams,
     compose_stream_rule,
+    is_neutral_clause_body,
     normalize_offer_rule_text,
     parse_rule_offer,
     parse_rule_offer_accept,
     parse_rule_offer_reject,
 )
 from consensus.facade import TipAdmissionView
+from consensus.approvals import (
+    MAX_TIER_AUTHORS,
+    audit_stream_collisions,
+    MAX_PENDING_REQUESTS_PER_APPROVER,
+    approval_slots_active,
+    MAX_PENDING_REQUESTS_PER_SENDER,
+    STATUS_OPEN,
+    TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_TRANSFER_VOTE,
+    parse_approval_request,
+    parse_transfer_vote,
+    screen_slot_widths,
+    validate_request_shape,
+)
 from consensus.governance import (
     normalize_validator_delta,
     normalize_validator_set,
@@ -34,6 +52,7 @@ from consensus.governance import (
     quorum_count,
     HOST_CONTRACT_PATCH_KEYS,
     validate_fee_beneficiary,
+    validate_approval_slots_active,
 )
 
 logger = logging.getLogger(__name__)
@@ -157,9 +176,17 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         )
 
     # Which operation keys are reserved depends on the eligibility mode in force
-    # (i13 only under tau_validator_set). getattr keeps the legacy contract where
+    # (i13 only under tau_validator_set) and on whether approval slots have been
+    # activated (i18..i25 only then). getattr keeps the legacy contract where
     # callers that only exercise the static screens may pass no tip view at all.
-    reserved_ops = tau_defs.reserved_operation_keys(getattr(tip_view, "eligibility_mode", ""))
+    #
+    # The slot reservation is what makes a co-signature unforgeable: without it a
+    # sender could put "18" in `operations` and write their own approval.
+    slots_active = approval_slots_active(tip_view)
+    reserved_ops = tau_defs.reserved_operation_keys(
+        getattr(tip_view, "eligibility_mode", ""),
+        approval_slots_active=slots_active,
+    )
 
     for key, val in operations.items():
         if not str(key).isdigit():
@@ -181,7 +208,9 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
             return format_error(
                 f"Invalid operation target '{key}'. Stream {idx} is reserved "
                 f"(i12 sender pubkey; i14/i15 consensus stake/mode inputs; "
-                f"i13 consensus proposer pubkey under tau_validator_set)."
+                f"i13 consensus proposer pubkey under tau_validator_set; "
+                f"i18-i25 co-signature approval slots, which only the node may "
+                f"write)."
             )
 
     # Screen user rule TEXT for reserved streams. Comment-stripped and
@@ -200,6 +229,18 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
     # revision screen, which still hard-rejects (b)).
     rule_text = operations.get("0")
     if isinstance(rule_text, str) and rule_text:
+        # DECIDED FIRST, before any user-rule screen. Once approval slots are
+        # active an o5 rule is a registered clause, not accumulated text, and the
+        # two are screened by OPPOSITE rules: the user context forbids reading
+        # the approval slots that a clause exists to read, and requires an i12
+        # guard that a clause must not carry. Running the user screens first
+        # rejected every co-signature policy with "references reserved consensus
+        # input stream 'i18'" -- found by the live-node e2e, invisible to a unit
+        # test that called the routing validator directly.
+        routing = validate_o5_clause_routing(tx, tip_view, rule_text)
+        if routing is not None:
+            return routing
+
         forbidden_out = _streams_referenced(rule_text, ("o6", "o7", "o9"))
         if forbidden_out:
             return format_error(
@@ -228,8 +269,14 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
             )
         # Same reserved set as the operations screen above, minus i12: READING the
         # sender pubkey is how a policy rule scopes itself, only WRITING it as an
-        # operation is forbidden.
-        typed_reserved = tuple(f"i{idx}" for idx in reserved_ops if idx != 12)
+        # operation is forbidden. Approval slots stay forbidden here -- a plain
+        # user_tx rule is not a registered o5 clause, and letting one type a slot
+        # would pin a width process-wide outside the clause screen's control.
+        typed_reserved = tau_defs.rule_text_forbidden_input_streams(
+            tau_defs.RULE_TEXT_CONTEXT_USER,
+            tip_view.eligibility_mode,
+            approval_slots_active=slots_active,
+        )
         typed_reserved_in = _streams_referenced(rule_text, typed_reserved)
         if typed_reserved_in:
             return format_error(
@@ -323,6 +370,47 @@ def precheck_scheduled_update(update: Any, active_validators: Optional[Any] = No
     return {"status": "ok", "error": None}
 
 
+def _tip_effective_spec_texts():
+    """The complete effective spec at the tip, for the activation audit.
+
+    Consensus rules, the application-rules accumulation, the builtin rules on
+    disk and every stored clause body. Auditing the application rules alone would
+    miss a collision hiding in a consensus revision or a builtin.
+    """
+    import chain_state
+    import db
+
+    texts = []
+    try:
+        # get_consensus_rules_state, NOT get_rules_state: the latter returns the
+        # application accumulation (it prefers `app` because the `u` state
+        # retention makes it a restoreable whole spec), so using it here audited
+        # the application rules twice and never looked at a consensus revision.
+        texts.append(("consensus_rules", chain_state.get_consensus_rules_state() or ""))
+    except Exception:  # noqa: BLE001 - advisory read
+        pass
+    try:
+        texts.append(("application_rules", chain_state.get_application_rules_state() or ""))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        texts.extend(
+            ("builtin_rule_%d" % n, text)
+            for n, text in enumerate(chain_state.load_builtin_rules_from_disk() or [])
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for row in db.load_rule_clauses() or []:
+            texts.append(
+                ("clause_%s_o%s" % (str(row["acceptor_pubkey"])[:10], row["target_stream"]),
+                 row["clause_body"])
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    return texts
+
+
 def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = None) -> Optional[str]:
     """Static checks for host contract parameters to ensure future-proofing definitions."""
     # Reject anything apply_host_contract_patch would not read. Without this an
@@ -357,6 +445,20 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         next_validators = (validators - removals) | additions
         if not next_validators:
             return "Validator delta would leave no active validators."
+    if "approval_slots_active" in patch:
+        err = validate_approval_slots_active(patch["approval_slots_active"])
+        if err:
+            return f"approval_slots_active: {err}"
+        # First phase of the two-phase activation. Refusing the PROPOSAL is the
+        # only place a collision can be reported loudly: at the activation height
+        # a raise would invalidate every block from there on and freeze the
+        # chain, so the second phase can only decline to flip the flag.
+        findings = audit_stream_collisions(_tip_effective_spec_texts())
+        if findings:
+            return (
+                "approval_slots_active cannot be activated on this chain: "
+                + "; ".join(findings)
+            )
     if "vote_quorum" in patch:
         policy = patch["vote_quorum"]
         err = validate_quorum_policy(policy)
@@ -710,16 +812,19 @@ def _screen_clause_domains(body: str) -> Optional[str]:
         )
 
     # i12 is excluded: the node supplies the sender guard, and clause_body_v1
-    # already rejects a clause that references it itself.
+    # already rejects a clause that references it itself. Approval slots are
+    # excluded too -- reading them is the whole point of a co-signature policy --
+    # but they get a stricter width check instead, below.
     #
     # The widest reserved set is screened regardless of the tip's current
-    # eligibility mode. A clause outlives the mode that was active when it was
-    # accepted, so admitting one that types i13 under validator_set would turn
-    # into a reserved-stream collision the moment governance switches to
-    # tau_validator_set.
-    reserved_inputs = tuple(
-        f"i{idx}" for idx in tau_defs.reserved_operation_keys("tau_validator_set")
-        if idx != 12
+    # eligibility mode, AND regardless of whether approval slots are active. A
+    # clause outlives the mode that was active when it was accepted, so admitting
+    # one that types i13 under validator_set would turn into a reserved-stream
+    # collision the moment governance switches to tau_validator_set.
+    reserved_inputs = tau_defs.rule_text_forbidden_input_streams(
+        tau_defs.RULE_TEXT_CONTEXT_O5_CLAUSE,
+        "tau_validator_set",
+        approval_slots_active=True,
     )
     typed = _streams_referenced(body, reserved_inputs)
     if typed:
@@ -727,6 +832,15 @@ def _screen_clause_domains(body: str) -> Optional[str]:
             "Shared rules may not reference reserved input streams: "
             + ", ".join(typed)
         )
+
+    # Approval slots may be read, but every occurrence must be typed bv[384].
+    # Per-stream bitvector typing is process-global and sticky, so one clause
+    # typing i18 at bv[384] and another at bv[24] leaves get_interpreter
+    # returning None for everyone. Reject-unless-annotated, because an
+    # unannotated mention is exactly what lets the engine infer another width.
+    slot_error = screen_slot_widths(body)
+    if slot_error:
+        return "Shared rules: " + slot_error
     return None
 
 
@@ -802,6 +916,248 @@ def validate_rule_offer_decision_payload(
     })
 
 
+
+
+# --- Routing an o5 policy rule into the clause registry ----------------------
+
+def validate_o5_clause_routing(
+    tx: Dict, tip_view: TipAdmissionView, rule_text: str
+) -> Optional[AdmissionResult]:
+    """Screens for a user rule that writes o5, once approval slots are active.
+
+    Returns None when the rule is not an o5 policy rule, so it takes the ordinary
+    accumulation path unchanged. Otherwise returns the verdict, and on success
+    the clause body the apply path should register.
+
+    WHY ROUTE AT ALL
+    ----------------
+    `operations["0"]` rules are appended into one accumulated spec. Rule sharing
+    measured what that does on a shared stream: two guarded total-form rules on
+    o5 conjoin to unsatisfiable, and fed sequentially through i0 the later one
+    silently supersedes the earlier. So the second user to deploy a policy rule
+    knocks out the first. The accepted-clause registry plus the derived composite
+    exists to fix exactly that, but its only door was someone else offering you a
+    rule. This is the missing self-service door: the sender still sends an
+    ordinary user rule, and "user rules are automatically scoped by user and
+    added to the state" becomes literally true instead of approximately true.
+    """
+    if not approval_slots_active(tip_view):
+        return None
+
+    streams = clause_output_streams(rule_text)
+    if tau_defs.USER_POLICY_STREAM_INDEX not in streams:
+        return None
+
+    if len(streams) > 1:
+        others = ", ".join(f"o{s}" for s in streams if s != tau_defs.USER_POLICY_STREAM_INDEX)
+        return format_error(
+            f"A rule writing o5 is registered as your policy clause and may write "
+            f"o5 only; this one also writes {others}. Split it into separate "
+            f"transactions.",
+            code="MIXED_OUTPUT_RULE",
+        )
+
+    # A routed rule replaces the policy that would judge the transfers, so the
+    # two cannot share a transaction: admission compiles the rule separately and
+    # evaluates transfers against the EXISTING live policy, which would judge
+    # them by the very clause being replaced.
+    operations = tx.get("operations") or {}
+    transfers = operations.get("1")
+    if isinstance(transfers, (list, tuple)) and len(transfers) > 0:
+        return format_error(
+            "A policy rule (o5) and transfers cannot share one transaction: the "
+            "transfers would be judged by the policy this rule replaces. Send the "
+            "rule first, then the transfers.",
+            code="RULE_WITH_TRANSFERS",
+        )
+
+    try:
+        body = clause_body_v1(rule_text)
+    except RuleOfferShapeError as exc:
+        return format_error(
+            f"o5 policy rule cannot be registered as a clause: {exc}. The node "
+            f"supplies the sender guard when composing, so submit the body "
+            f"UNGUARDED — drop the `i12 = <your pubkey>` wrapper and write only "
+            f"the policy itself.",
+            code="CLAUSE_SHAPE",
+        )
+
+    domain_error = _screen_clause_domains(body)
+    if domain_error:
+        return format_error(f"o5 policy rule rejected: {domain_error}")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str):
+        return format_error("o5 policy rule needs a sender_pubkey.")
+    sender_n = sender.strip().lower()
+
+    if is_neutral_clause_body(body, tau_defs.USER_POLICY_STREAM_INDEX):
+        # Revocation. Always allowed, never capped: it can only shrink the
+        # composite, and refusing it would make the author cap a permanent
+        # land-grab.
+        return success({
+            "o5_clause_action": "revoke",
+            "o5_clause_body": body,
+        })
+
+    existing = tip_view.clause_for(sender_n, tau_defs.USER_POLICY_STREAM_INDEX)
+    if existing is None:
+        authors = tip_view.clause_author_count(tau_defs.USER_POLICY_STREAM_INDEX)
+        if authors >= MAX_TIER_AUTHORS:
+            return format_error(
+                f"The o5 policy registry is full: {authors} of "
+                f"{MAX_TIER_AUTHORS} author slots are taken. This is a MEASURED "
+                f"ceiling, not a quota — interpreter rebuild time grows about "
+                f"eightfold per additional author (about 2.5s at one, 13-22s at "
+                f"two, 110s at four) against a 60s COMM_TIMEOUT with a watchdog "
+                f"kill past it. An existing author can free a slot by submitting "
+                f"the neutral clause "
+                f"`always ( {NEUTRAL_O5_CLAUSE_BODY} ).`",
+                code="CLAUSE_REGISTRY_FULL",
+            )
+
+    return success({
+        "o5_clause_action": "declare",
+        "o5_clause_body": body,
+    })
+
+
+# --- Co-signature approvals --------------------------------------------------
+
+def _approvals_inactive_error() -> AdmissionResult:
+    return format_error(
+        "Co-signature approval requests are not active on this chain. The "
+        "feature activates by governance patch (approval_slots_active), which "
+        "reserves the i18-i25 approval slots.",
+        code="FEATURE_INACTIVE",
+    )
+
+
+def validate_approval_request_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for parking a transfer pending co-signatures.
+
+    Deliberately does NOT decide whether the sender's own o5 clause actually
+    blocks this amount: that needs a Tau evaluation, which happens on the sendtx
+    path where the per-transfer step already runs. This function is the
+    deterministic, Tau-free part, and it is shared with block apply through
+    `validate_request_shape`.
+    """
+    if not approval_slots_active(tip_view):
+        return _approvals_inactive_error()
+
+    request = parse_approval_request(tx)
+    if request is None:
+        return format_error(
+            "Malformed approval_request: needs recipient_pubkey, amount, "
+            "expire_at_height, and an approvers map of slot -> 96-hex pubkey."
+        )
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender.strip().lower() != request.sender_pubkey:
+        return format_error("approval_request sender_pubkey must match the signer.")
+
+    # Stateless shape, byte-identical to what block apply applies.
+    shape_error = validate_request_shape(request, tip_view.next_block_height)
+    if shape_error:
+        return format_error(f"approval_request rejected: {shape_error}")
+
+    request_id_hex = request.request_id_hex
+    if tip_view.get_approval_request(request_id_hex) is not None:
+        return format_error(
+            "Duplicate approval_request (same sender, recipient, amount, "
+            "sequence, expiry and approver set).",
+            code="DUPLICATE_REQUEST",
+        )
+
+    if tip_view.open_requests_for_sender(request.sender_pubkey) >= MAX_PENDING_REQUESTS_PER_SENDER:
+        return format_error(
+            f"Sender already has {MAX_PENDING_REQUESTS_PER_SENDER} open approval "
+            "requests.",
+            code="TOO_MANY_REQUESTS",
+        )
+    for approver in sorted(request.approvers.values()):
+        if tip_view.open_requests_for_approver(approver) >= MAX_PENDING_REQUESTS_PER_APPROVER:
+            return format_error(
+                f"Approver {approver[:10]}... already has "
+                f"{MAX_PENDING_REQUESTS_PER_APPROVER} open approval requests.",
+                code="TOO_MANY_REQUESTS",
+            )
+
+    return success({
+        "request_id": request_id_hex,
+        "amount": request.amount,
+        "recipient_pubkey": request.recipient_pubkey,
+        "approvers": dict(request.approvers),
+        "custom_inputs": dict(request.custom_inputs),
+        "expire_at_height": request.expire_at_height,
+    })
+
+
+def validate_transfer_vote_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for one approver's vote on a parked transfer.
+
+    Feeless like a governance vote, so the bounds here are the whole defence:
+    the request must be open, the signer must be one of ITS declared approvers,
+    and each approver votes at most once.
+    """
+    if not approval_slots_active(tip_view):
+        return _approvals_inactive_error()
+
+    vote = parse_transfer_vote(tx)
+    if vote is None:
+        return format_error(
+            "Malformed transfer_vote: needs a 32-byte hex request_id and a "
+            "boolean approve (1/0 is rejected: a wallet bug must not turn a "
+            "decline into an approval)."
+        )
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender.strip().lower() != vote.voter_pubkey:
+        return format_error("transfer_vote sender_pubkey must match the signer.")
+
+    row = tip_view.get_approval_request(vote.request_id_hex)
+    if row is None:
+        return format_error("Unknown approval request.", code="UNKNOWN_REQUEST")
+    if int(row.get("status", STATUS_OPEN)) != STATUS_OPEN:
+        return format_error(
+            "Approval request is already resolved.", code="REQUEST_RESOLVED"
+        )
+
+    # Checked here AND in the apply branch: process_height_transitions runs after
+    # the transaction loop, so the expiry sweep cannot be relied on to stop a
+    # vote included at exactly the expiry height.
+    if int(row.get("expire_at_height", 0)) <= tip_view.next_block_height:
+        return format_error("Approval request has expired.", code="REQUEST_EXPIRED")
+
+    approvers = {int(k): str(v).lower() for k, v in (row.get("approvers") or {}).items()}
+    slot = next((s for s, pk in sorted(approvers.items()) if pk == vote.voter_pubkey), None)
+    if slot is None:
+        # The declared approver list IS the tier scoping: an account the sender
+        # did not name for this amount has nothing to say about it.
+        return format_error(
+            "Only an approver declared on this request may vote on it.",
+            code="NOT_AN_APPROVER",
+        )
+
+    voted = {int(k) for k in (row.get("voted") or {})}
+    declined = {int(d) for d in (row.get("declined") or [])}
+    if slot in voted or slot in declined:
+        return format_error(
+            "This approver has already voted on this request.",
+            code="ALREADY_VOTED",
+        )
+
+    return success({
+        "request_id": vote.request_id_hex,
+        "slot": slot,
+        "approve": vote.approve,
+    })
+
+
 def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """
     Primary Orchestrator Endpoint for Network Admission logic.
@@ -838,6 +1194,12 @@ def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> Adm
 
     elif tx_type == TX_TYPE_RULE_OFFER_REJECT:
          return validate_rule_offer_decision_payload(payload, tip_view, accept=False)
+
+    elif tx_type == TX_TYPE_APPROVAL_REQUEST:
+         return validate_approval_request_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_TRANSFER_VOTE:
+         return validate_transfer_vote_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

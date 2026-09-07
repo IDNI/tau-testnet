@@ -42,6 +42,7 @@ MagicMock
 !WALLET_USAGE.md
 !docs/CONSENSUS_ARCHITECTURE.md
 !docs/developer_cli.md
+!docs/approvals.md
 !docs/packaging.md
 
 # Python

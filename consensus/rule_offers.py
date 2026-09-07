@@ -256,6 +256,29 @@ def validate_clause_target(body: str) -> int:
     return target
 
 
+# CONSENSUS-FROZEN. Submitting a clause whose body is exactly this REMOVES the
+# author's registered clause instead of registering one.
+#
+# Sound because "always allow" and "no clause" are semantically identical, and it
+# gives the registry the release valve it otherwise lacks: with no revocation the
+# first N accounts would occupy every author slot forever, and the cap is small
+# because each author multiplies interpreter rebuild cost.
+#
+# Exact match on one frozen spelling, deliberately: a near-miss simply registers
+# a permissive clause, which is harmless and equivalent, so there is no incentive
+# to make the matching clever. Cleverness here would be text analysis on a
+# consensus path.
+NEUTRAL_O5_CLAUSE_BODY = "(o5[t]:bv[24] = { #x000001 }:bv[24])"
+
+
+def is_neutral_clause_body(body: str, stream_index: int) -> bool:
+    """True when this body is the frozen "no opinion" spelling for the stream."""
+    if stream_index != tau_defs.USER_POLICY_STREAM_INDEX:
+        return False
+    flat = re.sub(r"\s+", " ", (body or "").strip())
+    return flat in (NEUTRAL_O5_CLAUSE_BODY, NEUTRAL_O5_CLAUSE_BODY[1:-1])
+
+
 def normalize_offer_rule_text(rule_text: str) -> Tuple[str, int]:
     """Full offer-shape validation. Returns (canonical body, target stream)."""
     body = clause_body_v1(rule_text)

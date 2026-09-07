@@ -320,6 +320,36 @@ def init_db():
                     PRIMARY KEY (acceptor_pubkey, target_stream)
                 );
             ''')
+            # Co-signature approval requests: parked transfers awaiting votes.
+            # The book root (including which approvers have voted) is bound into
+            # consensus_meta_hash, so this must be written in the same
+            # transaction as accounts -- see save_canonical_state_atomically.
+            #
+            # `voted_json` is hash-bound state, not colour: it decides whether
+            # the parked transfer executes. `status` on a resolved row and the
+            # decline reasons are node-local.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS approval_requests_v1 (
+                    request_id         TEXT PRIMARY KEY,
+                    sender_pubkey      TEXT NOT NULL,
+                    recipient_pubkey   TEXT NOT NULL,
+                    amount             INTEGER NOT NULL,
+                    expire_at_height   INTEGER NOT NULL,
+                    approvers_json     TEXT NOT NULL DEFAULT '{}',
+                    custom_inputs_json TEXT NOT NULL DEFAULT '{}',
+                    voted_json         TEXT NOT NULL DEFAULT '{}',
+                    declined_json      TEXT NOT NULL DEFAULT '[]',
+                    status             INTEGER NOT NULL DEFAULT 0
+                );
+            ''')
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_approval_requests_sender_status "
+                "ON approval_requests_v1(sender_pubkey, status);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_approval_requests_expiry "
+                "ON approval_requests_v1(expire_at_height);"
+            )
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -1436,7 +1466,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
     """
@@ -1592,6 +1622,43 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                         )
                     )
 
+            # Approval requests, same full-replace semantics and same
+            # transaction as accounts, for the same reason: the request book root
+            # is bound into consensus_meta_hash, so a node whose in-memory
+            # manager disagrees with disk computes a different state hash after a
+            # restart than a peer replaying from genesis.
+            if approval_requests is not None:
+                _db_conn.execute('DELETE FROM approval_requests_v1')
+                for req in approval_requests:
+                    _db_conn.execute(
+                        'INSERT OR REPLACE INTO approval_requests_v1 '
+                        '(request_id, sender_pubkey, recipient_pubkey, amount, '
+                        'expire_at_height, approvers_json, custom_inputs_json, '
+                        'voted_json, declined_json, status) '
+                        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        (
+                            req['request_id'],
+                            req.get('sender_pubkey', ''),
+                            req.get('recipient_pubkey', ''),
+                            int(req.get('amount', 0)),
+                            int(req.get('expire_at_height', 0)),
+                            req.get('approvers_json', '{}'),
+                            req.get('custom_inputs_json', '{}'),
+                            req.get('voted_json', '{}'),
+                            req.get('declined_json', '[]'),
+                            int(req.get('status', 0)),
+                        )
+                    )
+
+            if approval_slots_active is not None:
+                # One-way activation flag. Persisted so a restart does not
+                # silently un-reserve i18..i25 and let a sender write their own
+                # approval slots.
+                _db_conn.execute(
+                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+                    ('approval_slots_active', '1' if approval_slots_active else '0')
+                )
+
             if max_rule_txs_per_block is not None:
                 # Governance-activated value; persisted verbatim so a reload
                 # reproduces the same per-block budget as a from-genesis replay.
@@ -1599,6 +1666,34 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                     'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
                     ('max_rule_txs_per_block', str(int(max_rule_txs_per_block)))
                 )
+
+
+def load_approval_requests() -> List[Dict]:
+    """All approval-request rows, open and resolved. Ordered by id so a reload is
+    deterministic."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.execute(
+            'SELECT request_id, sender_pubkey, recipient_pubkey, amount, '
+            'expire_at_height, approvers_json, custom_inputs_json, voted_json, '
+            'declined_json, status FROM approval_requests_v1 ORDER BY request_id'
+        )
+        return [
+            {
+                "request_id": r[0],
+                "sender_pubkey": r[1],
+                "recipient_pubkey": r[2],
+                "amount": int(r[3]),
+                "expire_at_height": int(r[4]),
+                "approvers_json": r[5],
+                "custom_inputs_json": r[6],
+                "voted_json": r[7],
+                "declined_json": r[8],
+                "status": int(r[9]),
+            }
+            for r in cur.fetchall()
+        ]
 
 
 def load_rule_offers() -> List[Dict]:

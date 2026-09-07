@@ -222,11 +222,59 @@ EXTRA_RESERVED_OPERATION_KEYS = (12, 14, 15)
 TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS = (13,)
 
 
-def reserved_operation_keys(eligibility_mode: str = "") -> tuple:
+# --- Co-signature approval slots (i18..i25) ----------------------------------
+# Streams the node fills with the public key of an approver who has actually
+# submitted a verified vote on a parked transfer. A user policy rule tests them
+# the way the wallet's multisig template tests a co-signer:
+#
+#   always ( ... && !(i18[t]:bv[384] = { #x<APPROVER> }:bv[384]) -> o5[t] = 0 ).
+#
+# They are WRITE-reserved and nothing more: a sender must never be able to put
+# "18" in `operations` (that would let them forge their own approvals -- the live
+# flaw in the wallet's escrow template, whose arbiter flag is a sender-supplied
+# i13), but a registered o5 clause MUST be able to READ them or the feature has
+# no point. So `reserved_operation_keys` governs writes and
+# `rule_text_forbidden_input_streams` governs reads, per context.
+#
+# Width is FROZEN at bv[384] (a full pubkey; 0 = no vote). Per-stream bitvector
+# typing is process-global and sticky, so one rule typing i18 at bv[384] and
+# another at bv[24] leaves get_interpreter returning None for everyone --
+# measured, and it fails closed. The clause screen therefore rejects any slot
+# occurrence not annotated at exactly bv[384], unannotated ones included.
+APPROVAL_SLOT_BASE = 18
+APPROVAL_SLOT_COUNT = 8
+APPROVAL_SLOT_BV_WIDTH = 384
+
+# A parked request's own custom inputs (a 2FA code, a comment to a partner) live
+# ABOVE the slot block. They must also clear the widest reserved set: i13 and i16
+# become reserved under tau_validator_set and cooldown activation respectively,
+# and a parked request can outlive the mode it was admitted under.
+REQUEST_CUSTOM_INPUT_MIN = APPROVAL_SLOT_BASE + APPROVAL_SLOT_COUNT
+
+# Rule-text screening contexts. Slots are readable in exactly one of them.
+RULE_TEXT_CONTEXT_USER = "user_rule"
+RULE_TEXT_CONTEXT_O5_CLAUSE = "o5_clause"
+RULE_TEXT_CONTEXT_CONSENSUS = "consensus_revision"
+
+
+def approval_slot_indices() -> tuple:
+    """The approval slot stream indices, low to high."""
+    return tuple(range(APPROVAL_SLOT_BASE, APPROVAL_SLOT_BASE + APPROVAL_SLOT_COUNT))
+
+
+def reserved_operation_keys(
+    eligibility_mode: str = "", approval_slots_active: bool = False
+) -> tuple:
     """Operation keys a user_tx may not target, for the given eligibility mode.
 
     Every ingest/apply site must derive the set through this helper so admission,
-    sendtx and block apply agree — a disagreement here is a consensus split."""
+    sendtx and block apply agree — a disagreement here is a consensus split.
+
+    `approval_slots_active` comes from CONSENSUS STATE (the lifecycle manager's
+    one-way activation flag, read from the parent snapshot), never from a module
+    global: block apply deep-copies the lifecycle manager per candidate, so a
+    global would leak across simulation, rollback and reorg.
+    """
     keys = EXTRA_RESERVED_OPERATION_KEYS
     if eligibility_mode == "tau_validator_set":
         keys = keys + TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS
@@ -234,4 +282,31 @@ def reserved_operation_keys(eligibility_mode: str = "") -> tuple:
         # Reserved only while the node actually feeds i16 (see above), so
         # pre-existing user rules using it keep working until activation.
         keys = keys + (COOLDOWN_STREAM_INDEX,)
+    if approval_slots_active:
+        # Reserved exactly when the node starts feeding them, mirroring the i13
+        # and i16 precedents.
+        keys = keys + approval_slot_indices()
     return keys
+
+
+def rule_text_forbidden_input_streams(
+    context: str = RULE_TEXT_CONTEXT_USER,
+    eligibility_mode: str = "",
+    approval_slots_active: bool = False,
+) -> tuple:
+    """Input stream NAMES that rule text of this kind may not reference.
+
+    Split out from `reserved_operation_keys` because the two questions differ:
+    writing a stream as an operation is always forbidden, while *reading* it from
+    rule text depends on what the rule is. i12 is the standing example — reading
+    the sender pubkey is how a policy rule scopes itself, only writing it as an
+    operation is forbidden. Approval slots are the second: write-forbidden
+    everywhere, readable only from a registered o5 clause.
+    """
+    keys = reserved_operation_keys(
+        eligibility_mode, approval_slots_active=approval_slots_active
+    )
+    readable = {12}
+    if context == RULE_TEXT_CONTEXT_O5_CLAUSE:
+        readable |= set(approval_slot_indices())
+    return tuple(f"i{idx}" for idx in keys if idx not in readable)

@@ -1338,6 +1338,27 @@ function log(msg, type = 'info') {
 init();
 
 // --- Rule Templates ---
+//
+// TWO FORMS OF o5 POLICY RULE, AND WHICH ONE A CHAIN WANTS
+// -------------------------------------------------------
+// Every o5 template below is in the LEGACY GUARDED form: it wraps its policy in
+// `(i12[t]:bv[384] = {#x<your pubkey>}:bv[384]) && ...`, because an accumulated
+// rule that does not scope itself applies to EVERY account on the network.
+//
+// On a chain with co-signature approvals ACTIVATED, o5 rules are registered as
+// per-author clauses instead of accumulated, and the node supplies the i12 guard
+// when it composes them. There the guard must be ABSENT: a guarded rule is
+// rejected with CLAUSE_SHAPE, and an unguarded one is rejected with
+// UNSCOPED_USER_RULE on a chain where it is not. So the two forms are not
+// interchangeable, and no single template serves both.
+//
+// Converting a guarded template to clause form: drop the
+// `(i12[t]:bv[384] = {#x...}:bv[384]) &&` wrapper (or the `... ->` guard) and
+// keep only the policy itself. Check which form your node wants with
+// `getapprovalslots <your address>`: an answer means approvals are active.
+//
+// The two templates at the end of this object are already in clause form and are
+// marked as such.
 const ruleTemplates = {
     "Block all transfers": `# ---------------------------------------------------------
 # BLOCK ALL TRANSFERS FROM MY ACCOUNT
@@ -1399,6 +1420,57 @@ always ((i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111
 # NOTE: every rule that reads i13 must agree on its bit-width (bv[24] here).
 always ((i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && !(i13[t]:bv[24] = {#x004142}:bv[24])) ? o5[t]:bv[24] = {#x000000}:bv[24] : o5[t]:bv[24] = {#x000001}:bv[24]).`,
 
+    "[CLAUSE FORM] Tiered co-signatures (auth bot / scanner / partner)": `# ---------------------------------------------------------
+# TIERED CO-SIGNATURES
+# ---------------------------------------------------------
+# CLAUSE FORM: no i12 guard. Requires a chain with co-signature approvals
+# activated -- check with \`getapprovalslots <your address>\`. The node supplies
+# your identity guard when it composes this into the shared o5 rule.
+#
+# Over 1,000   -> your auth bot must co-sign
+# Over 10,000  -> auth bot AND security scanner
+# Over 100,000 -> auth bot, scanner AND your partner
+#
+# The requirements ACCUMULATE because any true disjunct blocks: a 200,000
+# transfer fails the partner test, and once the partner signs it still has to
+# pass the scanner test, then the auth test.
+#
+# i1[t]        : amount being transferred (bv[24])
+# i18/i19/i20  : approval slots, bv[384]. The node writes an approver's PUBLIC
+#                KEY here only after verifying a signed vote from them; an
+#                unfilled slot reads 0, which no key equals. You cannot write
+#                these yourself -- that is the whole point.
+# o5[t]        : policy signal (bv[24]: 0 = block, 1 = allow)
+# ---------------------------------------------------------
+# Replace each #xaaaa/#xbbbb/#xcccc with the approver's 96-char public key.
+# Send a gated transfer with:
+#   tau-testnet approval request --key me --to <pk> --amount 50000 --auto
+( ( (i1[t]:bv[24] > { #x0186a0 }:bv[24] && !(i20[t]:bv[384] = {#xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc}:bv[384]))
+ || (i1[t]:bv[24] > { #x002710 }:bv[24] && !(i19[t]:bv[384] = {#xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}:bv[384]))
+ || (i1[t]:bv[24] > { #x0003e8 }:bv[24] && !(i18[t]:bv[384] = {#xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}:bv[384])) )
+    ? (o5[t]:bv[24] = { #x000000 }:bv[24])
+    : (o5[t]:bv[24] = { #x000001 }:bv[24]) )`,
+
+    "[CLAUSE FORM] Single co-signer above a limit": `# ---------------------------------------------------------
+# ONE CO-SIGNER ABOVE A LIMIT
+# ---------------------------------------------------------
+# CLAUSE FORM: no i12 guard. The simplest useful co-signature policy, and the
+# working replacement for the old "Time-Decaying Multi-Signature Vault"
+# template, which put the co-signer on i14 -- a RESERVED consensus stream that
+# every ingest site rejects, so that template could never be deployed at all.
+#
+# Anything over 1,000 needs a signed vote from the named co-signer. Under that,
+# transfers behave normally and NOBODY is notified.
+#
+# i18[t] : approval slot, bv[384]. The node writes the co-signer's public key
+#          here only after verifying their signed vote. Sender-writable streams
+#          cannot do this job: you would just fill it in yourself.
+# ---------------------------------------------------------
+( (i1[t]:bv[24] > { #x0003e8 }:bv[24]
+   && !(i18[t]:bv[384] = {#xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}:bv[384]))
+    ? (o5[t]:bv[24] = { #x000000 }:bv[24])
+    : (o5[t]:bv[24] = { #x000001 }:bv[24]) )`,
+
     "Time-locked (Block transfers before time X)": `# ---------------------------------------------------------
 # TIME-LOCKED WALLET
 # ---------------------------------------------------------
@@ -1412,7 +1484,20 @@ always ((i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111
 # Change {1704067200} to your target Unix timestamp.
 always ((i12[t]:bv[384] = {#x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}:bv[384] && i5[t]:bv[64] < {1704067200}:bv[64]) -> o5[t]:bv[24] = {#x000000}:bv[24]).`,
 
-    "Time-Decaying Multi-Signature Vault": `# ---------------------------------------------------------
+    "Time-Decaying Multi-Signature Vault (NOT DEPLOYABLE)": `# ---------------------------------------------------------
+# TIME-DECAYING MULTI-SIGNATURE VAULT -- CANNOT BE DEPLOYED
+# ---------------------------------------------------------
+# KEPT AS A WARNING, NOT AS A TEMPLATE. It puts the co-signer's key on i14,
+# which is a RESERVED consensus stream (proposer stake): every ingest site
+# rejects a transaction that writes it, and a rule that types it can pin a
+# conflicting bitvector width process-wide. This never worked.
+#
+# Use "[CLAUSE FORM] Single co-signer above a limit" instead: an approval slot
+# (i18..i25) is the stream a third party can fill and you cannot, which is
+# exactly what a co-signature needs.
+# ---------------------------------------------------------
+# ORIGINAL TEXT BELOW, FOR REFERENCE ONLY:
+# ---------------------------------------------------------
 # TIME-DECAYING MULTI-SIGNATURE VAULT
 # ---------------------------------------------------------
 # This sophisticated contract requires a Co-Signer to approve

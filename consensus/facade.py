@@ -186,3 +186,159 @@ class TipAdmissionView:
                 (int(target_stream),),
             )
             return {row[0]: row[1] for row in cur.fetchall()}
+
+    # --- Co-signature approvals -------------------------------------------
+    #
+    # Read from the persisted tables and chain_state values rather than the
+    # in-memory lifecycle manager, for the same reason rule sharing does:
+    # admission runs on RPC/gossip threads while block apply mutates the
+    # manager, and the tip tables are the same view every node has.
+
+    @property
+    def approval_slots_active(self) -> bool:
+        """Whether i18..i25 are reserved and fed at the canonical tip.
+
+        Consensus state, never a module global: block apply deep-copies the
+        lifecycle manager per candidate block, so a global would leak across
+        candidate simulation, rollback and reorg.
+        """
+        try:
+            value = db.get_chain_state_value("approval_slots_active", "0")
+        except Exception:
+            return False
+        return str(value) == "1"
+
+    def get_approval_request(self, request_id: str) -> Optional[dict]:
+        """The full request row, or None. Includes the recorded votes."""
+        import json as _json
+
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT request_id, sender_pubkey, recipient_pubkey, amount, "
+                "expire_at_height, approvers_json, custom_inputs_json, "
+                "voted_json, declined_json, status FROM approval_requests_v1 "
+                "WHERE request_id = ?",
+                (request_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+
+        def _imap(raw):
+            try:
+                parsed = _json.loads(raw or "{}")
+            except (TypeError, ValueError):
+                return {}
+            if not isinstance(parsed, dict):
+                return {}
+            out = {}
+            for k, v in parsed.items():
+                try:
+                    out[int(k)] = v
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        try:
+            declined = _json.loads(row[8] or "[]")
+            declined = [int(d) for d in declined] if isinstance(declined, list) else []
+        except (TypeError, ValueError):
+            declined = []
+
+        return {
+            "request_id": row[0],
+            "sender_pubkey": row[1],
+            "recipient_pubkey": row[2],
+            "amount": int(row[3] or 0),
+            "expire_at_height": int(row[4] or 0),
+            "approvers": _imap(row[5]),
+            "custom_inputs": _imap(row[6]),
+            "voted": _imap(row[7]),
+            "declined": declined,
+            "status": int(row[9] or 0),
+        }
+
+    def open_requests_for_sender(self, sender_pubkey: str) -> int:
+        from consensus.approvals import STATUS_OPEN
+
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM approval_requests_v1 "
+                "WHERE sender_pubkey = ? AND status = ?",
+                (sender_pubkey.lower(), STATUS_OPEN),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def open_requests_for_approver(self, approver_pubkey: str) -> int:
+        """Open requests naming this account as an approver.
+
+        No indexed column for it -- the approver set is a JSON map -- so this
+        scans the open rows. Bounded by MAX_PENDING_REQUESTS_PER_SENDER times the
+        number of senders, and the open book is small by construction.
+        """
+        from consensus.approvals import STATUS_OPEN
+
+        target = approver_pubkey.lower()
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT approvers_json FROM approval_requests_v1 WHERE status = ?",
+                (STATUS_OPEN,),
+            )
+            rows = cur.fetchall()
+        count = 0
+        for (blob,) in rows:
+            if target in (blob or "").lower():
+                count += 1
+        return count
+
+    def open_requests_naming(self, approver_pubkey: str) -> list:
+        """Open request rows naming this account as an approver.
+
+        This is the inbox, and it IS the tier scoping: a request declares only
+        the approvers its amount needs, so an approver whose vote is not needed
+        never sees it.
+        """
+        import json as _json
+        from consensus.approvals import STATUS_OPEN
+
+        target = approver_pubkey.lower()
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT request_id, approvers_json FROM approval_requests_v1 "
+                "WHERE status = ? ORDER BY request_id",
+                (STATUS_OPEN,),
+            )
+            rows = cur.fetchall()
+        out = []
+        for request_id, blob in rows:
+            try:
+                approvers = _json.loads(blob or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(approvers, dict):
+                continue
+            if target in {str(v).lower() for v in approvers.values()}:
+                row = self.get_approval_request(request_id)
+                if row:
+                    out.append(row)
+        return out
+
+    def clause_author_count(self, target_stream: int) -> int:
+        """How many principals hold a registered clause on this stream.
+
+        Bounds the derived composite, and with it interpreter rebuild cost: every
+        additional author multiplies it by roughly eight.
+        """
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM rule_clauses_v1 WHERE target_stream = ?",
+                (int(target_stream),),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0

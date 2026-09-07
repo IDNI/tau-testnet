@@ -8,6 +8,7 @@ import tau_manager
 import config
 import tau_native
 from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
+from consensus.lanes import TAU_EVALUATING_TX_TYPES
 from consensus.fees import FeeRuleError
 from block import Block
 import hashlib
@@ -591,7 +592,8 @@ def _process_new_block_locked(block: Block) -> bool:
             # stream o9 — unknowable without Tau. Defer (retry/resync
             # later) rather than validate user_tx blocks on guessed fees.
             has_user_tx = any(
-                isinstance(tx, dict) and tx.get("tx_type", "user_tx") == "user_tx"
+                isinstance(tx, dict)
+            and tx.get("tx_type", "user_tx") in TAU_EVALUATING_TX_TYPES
                 for tx in (block.transactions or [])
             )
             if has_user_tx and not tau_manager.tau_ready.wait(timeout=5):
@@ -717,6 +719,8 @@ def _process_new_block_locked(block: Block) -> bool:
                 rule_offers=_lifecycle_manager.rule_offers.snapshot_offers(),
                 rule_clauses=_lifecycle_manager.rule_offers.snapshot_clauses(),
                 max_rule_txs_per_block=_lifecycle_manager.max_rule_txs_per_block,
+                approval_requests=_lifecycle_manager.approval_requests.snapshot_requests(),
+                approval_slots_active=_lifecycle_manager.approval_slots_active,
                 eligibility_mode=_lifecycle_manager.eligibility_mode,
                 fee_beneficiary=_lifecycle_manager.fee_beneficiary,
                 last_transfer_ts=dict(_last_transfer_ts),
@@ -1065,6 +1069,22 @@ def load_genesis(genesis_json_path: str):
             _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
             _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
             _lifecycle_manager.fee_beneficiary = meta.get("mechanism_specific_metadata", {}).get("fee_beneficiary", "")
+            # A fresh chain may ship with co-signature approval slots already
+            # reserved (scripts/gen_genesis.py --approval-slots). One-way, so
+            # this only ever turns it on.
+            if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
+                _lifecycle_manager.activate_approval_slots()
+                # Persist immediately. TipAdmissionView reads this key, not the
+                # manager, so without it admission treats a genesis-activated
+                # chain as INACTIVE until the first block commits -- and rejects
+                # every co-signature policy in the meantime. Found by the
+                # live-node e2e.
+                try:
+                    db.set_chain_state_value("approval_slots_active", "1")
+                except Exception:
+                    logger.warning(
+                        "could not persist approval_slots_active from genesis",
+                        exc_info=True)
             _lifecycle_manager.recompute_approval_threshold()
 
         commit_state_to_db(genesis_block.block_hash, 0)
@@ -1115,6 +1135,22 @@ def load_genesis(genesis_json_path: str):
             _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
             _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
             _lifecycle_manager.fee_beneficiary = meta.get("mechanism_specific_metadata", {}).get("fee_beneficiary", "")
+            # A fresh chain may ship with co-signature approval slots already
+            # reserved (scripts/gen_genesis.py --approval-slots). One-way, so
+            # this only ever turns it on.
+            if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
+                _lifecycle_manager.activate_approval_slots()
+                # Persist immediately. TipAdmissionView reads this key, not the
+                # manager, so without it admission treats a genesis-activated
+                # chain as INACTIVE until the first block commits -- and rejects
+                # every co-signature policy in the meantime. Found by the
+                # live-node e2e.
+                try:
+                    db.set_chain_state_value("approval_slots_active", "1")
+                except Exception:
+                    logger.warning(
+                        "could not persist approval_slots_active from genesis",
+                        exc_info=True)
             _lifecycle_manager.recompute_approval_threshold()
             commit_state_to_db(_canonical_head_hash, latest["header"]["block_number"] if latest else 0)
         print(f"[INFO][chain_state] State loaded successfully. Last known block hash: '{_canonical_head_hash[:16]}...'")
@@ -1554,6 +1590,81 @@ def _restore_rule_offers(lm) -> None:
     lm.rule_offers.offer_payloads = payloads
 
 
+def _restore_approvals(lm) -> None:
+    """Rebuild the approval-request book from the database.
+
+    Open rows go back into the live book with their votes; every terminal row is
+    replayed as a bare id in `resolved`, which is the part the state hash binds.
+    The resolved set is never pruned -- see
+    ApprovalRequestLifecycleManager.is_empty, where shrinking back to empty
+    would revert the meta hash to the pre-feature preimage and fork the chain.
+
+    `voted` is restored, not recomputed: it decides whether the parked transfer
+    executes, so it is hash-bound state and losing it on restart would let a
+    node disagree with its peers about which approvers have signed.
+    """
+    from consensus.approvals import ApprovalRequestEntry, STATUS_OPEN, STATUS_FAILED
+
+    open_requests = {}
+    resolved = set()
+    statuses = {}
+    details = {}
+
+    def _index_map(raw, cast=str):
+        try:
+            parsed = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        out = {}
+        for k, v in parsed.items():
+            try:
+                out[int(k)] = cast(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    for row in db.load_approval_requests():
+        try:
+            request_id = bytes.fromhex(row["request_id"])
+        except (TypeError, ValueError):
+            logger.warning("Skipping malformed approval request id %r", row.get("request_id"))
+            continue
+        if len(request_id) != 32:
+            logger.warning("Skipping approval request id of wrong width %r", row.get("request_id"))
+            continue
+
+        status = int(row.get("status") or STATUS_OPEN)
+        statuses[request_id] = status
+        try:
+            declined_raw = json.loads(row.get("declined_json") or "[]")
+            declined = {int(d) for d in declined_raw} if isinstance(declined_raw, list) else set()
+        except (TypeError, ValueError):
+            declined = set()
+
+        entry = ApprovalRequestEntry(
+            sender_pubkey=row.get("sender_pubkey") or "",
+            recipient_pubkey=row.get("recipient_pubkey") or "",
+            amount=int(row.get("amount") or 0),
+            expire_at_height=int(row.get("expire_at_height") or 0),
+            approvers=_index_map(row.get("approvers_json")),
+            custom_inputs=_index_map(row.get("custom_inputs_json")),
+            voted=_index_map(row.get("voted_json")),
+            declined=declined,
+        )
+        if status == STATUS_OPEN:
+            open_requests[request_id] = entry
+        else:
+            resolved.add(request_id)
+            details[request_id] = entry
+
+    lm.approval_requests.open_requests = open_requests
+    lm.approval_requests.resolved = resolved
+    lm.approval_requests.terminal_status = statuses
+    lm.approval_requests.resolved_details = details
+
+
 def save_effective_tau_spec(canonical_rule_text: str):
     """
     Append ONE canonical (full-width, pre-shrink) application rule to the raw
@@ -1681,6 +1792,12 @@ def load_state_from_db() -> bool:
         # consensus_meta_hash, so a miss here shows up as a state-hash mismatch
         # on the first block after a restart.
         _restore_rule_offers(_lifecycle_manager)
+        _restore_approvals(_lifecycle_manager)
+        # One-way activation flag: rehydrated BEFORE anything reads the reserved
+        # stream set, so a restarted node does not briefly un-reserve i18..i25.
+        persisted_slots = db.get_chain_state_value("approval_slots_active", _MISSING)
+        if persisted_slots is not _MISSING and str(persisted_slots) == "1":
+            _lifecycle_manager.activate_approval_slots()
 
         for p in pending_updates:
             update = ConsensusRuleUpdate(
@@ -1727,6 +1844,8 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_offers_list = _lifecycle_manager.rule_offers.snapshot_offers()
         rule_clauses_list = _lifecycle_manager.rule_offers.snapshot_clauses()
         max_rule_txs_snapshot = _lifecycle_manager.max_rule_txs_per_block
+        approval_requests_list = _lifecycle_manager.approval_requests.snapshot_requests()
+        approval_slots_active_snapshot = _lifecycle_manager.approval_slots_active
 
     db.save_canonical_state_atomically(
         block_hash, block_number,
@@ -1741,6 +1860,8 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_offers=rule_offers_list,
         rule_clauses=rule_clauses_list,
         max_rule_txs_per_block=max_rule_txs_snapshot,
+        approval_requests=approval_requests_list,
+        approval_slots_active=approval_slots_active_snapshot,
     )
 
 def tick_governance(height: int):
@@ -2082,6 +2203,8 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
             rule_offers=rule_offers_list,
             rule_clauses=rule_clauses_list,
             max_rule_txs_per_block=_lifecycle_manager.max_rule_txs_per_block,
+            approval_requests=_lifecycle_manager.approval_requests.snapshot_requests(),
+            approval_slots_active=_lifecycle_manager.approval_slots_active,
         )
 
     # Phase 5: Mempool Restore
