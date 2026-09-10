@@ -1533,6 +1533,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 # arbitrary witness, and two total-form rules on
                                 # one stream either fail to conjoin or supersede
                                 # each other. See tests/test_rule_scoping_native.
+                                if (accept and target_stream
+                                        == tau_defs.USER_POLICY_STREAM_INDEX):
+                                    # Accepting an offered o5 clause replaces
+                                    # the acceptor's registered policy, exactly
+                                    # as an op-"0" declare does. Same hazard,
+                                    # same remedy: a request snapshots its
+                                    # approvers but re-evaluates the CURRENT
+                                    # clause, so recorded votes would come to
+                                    # mean something they were never given for.
+                                    book = lifecycle_mgr.approval_requests
+                                    doomed = book.resolve_all_for_sender(
+                                        decision.actor_pubkey, STATUS_FAILED
+                                    )
+                                    if doomed:
+                                        tx_receipt["logs"].append(
+                                            "Policy change failed %d open approval "
+                                            "request(s)" % len(doomed)
+                                        )
                                 composite = offers.composite_for_stream(target_stream)
                                 ok_apply, detail = _apply_composite_rule(
                                     composite, tx_receipt
