@@ -654,6 +654,20 @@ class ApprovalRequestLifecycleManager:
         self.terminal_status[request_id] = STATUS_OPEN
         return True
 
+    def withdraw_request(self, request_id: bytes) -> bool:
+        """Un-do a `submit_request` outright. False when it was not open.
+
+        NOT a terminal state: the id is forgotten entirely, so the same request
+        may be submitted again. Used when the transaction that parked a request
+        does not survive its own fee settlement -- parking is committed in the
+        apply branch, but the fee is settled afterwards and may hard-reject the
+        tx, and a request that paid nothing must not stay parked.
+        """
+        if self.open_requests.pop(request_id, None) is None:
+            return False
+        self.terminal_status.pop(request_id, None)
+        return True
+
     def can_admit_vote(self, vote: TransferVote, height: int) -> Tuple[bool, str]:
         entry = self.open_requests.get(vote.request_id)
         if entry is None:

@@ -1068,6 +1068,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # the generic transfer-less fee-query step (which feeds the canonical
             # mocked i1=i2=i3=i4=0) must not run for it as well and charge twice.
             fee_already_measured = False
+            # Set when this tx parked an approval request. Parking is committed
+            # in the apply branch below, but the fee is settled afterwards and
+            # can still hard-reject the tx -- and hard_reject suppresses staged
+            # balances and nonces without rolling lifecycle mutations back. A
+            # request whose tx paid nothing must not stay parked, so it is
+            # withdrawn after settlement. Deterministic: every node measures the
+            # same fee against the same signed fee_limit and balance.
+            parked_request_id: Optional[bytes] = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -1643,8 +1651,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     # transfer: releasing it later is free, so
                                     # there is no second fee to drift against a
                                     # fee rule that changed while it sat open.
+                                    # Which is exactly why the parking has to be
+                                    # withdrawn if this tx fails to pay it --
+                                    # see `parked_request_id` after settlement.
                                     fee_components.append(parked_fee)
                                     fee_already_measured = True
+                                    parked_request_id = request.request_id
                                     tx_receipt["logs"].append(
                                         "Approval request parked: " + request.request_id_hex
                                     )
@@ -2146,6 +2158,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             f"{'beneficiary' if fee_beneficiary else 'proposer'} "
                             f"{str(beneficiary)[:10]}..."
                         )
+
+            if parked_request_id is not None and not accepted_in_block:
+                # The tx did not survive settlement (fee_limit_exceeded or
+                # insufficient_funds_for_fee, both of which also set
+                # hard_reject). Un-park it: otherwise the request stays in
+                # consensus state having paid nothing, and a later vote releases
+                # the transfer for free. Replay is unaffected -- it logs and
+                # skips the fee without clearing accepted_in_block, so a request
+                # parked on the mined chain stays parked.
+                if lifecycle_mgr.approval_requests.withdraw_request(parked_request_id):
+                    tx_receipt["logs"].append(
+                        "Approval request un-parked (its fee was not paid)"
+                    )
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same

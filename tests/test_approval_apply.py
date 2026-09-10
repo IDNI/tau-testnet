@@ -70,7 +70,7 @@ def _request(amount=5000, seq=0, approvers=None, customs=None, expire=EXPIRE):
     )
 
 
-def request_tx(request=None, sk=SK_ALICE, sender=None, forge=False):
+def request_tx(request=None, sk=SK_ALICE, sender=None, forge=False, fee_limit="100"):
     req = request or _request()
     tx = {
         "tx_id": f"req-{next(_TX_SEQ)}",
@@ -78,7 +78,7 @@ def request_tx(request=None, sk=SK_ALICE, sender=None, forge=False):
         "sender_pubkey": sender or req.sender_pubkey,
         "sequence_number": req.sequence_number,
         "expiration_time": 9999999999,
-        "fee_limit": "100",
+        "fee_limit": str(fee_limit),
         "recipient_pubkey": req.recipient_pubkey,
         "amount": req.amount,
         "expire_at_height": req.expire_at_height,
@@ -120,7 +120,7 @@ def _lm(active=True, balances=None):
     return lm
 
 
-def _apply(txs, lm=None, height=HEIGHT, balances=None):
+def _apply(txs, lm=None, height=HEIGHT, balances=None, fee=0):
     """Apply a block and return (result, post_lifecycle_manager, tau_calls).
 
     The fake engine emulates a tier-1 co-signature policy: any amount over
@@ -159,7 +159,7 @@ def _apply(txs, lm=None, height=HEIGHT, balances=None):
         amount = int(str(vals.get(1, "0")) or 0)
         slot18 = str(vals.get(18, "0"))
         blocked = amount > TIER_1 and AUTH not in slot18
-        out = {1: str(amount), 8: "0", 9: "0"}
+        out = {1: str(amount), 8: "0", 9: str(fee)}
         out[5] = "0" if blocked else "1"
         return out
 
@@ -234,6 +234,60 @@ def test_requests_are_ignored_before_activation():
     result, lm, _ = _apply([request_tx(req)], lm=_lm(active=False))
     assert lm.approval_requests.get_request(req.request_id) is None
     assert "not active" in _logs(result)
+
+
+# --- the request's fee ------------------------------------------------------
+#
+# Parking is committed in the apply branch, but the fee is settled afterwards
+# and can still hard-reject the tx -- and hard_reject suppresses staged balances
+# and nonces without rolling lifecycle mutations back. A request that paid
+# nothing must not stay parked: it is the ONLY charge the parked transfer ever
+# pays, so a parked-but-unpaid request releases the transfer for free.
+
+def test_the_request_fee_is_charged_at_request_time():
+    # ALICE is both sender and block proposer here, so the debit and the credit
+    # alias and net to zero by design (the aliasing-safe ordering in the fee
+    # settlement block). The receipt is what records the charge.
+    result, _, _ = _apply([request_tx(_request())], fee=7)
+    assert "Fee charged: 7" in _logs(result)
+
+
+def test_a_request_whose_fee_exceeds_its_limit_is_not_parked():
+    req = _request()
+    result, post, _ = _apply([request_tx(req, fee_limit=3)], fee=7)
+    assert post.approval_requests.get_request(req.request_id) is None
+    assert "un-parked" in _logs(result)
+    assert _balances(result)[ALICE] == 100000, "a rejected tx pays nothing"
+
+
+def test_a_request_whose_sender_cannot_cover_the_fee_is_not_parked():
+    req = _request()
+    result, post, _ = _apply(
+        [request_tx(req)], balances={ALICE: 2, AUTH: 10, SCAN: 10, BOB: 0}, fee=7
+    )
+    assert post.approval_requests.get_request(req.request_id) is None
+    assert "un-parked" in _logs(result)
+
+
+def test_an_un_parked_request_may_be_submitted_again():
+    """withdraw_request forgets the id outright -- it is not a terminal state,
+    so the sender can retry with a fee_limit that actually covers the fee."""
+    req = _request()
+    _, post, _ = _apply([request_tx(req, fee_limit=3)], fee=7)
+    assert post.approval_requests.can_admit_request(req, HEIGHT)[0]
+
+
+def test_a_lapsed_request_does_not_return_its_fee():
+    """Deliberate: a refundable park makes request spam free, and the fee pays
+    for Tau evaluations and block space the network already spent. Pinned here
+    because nothing else in the repo says so."""
+    req = _request(expire=HEIGHT + 1)
+    result, lm, _ = _apply([request_tx(req)], fee=7)
+    parked = dict(_balances(result))
+    assert "Fee charged: 7" in _logs(result)
+    after, post, _ = _apply([], lm=lm, height=HEIGHT + 1, balances=parked, fee=7)
+    assert post.approval_requests.get_request(req.request_id) is None
+    assert _balances(after) == parked, "the expiry sweep re-credits nothing"
 
 
 # --- votes and release ------------------------------------------------------
