@@ -134,7 +134,7 @@ def test_node_local_runtime_ids_differ_but_transform_is_deterministic(direct_mod
     a = direct_mode.received_rules[-1]
 
     _switch_db("node_b.sqlite")
-    db.get_string_id("bv384:unrelated-preseed")  # takes id 1
+    db.get_shrink_id("bv384:unrelated-preseed")  # takes id 1
     iface_b = FakeIface()
     tau_manager.tau_direct_interface = iface_b
     tau_manager._runtime_shrunk_streams = frozenset()
@@ -150,7 +150,7 @@ def test_node_local_runtime_ids_differ_but_transform_is_deterministic(direct_mod
 def test_db_error_during_stream_shrink_aborts(direct_mode, monkeypatch):
     tau_manager.communicate_with_tau(rule_text=EQ_RULE, target_output_stream_index=0)
     assert tau_manager._runtime_shrunk_streams == frozenset({12})
-    monkeypatch.setattr(db, "get_string_id",
+    monkeypatch.setattr(db, "get_shrink_id",
                         lambda key: (_ for _ in ()).throw(RuntimeError("db down")))
     with pytest.raises(TauCommunicationError):
         tau_manager.communicate_with_tau_multi(
@@ -204,16 +204,16 @@ def test_application_rules_state_canonical_and_width_independent(temp_database, 
 def test_restore_never_repicks_the_process_shrink_width(direct_mode, monkeypatch):
     """Regression: `restore_full_tau_spec` used to recompute the shrink width.
 
-    Restores run mid-process (createblock does one per block) while the shared
-    `tau_strings` sequence grows every block, so the recompute eventually widened
-    a live interpreter's rules from bv[8] to bv[16] -- and the engine, which types
-    each stream once and never re-types it, rejected everything after that with
+    Restores run mid-process (createblock does one per block) while the intern
+    table grows under them, so the recompute eventually widened a live
+    interpreter's rules from bv[8] to bv[16] -- and the engine, which types each
+    stream once and never re-types it, rejected everything after that with
     "Incompatible type information in i12:untyped, expected :bv[8], found :bv[16]".
     """
     iface = direct_mode
     # Unpinned on purpose: if the recompute comes back, this widens to bv[16].
     monkeypatch.setattr(ts, "_width_pinned", False)
-    monkeypatch.setattr(db, "get_max_string_id", lambda: 300)   # table grew since boot
+    monkeypatch.setattr(db, "get_max_shrink_id", lambda: 300)   # table grew since boot
 
     tau_manager.restore_full_tau_spec(EQ_RULE)
 

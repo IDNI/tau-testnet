@@ -195,6 +195,28 @@ def init_db():
                     text TEXT    NOT NULL UNIQUE
                 );
             ''')
+            # The shrink layer's OWN id space, deliberately not `tau_strings`.
+            # That table's autoincrement is shared with
+            # TauConsensusEngine._encode_yid (proposer, parent hash, claims json),
+            # and the parent hash is unique per block -- so the sequence grows at
+            # least one id per block no matter how many addresses exist. Interning
+            # addresses there made the shrink bv width track the BLOCK count: a
+            # node with 7 addresses drifted to bv[16], and past ~254 rows every
+            # newly-seen address raised ShrinkWidthOverflow and re-exec'd the
+            # process. Here ids are dense -- one per distinct interned value.
+            #
+            # Additive table: SCHEMA_VERSION stays put (a bump makes init_db
+            # refuse to start and forces every live node to delete its DB).
+            # Shrink ids are node-local and eval-only -- never in persisted spec,
+            # block data or the state hash -- so an upgrading node just re-interns
+            # lazily into this empty table, with new (denser) ids. Its old
+            # `bv<width>:<hex>` rows in tau_strings become inert.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS tau_shrink_ids (
+                    id  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    key TEXT    NOT NULL UNIQUE
+                );
+            ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS mempool (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -529,25 +551,62 @@ def get_string_id(text: str) -> str:
             _db_conn.commit()
         return f'y{id_num}'
 
-def get_max_string_id() -> int:
-    """Largest assigned tau_strings id (0 if empty). Used to pick the smallest
-    bv shrink width that covers the current interned-address count.
+def get_shrink_id(key: str) -> int:
+    """Interns a shrink key (`bv<width>:<hex>`) to its dense node-local id.
 
-    Deliberately unfiltered. The table's id sequence is SHARED: shrink keys
-    (`bv<width>:<hex>`) and the consensus yids of TauConsensusEngine._encode_yid
-    (proposer, parent hash, claims json -- at least one new row per block) draw
-    from the same autoincrement. So an address can be handed an id far above the
-    address count, and the shrink width has to cover assigned id VALUES, not the
-    number of addresses. Narrowing this to `text LIKE 'bv%'` would pick a width
-    too small for the ids actually in use."""
+    Its own autoincrement, separate from get_string_id: ids here count distinct
+    interned VALUES, so the shrink bv width follows the address count and not the
+    block count (see the tau_shrink_ids comment in init_db). Returns the raw int,
+    not the `y<id>` form -- a shrunk id is fed to the interpreter as a bare bv
+    constant, never as a yid.
+    """
     global _db_conn
     if _db_conn is None:
         init_db()
     with _db_lock:
         cur = _db_conn.cursor()
-        cur.execute('SELECT MAX(id) FROM tau_strings')
+        cur.execute('SELECT id FROM tau_shrink_ids WHERE key = ?', (key,))
+        row = cur.fetchone()
+        if row:
+            return int(row[0])
+        cur.execute('INSERT INTO tau_shrink_ids(key) VALUES (?)', (key,))
+        id_num = int(cur.lastrowid)
+        _db_conn.commit()
+        return id_num
+
+def get_max_shrink_id() -> int:
+    """Largest assigned shrink id (0 if none). Used to pick the smallest bv
+    shrink width that covers the ids in use.
+
+    Scoped to the shrink id space on purpose. This used to read `MAX(id)` from
+    `tau_strings`, whose sequence the per-block consensus yids of
+    TauConsensusEngine._encode_yid also draw from -- so the width grew with the
+    chain instead of with the address count. tau_shrink_ids has no such sharing:
+    its MAX is exactly the largest id the shrink layer has handed out.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT MAX(id) FROM tau_shrink_ids')
         row = cur.fetchone()
         return int(row[0]) if row and row[0] is not None else 0
+
+def get_shrink_key_by_id(id_num: int) -> Optional[str]:
+    """The `bv<width>:<hex>` key behind a dense shrink id, or None if unassigned.
+
+    Diagnostics only (the leaked-shrunk-id output guard). The eval path is
+    one-way: it interns values and never expands ids back.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT key FROM tau_shrink_ids WHERE id = ?', (int(id_num),))
+        row = cur.fetchone()
+        return row[0] if row else None
 
 def get_text_by_id(yid: str) -> str:
     """

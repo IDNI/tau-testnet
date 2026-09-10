@@ -4,8 +4,13 @@ Eval-only shrinking of long equality-only bitvectors for the Tau interpreter.
 Long bitvectors that are only ever compared for equality (`=`) or emptiness
 (`!= 0`) -- wallet pubkeys, hashes -- are expensive in the native interpreter.
 This module interns each distinct long value to a small integer in the local
-`tau_strings` table (db.get_string_id) and rewrites the formula text + input
+`tau_shrink_ids` table (db.get_shrink_id) and rewrites the formula text + input
 stream values to the small `bv[64]` form *right before* the interpreter runs.
+
+The intern table is the shrink layer's OWN dense id space. It used to share
+`tau_strings` with the per-block consensus yids (proposer / parent hash / claims
+json), which made the assigned ids -- and therefore the shrink width -- track the
+block count rather than the address count.
 
 CRITICAL INVARIANTS (see plan: the-problem-in-replicated-taco.md):
 
@@ -35,8 +40,8 @@ logger = logging.getLogger(__name__)
 
 # Shrunk runtime width. Reuses tau_manager.DEFAULT_RULE_BV_WIDTH (64) without
 # importing it (avoid an import cycle: tau_manager imports this module).
-# Reserved id for the empty/zero value. tau_strings autoincrements from 1, so 0
-# is never assigned to a real value and is a safe "empty" sentinel.
+# Reserved id for the empty/zero value. tau_shrink_ids autoincrements from 1, so
+# 0 is never assigned to a real value and is a safe "empty" sentinel.
 RESERVED_EMPTY_ID = 0
 # Only literals/streams at least this wide are shrink candidates. Arithmetic
 # operands (amounts, balances, heights) are decimals well under this and never match.
@@ -107,9 +112,13 @@ def set_shrink_width_from_db() -> int:
     run per block) would emit rules at a width the live interpreter cannot type.
     A wider recomputed value only means the next NEW interned id will overflow,
     and `tau_manager._handle_width_overflow` re-execs -- the one safe way to grow.
+
+    The max is read from the shrink id space alone (db.get_max_shrink_id), so it
+    reflects the number of distinct interned addresses. It does NOT make the pin
+    redundant: a process that interns its 255th address still has to re-exec.
     """
     try:
-        max_id = db.get_max_string_id()
+        max_id = db.get_max_shrink_id()
     except Exception:
         max_id = 0
     width = width_for_count(max_id or 0)
@@ -139,7 +148,7 @@ class ShrinkUnavailable(Exception):
 class ShrinkWidthOverflow(Exception):
     """Raised when an interned id no longer fits the current process shrink width.
 
-    The id is already persisted in tau_strings, so a FRESH process will pick a
+    The id is already persisted in tau_shrink_ids, so a FRESH process will pick a
     wider width. The node must re-exec (NOT rebuild the interpreter in-process --
     the engine's per-stream bv typing is sticky). Distinct from ShrinkUnavailable
     so it is NOT swallowed by fail-closed disable paths.
@@ -197,9 +206,8 @@ def intern_value(hex_digits: str, width: int) -> int:
         return RESERVED_EMPTY_ID
     key = canonical_intern_key(hex_digits, width)
     try:
-        yid = db.get_string_id(key)
-        id_num = int(yid[1:])
-    except Exception as exc:  # DB unavailable, malformed yid, etc.
+        id_num = int(db.get_shrink_id(key))
+    except Exception as exc:  # DB unavailable, malformed id, etc.
         raise ShrinkUnavailable(f"intern failed: {exc}") from exc
     if id_num < 0:
         raise ShrinkUnavailable(f"interned id {id_num} is negative")
@@ -606,6 +614,11 @@ def expand_output_value(value, output_index=None) -> str:
     value parses as an integer > 1 (beyond the 0/1 verdict range) on a
     non-verdict stream AND that id exists in the intern store. Reserved ids 0/1
     overlap with verdict values, so they are never flagged.
+
+    Now that the shrink layer has its own dense id space, a hit here means the
+    value really is a shrink id -- there are no unrelated consensus yids sharing
+    the sequence to collide with. Denser ids do make small integers likelier to
+    be assigned, so the 0/1 verdict exemption still carries the false-alarm load.
     """
     text = "" if value is None else str(value).strip()
     m = _STREAM_LITERAL_RE.match(text)
@@ -617,10 +630,10 @@ def expand_output_value(value, output_index=None) -> str:
             return text
         if n > 1 and output_index not in _VERDICT_OUTPUT_STREAMS:
             try:
-                stored = db.get_text_by_id(f"y{n}")
+                stored = db.get_shrink_key_by_id(n)
             except Exception:
                 stored = None
-            if stored and stored.startswith("bv"):
+            if stored:
                 logger.error(
                     "tau_shrink: output o%s value=%s looks like a shrunk address "
                     "id (interned as %s) but output expansion is not configured. "
