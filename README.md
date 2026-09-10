@@ -275,7 +275,7 @@ tau-testnet rule reject --key bob <offer_id>
 tau-testnet --host testnet.tau.net --port 65432 status
 ```
 
-Full CLI reference, validator-setup recipe, and the governance update lifecycle: [docs/developer_cli.md](docs/developer_cli.md). Raw TCP/WebSocket command grammar and JSON envelopes: [docs/blockchain_api.md](docs/blockchain_api.md).
+Full CLI reference, validator-setup recipe, and the governance update lifecycle: [docs/developer_cli.md](docs/developer_cli.md) — which also covers the raw TCP/WebSocket command grammar and JSON envelopes under [Raw protocol](docs/developer_cli.md#raw-protocol).
 
 ### Web wallet
 

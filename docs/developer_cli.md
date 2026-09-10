@@ -43,8 +43,6 @@ the GHCR release workflow are documented in [packaging.md](packaging.md).
 Every node command (everything except the `hello` handshake) replies with a
 single-line JSON envelope:
 
-Protocol details (transports, handshake, full command list): [blockchain_api.md](blockchain_api.md).
-
 ```json
 {"status":"ok","command":"<name>","data":{...}}
 {"status":"error","command":"<name>","error":{"code":"<CODE>","message":"<text>","details":{...}?}}
@@ -56,19 +54,173 @@ envelope without `\r\n`. The handshake (`hello version=1` / `hello version=2`
 data API. `tau-testnet ping` and `tau-testnet --json status` consume the
 plain-text handshake reply directly.
 
-Error codes emitted by the node: `INVALID_PARAMS`, `PARSE_ERROR`,
-`INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`,
-`TX_INVALID`, `BLS_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`,
-`MEMPOOL_EMPTY`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`,
-`GOVERNANCE_ERROR`, `NOT_FOUND`, `TAU_NOT_READY`, `TIMEOUT`,
-`UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`. Structured context (e.g.
-`{"expected":5,"received":4}` on `INVALID_SEQUENCE`) lives under
-`error.details`.
+Structured context (e.g. `{"expected":5,"received":4}` on `INVALID_SEQUENCE`)
+lives under `error.details`.
+
+Error codes emitted by the node, by origin:
+
+| Origin | Codes |
+|---|---|
+| Server dispatch (`server.py`) | `UNKNOWN_COMMAND`, `RATE_LIMITED`, `FORBIDDEN`, `TIMEOUT`, `INTERNAL_ERROR` |
+| Argument / payload parsing (every command) | `INVALID_PARAMS`, `PARSE_ERROR` |
+| `sendtx` / `checktx` structural | `TX_INVALID`, `TX_EXPIRED`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `BLS_UNAVAILABLE`, `TX_REJECTED` |
+| `sendtx` fees & capacity | `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `MEMPOOL_FULL` |
+| Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `CLAUSE_REGISTRY_FULL`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED` |
+| `createblock` | `MEMPOOL_EMPTY`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED` |
+| Governance / rule / approval reads | `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `REQUEST_UNKNOWN`, `FEATURE_INACTIVE`, `TAU_UNAVAILABLE`, `TAU_ERROR` |
+
+> Earlier revisions of this table listed `NOT_FOUND` and `TAU_NOT_READY`. Neither
+> string exists anywhere in the node; the real codes are `OFFER_UNKNOWN` /
+> `REQUEST_UNKNOWN` and `TAU_UNAVAILABLE`. Do not match on the retired names.
 
 `rpc createblock` accepts one optional argument, `allow-empty`. By default an
 empty mempool is refused with `MEMPOOL_EMPTY`; pass the flag when the point is
 to advance height (e.g. reaching a governance activation). Rounds are
 serialized node-wide, so a caller racing the miner gets `MINING_BUSY`.
+
+## Raw protocol
+
+What the CLI, `wallet.py`, and `web-wallet/` all speak underneath. There is no
+authentication layer: reachability *is* authorization, so a node bound to
+anything other than loopback is world-writable for every command below.
+
+### Transports
+
+| | TCP | WebSocket |
+|---|---|---|
+| Address | `config.HOST` : `config.PORT` (`127.0.0.1:65432`) | `config.HOST` : `PORT + 1` (`65433`) |
+| Scheme | raw socket | `ws://`, or `wss://` when `TAU_WS_CERT_PATH` **and** `TAU_WS_KEY_PATH` are both set |
+| Request framing | one command per line, `\n` (an optional preceding `\r` is stripped) | one command per WebSocket text message, unframed |
+| Response framing | envelope + `\r\n` | envelope, raw, no `\r\n` |
+| Max request | `MAX_RPC_COMMAND_BYTES`, default 4 MiB | 1 MiB (`trio_websocket`'s `max_message_size` default — not configured by the node) |
+
+Both transports run the same `process_command` dispatcher, so the command
+grammar and envelopes are identical; only framing, size caps, and the
+locality rule below differ.
+
+The WebSocket listener scans `65433`–`65442` for the first free port, so on a
+host already running a node the browser wallet may need a port other than the
+default. It also enforces an `Origin` allowlist: missing/`null` origins and
+anything containing `localhost` or `127.0.0.1` pass, otherwise the origin must
+match an entry in the comma-separated `TAU_WS_ALLOWED_ORIGINS` (`*` allows
+all). A rejected connection gets the plain-text `error disallowed_origin` and
+is then closed.
+
+### Connection lifecycle
+
+The TCP handler is a request loop: it reassembles across `recv()` boundaries,
+dispatches every complete line, ignores blank lines, and on EOF flushes an
+unterminated remainder as one final command. It closes the connection only on
+peer disconnect or after an over-size request.
+
+Because the server keeps the connection open, a client that wants a large
+response cannot simply read once. `tau_testnet_cli/rpc.py` sends one command,
+half-closes the write side with `shutdown(SHUT_WR)`, then reads until the
+server closes — which is why the CLI is one-command-per-connection, and why
+its own 4 MiB read ceiling surfaces as exit code `3` rather than an envelope.
+
+### Handshake
+
+```
+hello version=1                    → ok version=1 env=<env> node=tau-node
+hello version=2                    → ok version=2 env=<env> node=tau-node
+hello version=9                    → error unsupported_version expected=1|2 got=9
+hello version=                     → error malformed_handshake
+```
+
+Plain text, not an envelope, and **stateless**: the dispatcher holds no
+per-connection session, so the handshake is optional and every command below
+works without it. Only the exact prefix `hello version=` is treated as a
+handshake — bare `hello` falls through to command dispatch and comes back as
+an `UNKNOWN_COMMAND` envelope.
+
+### Command grammar
+
+Whitespace-split, case-insensitive in the verb only (`parts[0].lower()`);
+arguments keep their case except where a handler lowercases a hex id. Payload
+commands take the rest of the line verbatim as one JSON argument, and tolerate
+it being wrapped in matching single or double quotes.
+
+The full registry (25 names, `app/container.py`):
+
+| Command | Grammar |
+|---|---|
+| `sendtx` | `sendtx <json_payload>` |
+| `checktx` | `checktx <json_payload>` — admission dry-run, no mempool write |
+| `createblock` | `createblock [allow-empty]` — **local-only**, see below |
+| `getmempool` | `getmempool` |
+| `gettimestamp` | `gettimestamp` |
+| `getcurrenttimestamp` | alias of `gettimestamp` |
+| `getbalance` | `getbalance <address>` |
+| `getaccountstate` | `getaccountstate <address>` — pending-aware |
+| `getsequence` | `getsequence <address>` |
+| `history` | `history <address>` — mempool only, not chain history |
+| `gettxstatus` | `gettxstatus <tx_hash>` — 64 hex chars |
+| `getblocks` | `getblocks [limit]` — bare form returns the whole chain |
+| `getallaccounts` | `getallaccounts` |
+| `gettaustate` | `gettaustate` |
+| `getgovernance` | `getgovernance` |
+| `getupdateid` | `getupdateid <json_payload>` |
+| `getofferid` | `getofferid <json_payload>` |
+| `getruleoffers` | `getruleoffers <address> [in\|out\|all]` (default `all`) |
+| `getruleoffer` | `getruleoffer <offer_id>` — 64 hex chars |
+| `getruleconflict` | `getruleconflict <offer_id>` — advisory, node-local |
+| `getapprovalrequests` | `getapprovalrequests <address> [in\|out\|all]` (default `all`) |
+| `getapprovalrequest` | `getapprovalrequest <request_id>` |
+| `getrequestid` | `getrequestid <json_payload>` |
+| `getapprovalslots` | `getapprovalslots <address>` — advisory, node-local |
+| `getapprovalpreview` | `getapprovalpreview <json_draft>` — advisory, node-local |
+
+`gettimestamp` and `getcurrenttimestamp` share one handler, and it hardcodes
+its own name: a `getcurrenttimestamp` request comes back with
+`"command":"gettimestamp"`. Match on `status`, not on the echoed name.
+
+The five approval commands return `FEATURE_INACTIVE` unless the co-signature
+slots are reserved at the tip.
+
+### Locality: `createblock`
+
+`createblock` is refused with `FORBIDDEN` unless the peer address is
+`127.0.0.1` or `::1`, because it signs with the node's own `MINER_PRIVKEY`.
+The WebSocket path never passes locality through, so `createblock` is
+**always** refused over WebSocket, loopback included. Set
+`TAU_ALLOW_REMOTE_CREATEBLOCK=true` (config key
+`authority.allow_remote_createblock`) to lift the check. Validators mine
+through the internal `SoleMiner` loop, not this command.
+
+### Rate limiting
+
+Two token buckets per connection, on both transports, keyed to nothing but the
+connection — reconnecting resets them.
+
+| Bucket | Burst | Refill | Applies to |
+|---|---|---|---|
+| general | 10 | 5/s | every command |
+| expensive | 2 | 0.5/s | `checktx`, `getapprovalpreview`, `getapprovalslots` |
+
+An expensive command is charged to *both* buckets, so it cannot be used to
+dodge the general rate. `sendtx` is deliberately not in the expensive tier: it
+burns a sequence number, is capped by the mempool limit, and carries a
+`fee_limit`, so it is already self-deterring.
+
+Over budget returns `RATE_LIMITED` and drops that one command, keeping the
+connection open. The envelope's `command` field is the literal string
+`rate_limit`, **not** the command you sent — this is the one response whose
+`command` does not round-trip.
+
+### Envelope edge cases
+
+These carry an empty `command` field, because the dispatcher rejected the
+request before it had a name:
+
+| Condition | Response |
+|---|---|
+| Empty or whitespace-only request | `INVALID_PARAMS`, `command: ""` |
+| Invalid UTF-8 in a TCP line | `INVALID_PARAMS`, `command: ""` |
+| Buffered request over `MAX_RPC_COMMAND_BYTES` | `PARSE_ERROR`, `command: ""`, then the connection closes |
+
+A handler that raises is caught per-command and reported as `INTERNAL_ERROR`
+(or `TIMEOUT` for a `TimeoutError`); the connection survives either way.
 
 ## Commands
 
@@ -127,9 +279,15 @@ tau-testnet accounts
 ```bash
 tau-testnet mempool
 tau-testnet blocks
-tau-testnet blocks --limit 10
+tau-testnet blocks --limit 10   # the 10 most recent blocks
 tau-testnet tau-state
 ```
+
+`--limit N` sends `getblocks N` and returns the N highest-numbered blocks,
+still ordered oldest → newest. Prefer it on a long chain: the unlimited form
+can exceed the CLI's 4 MiB read ceiling and fail with exit code `3`. The
+response also carries `total` (the full chain length) and `truncated`, so a
+short window is distinguishable from a short chain.
 
 ### Governance introspection
 
