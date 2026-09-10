@@ -114,7 +114,8 @@ approver's refusal does not, and the transfer still executes once whoever *was*
 required has signed.
 
 Both error directions land on the sender: under-declaring means the rule never
-allows and the request expires with funds intact, and over-declaring means
+allows and the request expires with the transfer amount intact (the fee is
+spent either way), and over-declaring means
 unnecessary notifications but no veto.
 
 ## Voting
@@ -140,9 +141,9 @@ the code is verified by the bot, not the chain, and the flag exists to say so.
 
 | Status | Meaning |
 |---|---|
-| `open` | At least one required signature outstanding. No balance has moved. |
+| `open` | At least one required signature outstanding. The fee is already paid; the transfer amount has not moved. |
 | `executed` | The rule was satisfied and the parked transfer ran. |
-| `failed` | Terminal: a required approver declined, the sender's policy was replaced, `o1` rejected the transfer, or the balance no longer covers it. |
+| `failed` | Terminal: every declared approver answered and the policy still blocks, the sender's policy was replaced, `o1` rejected the transfer, or the balance no longer covers it. A single decline is not a veto and does not fail a request. |
 | `expired` | `expire_at_height` passed with the rule still blocking. |
 
 **Nothing is escrowed.** A pending request reserves no balance; if the sender
@@ -153,7 +154,11 @@ failure hard-rejects.
 
 Fees are charged **once, at request time**, from the request's own signed
 `fee_limit`; execution charges nothing, so a fee-rule change between request and
-approval cannot alter what was authorized.
+approval cannot alter what was authorized. That charge is **not returned** if the
+request lapses, is failed by a policy replacement, or fails on release: a
+refundable park would make request spam free, and the fee pays for Tau
+evaluations and block space the network has already spent. A request whose own
+tx cannot pay the fee is not parked at all.
 
 ## Inspecting
 
@@ -256,9 +261,17 @@ if one ever got through.
 Interpreter rebuild time grows roughly eightfold per additional policy author —
 about 2.5s at one, 13–22s at two, 110s at four — against a 60s `COMM_TIMEOUT`
 with a watchdog SIGKILL past it. Any design carrying per-user policy as rule
-text dies at four authors. Width is *not* a lever here: `tau_shrink` interns
-pubkey literals to `bv[8]`, so a `bv[384]` slot comparison costs the same as
-`bv[24]`. The driver is conditional depth times comparisons per level.
+text dies at four authors. The driver is conditional depth times comparisons per
+level.
+
+Width is not a lever **at apply**, where `tau_shrink` interns pubkey literals to
+`bv[8]`. It very much is a lever **at admission**, which does not shrink at all
+(`tau_compile_worker` calls `tau_native` directly): there the raw `bv[384]` slot
+comparisons cost about 3.7x their `bv[8]` equivalents. Measured against the 8s
+`admission_budget`, one author reading N approval slots: 1 slot 0.9s, 2 slots
+3.0s, 3 slots 6.4s, 4 slots over budget. **Three slots per clause is the
+admissible ceiling on x86-class hardware**, well below the eight slots `i18..i25`
+reserves, and the margin does not survive a slower host.
 
 ## Error codes
 
@@ -345,9 +358,12 @@ verdict from the block bytes alone.
 - **Balance locking / escrow.** A pending request reserves nothing.
 - **Sender-initiated cancel.** Expiry only, plus policy replacement, which fails
   the sender's own open requests.
-- **Weighted or threshold-of-N voting** ("any two of three"). The disjunction
-  expresses ordered requirements, not counting; Tau has no cross-step
-  accumulation.
+- **Weighted or threshold-of-N voting** ("any two of three") as a shipped
+  template. The form itself works — a within-step disjunction of conjunctions
+  over the slots expresses it, and does not need cross-step accumulation — but
+  it costs `C(M,N)` terms, so the admission compile bound and the 8192-byte
+  `TAU_MAX_USER_TX_BYTES` gossip cap put the practical ceiling near `M<=5` at
+  `N=3`. Nothing ships to help you write one.
 - **Approvers attaching data**, beyond the decline reason.
 - **Real Google Identity / OAuth.** The bot is Google-Authenticator-compatible
   TOTP, which is the actual mechanism; no Google API is contacted.

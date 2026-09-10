@@ -24,8 +24,9 @@ consensus path does.
 Both ways the declaration can be wrong are safe and land on the sender:
 
   * under-declare (one approver named on a transfer the clause gates on three)
-    -> the clause never allows, the request expires, funds never move. A sender
-    cannot buy cheaper approval by naming fewer approvers.
+    -> the clause never allows, the request expires, the transfer amount never
+    moves. The request-time fee is spent either way, so a sender cannot buy
+    cheaper approval by naming fewer approvers.
   * over-declare -> unnecessary notifications, but no wrong execution, and
     crucially NO VETO: see `record_decline`. If a decline resolved the request,
     an over-declared approver would hold terminal veto power and the

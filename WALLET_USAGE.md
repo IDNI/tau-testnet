@@ -152,9 +152,9 @@ example, a passphrase-confirmation gate on `o5` (block unless `i13` matches and 
 non-zero amount is sent):
 
 ```
-always ( (i13[t] = { #x2A }:bv[16] && i1[t] != {0}:bv[16])
-         ? o5[t] = {1}:bv[16]
-         : o5[t] = {0}:bv[16] ).
+always ( (i13[t] = { #x2A }:bv[16] && i1[t]:bv[24] != { #x000000 }:bv[24])
+         ? o5[t]:bv[24] = { #x000001 }:bv[24]
+         : o5[t]:bv[24] = { #x000000 }:bv[24] ).
 ```
 
 Sending the transfer with `--operation "13:0x2A"` yields `o5=1` (allow); a wrong
@@ -174,7 +174,7 @@ Rules scope on the sender (`i12` pubkey, or `i3`) and may read the recipient
 (`i4`), block time (`i5`), and amount (`i1`) — all real at both admission and
 apply. Examples expressible today:
 
-- **Recipient whitelist:** `always ( (i4[t] = {#x…}:bv[384]) ? o5[t] = {1}:bv[16] : o5[t] = {0}:bv[16] ).`
+- **Recipient whitelist:** `always ( (i4[t] = {#x…}:bv[384]) ? o5[t]:bv[24] = { #x000001 }:bv[24] : o5[t]:bv[24] = { #x000000 }:bv[24] ).`
 - **Time-lock:** block transfers while `i5[t] < {unlock_ts}:bv[64]`.
 - **Spending limit:** block when `i1[t]` exceeds a per-tier cap.
 - **Cooldown** (once the network enables `i16`): block when
