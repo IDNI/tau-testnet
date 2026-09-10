@@ -360,3 +360,68 @@ def test_soft_no_op_offer_leaves_the_offer_book_out_of_the_hash():
 
     assert lm.rule_offers.is_empty()
     assert lm.consensus_meta_hash() == base_lm.consensus_meta_hash()
+
+
+# --- the second door onto a sender's o5 policy ------------------------------
+
+def test_accepting_an_offered_o5_clause_fails_the_acceptors_open_requests():
+    """`rule_offer_accept` replaces the acceptor's registered o5 clause exactly
+    as an op-"0" declare does, so it has to invalidate their open approval
+    requests for the same reason: a request snapshots its approvers but
+    re-evaluates the CURRENT clause, and carrying recorded votes across a
+    replacement forges consent to a rule nobody signed off on.
+    """
+    from consensus.approvals import STATUS_FAILED, ApprovalRequest
+
+    lm = ConsensusLifecycleManager(active_validators=[A])
+    lm.activate_approval_slots()
+    req = ApprovalRequest(
+        sender_pubkey=B, recipient_pubkey=C, amount=5000,
+        sequence_number=0, expire_at_height=EXPIRE,
+        approvers={18: A}, custom_inputs={},
+    )
+    lm.approval_requests.submit_request(req)
+
+    offer = _offer(text=ALLOW_RULE)
+    _, post, _ = _apply([offer_tx(offer), decision_tx(offer, accept=True)], lm=lm)
+
+    assert post.rule_offers.clause_for(B, TARGET) is not None, "the policy did change"
+    assert post.approval_requests.get_request(req.request_id) is None
+    assert post.approval_requests.terminal_status[req.request_id] == STATUS_FAILED
+
+
+def test_rejecting_an_offer_leaves_the_recipients_requests_open():
+    """A reject changes no policy, so it must not touch the request book."""
+    from consensus.approvals import ApprovalRequest
+
+    lm = ConsensusLifecycleManager(active_validators=[A])
+    lm.activate_approval_slots()
+    req = ApprovalRequest(
+        sender_pubkey=B, recipient_pubkey=C, amount=5000,
+        sequence_number=0, expire_at_height=EXPIRE,
+        approvers={18: A}, custom_inputs={},
+    )
+    lm.approval_requests.submit_request(req)
+
+    offer = _offer(text=ALLOW_RULE)
+    _, post, _ = _apply([offer_tx(offer), decision_tx(offer, accept=False)], lm=lm)
+
+    assert post.approval_requests.get_request(req.request_id) is not None
+
+
+def test_another_principals_requests_survive_an_acceptance():
+    from consensus.approvals import ApprovalRequest
+
+    lm = ConsensusLifecycleManager(active_validators=[A])
+    lm.activate_approval_slots()
+    theirs = ApprovalRequest(
+        sender_pubkey=C, recipient_pubkey=A, amount=5000,
+        sequence_number=0, expire_at_height=EXPIRE,
+        approvers={18: A}, custom_inputs={},
+    )
+    lm.approval_requests.submit_request(theirs)
+
+    offer = _offer(text=ALLOW_RULE)
+    _, post, _ = _apply([offer_tx(offer), decision_tx(offer, accept=True)], lm=lm)
+
+    assert post.approval_requests.get_request(theirs.request_id) is not None
