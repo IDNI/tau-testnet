@@ -356,3 +356,44 @@ class TestMempoolPrunesByHeight:
         db.add_mempool_tx(self._payload(expire_at_height=50), "dead", 1, fee_limit=10)
         db.add_mempool_tx(self._payload(expire_at_height=500, seq=1), "alive", 2, fee_limit=10)
         assert db.get_dropped_tx("dead") is not None
+
+
+# --------------------------------------------------------------------------- #
+# the CLI's deadline resolution
+# --------------------------------------------------------------------------- #
+
+class TestResolveExpireAtHeight:
+    """`getsequence` carries the tip, but a node too old to report one answers
+    0 -- and a deadline measured from 0 on a live chain is already past."""
+
+    class Args:
+        host, port, timeout = "127.0.0.1", 1, 1.0
+        expire_at_height = None
+        expire_in = None
+
+    def test_an_explicit_height_wins(self, monkeypatch):
+        from tau_testnet_cli import cli
+
+        args = self.Args()
+        args.expire_at_height = 4242
+        monkeypatch.setattr(cli, "_tip_height", lambda a: pytest.fail("asked the node"))
+        assert cli._resolve_expire_at_height(args, tip=10) == 4242
+
+    def test_the_passed_tip_is_used_without_a_round_trip(self, monkeypatch):
+        from tau_testnet_cli import cli
+
+        monkeypatch.setattr(cli, "_tip_height", lambda a: pytest.fail("asked the node"))
+        assert cli._resolve_expire_at_height(self.Args(), tip=300) == 300 + 1000
+
+    def test_a_zero_tip_falls_back_to_asking_the_chain(self, monkeypatch):
+        from tau_testnet_cli import cli
+
+        monkeypatch.setattr(cli, "_tip_height", lambda a: 5_000)
+        assert cli._resolve_expire_at_height(self.Args(), tip=0) == 5_000 + 1000
+
+    def test_expire_in_is_honoured(self, monkeypatch):
+        from tau_testnet_cli import cli
+
+        args = self.Args()
+        args.expire_in = 7
+        assert cli._resolve_expire_at_height(args, tip=100) == 107

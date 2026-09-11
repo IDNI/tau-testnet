@@ -1526,11 +1526,18 @@ def _tip_height(args) -> int:
 
 
 def _resolve_expire_at_height(args, *, tip: int | None = None) -> int:
-    """--expire-at-height wins; otherwise tip + --expire-in."""
+    """--expire-at-height wins; otherwise tip + --expire-in.
+
+    A `tip` of 0 is not trusted: a node too old to report `tip_height` with the
+    sequence answers 0, and measuring the deadline from there on a chain at
+    height 5,000 builds a transaction that is already dead. Asking getblocks
+    costs one extra round trip on a genuinely empty chain, which is the cheap
+    side of that trade.
+    """
     explicit = getattr(args, "expire_at_height", None)
     if explicit:
         return int(explicit)
-    if tip is None:
+    if not tip:
         tip = _tip_height(args)
     return tip + int(getattr(args, "expire_in", None)
                      or tx_mod.DEFAULT_EXPIRY_BLOCKS)
