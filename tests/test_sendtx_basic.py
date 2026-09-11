@@ -128,6 +128,26 @@ class TestSendTxBasic(unittest.TestCase):
         }
         return _sign_tx(tx_dict)
 
+    def test_a_transaction_without_a_height_is_refused(self):
+        """The whole point of the field: a node will not take one without it."""
+        tx = json.loads(self._create_tx([[SENDER, ADDR_A, "10"]]))
+        tx.pop("expire_at_height")
+        result = sendtx.queue_transaction(json.dumps(tx))
+        self.assertFalse(result["ok"], msg=result)
+        self.assertEqual(result["code"], "INVALID_PARAMS")
+        self.assertIn("expire_at_height", result["message"])
+
+    def test_a_height_already_reached_is_refused(self):
+        """Genesis leaves the tip at 0, so the next block is 1: a deadline of 1
+        can no longer be met."""
+        tx = json.loads(self._create_tx([[SENDER, ADDR_A, "10"]]))
+        tx["expire_at_height"] = 1
+        # Re-signed: the height is part of the signed message, so editing it
+        # would otherwise fail as a bad signature before admission looks at it.
+        result = sendtx.queue_transaction(_sign_tx(tx))
+        self.assertFalse(result["ok"], msg=result)
+        self.assertEqual(result["code"], "TX_EXPIRED")
+
     def test_successful_single_transfer(self):
         amount = 10
         tx_json = self._create_tx([[SENDER, ADDR_A, str(amount)]])
