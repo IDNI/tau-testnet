@@ -102,7 +102,9 @@ class _FakeClient:
         if command.startswith("getapprovalrequests"):
             return {"incoming": self.incoming}
         if command.startswith("getsequence"):
-            return {"sequence_number": 0}
+            # A node reports the tip alongside the sequence, and the bot needs
+            # it to set the vote's expire_at_height.
+            return {"sequence_number": 0, "tip_height": 7}
         return {}
 
     def rpc(self, command):

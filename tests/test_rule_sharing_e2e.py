@@ -149,6 +149,9 @@ class RuleSharingE2E(unittest.TestCase):
             "tx_type": "rule_offer_accept" if accept else "rule_offer_reject",
             "sender_pubkey": actor,
             "offer_id": offer_id,
+            # A decision is a transaction like any other and must say when it
+            # stops being includable.
+            "expire_at_height": EXPIRE_AT,
         }
         if accept:
             payload["rule_text"] = rule_text
@@ -335,6 +338,7 @@ class RuleSharingE2E(unittest.TestCase):
             "tx_type": "user_tx",
             "sender_pubkey": CAROL,
             "operations": {"1": [[CAROL, BOB, 1]]},
+            "expire_at_height": EXPIRE_AT,
         }, SK_CAROL)
 
         entries = {e["tx_hash"]: e for e in db.get_mempool_entries()}

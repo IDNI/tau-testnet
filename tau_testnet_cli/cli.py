@@ -1456,6 +1456,20 @@ def _add_tx_subparsers(sub) -> None:
         default=tx_mod.DEFAULT_EXPIRY_SECONDS,
         help="Seconds until expiration_time (default: %(default)s)",
     )
+    # The deadline that actually binds: expiration_time is rechecked against the
+    # block timestamp, which the proposer picks, while a height cannot be moved.
+    p_send.add_argument(
+        "--expire-in",
+        type=int,
+        default=tx_mod.DEFAULT_EXPIRY_BLOCKS,
+        help="Blocks past the tip until expire_at_height (default: %(default)s)",
+    )
+    p_send.add_argument(
+        "--expire-at-height",
+        type=int,
+        default=None,
+        help="Absolute expiry height (overrides --expire-in)",
+    )
     p_send.set_defaults(func=cmd_tx_send)
 
     p_rs = tx_sub.add_parser(
