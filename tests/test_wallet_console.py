@@ -6,8 +6,8 @@ import builtins
 import sys
 import os
 
-# Ensure we can import wallet
 sys.path.append(os.getcwd())
+import tau_defs
 import wallet
 
 class TestWalletConsole(unittest.TestCase):
@@ -18,6 +18,8 @@ class TestWalletConsole(unittest.TestCase):
         self.mock_args.port = 65432
         self.mock_args.fee = 100
         self.mock_args.expiry = 10
+        # What the parser defaults it to; a MagicMock would int() to 1.
+        self.mock_args.expire_in_blocks = tau_defs.DEFAULT_TX_EXPIRY_BLOCKS
         
         # Valid key for signing
         # Int: 1
@@ -43,7 +45,10 @@ class TestWalletConsole(unittest.TestCase):
         
         def rpc_side_effect(cmd, host, port):
             if "getsequence" in cmd:
-                return '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":5}}'
+                # tip_height rides along with the sequence; the wallet needs it
+                # to set expire_at_height and refuses to send without one.
+                return ('{"status":"ok","command":"getsequence","data":'
+                        '{"address":"x","sequence_number":5,"tip_height":7}}')
             if "sendtx" in cmd:
                 return '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"txid"}}'
             return '{"status":"error","command":"","error":{"code":"UNKNOWN_COMMAND","message":"Unknown"}}'
@@ -84,6 +89,9 @@ class TestWalletConsole(unittest.TestCase):
             self.assertIn("200", ops)
             self.assertEqual(ops["200"], "test_val_2")
             self.assertEqual(data["sequence_number"], 5)
+            # Counted from the tip the node reported, not from nothing.
+            self.assertEqual(data["expire_at_height"],
+                             7 + tau_defs.DEFAULT_TX_EXPIRY_BLOCKS)
 
 if __name__ == '__main__':
     unittest.main()
