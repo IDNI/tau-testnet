@@ -36,6 +36,7 @@ def _payload(tx_type="user_tx", sender=A, seq=0, operations=None, **extra):
         "sender_pubkey": sender,
         "sequence_number": seq,
         "expiration_time": FUTURE,
+        "expire_at_height": 5000,
         "fee_limit": "10",
     }
     if operations is not None:

@@ -421,6 +421,7 @@ class TestAdmissionFees(unittest.TestCase):
             "sender_pubkey": SENDER,
             "sequence_number": 1,
             "expiration_time": 9999999999,
+            "expire_at_height": 5000,
             "operations": operations if operations is not None else {"100": "42"},
             "fee_limit": fee_limit,
             "signature": "00" * 48,

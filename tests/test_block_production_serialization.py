@@ -67,6 +67,7 @@ def _submit(senders, recipient, amount: str = "10") -> list:
             "sender_pubkey": pk,
             "sequence_number": 0,
             "expiration_time": int(time.time()) + 3600,
+            "expire_at_height": 5000,
             "operations": {"1": [[pk, recipient, amount]]},
             "fee_limit": "0",
         }

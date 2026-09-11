@@ -72,6 +72,7 @@ class TestChecktx(unittest.TestCase):
             "sender_pubkey": SENDER,
             "sequence_number": chain_state.get_sequence_number(SENDER),
             "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
             "operations": {"1": [[SENDER, RECIPIENT, "100"]]},
             "fee_limit": "50",
         }

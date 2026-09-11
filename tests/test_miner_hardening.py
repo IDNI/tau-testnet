@@ -150,6 +150,7 @@ class TestMinerHardening(unittest.TestCase):
                 "sender_pubkey": "UserOverspend",
                 "sequence_number": 0,
                 "expiration_time": int(time.time() + 3600),
+                "expire_at_height": 5000,
                 "operations": {
                     "1": [
                         ["UserOverspend", "Alice", "60"],
@@ -237,6 +238,7 @@ class TestMinerHardening(unittest.TestCase):
             "sender_pubkey": user_addr,
             "sequence_number": 0,
             "expiration_time": int(time.time() + 3600),
+            "expire_at_height": 5000,
             "operations": {
                 "1": [[user_addr, "Bob", str(transfer_amount)]]
             }

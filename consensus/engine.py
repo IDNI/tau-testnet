@@ -1021,6 +1021,26 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 execution_success = False
                 tx_receipt["logs"].append("Transaction expired at block timestamp")
 
+            # The same question asked of the height, which the proposer cannot
+            # choose: `block_timestamp` above is picked by whoever builds the
+            # block, within the clock tolerance, so the timestamp gate alone
+            # lets a proposer hold a transaction past its deadline or bury a
+            # live one. Absent means a transaction written before heights
+            # existed: those still replay, and admission is what refuses a new
+            # one without it.
+            expire_at_height = tx.get('expire_at_height')
+            if (block_height is not None and isinstance(expire_at_height, int)
+                    and not isinstance(expire_at_height, bool)
+                    and int(block_height) >= expire_at_height):
+                if not replay_mode:
+                    accepted_in_block = False
+                    hard_reject = True
+                execution_success = False
+                tx_receipt["logs"].append(
+                    f"Transaction expired at height {expire_at_height} "
+                    f"(block {block_height})"
+                )
+
             # Sequence number handling: only increment if the tx is included/accepted.
             sequence_number = tx.get('sequence_number')
             should_increment_seq = False

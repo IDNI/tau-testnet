@@ -103,6 +103,7 @@ def vote_tx(request, voter=AUTH, sk=SK_AUTH, approve=True, forge=False, reason="
         "sender_pubkey": voter,
         "sequence_number": seq,
         "expiration_time": 9999999999,
+        "expire_at_height": 5000,
         "fee_limit": "0",
         "request_id": request.request_id_hex,
         "approve": approve,
@@ -457,6 +458,7 @@ def rule_tx(rule, sk=SK_ALICE, sender=None, seq=0):
         "sender_pubkey": sender or ALICE,
         "sequence_number": seq,
         "expiration_time": 9999999999,
+        "expire_at_height": 5000,
         "fee_limit": "100",
         "operations": {"0": rule},
     }

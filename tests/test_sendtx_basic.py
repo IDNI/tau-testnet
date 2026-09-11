@@ -122,6 +122,7 @@ class TestSendTxBasic(unittest.TestCase):
             "sender_pubkey": pk_hex,
             "sequence_number": seq,
             "expiration_time": exp_time,
+            "expire_at_height": 5000,
             "operations": ops,
             "fee_limit": "0",
         }

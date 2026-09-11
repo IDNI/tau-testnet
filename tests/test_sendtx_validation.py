@@ -109,6 +109,7 @@ class TestSendTxValidation(unittest.TestCase):
             "sender_pubkey": pk_hex,
             "sequence_number": chain_state.get_sequence_number(pk_hex),
             "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
             "operations": ops,
             "fee_limit": "0",
         }
@@ -145,6 +146,7 @@ class TestSendTxValidation(unittest.TestCase):
             "sender_pubkey": SENDER,
             "sequence_number": chain_state.get_sequence_number(SENDER),
             "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
             "operations": {"0": "some_other_op_data"},
             "fee_limit": "0",
         }
@@ -175,6 +177,7 @@ class TestSendTxValidation(unittest.TestCase):
             "sender_pubkey": SENDER,
             "sequence_number": chain_state.get_sequence_number(SENDER),
             "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
             # operations['0'] is a list — invalid; the server must not crash.
             "operations": {"0": ["always."]},
             "fee_limit": "0",

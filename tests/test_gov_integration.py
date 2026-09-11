@@ -71,6 +71,7 @@ def test_gov_update_acceptance():
         "sender_pubkey": pk_hex,
         "sequence_number": 0,
         "expiration_time": int(time.time()) + 600,
+        "expire_at_height": 5000,
         "fee_limit": "0",
         "rule_revisions": ["always."],
         "activate_at_height": 100,
@@ -114,6 +115,7 @@ def test_gov_vote_acceptance():
         "sender_pubkey": pk_hex,
         "sequence_number": 0,
         "expiration_time": int(time.time()) + 600,
+        "expire_at_height": 5000,
         "fee_limit": "0",
         "update_id": "a" * 64,
         "approve": True
@@ -148,6 +150,7 @@ def test_gov_update_reject_approve_false():
         "sender_pubkey": pk_hex,
         "sequence_number": 0,
         "expiration_time": int(time.time()) + 600,
+        "expire_at_height": 5000,
         "fee_limit": "0",
         "update_id": "a" * 64,
         "approve": False

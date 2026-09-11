@@ -679,6 +679,26 @@ def _backfill_mempool_lanes(conn) -> None:
         logger.info("Backfilled transaction lanes for %d mempool rows", len(rows))
 
 
+def _head_block_number_locked(cur) -> Optional[int]:
+    """Canonical tip height on an OPEN cursor. None when there is no head yet.
+
+    `_db_lock` is a plain Lock, so the prune cannot call get_canonical_head():
+    it takes the same lock and would deadlock. Two reads on the caller's cursor
+    instead.
+    """
+    cur.execute("SELECT value FROM chain_state WHERE key = ?", ("canonical_head_hash",))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return None
+    cur.execute("SELECT block_number FROM blocks WHERE block_hash = ? LIMIT 1", (row[0],))
+    row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
+
 def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
                    fee_limit: int = 0, estimated_fee: int = 0,
                    lane: int | None = None):
@@ -742,6 +762,49 @@ def add_mempool_tx(tx_data: str, tx_hash: str, received_at: int,
                 marks = ",".join("?" for _ in expired_ids)
                 cur.execute(f"DELETE FROM mempool WHERE id IN ({marks})", tuple(expired_ids))
         _record_dropped_locked(cur, expired_hashes, "expired", now_ms)
+
+        # The same prune by HEIGHT. A transaction is dead once the next block
+        # would be at or past its expire_at_height: block apply refuses it from
+        # there on, so holding it only wastes a mempool slot. Rows written
+        # before heights existed have no such field and json_extract returns
+        # NULL, which fails the comparison and leaves them to the clock prune.
+        by_height_hashes = []
+        try:
+            next_height = int((_head_block_number_locked(cur) or 0)) + 1
+        except Exception:
+            next_height = None
+        if next_height is not None:
+            try:
+                by_height_hashes = [
+                    r[0] for r in cur.execute(
+                        "SELECT tx_hash FROM mempool WHERE status='pending' "
+                        "AND CAST(json_extract(payload, '$.expire_at_height') AS INTEGER) <= ?",
+                        (next_height,),
+                    ).fetchall()
+                ]
+                cur.execute(
+                    "DELETE FROM mempool WHERE status='pending' "
+                    "AND CAST(json_extract(payload, '$.expire_at_height') AS INTEGER) <= ?",
+                    (next_height,),
+                )
+            except sqlite3.Error:
+                by_height_ids = []
+                by_height_hashes = []
+                for row in cur.execute(
+                    "SELECT id, tx_hash, payload FROM mempool WHERE status='pending'"
+                ).fetchall():
+                    try:
+                        exp = json.loads(row[2]).get("expire_at_height")
+                    except (ValueError, TypeError):
+                        continue
+                    if isinstance(exp, int) and not isinstance(exp, bool) and exp <= next_height:
+                        by_height_ids.append(row[0])
+                        by_height_hashes.append(row[1])
+                if by_height_ids:
+                    marks = ",".join("?" for _ in by_height_ids)
+                    cur.execute(f"DELETE FROM mempool WHERE id IN ({marks})", tuple(by_height_ids))
+            if by_height_hashes:
+                _record_dropped_locked(cur, by_height_hashes, "expired", now_ms)
 
         # Cap the pending mempool; evict oldest pending only (never reserved — the miner holds them).
         # Count pending-only (matching count_mempool_txs / the soft sendtx pre-check) so the

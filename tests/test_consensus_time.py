@@ -52,6 +52,7 @@ class TestConsensusTime(unittest.TestCase):
             "sender_pubkey": chain_state.GENESIS_ADDRESS,
             "sequence_number": 0,
             "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
             "operations": {
                 "5": "1234567890"  # Attempting to inject consensus time!
             },
@@ -80,6 +81,7 @@ class TestConsensusTime(unittest.TestCase):
             "sender_pubkey": chain_state.GENESIS_ADDRESS,
             "sequence_number": chain_state.get_sequence_number(chain_state.GENESIS_ADDRESS),
             "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
             "operations": {"1": [[chain_state.GENESIS_ADDRESS, recipient, "1"]]},
             "fee_limit": "1000",
             "signature": "00" * 48,
@@ -110,6 +112,7 @@ class TestConsensusTime(unittest.TestCase):
             "sender_pubkey": chain_state.GENESIS_ADDRESS,
             "sequence_number": chain_state.get_sequence_number(chain_state.GENESIS_ADDRESS),
             "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
             "operations": {
                 "1": [[chain_state.GENESIS_ADDRESS, "some_addr", "1"]],
                 "20": "custom_data"

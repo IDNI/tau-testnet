@@ -90,13 +90,24 @@ def _validate_update_id_hex(update_id: str) -> str:
     return update_id
 
 def get_seq(pk, host, port):
+    return get_seq_and_tip(pk, host, port)[0]
+
+
+def get_seq_and_tip(pk, host, port):
+    """Sequence and tip height in one call: a transaction needs both."""
     seq_resp = rpc_command(f"getsequence {pk}\r\n", host, port).strip()
     env = _parse_envelope(seq_resp)
     if isinstance(env, dict) and env.get("status") == "ok":
-        seq = (env.get("data") or {}).get("sequence_number")
+        data = env.get("data") or {}
+        seq = data.get("sequence_number")
+        tip = data.get("tip_height")
         if isinstance(seq, int):
-            return seq
-    return 0
+            return seq, (tip if isinstance(tip, int) else 0)
+    return 0, 0
+
+
+# Blocks a governance transaction stays includable for.
+EXPIRY_BLOCKS = 1000
 
 
 def get_governance_state(host, port):
@@ -118,7 +129,7 @@ def submit_rule_update(host, port, privkey, activate_at, rule: list, patch=None)
     sk_bytes = _parse_privkey(privkey)
     sk_int = int.from_bytes(sk_bytes, 'big')
     pk = _pk_from_sk(sk_bytes)
-    seq = get_seq(pk, host, port)
+    seq, tip = get_seq_and_tip(pk, host, port)
     
     uid_bytes = compute_update_id(rule, activate_at, patch)
     uid_hex = uid_bytes.hex()
@@ -129,6 +140,7 @@ def submit_rule_update(host, port, privkey, activate_at, rule: list, patch=None)
         "sender_pubkey": pk,
         "sequence_number": seq,
         "expiration_time": int(time.time()) + 3600,
+        "expire_at_height": tip + EXPIRY_BLOCKS,
         "fee_limit": "0",
         "rule_revisions": rule,
         "activate_at_height": activate_at
@@ -155,13 +167,14 @@ def submit_vote(host, port, privkey, update_id, approve=True):
     sk_bytes = _parse_privkey(privkey)
     sk_int = int.from_bytes(sk_bytes, 'big')
     pk = _pk_from_sk(sk_bytes)
-    seq = get_seq(pk, host, port)
+    seq, tip = get_seq_and_tip(pk, host, port)
     
     payload = {
         "tx_type": "consensus_rule_vote",
         "sender_pubkey": pk,
         "sequence_number": seq,
         "expiration_time": int(time.time()) + 3600,
+        "expire_at_height": tip + EXPIRY_BLOCKS,
         "fee_limit": "0",
         "update_id": update_id,
         "approve": approve

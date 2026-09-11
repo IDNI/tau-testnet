@@ -25,6 +25,10 @@ if REPO_ROOT not in sys.path:
 
 logger = logging.getLogger("approval_bot")
 
+# Blocks a vote stays valid for. Short: a vote is only meaningful while the
+# request it answers is still open, and a stale one should die on its own.
+VOTE_EXPIRY_BLOCKS = 500
+
 
 class RpcError(RuntimeError):
     pass
@@ -131,12 +135,19 @@ class ApproverBot:
             logger.info("[dry-run] would %s %s (%s)",
                         "approve" if approve else "decline", request_id[:16], reason)
             return None
-        sequence = self.client.data(
-            f"getsequence {self.signer.pubkey}")["sequence_number"]
+        seq_data = self.client.data(f"getsequence {self.signer.pubkey}")
+        sequence = seq_data["sequence_number"]
+        # getsequence carries the tip, which is what the height deadline counts
+        # from. A bot votes within blocks, so the window only has to be long
+        # enough to survive a slow miner.
+        tip = seq_data.get("tip_height")
+        if not isinstance(tip, int) or isinstance(tip, bool):
+            raise RuntimeError("node did not report tip_height; cannot set expire_at_height")
         payload = build_transfer_vote_tx(
             sender_pubkey=self.signer.pubkey,
             sequence_number=int(sequence),
             expiration_time=int(time.time()) + 3600,
+            expire_at_height=tip + VOTE_EXPIRY_BLOCKS,
             request_id=request_id,
             approve=approve,
             reason=reason[:256],

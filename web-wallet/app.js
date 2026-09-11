@@ -8,7 +8,13 @@ let socket = null;
 let currentKeyPair = null;
 let isConnected = false;
 let savedWallets = {}; // name -> {priv: hex, pub: hex}
-let pendingSequence = null; // Track local sequence to prevent 'expected 1 got 0' on rapid sends
+let pendingSequence = null;
+// Last tip height the node reported, from getsequence. null until asked, and a
+// transaction cannot be built without it: every transaction must name the
+// height at which it expires.
+let tipHeight = null;
+// Blocks a transaction stays includable for. Mirrors tau_defs.DEFAULT_TX_EXPIRY_BLOCKS.
+const DEFAULT_EXPIRY_BLOCKS = 1000; // Track local sequence to prevent 'expected 1 got 0' on rapid sends
 let _pendingGovTx = null; // { seq, activeTab } — set during gov tx send, consumed on SUCCESS/FAILURE
 let _pendingPreview = null; // { nonce, sentFingerprint } — tracks in-flight preview request
 
@@ -456,6 +462,10 @@ function handleServerResponse(msg) {
             if (ok) {
                 const seq = parseInt(data.sequence_number);
                 statSequence.textContent = seq;
+                // The tip rides along with the sequence, because a transaction
+                // needs both: the sequence to order it and the height its
+                // expire_at_height is counted from.
+                if (Number.isInteger(data.tip_height)) tipHeight = data.tip_height;
                 // Only update pending if it's null (initial load) or the
                 // confirmed sequence has caught up/surpassed our local tracking.
                 if (pendingSequence === null || seq > pendingSequence) {
@@ -841,11 +851,16 @@ async function onSendTransaction() {
     }
 
     // Payload for the wire (what gets sent to the server)
+    if (!Number.isInteger(tipHeight)) {
+        log("Chain height unknown -- refresh the account before sending.", "error");
+        return;
+    }
     const payload = {
         "tx_type": "user_tx",
         "sender_pubkey": senderPub,
         "sequence_number": seq,
         "expiration_time": Math.floor(Date.now() / 1000) + 300, // 5 mins
+        "expire_at_height": tipHeight + DEFAULT_EXPIRY_BLOCKS,
         "operations": ops,
         "fee_limit": String(feeLimitNum)
     };
@@ -859,6 +874,7 @@ async function onSendTransaction() {
             "sender_pubkey": payload.sender_pubkey,
             "sequence_number": payload.sequence_number,
             "expiration_time": payload.expiration_time,
+            "expire_at_height": payload.expire_at_height,
             "fee_limit": payload.fee_limit,
             "tx_type": "user_tx",
             "operations": payload.operations
@@ -2722,6 +2738,7 @@ function buildConsensusRuleVoteTx(draft) {
 function buildSignedEnvelope(txBody, senderPub, seq, expiration, privKeyBytes) {
     if (typeof seq !== 'number' || !Number.isInteger(seq)) throw new Error("sequence_number must be an integer");
     if (typeof expiration !== 'number' || !Number.isInteger(expiration)) throw new Error("expiration_time must be an integer");
+    if (!Number.isInteger(tipHeight)) throw new Error("chain height unknown; refresh the account first");
     if (typeof senderPub !== 'string' || senderPub.length !== 96 || !/^[0-9a-f]{96}$/.test(senderPub)) {
         throw new Error("sender_pubkey must be 96-char lowercase hex");
     }
@@ -2746,6 +2763,7 @@ function buildSignedEnvelope(txBody, senderPub, seq, expiration, privKeyBytes) {
         sender_pubkey: senderPub,
         sequence_number: seq,
         expiration_time: expiration,
+        expire_at_height: tipHeight + DEFAULT_EXPIRY_BLOCKS,
         fee_limit: "0",
         ...txBody
     };

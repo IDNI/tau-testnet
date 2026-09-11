@@ -53,6 +53,7 @@ def _create_signed_tx_json(sender_privkey_int, operations, seq_num, expiration_o
         "sender_pubkey": sender_pk_hex,
         "sequence_number": seq_num,
         "expiration_time": int(time.time()) + expiration_offset,
+        "expire_at_height": 5000,
         "operations": operations,
         "fee_limit": "0",
     }

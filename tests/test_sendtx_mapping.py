@@ -81,6 +81,7 @@ class TestSendTxMapping(unittest.TestCase):
             "sender_pubkey": SENDER,
             "sequence_number": chain_state.get_sequence_number(SENDER),
             "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
             "operations": {"1": []},
             "fee_limit": "0",
         }
@@ -303,6 +304,7 @@ class TestSendTxMapping(unittest.TestCase):
             "sender_pubkey": SENDER,
             "sequence_number": chain_state.get_sequence_number(SENDER),
             "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
             "rule_revisions": revisions or ["always (o9[t]:bv[24] = {#x000005}:bv[24])."],
             "activate_at_height": activate_at,
             "fee_limit": "0",

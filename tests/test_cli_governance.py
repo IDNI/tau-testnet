@@ -220,6 +220,7 @@ def test_gov_vote_signature_uses_canonical_signer():
         sender_pubkey=pk_hex,
         sequence_number=0,
         expiration_time=1234,
+        expire_at_height=5000,
         update_id="b" * 64,
         approve=True,
         fee_limit="0",

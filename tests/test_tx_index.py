@@ -99,6 +99,7 @@ def test_add_mempool_expiry_records_dropped(temp_database):
     expired = {
         "tx_type": "user_tx", "sender_pubkey": "a" * 96, "sequence_number": 0,
         "expiration_time": now_s - 10, "operations": {"1": []}, "signature": "00" * 48,
+        "expire_at_height": 5000,
     }
     fresh = dict(expired)
     fresh["expiration_time"] = now_s + 10_000

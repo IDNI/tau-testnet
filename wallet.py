@@ -152,6 +152,23 @@ def cmd_send(args):
         hist = rpc_command(f"history {sender_pk}\r\n", args.host, args.port).splitlines()
         seq = len(hist) - 1 if len(hist) > 1 else 0
     expiration = int(time.time()) + args.expiry
+
+    # The height deadline, counted from the tip that came back with the
+    # sequence. A node too old to report one leaves tip 0, and the transaction
+    # is refused rather than sent with a deadline measured from nothing.
+    tip_height = None
+    try:
+        if isinstance(parsed, dict):
+            candidate = (parsed.get("data") or {}).get("tip_height")
+            if isinstance(candidate, int) and not isinstance(candidate, bool):
+                tip_height = candidate
+    except (AttributeError, TypeError):
+        tip_height = None
+    if tip_height is None:
+        print("Error: node did not report tip_height; cannot set expire_at_height.")
+        return
+    expire_at_height = tip_height + int(getattr(args, "expire_in_blocks", 0)
+                                        or tau_defs.DEFAULT_TX_EXPIRY_BLOCKS)
     
     # Build operations dictionary
     operations = {}
@@ -228,6 +245,7 @@ def cmd_send(args):
         "sender_pubkey": sender_pk,
         "sequence_number": seq,
         "expiration_time": expiration,
+        "expire_at_height": expire_at_height,
         "operations": operations,
         "fee_limit": str(args.fee),
     }
@@ -279,6 +297,9 @@ def main():
     # Transaction metadata
     p_send.add_argument("--fee", "-f", default=DEFAULT_FEE_LIMIT, type=int, help="Fee limit (cap on the total fee charged)")
     p_send.add_argument("--expiry", "-e", default=3600, type=int, help="Expiration seconds from now")
+    p_send.add_argument("--expire-in-blocks", default=tau_defs.DEFAULT_TX_EXPIRY_BLOCKS,
+                        type=int, dest="expire_in_blocks",
+                        help="Blocks from the current tip after which the transaction expires")
     p_send.set_defaults(func=cmd_send)
     
     # Create block command

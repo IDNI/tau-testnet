@@ -71,6 +71,7 @@ class TestCustomInputs(unittest.TestCase):
                 "sender_pubkey": "a" * 96,
                 "sequence_number": 1,
                 "expiration_time": 9999999999,
+                "expire_at_height": 5000,
                 "operations": {key: "val"},
                 "fee_limit": 100,
                 "signature": "00" * 48
@@ -90,6 +91,7 @@ class TestCustomInputs(unittest.TestCase):
             "sender_pubkey": "a" * 96,
             "sequence_number": 1,
             "expiration_time": 9999999999,
+            "expire_at_height": 5000,
             "operations": {"12": "deadbeef"},
             "fee_limit": 100,
             "signature": "00" * 48,
@@ -108,6 +110,7 @@ class TestCustomInputs(unittest.TestCase):
                 "sender_pubkey": "a" * 96,
                 "sequence_number": 1,
                 "expiration_time": 9999999999,
+                "expire_at_height": 5000,
                 "operations": {key: "5"},
                 "fee_limit": 100,
                 "signature": "00" * 48,
@@ -140,6 +143,7 @@ class TestCustomInputs(unittest.TestCase):
             "sender_pubkey": "A" * 96,
             "sequence_number": 1,
             "expiration_time": 9999999999,
+            "expire_at_height": 5000,
             "operations": {
                 "100": "42",
                 "200": ["a", 1]
@@ -180,6 +184,7 @@ class TestCustomInputs(unittest.TestCase):
             "sender_pubkey": "a" * 96,
             "sequence_number": 1,
             "expiration_time": 9999999999,
+            "expire_at_height": 5000,
             "operations": {
                 "0": "some rule",
                 "100": "42"
@@ -342,6 +347,7 @@ class TestCustomInputUnification(unittest.TestCase):
             "sender_pubkey": self._sender,
             "sequence_number": chain_state.get_sequence_number(self._sender),
             "expiration_time": 9999999999,
+            "expire_at_height": 5000,
             "operations": ops,
             "fee_limit": "0",
         })

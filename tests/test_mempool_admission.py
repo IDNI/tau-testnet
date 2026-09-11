@@ -13,6 +13,7 @@ from consensus.admission import (
 def get_user_tx(operations=None):
     return {
         "tx_type": "user_tx",
+        "expire_at_height": 5000,
         "sender_pubkey": "a" * 96,
         "operations": operations or {}
     }
@@ -20,6 +21,7 @@ def get_user_tx(operations=None):
 def get_update_tx(revisions=None, activate_at=None, patch=None):
     return {
         "tx_type": "consensus_rule_update",
+        "expire_at_height": 5000,
         "sender_pubkey": "a" * 96,
         "rule_revisions": revisions if revisions is not None else ["hello"],
         "activate_at_height": activate_at if activate_at is not None else 100,
@@ -29,6 +31,7 @@ def get_update_tx(revisions=None, activate_at=None, patch=None):
 def get_vote_tx(update_id="b"*64, approve=True):
     return {
         "tx_type": "consensus_rule_vote",
+        "expire_at_height": 5000,
         "sender_pubkey": "a" * 96,
         "update_id": update_id,
         "approve": approve
@@ -54,7 +57,7 @@ class TestMempoolAdmission:
         assert "Legacy transaction types" in res.error
 
     def test_unknown_tx_type_rejected(self, tip_view):
-        tx = {"tx_type": "some_other_type"}
+        tx = {"tx_type": "some_other_type", "expire_at_height": 5000}
         res = validate_mempool_admission(tx, tip_view)
         assert not res.is_valid
         assert "Unknown or unsupported tx_type" in res.error
@@ -67,7 +70,8 @@ class TestMempoolAdmission:
         assert "must not contain governance field" in res.error
 
     def test_missing_required_governance_fields_rejected(self, tip_view):
-        tx = {"tx_type": "consensus_rule_update", "sender_pubkey": "a"*96}
+        tx = {"tx_type": "consensus_rule_update", "sender_pubkey": "a"*96,
+              "expire_at_height": 5000}
         res = validate_mempool_admission(tx, tip_view)
         assert not res.is_valid
         assert "Missing or invalid 'rule_revisions'" in res.error
@@ -377,7 +381,8 @@ class TestStructuredRejections:
     def test_unmarked_rejections_still_default_to_tx_rejected(self, tip_view):
         # An unknown tx_type takes a plain format_error path; it must keep the
         # blanket code so nothing that did not opt in changes shape.
-        res = validate_mempool_admission({"tx_type": "nonsense"}, tip_view)
+        res = validate_mempool_admission(
+            {"tx_type": "nonsense", "expire_at_height": 5000}, tip_view)
         assert not res.is_valid
         assert res.code == "TX_REJECTED"
         assert res.details == {}

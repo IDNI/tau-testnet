@@ -31,6 +31,7 @@ from consensus.rule_offers import (
 )
 from consensus.facade import TipAdmissionView
 from consensus.approvals import (
+    MAX_APPROVAL_WINDOW_BLOCKS,
     MAX_TIER_AUTHORS,
     audit_stream_collisions,
     MAX_PENDING_REQUESTS_PER_APPROVER,
@@ -1158,6 +1159,50 @@ def validate_transfer_vote_payload(
     })
 
 
+# Two types carried a height deadline before this was general, each with its own
+# window, and those windows are what their senders and tests already use. The
+# generic ceiling applies to everything else.
+_EXPIRY_WINDOW_BY_TYPE = {
+    TX_TYPE_RULE_OFFER: MAX_OFFER_WINDOW_BLOCKS,
+    TX_TYPE_APPROVAL_REQUEST: MAX_APPROVAL_WINDOW_BLOCKS,
+}
+
+
+def validate_expire_at_height(payload: Dict, tip_view: TipAdmissionView) -> Optional[AdmissionResult]:
+    """The height deadline every transaction carries. None when it is fine.
+
+    Runs before the per-type validators and applies to all of them, including
+    the two types that already carried the field: one rule, one error string,
+    and no way for a type to be added later without one.
+    """
+    expire_at_height = payload.get("expire_at_height")
+    if not isinstance(expire_at_height, int) or isinstance(expire_at_height, bool):
+        return format_error(
+            "Missing or invalid 'expire_at_height': every transaction must name "
+            "the height at which it expires.",
+            code="INVALID_PARAMS",
+        )
+
+    next_height = tip_view.next_block_height
+    if expire_at_height <= next_height:
+        return format_error(
+            f"Transaction expired: expire_at_height {expire_at_height} is at or "
+            f"before the next block height {next_height}.",
+            code="TX_EXPIRED",
+            expires_at_height=expire_at_height,
+            next_height=next_height,
+        )
+    window = _EXPIRY_WINDOW_BY_TYPE.get(payload.get("tx_type", "user_tx"),
+                                        tau_defs.TX_EXPIRY_MAX_WINDOW_BLOCKS)
+    if expire_at_height > next_height + window:
+        return format_error(
+            f"expire_at_height {expire_at_height} is more than {window} blocks "
+            f"ahead of the next block height {next_height}.",
+            code="INVALID_PARAMS",
+        )
+    return None
+
+
 def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """
     Primary Orchestrator Endpoint for Network Admission logic.
@@ -1167,6 +1212,10 @@ def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> Adm
     
     if "consensus_proposal" == tx_type or "bundle" in payload:
         return format_error("Legacy transaction types (consensus_proposal/bundle) explicitly deprecated and rejected natively.")
+
+    expiry_error = validate_expire_at_height(payload, tip_view)
+    if expiry_error is not None:
+        return expiry_error
 
     if tx_type == "user_tx":
          return validate_user_tx_reserved_domains(payload, tip_view)

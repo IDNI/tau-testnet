@@ -37,6 +37,7 @@ def _tx(sender, seq, transfers):
         "sender_pubkey": sender,
         "sequence_number": seq,
         "expiration_time": 9999999999,
+        "expire_at_height": 5000,
         "operations": {"1": transfers},
         "fee_limit": "0",
         "signature": "dummy_signature_for_testing",

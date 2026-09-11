@@ -445,8 +445,10 @@ tau-testnet gov vote --key alice --update-id <update_id_hex>
 `{"proof_scheme": "bls_header_sig", "fork_choice_scheme": "height_then_hash", "input_contract_version": 1}`.
 
 The CLI wraps this with `tx_type`, `sender_pubkey`, `sequence_number`,
-`expiration_time`, `fee_limit`, and the BLS `signature` — all flat at the top
-level (matching `tests/test_gov_integration.py`).
+`expiration_time`, `expire_at_height`, `fee_limit`, and the BLS `signature` —
+all flat at the top level (matching `tests/test_gov_integration.py`). The CLI
+fills `expire_at_height` from the node's tip (`--expire-in` blocks ahead,
+default 1000); every transaction must carry one.
 
 ### Prerequisite: the proposer/voter must be an active validator
 

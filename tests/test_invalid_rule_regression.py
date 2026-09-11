@@ -55,6 +55,7 @@ class TestInvalidRuleRegression(unittest.TestCase):
                     "sender_pubkey": "a" * 96,
                     "sequence_number": 0,
                     "expiration_time": 9999999999,
+                    "expire_at_height": 5000,
                     "operations": {
                         "0": "invalid rule here"
                     },

@@ -43,6 +43,21 @@ FAIL_INVALID_SBF = TAU_VALUE_ZERO
 TRANSFER_VALUE_BV_WIDTH = 24
 MAX_TRANSFER_VALUE = (1 << TRANSFER_VALUE_BV_WIDTH) - 1
 
+# --- Transaction expiry ---
+# Every transaction carries `expire_at_height`: the first height at which it is
+# too late to include it. Height is the expiry a proposer cannot lie about --
+# `expiration_time` is checked at apply against the block TIMESTAMP, which the
+# proposer chooses within the clock tolerance, so a proposer can hold a
+# transaction past its owner's deadline or bury one that should still be live.
+# A height cannot be backdated without the block itself being invalid.
+#
+# The window matches approval requests (consensus/approvals.py), which have
+# lived with it: far enough ahead that an honest sender is never caught by it,
+# near enough that a mempool cannot hold a transaction indefinitely.
+TX_EXPIRY_MAX_WINDOW_BLOCKS = 10_000
+# What a client picks when the user does not: roughly a day of blocks.
+DEFAULT_TX_EXPIRY_BLOCKS = 1_000
+
 # --- Tau Pin/Stream Names (Symbolic, for clarity in wrapper logic) ---
 # Inputs
 TAU_INPUT_STREAM_RULES = "i0"

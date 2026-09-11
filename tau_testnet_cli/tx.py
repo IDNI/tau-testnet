@@ -24,6 +24,20 @@ from tau_testnet_cli import rpc as rpc_mod
 
 MAX_TAU_TRANSFER_AMOUNT = (1 << DEFAULT_RULE_BV_WIDTH) - 1
 DEFAULT_EXPIRY_SECONDS = 600
+# Blocks, not seconds: the height deadline every transaction carries. Mirrors
+# tau_defs.DEFAULT_TX_EXPIRY_BLOCKS, kept here so the CLI has no import of the
+# node package.
+DEFAULT_EXPIRY_BLOCKS = 1_000
+
+
+def _check_expire_at_height(expire_at_height: Any) -> int:
+    """Every builder takes one. A transaction without it is refused at
+    admission, so building one that cannot be sent helps nobody."""
+    if not isinstance(expire_at_height, int) or isinstance(expire_at_height, bool):
+        raise ValueError("expire_at_height must be an integer block height")
+    if expire_at_height < 1:
+        raise ValueError("expire_at_height must be a positive block height")
+    return expire_at_height
 
 
 # --------------------------------------------------------------------------- #
@@ -69,6 +83,7 @@ def build_user_tx(
     sender_pubkey: str,
     sequence_number: int,
     expiration_time: int,
+    expire_at_height: int,
     operations: Mapping[str, Any],
     fee_limit: str | int = "0",
 ) -> dict:
@@ -80,6 +95,7 @@ def build_user_tx(
         "sender_pubkey": sender_pubkey,
         "sequence_number": sequence_number,
         "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
         "operations": dict(operations),
         "fee_limit": str(fee_limit),
     }
@@ -90,6 +106,7 @@ def build_consensus_rule_update_tx(
     sender_pubkey: str,
     sequence_number: int,
     expiration_time: int,
+    expire_at_height: int,
     rule_revisions: list[str],
     activate_at_height: int,
     host_contract_patch: dict | None = None,
@@ -108,6 +125,7 @@ def build_consensus_rule_update_tx(
         "sender_pubkey": sender_pubkey,
         "sequence_number": sequence_number,
         "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
         "fee_limit": str(fee_limit),
         "rule_revisions": list(rule_revisions),
         "activate_at_height": activate_at_height,
@@ -122,6 +140,7 @@ def build_consensus_rule_vote_tx(
     sender_pubkey: str,
     sequence_number: int,
     expiration_time: int,
+    expire_at_height: int,
     update_id: str,
     approve: bool = True,
     fee_limit: str | int = "0",
@@ -136,6 +155,7 @@ def build_consensus_rule_vote_tx(
         "sender_pubkey": sender_pubkey,
         "sequence_number": sequence_number,
         "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
         "fee_limit": str(fee_limit),
         "update_id": update_id,
         "approve": approve,
@@ -187,6 +207,22 @@ def get_sequence(
     timeout: float = rpc_mod.DEFAULT_TIMEOUT,
 ) -> int:
     """Fetch the next sequence number for ``pubkey`` from the node."""
+    return get_sequence_and_tip(pubkey, host=host, port=port, timeout=timeout)[0]
+
+
+def get_sequence_and_tip(
+    pubkey: str,
+    *,
+    host: str,
+    port: int,
+    timeout: float = rpc_mod.DEFAULT_TIMEOUT,
+) -> tuple[int, int]:
+    """The next sequence number for ``pubkey`` and the node's tip height.
+
+    One call, because a transaction needs both: the sequence to order it, and
+    the height its ``expire_at_height`` is counted from. A node too old to
+    report ``tip_height`` yields 0, and the caller falls back to getblocks.
+    """
     response = rpc_mod.send_command(
         f"getsequence {pubkey}", host, port, timeout=timeout
     )
@@ -205,7 +241,10 @@ def get_sequence(
     seq = data.get("sequence_number")
     if not isinstance(seq, int):
         raise RuntimeError(f"unexpected getsequence response: {response!r}")
-    return seq
+    tip = data.get("tip_height")
+    if not isinstance(tip, int) or isinstance(tip, bool):
+        tip = 0
+    return seq, tip
 
 
 def submit_tx(
@@ -259,6 +298,7 @@ def build_rule_offer_accept_tx(
     sender_pubkey: str,
     sequence_number: int,
     expiration_time: int,
+    expire_at_height: int,
     offer_id: str,
     rule_text: str,
     fee_limit: str | int = "0",
@@ -278,6 +318,7 @@ def build_rule_offer_accept_tx(
         "sender_pubkey": sender_pubkey,
         "sequence_number": sequence_number,
         "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
         "fee_limit": str(fee_limit),
         "offer_id": offer_id.lower(),
         "rule_text": rule_text,
@@ -289,6 +330,7 @@ def build_rule_offer_reject_tx(
     sender_pubkey: str,
     sequence_number: int,
     expiration_time: int,
+    expire_at_height: int,
     offer_id: str,
     fee_limit: str | int = "0",
 ) -> dict:
@@ -301,6 +343,7 @@ def build_rule_offer_reject_tx(
         "sender_pubkey": sender_pubkey,
         "sequence_number": sequence_number,
         "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
         "fee_limit": str(fee_limit),
         "offer_id": offer_id.lower(),
     }
@@ -371,6 +414,7 @@ def build_and_sign_user_tx(
     sender_pubkey: str,
     sequence_number: int,
     operations: Mapping[str, Any],
+    expire_at_height: int,
     fee_limit: str | int = "0",
     expiry_seconds: int = DEFAULT_EXPIRY_SECONDS,
     now: int | None = None,
@@ -382,6 +426,7 @@ def build_and_sign_user_tx(
         sender_pubkey=sender_pubkey,
         sequence_number=sequence_number,
         expiration_time=now + int(expiry_seconds),
+        expire_at_height=expire_at_height,
         operations=operations,
         fee_limit=fee_limit,
     )
@@ -460,6 +505,7 @@ def build_transfer_vote_tx(
     sender_pubkey: str,
     sequence_number: int,
     expiration_time: int,
+    expire_at_height: int,
     request_id: str,
     approve: bool = True,
     reason: str = "",
@@ -483,6 +529,7 @@ def build_transfer_vote_tx(
         "sender_pubkey": sender_pubkey,
         "sequence_number": sequence_number,
         "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
         "fee_limit": str(fee_limit),
         "request_id": request_id.lower(),
         "approve": approve,

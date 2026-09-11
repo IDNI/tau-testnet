@@ -96,6 +96,7 @@ class TestDHTFormula(unittest.TestCase):
             "sender_pubkey": "b" * 96,
             "operations": {"1": [["b" * 96, "c" * 96, "1"]]},
             "expiration_time": 9999999999,
+            "expire_at_height": 5000,
             "fee_limit": "0",
             "sequence_number": 1,
         }
@@ -110,6 +111,7 @@ class TestDHTFormula(unittest.TestCase):
             "sender_pubkey": "b" * 96,
             "sequence_number": 1,
             "expiration_time": 9999999999,
+            "expire_at_height": 5000,
             "operations": {"1": [["b" * 96, "c" * 96, "1"]]},
             "fee_limit": "0",
             "signature": "0" * 192,

@@ -74,6 +74,14 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         "fee_limit": payload["fee_limit"],
         "tx_type": tx_type,
     }
+    # The height deadline is signed for EVERY type, or a proposer could strip it
+    # and revive a transaction its owner had let expire. Included only when
+    # present, so the bytes of a transaction written before heights existed are
+    # unchanged and its signature still verifies -- admission is what requires
+    # the field on anything new. approval_request and rule_offer set it again
+    # below with the same value, which is a no-op on a dict.
+    if payload.get("expire_at_height") is not None:
+        signing_dict["expire_at_height"] = payload["expire_at_height"]
     if tx_type == "user_tx":
         signing_dict["operations"] = payload.get("operations", {})
     elif tx_type == "consensus_rule_update":

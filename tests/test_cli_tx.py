@@ -32,6 +32,7 @@ def test_build_user_tx_includes_required_fields():
         sender_pubkey=pk,
         sequence_number=5,
         expiration_time=1234567890,
+        expire_at_height=5000,
         operations={"1": [[pk, "ab" * 48, "10"]]},
     )
     assert payload["tx_type"] == "user_tx"
@@ -49,6 +50,7 @@ def test_build_user_tx_rejects_empty_operations():
             sender_pubkey=pk,
             sequence_number=0,
             expiration_time=0,
+            expire_at_height=5000,
             operations={},
         )
 
@@ -81,6 +83,7 @@ def test_sign_tx_matches_canonical_chain():
         sender_pubkey=pk,
         sequence_number=0,
         expiration_time=999,
+        expire_at_height=5000,
         operations={"1": [[pk, pk, "1"]]},
     )
 
@@ -270,6 +273,7 @@ def test_tx_raw_sign_then_raw_submit_round_trip(tmp_path):
         "sender_pubkey": pk,
         "sequence_number": 0,
         "expiration_time": 1,
+        "expire_at_height": 5000,
         "operations": {"1": [[pk, pk, "1"]]},
         "fee_limit": "0",
     }

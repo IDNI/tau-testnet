@@ -66,6 +66,7 @@ def offer_tx(**over):
 def accept_tx(**over):
     tx = {
         "tx_type": "rule_offer_accept",
+        "expire_at_height": 5000,
         "sender_pubkey": B,
         "offer_id": _offer_id(),
         "rule_text": BLOCK_RULE,
@@ -77,6 +78,7 @@ def accept_tx(**over):
 def reject_tx(**over):
     tx = {
         "tx_type": "rule_offer_reject",
+        "expire_at_height": 5000,
         "sender_pubkey": B,
         "offer_id": _offer_id(),
     }
@@ -123,9 +125,16 @@ def test_offer_to_self_rejected(tip_view):
 
 def test_offer_malformed_rejected(tip_view):
     for over in ({"recipient_pubkey": "short"}, {"rule_text": 5},
-                 {"expire_at_height": "500"}, {"recipient_pubkey": None}):
+                 {"recipient_pubkey": None}):
         res = validate_mempool_admission(offer_tx(**over), tip_view)
         assert not res.is_valid and "Malformed" in res.error, over
+
+
+def test_offer_with_a_non_integer_height_rejected(tip_view):
+    """Caught by the generic height check, which runs before the per-type
+    validators, so the wording is the one every tx type gets."""
+    res = validate_mempool_admission(offer_tx(expire_at_height="500"), tip_view)
+    assert not res.is_valid and "expire_at_height" in res.error
 
 
 def test_offer_offerer_must_be_the_sender(tip_view):
@@ -140,6 +149,7 @@ def test_offer_offerer_must_be_the_sender(tip_view):
             "rule_text": BLOCK_RULE,
             "expire_at_height": EXPIRE,
         },
+        "expire_at_height": EXPIRE,
     }
     res = validate_mempool_admission(tx, tip_view)
     assert not res.is_valid and "sender" in res.error
@@ -154,8 +164,10 @@ def test_offer_oversized_rejected(tip_view):
 
 
 @pytest.mark.parametrize("expire,fragment", [
-    (NEXT_HEIGHT, "must be beyond"),
-    (NEXT_HEIGHT - 1, "must be beyond"),
+    # The "already expired" half is the generic check's, which every type now
+    # shares; the window ceiling is still the offer's own, wider one.
+    (NEXT_HEIGHT, "at or before the next block height"),
+    (NEXT_HEIGHT - 1, "at or before the next block height"),
     (NEXT_HEIGHT + MAX_OFFER_WINDOW_BLOCKS + 1, "blocks ahead"),
 ])
 def test_offer_expiry_window(tip_view, expire, fragment):
@@ -344,7 +356,8 @@ def test_reject_of_unknown_offer_rejected(tip_view):
 # --- cross-cutting ----------------------------------------------------------
 
 def test_unknown_tx_type_still_rejected(tip_view):
-    res = validate_mempool_admission({"tx_type": "rule_offer_maybe"}, tip_view)
+    res = validate_mempool_admission(
+        {"tx_type": "rule_offer_maybe", "expire_at_height": EXPIRE}, tip_view)
     assert not res.is_valid and "Unknown or unsupported" in res.error
 
 

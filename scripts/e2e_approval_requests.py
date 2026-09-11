@@ -145,9 +145,13 @@ class Node:
 
     def submit(self, name, payload, expect_ok=True):
         payload["sender_pubkey"] = self.pk(name)
-        payload["sequence_number"] = self.rpc(
-            f"getsequence {self.pk(name)}")["data"]["sequence_number"]
+        seq_data = self.rpc(f"getsequence {self.pk(name)}")["data"]
+        payload["sequence_number"] = seq_data["sequence_number"]
         payload["expiration_time"] = int(time.time()) + 3600
+        # Height deadline, counted from the tip that came back with the
+        # sequence. A request or offer that sets its own keeps it.
+        payload.setdefault("expire_at_height",
+                           int(seq_data.get("tip_height") or 0) + 1000)
         payload.setdefault("fee_limit", "10000")
         digest = hashlib.sha256(self._sign_bytes(payload)).digest()
         payload["signature"] = self._bls.Sign(

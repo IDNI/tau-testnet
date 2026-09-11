@@ -281,6 +281,7 @@ def test_concurrent_sendtx_and_createblock(node_state):
                 "sender_pubkey": pk,
                 "sequence_number": 0,
                 "expiration_time": int(time.time()) + 3600,
+                "expire_at_height": 5000,
                 "operations": {"1": [[pk, recipient, "10"]]},
                 "fee_limit": "0",
             }

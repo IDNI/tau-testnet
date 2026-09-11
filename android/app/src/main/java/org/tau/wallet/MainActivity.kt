@@ -28,6 +28,10 @@ import com.google.android.material.tabs.TabLayout
 import android.view.View
 import android.widget.LinearLayout
 
+// Blocks a transaction stays includable for, counted from the tip the node
+// reports. Mirrors tau_defs.DEFAULT_TX_EXPIRY_BLOCKS.
+private const val DEFAULT_EXPIRY_BLOCKS = 1000
+
 class MainActivity : AppCompatActivity() {
 
     private lateinit var actHost: AutoCompleteTextView
@@ -665,11 +669,23 @@ class MainActivity : AppCompatActivity() {
                 histTx?.length() ?: 0
             }
 
+            // getsequence carries the tip, which is the height expire_at_height
+            // counts from. Without it the transaction cannot be built: a node
+            // refuses one that does not say when it expires.
+            val tipHeight = seqData?.optInt("tip_height", -1) ?: -1
+            if (tipHeight < 0) {
+                runOnUiThread {
+                    tvResult.text = "Error: node did not report the chain height; cannot send."
+                }
+                return@thread
+            }
+
             val expiry = (System.currentTimeMillis() / 1000L + 3600).toInt()
             val payloadNoSig = mapOf(
                 "sender_pubkey" to senderPk,
                 "sequence_number" to seq,
                 "expiration_time" to expiry,
+                "expire_at_height" to tipHeight + DEFAULT_EXPIRY_BLOCKS,
                 "operations" to operations,
                 "fee_limit" to feeLimit.toString()
             )

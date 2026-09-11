@@ -25,6 +25,7 @@ def _add_mempool(tx_hash, expiration):
     payload = {
         "tx_type": "user_tx", "sender_pubkey": "a" * 96, "sequence_number": 0,
         "expiration_time": expiration, "operations": {"1": []}, "signature": "00" * 48,
+        "expire_at_height": 5000,
     }
     db.add_mempool_tx(json.dumps(payload), tx_hash, int(time.time() * 1000))
 

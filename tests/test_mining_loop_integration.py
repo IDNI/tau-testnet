@@ -103,6 +103,7 @@ class TestMiningLoopIntegration(unittest.TestCase):
             "sender_pubkey": sender_pubkey,
             "sequence_number": 0,
             "expiration_time": int(time.time()) + 3600,
+            "expire_at_height": 5000,
             "operations": {"1": []}, # Empty transfer list is valid
             "fee_limit": 1000,
             "signature": "b" * 192, # Dummy signature
@@ -160,6 +161,7 @@ class TestMiningLoopIntegration(unittest.TestCase):
             "sender_pubkey": sender_pubkey,
             "sequence_number": 0,
             "expiration_time": int(time.time()) + 3600,
+            "expire_at_height": 5000,
             "operations": {}, 
             "fee_limit": 1000,
             "signature": "d" * 192,

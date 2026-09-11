@@ -84,6 +84,7 @@ def request_tx(**over):
 def vote_tx(request_id=None, voter=AUTH, approve=True, **over):
     tx = {
         "tx_type": "transfer_vote",
+        "expire_at_height": 5000,
         "sender_pubkey": voter,
         "request_id": request_id or _request().request_id_hex,
         "approve": approve,
@@ -135,7 +136,9 @@ def test_a_well_formed_request_is_admitted(tip_view):
     ({"approvers": {18: A}}, "their own approver"),
     ({"amount": 0}, "amount must be in"),
     ({"custom_inputs": {13: "x"}}, "below i26"),
-    ({"expire_at_height": NEXT_HEIGHT}, "must be in the future"),
+    # The generic height check runs before the per-type validators, so this
+    # condition is now reported once, in one wording, for every tx type.
+    ({"expire_at_height": NEXT_HEIGHT}, "at or before the next block height"),
 ])
 def test_shape_errors_are_surfaced(tip_view, over, fragment):
     result = validate_mempool_admission(request_tx(**over), tip_view)

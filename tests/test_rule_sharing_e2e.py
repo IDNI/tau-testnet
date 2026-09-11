@@ -283,6 +283,7 @@ class RuleSharingE2E(unittest.TestCase):
             "offer_id": offer_id,
             "rule_text": BLOCK_RULE,
             "expiration_time": 9999999999,
+            "expire_at_height": 5000,
             "fee_limit": "10",
             "sequence_number": chain_state.get_sequence_number(CAROL),
         }
@@ -302,6 +303,7 @@ class RuleSharingE2E(unittest.TestCase):
             "offer_id": offer_id,
             "rule_text": ALLOW_RULE,          # not what was offered
             "expiration_time": 9999999999,
+            "expire_at_height": 5000,
             "fee_limit": "10",
             "sequence_number": chain_state.get_sequence_number(BOB),
         }

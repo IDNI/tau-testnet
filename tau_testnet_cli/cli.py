@@ -418,7 +418,7 @@ def cmd_tx_send(args: argparse.Namespace) -> int:
         return EXIT_LOCAL
 
     try:
-        sequence_number = tx_mod.get_sequence(
+        sequence_number, tip = tx_mod.get_sequence_and_tip(
             sender_pubkey,
             host=args.host,
             port=args.port,
@@ -433,6 +433,7 @@ def cmd_tx_send(args: argparse.Namespace) -> int:
         sender_pubkey=sender_pubkey,
         sequence_number=sequence_number,
         operations=operations,
+        expire_at_height=_resolve_expire_at_height(args, tip=tip),
         fee_limit=args.fee,
         expiry_seconds=args.expiry,
     )
@@ -553,7 +554,7 @@ def cmd_gov_propose(args: argparse.Namespace) -> int:
     host_contract_patch = update_obj.get("host_contract_patch")
 
     try:
-        sequence_number = tx_mod.get_sequence(
+        sequence_number, tip = tx_mod.get_sequence_and_tip(
             sender_pubkey, host=args.host, port=args.port, timeout=args.timeout
         )
     except RuntimeError as exc:
@@ -565,6 +566,7 @@ def cmd_gov_propose(args: argparse.Namespace) -> int:
             sender_pubkey=sender_pubkey,
             sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry,
+            expire_at_height=_resolve_expire_at_height(args, tip=tip),
             rule_revisions=rule_revisions or [],
             activate_at_height=activate_at_height or 0,
             host_contract_patch=host_contract_patch,
@@ -600,7 +602,7 @@ def cmd_gov_vote(args: argparse.Namespace) -> int:
         return EXIT_LOCAL
 
     try:
-        sequence_number = tx_mod.get_sequence(
+        sequence_number, tip = tx_mod.get_sequence_and_tip(
             sender_pubkey, host=args.host, port=args.port, timeout=args.timeout
         )
     except RuntimeError as exc:
@@ -611,6 +613,7 @@ def cmd_gov_vote(args: argparse.Namespace) -> int:
         sender_pubkey=sender_pubkey,
         sequence_number=sequence_number,
         expiration_time=int(_now()) + args.expiry,
+        expire_at_height=_resolve_expire_at_height(args, tip=tip),
         update_id=args.update_id,
         approve=True,
         fee_limit=args.fee,
@@ -657,7 +660,12 @@ def _read_rule_text(args: argparse.Namespace) -> str:
 
 
 def _submit_rule_tx(args: argparse.Namespace, build) -> int:
-    """Shared build -> sign -> submit path for the three rule-sharing types."""
+    """Shared build -> sign -> submit path for the three rule-sharing types.
+
+    `build` is called with (pubkey, sequence, expire_at_height): the height is
+    resolved once here, from the tip that came back with the sequence, so no
+    builder has to ask for it again.
+    """
     try:
         sk_int, sender_pubkey = _resolve_signing_key(args)
     except _PayloadError as exc:
@@ -665,7 +673,7 @@ def _submit_rule_tx(args: argparse.Namespace, build) -> int:
         return EXIT_LOCAL
 
     try:
-        sequence_number = tx_mod.get_sequence(
+        sequence_number, tip = tx_mod.get_sequence_and_tip(
             sender_pubkey, host=args.host, port=args.port, timeout=args.timeout
         )
     except RuntimeError as exc:
@@ -673,7 +681,8 @@ def _submit_rule_tx(args: argparse.Namespace, build) -> int:
         return EXIT_APP_ERROR
 
     try:
-        payload = build(sender_pubkey, sequence_number)
+        payload = build(sender_pubkey, sequence_number,
+                        _resolve_expire_at_height(args, tip=tip))
     except (_PayloadError, ValueError) as exc:
         print_error(str(exc))
         return EXIT_LOCAL
@@ -716,7 +725,7 @@ def cmd_rule_offer(args: argparse.Namespace) -> int:
 
     return _submit_rule_tx(
         args,
-        lambda pubkey, seq: tx_mod.build_rule_offer_tx(
+        lambda pubkey, seq, _height: tx_mod.build_rule_offer_tx(
             sender_pubkey=pubkey,
             sequence_number=seq,
             expiration_time=int(_now()) + args.expiry,
@@ -803,10 +812,11 @@ def cmd_rule_accept(args: argparse.Namespace) -> int:
 
     return _submit_rule_tx(
         args,
-        lambda pubkey, seq: tx_mod.build_rule_offer_accept_tx(
+        lambda pubkey, seq, height: tx_mod.build_rule_offer_accept_tx(
             sender_pubkey=pubkey,
             sequence_number=seq,
             expiration_time=int(_now()) + args.expiry,
+            expire_at_height=height,
             offer_id=args.offer_id,
             rule_text=rule_text,
             fee_limit=args.fee,
@@ -817,10 +827,11 @@ def cmd_rule_accept(args: argparse.Namespace) -> int:
 def cmd_rule_reject(args: argparse.Namespace) -> int:
     return _submit_rule_tx(
         args,
-        lambda pubkey, seq: tx_mod.build_rule_offer_reject_tx(
+        lambda pubkey, seq, height: tx_mod.build_rule_offer_reject_tx(
             sender_pubkey=pubkey,
             sequence_number=seq,
             expiration_time=int(_now()) + args.expiry,
+            expire_at_height=height,
             offer_id=args.offer_id,
             fee_limit=args.fee,
         ),
@@ -1484,11 +1495,8 @@ def _parse_kv_pairs(values, what, sep="="):
     return out
 
 
-def _resolve_expire_at_height(args) -> int:
-    """--expire-at-height wins; otherwise tip + --expire-in."""
-    explicit = getattr(args, "expire_at_height", None)
-    if explicit:
-        return int(explicit)
+def _tip_height(args) -> int:
+    """The node's tip, from getblocks. Last resort: `getsequence` carries it."""
     response = rpc_mod.send_command(
         "getblocks", host=args.host, port=args.port, timeout=args.timeout
     )
@@ -1500,7 +1508,18 @@ def _resolve_expire_at_height(args) -> int:
             tip = max(tip, int(block["header"]["block_number"]))
         except (KeyError, TypeError, ValueError):
             continue
-    return tip + int(getattr(args, "expire_in", 1000) or 1000)
+    return tip
+
+
+def _resolve_expire_at_height(args, *, tip: int | None = None) -> int:
+    """--expire-at-height wins; otherwise tip + --expire-in."""
+    explicit = getattr(args, "expire_at_height", None)
+    if explicit:
+        return int(explicit)
+    if tip is None:
+        tip = _tip_height(args)
+    return tip + int(getattr(args, "expire_in", None)
+                     or tx_mod.DEFAULT_EXPIRY_BLOCKS)
 
 
 def _auto_discover_approvers(args, sender_pubkey, amount, recipient) -> dict:
@@ -1574,7 +1593,7 @@ def cmd_approval_request(args: argparse.Namespace) -> int:
         )
         return EXIT_LOCAL
 
-    def _build(sender_pubkey, sequence_number):
+    def _build(sender_pubkey, sequence_number, expire_at_height):
         approvers = explicit
         if not approvers:
             if not getattr(args, "auto", False):
@@ -1591,7 +1610,7 @@ def cmd_approval_request(args: argparse.Namespace) -> int:
             expiration_time=int(_now()) + args.expiry,
             recipient_pubkey=args.to,
             amount=int(args.amount),
-            expire_at_height=_resolve_expire_at_height(args),
+            expire_at_height=expire_at_height,
             approvers=approvers,
             custom_inputs=customs,
             fee_limit=args.fee,
@@ -1601,11 +1620,12 @@ def cmd_approval_request(args: argparse.Namespace) -> int:
 
 
 def cmd_approval_vote(args: argparse.Namespace, approve: bool) -> int:
-    def _build(sender_pubkey, sequence_number):
+    def _build(sender_pubkey, sequence_number, expire_at_height):
         return tx_mod.build_transfer_vote_tx(
             sender_pubkey=sender_pubkey,
             sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
             request_id=args.request_id,
             approve=approve,
             reason=getattr(args, "reason", "") or "",

@@ -369,6 +369,20 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
             current=current_time,
         )
 
+    # The height deadline is checked in full against the tip by
+    # consensus.admission.validate_expire_at_height; this is the structural
+    # half, alongside the other shape checks, so a malformed field is refused
+    # before any state is read.
+    expire_at_height = payload.get('expire_at_height')
+    if not isinstance(expire_at_height, int) or isinstance(expire_at_height, bool):
+        return _qt_err(
+            "INVALID_PARAMS",
+            "Missing or invalid 'expire_at_height': every transaction must name "
+            "the height at which it expires.",
+        )
+    if expire_at_height <= 0:
+        return _qt_err("INVALID_PARAMS", "'expire_at_height' must be a positive block height.")
+
     if 'fee_limit' not in payload:
         return _qt_err("INVALID_PARAMS", "Missing 'fee_limit' in transaction.")
     # All tx types (governance included) must carry a syntactically valid

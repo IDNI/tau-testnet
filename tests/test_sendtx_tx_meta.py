@@ -104,6 +104,7 @@ class TestSendTxTxMeta(unittest.TestCase):
             "sender_pubkey": pk_hex,
             "sequence_number": seq,
             "expiration_time": exp_time,
+            "expire_at_height": 5000,
             "operations": ops,
             "fee_limit": "0",
         }
@@ -135,6 +136,7 @@ class TestSendTxTxMeta(unittest.TestCase):
         tx = {
             "sender_pubkey": GENESIS,
             "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
             "operations": {"1": [[GENESIS, ADDR_A, "1"]]},
             "fee_limit": "0",
             "signature": "SIG"
@@ -150,6 +152,7 @@ class TestSendTxTxMeta(unittest.TestCase):
             "sender_pubkey": GENESIS,
             "sequence_number": chain_state.get_sequence_number(GENESIS),
             "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
             "operations": {"1": [[GENESIS, ADDR_A, "1"]]},
             "fee_limit": "0"
         }

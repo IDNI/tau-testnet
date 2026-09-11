@@ -174,6 +174,7 @@ class TestGhostTxIntegration(unittest.TestCase):
                  "sender_pubkey": "UserRule",
                  "sequence_number": 0,
                  "expiration_time": int(time.time() + 3600),
+                 "expire_at_height": 5000,
                  "operations": {"0": "rule X"}
              })
              db.add_mempool_tx(payload_rule, "hash_rule", 1000)
@@ -197,6 +198,7 @@ class TestGhostTxIntegration(unittest.TestCase):
             "sender_pubkey": "UserBad",
             "sequence_number": 100,
             "expiration_time": int(time.time() + 3600),
+            "expire_at_height": 5000,
             "operations": {"1": [["UserBad", "UserX", "10"]]}
         })
         db.add_mempool_tx(payload_bad, "hash_bad", 2000)
