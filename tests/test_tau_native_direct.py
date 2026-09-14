@@ -16,7 +16,11 @@ class _FakeInterpreter:
     def __init__(self, spec: str):
         self.spec = spec
         self.time_point = 0
+        self.spec_revision = 0
         self.input_names = self._extract_input_names(spec)
+
+    def current_spec(self) -> str:
+        return self.spec
 
     @staticmethod
     def _extract_input_names(spec: str) -> set[str]:
@@ -56,8 +60,8 @@ class _FakeTauModule:
             lhs = interpreter.spec.rstrip(".")
             rhs = i0_value.rstrip(".")
             updated = f"{lhs} && {rhs}."
-            print(f"Updated specification: {updated}")
             interpreter.spec = updated
+            interpreter.spec_revision += 1
             interpreter.input_names = interpreter._extract_input_names(updated)
 
         outputs = {
