@@ -405,3 +405,68 @@ def test_every_vote_field_is_signed():
         assert signing_message_bytes(dict(vote, **{field: tampered})) != base, (
             f"{field} is not covered by the signature"
         )
+
+
+# --- o5/o8 reject-unless-annotated bv[24] -----------------------------------
+
+SCOPE = "i12[t]:bv[384] = { #x" + A + " }:bv[384]"
+
+
+def _scoped(body):
+    return f"always (({SCOPE}) -> ({body}))."
+
+
+def test_bv16_policy_rule_is_refused_at_admission(tip_view):
+    tip_view.approval_slots_active = False
+    result = validate_user_tx_reserved_domains(
+        _user_tx(operations={"0": _scoped("o5[t]:bv[16] = { #x000001 }:bv[16]")}),
+        tip_view,
+    )
+    assert result.is_valid is False
+    assert result.code == "WIDTH_MISMATCH"
+    assert result.details["stream"] == "o5"
+    assert result.details["expected"] == 24
+    assert result.details["found"] == 16
+
+
+def test_untyped_o5_is_refused_at_admission(tip_view):
+    tip_view.approval_slots_active = False
+    result = validate_user_tx_reserved_domains(
+        _user_tx(operations={"0": _scoped("o5[t] = 1")}), tip_view)
+    assert result.is_valid is False
+    assert result.code == "WIDTH_MISMATCH"
+    assert result.details["found"] == "untyped"
+
+
+def test_bv24_scoped_unit_is_admitted(tip_view):
+    tip_view.approval_slots_active = False
+    result = validate_user_tx_reserved_domains(
+        _user_tx(operations={"0": _scoped("o5[t]:bv[24] = { #x000001 }:bv[24]")}),
+        tip_view,
+    )
+    assert result.is_valid is True, result.error
+
+
+def test_o5_named_only_in_a_comment_is_not_a_width_hazard(tip_view):
+    tip_view.approval_slots_active = False
+    result = validate_user_tx_reserved_domains(
+        _user_tx(operations={"0": "always (o13[t]:bv[16] = {1}:bv[16]). # o5[t]:bv[16] = 1"}),
+        tip_view,
+    )
+    assert result.is_valid is True, result.error
+
+
+def test_clause_body_bv16_is_refused_by_routing(tip_view):
+    """Unguarded bodies go through _screen_clause_domains, which now carries
+    the same o5 width screen. A bv[16] clause must not type the interpreter."""
+    rule = ("always ( ( (i1[t]:bv[24] > { #x0003e8 }:bv[24] && "
+            "!(i18[t]:bv[384] = { #x" + AUTH + " }:bv[384])) "
+            "? (o5[t]:bv[16] = { #x000000 }:bv[16]) "
+            ": (o5[t]:bv[16] = { #x000001 }:bv[16]) ) ).")
+    tip_view.clause_for.return_value = None
+    tip_view.clause_author_count.return_value = 0
+    result = validate_user_tx_reserved_domains(_user_tx(operations={"0": rule}), tip_view)
+    assert result.is_valid is False
+    assert result.code == "WIDTH_MISMATCH"
+    assert result.details["stream"] == "o5"
+

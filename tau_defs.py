@@ -43,6 +43,27 @@ FAIL_INVALID_SBF = TAU_VALUE_ZERO
 TRANSFER_VALUE_BV_WIDTH = 24
 MAX_TRANSFER_VALUE = (1 << TRANSFER_VALUE_BV_WIDTH) - 1
 
+# o5 (user policy) and o8 (user custom fee) are the same width as the transfer
+# value streams. Per-stream bitvector typing is process-global and sticky: the
+# first unit that types o5 pins the interpreter, so a later bv[16] clause
+# leaves get_interpreter returning None for everyone. Reject-unless-annotated
+# at admission and apply (consensus/approvals.py::screen_policy_widths).
+# o9 is pinned by the shipped genesis consensus rules; advertised here so
+# wallets stop scraping rule text for widths.
+USER_POLICY_BV_WIDTH = 24
+CUSTOM_FEE_BV_WIDTH = USER_POLICY_BV_WIDTH
+CONSENSUS_FEE_BV_WIDTH = 24
+
+# Frozen constants `getgovernance` returns as `stream_widths`. Not inferred
+# from live spec text — a poisoned chain must not teach wallets the wrong width.
+HOST_STREAM_WIDTHS = {
+    "i1": TRANSFER_VALUE_BV_WIDTH,
+    "i2": TRANSFER_VALUE_BV_WIDTH,
+    "o5": USER_POLICY_BV_WIDTH,
+    "o8": CUSTOM_FEE_BV_WIDTH,
+    "o9": CONSENSUS_FEE_BV_WIDTH,
+}
+
 # --- Transaction expiry ---
 # Every transaction carries `expire_at_height`: the first height at which it is
 # too late to include it. Height is the expiry a proposer cannot lie about --
@@ -95,6 +116,11 @@ TAU_OUTPUT_STREAM_VALIDATION_RESULT = "o1"
 # o1 passes AND (o5 absent OR o5 != 0). A policy block on ANY transfer rejects
 # the WHOLE user_tx (no partial execution). Malformed/unparseable o5 fails
 # closed (parse_tau_output -> 0 -> block).
+#
+# Width: every o5 (and o8) occurrence must be `o5[t]:bv[24]`, and every literal
+# assigned to them must be a bv[24] literal. Untyped `o5[t] = 0` is how a stray
+# width gets inferred process-wide. Screened at admission and hard-rejected at
+# apply (WIDTH_MISMATCH).
 USER_POLICY_STREAM_INDEX = 5
 USER_POLICY_BLOCK_VALUE = 0
 USER_POLICY_ALLOW_VALUE = 1

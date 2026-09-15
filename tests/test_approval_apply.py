@@ -166,13 +166,20 @@ def _apply(txs, lm=None, height=HEIGHT, balances=None, fee=0):
 
     single_calls = []
 
+    persisted = []
+
     def _fake_single(**kwargs):
         single_calls.append(kwargs)
+        text = kwargs.get("rule_text")
+        if text and kwargs.get("apply_rules_update"):
+            persisted.append(str(text).strip())
         return "T"
 
     engine = TauConsensusEngine()
     with patch("tau_manager.communicate_with_tau", side_effect=_fake_single), \
          patch("tau_manager.communicate_with_tau_multi", side_effect=_fake_multi), \
+         patch("chain_state.get_application_rules_state",
+               side_effect=lambda: "\n".join(persisted)), \
          patch("tau_manager.tau_ready") as ready:
         ready.is_set.return_value = True
         result = engine.apply_block(active_view, block_obj, parent_snapshot)

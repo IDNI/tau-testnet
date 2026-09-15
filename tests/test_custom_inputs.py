@@ -233,9 +233,13 @@ class TestCustomInputs(unittest.TestCase):
         
         # Mock communicate_with_tau to return distinct outputs
         self.mock_communicate.side_effect = ["output_rule", "output_custom"]
-        
-        result = engine.apply(snapshot, [tx], 1700000000)
-        
+
+        with patch(
+            "chain_state.get_application_rules_state",
+            return_value="new rule",
+        ):
+            result = engine.apply(snapshot, [tx], 1700000000)
+
         receipt = result.receipts["tx1"]
         logs = receipt["logs"]
         

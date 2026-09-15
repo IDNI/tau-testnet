@@ -27,6 +27,8 @@ from .approvals import (
     TX_TYPE_TRANSFER_VOTE,
     parse_approval_request,
     parse_transfer_vote,
+    screen_policy_widths,
+    screen_unsatisfiable_sender_conjunction,
 )
 from .rule_offers import (
     NEUTRAL_O5_CLAUSE_BODY,
@@ -67,6 +69,34 @@ import tau_manager
 # chain_state will be imported inside methods to avoid circular dependency if chain_state imports this module.
 
 logger = logging.getLogger(__name__)
+
+
+def _application_rule_landed(rule_text: str) -> bool:
+    """True when the preprocessed unit is in the hashed application-rules state.
+
+    `communicate_with_tau(..., apply_rules_update=True)` is supposed to persist
+    via `save_effective_tau_spec`. If the handler did not run, a success string
+    from Tau is a no-op: the spec is unchanged, but a soft fail would still
+    include the tx and charge a fee. Membership here is the honesty check.
+    """
+    import chain_state
+
+    raw = (rule_text or "").strip()
+    if not raw:
+        return False
+    try:
+        unit = chain_state._preprocess_tau_spec_text(raw) or raw
+    except Exception:
+        unit = raw
+    try:
+        app = chain_state.get_application_rules_state() or ""
+    except Exception:
+        return False
+    units = [u.strip() for u in app.split("\n") if u.strip()]
+    if unit in units or raw in units:
+        return True
+    return unit in app or raw in app
+
 
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
@@ -1111,11 +1141,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 False means "not an o5 policy rule, or routing is inactive", and
                 the caller takes the ordinary accumulation path unchanged.
 
-                Mirrors admission.validate_o5_clause_routing; the shapes it
-                refuses are refused here too, as SOFT no-ops so block validity
-                stays a function of the block alone.
+                Mirrors admission.validate_o5_clause_routing. A clause that does
+                not land is hard-rejected: a soft no-op would let a rule-only
+                tx sit in the block, pay the fee, and leave the spec unchanged.
                 """
                 nonlocal accepted_in_block, hard_reject, execution_success
+
+                def _did_not_land(log_msg, reason="rule_not_applied"):
+                    nonlocal accepted_in_block, hard_reject, execution_success
+                    tx_receipt["logs"].append(log_msg)
+                    accepted_in_block = False
+                    hard_reject = True
+                    execution_success = False
+                    tx_receipt["reason"] = reason
 
                 if not approval_slots_on:
                     return False
@@ -1123,8 +1161,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return False
 
                 if not isinstance(sender, str):
-                    tx_receipt["logs"].append("o5 clause ignored (no sender)")
-                    accepted_in_block = False
+                    _did_not_land("o5 clause ignored (no sender)")
                     return True
 
                 offers = lifecycle_mgr.rule_offers
@@ -1137,20 +1174,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 except RuleOfferShapeError as exc:
                     # The commonest case is the OLD guarded form: accumulated
                     # rules must carry an i12 guard, registered clauses must not.
-                    tx_receipt["logs"].append(f"o5 clause ignored ({exc})")
-                    accepted_in_block = False
+                    _did_not_land(f"o5 clause ignored ({exc})")
                     return True
 
                 # Same screen admission runs, so the two paths reject the same
                 # clause bodies. Imported lazily: consensus.admission pulls in
                 # the facade and chain_state, and chain_state imports this
                 # module, so a module-level import would be a cycle.
-                from consensus.admission import _screen_clause_domains
+                from consensus.admission import _screen_clause_domains, _width_mismatch_details
 
                 domain_error = _screen_clause_domains(body)
                 if domain_error:
-                    tx_receipt["logs"].append(f"o5 clause ignored ({domain_error})")
-                    accepted_in_block = False
+                    reason = (
+                        "width_mismatch"
+                        if _width_mismatch_details(domain_error)
+                        else "rule_not_applied"
+                    )
+                    _did_not_land(f"o5 clause ignored ({domain_error})", reason=reason)
                     return True
 
                 key = (sender_n, stream)
@@ -1158,15 +1198,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 registered = key in offers.accepted_clauses
 
                 if revoking and not registered:
-                    tx_receipt["logs"].append(
+                    _did_not_land(
                         "o5 clause revocation ignored (nothing registered)")
-                    accepted_in_block = False
                     return True
                 if not revoking and not registered:
                     if len(offers.clauses_for_stream(stream)) >= MAX_TIER_AUTHORS:
-                        tx_receipt["logs"].append(
+                        _did_not_land(
                             f"o5 clause ignored (registry full: {MAX_TIER_AUTHORS} authors)")
-                        accepted_in_block = False
                         return True
 
                 # A request snapshots its approvers but re-evaluates the CURRENT
@@ -1874,67 +1912,110 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         # composite was fed instead of accumulating the text.
                         pass
                      elif isinstance(rule_op_data, str) and rule_op_data.strip():
-                        try:
+                        rule_text = rule_op_data.strip()
+                        width_error = screen_policy_widths(rule_text)
+                        conj_error = (
+                            None if approval_slots_on
+                            else screen_unsatisfiable_sender_conjunction(rule_text)
+                        )
+                        if (width_error or conj_error) and not replay_mode:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = (
+                                "width_mismatch" if width_error
+                                else "unsatisfiable_sender_conjunction"
+                            )
+                            tx_receipt["logs"].append(
+                                f"Error: {width_error or conj_error}"
+                            )
+                        if execution_success and accepted_in_block and not hard_reject:
+                          try:
                             # Wait for Tau availability logic
                             if not tau_manager.tau_ready.is_set():
                                 tau_manager.tau_ready.wait(timeout=5)
-                            
+
                             if not tau_manager.tau_ready.is_set():
                                 logger.error("Tau process not ready for rule execution")
                                 execution_success = False
                                 tx_receipt["logs"].append("Tau not ready")
-                                # Skip further processing if Tau is down
+                                if not replay_mode:
+                                    accepted_in_block = False
+                                    hard_reject = True
+                                    tx_receipt["reason"] = "rule_not_applied"
                             else:
                                 output = tau_manager.communicate_with_tau(
-                                    rule_text=rule_op_data.strip(), 
+                                    rule_text=rule_text,
                                     target_output_stream_index=0,
                                     apply_rules_update=True # Apply update for consensus
                                 )
-                                
+
                                 tx_receipt["logs"].append(f"Tau(rule) o0: {output}")
 
-                                if "error" in output.lower() and "x1001" not in output.lower():
+                                tau_failed = (
+                                    isinstance(output, str)
+                                    and "error" in output.lower()
+                                    and "x1001" not in output.lower()
+                                )
+                                if tau_failed:
                                     logger.warning("Tau rejected rule: %s", output)
-                                    # A rule Tau cannot parse/compile is
-                                    # structurally invalid and must not be
-                                    # embedded in the block. Hard-reject it,
-                                    # mirroring reserved-stream/bad-format paths,
-                                    # so the "logically valid" count excludes it.
-                                    accepted_in_block = False
-                                    hard_reject = True
                                     execution_success = False
-                                    tx_receipt["logs"].append(f"Error: Tau rejected rule output: {output}")
-
-                                # Persist updated rules state
-                                rules_text = None
-                                try:
-                                    # Try to fetch authoritative state from global tracker (updated by handler)
-                                    val = chain_state.get_rules_state() if hasattr(chain_state, "get_rules_state") else None
-                                    if isinstance(val, str):
-                                        rules_text = val
-                                except Exception:
-                                    pass
-
-                                if rules_text is not None:
-                                    current_tau_bytes = rules_text.encode("utf-8")
+                                    tx_receipt["logs"].append(
+                                        f"Error: Tau rejected rule output: {output}"
+                                    )
+                                    if not replay_mode:
+                                        accepted_in_block = False
+                                        hard_reject = True
+                                        tx_receipt["reason"] = "rule_rejected"
+                                elif not _application_rule_landed(rule_text):
+                                    # Live apply: the handler did not persist, so
+                                    # this is a no-op that must not sit in the
+                                    # block or charge a fee. Replay: TAU_FORCE_TEST
+                                    # and historical blocks do not re-run the
+                                    # handler; application-rules state is restored
+                                    # from the snapshot, so dropping the tx would
+                                    # diverge reconstruction.
+                                    if not replay_mode:
+                                        accepted_in_block = False
+                                        hard_reject = True
+                                        execution_success = False
+                                        tx_receipt["reason"] = "rule_not_applied"
+                                        tx_receipt["logs"].append(
+                                            "Error: rule did not persist to application-rules state"
+                                        )
+                                    else:
+                                        tx_receipt["logs"].append("Rule applied")
                                 else:
-                                    # Fallback
-                                    current_tau_bytes += rule_op_data.encode("utf-8")
-                                tx_receipt["logs"].append("Rule applied")
+                                    rules_text = None
+                                    try:
+                                        val = (
+                                            chain_state.get_application_rules_state()
+                                            if hasattr(chain_state, "get_application_rules_state")
+                                            else None
+                                        )
+                                        if isinstance(val, str):
+                                            rules_text = val
+                                    except Exception:
+                                        pass
 
-                        except Exception as e:
+                                    if rules_text is not None:
+                                        current_tau_bytes = rules_text.encode("utf-8")
+                                    else:
+                                        current_tau_bytes += rule_op_data.encode("utf-8")
+                                    tx_receipt["logs"].append("Rule applied")
+
+                          except Exception as e:
                             logger.error("Error applying rule: %s", e)
                             execution_success = False
                             tx_receipt["logs"].append(f"Error: {e}")
-                            # A deterministic Tau parse/compile failure (the
-                            # native engine emits "(Error)" lines, which bubble
-                            # up in the exception text) means the rule is
-                            # unparseable — hard-reject so it cannot enter the
-                            # block. Other failures (e.g. transient Tau outage)
-                            # stay soft.
-                            if "(error)" in str(e).lower():
+                            # Live apply: a rule that did not land must not sit
+                            # in the block and pay a fee. Replay keeps the
+                            # historical inclusion (only a deterministic Tau
+                            # parse error still hard-rejects, as before).
+                            if not replay_mode or "(error)" in str(e).lower():
                                 accepted_in_block = False
                                 hard_reject = True
+                                tx_receipt["reason"] = "rule_not_applied"
 
                 # --- Step 2 & 3: Unified Custom Inputs & Transfers ---
                 if execution_success and transfers_op_data is not None:

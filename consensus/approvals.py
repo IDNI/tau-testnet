@@ -174,6 +174,133 @@ def screen_slot_widths(body: str) -> Optional[str]:
     return None
 
 
+# --- User-policy / custom-fee width screening (o5, o8) ----------------------
+#
+# Same reject-unless-annotated contract as the approval slots, for the shared
+# application streams. The first unit that types o5 pins the interpreter
+# process-wide; a later bv[16] (or an untyped `o5[t] = 0` that lets the engine
+# infer one) poisons get_interpreter for everyone until restart.
+
+_POLICY_OCCURRENCE_RE = re.compile(r"\bo(\d+)\b")
+_POLICY_TYPED_RE = re.compile(r"\bo(\d+)\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*(\d+)\s*\]")
+_POLICY_ASSIGN_RE = re.compile(r"\s*=\s*")
+_POLICY_BV_LIT_RE = re.compile(r"\s*:\s*bv\s*\[\s*(\d+)\s*\]")
+
+
+def _policy_width_streams() -> set:
+    return {
+        tau_defs.USER_POLICY_STREAM_INDEX,
+        tau_defs.CUSTOM_FEE_STREAM_INDEX,
+    }
+
+
+def _screen_policy_literal(rhs: str, idx: int, width: int) -> Optional[str]:
+    """None when RHS is not a literal, or is a correctly typed bv[width] one."""
+    text = (rhs or "").lstrip()
+    # Skip grouping parens wrapping a literal (`( { #x1 }:bv[24] )`).
+    while text.startswith("("):
+        text = text[1:].lstrip()
+    if not text:
+        return None
+    if text[0].isdigit():
+        return (
+            f"literals assigned to o{idx} must be typed bv[{width}], "
+            f"found a bare integer"
+        )
+    if text[0] != "{":
+        return None
+    close = text.find("}")
+    if close < 0:
+        return (
+            f"literals assigned to o{idx} must be typed bv[{width}], "
+            f"found an untyped literal"
+        )
+    after = text[close + 1:]
+    match = _POLICY_BV_LIT_RE.match(after)
+    if not match:
+        return (
+            f"literals assigned to o{idx} must be typed bv[{width}], "
+            f"found an untyped literal"
+        )
+    found = int(match.group(1))
+    if found != width:
+        return (
+            f"literals assigned to o{idx} must be typed bv[{width}], "
+            f"found bv[{found}]"
+        )
+    return None
+
+
+def screen_policy_widths(text: str) -> Optional[str]:
+    """None when every o5/o8 mention is typed bv[24], else the reason.
+
+    Comment-stripped, word-boundary: `o50` and a stream named only in a comment
+    are not a typing hazard. Untyped `o5[t] = 0` / `1` is refused — that is
+    how a stray width gets inferred. Literals assigned to o5/o8 must themselves
+    be `bv[24]` (`{ #x000001 }:bv[24]`, not `{1}:bv[16]` or bare `1`).
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    scrubbed = strip_clause_comments(text or "")
+    streams = _policy_width_streams()
+    width = tau_defs.USER_POLICY_BV_WIDTH
+    typed_tail = re.compile(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*%d\s*\]" % width)
+
+    for match in _POLICY_TYPED_RE.finditer(scrubbed):
+        idx, w = int(match.group(1)), int(match.group(2))
+        if idx in streams and w != width:
+            return (
+                f"o{idx} must be typed bv[{width}], found bv[{w}]"
+            )
+
+    for match in _POLICY_OCCURRENCE_RE.finditer(scrubbed):
+        idx = int(match.group(1))
+        if idx not in streams:
+            continue
+        tail = scrubbed[match.end():]
+        typed_ok = typed_tail.match(tail)
+        if not typed_ok:
+            return (
+                f"every mention of o{idx} must be written "
+                f"o{idx}[t]:bv[{width}]; an untyped mention lets the engine "
+                f"infer a conflicting width process-wide"
+            )
+        rest = tail[typed_ok.end():]
+        assign = _POLICY_ASSIGN_RE.match(rest)
+        if not assign:
+            continue
+        lit_err = _screen_policy_literal(rest[assign.end():], idx, width)
+        if lit_err:
+            return lit_err
+    return None
+
+
+def screen_unsatisfiable_sender_conjunction(text: str) -> Optional[str]:
+    """Refuse a top-level `i12 = me && …` total-form unit (routing off only).
+
+    That shape is unsatisfiable for every other sender: Tau conjoins every
+    deployed o5 unit, so `always (i12 = A && o5 = 0)` cannot hold when the
+    current sender is not A. Implication (`->`) and ternary (`? :`) are the
+    documented guards and are left alone. Cheap heuristic, not a proof of
+    scoping; unused once o5 is routed into the clause registry.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    scrubbed = strip_clause_comments(text or "")
+    if not re.search(r"\bo5\b", scrubbed):
+        return None
+    if not re.search(r"\bi12\b", scrubbed):
+        return None
+    if "->" in scrubbed or "?" in scrubbed:
+        return None
+    if "&&" not in scrubbed:
+        return None
+    return (
+        "top-level i12 conjunction (i12 = me && …) is unsatisfiable for every "
+        "other sender; guard with -> or ? : instead of &&"
+    )
+
+
 # --- Activation audit -------------------------------------------------------
 
 def audit_stream_collisions(spec_texts) -> List[str]:

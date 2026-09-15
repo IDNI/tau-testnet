@@ -42,7 +42,9 @@ from consensus.approvals import (
     TX_TYPE_TRANSFER_VOTE,
     parse_approval_request,
     parse_transfer_vote,
+    screen_policy_widths,
     screen_slot_widths,
+    screen_unsatisfiable_sender_conjunction,
     validate_request_shape,
 )
 from consensus.governance import (
@@ -131,6 +133,35 @@ class AdmissionResult:
 # Keys the envelope already owns; a details kwarg using one would silently
 # shadow it rather than reach the client (api_response.error_response).
 _RESERVED_DETAIL_KEYS = frozenset({"code", "message"})
+
+
+def _width_mismatch_details(reason: str) -> Optional[Dict]:
+    """Structured WIDTH_MISMATCH payload, or None when `reason` is some other screen."""
+    if not reason:
+        return None
+    if (
+        "must be typed bv[" not in reason
+        and "must be written o" not in reason
+        and "literals assigned to o" not in reason
+    ):
+        return None
+    stream_m = re.search(r"\bo([58])\b", reason)
+    if not stream_m:
+        return None
+    found_m = re.search(r"found bv\[(\d+)\]", reason)
+    return {
+        "stream": f"o{stream_m.group(1)}",
+        "expected": tau_defs.USER_POLICY_BV_WIDTH,
+        "found": int(found_m.group(1)) if found_m else "untyped",
+    }
+
+
+def _admission_from_domain_error(domain_error: str, prefix: str = "") -> AdmissionResult:
+    msg = f"{prefix}{domain_error}" if prefix else domain_error
+    mismatch = _width_mismatch_details(domain_error)
+    if mismatch:
+        return format_error(msg, code="WIDTH_MISMATCH", **mismatch)
+    return format_error(msg)
 
 
 def format_error(msg: str, *, code: str = "TX_REJECTED", **details) -> AdmissionResult:
@@ -318,6 +349,23 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
                 code="UNSCOPED_USER_RULE",
                 stream=policy_out[0],
             )
+
+        # Reject-unless-annotated bv[24] on o5/o8. Per-stream typing is
+        # process-global and sticky; a bv[16] or untyped `o5[t] = 0` pins the
+        # interpreter for everyone. Runs even when the rule is sender-scoped.
+        width_error = screen_policy_widths(rule_text)
+        if width_error:
+            mismatch = _width_mismatch_details(width_error) or {}
+            return format_error(width_error, code="WIDTH_MISMATCH", **mismatch)
+
+        # While o5 still accumulates (approval slots off), a top-level
+        # `i12 = me && …` total-form unit is unsatisfiable for every other
+        # sender. Implication / ternary are the documented guards. Goes away
+        # once routing is on — a registered clause must not carry i12 at all.
+        if not slots_active:
+            conj_error = screen_unsatisfiable_sender_conjunction(rule_text)
+            if conj_error:
+                return format_error(conj_error)
 
     return success()
 
@@ -751,7 +799,7 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
 
     domain_error = _screen_clause_domains(body)
     if domain_error:
-        return format_error(domain_error)
+        return _admission_from_domain_error(domain_error)
 
     # Compose the rule as it WOULD look if the recipient accepted, so an offer
     # that could never be accepted is rejected at the source rather than
@@ -842,6 +890,13 @@ def _screen_clause_domains(body: str) -> Optional[str]:
     slot_error = screen_slot_widths(body)
     if slot_error:
         return "Shared rules: " + slot_error
+
+    # Same contract for o5 itself: an unguarded clause body still types the
+    # shared policy stream, and a bv[16] unit here poisons the interpreter
+    # the same way a raw accumulated one does.
+    policy_error = screen_policy_widths(body)
+    if policy_error:
+        return "Shared rules: " + policy_error
     return None
 
 
@@ -901,7 +956,7 @@ def validate_rule_offer_decision_payload(
 
     domain_error = _screen_clause_domains(body)
     if domain_error:
-        return format_error(domain_error)
+        return _admission_from_domain_error(domain_error)
 
     composite, compose_error = _compose_with_clause(
         tip_view, target_stream, decision.actor_pubkey, body
@@ -985,7 +1040,9 @@ def validate_o5_clause_routing(
 
     domain_error = _screen_clause_domains(body)
     if domain_error:
-        return format_error(f"o5 policy rule rejected: {domain_error}")
+        return _admission_from_domain_error(
+            domain_error, prefix="o5 policy rule rejected: "
+        )
 
     sender = tx.get("sender_pubkey")
     if not isinstance(sender, str):

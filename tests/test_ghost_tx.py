@@ -157,6 +157,7 @@ class TestGhostTxIntegration(unittest.TestCase):
         # However, chain_state is imported both in test and in createblock.
         
         with patch('chain_state.get_rules_state', return_value="rule X"), \
+             patch('chain_state.get_application_rules_state', return_value="rule X"), \
              patch('consensus.engine.TauConsensusEngine.query_eligibility', return_value=True), \
              patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True), \
              patch('consensus.engine.tau_manager.tau_ready.is_set', return_value=True), \

@@ -1,6 +1,7 @@
 import json
 
 import api_response
+import tau_defs
 from consensus.admission import precheck_scheduled_update
 
 
@@ -179,6 +180,7 @@ def execute(raw_command: str, container):
             "archival_update_details": archival_update_details,
             "votes": sorted(votes, key=lambda entry: (entry["update_id"], entry["voter_pubkey"])),
             "lifecycle": lifecycle,
+            "stream_widths": dict(tau_defs.HOST_STREAM_WIDTHS),
         }
 
     return api_response.success_response("getgovernance", payload)

@@ -500,7 +500,7 @@ class TestAdmissionFees(unittest.TestCase):
         return f"always (({self._SCOPE}) -> ({body}))."
 
     def test_benign_rule_text_passes_screen(self):
-        rule = self._scoped("o5[t]:bv[16] = { #x0001 }:bv[16]")
+        rule = self._scoped("o5[t]:bv[24] = { #x000001 }:bv[24]")
         result, _ = self.queue(self.payload(operations={"0": rule}))
         self.assertTrue(result["ok"], msg=f"benign rule rejected: {result}")
 
