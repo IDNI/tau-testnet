@@ -1,12 +1,9 @@
-import ctypes
 import json
 import logging
 import os
 import re
 import subprocess
-import tempfile
 import sys
-import threading
 from collections import deque
 
 from errors import TauEngineBug, TauEngineCrash
@@ -127,148 +124,38 @@ def load_tau_module():
             logger.error("Could not find native tau module in candidates or PYTHONPATH")
             raise ImportError("Native tau module not found. Ensure tau-lang is built and accessible.")
 
-# FD 1 is process-global, so StdOutCapture's save/redirect/restore cycle is a
-# process-wide critical section: two threads inside it at once leak each other's
-# pipe write end into the saved fd, which ends with stdout wired to a closed pipe
-# ("[Errno 9] Bad file descriptor" out of the next native call) or a reader
-# blocking forever on a pipe whose write end still lives on fd 1. Reentrant so a
-# nested capture on the same thread (e.g. interpreter rebuild inside a step)
-# still works. This is a safety net for engine entries that do NOT go through
-# `tau_manager.tau_comm_lock` (interpreter construction, update_spec); the
-# whole-call serialization that keeps the stateful interpreter coherent lives in
-# tau_manager.
-_stdout_capture_lock = threading.RLock()
-
-
-class StdOutCapture:
-    """
-    Context manager to capture C-level stdout AND stderr output.
-    Required because nanobind/C++ prints directly to file descriptors,
-    bypassing sys.stdout / sys.stderr.
-
-    Both fds matter: the native engine routes its `(Error)` diagnostics to
-    fd 2, so a capture of fd 1 alone silently loses every engine error and
-    makes the rule-validation gates no-ops. `output` is the concatenation of
-    both streams so callers can screen it with `tau_reports_error()`.
-
-    Backed by temp files rather than pipes: a pipe's ~64 KiB kernel buffer
-    deadlocks the engine mid-call as soon as it prints a large normalized
-    spec, because nothing drains the read end until __exit__.
-
-    Mutually exclusive across threads: `__enter__` holds `_stdout_capture_lock`
-    until `__exit__`. Only usable as a context manager -- the fd bookkeeping is
-    set up in `__enter__`, not in `__init__`, so it stays inside the lock.
-    """
-
-    # (fd, attribute holding the captured text)
-    _CAPTURED_FDS = ((1, "stdout_output"), (2, "stderr_output"))
-
-    def __init__(self):
-        # FD 1/2 are used directly because C++ std::cout / boost::log write to
-        # them regardless of any sys.stdout redirection by pytest/CaptureIO.
-        self._saved = {}   # fd -> dup'd original fd
-        self._files = {}   # fd -> temp file object
-        self.output = ""
-        self.stdout_output = ""
-        self.stderr_output = ""
-
-        # Load C standard library for flushing
-        try:
-            self.libc = ctypes.CDLL(None)
-        except Exception:
-            self.libc = None
-
-    def _flush_all(self):
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-            except Exception:
-                pass
-        if self.libc:
-            self.libc.fflush(None)
-
-    def __enter__(self):
-        _stdout_capture_lock.acquire()
-        try:
-            self._flush_all()
-            for fd, _attr in self._CAPTURED_FDS:
-                tmp = tempfile.TemporaryFile(mode="w+b")
-                self._files[fd] = tmp
-                self._saved[fd] = os.dup(fd)
-                os.dup2(tmp.fileno(), fd)
-        except BaseException:
-            # Never hold the lock if the redirect never took effect.
-            self._restore_and_close()
-            _stdout_capture_lock.release()
-            raise
-        return self
-
-    def _restore_and_close(self):
-        for fd, _attr in self._CAPTURED_FDS:
-            saved = self._saved.pop(fd, None)
-            if saved is not None:
-                try:
-                    os.dup2(saved, fd)
-                except OSError:
-                    pass
-                try:
-                    os.close(saved)
-                except OSError:
-                    pass
-            tmp = self._files.pop(fd, None)
-            if tmp is not None:
-                try:
-                    tmp.close()
-                except OSError:
-                    pass
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            self._flush_all()
-            texts = []
-            for fd, attr in self._CAPTURED_FDS:
-                text = ""
-                tmp = self._files.get(fd)
-                saved = self._saved.get(fd)
-                if tmp is not None:
-                    try:
-                        # Restore first so any read error still leaves the fd sane.
-                        if saved is not None:
-                            os.dup2(saved, fd)
-                        tmp.seek(0)
-                        text = tmp.read().decode("utf-8", errors="replace")
-                    except Exception:
-                        text = ""
-                setattr(self, attr, text)
-                texts.append(text)
-            self.output = "".join(texts)
-        finally:
-            self._restore_and_close()
-            _stdout_capture_lock.release()
-
-
-# The native engine ALWAYS ANSI-colours its severity marker (see tau-lang
-# src/logging.h: `"(" << LOG_ERROR_COLOR << "Error" << TC.CLEAR() << ") "`),
-# so a literal `"(Error)" in output` screen never matches and every rule
-# validation gate built on it silently passes. Match the marker with the
-# escape sequences allowed anywhere inside it.
-_TAU_ERROR_RE = re.compile(r"\(\s*(?:\x1b\[[0-9;]*m)*\s*Error\s*(?:\x1b\[[0-9;]*m)*\s*\)")
-
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def strip_ansi(text) -> str:
-    """Drop ANSI colour escapes so captured engine output is greppable."""
-    if not text:
+def report_errors(report) -> str:
+    """Join a tau report's error messages into one plain-text line."""
+    if report is None:
         return ""
-    return _ANSI_ESCAPE_RE.sub("", str(text))
+    return "; ".join(s for s in (m.strip() for m in report.errors) if s)
 
 
-def tau_reports_error(text) -> bool:
-    """True when captured native output carries an engine `(Error)` marker."""
-    if not text:
-        return False
-    return bool(_TAU_ERROR_RE.search(str(text)))
+def _no_outputs_reason(report) -> str:
+    """Why a step loop ended without outputs, for the TauEngineBug message."""
+    if report is None:
+        return "no step was attempted"
+    if report.awaiting_input:
+        return "still awaiting input after 100 iterations"
+    return "engine produced no outputs and reported no error"
+
+
+def log_report(report, context: str) -> None:
+    """Record a tau report's diagnostics in the rolling IO log (crash dumps).
+
+    Replaces the old capture-and-reprint of engine stdout: errors and warnings
+    always, the chattier infos only under TAU_DEBUG_STEP_IO.
+    """
+    if report is None:
+        return
+    severities = [("ERROR", report.errors), ("WARN", report.warnings)]
+    if _step_io_debug_enabled():
+        severities.append(("INFO", report.infos))
+    for severity, messages in severities:
+        for message in messages:
+            text = message.strip()
+            if text:
+                tau_io_logger.log_native_stdout(f"[{context}] {severity}: {text}")
 
 
 class TauInterface:
@@ -451,17 +338,22 @@ class TauInterface:
     def _build_interpreter_from_spec(self, spec_text: str, *, reason: str):
         mem_before = get_memory_rss_mb()
         prepared = self.preprocess_spec_text(spec_text)
-        interpreter = self.tau.get_interpreter(prepared)
+        built = self.tau.get_interpreter(prepared)
         mem_after = get_memory_rss_mb()
         logger.debug(f"[MEM] _build_interpreter_from_spec ({reason}): {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
-        
-        if interpreter is None:
+
+        log_report(built.report, f"get_interpreter ({reason})")
+        if not built:
+            detail = report_errors(built.report)
             msg = f"Failed to create Tau interpreter ({reason})."
+            if detail:
+                msg = f"{msg} {detail}"
             filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
             if filepath:
                  logger.error(f"Dumped Tau crash log to {filepath}")
             raise TauEngineCrash(msg)
         self.accumulated_spec = prepared
+        interpreter = built.value
         self._last_spec_revision = interpreter.spec_revision
         return interpreter
 
@@ -547,9 +439,9 @@ class TauInterface:
             normalized_rule_text = self._normalize_assignment_value(rule_text, allow_hex_literal=False)
 
         # We must loop to provide inputs since Tau asks for them lazily.
-        captured_output = ""
+        step_report = None
         outputs = None
-        
+
         for _ in range(100):
             required_inputs = self.tau.get_inputs_for_step(self.interpreter)
             input_assignments = {}
@@ -595,37 +487,34 @@ class TauInterface:
                      else:
                          logger.debug(f"  {k.name}: {COLOR_GREEN}{val_str}{COLOR_RESET}")
 
-            try:
-                mem_before = get_memory_rss_mb()
-                with StdOutCapture() as capture:
-                    outputs = self.tau.step(self.interpreter, input_assignments)
-                mem_after = get_memory_rss_mb()
-                if _step_io_debug_enabled():
-                    logger.debug(f"[MEM] tau.step: {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
-                captured_output += capture.output
-            except Exception as e:
-                raise e
+            mem_before = get_memory_rss_mb()
+            stepped = self.tau.step(self.interpreter, input_assignments)
+            mem_after = get_memory_rss_mb()
+            if _step_io_debug_enabled():
+                logger.debug(f"[MEM] tau.step: {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
+
+            step_report = stepped.report
+            log_report(step_report, "step")
+            outputs = stepped.value
 
             if outputs is not None:
                 break # We have outputs, step is fully finished
-                
-            if tau_reports_error(capture.output):
+
+            if step_report.has_error:
                 break # Native engine reported a parsing/logic error, don't loop forever
 
-        # Re-print accumulated captured output to real stdout so logs are visible
-        if captured_output:
-            print(captured_output, end='')
-            tau_io_logger.log_native_stdout(captured_output)
-            
-            if tau_reports_error(captured_output):
-                msg = f"Tau native step reported an error: {captured_output.strip()}"
-                filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
-                if filepath:
-                     logger.error(f"Dumped Tau crash log to {filepath}")
-                raise TauEngineBug(msg)
+            if not step_report.awaiting_input:
+                break # Nothing further to step: a clean stop, not a failure
+
+        if step_report is not None and step_report.has_error:
+            msg = f"Tau native step reported an error: {report_errors(step_report)}"
+            filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
+            if filepath:
+                 logger.error(f"Dumped Tau crash log to {filepath}")
+            raise TauEngineBug(msg)
 
         if outputs is None:
-            msg = "Tau step failed (returned None after 100 iterations)"
+            msg = f"Tau step failed ({_no_outputs_reason(step_report)})"
             filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
             if filepath:
                  logger.error(f"Dumped Tau crash log to {filepath}")
@@ -728,7 +617,7 @@ class TauInterface:
         if rule_text is not None:
             normalized_rule_text = self._normalize_assignment_value(rule_text, allow_hex_literal=False)
 
-        captured_output = ""
+        step_report = None
         outputs = None
 
         for _ in range(100):
@@ -752,37 +641,34 @@ class TauInterface:
                 input_assignments[input_obj] = value_to_assign
                 tau_io_logger.log_native_input(name, value_to_assign)
 
-            try:
-                mem_before = get_memory_rss_mb()
-                with StdOutCapture() as capture:
-                    outputs = self.tau.step(self.interpreter, input_assignments)
-                mem_after = get_memory_rss_mb()
-                if _step_io_debug_enabled():
-                    logger.debug(f"[MEM] tau.step (multi): {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
-                captured_output += capture.output
-            except Exception as e:
-                raise e
+            mem_before = get_memory_rss_mb()
+            stepped = self.tau.step(self.interpreter, input_assignments)
+            mem_after = get_memory_rss_mb()
+            if _step_io_debug_enabled():
+                logger.debug(f"[MEM] tau.step (multi): {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
+
+            step_report = stepped.report
+            log_report(step_report, "step (multi)")
+            outputs = stepped.value
 
             if outputs is not None:
                 break
 
-            if tau_reports_error(capture.output):
+            if step_report.has_error:
                 break
 
-        # Re-print captured output for log visibility
-        if captured_output:
-            print(captured_output, end='')
-            tau_io_logger.log_native_stdout(captured_output)
+            if not step_report.awaiting_input:
+                break # Clean stop: the spec asked not to continue
 
-            if tau_reports_error(captured_output):
-                msg = f"Tau native step reported an error: {captured_output.strip()}"
-                filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
-                if filepath:
-                    logger.error(f"Dumped Tau crash log to {filepath}")
-                raise TauEngineBug(msg)
+        if step_report is not None and step_report.has_error:
+            msg = f"Tau native step reported an error: {report_errors(step_report)}"
+            filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
+            if filepath:
+                logger.error(f"Dumped Tau crash log to {filepath}")
+            raise TauEngineBug(msg)
 
         if outputs is None:
-            msg = "Tau step failed (returned None after 100 iterations)"
+            msg = f"Tau step failed ({_no_outputs_reason(step_report)})"
             filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
             if filepath:
                 logger.error(f"Dumped Tau crash log to {filepath}")
@@ -878,20 +764,18 @@ class TauInterface:
             return None
 
         try:
-            with StdOutCapture() as init_capture:
-                interpreter = tau_module.get_interpreter(seed_spec)
+            built = tau_module.get_interpreter(seed_spec)
         except Exception as e:
             return f"Failed to construct staging Tau interpreter: {e}"
 
-        if interpreter is None:
-            err = (init_capture.output or "").strip()
+        if not built:
+            err = report_errors(built.report)
             return (
                 f"Failed to construct staging Tau interpreter from current consensus rules: {err}"
                 if err
                 else "Failed to construct staging Tau interpreter from current consensus rules."
             )
-        if tau_reports_error(init_capture.output):
-            return f"Tau staging compile error: {init_capture.output.strip()}"
+        interpreter = built.value
 
         # Replay the remaining accumulated units (joined via i0 -> u like the
         # live interpreter), then the candidate revisions, through i0.
@@ -902,28 +786,19 @@ class TauInterface:
 
             prepared_rev = cls._normalize_assignment_value(rev, allow_hex_literal=False)
 
-            captured_output = ""
             outputs = None
             rev_consumed = False
+            step_report = None
 
             # Bounded lazy-prompt loop matching communicate()'s shape: keep
             # feeding required inputs (rev for the first i0, fallbacks for
             # everything else) until tau.step yields outputs or we hit the
-            # iteration cap. An engine error marker short-circuits.
-            #
-            # `get_inputs_for_step` is captured too: the engine defers type
-            # errors to the *next* prompt, so a bv-width conflict introduced by
-            # `rev` surfaces there rather than out of `step`.
+            # iteration cap. A reported error short-circuits.
             for _ in range(100):
                 try:
-                    with StdOutCapture() as prompt_capture:
-                        required_inputs = tau_module.get_inputs_for_step(interpreter)
-                    captured_output += prompt_capture.output
+                    required_inputs = tau_module.get_inputs_for_step(interpreter)
                 except Exception as e:
                     return f"Tau staging compile error: {e}"
-
-                if tau_reports_error(prompt_capture.output):
-                    return f"Tau staging compile error: {prompt_capture.output.strip()}"
 
                 assignments = {}
                 consumed_this_iteration = False
@@ -937,42 +812,35 @@ class TauInterface:
                         assignments[input_obj] = cls._fallback_value_for_stream(name)
 
                 try:
-                    with StdOutCapture() as capture:
-                        outputs = tau_module.step(interpreter, assignments)
-                    captured_output += capture.output
+                    stepped = tau_module.step(interpreter, assignments)
                 except Exception as e:
                     return f"Tau staging compile error: {e}"
 
-                if tau_reports_error(capture.output):
-                    return f"Tau staging compile error: {capture.output.strip()}"
+                step_report = stepped.report
+                if step_report.has_error:
+                    return f"Tau staging compile error: {report_errors(step_report)}"
 
+                outputs = stepped.value
                 if outputs is not None:
                     break
 
                 if consumed_this_iteration:
                     # The engine refused the revision itself: it returned no
-                    # outputs for the very step that fed it. Continuing would
-                    # re-prompt i0, feed the benign "F" fallback, succeed, and
-                    # report the malformed rule as clean.
-                    detail = strip_ansi(captured_output).strip()
-                    return (
-                        f"Tau staging compile error: engine rejected revision: {detail}"
-                        if detail
-                        else "Tau staging compile error: engine rejected revision (no outputs)"
-                    )
+                    # outputs for the very step that fed it, and no error to
+                    # explain why. Continuing would re-prompt i0, feed the
+                    # benign "F" fallback, succeed, and report the malformed
+                    # rule as clean.
+                    return "Tau staging compile error: engine rejected revision (no outputs)"
 
-            if tau_reports_error(captured_output):
-                return f"Tau staging compile error: {captured_output.strip()}"
+                if not step_report.awaiting_input:
+                    break # Clean stop: nothing further to step for this revision
 
-        # Drain one more prompt so a type error deferred past the final
-        # revision's step still surfaces instead of going unobserved.
+        # Drain one more prompt so the engine normalizes past the final
+        # revision before the staging interpreter is dropped.
         try:
-            with StdOutCapture() as tail_capture:
-                tau_module.get_inputs_for_step(interpreter)
+            tau_module.get_inputs_for_step(interpreter)
         except Exception as e:
             return f"Tau staging compile error: {e}"
-        if tau_reports_error(tail_capture.output):
-            return f"Tau staging compile error: {tail_capture.output.strip()}"
 
         # `interpreter` falls out of scope here and is reclaimed; no live state touched.
         return None

@@ -1,107 +1,34 @@
 """Regression tests for native-engine serialization.
 
-`tau_native.StdOutCapture` dups and closes FD 1 to capture the C++-level stdout
-of the nanobind engine, so two threads inside the engine at once corrupt each
-other's capture: FD 1 ends up wired to a closed pipe (the next native call dies
-with "[Errno 9] Bad file descriptor", surfaced as
-`TX_REJECTED: ... Direct Tau multi-output communication failed`) or a reader
-blocks forever on a pipe whose write end still lives on FD 1.
+The interpreter is stateful and process-global, so two threads inside it at
+once interleave their inputs into one evaluation. That happened for real
+whenever an admission-path `sendtx` (`commands/sendtx.py` ->
+`communicate_with_tau_multi`) overlapped a `createblock` on the block-producer
+thread -- even with a single serial submitter, because the producer runs on its
+own thread. Dropped transactions then desynced the sender's sequence, cascading
+into INVALID_SEQUENCE.
 
-That happened for real whenever an admission-path `sendtx`
-(`commands/sendtx.py` -> `communicate_with_tau_multi`) overlapped a
-`createblock` on the block-producer thread -- even with a single serial
-submitter, because the producer runs on its own thread. Dropped transactions
-then desynced the sender's sequence, cascading into INVALID_SEQUENCE.
-
-Two layers are asserted here:
-  * `tau_manager.tau_comm_lock` (reentrant) serializes whole evaluations, which
-    is what the *stateful* interpreter needs -- StdOutCapture is entered once
-    per `tau.step`, so capture-level locking alone would still let a second
-    thread interleave inputs between steps of one evaluation.
-  * `tau_native._stdout_capture_lock` protects FD 1 for engine entries that do
-    not go through tau_manager (interpreter construction, `update_spec`).
+`tau_manager.tau_comm_lock` (reentrant) serializes whole evaluations, which is
+what the stateful interpreter needs: locking a single `tau.step` would still
+let a second thread interleave inputs between steps of one evaluation.
 """
 
-import errno
 import hashlib
 import json
-import os
 import threading
 import time
 from unittest.mock import patch
 
-import pytest
 from py_ecc.bls import G2Basic as bls
 
 import chain_state
-import config
-import db
 import tau_manager
-import tau_native
 from commands import createblock, sendtx
 from commands.sendtx import _get_signing_message_bytes
 
 
 # --------------------------------------------------------------------------
-# Layer 1: StdOutCapture must be mutually exclusive (real file descriptors).
-# --------------------------------------------------------------------------
-
-def test_stdout_capture_serializes_across_threads():
-    """Concurrent captures keep their own output and leave FD 1 intact.
-
-    Pre-fix this hangs (a thread blocks reading a pipe whose write end leaked
-    onto FD 1) or reports foreign/empty output.
-    """
-    real_stdout = os.dup(1)
-    before = os.fstat(real_stdout)
-    errors: list[str] = []
-    n_threads, rounds = 6, 25
-
-    def worker(tid: int) -> None:
-        for r in range(rounds):
-            marker = f"T{tid}R{r}"
-            try:
-                with tau_native.StdOutCapture() as cap:
-                    os.write(1, marker.encode())
-            except Exception as exc:  # pragma: no cover - only on regression
-                errors.append(f"{marker}: {type(exc).__name__}: {exc}")
-                continue
-            if cap.output != marker:
-                errors.append(f"{marker}: captured {cap.output!r}")
-
-    threads = [threading.Thread(target=worker, args=(i,), daemon=True)
-               for i in range(n_threads)]
-    try:
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=60)
-        # daemon threads: a regression leaves one blocked in the pipe read
-        # instead of hanging the whole suite.
-        assert not any(t.is_alive() for t in threads), "StdOutCapture deadlocked"
-        assert errors == [], f"captures interfered: {errors[:5]}"
-
-        after = os.fstat(1)
-        assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino), \
-            "FD 1 was not restored to the original stdout"
-        os.write(1, b"")  # would raise EBADF/EPIPE on a corrupted FD 1
-    finally:
-        os.close(real_stdout)
-
-
-def test_stdout_capture_is_reentrant_on_one_thread():
-    """A nested capture (interpreter rebuild inside a step) must not self-deadlock."""
-    with tau_native.StdOutCapture() as outer:
-        os.write(1, b"outer-a")
-        with tau_native.StdOutCapture() as inner:
-            os.write(1, b"inner")
-        os.write(1, b"outer-b")
-    assert inner.output == "inner"
-    assert outer.output == "outer-aouter-b"
-
-
-# --------------------------------------------------------------------------
-# Layer 2: tau_manager serializes whole evaluations.
+# tau_manager serializes whole evaluations.
 # --------------------------------------------------------------------------
 
 # `FakeEngine` and the `fake_engine` / `node_state` fixtures live in
@@ -253,9 +180,8 @@ def test_concurrent_sendtx_and_createblock(node_state):
 
     Before the fix the two threads collided inside the native engine and
     admission returned
-    `TX_REJECTED: ... Direct Tau multi-output communication failed:
-    [Errno 9] Bad file descriptor`, dropping a valid tx (and desyncing the
-    sender's sequence for every later one).
+    `TX_REJECTED: ... Direct Tau multi-output communication failed`, dropping a
+    valid tx (and desyncing the sender's sequence for every later one).
     """
     engine = node_state
     n_senders = 6

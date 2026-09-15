@@ -607,9 +607,7 @@ def communicate_with_tau_multi(
     # the rule-exec path in apply_block nests) -- tau_comm_lock is now an RLock,
     # so nesting is safe and the admission path (commands/sendtx.py) no longer
     # races the block producer inside the native engine. Two threads in
-    # `tau.step` at once corrupt each other's StdOutCapture fd-1 redirect
-    # ("[Errno 9] Bad file descriptor" -> valid txs rejected, sender sequence
-    # then drifts) and interleave inputs into the one stateful interpreter.
+    # `tau.step` at once interleave inputs into the one stateful interpreter.
     # Acquire BEFORE _write_status so queueing time is not charged to the
     # watchdog's in-flight comm window (config.COMM_TIMEOUT).
     tau_comm_lock.acquire()
@@ -788,9 +786,7 @@ def kill_tau_process():
     Deliberately does NOT take tau_comm_lock: an evaluation that hung inside the
     engine still holds it, and recovery must not queue behind it (the external
     watchdog SIGKILLs the process on COMM_TIMEOUT, but in-process callers --
-    server.py's shutdown path -- would block). FD-1 safety across the concurrent
-    interpreter construction comes from `tau_native._stdout_capture_lock`, whose
-    critical section is one `tau.step` and therefore always short.
+    server.py's shutdown path -- would block).
     """
     global tau_ready, tau_process_ready, tau_direct_interface, restart_in_progress
     logger.warning("Resetting direct Tau interface after failure.")

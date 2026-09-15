@@ -5,12 +5,10 @@ on. All four were empirically discovered; none was previously covered, and the
 first one is a live latent bug in the `o5` user-policy convention documented in
 `tau_defs.py`.
 
-1. ERROR DETECTION. The engine routes `(Error)` diagnostics to **fd 2** and
-   ANSI-colours the marker (`tau-lang src/logging.h` renders
-   `"(" << LOG_ERROR_COLOR << "Error" << TC.CLEAR() << ") "`). A capture of
-   fd 1 screened with a literal `"(Error)"` substring test therefore sees
-   nothing, and every rule-validation gate built on it silently passes. Covered
-   here unmocked, unlike `test_invalid_rule_regression.py` which stubs the
+1. ERROR DETECTION. The compile gate reads the structured `report` each
+   `get_interpreter` / `step` returns, so a malformed rule is rejected on the
+   reported error rather than on a substring of printed output. Covered here
+   unmocked, unlike `test_invalid_rule_regression.py` which stubs the
    subprocess out.
 
 2. IMPLICATION GUARDS DO NOT ISOLATE USERS. An output stream that no clause
@@ -123,7 +121,9 @@ def sender_step(iface, pk, amount=AMOUNT):
 
 
 def emit(obj):
-    print(SENTINEL + json.dumps(obj))
+    # Leading newline: the engine writes to fd 1 directly and can leave a
+    # partial line, which would otherwise swallow the sentinel's line start.
+    print("\n" + SENTINEL + json.dumps(obj))
     sys.stdout.flush()
     # The native engine segfaults on interpreter teardown (known pre-existing
     # flaky crash). The result above is already computed; hard-exit before any
@@ -142,8 +142,9 @@ def _run_child(tmp_path, name, body):
         timeout=300,
     )
     line = next((l for l in proc.stdout.splitlines()
-                 if l.startswith("SPIKE_RESULT ")), None)
-    parsed = json.loads(line[len("SPIKE_RESULT "):]) if line else None
+                 if "SPIKE_RESULT " in l), None)
+    parsed = (json.loads(line[line.index("SPIKE_RESULT ") + len("SPIKE_RESULT "):])
+              if line else None)
     return proc, parsed
 
 
@@ -157,16 +158,16 @@ def _assert_ok(proc, parsed):
 
 
 # ---------------------------------------------------------------------------
-# 1. Error detection (the fd-2 + ANSI bug)
+# 1. Error detection (the structured report)
 # ---------------------------------------------------------------------------
 
 @requires_native
 def test_engine_error_marker_is_detected(tmp_path):
     """A malformed rule must be REJECTED by the isolated compile gate.
 
-    Before the fd-2/ANSI fix this returned None (clean) for every case below,
-    so invalid rules were admitted, charged fees, and appended to the persisted
-    application-rules state.
+    When the gate misses the engine's error it returns None (clean) for every
+    case below, so invalid rules are admitted, charged fees, and appended to
+    the persisted application-rules state.
     """
     proc, parsed = _run_child(tmp_path, "err_marker", r'''
 ACCUM = ("always ( " + ROUTER + " ).\n"
@@ -183,26 +184,33 @@ for name, rule in cases.items():
         r = tau_native.TauInterface.compile_revisions_isolated(ACCUM, [rule])
     except Exception as e:
         r = "EXC: %s: %s" % (type(e).__name__, e)
-    res[name] = tau_native.strip_ansi(r) if r else None
+    res[name] = r if r else None
 emit(res)
 ''')
     _assert_ok(proc, parsed)
 
     assert parsed["garbage"], "malformed rule was silently accepted by the compile gate"
-    assert "Error" in parsed["garbage"] or "rejected" in parsed["garbage"]
+    assert "compile error" in parsed["garbage"] or "rejected" in parsed["garbage"]
     assert parsed["width_clash"], "bv-width conflict was silently accepted"
     assert parsed["valid"] is None, f"valid rule wrongly rejected: {parsed['valid']}"
 
 
-def test_error_marker_regex_tolerates_ansi():
-    """Pure unit check on the marker screen -- no engine needed."""
+class _FakeReport:
+    def __init__(self, errors):
+        self.errors = errors
+
+
+def test_report_errors_flattens():
+    """Pure unit check on the report reader -- no engine needed.
+
+    The binding renders report.errors without colour, so this only has to
+    join and drop blanks.
+    """
     import tau_native
-    coloured = "(\x1b[31;1mError\x1b[0m) [tau] Syntax Error: boom"
-    assert tau_native.tau_reports_error(coloured)
-    assert tau_native.tau_reports_error("(Error) plain")
-    assert not tau_native.tau_reports_error("Temporal normalization reached fixpoint")
-    assert not tau_native.tau_reports_error("")
-    assert tau_native.strip_ansi(coloured).startswith("(Error)")
+    report = _FakeReport(["Syntax Error: boom", "  ", "second"])
+    assert tau_native.report_errors(report) == "Syntax Error: boom; second"
+    assert tau_native.report_errors(_FakeReport([])) == ""
+    assert tau_native.report_errors(None) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -266,10 +274,9 @@ def total(pk, val):
 tau_mod = tau_native.load_tau_module()
 spec = ("always ( (" + BASE + ") && " + total(A, "000000")
         + " && " + total(B, "000000") + " ).")
-with tau_native.StdOutCapture() as cap:
-    built = tau_mod.get_interpreter(tau_native.TauInterface.preprocess_spec_text(spec))
-res["conjoined_built"] = built is not None
-res["conjoined_err"] = tau_native.strip_ansi(cap.output)[:400]
+built = tau_mod.get_interpreter(tau_native.TauInterface.preprocess_spec_text(spec))
+res["conjoined_built"] = bool(built)
+res["conjoined_err"] = tau_native.report_errors(built.report)[:400]
 
 # (b) Applied sequentially through i0: does A's own clause survive B's?
 iface = new_iface()
@@ -318,10 +325,9 @@ composite = ("(" + guard(A) + " ? " + o5("000000")
 # (a) Conjoined build.
 tau_mod = tau_native.load_tau_module()
 spec = "always ( (" + BASE + ") && " + composite + " )."
-with tau_native.StdOutCapture() as cap:
-    built = tau_mod.get_interpreter(tau_native.TauInterface.preprocess_spec_text(spec))
-res["conjoined_built"] = built is not None
-res["conjoined_err"] = tau_native.strip_ansi(cap.output)[:300]
+built = tau_mod.get_interpreter(tau_native.TauInterface.preprocess_spec_text(spec))
+res["conjoined_built"] = bool(built)
+res["conjoined_err"] = tau_native.report_errors(built.report)[:300]
 
 # (b) Sequential i0 application -- the path a live node and a replaying node
 #     both take.
