@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 # -> reorg_to.
 #
 # This is the OUTERMOST application lock. Order is
-#   _chain_lock -> tau_comm_lock -> _stdout_capture_lock
+#   _chain_lock -> tau_comm_lock
 #   _chain_lock -> _balance_lock -> _sequence_lock -> _rules_lock -> _db_lock
 # Never acquire it below tau_comm_lock, and never add it to the Tau
 # restore/replay path: a producer holding it can block on `tau_ready`, so a
@@ -1886,17 +1886,17 @@ def tick_governance(height: int):
         return
 
     # Route every activated revision through `i0` in declaration order. The
-    # genesis routing emits `Updated specification:` and tau_native rebuilds
-    # the interpreter, so the live spec advances exactly like user_tx ops['0']
-    # application-rule changes.
+    # genesis routing bumps the interpreter's spec revision and tau_native
+    # rebuilds from `current_spec()`, so the live spec advances exactly like
+    # user_tx ops['0'] application-rule changes.
     #
     # Activation revisions intentionally do NOT trigger the rules-handler
     # (`apply_rules_update=False`): consensus provenance is updated via the
     # deterministic `"\n".join(rule_revisions)` tag written into
-    # `_consensus_rules_state` below, not via the live spec extracted from
-    # stdout. Letting the handler fire would briefly write a partially-
-    # stripped intermediate into `_application_rules_state` and persist a
-    # polluted `full_tau_spec` to the DB.
+    # `_consensus_rules_state` below, not via the live spec. Letting the
+    # handler fire would briefly write a partially-stripped intermediate into
+    # `_application_rules_state` and persist a polluted `full_tau_spec` to the
+    # DB.
     import tau_manager
     for update in newly_active:
         logger.info("Governance activated consensus update: %s", update.update_id_hex)

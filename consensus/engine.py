@@ -679,18 +679,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         next_active_consensus_id = parent_snapshot.metadata.get("active_consensus_id", "")
         if newly_active:
             # Route every activated revision through `i0` in declaration order.
-            # The genesis `i0 -> u` routing emits an `Updated specification:`
-            # marker on stdout and tau_native rebuilds the interpreter from
-            # that output, so the live spec advances exactly the same way it
-            # does for user_tx ops['0'] application-rule changes.
+            # The genesis `i0 -> u` routing bumps the interpreter's spec
+            # revision and tau_native rebuilds from `current_spec()`, so the
+            # live spec advances exactly the same way it does for user_tx
+            # ops['0'] application-rule changes.
             #
             # Activation revisions intentionally do NOT trigger the
             # rules-handler (`apply_rules_update=False`): consensus provenance
             # is updated via the deterministic `"\n".join(rule_revisions)` tag
             # written into `next_snapshot.metadata["consensus_rules_state"]`
-            # below, not via the live spec extracted from stdout. Letting the
-            # handler fire here would briefly write a partially-stripped
-            # intermediate into `_application_rules_state` (the old consensus
+            # below, not via the live spec. Letting the handler fire here would
+            # briefly write a partially-stripped intermediate into
+            # `_application_rules_state` (the old consensus
             # prefix no longer matches the post-revision spec) and persist a
             # polluted `full_tau_spec` to the DB before the snapshot commit
             # overwrites it.

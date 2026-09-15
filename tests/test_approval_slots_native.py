@@ -180,7 +180,9 @@ def step(iface, sender, amount, slots=None):
 
 
 def emit(obj):
-    print(SENTINEL + json.dumps(obj))
+    # Leading newline: the engine writes to fd 1 directly and can leave a
+    # partial line, which would otherwise swallow the sentinel's line start.
+    print("\n" + SENTINEL + json.dumps(obj))
     sys.stdout.flush()
     # The engine segfaults on interpreter teardown (known, pre-existing). The
     # result is already computed; hard-exit before any destructor runs so the
@@ -201,9 +203,9 @@ def _run_child(tmp_path, name, body, timeout=600):
         capture_output=True, text=True,
         env=_child_env({"SLOT_CASES": cases}), timeout=timeout,
     )
-    line = next((l for l in proc.stdout.splitlines()
-                 if l.startswith("SLOTS_RESULT ")), None)
-    parsed = json.loads(line[len("SLOTS_RESULT "):]) if line else None
+    marker = "SLOTS_RESULT "
+    line = next((l for l in proc.stdout.splitlines() if marker in l), None)
+    parsed = json.loads(line[line.index(marker) + len(marker):]) if line else None
     return proc, parsed
 
 
@@ -357,11 +359,10 @@ narrow = ("(" + guard(BOB) + " ? ((i18[t]:bv[24] = { #x000001 }:bv[24])"
 for label, bodies in (("consistent", [BASE, good]),
                       ("clashing", [BASE, good, narrow])):
     spec = "always ( " + " && ".join("(" + b + ")" for b in bodies) + " )."
-    with tau_native.StdOutCapture() as cap:
-        built = tau_mod.get_interpreter(
-            tau_native.TauInterface.preprocess_spec_text(spec))
-    res[label] = built is not None
-    res[label + "_err"] = tau_native.strip_ansi(cap.output)[-300:]
+    built = tau_mod.get_interpreter(
+        tau_native.TauInterface.preprocess_spec_text(spec))
+    res[label] = bool(built)
+    res[label + "_err"] = tau_native.report_errors(built.report)[-300:]
 emit(res)
 ''')
     _assert_ok(proc, parsed)

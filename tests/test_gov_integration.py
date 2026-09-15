@@ -259,7 +259,7 @@ def test_apply_block_routes_activation_revisions_through_i0():
         assert call.get("target_output_stream_index") == 0
         # Activation revisions must NOT trigger the rules-handler — consensus
         # provenance is updated via the snapshot commit, not via the live
-        # spec extracted from stdout. (See `engine.apply_block`.)
+        # spec. (See `engine.apply_block`.)
         assert call.get("apply_rules_update") is False
         assert str(call.get("source", "")).startswith("governance_activation:")
 

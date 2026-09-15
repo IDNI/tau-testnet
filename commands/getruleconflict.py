@@ -280,9 +280,7 @@ def execute(raw_command: str, container):
                     app_rules, [composite], timeout=timeout
                 )
                 if error:
-                    layers.append(_layer(
-                        "compile", "conflict", tau_native.strip_ansi(error)
-                    ))
+                    layers.append(_layer("compile", "conflict", error))
                     escalate(VERDICT_CONFLICT)
                 else:
                     layers.append(_layer("compile", "ok"))

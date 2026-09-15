@@ -12,6 +12,33 @@ class _FakeStreamAt:
     time_point: int
 
 
+class _FakeReport:
+    """The subset of `tau.report` that tau_native reads."""
+
+    def __init__(self, errors=None, awaiting_input=False):
+        self.errors = list(errors or [])
+        self.warnings = []
+        self.infos = []
+        self.codes = []
+        self.code_names = []
+        self.awaiting_input = awaiting_input
+
+    @property
+    def has_error(self) -> bool:
+        return bool(self.errors)
+
+
+class _FakeResult:
+    """The subset of `tau.result` that tau_native reads."""
+
+    def __init__(self, value, report=None):
+        self.value = value
+        self.report = report or _FakeReport()
+
+    def __bool__(self) -> bool:
+        return self.value is not None
+
+
 class _FakeInterpreter:
     def __init__(self, spec: str):
         self.spec = spec
@@ -35,7 +62,7 @@ class _FakeTauModule:
         self.last_assigned_inputs: dict[str, str] = {}
 
     def get_interpreter(self, spec: str):
-        return _FakeInterpreter(spec)
+        return _FakeResult(_FakeInterpreter(spec))
 
     def get_inputs_for_step(self, interpreter: _FakeInterpreter):
         def _sort_key(name: str) -> int:
@@ -50,8 +77,8 @@ class _FakeTauModule:
         assigned: dict[str, str] = {}
         for stream_at, value in inputs.items():
             if stream_at.name not in interpreter.input_names:
-                print(f"(Error) Input stream {stream_at.name} not found in context")
-                return None
+                return _FakeResult(None, _FakeReport(
+                    [f"Input stream {stream_at.name} not found in context"]))
             assigned[stream_at.name] = str(value)
         self.last_assigned_inputs = assigned
 
@@ -69,7 +96,7 @@ class _FakeTauModule:
             _FakeStreamAt(name="o1", time_point=interpreter.time_point): assigned.get("i1", "0"),
         }
         interpreter.time_point += 1
-        return outputs
+        return _FakeResult(outputs)
 
 
 def _make_genesis_file(tmp_path):
