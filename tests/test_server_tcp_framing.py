@@ -384,6 +384,31 @@ class TestRpcRateLimiting(unittest.TestCase):
         from server import _EXPENSIVE_COMMANDS
         assert "sendtx" not in _EXPENSIVE_COMMANDS
         assert "checktx" in _EXPENSIVE_COMMANDS
+        # Chain dumps hold `_db_lock`; a WS poller of these is what wedges the node.
+        assert "getblocks" in _EXPENSIVE_COMMANDS
+        assert "gettaustate" in _EXPENSIVE_COMMANDS
+
+    def test_expensive_rpc_returns_busy_when_global_slots_are_taken(self):
+        from server import (
+            _EXPENSIVE_RPC_CONCURRENCY,
+            _expensive_rpc_sema,
+            process_command,
+        )
+        handler = _handler()
+        container = _make_container({"getblocks": handler})
+        held = 0
+        try:
+            for _ in range(_EXPENSIVE_RPC_CONCURRENCY):
+                assert _expensive_rpc_sema.acquire(blocking=False)
+                held += 1
+            ok, resp = process_command("getblocks 1", container, "1.2.3.4:5")
+            assert ok is True
+            body = json.loads(resp)
+            assert body["error"]["code"] == "BUSY"
+            handler.execute.assert_not_called()
+        finally:
+            for _ in range(held):
+                _expensive_rpc_sema.release()
 
     def test_tcp_dispatch_emits_rate_limited_envelope(self):
         from server import handle_client

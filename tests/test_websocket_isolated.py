@@ -1,3 +1,4 @@
+import json
 import trio
 import trio_websocket
 import pytest
@@ -85,4 +86,98 @@ async def test_process_command_integration(mock_container, nursery):
         
         # Verify handler called
         mock_handler.execute.assert_called_once()
-    
+
+
+def _serve(handler, nursery):
+    return nursery.start(trio_websocket.serve_websocket, handler, "127.0.0.1", 0, None)
+
+
+@pytest.mark.trio
+async def test_bare_getblocks_over_ws_is_windowed(mock_container, nursery):
+    mock_handler = MagicMock()
+    mock_handler.execute.return_value = '{"status":"ok","command":"getblocks","data":{}}'
+    mock_container.command_handlers["getblocks"] = mock_handler
+
+    async def handler_with_container(request):
+        request.server_container = mock_container
+        await websocket_handler(request)
+
+    server = await _serve(handler_with_container, nursery)
+    async with trio_websocket.open_websocket_url(f"ws://127.0.0.1:{server.port}") as ws:
+        await ws.send_message("getblocks")
+        await ws.get_message()
+    called = mock_handler.execute.call_args[0][0]
+    from server import _WS_DEFAULT_GETBLOCKS_LIMIT
+    assert called == f"getblocks {_WS_DEFAULT_GETBLOCKS_LIMIT}"
+
+
+@pytest.mark.trio
+async def test_ws_idle_timeout_disconnects(mock_container, nursery):
+    async def handler_with_container(request):
+        request.server_container = mock_container
+        request.ws_idle_timeout = 0.2
+        await websocket_handler(request)
+
+    server = await _serve(handler_with_container, nursery)
+    async with trio_websocket.open_websocket_url(f"ws://127.0.0.1:{server.port}") as ws:
+        await trio.sleep(0.6)
+        with pytest.raises(trio_websocket.ConnectionClosed):
+            await ws.send_message("hello version=1")
+
+
+@pytest.mark.trio
+async def test_ws_capacity_rejects_additional_clients(mock_container, nursery):
+    slots = trio.CapacityLimiter(1)
+
+    async def handler_with_container(request):
+        request.server_container = mock_container
+        request.ws_slots = slots
+        request.ws_idle_timeout = 5.0
+        await websocket_handler(request)
+
+    server = await _serve(handler_with_container, nursery)
+    url = f"ws://127.0.0.1:{server.port}"
+    async with trio_websocket.open_websocket_url(url) as held:
+        await held.send_message("hello version=1")
+        await held.get_message()
+        with pytest.raises(trio_websocket.ConnectionRejected):
+            async with trio_websocket.open_websocket_url(url) as _second:
+                pass
+
+
+@pytest.mark.trio
+async def test_ws_oversized_response_is_payload_too_large(mock_container, nursery, monkeypatch):
+    import server as server_mod
+
+    monkeypatch.setattr(server_mod, "_WS_MAX_RESPONSE_BYTES", 32)
+    mock_handler = MagicMock()
+    mock_handler.execute.return_value = "x" * 200
+    mock_container.command_handlers["getbalance"] = mock_handler
+
+    async def handler_with_container(request):
+        request.server_container = mock_container
+        await websocket_handler(request)
+
+    server = await _serve(handler_with_container, nursery)
+    async with trio_websocket.open_websocket_url(f"ws://127.0.0.1:{server.port}") as ws:
+        await ws.send_message("getbalance abc")
+        resp = json.loads(await ws.get_message())
+    assert resp["status"] == "error"
+    assert resp["error"]["code"] == "PAYLOAD_TOO_LARGE"
+
+
+@pytest.mark.trio
+async def test_isolating_nursery_keeps_listener_up_after_handler_crash():
+    """A connection-task exception must not cancel the parent nursery."""
+    import server as server_mod
+
+    async def boom():
+        raise RuntimeError("connection boom")
+
+    async with trio.open_nursery() as handler_n:
+        isolator = server_mod._IsolatingNursery(handler_n)
+        isolator.start_soon(boom)
+        await trio.sleep(0.05)
+        # If the isolator leaked the error, this sleep would have been cancelled.
+        handler_n.cancel_scope.cancel()
+

@@ -85,6 +85,48 @@ def test_extra_arguments_rejected():
     assert resp["error"]["code"] == "INVALID_PARAMS"
 
 
+def test_limited_getblocks_uses_recent_window_not_full_scan():
+    """A windowed query must not parse the whole chain (that's what stalled the node)."""
+
+    def boom():
+        raise AssertionError("should not load the full chain")
+
+    db = types.SimpleNamespace(
+        get_all_blocks=boom,
+        get_block_count=lambda: 100,
+        get_recent_blocks=lambda n: [
+            {"header": {"block_number": i}} for i in range(100 - n, 100)
+        ],
+    )
+    resp = json.loads(
+        getblocks.execute("getblocks 10", types.SimpleNamespace(db=db))
+    )
+    assert resp["status"] == "ok", resp
+    assert _numbers(resp["data"]) == list(range(90, 100))
+    assert resp["data"]["total"] == 100
+    assert resp["data"]["truncated"] is True
+
+
+def test_get_recent_blocks_sql_limit(temp_database):
+    import db
+    from block import Block
+
+    prev = "00" * 32
+    for i in range(5):
+        blk = Block.create(
+            block_number=i,
+            previous_hash=prev,
+            transactions=[],
+            proposer_pubkey="a" * 96,
+            timestamp=1_700_000_000 + i,
+        )
+        db.add_block(blk)
+        prev = blk.block_hash
+    assert db.get_block_count() == 5
+    assert [b["header"]["block_number"] for b in db.get_recent_blocks(2)] == [3, 4]
+    assert [b["header"]["block_number"] for b in db.get_all_blocks()] == list(range(5))
+
+
 def test_db_failure_is_internal_error():
     def boom():
         raise RuntimeError("disk gone")

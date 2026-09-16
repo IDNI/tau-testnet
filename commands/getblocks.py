@@ -49,16 +49,24 @@ def execute(raw_command: str, container):
 
     logger.debug("getblocks requested (limit=%s)", limit)
     try:
-        blocks = container.db.get_all_blocks()
+        # Prefer a SQL window so `getblocks 10` does not parse the whole chain
+        # while holding `_db_lock`. Tests and older db stubs only implement
+        # get_all_blocks(); slice in memory in that case.
+        if limit is None:
+            blocks = container.db.get_all_blocks()
+            total = len(blocks)
+        elif hasattr(container.db, "get_recent_blocks") and hasattr(container.db, "get_block_count"):
+            total = container.db.get_block_count()
+            blocks = container.db.get_recent_blocks(limit)
+        else:
+            blocks = container.db.get_all_blocks()
+            total = len(blocks)
+            blocks = blocks[-limit:]
     except Exception as exc:
         logger.exception("getblocks failed")
         return api_response.error_response(
             "getblocks", f"Failed to fetch blocks: {exc}", "INTERNAL_ERROR"
         )
-
-    total = len(blocks)
-    if limit is not None:
-        blocks = blocks[-limit:]
 
     # `total` and `truncated` are additive: without them a client cannot tell a
     # short window from a short chain, which is the whole point of asking for

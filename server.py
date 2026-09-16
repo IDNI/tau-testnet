@@ -40,8 +40,9 @@ SUPPORTED_HANDSHAKE_VERSIONS = {"1", "2"}
 #
 # Two tiers, because the commands differ by orders of magnitude in cost:
 #   general   — ordinary reads/writes
-#   expensive — commands that spawn a native compile subprocess per call and
-#               cost the caller nothing. sendtx is deliberately NOT in this tier:
+#   expensive — commands that either spawn a native compile subprocess, walk
+#               the whole chain/state, or take the global Tau lock, and cost
+#               the caller nothing. sendtx is deliberately NOT in this tier:
 #               it consumes a sequence number, is capped by the mempool limit and
 #               carries a fee_limit, so it is already self-deterring. checktx has
 #               none of those brakes.
@@ -51,8 +52,42 @@ _EXPENSIVE_BURST = 2.0
 _EXPENSIVE_REFILL_PER_SEC = 0.5
 # getapprovalpreview enumerates up to 64 engine steps under the global Tau lock,
 # and getapprovalslots is unauthenticated text inspection; both are advisory
-# conveniences, so neither should be able to crowd out real traffic.
-_EXPENSIVE_COMMANDS = frozenset({"checktx", "getapprovalpreview", "getapprovalslots"})
+# conveniences. getblocks/getallaccounts/gettaustate/getgovernance/history are
+# cheap for the caller and hold the process-wide DB or state lock, so a poller
+# can stall mining and admission.
+_EXPENSIVE_COMMANDS = frozenset({
+    "checktx",
+    "getapprovalpreview",
+    "getapprovalslots",
+    "getblocks",
+    "getallaccounts",
+    "gettaustate",
+    "getgovernance",
+    "history",
+})
+
+# Global cap on heavy RPC currently inside handler.execute(). Per-connection
+# token buckets still allow a burst; without this, N clients each sending
+# getblocks at once serialize on _db_lock and the node looks dead.
+_EXPENSIVE_RPC_CONCURRENCY = 2
+_expensive_rpc_sema = threading.BoundedSemaphore(_EXPENSIVE_RPC_CONCURRENCY)
+
+# TCP accept loop used to spawn an unbounded thread per connection.
+_TCP_MAX_CONNECTIONS = 64
+_tcp_conn_sema = threading.BoundedSemaphore(_TCP_MAX_CONNECTIONS)
+
+# WebSocket listener is a single Trio thread. Unbounded accept + huge replies
+# are what make a handful of dashboard pollers look like "the node is wedged".
+_WS_MAX_CONNECTIONS = 32
+_WS_IDLE_TIMEOUT = 120.0
+_WS_CONNECT_TIMEOUT = 10.0
+_WS_DISCONNECT_TIMEOUT = 5.0
+# trio-websocket's default inbound max is 1 MiB; stay under that for replies
+# so a client with the same default does not 1009-close the socket.
+_WS_MAX_RESPONSE_BYTES = 900_000
+# Bare `getblocks` over WS used to dump the whole chain. TCP/CLI keep that
+# behaviour; WS pollers get a recent window and truncated=true when there is more.
+_WS_DEFAULT_GETBLOCKS_LIMIT = 50
 
 
 class _TokenBucket:
@@ -108,6 +143,49 @@ def _rate_limited_response() -> str:
     )
 
 
+def _busy_response(command_name: str) -> str:
+    return api_response.error_response(
+        command_name,
+        "Too many heavy RPC calls in flight; retry shortly.",
+        "BUSY",
+    )
+
+
+def _payload_too_large_response(command_name: str, size: int) -> str:
+    hint = ""
+    if command_name == "getblocks":
+        hint = f" Pass a smaller window, e.g. getblocks {_WS_DEFAULT_GETBLOCKS_LIMIT}."
+    return api_response.error_response(
+        command_name,
+        f"Response too large ({size} bytes).{hint}",
+        "PAYLOAD_TOO_LARGE",
+    )
+
+
+class _IsolatingNursery:
+    """`start_soon` wrapper so one connection crash cannot cancel the WS listener.
+
+    trio.serve_listeners documents that an unhandled handler exception
+    propagates out of the listener nursery and takes the whole server down.
+    trio-websocket runs each TCP accept through `_handle_connection` in that
+    nursery; wrapping start_soon keeps the listener alive.
+    """
+
+    def __init__(self, nursery: trio.Nursery):
+        self._nursery = nursery
+
+    def start_soon(self, fn, *args, **kwargs):
+        async def _guarded():
+            try:
+                await fn(*args)
+            except Exception:
+                logger.exception("WS connection task crashed; dropping client")
+            except BaseExceptionGroup as exc:
+                logger.error("WS connection task group failed: %r", exc)
+
+        self._nursery.start_soon(_guarded, **kwargs)
+
+
 def process_command(raw_command: str, container: ServiceContainer, client_label: str, *, is_local: bool = False) -> tuple[bool, str]:
     """
     Process a single command string from any source (TCP or WS).
@@ -159,6 +237,11 @@ def process_command(raw_command: str, container: ServiceContainer, client_label:
             command_name, f"Unknown command '{command_name}'", "UNKNOWN_COMMAND"
         )
 
+    heavy = command_name in _EXPENSIVE_COMMANDS
+    if heavy and not _expensive_rpc_sema.acquire(blocking=False):
+        logger.warning("Heavy RPC busy; refusing %s from %s", command_name, client_label)
+        return True, _busy_response(command_name)
+
     try:
         resp = handler.execute(raw_command, container)
     except TauTestnetError as exc:
@@ -172,6 +255,9 @@ def process_command(raw_command: str, container: ServiceContainer, client_label:
     except Exception as exc:
         logger.exception("Error executing local command %s for %s", command_name, client_label)
         return True, api_response.error_response(command_name, str(exc), "INTERNAL_ERROR")
+    finally:
+        if heavy:
+            _expensive_rpc_sema.release()
 
     if not isinstance(resp, str):
         logger.error("Handler %s returned non-string response", command_name)
@@ -222,77 +308,114 @@ def _start_network_background(container: ServiceContainer) -> None:
 
 
 # --- WebSocket Server ---
+def _ws_peer_label(request, ws=None) -> str:
+    remote = getattr(ws, "remote", None) if ws is not None else None
+    if remote is None:
+        remote = getattr(request, "remote", None)
+    return f"WS:{remote}"
+
+
 async def websocket_handler(request):
     """
     Handles WebSocket connections.
     Includes Handshake, Origin Check, and Command Processing.
     """
     container = request.server_container
-    ws = await request.accept()
-    
-    # Origin Check (Basic)
-    headers = dict(request.headers)
-    origin = headers.get("Origin") or headers.get("origin")
-    
-    # Parse allowed origins from environment (comma-separated, e.g. "https://domain1.com,https://domain2.com,*")
-    allowed_env = os.environ.get("TAU_WS_ALLOWED_ORIGINS", "")
-    allowed_domains = [d.strip() for d in allowed_env.split(",") if d.strip()]
+    slots = getattr(request, "ws_slots", None)
+    slot_held = False
+    if slots is not None:
+        try:
+            slots.acquire_nowait()
+        except trio.WouldBlock:
+            logger.warning("Rejected WS from %s: at capacity", _ws_peer_label(request))
+            await request.reject(503, body=b"too many websocket connections")
+            return
+        slot_held = True
 
-    # Allow missing origin (localhost tools) or localhost/file
-    allowed = False
-    if not origin or origin == "null":
-        allowed = True
-    elif "localhost" in origin or "127.0.0.1" in origin:
-        allowed = True
-    elif "*" in allowed_domains:
-        allowed = True
-    else:
-        for domain in allowed_domains:
-            if domain in origin:
-                allowed = True
-                break
-        
-    if not allowed:
-        logger.warning("Rejected WS connection from disallowed origin: %s. Use TAU_WS_ALLOWED_ORIGINS to allow it.", origin)
-        await ws.send_message("error disallowed_origin")
-        await ws.aclose()
-        return
-
-    client_label = f"WS:{id(ws)}"
-    logger.info("WS Connection accepted: %s (Origin: %s)", client_label, origin)
-
-    # Shared limiter with the TCP path (_RpcLimiter), on trio's clock.
-    limiter = _RpcLimiter(trio.current_time())
-
+    client_label = _ws_peer_label(request)
     try:
+        ws = await request.accept()
+        client_label = _ws_peer_label(request, ws)
+
+        # Origin Check (Basic)
+        headers = dict(request.headers)
+        origin = headers.get("Origin") or headers.get("origin")
+
+        # Parse allowed origins from environment (comma-separated, e.g. "https://domain1.com,https://domain2.com,*")
+        allowed_env = os.environ.get("TAU_WS_ALLOWED_ORIGINS", "")
+        allowed_domains = [d.strip() for d in allowed_env.split(",") if d.strip()]
+
+        # Allow missing origin (localhost tools) or localhost/file
+        allowed = False
+        if not origin or origin == "null":
+            allowed = True
+        elif "localhost" in origin or "127.0.0.1" in origin:
+            allowed = True
+        elif "*" in allowed_domains:
+            allowed = True
+        else:
+            for domain in allowed_domains:
+                if domain in origin:
+                    allowed = True
+                    break
+
+        if not allowed:
+            logger.warning(
+                "Rejected WS connection from disallowed origin: %s. Use TAU_WS_ALLOWED_ORIGINS to allow it.",
+                origin,
+            )
+            await ws.send_message("error disallowed_origin")
+            await ws.aclose()
+            return
+
+        logger.info("WS Connection accepted: %s (Origin: %s)", client_label, origin)
+
+        # Shared limiter with the TCP path (_RpcLimiter), on trio's clock.
+        limiter = _RpcLimiter(trio.current_time())
+        idle_timeout = getattr(request, "ws_idle_timeout", _WS_IDLE_TIMEOUT)
+
         while True:
             try:
-                message = await ws.get_message()
+                with trio.move_on_after(idle_timeout) as idle_scope:
+                    message = await ws.get_message()
+                if idle_scope.cancelled_caught:
+                    logger.info("WS idle timeout: %s", client_label)
+                    break
             except trio_websocket.ConnectionClosed:
                 break
 
-            command_name = message.split()[0].lower() if message.split() else ""
+            if not isinstance(message, str):
+                message = message.decode("utf-8", errors="replace")
+
+            parts = message.split()
+            command_name = parts[0].lower() if parts else ""
+            # Bare getblocks over WS is how dashboards stall the node: full-chain
+            # dump under _db_lock, then a multi-MB send on the Trio thread.
+            if command_name == "getblocks" and len(parts) == 1:
+                message = f"getblocks {_WS_DEFAULT_GETBLOCKS_LIMIT}"
+
             if not limiter.allow(command_name, trio.current_time()):
                 logger.warning("Rate limit exceeded for %s (%s)", client_label, command_name)
                 await ws.send_message(_rate_limited_response())
-                # Drop this command, keep the connection.
                 continue
 
             # Process in a worker thread to avoid blocking the Trio event loop
             success, response = await trio.to_thread.run_sync(
                 process_command, message, container, client_label
             )
-            await ws.send_message(response)
-            
-            # Close on fatal protocol errors if desired, or keep open.
-            # Here we keep open unless handshake failed fatally? 
-            # process_command returns success=False for protocol errors, but we usually want to keep connection for invalid commands (typos)
-            # Only close if it was a handshake failure that mandated it?
-            # For now, keep open.
-            
+            if len(response) > _WS_MAX_RESPONSE_BYTES:
+                response = _payload_too_large_response(command_name, len(response))
+            try:
+                await ws.send_message(response)
+            except trio_websocket.ConnectionClosed:
+                break
     except Exception as e:
         logger.error("WS Handler Error %s: %s", client_label, e)
+    except BaseExceptionGroup:
+        logger.exception("WS Handler group error %s", client_label)
     finally:
+        if slot_held:
+            slots.release()
         logger.info("WS Client disconnected: %s", client_label)
 
 
@@ -305,13 +428,9 @@ def _start_websocket_server(container: ServiceContainer) -> None:
         # Try to find a free port if busy, or just fail? 
         # Plan says: Handle port conflicts (start at config.PORT + 1, scan if busy).
         
-        # We need a partial to pass container to handler, or attach it to the request object wrapper?
-        # trio-websocket handler signature is fn(request).
-        # We can wrap it.
-        
-        async def handler_with_container(request):
-            request.server_container = container
-            await websocket_handler(request)
+        # trio-websocket handler signature is fn(request). The wrapper that
+        # attaches container + the connection limiter is created inside main()
+        # so it closes over the Trio-scoped CapacityLimiter.
 
         def _build_ws_ssl_context() -> ssl.SSLContext | None:
             cert_path = os.environ.get("TAU_WS_CERT_PATH", "").strip()
@@ -349,26 +468,39 @@ def _start_websocket_server(container: ServiceContainer) -> None:
             actual_ws_port = ws_port
             ssl_context = _build_ws_ssl_context()
             scheme = "wss" if ssl_context else "ws"
+            ws_slots = trio.CapacityLimiter(_WS_MAX_CONNECTIONS)
+
+            async def handler_with_container(request):
+                request.server_container = container
+                request.ws_slots = ws_slots
+                await websocket_handler(request)
+
             # Simple scan: bind to the first free port, then serve until it crashes
             # or is cancelled. A non-OSError escapes this function so the outer
             # supervisor loop can log it and restart.
-            for i in range(10):
-                p = actual_ws_port + i
-                try:
-                    logger.info("Attempting to bind %s to %s:%s", scheme, config.HOST, p)
-                    # serve_websocket blocks until cancelled.
-                    await trio_websocket.serve_websocket(
-                        handler_with_container,
-                        config.HOST,
-                        p,
-                        ssl_context=ssl_context,
-                    )
-                    # If it returns, the server shut down on its own.
-                    logger.warning("WS serve returned (unexpected).")
-                    return
-                except OSError as e:
-                    logger.warning("WS Port %s busy, trying next... (%s)", p, e)
-                    continue
+            # handler_nursery is isolated so one client's ExceptionGroup cannot
+            # cancel the listener (the May 2026 WS-death failure mode).
+            async with trio.open_nursery() as handler_n:
+                for i in range(10):
+                    p = actual_ws_port + i
+                    try:
+                        logger.info("Attempting to bind %s to %s:%s", scheme, config.HOST, p)
+                        # serve_websocket blocks until cancelled.
+                        await trio_websocket.serve_websocket(
+                            handler_with_container,
+                            config.HOST,
+                            p,
+                            ssl_context=ssl_context,
+                            handler_nursery=_IsolatingNursery(handler_n),
+                            connect_timeout=_WS_CONNECT_TIMEOUT,
+                            disconnect_timeout=_WS_DISCONNECT_TIMEOUT,
+                        )
+                        # If it returns, the server shut down on its own.
+                        logger.warning("WS serve returned (unexpected).")
+                        return
+                    except OSError as e:
+                        logger.warning("WS Port %s busy, trying next... (%s)", p, e)
+                        continue
             raise RuntimeError(
                 f"WS server could not bind any port in {actual_ws_port}-{actual_ws_port + 9}"
             )
@@ -671,7 +803,21 @@ def _run_server(container: ServiceContainer):
         while not tau_module.server_should_stop.is_set():
             try:
                 conn, addr = server_socket.accept()
-                client_thread = threading.Thread(target=handle_client, args=(conn, addr, container), daemon=True)
+                if not _tcp_conn_sema.acquire(blocking=False):
+                    logger.warning("Rejected TCP from %s: at capacity", addr)
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    continue
+
+                def _run_tcp_client(c=conn, a=addr):
+                    try:
+                        handle_client(c, a, container)
+                    finally:
+                        _tcp_conn_sema.release()
+
+                client_thread = threading.Thread(target=_run_tcp_client, daemon=True)
                 client_thread.start()
             except OSError:
                 if tau_module.server_should_stop.is_set():

@@ -1427,21 +1427,59 @@ def get_genesis_hash() -> str:
         return row[0]
     return ""
 
+def _parse_block_data_rows(rows) -> List[Dict]:
+    """JSON-decode block_data blobs. Callers must not hold `_db_lock`."""
+    out: List[Dict] = []
+    for (block_json,) in rows:
+        try:
+            out.append(json.loads(block_json))
+        except Exception:
+            continue
+    return out
+
+
 def get_all_blocks() -> List[Dict]:
     """Returns all blocks ordered by block_number ascending as parsed dicts."""
     if _db_conn is None:
         init_db()
-    out: List[Dict] = []
     with _db_lock:
         cur = _db_conn.cursor()
         cur.execute('SELECT block_data FROM blocks ORDER BY block_number ASC')
         rows = cur.fetchall()
-        for (block_json,) in rows:
-            try:
-                out.append(json.loads(block_json))
-            except Exception:
-                continue
-    return out
+    return _parse_block_data_rows(rows)
+
+
+def get_block_count() -> int:
+    """Number of rows in `blocks` (canonical and stale forks)."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT COUNT(*) FROM blocks')
+        row = cur.fetchone()
+    return int(row[0] if row else 0)
+
+
+def get_recent_blocks(limit: int) -> List[Dict]:
+    """Highest-numbered `limit` blocks, returned in ascending block_number order.
+
+    Uses SQL LIMIT so a `getblocks N` poller does not parse the whole chain
+    under `_db_lock`. Forks are included, matching `get_all_blocks()`.
+    """
+    if limit < 1:
+        return []
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT block_data FROM blocks ORDER BY block_number DESC LIMIT ?',
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+    blocks = _parse_block_data_rows(rows)
+    blocks.reverse()
+    return blocks
 
 def get_canonical_blocks_at_or_after_height(block_number: int) -> List[Dict]:
     """
@@ -1468,12 +1506,12 @@ def get_canonical_blocks_at_or_after_height(block_number: int) -> List[Dict]:
         cur = _db_conn.cursor()
         cur.execute('SELECT block_data, block_hash FROM blocks WHERE block_number >= ? ORDER BY block_number ASC', (block_number,))
         rows = cur.fetchall()
-        for block_json, b_hash in rows:
-            if b_hash in path_hashes:
-                try:
-                    out.append(json.loads(block_json))
-                except Exception:
-                    continue
+    for block_json, b_hash in rows:
+        if b_hash in path_hashes:
+            try:
+                out.append(json.loads(block_json))
+            except Exception:
+                continue
     return out
 
 def load_last_transfer_ts() -> Dict[str, int]:
