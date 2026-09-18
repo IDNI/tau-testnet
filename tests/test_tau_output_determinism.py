@@ -89,31 +89,35 @@ class _TauDeterminismBase(unittest.TestCase):
 @pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
 class TestTauOutputDeterminism(_TauDeterminismBase):
 
-    def test_determinism_same_instance_repeated_inputs(self):
-        rule = "always (o1[t] = i1[t] > i2[t])."
-        self._seed_rule(rule, "same-instance-det")
+    DET_RULE = (
+        "always ( ((i1[t]:bv[24] >  i2[t]:bv[24]) && o2[t] = { #x000001 }:bv[24])"
+        "      || ((i1[t]:bv[24] <= i2[t]:bv[24]) && o2[t] = { #x000000 }:bv[24]) )."
+    )
 
-        # target_output_stream_index=1 is o1
+    def test_determinism_same_instance_repeated_inputs(self):
+        self._seed_rule(self.DET_RULE, "same-instance-det")
+
+        # target_output_stream_index=2 is o2
         inputs = {1: ["100"], 2: ["50"]}
         tau_manager.tau_ready.set()
-        
+
         result1 = tau_manager.communicate_with_tau(
             rule_text=None,
-            target_output_stream_index=1,
+            target_output_stream_index=2,
             input_stream_values=inputs,
             apply_rules_update=False
         )
         result2 = tau_manager.communicate_with_tau(
             rule_text=None,
-            target_output_stream_index=1,
+            target_output_stream_index=2,
             input_stream_values=inputs,
             apply_rules_update=False
         )
         self.assertEqual(result1, result2)
 
     def test_determinism_fresh_instances_identical_inputs(self):
-        rule = "always (o1[t] = i1[t] > i2[t])."
-        
+        rule = self.DET_RULE
+
         interface1 = tau_native.TauInterface(GENESIS_TAU)
         interface2 = tau_native.TauInterface(GENESIS_TAU)
         
