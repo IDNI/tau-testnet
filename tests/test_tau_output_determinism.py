@@ -132,7 +132,7 @@ class TestTauOutputDeterminism(_TauDeterminismBase):
 
     def test_determinism_o5_user_policy(self):
         # o5 is index 5
-        rule = "always ((i3[t] = {#x0011}:bv[16] && i1[t] > {1000}:bv[24]) ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16])."
+        rule = "always ((i3[t] = {#x0011}:bv[16] && i1[t] > {1000}:bv[24]) ? o5[t] = {0}:bv[24] : o5[t] = {1}:bv[24])."
         
         interface1 = tau_native.TauInterface(GENESIS_TAU)
         interface2 = tau_native.TauInterface(GENESIS_TAU)
