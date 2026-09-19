@@ -24,6 +24,7 @@ occurred.
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import struct
@@ -62,12 +63,30 @@ def _write_frame(fd: int, payload: dict) -> None:
     os.write(fd, _HDR.pack(len(blob)) + blob)
 
 
+def _flush_native_streams() -> bool:
+    """Flush the C/C++ stdio buffers before the captured fds are restored.
+
+    Native output is fully buffered when stdout is not a tty, which it never is
+    for a worker. Restoring the fds first means the buffer drains to the ORIGINAL
+    destination afterwards and the capture reads back empty -- indistinguishable
+    from "the engine said nothing", which is exactly the reading that must never
+    be possible. `fflush(NULL)` flushes every open C stream; the C++ streams are
+    sync'd with stdio by default.
+    """
+    try:
+        ctypes.CDLL(None).fflush(None)
+        return True
+    except Exception:
+        return False
+
+
 class _Capture:
     """Capture fd 1 and 2 around a native call, reporting completeness.
 
     Temp files, not pipes: a pipe's buffer deadlocks the engine on a large spec
-    dump. `complete` is False when the capture could not be read back -- the
-    caller must treat that as operational, not as "no diagnostic".
+    dump. `complete` is False when the capture could not be read back or could not
+    be flushed -- the caller must treat that as operational, not as "no
+    diagnostic".
     """
 
     def __init__(self):
@@ -82,6 +101,7 @@ class _Capture:
         return self
 
     def __exit__(self, *exc):
+        flushed = _flush_native_streams()
         os.dup2(self._saved[0], 1)
         os.dup2(self._saved[1], 2)
         os.close(self._saved[0])
@@ -93,7 +113,7 @@ class _Capture:
                 chunks.append(tf.read().decode("utf-8", "replace"))
                 tf.close()
             self.text = "".join(chunks)
-            self.complete = True
+            self.complete = flushed
         except Exception:
             self.text = ""
             self.complete = False

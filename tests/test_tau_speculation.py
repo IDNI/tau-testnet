@@ -238,3 +238,31 @@ def test_revision_outcomes_are_separated(tmp_path, candidate, expected):
         assert receipt["outcome"] == expected, receipt
     finally:
         s.kill()
+
+
+@pytest.mark.skipif(not _native_available(), reason="native tau module not built")
+def test_a_refusal_reaches_the_receipt_through_the_subprocess(tmp_path):
+    """Native output is fully buffered when stdout is not a tty, which it never is
+    for a worker. Without an explicit flush before the captured fds are restored,
+    the buffer drains to the original destination afterwards and every receipt
+    reads back empty -- indistinguishable from "the engine said nothing", which is
+    the one reading that must never be possible.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo_root, "genesis.tau")) as fh:
+        router = fh.read().strip()
+    baseline = (f"always ( {router} && "
+                "( i12[t]:bv[8] = { 1 }:bv[8] -> o5[t]:bv[24] = { #x000001 }:bv[24] ) ).")
+    clashing = ("always ( i12[t]:bv[384] = { #x" + "bb" * 48 + " }:bv[384] -> "
+                "( o5[t]:bv[24] = { #x000000 }:bv[24] ) ).")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    s = spec.SpeculationSession(cwd=repo_root, env=env)
+    try:
+        s.init(baseline)
+        receipt = s.revise(clashing, "c")
+        assert receipt["outcome"] == "REJECTED_RULE", receipt
+        assert receipt["capture_complete"] is True
+        assert "Incompatible type information in i12" in receipt["diagnostics"], receipt
+    finally:
+        s.kill()
