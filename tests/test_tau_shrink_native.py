@@ -288,3 +288,97 @@ def test_src_eq_dest_rule_full_pubkeys_real_engine(tmp_path):
     assert streams == "3/4", line          # both address streams shrunk
     assert same == "0", f"from==to must fail src!=dest (o3=0): {line}"
     assert diff == "1", f"from!=to must pass (o3=1): {line}"
+
+
+# --- W1: the incident, end to end on the real engine --------------------------
+#
+# Pin i12 at the shrink width with a composite (the rule-sharing shape, which
+# always shrank correctly), then apply the UNPARENTHESIZED implication rule the
+# monitoring swarm submitted. Before the supported-subset rewrite this produced
+# `i12[t]:bv[8] = { #x<pk> }:bv[384]` and the engine refused it with
+# "Incompatible type information in i12, expected :bv[384], found :bv[8]" --
+# admitted by sendtx, then rejected at apply, with a crash dump each time.
+#
+# Driven through the RAW tau API on purpose: `spec_revision` is the engine's own
+# acknowledgement, and tau_manager rebuilds its interpreter after each revision,
+# which resets that counter.
+_CHILD_INCIDENT = r'''
+import os, sys, tempfile
+os.environ["TAU_ENV"] = "test"
+os.environ["TAU_FORCE_TEST"] = "0"
+os.environ["TAU_SHRINK_ENABLED"] = "true"
+import config
+config.set_database_path(os.environ["SHRINK_DB"])
+import db; db.init_db()
+import tau, tau_shrink as S
+
+A = "%s"; B = "%s"
+S.reset_shrink_width(8); S.set_shrink_width(8, pin=True)
+
+def cap(fn):
+    s1, s2 = os.dup(1), os.dup(2)
+    t1, t2 = tempfile.TemporaryFile(), tempfile.TemporaryFile()
+    os.dup2(t1.fileno(), 1); os.dup2(t2.fileno(), 2)
+    try: r = fn()
+    except BaseException: r = None
+    finally:
+        os.dup2(s1, 1); os.dup2(s2, 2); os.close(s1); os.close(s2)
+    return r
+
+router = open(os.path.join(os.environ["REPO_ROOT"], "genesis.tau")).read().strip()
+itp = cap(lambda: tau.get_interpreter("always ( " + router + " )."))
+
+def send(rule=None, i12=None):
+    ins = cap(lambda: tau.get_inputs_for_step(itp))
+    vals = {}
+    for s in ins:
+        if s.name == "i0": vals[s] = rule if rule is not None else "F"
+        elif s.name == "i12" and i12 is not None: vals[s] = i12
+        else: vals[s] = "0"
+    before = itp.spec_revision
+    outs = cap(lambda: tau.step(itp, vals))
+    o = {k.name: v for k, v in outs.items()} if outs else {}
+    return (itp.spec_revision > before), o.get("o5")
+
+comp = ("always ( (i12[t]:bv[384] = { #x" + A + " }:bv[384]) ? "
+        "( o5[t]:bv[24] = { #x000001 }:bv[24] ) : "
+        "( o5[t]:bv[24] = { #x000001 }:bv[24] ) ).")
+pinned, _ = send(S.prepare_rule(comp).runtime_text)
+
+incident = ("always ( i12[t]:bv[384] = { #x" + B + " }:bv[384] -> "
+            "( o5[t]:bv[24] = { #x000000 }:bv[24] ) ).")
+prep = S.prepare_rule(incident)
+applied, _ = send(prep.runtime_text)
+
+_, blocked = send(None, str(S.intern_value(B, 384)))
+_, allowed = send(None, str(S.intern_value(A, 384)))
+mixed = ("bv[384]" in prep.runtime_text and "bv[8]" in prep.runtime_text)
+print("INCIDENT_RESULT", pinned, applied, blocked, allowed, mixed)
+sys.stdout.flush()
+os._exit(0)
+'''
+
+
+def test_unparenthesized_implication_applies_against_a_pinned_stream(tmp_path):
+    child = _CHILD_INCIDENT % ("aa" * 48, "bb" * 48)
+    script = tmp_path / "child_incident.py"
+    script.write_text(child)
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ)
+    env["SHRINK_DB"] = str(tmp_path / "incident.db")
+    env["REPO_ROOT"] = repo_root
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True, text=True, env=env, timeout=120,
+    )
+    line = next((l for l in proc.stdout.splitlines() if l.startswith("INCIDENT_RESULT")), None)
+    assert line is not None, f"child produced no result.\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    _, pinned, applied, blocked, allowed, mixed = line.split()
+    assert pinned == "True", f"composite should pin i12: {line}"
+    assert mixed == "False", f"prepared text must not mix widths: {line}"
+    # The regression itself: pre-fix the engine rejected this outright.
+    assert applied == "True", f"implication rule must apply against a pinned i12: {line}"
+    # And it must actually MEAN something: the guarded sender is blocked.
+    assert blocked == "0", f"guarded sender should be blocked (o5=0): {line}"
+    assert allowed == "1", f"unrelated sender should be allowed (o5=1): {line}"

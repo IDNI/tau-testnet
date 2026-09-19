@@ -155,6 +155,17 @@ class ShrinkWidthOverflow(Exception):
     """
 
 
+class ShrinkTypeConflict(Exception):
+    """A rule references a stream the live process already typed at the shrunk
+    width, but the classifier refuses to shrink it here -- so NEITHER form can be
+    typed and there is no correct text to dispatch.
+
+    Deliberately not a subclass of ShrinkUnavailable or ShrinkWidthOverflow:
+    neither the "fall back to full width" handler nor the re-exec handler must
+    swallow it. Node-local, never a consensus verdict about the rule.
+    """
+
+
 @dataclass(frozen=True)
 class PreparedTauSpec:
     """The explicit two-representation contract handed back by prepare_rule.
@@ -164,12 +175,18 @@ class PreparedTauSpec:
     shrink_enabled -- False => runtime_text == canonical_text (no shrink applied).
     shrunk_streams -- input stream indices whose runtime values must be shrunk
                       to stay consistent with the shrunk rule literals.
+    wide_streams_unshrunk -- wide input streams left at full width by this
+                      preparation (fallbacks included).
     """
 
     canonical_text: str
     runtime_text: str
     shrink_enabled: bool
     shrunk_streams: frozenset
+    # Input streams the text references at >= MIN_SHRINK_WIDTH that are NOT shrunk.
+    # Populated on EVERY return path, including the fallbacks, so a caller can see
+    # that a stream stayed full-width and compare that against the live process.
+    wide_streams_unshrunk: frozenset = frozenset()
 
 
 # --- Canonicalisation / interning ---------------------------------------------
@@ -220,16 +237,19 @@ def intern_value(hex_digits: str, width: int) -> int:
 
 
 # --- Tokeniser ----------------------------------------------------------------
+#
+# W1: the scanner recognises a deliberately RESTRICTED fragment and consumes every
+# token. Anything it cannot account for disqualifies the streams it touches -- it
+# never silently classifies as NEUTRAL and keeps going.
 
-# Order matters: multi-char operators and bracketed forms before single chars.
 _TOKEN_RE = re.compile(
     r"""
       (?P<ws>\s+)
     | (?P<bvlit>\{[^{}]*\}\s*:\s*bv\[\s*\d+\s*\])
-    | (?P<streamref>[io]\d+\s*\[\s*t\s*\]\s*(?::\s*bv\[\s*\d+\s*\])?)
+    | (?P<streamref>[io]\d+\s*\[[^\[\]]*\]\s*(?::\s*bv\[\s*\d+\s*\])?)
     | (?P<hexnum>\#x[0-9a-fA-F]+|\#b[01]+)
     | (?P<num>\d+)
-    | (?P<op>!=|<=|>=|<<|>>|&&|\|\||[=<>+\-*/%&|\^!])
+    | (?P<op><->|->|<-|\^\^|!=|<=|>=|<<|>>|&&|\|\||'|[=<>+\-*/%&|\^!])
     | (?P<group>[()])
     | (?P<dot>\.)
     | (?P<comma>,)
@@ -240,20 +260,30 @@ _TOKEN_RE = re.compile(
     re.VERBOSE,
 )
 
+# A stream reference, with its time expression and optional type annotation kept as
+# separate spans so a rewrite can touch the ANNOTATION ONLY and leave `[t-1]` alone.
 _STREAMREF_RE = re.compile(
-    r"([io])(\d+)\s*\[\s*t\s*\]\s*(?::\s*bv\[\s*(\d+)\s*\])?"
+    r"([io])(\d+)\s*\[\s*(?P<time>t\s*[-+]\s*\d+|t|\d+)\s*\]"
+    r"(?P<ann>\s*:\s*bv\[\s*(?P<width>\d+)\s*\])?"
 )
-_BVLIT_RE = re.compile(r"\{\s*([^{}]*?)\s*\}\s*:\s*bv\[\s*(\d+)\s*\]")
+_BVLIT_RE = re.compile(r"\{\s*(?P<body>[^{}]*?)\s*\}\s*:\s*bv\[\s*(?P<width>\d+)\s*\]")
+# A bare `iN` / `oN` that did NOT parse as a stream reference: an occurrence the
+# analyzer does not understand. It must disqualify, never disappear from the audit.
+_BARE_STREAM_IDENT_RE = re.compile(r"^([io])(\d+)$")
 
-# Operators that mean "this is not an equality/emptiness operand". A candidate
-# adjacent to any of these is never shrunk.
+# Operators that mean "this operand is not an equality/emptiness operand".
+# `'` (postfix complement) is here deliberately: complementing an interned id
+# computes over a node-local value, which is a wrong answer, not a crash.
 _DISQ_OPS = frozenset(
-    {"<", ">", "<=", ">=", "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "!"}
+    {"<", ">", "<=", ">=", "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "!", "'"}
 )
 _EQ_OPS = frozenset({"=", "!="})
+# Boolean connectives: they delimit formulas, so an operand beside one is still a
+# complete comparison. They are NOT disqualifying and NOT equality operators.
+_WFF_OPS = frozenset({"->", "<-", "<->", "^^", "&&", "||"})
 # Temporal / quantifier keywords that legitimately precede '(' and are NOT
-# function calls (`always (...)`, `all x (...)`). Any OTHER identifier before a
-# '(' is treated as a function call wrapping the operand -> fail closed.
+# function calls. Any OTHER identifier before a '(' wraps the operand in something
+# this analyzer cannot reason about -> fail closed, through ANY nesting depth.
 _KEYWORDS_BEFORE_PAREN = frozenset({"always", "sometimes", "all", "ex"})
 
 
@@ -263,6 +293,18 @@ class _Tok:
     text: str
     start: int
     end: int
+
+
+@dataclass
+class _Ref:
+    """One stream occurrence, with source spans."""
+    pos: int            # token index
+    io: str             # "i" or "o"
+    index: int
+    time_expr: str      # verbatim, e.g. "t" or "t-1"
+    width: int          # declared width, or -1 when unannotated
+    ann_start: int      # absolute span of the ":bv[N]" annotation, -1 when absent
+    ann_end: int
 
 
 def _tokenize(text: str) -> list:
@@ -275,58 +317,86 @@ def _tokenize(text: str) -> list:
     return toks
 
 
-def _streamref_info(tok: _Tok):
-    """Return (index, width_or_None) for a streamref token, or None."""
+def _ref_of(tok: _Tok, pos: int):
+    """Parse a streamref token into a _Ref, or None if it is not one."""
     m = _STREAMREF_RE.match(tok.text)
-    if not m or m.group(1) != "i":
+    if not m:
         return None
-    width = int(m.group(3)) if m.group(3) is not None else None
-    return int(m.group(2)), width
+    width = int(m.group("width")) if m.group("width") is not None else -1
+    if m.group("ann") is not None:
+        ann_start = tok.start + m.start("ann")
+        ann_end = tok.start + m.end("ann")
+    else:
+        ann_start = ann_end = -1
+    time_expr = re.sub(r"\s+", "", m.group("time"))
+    return _Ref(pos, m.group(1), int(m.group(2)), time_expr, width, ann_start, ann_end)
+
+
+def _streamref_info(tok: _Tok):
+    """Back-compat shim: (index, width_or_None) for an INPUT stream token."""
+    ref = _ref_of(tok, -1)
+    if ref is None or ref.io != "i":
+        return None
+    return ref.index, (None if ref.width < 0 else ref.width)
+
+
+def _lit_of(tok: _Tok):
+    """Validate a bitvector literal. Returns a dict or None.
+
+    A literal is internable only if its body is a COMPLETE supported constant that
+    is representable at its declared width -- never an arbitrary `#x`-prefixed
+    string, and never an expression.
+    """
+    m = _BVLIT_RE.match(tok.text)
+    if not m or m.end() != len(tok.text):
+        return None
+    body = m.group("body").strip()
+    width = int(m.group("width"))
+    low = body.lower()
+    if low.startswith("#x"):
+        digits = low[2:]
+        if not digits or any(c not in "0123456789abcdef" for c in digits):
+            return None
+        value, hex_digits = int(digits, 16), digits
+    elif low.startswith("#b"):
+        bits = low[2:]
+        if not bits or any(c not in "01" for c in bits):
+            return None
+        value = int(bits, 2)
+        hex_digits = format(value, "x")
+    elif low.isdigit():
+        value = int(low)
+        hex_digits = format(value, "x")
+    else:
+        return None
+    if width <= 0 or value >= (1 << width):
+        return None  # not representable at its declared width
+    return {
+        "width": width,
+        "value": value,
+        "hex_digits": hex_digits,
+        "is_zero": value == 0,
+        "body_start": tok.start + m.start("body"),
+        "body_end": tok.start + m.end("body"),
+    }
 
 
 def _bvlit_info(tok: _Tok):
-    """Return (hex_digits_or_None, width, is_zero) for a bvlit token, or None.
-
-    hex_digits is None for a typed decimal literal like `{ 0 }:bv[N]` (only zero
-    is recognised as a decimal candidate; non-zero decimals are not addresses).
-    """
-    m = _BVLIT_RE.match(tok.text)
-    if not m:
+    """Back-compat shim: (hex_digits_or_None, width, is_zero)."""
+    info = _lit_of(tok)
+    if info is None:
         return None
-    inner = m.group(1).strip()
-    width = int(m.group(2))
-    if inner.lower().startswith("#x"):
-        hex_digits = inner[2:]
-        return hex_digits, width, _hex_is_zero(hex_digits)
-    if inner == "0":
-        return None, width, True
-    return None, width, False  # non-zero decimal / binary: not an address literal
-
-
-def _is_candidate_operand(tok: _Tok) -> bool:
-    """A token that *could* be shrunk: wide hex/zero literal or wide stream ref."""
-    if tok.kind == "bvlit":
-        info = _bvlit_info(tok)
-        if info is None:
-            return False
-        hex_digits, width, is_zero = info
-        if is_zero:
-            return width >= MIN_SHRINK_WIDTH
-        return hex_digits is not None and width >= MIN_SHRINK_WIDTH
-    if tok.kind == "streamref":
-        info = _streamref_info(tok)
-        if info is None:
-            return False
-        _idx, width = info
-        return width is not None and width >= MIN_SHRINK_WIDTH
-    if tok.kind == "num" and tok.text == "0":
-        return True  # bare zero, only honoured opposite a shrinkable stream
-    return False
+    if info["is_zero"]:
+        return None if info["hex_digits"] in ("", None) else info["hex_digits"], info["width"], True
+    return info["hex_digits"], info["width"], False
 
 
 def _enclosing_is_funccall(toks: list, idx: int) -> bool:
-    """True if the operand at idx sits inside `<ident>( ... )` -- a function
-    call we cannot reason about. Fail closed (don't shrink)."""
+    """True if the operand at idx sits inside `<ident>( ... )` at ANY nesting depth.
+
+    The old version stopped at the nearest enclosing paren, so an extra pair of
+    parentheses defeated it.
+    """
     depth = 0
     j = idx - 1
     while j >= 0:
@@ -335,12 +405,13 @@ def _enclosing_is_funccall(toks: list, idx: int) -> bool:
             depth += 1
         elif t.kind == "group" and t.text == "(":
             if depth == 0:
-                # Found the opening paren that encloses idx. Function call iff
-                # the token before it is an identifier that is NOT a temporal/
-                # quantifier keyword.
                 if j > 0 and toks[j - 1].kind == "ident":
-                    return toks[j - 1].text.lower() not in _KEYWORDS_BEFORE_PAREN
-                return False
+                    if toks[j - 1].text.lower() not in _KEYWORDS_BEFORE_PAREN:
+                        return True
+                # keep walking outward -- nesting must not launder the context
+                idx = j
+                j = idx - 1
+                continue
             depth -= 1
         j -= 1
     return False
@@ -355,139 +426,218 @@ def _neighbor_class(tok) -> str:
             return "EQ"
         if tok.text in _DISQ_OPS:
             return "DISQ"
-        return "NEUTRAL"
     return "NEUTRAL"
 
 
-def _classify(text: str, exclude_streams=frozenset()):
-    """Return (shrunk_streams:set[int], literal_edits:list[(tok, kind)]).
+@dataclass
+class _Plan:
+    """What prepare_rule intends to do, and the evidence the audit re-checks."""
+    shrunk: set                 # input stream indices to shrink
+    refs: list                  # every _Ref found
+    unknown_streams: set        # streams with an occurrence we could not parse
+    unresolved: set             # streams whose canonical width is not established
+    ann_edits: list             # (start, end, replacement) for annotations
+    lit_edits: list             # (tok, kind) approved literal rewrites
+    edges: list                 # (left_pos, right_pos, op_text)
 
-    literal kind is "hex" (intern) or "zero" (-> {0}). Conservative + fail
-    closed: a stream is shrinkable only if EVERY occurrence is an equality
-    operand opposite another shrink candidate, with a consistent width >=128
-    explicit annotation; a literal is shrinkable only opposite a shrunk stream.
-    Stream indices in exclude_streams are never shrunk (config safety override).
+
+def _classify(text: str, exclude_streams=frozenset()):
+    """Return (shrunk_streams:set[int], literal_edits:list[(tok, kind)], toks).
+
+    Conservative supported-subset analysis. A stream is shrinkable only when every
+    one of its occurrences is an operand of a supported equality/emptiness edge
+    whose opposite operand carries the SAME declared canonical width, its own
+    annotation is present and consistent everywhere, and nothing about it is
+    unparsed. Comparing two operands of DIFFERENT canonical widths is never made
+    to look well-typed by narrowing both sides.
     """
+    plan = _plan(text, exclude_streams)
+    return plan.shrunk, plan.lit_edits, _tokenize(text)
+
+
+def _plan(text: str, exclude_streams=frozenset()) -> _Plan:
     toks = _tokenize(text)
     n = len(toks)
 
-    # Index every streamref occurrence and remember per-stream widths.
-    stream_occurrences = {}      # idx -> list[token positions]
-    stream_widths = {}           # idx -> set of declared widths (None if bare)
+    refs: list = []
+    occurrences: dict = {}
+    unknown: set = set()
     for pos, t in enumerate(toks):
         if t.kind == "streamref":
-            info = _streamref_info(t)
-            if info is None:
+            ref = _ref_of(t, pos)
+            if ref is None:
+                # a streamref-shaped token we cannot parse: disqualify loudly
+                m = re.match(r"([io])(\d+)", t.text)
+                if m and m.group(1) == "i":
+                    unknown.add(int(m.group(2)))
                 continue
-            sidx, width = info
-            stream_occurrences.setdefault(sidx, []).append(pos)
-            stream_widths.setdefault(sidx, set()).add(width)
+            refs.append(ref)
+            if ref.io == "i":
+                occurrences.setdefault(ref.index, []).append(ref)
+        elif t.kind == "ident":
+            m = _BARE_STREAM_IDENT_RE.match(t.text)
+            if m and m.group(1) == "i":
+                unknown.add(int(m.group(2)))  # `i12` with no `[...]` -> not understood
 
-    def opposite_of(pos):
-        """If toks[pos] is an operand of an =/!= at pos-1 or pos+1, return the
-        opposite operand token + a flag for precedence-steal/funccall safety."""
-        left = toks[pos - 1] if pos - 1 >= 0 else None
-        right = toks[pos + 1] if pos + 1 < n else None
-        lc, rc = _neighbor_class(left), _neighbor_class(right)
-        # A candidate next to any disqualifying operator is never an eq operand.
-        if lc == "DISQ" or rc == "DISQ":
-            return None
-        if _enclosing_is_funccall(toks, pos):
-            return None
-        if rc == "EQ":
-            # operand is the LEFT side: opposite is toks[pos+2]; guard precedence
-            far = toks[pos + 2] if pos + 2 < n else None
-            if _neighbor_class(far) == "DISQ":
-                return None
-            return far
-        if lc == "EQ":
-            far = toks[pos - 2] if pos - 2 >= 0 else None
-            if _neighbor_class(far) == "DISQ":
-                return None
-            return far
-        return None  # not an equality operand
+    # Supported equality edges: both operands are single tokens directly adjacent
+    # to the operator, and each is a COMPLETE operand -- nothing value-ish or
+    # disqualifying immediately outside it. This is what rejects juxtaposition-AND
+    # (`= A B`, where the right operand is really a compound) and a postfix
+    # complement (`= A'`), neither of which involves an operator the scanner could
+    # have enumerated.
+    _VALUEISH = {"bvlit", "streamref", "num", "hexnum", "ident"}
 
-    # Stream candidacy: consistent explicit width >=128 and every occurrence is
-    # an equality operand (structurally) opposite a candidate.
-    def stream_structurally_ok(sidx) -> bool:
-        widths = stream_widths.get(sidx, set())
-        if None in widths or len(widths) != 1:
-            return False  # bare / inconsistent annotation -> fail closed
-        (w,) = tuple(widths)
-        if w < MIN_SHRINK_WIDTH:
+    def _operand_complete(pos: int, outward: int) -> bool:
+        j = pos + outward
+        if j < 0 or j >= n:
+            return True
+        nb = toks[j]
+        if nb.kind in _VALUEISH:
             return False
-        for pos in stream_occurrences[sidx]:
-            opp = opposite_of(pos)
-            if opp is None or not _is_candidate_operand(opp):
-                return False
+        if nb.kind == "op" and nb.text in _DISQ_OPS:
+            return False
         return True
 
-    candidate_streams = {
-        s
-        for s in stream_occurrences
-        if s not in exclude_streams and stream_structurally_ok(s)
-    }
+    edges = []
+    for pos, t in enumerate(toks):
+        if t.kind == "op" and t.text in _EQ_OPS:
+            if pos - 1 < 0 or pos + 1 >= n:
+                continue
+            if not _operand_complete(pos - 1, -1) or not _operand_complete(pos + 1, +1):
+                continue          # compound operand -> outside the supported fragment
+            edges.append((pos - 1, pos + 1, t.text))
 
-    # Fixpoint: a stream stays in S only if every occurrence's opposite is a
-    # >=128 literal/zero OR a stream still in S. (Handles iN = iM chains.)
+    edge_of: dict = {}
+    for lpos, rpos, op in edges:
+        edge_of.setdefault(lpos, []).append((rpos, op))
+        edge_of.setdefault(rpos, []).append((lpos, op))
+
+    def operand_width(pos):
+        """Declared canonical width of a single-token operand, or None."""
+        t = toks[pos]
+        if t.kind == "streamref":
+            ref = _ref_of(t, pos)
+            return None if ref is None or ref.width < 0 else ref.width
+        if t.kind == "bvlit":
+            info = _lit_of(t)
+            return None if info is None else info["width"]
+        if t.kind == "num" and t.text == "0":
+            return 0      # bare zero: width-agnostic emptiness operand
+        return None
+
+    def is_zero_operand(pos):
+        t = toks[pos]
+        if t.kind == "num" and t.text == "0":
+            return True
+        if t.kind == "bvlit":
+            info = _lit_of(t)
+            return bool(info and info["is_zero"])
+        return False
+
+    # Per-stream resolution: one consistent, explicit, wide-enough annotation.
+    unresolved: set = set(unknown)
+    for sidx, occ in occurrences.items():
+        widths = {r.width for r in occ}
+        if -1 in widths or len(widths) != 1:
+            unresolved.add(sidx)          # unannotated or inconsistent -> never invent one
+    candidates = set()
+    for sidx, occ in occurrences.items():
+        if sidx in unresolved or sidx in exclude_streams:
+            continue
+        if occ[0].width < MIN_SHRINK_WIDTH:
+            continue
+        candidates.add(sidx)
+
+    def occurrence_ok(ref: _Ref, live: set) -> bool:
+        partners = edge_of.get(ref.pos)
+        if not partners:
+            return False                              # not an equality operand
+        if _enclosing_is_funccall(toks, ref.pos):
+            return False
+        for other_pos, _op in partners:
+            if is_zero_operand(other_pos):
+                continue                              # emptiness check: always fine
+            ow = operand_width(other_pos)
+            if ow is None or ow != ref.width:
+                return False                          # W1.3: canonical widths must AGREE
+            ot = toks[other_pos]
+            if ot.kind == "bvlit":
+                continue
+            if ot.kind == "streamref":
+                oref = _ref_of(ot, other_pos)
+                if oref is None or oref.io != "i" or oref.index not in live:
+                    return False
+                continue
+            return False
+        return True
+
+    # Dependency closure, once, to a fixpoint.
     changed = True
     while changed:
         changed = False
-        for sidx in list(candidate_streams):
-            ok = True
-            for pos in stream_occurrences[sidx]:
-                opp = opposite_of(pos)
-                if opp is None:
-                    ok = False
-                    break
-                if opp.kind == "streamref":
-                    oinfo = _streamref_info(opp)
-                    if oinfo is None or oinfo[0] not in candidate_streams:
-                        ok = False
-                        break
-                elif not _is_candidate_operand(opp):
-                    ok = False
-                    break
-            if not ok:
-                candidate_streams.discard(sidx)
+        for sidx in list(candidates):
+            if not all(occurrence_ok(r, candidates) for r in occurrences[sidx]):
+                candidates.discard(sidx)
                 changed = True
 
-    # Literal edits: a wide hex/zero literal (or bare zero) that is an operand of
-    # an =/!= opposite a shrunk stream.
-    literal_edits = []
-    for pos, t in enumerate(toks):
-        if t.kind == "bvlit":
-            info = _bvlit_info(t)
-            if info is None:
-                continue
-            hex_digits, width, is_zero = info
-            if width < MIN_SHRINK_WIDTH:
-                continue
-            opp = opposite_of(pos)
-            if opp is None or opp.kind != "streamref":
-                continue
-            oinfo = _streamref_info(opp)
-            if oinfo is None or oinfo[0] not in candidate_streams:
-                continue
-            literal_edits.append((t, "zero" if is_zero else "hex"))
-        elif t.kind == "num" and t.text == "0":
-            opp = opposite_of(pos)
-            if opp is None or opp.kind != "streamref":
-                continue
-            oinfo = _streamref_info(opp)
-            if oinfo is None or oinfo[0] not in candidate_streams:
-                continue
-            literal_edits.append((t, "zero"))
+    # Literal edits derive from the SETTLED set, in both orientations.
+    lit_edits = []
+    seen_lit = set()
+    for sidx in candidates:
+        for ref in occurrences[sidx]:
+            for other_pos, _op in edge_of.get(ref.pos, []):
+                if other_pos in seen_lit:
+                    continue
+                ot = toks[other_pos]
+                if ot.kind == "bvlit":
+                    info = _lit_of(ot)
+                    if info is None:
+                        continue
+                    seen_lit.add(other_pos)
+                    lit_edits.append((ot, "zero" if info["is_zero"] else "hex"))
+                elif ot.kind == "num" and ot.text == "0":
+                    seen_lit.add(other_pos)
+                    lit_edits.append((ot, "zero"))
 
-    return candidate_streams, literal_edits, toks
+    return _Plan(
+        shrunk=candidates,
+        refs=refs,
+        unknown_streams=unknown,
+        unresolved=unresolved,
+        ann_edits=[],
+        lit_edits=lit_edits,
+        edges=edges,
+    )
+
+
+def wide_input_streams(text: str) -> frozenset:
+    """Input streams referenced at >= MIN_SHRINK_WIDTH, from a standalone scan.
+
+    Used on the fallback paths so a classifier failure cannot report a falsely
+    empty set.
+    """
+    out = set()
+    try:
+        for t in _tokenize(text or ""):
+            if t.kind != "streamref":
+                continue
+            ref = _ref_of(t, -1)
+            if ref is not None and ref.io == "i" and ref.width >= MIN_SHRINK_WIDTH:
+                out.add(ref.index)
+    except Exception:  # a scan must never break the eval path
+        pass
+    return frozenset(out)
 
 
 # --- Rewrite ------------------------------------------------------------------
 
 def _shrunk_streamref_text(tok: _Tok, width: int) -> str:
-    """Rewrite a streamref's type annotation to the current shrink width."""
-    m = _STREAMREF_RE.match(tok.text)
-    return f"i{m.group(2)}[t]:bv[{width}]"
+    """Back-compat helper. Rewrites ONLY the type annotation, preserving the time
+    expression -- `i12[t-1]:bv[384]` must not become `i12[t]:bv[W]`."""
+    ref = _ref_of(tok, -1)
+    if ref is None:
+        return tok.text
+    return f"{ref.io}{ref.index}[{ref.time_expr}]:bv[{width}]"
 
 
 def _apply_edits(text: str, edits: list) -> str:
@@ -497,150 +647,268 @@ def _apply_edits(text: str, edits: list) -> str:
     return text
 
 
+class ShrinkAuditFailure(Exception):
+    """The rewrite did not match the plan. The classifier and the rewriter
+    disagree, which is the invariant this module rests on -- never dispatch."""
+
+
+def _audit(canonical: str, runtime: str, plan: _Plan, width: int, id_by_pos: dict) -> None:
+    """Independent edit-coverage audit.
+
+    Deliberately does NOT re-run the classifier on the rewritten text -- that would
+    share its blind spots. It compares the tokens actually produced against the
+    ORIGINAL occurrence/type information: only approved type-annotation and
+    literal-payload spans may differ, every other token is identical, time
+    expressions are unchanged, and each literal substitution matches the plan.
+    """
+    before = _tokenize(canonical)
+    after = _tokenize(runtime)
+    if len(before) != len(after):
+        raise ShrinkAuditFailure(
+            f"token count changed: {len(before)} -> {len(after)}"
+        )
+    approved_lit = {tok.start: kind for tok, kind in plan.lit_edits}
+    covered = {s: 0 for s in plan.shrunk}
+    for pos, (b, a) in enumerate(zip(before, after)):
+        if b.kind != a.kind:
+            approved_zero = (
+                b.kind == "num" and a.kind == "bvlit"
+                and approved_lit.get(b.start) == "zero"
+            )
+            if not approved_zero:
+                raise ShrinkAuditFailure(f"token {pos} kind {b.kind} -> {a.kind}")
+        if b.text == a.text:
+            if b.kind in ("bvlit", "num") and b.start in approved_lit:
+                raise ShrinkAuditFailure(f"planned literal at {pos} was not rewritten")
+            continue
+        # Changed: it must be an approved annotation or literal-payload edit.
+        if b.kind == "streamref":
+            rb, ra = _ref_of(b, pos), _ref_of(a, pos)
+            if rb is None or ra is None:
+                raise ShrinkAuditFailure(f"unparsable streamref at {pos}")
+            if rb.io != ra.io or rb.index != ra.index:
+                raise ShrinkAuditFailure(f"stream identity changed at {pos}")
+            if rb.time_expr != ra.time_expr:
+                raise ShrinkAuditFailure(
+                    f"time expression changed at {pos}: {rb.time_expr} -> {ra.time_expr}"
+                )
+            if rb.index not in plan.shrunk:
+                raise ShrinkAuditFailure(f"unplanned stream rewrite at {pos}")
+            if ra.width != width:
+                raise ShrinkAuditFailure(
+                    f"stream {rb.index} rewritten to bv[{ra.width}], expected bv[{width}]"
+                )
+            covered[rb.index] = covered.get(rb.index, 0) + 1
+        elif b.kind in ("bvlit", "num"):
+            kind = approved_lit.get(b.start)
+            if kind is None:
+                raise ShrinkAuditFailure(f"unplanned literal rewrite at {pos}")
+            info = _lit_of(a)
+            if info is None:
+                raise ShrinkAuditFailure(f"rewritten literal at {pos} is not a valid constant")
+            if info["width"] != width:
+                raise ShrinkAuditFailure(
+                    f"literal at {pos} rewritten at bv[{info['width']}], expected bv[{width}]"
+                )
+            expected = 0 if kind == "zero" else id_by_pos.get(b.start)
+            if expected is None or info["value"] != expected:
+                raise ShrinkAuditFailure(
+                    f"literal at {pos} encodes {info['value']}, plan said {expected}"
+                )
+        else:
+            raise ShrinkAuditFailure(f"unapproved change at token {pos}: {b.text!r} -> {a.text!r}")
+    # Every occurrence of a shrunk stream must have been rewritten.
+    for sidx in plan.shrunk:
+        want = sum(1 for r in plan.refs if r.io == "i" and r.index == sidx)
+        if covered.get(sidx, 0) != want:
+            raise ShrinkAuditFailure(
+                f"stream {sidx}: rewrote {covered.get(sidx, 0)} of {want} occurrences"
+            )
+
+
 def prepare_rule(full_width_text: str, exclude_streams=frozenset()) -> PreparedTauSpec:
     """Produce the canonical/runtime split for a normalized full-width rule.
 
-    On DB/intern failure the whole spec falls back to full-width (shrink disabled,
-    all-or-nothing -- never a partial mix). MAY raise ShrinkWidthOverflow if a rule
-    literal interns to an id beyond the current process width -- that is propagated
-    deliberately so the node can re-exec at a wider width (do not swallow it).
+    On DB/intern failure, or on any audit failure, the whole spec falls back to
+    full-width (shrink disabled, all-or-nothing -- never a partial mix). MAY raise
+    ShrinkWidthOverflow if a rule literal interns to an id beyond the current
+    process width -- propagated deliberately so the node can re-exec (do not swallow).
     """
     canonical = full_width_text or ""
     if not canonical.strip():
-        return PreparedTauSpec(canonical, canonical, False, frozenset())
+        return PreparedTauSpec(canonical, canonical, False, frozenset(), frozenset())
 
     width = current_shrink_width()
 
     try:
-        shrunk_streams, literal_edits, toks = _classify(canonical, exclude_streams)
+        plan = _plan(canonical, exclude_streams)
     except Exception as exc:  # classifier must never break the eval path
         logger.warning("tau_shrink: classify failed, disabled reason=%s", exc)
-        return PreparedTauSpec(canonical, canonical, False, frozenset())
+        return PreparedTauSpec(
+            canonical, canonical, False, frozenset(), wide_input_streams(canonical)
+        )
 
-    if not shrunk_streams and not literal_edits:
-        return PreparedTauSpec(canonical, canonical, False, frozenset())
+    if not plan.shrunk and not plan.lit_edits:
+        return PreparedTauSpec(
+            canonical, canonical, False, frozenset(), wide_input_streams(canonical)
+        )
 
-    # Intern ALL hex literals first (all-or-nothing). On DB failure: full-width.
+    # Intern ALL literals first (all-or-nothing). On DB failure: full-width.
     # ShrinkWidthOverflow is NOT caught here -- it must propagate to trigger re-exec.
     edits = []
+    id_by_pos = {}
     try:
-        for tok, kind in literal_edits:
+        for tok, kind in plan.lit_edits:
             if kind == "zero":
+                id_by_pos[tok.start] = 0
                 edits.append((tok.start, tok.end, f"{{ 0 }}:bv[{width}]"))
             else:
-                info = _bvlit_info(tok)
-                hex_digits, vwidth, _is_zero = info
-                id_num = intern_value(hex_digits, vwidth)
-                if id_num == RESERVED_EMPTY_ID:
-                    edits.append((tok.start, tok.end, f"{{ 0 }}:bv[{width}]"))
-                else:
-                    edits.append(
-                        (tok.start, tok.end, f"{{ {id_num} }}:bv[{width}]")
-                    )
+                info = _lit_of(tok)
+                id_num = intern_value(info["hex_digits"], info["width"])
+                id_by_pos[tok.start] = id_num
+                edits.append((tok.start, tok.end, f"{{ {id_num} }}:bv[{width}]"))
     except ShrinkUnavailable as exc:
         logger.warning("tau_shrink: intern failed, disabled reason=%s", exc)
-        return PreparedTauSpec(canonical, canonical, False, frozenset())
+        return PreparedTauSpec(
+            canonical, canonical, False, frozenset(), wide_input_streams(canonical)
+        )
 
-    # Rewrite shrunk-stream annotations to the current width (every occurrence).
-    for tok in toks:
-        if tok.kind != "streamref":
+    # Annotation-only rewrites, every occurrence of every shrunk stream.
+    for ref in plan.refs:
+        if ref.io != "i" or ref.index not in plan.shrunk:
             continue
-        info = _streamref_info(tok)
-        if info is None or info[0] not in shrunk_streams:
-            continue
-        edits.append((tok.start, tok.end, _shrunk_streamref_text(tok, width)))
+        if ref.ann_start < 0:
+            # unannotated occurrences never reach here (they are unresolved), but
+            # fail closed rather than synthesize a type.
+            logger.error("tau_shrink: unannotated occurrence of shrunk i%s", ref.index)
+            return PreparedTauSpec(
+                canonical, canonical, False, frozenset(), wide_input_streams(canonical)
+            )
+        edits.append((ref.ann_start, ref.ann_end, f":bv[{width}]"))
 
     runtime_text = _apply_edits(canonical, edits)
+
+    try:
+        _audit(canonical, runtime_text, plan, width, id_by_pos)
+    except ShrinkAuditFailure as exc:
+        logger.error("tau_shrink: refusing partial shrink, audit failed: %s", exc)
+        return PreparedTauSpec(
+            canonical, canonical, False, frozenset(), wide_input_streams(canonical)
+        )
+
     logger.info(
         "tau_shrink: shrunk %d literals, streams=%s, width=bv[%d]",
-        len(literal_edits),
-        sorted(shrunk_streams),
+        len(plan.lit_edits),
+        sorted(plan.shrunk),
         width,
     )
-    return PreparedTauSpec(
-        canonical, runtime_text, True, frozenset(shrunk_streams)
+    wide_left = frozenset(
+        r.index for r in plan.refs
+        if r.io == "i" and r.width >= MIN_SHRINK_WIDTH and r.index not in plan.shrunk
     )
+    return PreparedTauSpec(
+        canonical, runtime_text, True, frozenset(plan.shrunk), wide_left
+    )
+
 
 
 # --- Stream value shrink ------------------------------------------------------
+
+
+class RuntimeEncoded(str):
+    """A stream value that is ALREADY in runtime (interned) form.
+
+    W4: the adapter must never guess. Previously a bare decimal was assumed to be
+    an internal id and passed through, so an externally supplied canonical `"1"`
+    compared equal to whichever 384-bit address happened to hold interned id 1.
+    Re-normalising an already-encoded value is a real internal need, so it gets an
+    explicit, distinguishable type instead of a heuristic.
+    """
+    __slots__ = ()
 
 _STREAM_LITERAL_RE = re.compile(r"^\{\s*([^{}]*?)\s*\}\s*:\s*bv\[\s*(\d+)\s*\]$")
 
 
 def shrink_stream_value(value, stream_index: int, shrunk_streams) -> str:
-    """Shrink a single input-stream value, idempotently.
+    """Encode ONE canonical input-stream value for the runtime representation.
 
-    The native engine expects input-stream VALUES as BARE constants (a decimal
-    like `1`, or `#x..` hex) -- NOT the `{ .. }:bv[N]` literal wrapper, which is
-    only valid for in-spec literals. (This mirrors the existing i3/i4 path, which
-    feeds bare interned ids.) So a shrunk address value becomes the bare decimal
-    id; zero becomes bare `0`.
+    The native engine expects input-stream VALUES as BARE constants (`1`, `#x..`)
+    -- never the `{ .. }:bv[N]` wrapper, which is in-spec literal syntax only.
 
-    Only shrinks when the stream index is in shrunk_streams AND the value is a
-    `{ #x.. }:bv[N]` (N>=128) literal carrying its declared width (so its intern
-    key matches the rule literal's). Bare ints/decimals/already-shrunk values
-    pass through unchanged (idempotent).
+    For a stream in `shrunk_streams` the value is interned BY VALUE at the
+    stream's declared canonical width. A bare decimal is a canonical value like
+    any other; it is NOT accepted as an internal id, because an external caller
+    can supply one (apply forwards user custom inputs here). Pass a
+    `RuntimeEncoded` when the value is genuinely already encoded.
 
-    Raises ShrinkUnavailable if a value that SHOULD shrink cannot be interned --
-    callers must fail closed rather than feed a mixed-width convention.
+    Raises ShrinkUnavailable if a value that MUST shrink cannot be interned --
+    callers fail closed rather than feed a mixed-width convention.
     """
+    if isinstance(value, RuntimeEncoded):
+        return str(value)
     text = "" if value is None else str(value).strip()
     if stream_index not in shrunk_streams or not text:
         return text
+
     m = _STREAM_LITERAL_RE.match(text)
-    if not m:
-        return text  # bare int / decimal / already shrunk -> idempotent passthrough
-    inner = m.group(1).strip()
-    width = int(m.group(2))
-    if width < MIN_SHRINK_WIDTH:
-        return text
-    if inner.lower().startswith("#x"):
-        hex_digits = inner[2:]
-    elif inner == "0":
-        return "0"
+    if m:
+        inner = m.group(1).strip()
+        width = int(m.group(2))
+        if width < MIN_SHRINK_WIDTH:
+            return text
     else:
-        return text  # not a hex address literal -> leave untouched
-    id_num = intern_value(hex_digits, width)  # may raise ShrinkUnavailable
-    return str(id_num)  # bare decimal id (0 for empty)
+        # bare constant: canonical value at the stream's shrink-eligible width
+        inner = text
+        width = None
+
+    low = inner.lower()
+    if low.startswith("#x"):
+        hex_digits = low[2:]
+        if not hex_digits or any(c not in "0123456789abcdef" for c in hex_digits):
+            return text
+    elif low.startswith("#b"):
+        bits = low[2:]
+        if not bits or any(c not in "01" for c in bits):
+            return text
+        hex_digits = format(int(bits, 2), "x")
+    elif low.isdigit():
+        hex_digits = format(int(low), "x")
+    else:
+        return text
+
+    if width is None:
+        # A bare value carries no declared width. Intern it at the width the rule
+        # literals used, so the stream value and the literal collide on one id.
+        width = _canonical_width_for(stream_index)
+        if width is None:
+            return text
+
+    if _hex_is_zero(hex_digits):
+        return "0"
+    return str(intern_value(hex_digits, width))
 
 
-# --- Output expansion (deferred, with detection guard) ------------------------
+# Canonical widths for shrink-eligible input streams. A bare stream value has no
+# declared width of its own, and the intern key is width-tagged, so the adapter
+# needs the stream's canonical width to land on the same id as the rule literal.
+_CANONICAL_STREAM_WIDTHS = {3: 384, 4: 384, 12: 384}
+for _slot in range(18, 26):
+    _CANONICAL_STREAM_WIDTHS[_slot] = 384
+
+
+def _canonical_width_for(stream_index: int):
+    return _CANONICAL_STREAM_WIDTHS.get(stream_index)
+
 
 def expand_output_value(value, output_index=None) -> str:
-    """Identity (output expansion is deferred), but loudly flags a value that
-    looks like a leaked shrunk address id on a non-verdict stream.
+    """Identity.
 
-    Heuristic to avoid false alarms on boolean verdicts: only warns when the
-    value parses as an integer > 1 (beyond the 0/1 verdict range) on a
-    non-verdict stream AND that id exists in the intern store. Reserved ids 0/1
-    overlap with verdict values, so they are never flagged.
-
-    Now that the shrink layer has its own dense id space, a hit here means the
-    value really is a shrink id -- there are no unrelated consensus yids sharing
-    the sequence to collide with. Denser ids do make small integers likelier to
-    be assigned, so the 0/1 verdict exemption still carries the false-alarm load.
+    W4: the previous implementation guessed that an ordinary numeric output was a
+    leaked interned id whenever that number happened to exist in the intern table
+    -- numeric overlap is not provenance, and an ordinary fee could be diagnosed
+    as a leak. The optimization is instead RESTRICTED so encoded values cannot
+    reach an output at all: `_plan` only ever treats INPUT streams as candidates,
+    and an equality whose opposite operand is an output stream disqualifies the
+    component. So there is nothing here to expand, and nothing to guess about.
     """
-    text = "" if value is None else str(value).strip()
-    m = _STREAM_LITERAL_RE.match(text)
-    inner = m.group(1).strip() if m else text
-    if inner.lstrip("#x").isdigit() or inner.isdigit():
-        try:
-            n = int(inner[2:], 16) if inner.lower().startswith("#x") else int(inner)
-        except ValueError:
-            return text
-        if n > 1 and output_index not in _VERDICT_OUTPUT_STREAMS:
-            try:
-                stored = db.get_shrink_key_by_id(n)
-            except Exception:
-                stored = None
-            if stored:
-                logger.error(
-                    "tau_shrink: output o%s value=%s looks like a shrunk address "
-                    "id (interned as %s) but output expansion is not configured. "
-                    "A rule may be emitting a node-local id -- this would diverge "
-                    "across nodes.",
-                    output_index,
-                    n,
-                    stored[:16],
-                )
-    return text
+    return "" if value is None else str(value).strip()
