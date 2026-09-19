@@ -62,6 +62,7 @@ FEE_BEARING_TX_TYPES = frozenset(
 )
 from consensus.tx_signing import verify_tx_signature
 import tau_native
+import tau_session
 import tau_shrink
 
 from errors import (
@@ -888,6 +889,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         parent_balances: Optional[Dict[str, int]] = None,
         parent_last_transfer_ts: Optional[Dict[str, int]] = None,
         target_last_transfer_ts: Optional[Dict[str, int]] = None,
+        session=None,
     ) -> TauExecutionResult:
         """
         Apply transactions to the current state.
@@ -911,6 +913,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             block_timestamp = 0
             
         lifecycle_mgr = target_lifecycle if target_lifecycle is not None else chain_state._lifecycle_manager
+        # The evaluator this apply drives. Defaults to the live in-process one, so
+        # nothing changes until a caller hands in something else.
+        _session = session if session is not None else tau_session.default_session()
 
         accepted_txs = []
         rejected_txs = []
@@ -1970,11 +1975,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                         if execution_success and accepted_in_block and not hard_reject:
                           try:
-                            # Wait for Tau availability logic
-                            if not tau_manager.tau_ready.is_set():
-                                tau_manager.tau_ready.wait(timeout=5)
-
-                            if not tau_manager.tau_ready.is_set():
+                            # The rule goes through the evaluator SESSION rather
+                            # than straight to the manager: the same code has to be
+                            # able to drive a disposable worker, and the engine
+                            # offers no rollback, so which evaluator runs a rule
+                            # cannot be a module-level fact. Dispatch is unchanged.
+                            if not _session.ready(timeout=5):
                                 logger.error("Tau process not ready for rule execution")
                                 execution_success = False
                                 tx_receipt["logs"].append("Tau not ready")
@@ -1983,11 +1989,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     hard_reject = True
                                     tx_receipt["reason"] = "rule_not_applied"
                             else:
-                                output = tau_manager.communicate_with_tau(
-                                    rule_text=rule_text,
-                                    target_output_stream_index=0,
-                                    apply_rules_update=True # Apply update for consensus
-                                )
+                                output = _session.apply_rule(rule_text, target=0)
 
                                 tx_receipt["logs"].append(f"Tau(rule) o0: {output}")
 
@@ -1997,7 +1999,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 # never routed -- an unsatisfiable rule is
                                 # evaluated into the no-revision branch, which the
                                 # string heuristic reads as success.
-                                receipt = tau_manager.get_last_revision_receipt()
+                                receipt = _session.last_receipt()
                                 if receipt is not None:
                                     tau_failed = not receipt.get("accepted", False)
                                     tx_receipt["logs"].append(
