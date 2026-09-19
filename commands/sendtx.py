@@ -313,6 +313,70 @@ def _process_transfers_operation(transfers, sender_pubkey):
     return True, {"transfers": validated_transfers, "tau_inputs": tau_inputs}, None
 
 
+
+def _preflight_prepared_rule(rule_text: str):
+    """Validate the PREPARED rule against the live runtime baseline.
+
+    Returns an error envelope to return to the caller, or None to continue.
+
+    Admission stays node-local policy here: this can only reject a transaction
+    that apply would have refused anyway, turning "admitted, then silently never
+    applied" into a reason at submit time. It never admits anything new, and an
+    operational failure is never reported as a rule rejection.
+    """
+    try:
+        import tau_manager
+        import tau_preflight
+    except Exception:  # pragma: no cover - import-time environment problem
+        return None
+
+    # Mock mode has no interpreter to be compatible with.
+    if getattr(tau_manager, "tau_test_mode", False):
+        return None
+
+    try:
+        prepared = tau_manager._prepare_rule_for_tau(rule_text)
+    except Exception as exc:
+        # ShrinkTypeConflict and friends: this process cannot represent the rule.
+        # Node-local, so reject with a distinct code rather than TX_REJECTED.
+        logger.warning("Rule cannot be represented in this process: %s", exc)
+        return _qt_err(
+            "ADMISSION_UNAVAILABLE",
+            f"This node cannot currently represent that rule: {exc}",
+        )
+    if prepared is None:
+        return None
+
+    # The interpreter's own composed spec -- deliberately the RUNTIME form, since
+    # that is the representation the prepared rule has to be compatible with.
+    baseline = tau_manager.last_known_tau_spec
+    if not baseline:
+        return None
+
+    result = tau_preflight.preflight_rule(
+        baseline,
+        prepared.runtime_text,
+        context=tau_preflight.capture_context(
+            tau_manager.get_evaluator_state(), mapping_epoch=None
+        ),
+    )
+    if result.verdict == tau_preflight.REJECT:
+        logger.warning("Rule preflight rejected the prepared text: %s", result.detail)
+        return _qt_err(
+            "TX_REJECTED",
+            f"Transaction rejected by Tau (rule preflight). {result.detail}",
+        )
+    if result.verdict == tau_preflight.UNAVAILABLE:
+        # This is an ADDITIONAL screen on top of the canonical compile above. If
+        # it cannot run -- no binding, no worker, an unreadable capture -- the
+        # transaction keeps whatever verdict the existing path gave it. Turning an
+        # inability to run an extra check into a rejection would make admission
+        # depend on spawning a worker, and would report an operational failure as
+        # a verdict about someone's rule.
+        logger.warning("Rule preflight unavailable, continuing: %s", result.detail)
+    return None
+
+
 def queue_transaction(json_blob: str, propagate: bool = True, *,
                       dry_run: bool = False, skip_tau_eval: bool = False) -> dict:
     """Validate a transaction and (unless dry_run) queue it in the mempool.
@@ -693,6 +757,15 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                                     f"Transaction rejected by Tau (rule validation). {compile_err}",
                                 )
                             logger.info("Tau rule validation successful (isolated compile).")
+
+                            # The canonical compile above runs in a FRESH process,
+                            # which has no type commitments and does no shrinking,
+                            # so it passes text the live process cannot type. Now
+                            # validate what apply will actually feed: the PREPARED
+                            # runtime rule against the runtime baseline.
+                            preflight_err = _preflight_prepared_rule(rule_text)
+                            if preflight_err is not None:
+                                return preflight_err
 
             # Step 2: Custom Input Validation (transfer-less user_tx only).
             # For txs WITH transfers the custom streams are merged into the
