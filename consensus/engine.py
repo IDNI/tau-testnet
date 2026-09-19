@@ -1907,6 +1907,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     
                     custom_tau_inputs[idx] = normalized_val
 
+            # W7: the rule path writes canonical application-rules state (and the
+            # hashed tau bytes) as soon as the engine accepts the text, while fee
+            # settlement downstream can still reject the whole transaction. A
+            # rejected transaction then kept its rule -- probe: receipt
+            # fee_limit_exceeded, fee_charged 0, transaction rejected, snapshot
+            # still carrying the new rule. Stage the canonical effect the way
+            # balance writes are already staged, and roll it back with them if the
+            # verdict goes the other way. Bound for EVERY transaction, not just the
+            # ones that reach the rule path.
+            _rule_prior_rules_state = None
+            _rule_prior_tau_bytes = current_tau_bytes
+            _rule_touched_canonical = False
+            try:
+                if hasattr(chain_state, "get_application_rules_state"):
+                    _rule_prior_rules_state = chain_state.get_application_rules_state()
+            except Exception:
+                _rule_prior_rules_state = None
+
             if reserved_error:
                 logger.error("Transaction invalid: %s", reserved_error)
                 accepted_in_block = False
@@ -1973,11 +1991,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
                                 tx_receipt["logs"].append(f"Tau(rule) o0: {output}")
 
-                                tau_failed = (
-                                    isinstance(output, str)
-                                    and "error" in output.lower()
-                                    and "x1001" not in output.lower()
-                                )
+                                # W6: prefer what the engine actually reported
+                                # over parsing the formatted output. A receipt
+                                # separates a genuine no-op from a rule that was
+                                # never routed -- an unsatisfiable rule is
+                                # evaluated into the no-revision branch, which the
+                                # string heuristic reads as success.
+                                receipt = tau_manager.get_last_revision_receipt()
+                                if receipt is not None:
+                                    tau_failed = not receipt.get("accepted", False)
+                                    tx_receipt["logs"].append(
+                                        f"Tau(rule) outcome: {receipt.get('outcome')}"
+                                    )
+                                else:
+                                    tau_failed = (
+                                        isinstance(output, str)
+                                        and "error" in output.lower()
+                                        and "x1001" not in output.lower()
+                                    )
                                 if tau_failed:
                                     logger.warning("Tau rejected rule: %s", output)
                                     execution_success = False
@@ -2023,6 +2054,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         current_tau_bytes = rules_text.encode("utf-8")
                                     else:
                                         current_tau_bytes += rule_op_data.encode("utf-8")
+                                    _rule_touched_canonical = True
                                     tx_receipt["logs"].append("Rule applied")
 
                           except tau_shrink.ShrinkTypeConflict as e:
@@ -2353,6 +2385,37 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if (accepted_in_block and not hard_reject and staged_writes
                     and target_balances is not None):
                 target_balances.update(staged_writes)
+
+            # W7: same verdict, same moment -- a transaction that does not stay
+            # accepted must not leave its rule in canonical state. Replay is
+            # excluded for the same reason the landed-check is: historical blocks
+            # restore application-rules state from the snapshot, so rewriting it
+            # here would diverge reconstruction.
+            if (_rule_touched_canonical and not replay_mode
+                    and not (accepted_in_block and not hard_reject)):
+                current_tau_bytes = _rule_prior_tau_bytes
+                if (_rule_prior_rules_state is not None
+                        and hasattr(chain_state, "save_application_rules_state")):
+                    try:
+                        chain_state.save_application_rules_state(_rule_prior_rules_state)
+                        logger.warning(
+                            "rolled back the canonical application rule of a rejected "
+                            "transaction (reason=%s)", tx_receipt.get("reason")
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "could not roll back the canonical application rule of a "
+                            "rejected transaction: %s", exc
+                        )
+                # The live interpreter still holds the rule: the engine commits a
+                # stream's width on the first accepted revision and there is no
+                # in-process way to undo that. Canonical state -- what is hashed,
+                # persisted and replayed -- is correct again; the evaluator is
+                # rebuilt from it on the next reconstruction.
+                logger.warning(
+                    "the live interpreter still holds the rolled-back rule until "
+                    "it is next reconstructed from canonical state"
+                )
 
             if accepted_in_block and not hard_reject:
                 # Record this sender's transfer time for the cooldown stream

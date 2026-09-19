@@ -93,3 +93,65 @@ def test_a_live_transaction_still_registers_its_clause():
     _, lifecycle = _apply(sequence_number=0, seq_state={})
     assert lifecycle.rule_offers.accepted_clauses[(SENDER.lower(), STREAM)] != "PREVIOUS POLICY", \
         "a valid transaction must still register its clause"
+
+
+# --- the rule must not survive a later rejection ------------------------------
+
+RULE = "always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."
+
+
+def _apply_rule_with_fee(*, fee_limit, saves, states):
+    """Apply a rule-bearing tx whose fee settlement may reject it.
+
+    `states` is consumed by the application-rules getter, so the state captured
+    BEFORE the rule is applied differs from the state after it landed -- which is
+    what makes the rollback assertion meaningful.
+    """
+    engine = TauConsensusEngine(state_store=MagicMock())
+    engine._state_store.commit.side_effect = lambda snap: snap
+    tx = {
+        "tx_id": "r1",
+        "tx_type": "user_tx",
+        "sender_pubkey": SENDER,
+        "sequence_number": 0,
+        "fee_limit": fee_limit,
+        "operations": {"0": RULE},
+    }
+
+    def _get_state():
+        return states.pop(0) if len(states) > 1 else states[0]
+
+    with patch("tau_manager.tau_ready") as ready, \
+         patch("tau_manager.communicate_with_tau", return_value="ok"), \
+         patch("tau_manager.communicate_with_tau_multi", return_value={9: "7"}), \
+         patch("chain_state.get_application_rules_state", side_effect=_get_state), \
+         patch("chain_state.save_application_rules_state",
+               side_effect=lambda text: saves.append(text), create=True):
+        ready.is_set.return_value = True
+        return engine.apply(
+            TauStateSnapshot(b"hash", b"rules", {}),
+            [tx], 1700000000,
+            target_balances={SENDER: 1000},
+            target_sequences={},
+            proposer_pubkey=PROPOSER,
+            block_height=1,
+        )
+
+
+def test_a_rule_rejected_by_fee_settlement_is_rolled_back():
+    """Probe on the unpatched engine: receipt `fee_limit_exceeded`, fee_charged 0,
+    transaction rejected -- and the returned snapshot still carried the rule."""
+    saves = []
+    result = _apply_rule_with_fee(fee_limit="1", saves=saves, states=["", RULE])
+    assert "r1" in [t.get("tx_id") for t in result.rejected_transactions]
+    assert saves == [""], (
+        "a rejected transaction left its rule in canonical application state"
+    )
+
+
+def test_an_accepted_rule_is_not_rolled_back():
+    """Guard the guard: the rollback must not fire for a transaction that stays."""
+    saves = []
+    result = _apply_rule_with_fee(fee_limit="1000", saves=saves, states=["", RULE])
+    assert "r1" in [t.get("tx_id") for t in result.accepted_transactions]
+    assert saves == [], "an accepted transaction must keep its rule"

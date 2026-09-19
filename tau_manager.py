@@ -128,6 +128,18 @@ _runtime_shrunk_streams: frozenset = frozenset()
 _evaluator_state = tau_evaluator_state.EvaluatorState()
 
 
+_last_revision_receipt = None
+
+
+def get_last_revision_receipt():
+    """What the engine did with the most recent revision, or None.
+
+    W6: the apply path used to infer acceptance from a formatted output string,
+    which cannot tell a genuine no-op from a rule the engine never routed.
+    """
+    return _last_revision_receipt
+
+
 def get_evaluator_state() -> "tau_evaluator_state.EvaluatorState":
     return _evaluator_state
 
@@ -579,6 +591,11 @@ def communicate_with_tau(
              filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
              raise TauEngineCrash(msg)
 
+        # A receipt describes ONE call; never let a previous one answer for this
+        # one if this call raises before recording its own.
+        global _last_revision_receipt
+        _last_revision_receipt = None
+
         # --- Shrink: canonical (persisted) vs runtime (interpreter) split ---
         prepared = None
         if rule_text is not None:
@@ -651,6 +668,10 @@ def communicate_with_tau(
                 )
         except Exception:
             pass
+
+        _last_revision_receipt = getattr(
+            tau_direct_interface, "last_revision_receipt", None
+        )
 
         # Commit runtime shrink state (shrunk-stream set) AFTER a successful
         # interpreter update.

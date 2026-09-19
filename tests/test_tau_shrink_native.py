@@ -382,3 +382,58 @@ def test_unparenthesized_implication_applies_against_a_pinned_stream(tmp_path):
     # And it must actually MEAN something: the guarded sender is blocked.
     assert blocked == "0", f"guarded sender should be blocked (o5=0): {line}"
     assert allowed == "1", f"unrelated sender should be allowed (o5=1): {line}"
+
+
+# --- W6: the engine's own verdict, through the live wrapper -------------------
+_CHILD_RECEIPT = r'''
+import os, sys, tempfile
+os.environ["TAU_ENV"] = "test"
+os.environ["TAU_FORCE_TEST"] = "0"
+import config
+config.set_database_path(os.environ["SHRINK_DB"])
+import db; db.init_db()
+import tau_native, tau_manager
+
+boot = tempfile.NamedTemporaryFile("w", suffix=".tau", delete=False)
+boot.write(open(os.path.join(os.environ["REPO_ROOT"], "genesis.tau")).read())
+boot.close()
+iface = tau_native.TauInterface(boot.name)
+tau_manager.tau_direct_interface = iface
+tau_manager.tau_test_mode = False
+tau_manager.tau_ready.set()
+
+def outcome(rule):
+    tau_manager.communicate_with_tau(rule_text=rule, target_output_stream_index=0)
+    r = tau_manager.get_last_revision_receipt() or {}
+    return r.get("outcome"), r.get("accepted")
+
+changed = outcome("always ( o5[t]:bv[24] = { #x000007 }:bv[24] ).")
+noop    = outcome("always ( o5[t]:bv[24] = o5[t]:bv[24] ).")
+unsat   = outcome("always ( o5[t]:bv[24] = { #x000001 }:bv[24] && o5[t]:bv[24] = { #x000002 }:bv[24] ).")
+print("RECEIPT_RESULT", changed[0], changed[1], noop[0], noop[1], unsat[0], unsat[1])
+sys.stdout.flush()
+os._exit(0)
+'''
+
+
+def test_the_engines_own_verdict_reaches_the_caller(tmp_path):
+    """The wrapper rebuilds its interpreter from stdout after a revision, which
+    resets `spec_revision` to 0 -- so the evidence has to be captured before that
+    happens. Without it the caller can only parse a formatted string, which reads
+    an unsatisfiable rule (never routed) as success."""
+    script = tmp_path / "child_receipt.py"
+    script.write_text(_CHILD_RECEIPT)
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ)
+    env["SHRINK_DB"] = str(tmp_path / "receipt.db")
+    env["REPO_ROOT"] = repo_root
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True,
+                          text=True, env=env, timeout=120)
+    line = next((l for l in proc.stdout.splitlines() if l.startswith("RECEIPT_RESULT")), None)
+    assert line is not None, f"no result.\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    _, ch_out, ch_acc, np_out, np_acc, un_out, un_acc = line.split()
+    assert (ch_out, ch_acc) == ("ACCEPTED_CHANGED", "True"), line
+    assert (np_out, np_acc) == ("ACCEPTED_NOOP", "True"), line
+    # the one the string heuristic gets wrong
+    assert (un_out, un_acc) == ("REJECTED_NOT_ROUTED", "False"), line
