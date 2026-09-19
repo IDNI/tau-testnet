@@ -161,13 +161,41 @@ class _Session:
         named = {k.name: str(v) for k, v in (outs or {}).items()} if outs else None
         return named, [s.name for s in (asked or [])], cap
 
-    def revise(self, candidate: str, candidate_id: str) -> dict:
+    def revise(self, candidate: str, candidate_id: str, max_offers: int = 16) -> dict:
+        """Offer a candidate until the engine actually asks for i0.
+
+        Inputs are requested lazily and i0 is NOT requested on every step: after a
+        rule that introduces an input dependency, the next prompt asks for that
+        input alone. Treating the first step as the only chance to deliver reports
+        INCOMPLETE for a candidate the engine would have taken one step later.
+        The live wrapper loops for the same reason.
+
+        Filler steps advance logical time, so they are reported: a step log that
+        omits them cannot be replayed faithfully.
+        """
         before = self.itp.spec_revision
+        filler = []
+        for _ in range(max_offers):
+            with _Capture() as peek:
+                asked = self.tau.get_inputs_for_step(self.itp)
+            names = [s.name for s in (asked or [])]
+            if "i0" in names:
+                break
+            # Not offered i0 yet: advance with fallbacks and try again.
+            named, step_asked, cap = self._one_step({})
+            filler.append({"asked": step_asked, "outputs": named})
+            if named is None:
+                return {
+                    "ok": False, "outcome": INCOMPLETE, "candidate_id": candidate_id,
+                    "consumed": False, "asked": step_asked, "outputs": None,
+                    "filler_steps": filler, "diagnostics": cap.text,
+                    "deferred_diagnostics": "", "capture_complete": cap.complete,
+                    "binding_id": self.binding_id, **self.observe(),
+                }
+
         named, asked, cap = self._one_step({"i0": candidate})
         delivered = "i0" in asked
         if not delivered:
-            # The engine never asked for i0, so the candidate was never submitted.
-            # A returned output here says nothing about it.
             outcome = INCOMPLETE
         elif named is None:
             outcome = REJECTED_RULE
@@ -191,6 +219,7 @@ class _Session:
             "consumed": delivered and named is not None and named.get("o0") == "F",
             "asked": asked,
             "outputs": named,
+            "filler_steps": filler,
             "diagnostics": cap.text,
             "deferred_diagnostics": drain.text,
             "capture_complete": bool(cap.complete and drain.complete),
