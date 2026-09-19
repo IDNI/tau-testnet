@@ -61,7 +61,17 @@ FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST} | set(RULE_OFFER_TX_TYPES)
 )
 from consensus.tx_signing import verify_tx_signature
-from errors import BlockchainBug, TauCommunicationError, TauEngineBug, TauEngineCrash
+import tau_native
+import tau_shrink
+
+from errors import (
+    BlockchainBug,
+    TauCommunicationError,
+    TauEngineBug,
+    TauEngineCrash,
+    TauSpecIntegrationError,
+    TauSpecRejected,
+)
 
 # We need to import chain_state and tau_manager, but we must be careful about circular imports.
 # We'll import them inside methods or use a lazy import pattern if needed.
@@ -1905,8 +1915,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 tx_receipt["logs"].append(f"Error: {reserved_error}")
             else:
                 # --- Step 1: Rule Execution ---
+                # W7: the routed-clause path MUTATES -- it resolves the sender's
+                # open approval requests and replaces or removes their registered
+                # clause -- so it must not run for a transaction an earlier check
+                # already rejected. It used to be guarded only by `reserved_error`,
+                # so a transaction with (say) a stale sequence number still had its
+                # policy replaced and its pending approvals cancelled before the
+                # verdict was applied.
+                _verdict_still_open = (
+                    execution_success and accepted_in_block and not hard_reject
+                )
                 if rule_op_data is not None:
                      if isinstance(rule_op_data, str) and rule_op_data.strip() \
+                             and _verdict_still_open \
                              and _apply_o5_clause_routing(rule_op_data.strip()):
                         # Registered as this sender's policy clause; the
                         # composite was fed instead of accumulating the text.
@@ -2004,6 +2025,47 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         current_tau_bytes += rule_op_data.encode("utf-8")
                                     tx_receipt["logs"].append("Rule applied")
 
+                          except tau_shrink.ShrinkTypeConflict as e:
+                            # W3: node-local. This process cannot represent the
+                            # rule because of a width it already committed to;
+                            # another node, or this one after a restart, can.
+                            # Must never rewrite history on replay, and must
+                            # never be reported as an invalid rule.
+                            logger.error("Cannot represent rule in this process: %s", e)
+                            execution_success = False
+                            tx_receipt["logs"].append(f"Error: runtime type conflict: {e}")
+                            if not replay_mode:
+                                accepted_in_block = False
+                                hard_reject = True
+                                tx_receipt["reason"] = "rule_type_conflict"
+                          except TauSpecRejected as e:
+                            # W9: the engine refused the AUTHOR's text. Measured to
+                            # be a clean no-op (no revision, no type established,
+                            # interpreter still usable), so it is a deterministic
+                            # per-transaction verdict every node reaches -- and it
+                            # is NOT a node crash. Hard-rejects in replay too,
+                            # because the verdict is a function of the text alone.
+                            logger.warning("Tau rejected the submitted rule: %s", e)
+                            execution_success = False
+                            tx_receipt["logs"].append(f"Error: rule rejected by Tau: {e}")
+                            accepted_in_block = False
+                            hard_reject = True
+                            tx_receipt["reason"] = "rule_rejected"
+                          except TauSpecIntegrationError as e:
+                            # W9: the author's rule was fine and the runtime text
+                            # THIS NODE generated from it was not. Node-local
+                            # integration failure: never report it as an invalid
+                            # rule, and never rewrite history on replay.
+                            logger.error(
+                                "Node-generated runtime text was refused by Tau "
+                                "(integration failure, not an invalid rule): %s", e
+                            )
+                            execution_success = False
+                            tx_receipt["logs"].append(f"Error: runtime preparation failure: {e}")
+                            if not replay_mode:
+                                accepted_in_block = False
+                                hard_reject = True
+                                tx_receipt["reason"] = "rule_not_applied"
                           except Exception as e:
                             logger.error("Error applying rule: %s", e)
                             execution_success = False
@@ -2011,8 +2073,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             # Live apply: a rule that did not land must not sit
                             # in the block and pay a fee. Replay keeps the
                             # historical inclusion (only a deterministic Tau
-                            # parse error still hard-rejects, as before).
-                            if not replay_mode or "(error)" in str(e).lower():
+                            # parse error still hard-rejects). The marker is
+                            # ANSI-wrapped by the engine, so match it with the
+                            # ANSI-aware helper, never a literal substring.
+                            if not replay_mode or tau_native.tau_reports_error(str(e)):
                                 accepted_in_block = False
                                 hard_reject = True
                                 tx_receipt["reason"] = "rule_not_applied"
