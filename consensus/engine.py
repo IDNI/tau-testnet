@@ -913,9 +913,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             block_timestamp = 0
             
         lifecycle_mgr = target_lifecycle if target_lifecycle is not None else chain_state._lifecycle_manager
-        # The evaluator this apply drives. Defaults to the live in-process one, so
-        # nothing changes until a caller hands in something else.
-        _session = session if session is not None else tau_session.default_session()
+        # The evaluator this apply drives. The default binds to THIS module's
+        # `tau_manager` reference rather than importing its own, so a caller that
+        # substitutes the manager -- which is how much of the suite drives apply --
+        # substitutes the evaluator too, exactly as before. A caller that wants
+        # continuity across blocks passes its own session.
+        _session = (
+            session if session is not None
+            else tau_session.InProcessSession(manager=tau_manager)
+        )
 
         accepted_txs = []
         rejected_txs = []
@@ -1315,9 +1321,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     from_addr, to_addr, amount,
                     slot_values=slot_values, overrides=overrides,
                 )
-                if not tau_manager.tau_ready.is_set():
-                    tau_manager.tau_ready.wait(timeout=5)
-                if not tau_manager.tau_ready.is_set():
+                if not _session.ready(timeout=5):
                     if replay_mode:
                         # Same concession the transfer path makes: a Tau-less
                         # replay cannot know the verdict, and the state-hash
@@ -1331,8 +1335,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         f"Tau unavailable measuring a parked transfer (tx {tx_id})"
                     )
                 with tau_manager.tau_comm_lock:
-                    outputs = tau_manager.communicate_with_tau_multi(
-                        input_stream_values=inputs, apply_rules_update=False,
+                    outputs = _session.evaluate(
+                        inputs, multi=True, apply_rules_update=False,
                     )
                 # o5 semantics, identical to the transfer path: absent -> allow,
                 # BLOCK -> block, unparseable -> 0 -> block (fails closed).
@@ -1386,9 +1390,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         overrides=custom_tau_inputs if overrides is None else overrides,
                     )
 
-                    if not tau_manager.tau_ready.is_set():
-                        tau_manager.tau_ready.wait(timeout=5)
-                    if not tau_manager.tau_ready.is_set():
+                    if not _session.ready(timeout=5):
                         if replay_mode:
                             # Tau-less replay is supported for
                             # pre-fee chains (fee 0 matches).
@@ -1408,8 +1410,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                     else:
                         with tau_manager.tau_comm_lock:
-                            tau_outputs = tau_manager.communicate_with_tau_multi(
-                                input_stream_values=tau_input_stream_values,
+                            tau_outputs = _session.evaluate(
+                                tau_input_stream_values, multi=True,
                                 apply_rules_update=False,
                             )
                         tx_receipt["logs"].append(
@@ -2172,10 +2174,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         tau_input_stream_values[k] = v
                                     tau_input_stream_values[5] = str(block_timestamp)
 
-                                    if tau_manager.tau_ready.is_set():
-                                        tau_output_transfer = tau_manager.communicate_with_tau(
-                                            target_output_stream_index=1,
-                                            input_stream_values=tau_input_stream_values,
+                                    if _session.ready(timeout=0):
+                                        tau_output_transfer = _session.evaluate(
+                                            tau_input_stream_values, target=1,
                                             apply_rules_update=False,
                                         )
                                         tx_receipt["logs"].append(f"Tau(transfer) o1: {tau_output_transfer}")
@@ -2230,11 +2231,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                              unified_inputs[k] = v
                          unified_inputs[5] = str(block_timestamp)
                          
-                         if tau_manager.tau_ready.is_set():
-                             res_eval = tau_manager.communicate_with_tau(
-                                 target_output_stream_index=0,
-                                 input_stream_values=unified_inputs,
-                                 apply_rules_update=False
+                         if _session.ready(timeout=0):
+                             res_eval = _session.evaluate(
+                                 unified_inputs, target=0,
+                                 apply_rules_update=False,
                              )
                              tx_receipt["logs"].append(f"Tau(custom_unified) o0: {res_eval}")
                              if "error" in res_eval.lower():
@@ -2263,9 +2263,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     }
                     for k, v in custom_tau_inputs.items():
                         fee_query_inputs[k] = v
-                    if not tau_manager.tau_ready.is_set():
-                        tau_manager.tau_ready.wait(timeout=5)
-                    if not tau_manager.tau_ready.is_set():
+                    if not _session.ready(timeout=5):
                         if replay_mode:
                             logger.warning(
                                 "Replay without Tau: fee-query step assumed 0 for tx %s.", tx_id
@@ -2276,8 +2274,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                     else:
                         with tau_manager.tau_comm_lock:
-                            fee_outputs = tau_manager.communicate_with_tau_multi(
-                                input_stream_values=fee_query_inputs,
+                            fee_outputs = _session.evaluate(
+                                fee_query_inputs, multi=True,
                                 apply_rules_update=False,
                             )
                         fee_components.append(

@@ -157,3 +157,20 @@ def test_apply_records_the_rule_in_the_step_log():
     assert rules, "the applied rule is missing from the step log"
     assert rules[0].rule_text.strip() == rule
     assert rules[0].outcome == "ACCEPTED_CHANGED"
+
+
+def test_the_default_session_follows_a_substituted_manager():
+    """Much of the suite drives apply by patching `consensus.engine.tau_manager`.
+    A session that imported its own reference would evaluate against the real
+    interpreter while the engine thought it had substituted one -- two evaluators
+    disagreeing, which is the exact failure mode this refactor exists to remove.
+    """
+    from unittest.mock import patch
+    import consensus.engine as engine
+
+    fake = _Manager(receipt={"outcome": "ACCEPTED_CHANGED", "accepted": True})
+    fake.tau_comm_lock = MagicMock()
+    with patch.object(engine, "tau_manager", fake):
+        session = ts.InProcessSession(manager=engine.tau_manager)
+        session.apply_rule("RULE")
+    assert fake.calls, "the substituted manager was bypassed"
