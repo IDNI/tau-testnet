@@ -39,7 +39,8 @@ class FakeIface:
         )
 
     def communicate(self, rule_text=None, target_output_stream_index=0,
-                    input_stream_values=None, source="", apply_rules_update=True):
+                    input_stream_values=None, source="", apply_rules_update=True,
+                    node_generated=False):
         if rule_text is not None:
             self.received_rules.append(rule_text)
             self.spec = rule_text
@@ -47,7 +48,7 @@ class FakeIface:
         return "1"
 
     def communicate_multi(self, rule_text=None, input_stream_values=None,
-                          source="", apply_rules_update=True):
+                          source="", apply_rules_update=True, node_generated=False):
         self.last_inputs = input_stream_values
         return {1: "1"}
 

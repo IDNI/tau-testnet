@@ -108,12 +108,13 @@ class FakeEngine:
     # --- TauInterface surface used by tau_manager ---
     def communicate(self, rule_text=None, target_output_stream_index=0,
                     input_stream_values=None, source="unknown",
-                    apply_rules_update=True):
+                    apply_rules_update=True, node_generated=False):
         self._run(f"communicate(o{target_output_stream_index})", source)
         return "1"
 
     def communicate_multi(self, rule_text=None, input_stream_values=None,
-                          source="unknown", apply_rules_update=True):
+                          source="unknown", apply_rules_update=True,
+                          node_generated=False):
         self._run("communicate_multi", source)
         return {1: "1", 6: "1", 7: "1"}
 
