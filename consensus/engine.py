@@ -62,6 +62,7 @@ FEE_BEARING_TX_TYPES = frozenset(
 )
 from consensus.tx_signing import verify_tx_signature
 import tau_native
+import tau_advisory
 import tau_session
 import tau_shrink
 
@@ -234,6 +235,18 @@ def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict) -> Tuple[b
     if "error" in str(output).lower() and "x1001" not in str(output).lower():
         return False, str(output)
     return True, ""
+
+
+
+def _advisory_is_available() -> bool:
+    """Whether a separate advisory evaluator can run at all.
+
+    Mock mode has no interpreter to isolate from, and a node with no native
+    interface has nothing to contaminate. Both keep the in-process path.
+    """
+    if getattr(tau_manager, "tau_test_mode", False):
+        return False
+    return getattr(tau_manager, "tau_direct_interface", None) is not None
 
 
 class TauConsensusEngine(TauEngine, ConsensusEngine):
@@ -820,6 +833,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
 
+    @staticmethod
+    def _advisory_available() -> bool:
+        return _advisory_is_available()
+
     def query_eligibility(self, *args, **kwargs) -> bool:
         """
         Check if we are eligible to propose the next block by dry-running consensus logic.
@@ -860,11 +877,26 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 stake_mode=stake_mode,
                 feed_proposer_pubkey=(mode == "tau_validator_set"),
             )
-            output = tau_manager.communicate_with_tau(
-                target_output_stream_index=7,
-                input_stream_values=tau_inputs,
-                apply_rules_update=False
-            )
+            # ADVISORY, and isolated for it. This used to step the authoritative
+            # interpreter: measured, one such query between two authoritative
+            # inputs changed the next history-dependent verdict from 5 to 255,
+            # because the query's own input became the following transaction's
+            # `i1[t-1]`. The miner runs this every round. The advisory evaluator
+            # is a separate process in canonical representation; if it cannot
+            # answer, fall back to the old path rather than stop mining.
+            output = None
+            if _advisory_is_available():
+                output = tau_advisory.evaluator().evaluate(
+                    tau_manager.get_canonical_spec() or "",
+                    tau_inputs,
+                    target=7,
+                )
+            if output is None:
+                output = tau_manager.communicate_with_tau(
+                    target_output_stream_index=7,
+                    input_stream_values=tau_inputs,
+                    apply_rules_update=False
+                )
             verdict = tau_manager.parse_tau_output(str(output))
             if verdict != 0:
                 return True

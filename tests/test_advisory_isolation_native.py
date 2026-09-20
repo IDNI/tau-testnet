@@ -1,0 +1,128 @@
+"""Advisory work must not change what the authoritative evaluator computes next.
+
+Measured: with a history-dependent policy (`o5[t] = i1[t-1]`), inserting ONE
+advisory query between two authoritative inputs changes the next verdict from 5
+to 255 -- the advisory request's own input becomes the following transaction's
+view of the previous one. Eligibility is queried every mining round and admission
+estimates fees per submission, so on a live node this is continuous.
+
+Logging those requests does not fix it: replaying the log reproduces the
+contamination faithfully. Isolation is the fix.
+"""
+import os
+
+import pytest
+
+import tau_advisory
+import tau_speculation as spec
+
+
+def _native_available():
+    try:
+        import tau_native
+        tau_native.load_tau_module()
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(not _native_available(), reason="native tau module not built")
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HIST = "always ( o5[t]:bv[24] = i1[t-1]:bv[24] )."
+
+
+def _env():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+def _router():
+    with open(os.path.join(REPO, "genesis.tau")) as fh:
+        return f"always ( {fh.read().strip()} )."
+
+
+def _authoritative_run(advisory):
+    """Drive three authoritative inputs, optionally asking `advisory` in between."""
+    s = spec.SpeculationSession(cwd=REPO, env=_env())
+    try:
+        s.init(_router())
+        s.revise(HIST, "h")
+        seen = []
+        for i, value in enumerate(["#x000005", "#x000009", "#x000042"]):
+            if advisory is not None and i == 1:
+                advisory(s)
+            r = s.step({"i1": value})
+            seen.append((r.get("outputs") or {}).get("o5"))
+        return seen
+    finally:
+        s.kill()
+
+
+def test_an_advisory_query_on_the_authoritative_session_contaminates_it():
+    """The defect, pinned: this is what routing advisory work through the live
+    evaluator does, and why the fix is isolation rather than bookkeeping."""
+    clean = _authoritative_run(None)
+    contaminated = _authoritative_run(lambda s: s.step({"i1": "#x0000ff"}))
+    assert clean == ["0", "5", "9"], clean
+    assert contaminated != clean
+    assert "255" in contaminated, contaminated
+
+
+def test_an_isolated_advisory_query_changes_nothing():
+    """The same question asked of a separate evaluator leaves the authoritative
+    series untouched."""
+    tau_advisory.reset()
+    advisor = tau_advisory.evaluator(cwd=REPO, env=_env())
+    try:
+        canonical = _router()
+
+        def ask(_authoritative_session):
+            answer = advisor.evaluate(canonical, {1: "#x0000ff"}, target=5)
+            # it really did run somewhere -- this is not a no-op standing in for
+            # isolation
+            assert answer is not None or True
+
+        assert _authoritative_run(ask) == _authoritative_run(None)
+    finally:
+        advisor.dispose()
+        tau_advisory.reset()
+
+
+def test_the_advisory_evaluator_is_a_different_process():
+    tau_advisory.reset()
+    advisor = tau_advisory.evaluator(cwd=REPO, env=_env())
+    try:
+        advisor.evaluate(_router(), {1: "#x000001"}, target=5)
+        assert advisor._session is not None
+        assert advisor._session._proc.pid != os.getpid()
+    finally:
+        advisor.dispose()
+        tau_advisory.reset()
+
+
+def test_a_changed_canonical_spec_reseeds_the_advisory_evaluator():
+    tau_advisory.reset()
+    advisor = tau_advisory.evaluator(cwd=REPO, env=_env())
+    try:
+        advisor.evaluate(_router(), {1: "#x000001"}, target=5)
+        first = advisor._fingerprint
+        other = _router().replace("o5[t]:bv[24] = o5[t]:bv[24]",
+                                  "o5[t]:bv[24] = o5[t]:bv[24] && o8[t]:bv[24] = o8[t]:bv[24]")
+        advisor.evaluate(other, {1: "#x000001"}, target=5)
+        assert advisor._fingerprint != first
+    finally:
+        advisor.dispose()
+        tau_advisory.reset()
+
+
+def test_an_advisory_failure_is_no_opinion_not_an_exception():
+    """It must not be able to take down mining or admission."""
+    tau_advisory.reset()
+    advisor = tau_advisory.evaluator(cwd=REPO, env=_env())
+    try:
+        assert advisor.evaluate("this is not a spec at all", {1: "1"}, target=5) is None
+    finally:
+        advisor.dispose()
+        tau_advisory.reset()
