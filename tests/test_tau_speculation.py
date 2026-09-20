@@ -266,3 +266,26 @@ def test_a_refusal_reaches_the_receipt_through_the_subprocess(tmp_path):
         assert "Incompatible type information in i12" in receipt["diagnostics"], receipt
     finally:
         s.kill()
+
+
+@pytest.mark.skipif(not _native_available(), reason="native tau module not built")
+def test_an_unconsumed_candidate_is_incomplete_not_accepted(tmp_path):
+    """"The engine never asked for i0" says nothing about the candidate, so it
+    must not be reported as acceptance. Bounding the offers to zero reproduces
+    that state deterministically."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(repo_root, "genesis.tau")) as fh:
+        router = fh.read().strip()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    s = spec.SpeculationSession(cwd=repo_root, env=env)
+    try:
+        s.init(f"always ( {router} ).")
+        # a rule that makes the next prompt ask for i1 alone
+        s.revise("always ( o5[t]:bv[24] = i1[t-1]:bv[24] ).", "hist")
+        resp = s._request({"op": "revise", "candidate": "always ( o8[t]:bv[24] = { #x3 }:bv[24] ).",
+                           "candidate_id": "c", "max_offers": 0})
+        assert resp["outcome"] == "INCOMPLETE", resp
+        assert resp["ok"] is False
+    finally:
+        s.kill()

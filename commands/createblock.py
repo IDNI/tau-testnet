@@ -249,6 +249,47 @@ def _restore_per_sender_sequence_order(transactions, execution_transactions, res
             reserved_ids[slot] = rid
 
 
+
+def _speculative_session():
+    """A disposable evaluator for the miner simulation, or None to stay in-process.
+
+    None whenever there is nothing to isolate from -- mock mode, no native
+    interface -- or when a worker cannot be built. Falling back is safe: it is
+    exactly today's behaviour, including its save/restore.
+    """
+    try:
+        import tau_manager
+        import tau_session
+    except Exception:
+        return None
+    if getattr(tau_manager, "tau_test_mode", False):
+        return None
+    iface = getattr(tau_manager, "tau_direct_interface", None)
+    if iface is None:
+        return None
+    baseline = None
+    try:
+        baseline = iface.get_current_spec()
+    except Exception:
+        baseline = None
+    baseline = baseline or getattr(tau_manager, "last_known_tau_spec", None)
+    if not baseline:
+        return None
+    # The baseline is the RUNTIME spec, so the worker needs runtime-encoded
+    # inputs: the same encoder the authoritative path uses, against the same
+    # node-local intern table.
+    shrunk = tau_manager.get_runtime_shrunk_streams()
+
+    def normalize(inputs):
+        return tau_manager._normalize_inputs(inputs, shrunk) or inputs
+
+    try:
+        return tau_session.WorkerSession.spawn(baseline, normalize=normalize)
+    except Exception as exc:
+        logger.warning("createblock: no simulation worker (%s); simulating in-process", exc)
+        return None
+
+
 def create_block_from_mempool(allow_empty: bool = False) -> Dict:
     """
     Creates a new block from all transactions currently in the mempool,
@@ -535,14 +576,32 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
         except Exception:
             saved_shrunk_streams = None
 
+        # Prefer a DISPOSABLE evaluator for the simulation. The save/restore
+        # below exists because the simulation mutates the live interpreter, and
+        # it does not actually undo that: measured, `restore_full_tau_spec` comes
+        # back with time_point reset from 3 to 0 and a different interpreter
+        # object, so a history-dependent rule answers differently before and
+        # after -- the block is chosen under one state and applied under another.
+        # A worker cannot contaminate anything, and disposal is the only rollback
+        # the engine offers.
+        sim_session = _speculative_session()
         try:
             # Call the unified path
-            apply_result = engine.apply_block(active_view, candidate_block, parent_snapshot)
+            apply_result = engine.apply_block(
+                active_view, candidate_block, parent_snapshot, session=sim_session
+            )
         finally:
+            if sim_session is not None:
+                try:
+                    sim_session.dispose()
+                except Exception:
+                    logger.warning("createblock: failed to dispose the simulation worker")
             # Restore the interpreter + cached rules state so `process_new_block`
             # below re-applies the block from the same baseline the miner saw.
+            # Only meaningful when the simulation ran IN-PROCESS; a worker leaves
+            # nothing to restore.
             try:
-                if saved_full_spec is not None:
+                if sim_session is None and saved_full_spec is not None:
                     tau_manager.restore_full_tau_spec(
                         saved_full_spec, runtime_shrunk_streams=saved_shrunk_streams
                     )

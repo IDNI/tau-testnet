@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 RULE = "rule"
 EVAL = "eval"
 
+#: Revision outcomes that mean the engine took the candidate.
+_ACCEPTED = ("ACCEPTED_CHANGED", "ACCEPTED_NOOP")
+
 
 @dataclass
 class StepRecord:
@@ -75,6 +78,11 @@ class StepLog:
 
 class EvaluatorSession:
     """What the apply path needs from an evaluator."""
+
+    #: A speculative session evaluates without committing anything: its rule
+    #: applications do not reach the canonical persistence handler, so the apply
+    #: path must not demand evidence of persistence from it.
+    is_speculative = False
 
     def ready(self, timeout: float = 5.0) -> bool:
         raise NotImplementedError
@@ -148,6 +156,121 @@ class InProcessSession(EvaluatorSession):
 
     def last_receipt(self):
         return self._manager.get_last_revision_receipt()
+
+
+class WorkerSession(EvaluatorSession):
+    """A session backed by a disposable worker, in CANONICAL representation.
+
+    Speculative evaluation cannot share a process with the authoritative
+    evaluator: the engine commits a stream's width on the first accepted revision
+    and offers no rollback, so an attempt that is later rejected cannot be undone
+    in place. Disposal IS the rollback, which means the attempt has to run
+    somewhere disposable.
+
+    Canonical representation, for the same reason the advisory evaluator uses it:
+    a worker that interns nothing has no mapping epoch and pins no width that has
+    to agree with anybody else's. Slower per step, and a whole class of
+    disagreement stops existing.
+    """
+
+    is_speculative = True
+
+    def __init__(self, spec_session, log=None, normalize=None):
+        self._spec = spec_session
+        self.log = log if log is not None else StepLog()
+        self.last_outcome = None
+        # A worker seeded with the RUNTIME (possibly shrunk) spec has to receive
+        # runtime-encoded values, or its comparisons silently never match. The
+        # caller supplies the same encoder the authoritative path uses; without
+        # one the session is canonical end to end.
+        self._normalize = normalize
+
+    @classmethod
+    def spawn(cls, baseline_spec, *, cwd=None, env=None, trace=None, normalize=None):
+        """Build a worker at `baseline_spec`, replaying `trace` onto it.
+
+        Replay is how a worker reaches a state at all: reconstruction from
+        specification text alone was measured to come back with the history gone.
+        """
+        import os as _os
+        import tau_speculation
+
+        cwd = cwd or _os.getcwd()
+        env = dict(env or _os.environ)
+        env["PYTHONPATH"] = cwd + _os.pathsep + env.get("PYTHONPATH", "")
+        spec_session = tau_speculation.SpeculationSession(cwd=cwd, env=env)
+        spec_session.init(baseline_spec)
+        session = cls(spec_session, normalize=normalize)
+        for entry in (trace or []):
+            if entry.get("kind") == RULE:
+                session.apply_rule(entry.get("rule_text") or "")
+            else:
+                session.evaluate(entry.get("inputs") or {}, target=entry.get("target"))
+        return session
+
+    def dispose(self):
+        try:
+            self._spec.kill()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _bare(value):
+        """Input VALUES go bare; `{ .. }:bv[N]` is in-spec literal syntax and does
+        not parse as an input."""
+        text = "" if value is None else str(value).strip()
+        if text.startswith("{") and ":bv[" in text and "}" in text:
+            return text[1:text.index("}")].strip()
+        return text
+
+    def _named_inputs(self, inputs):
+        if self._normalize is not None:
+            try:
+                inputs = self._normalize(inputs)
+            except Exception:
+                raise
+        named = {}
+        for key, value in (inputs or {}).items():
+            name = key if isinstance(key, str) and key.startswith("i") else f"i{key}"
+            named[name] = self._bare(value)
+        return named
+
+    @staticmethod
+    def _by_index(outputs):
+        indexed = {}
+        for name, value in (outputs or {}).items():
+            if name.startswith("o") and name[1:].isdigit():
+                indexed[int(name[1:])] = str(value)
+        return indexed
+
+    def ready(self, timeout=5.0):
+        return self._spec is not None
+
+    def apply_rule(self, rule_text, *, target=0, record=True):
+        receipt = self._spec.revise(rule_text, "apply")
+        self.last_outcome = receipt
+        outcome = receipt.get("outcome")
+        # `accepted` is a property on the receipt, not a key: reading it with
+        # .get() silently returns None and turns every acceptance into an error.
+        accepted = bool(getattr(receipt, "accepted", False)) or outcome in _ACCEPTED
+        if record:
+            self.log.record(StepRecord(kind=RULE, rule_text=rule_text, target=target,
+                                       outcome=outcome))
+        return "ok" if accepted else f"error: {outcome}"
+
+    def evaluate(self, inputs, *, target=None, source="unknown", multi=False,
+                 apply_rules_update=False, record=True):
+        result = self._spec.step(self._named_inputs(inputs))
+        indexed = self._by_index(result.get("outputs") or {})
+        if record:
+            self.log.record(StepRecord(kind=EVAL, inputs=dict(inputs or {}),
+                                       target=target))
+        if multi:
+            return indexed
+        return "" if target is None else indexed.get(target, "")
+
+    def last_receipt(self):
+        return self.last_outcome
 
 
 _default_session = None

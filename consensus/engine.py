@@ -608,6 +608,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         block: Any,
         parent_snapshot: TauStateSnapshot,
         *,
+        session=None,
         replay_mode: bool = False,
     ) -> ApplyBlockResult:
         """
@@ -658,6 +659,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # mutable copy apply() debits, and must NOT be used for i2.
             parent_balances=metadata.get('balances'),
             parent_last_transfer_ts=metadata.get('last_transfer_ts'),
+            session=session,
             target_last_transfer_ts=t_lts,
         )
 
@@ -2055,6 +2057,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         accepted_in_block = False
                                         hard_reject = True
                                         tx_receipt["reason"] = "rule_rejected"
+                                elif _session.is_speculative:
+                                    # A speculative session commits nothing, so
+                                    # there is no persistence to check for. The
+                                    # engine's own receipt is the evidence, and
+                                    # the canonical write happens on acceptance,
+                                    # on the authoritative path.
+                                    tx_receipt["logs"].append("Rule applied (speculative)")
                                 elif not _application_rule_landed(rule_text):
                                     # Live apply: the handler did not persist, so
                                     # this is a no-op that must not sit in the

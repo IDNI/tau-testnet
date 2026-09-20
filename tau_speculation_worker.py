@@ -260,7 +260,10 @@ def main(argv=None) -> int:
                 if not session.healthy or session.itp is None:
                     body = {"ok": False, "phase": "session", "error": "session unusable"}
                 else:
-                    body = session.revise(req.get("candidate", ""), req.get("candidate_id", ""))
+                    body = session.revise(
+                        req.get("candidate", ""), req.get("candidate_id", ""),
+                        max_offers=int(req.get("max_offers", 16)),
+                    )
             elif op == "step":
                 if not session.healthy or session.itp is None:
                     body = {"ok": False, "phase": "session", "error": "session unusable"}
