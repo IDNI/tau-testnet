@@ -791,10 +791,14 @@ def prepare_rule(full_width_text: str, exclude_streams=frozenset()) -> PreparedT
     try:
         _audit(canonical, runtime_text, plan, width, id_by_pos)
     except ShrinkAuditFailure as exc:
-        logger.error("tau_shrink: refusing partial shrink, audit failed: %s", exc)
-        return PreparedTauSpec(
-            canonical, canonical, False, frozenset(), wide_input_streams(canonical)
-        )
+        # NOT a fallback. Choosing an unoptimized representation is legitimate when
+        # the fragment is merely unsupported; this is the implementation violating
+        # its own edit plan, and the full-width text it would fall back to can be
+        # incompatible with a width this process already committed to. Surface it
+        # as a preparation failure and let the caller decide, rather than
+        # dispatching something nobody checked.
+        logger.error("tau_shrink: preparation failed its own edit audit: %s", exc)
+        raise
 
     logger.info(
         "tau_shrink: shrunk %d literals, streams=%s, width=bv[%d]",

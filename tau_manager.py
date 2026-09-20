@@ -233,6 +233,30 @@ def _shrink_exclude() -> frozenset:
     return frozenset(getattr(config, "TAU_SHRINK_STREAM_EXCLUDE", frozenset()))
 
 
+def _assert_representation_compatible(prepared) -> None:
+    """Refuse any representation this process cannot type.
+
+    Applies to EVERY preparation exit, including the whole-rule fallbacks: a
+    fallback widens every stream it touches, not just the one whose optimization
+    was refused, and the engine commits a stream's width on the first accepted
+    revision and never re-types it. Checking only the stream that caused the
+    fallback would let the others through.
+    """
+    wide = frozenset(getattr(prepared, "wide_streams_unshrunk", ()) or ())
+    conflict = wide & frozenset(_runtime_shrunk_streams)
+    conflict |= _evaluator_state.conflicts(
+        prepared, width=tau_shrink.current_shrink_width()
+    )
+    if conflict:
+        raise tau_shrink.ShrinkTypeConflict(
+            "rule references "
+            + ", ".join(f"i{i}" for i in sorted(conflict))
+            + " at a width this process has already committed differently; no "
+            "representation of it can be typed here. A fresh process rebuilds "
+            "from the canonical full-width state."
+        )
+
+
 def _prepare_rule_for_tau(rule_text: str | None) -> "tau_shrink.PreparedTauSpec | None":
     """Canonical/runtime split for a rule. canonical_text is persisted; the
     interpreter is fed runtime_text. Disabled => canonical == runtime.
@@ -250,22 +274,7 @@ def _prepare_rule_for_tau(rule_text: str | None) -> "tau_shrink.PreparedTauSpec 
     if not getattr(config, "TAU_SHRINK_ENABLED", False):
         return tau_shrink.PreparedTauSpec(canonical, canonical, False, frozenset())
     prepared = tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
-    conflict = frozenset(prepared.wide_streams_unshrunk) & frozenset(_runtime_shrunk_streams)
-    # W2: process commitments outlive the rules that made them, so they catch a
-    # conflict the derived set no longer remembers -- and they catch the mirror
-    # direction (a rule that wants to shrink a stream committed plain).
-    conflict |= _evaluator_state.conflicts(
-        prepared, width=tau_shrink.current_shrink_width()
-    )
-    if conflict:
-        raise tau_shrink.ShrinkTypeConflict(
-            "rule references "
-            + ", ".join(f"i{i}" for i in sorted(conflict))
-            + " at full width, but this process already typed "
-            + ("it" if len(conflict) == 1 else "them")
-            + " at the shrunk width; no representation of this rule can be typed "
-            "here. A fresh process rebuilds from the canonical full-width state."
-        )
+    _assert_representation_compatible(prepared)
     return prepared
 
 
@@ -904,6 +913,10 @@ def restore_full_tau_spec(spec_text: str, *, runtime_shrunk_streams: "frozenset 
             # "Incompatible type information in i12:untyped, expected :bv[8],
             # found :bv[16]". Widening is only safe via re-exec.
             prepared = tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
+            # The restore path builds its own preparation, so it needs the same
+            # gate: the engine's type commitments are process-global and survive
+            # the interpreter rebuild this function performs.
+            _assert_representation_compatible(prepared)
         else:
             prepared = tau_shrink.PreparedTauSpec(canonical, canonical, False, frozenset())
         _print_tau_send("restore_full_tau_spec update_spec", prepared.runtime_text)

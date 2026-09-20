@@ -9,6 +9,7 @@ and no engine error at all:
   value encoding entirely, while the native adapter accepted it.
 """
 import pytest
+from unittest.mock import MagicMock
 
 import tau_manager
 import tau_shrink as ts
@@ -165,3 +166,39 @@ def test_conflict_is_not_swallowed_as_shrink_unavailable(temp_database):
     import tau_shrink
     assert not issubclass(tau_shrink.ShrinkTypeConflict, tau_shrink.ShrinkUnavailable)
     assert not issubclass(tau_shrink.ShrinkTypeConflict, tau_shrink.ShrinkWidthOverflow)
+
+
+def test_a_whole_rule_fallback_is_checked_against_commitments(temp_database, monkeypatch):
+    """A whole-rule fallback widens EVERY stream it touches, not just the one that
+    caused it. Here interning fails, so a rule that would have shrunk i3 falls
+    back to full width -- and i3 is already committed narrow, so the fallback is
+    exactly what this process cannot type. Checking only the offending stream, or
+    not checking the fallback at all, would dispatch it."""
+    import config
+    import db as db_mod
+    import tau_shrink
+    monkeypatch.setattr(config, "TAU_SHRINK_ENABLED", True, raising=False)
+    monkeypatch.setattr(tau_manager, "_runtime_shrunk_streams", frozenset({3}))
+    monkeypatch.setattr(db_mod, "get_shrink_id",
+                        lambda key: (_ for _ in ()).throw(RuntimeError("db down")))
+    rule = f"always ( i3[t]:bv[384] = {{ #x{HEX96_B} }}:bv[384] )."
+    with pytest.raises(tau_shrink.ShrinkTypeConflict) as exc:
+        tau_manager._prepare_rule_for_tau(rule)
+    assert "i3" in str(exc.value)
+
+
+def test_a_restore_is_checked_against_commitments(temp_database, monkeypatch):
+    """`restore_full_tau_spec` builds its own preparation and rebuilds the
+    interpreter -- but the engine's type commitments are process-global and
+    survive that rebuild, so the restore needs the same gate."""
+    import config
+    import tau_shrink
+    monkeypatch.setattr(config, "TAU_SHRINK_ENABLED", True, raising=False)
+    monkeypatch.setattr(tau_manager, "tau_test_mode", False)
+    iface = MagicMock()
+    iface.preprocess_spec_text.side_effect = lambda text: text
+    monkeypatch.setattr(tau_manager, "tau_direct_interface", iface)
+    monkeypatch.setattr(tau_manager, "_runtime_shrunk_streams", frozenset({12}))
+    wide = f"always ( i12[t]:bv[384] > {{ #x{HEX96} }}:bv[384] )."
+    with pytest.raises(tau_shrink.ShrinkTypeConflict):
+        tau_manager.restore_full_tau_spec(wide)

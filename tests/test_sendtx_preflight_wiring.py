@@ -19,9 +19,10 @@ class _Prepared:
 
 
 def _wire(verdict, *, detail="", test_mode=False, baseline="always ( x ).",
-          prepare_exc=None):
+          prepare_exc=None, has_interface=True):
     manager = MagicMock()
     manager.tau_test_mode = test_mode
+    manager.tau_direct_interface = object() if has_interface else None
     manager.last_known_tau_spec = baseline
     if prepare_exc is not None:
         manager._prepare_rule_for_tau.side_effect = prepare_exc
@@ -45,10 +46,23 @@ def test_an_admit_lets_the_transaction_through():
     assert out is None
 
 
-def test_unavailable_does_not_reject_the_transaction():
-    """An extra screen that cannot run leaves the existing verdict alone."""
-    out, _ = _wire(pf.UNAVAILABLE, detail="native tau unavailable")
+def test_unavailable_is_reported_not_swallowed():
+    """"Could not validate" is not "validated". The caller gets a distinct
+    operational code and can resubmit; returning the previous successful-looking
+    verdict would let an unvalidated rule into the mempool while reporting that it
+    passed."""
+    out, _ = _wire(pf.UNAVAILABLE, detail="worker would not spawn")
+    assert out is not None
+    assert out["code"] == "ADMISSION_UNAVAILABLE"
+    assert "TX_REJECTED" not in out["code"], "an operational failure is not a verdict"
+
+
+def test_a_node_without_a_native_interface_skips_the_preflight():
+    """Applicability is a node fact decided before anything is attempted, so it
+    is not an operational failure and does not change the verdict."""
+    out, called = _wire(pf.REJECT, has_interface=False)
     assert out is None
+    assert called.call_count == 0
 
 
 def test_mock_mode_skips_the_preflight_entirely():

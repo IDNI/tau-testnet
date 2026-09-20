@@ -330,8 +330,14 @@ def _preflight_prepared_rule(rule_text: str):
     except Exception:  # pragma: no cover - import-time environment problem
         return None
 
-    # Mock mode has no interpreter to be compatible with.
+    # Applicability is a NODE fact, decided before anything is attempted: mock
+    # mode has no interpreter to be compatible with, and neither does a node with
+    # no native interface or no composed baseline. Those are not failures, so they
+    # leave the existing verdict alone. Anything that goes wrong AFTER this point
+    # is operational, and operational is reported, not swallowed.
     if getattr(tau_manager, "tau_test_mode", False):
+        return None
+    if getattr(tau_manager, "tau_direct_interface", None) is None:
         return None
 
     try:
@@ -367,13 +373,17 @@ def _preflight_prepared_rule(rule_text: str):
             f"Transaction rejected by Tau (rule preflight). {result.detail}",
         )
     if result.verdict == tau_preflight.UNAVAILABLE:
-        # This is an ADDITIONAL screen on top of the canonical compile above. If
-        # it cannot run -- no binding, no worker, an unreadable capture -- the
-        # transaction keeps whatever verdict the existing path gave it. Turning an
-        # inability to run an extra check into a rejection would make admission
-        # depend on spawning a worker, and would report an operational failure as
-        # a verdict about someone's rule.
-        logger.warning("Rule preflight unavailable, continuing: %s", result.detail)
+        # "Could not validate" is not "validated". It is also not "invalid rule":
+        # the caller gets a distinct operational code and can resubmit, and the
+        # author is not blamed for a worker that would not spawn or a diagnostic
+        # capture that could not be read. Returning the previous successful-looking
+        # verdict instead would let an unvalidated rule into the mempool while
+        # reporting that it passed.
+        logger.warning("Rule preflight unavailable: %s", result.detail)
+        return _qt_err(
+            "ADMISSION_UNAVAILABLE",
+            "Rule validation is temporarily unavailable; please resubmit.",
+        )
     return None
 
 

@@ -183,10 +183,14 @@ def test_independent_streams_keep_their_own_widths(temp_database):
 
 # --- the independent edit audit ----------------------------------------------
 
-def test_audit_rejects_a_rewrite_that_does_not_match_the_plan(temp_database, monkeypatch):
-    """Exercise the audit on its own by corrupting edit APPLICATION after a valid
-    classification -- not by faking the classifier, whose result is a triple and
-    whose malformed return would merely hit the unpacking fallback."""
+def test_audit_failure_is_a_preparation_failure_not_a_fallback(temp_database, monkeypatch):
+    """An audit mismatch means the implementation violated its own edit plan.
+
+    Falling back to full width would be a SECOND unchecked decision: a fallback
+    widens every stream it touches, and the engine commits a width on the first
+    accepted revision and never re-types it, so the "safe" text can be exactly
+    what the process cannot accept. Fail the preparation instead.
+    """
     real_apply = ts._apply_edits
 
     def corrupt(text, edits):
@@ -194,25 +198,23 @@ def test_audit_rejects_a_rewrite_that_does_not_match_the_plan(temp_database, mon
         return out.replace("i12[t]:bv[8]", "i12[t]:bv[384]", 1)
 
     monkeypatch.setattr(ts, "_apply_edits", corrupt)
-    p = ts.prepare_rule(_guard("->"))
-    assert not p.shrink_enabled                  # audit caught it, fell back whole
-    assert p.runtime_text == p.canonical_text
+    with pytest.raises(ts.ShrinkAuditFailure):
+        ts.prepare_rule(_guard("->"))
 
 
-def test_audit_rejects_a_changed_time_expression(temp_database, monkeypatch):
+def test_audit_catches_a_changed_time_expression(temp_database, monkeypatch):
     real_apply = ts._apply_edits
     monkeypatch.setattr(
         ts, "_apply_edits",
         lambda text, edits: real_apply(text, edits).replace("[t-1]", "[t]"),
     )
-    p = ts.prepare_rule(
-        _rule(
-            f"i12[t]:bv[384] = {{ #x{HEX96} }}:bv[384] && "
-            f"i12[t-1]:bv[384] = {{ #x{HEX96_B} }}:bv[384]"
+    with pytest.raises(ts.ShrinkAuditFailure):
+        ts.prepare_rule(
+            _rule(
+                f"i12[t]:bv[384] = {{ #x{HEX96} }}:bv[384] && "
+                f"i12[t-1]:bv[384] = {{ #x{HEX96_B} }}:bv[384]"
+            )
         )
-    )
-    assert not p.shrink_enabled
-    assert p.runtime_text == p.canonical_text
 
 
 def test_classify_still_returns_a_triple(temp_database):
