@@ -219,45 +219,31 @@ def canonical_intern_key(hex_digits: str, width: int) -> str:
 _allocator = None
 
 
-class _SpeculativeAllocator:
-    """Reads committed ids; mints new ones in memory only.
+class speculative_allocation:
+    """Install a private allocation overlay for a speculative evaluation.
 
-    Equality semantics are invariant under any injective relabeling, which is the
-    property this whole module rests on, so a speculative id that never leaves the
-    worker may differ from the one the authoritative path later commits.
+    The overlay is a `tau_allocator.Allocator` over a read-through snapshot of the
+    committed mapping, so it inherits every committed binding, mints new ids above
+    the committed high-water mark, and publishes nothing. Transaction children
+    come off the same object, which is what lets an accepted transaction's
+    allocations be visible to the next one while a rejected transaction's are not.
     """
 
-    def __init__(self, high_water: int):
-        self._local = {}
-        self._next = int(high_water)
-
-    def __call__(self, key: str) -> int:
-        committed = db.lookup_shrink_id(key)
-        if committed is not None:
-            return committed
-        if key not in self._local:
-            self._next += 1
-            self._local[key] = self._next
-        return self._local[key]
-
-    @property
-    def minted(self) -> dict:
-        return dict(self._local)
-
-
-class speculative_allocation:
-    """Install a private allocator for the duration of a speculative evaluation."""
-
-    def __init__(self, high_water=None):
-        self._high_water = (
-            db.get_max_shrink_id() if high_water is None else int(high_water)
-        )
+    def __init__(self, allocator=None):
+        self._explicit = allocator
         self.allocator = None
         self._previous = None
 
     def __enter__(self):
         global _allocator
-        self.allocator = _SpeculativeAllocator(self._high_water)
+        if self._explicit is not None:
+            self.allocator = self._explicit
+        else:
+            import tau_allocator
+            snapshot = tau_allocator.DbMappingSnapshot()
+            self.allocator = tau_allocator.Allocator(
+                snapshot, width=_current_shrink_width, label="proposal"
+            )
         self._previous = _allocator
         _allocator = self.allocator
         return self.allocator
@@ -279,8 +265,10 @@ def intern_value(hex_digits: str, width: int) -> int:
         return RESERVED_EMPTY_ID
     key = canonical_intern_key(hex_digits, width)
     try:
-        allocate = _allocator if _allocator is not None else db.get_shrink_id
-        id_num = int(allocate(key))
+        if _allocator is not None:
+            id_num = int(_allocator.id_for(key))
+        else:
+            id_num = int(db.get_shrink_id(key))
     except Exception as exc:  # DB unavailable, malformed id, etc.
         raise ShrinkUnavailable(f"intern failed: {exc}") from exc
     if id_num < 0:

@@ -23,7 +23,7 @@ def test_speculative_interning_publishes_nothing(temp_database):
         assert first != second, "distinct values must not collide speculatively"
     assert db.get_max_shrink_id() == before
     assert db.lookup_shrink_id(ts.canonical_intern_key(ADDR, 384)) is None
-    assert sorted(alloc.minted.values()) == [first, second]
+    assert sorted(alloc.delta().values()) == [first, second]
 
 
 def test_speculative_ids_start_above_the_committed_high_water(temp_database):
@@ -77,3 +77,122 @@ def test_an_accepted_value_publishes_exactly_what_was_tested(temp_database):
         ts.intern_value(ADDR, 384)
     published = ts.intern_value(ADDR, 384)
     assert db.lookup_shrink_id(ts.canonical_intern_key(ADDR, 384)) == published
+
+
+# --- the overlay hierarchy ----------------------------------------------------
+
+import tau_allocator as alloc_mod
+
+
+def _proposal():
+    return alloc_mod.Allocator(alloc_mod.DbMappingSnapshot(),
+                               width=16, label="proposal")
+
+
+def test_an_accepted_transaction_is_visible_to_the_next_one(temp_database):
+    """The block-prefix property: C must not be able to mint a colliding id for a
+    different value just because it captured the same high-water mark as A."""
+    proposal = _proposal()
+    a = proposal.child("A")
+    alice = a.id_for("bv384:alice")
+    proposal.merge(a)
+
+    c = proposal.child("C")
+    carol = c.id_for("bv384:carol")
+    proposal.merge(c)
+
+    assert alice != carol
+    assert proposal.delta() == {"bv384:alice": alice, "bv384:carol": carol}
+
+
+def test_a_rejected_transaction_is_invisible_and_its_number_is_free(temp_database):
+    """What must not survive B is the MAPPING, not necessarily the integer."""
+    proposal = _proposal()
+    a = proposal.child("A")
+    a.id_for("bv384:alice")
+    proposal.merge(a)
+
+    b = proposal.child("B")
+    bob = b.id_for("bv384:bob")
+    proposal.discard(b)
+
+    c = proposal.child("C")
+    carol = c.id_for("bv384:carol")
+    proposal.merge(c)
+
+    assert carol == bob, "a fully disposed context's number may be reused"
+    assert "bv384:bob" not in proposal.delta()
+
+
+def test_the_same_new_value_in_two_transactions_gets_one_id(temp_database):
+    proposal = _proposal()
+    a = proposal.child("A")
+    first = a.id_for("bv384:alice")
+    proposal.merge(a)
+    c = proposal.child("C")
+    assert c.id_for("bv384:alice") == first
+
+
+def test_a_committed_binding_cannot_be_shadowed(temp_database):
+    """Every child must resolve a committed value to its committed id, even
+    transiently."""
+    committed = ts.intern_value(ADDR, 384)
+    proposal = _proposal()
+    child = proposal.child("A")
+    assert child.id_for(ts.canonical_intern_key(ADDR, 384)) == committed
+    assert proposal.delta() == {}, "resolving a committed binding allocates nothing"
+
+
+def test_a_discarded_transaction_cannot_be_merged_or_reused(temp_database):
+    proposal = _proposal()
+    b = proposal.child("B")
+    b.id_for("bv384:bob")
+    proposal.discard(b)
+    with pytest.raises(RuntimeError):
+        b.id_for("bv384:other")
+    with pytest.raises(ValueError):
+        proposal.merge(b)
+
+
+def test_width_planning_uses_the_proposal_high_water(temp_database, monkeypatch):
+    """The 254 -> 255 boundary has to be known before the worker that embeds those
+    ids is built, not discovered at publication."""
+    proposal = alloc_mod.Allocator(alloc_mod.DbMappingSnapshot(), width=16)
+    for i in range(3):
+        child = proposal.child(f"t{i}")
+        child.id_for(f"bv384:v{i}")
+        proposal.merge(child)
+    assert proposal.required_width() == alloc_mod.width_for_max_id(
+        max(proposal.retained_plan().values())
+    )
+
+
+def test_publication_commits_exactly_the_tested_ids(temp_database):
+    proposal = _proposal()
+    child = proposal.child("A")
+    planned = child.id_for("bv384:alice")
+    proposal.merge(child)
+    alloc_mod.publish_to_db(proposal)
+    assert db.lookup_shrink_id("bv384:alice") == planned
+
+
+def test_a_moved_epoch_aborts_publication_entirely(temp_database):
+    proposal = _proposal()
+    child = proposal.child("A")
+    child.id_for("bv384:alice")
+    child.id_for("bv384:bob")
+    proposal.merge(child)
+    ts.intern_value(OTHER, 384)          # someone else commits first
+    with pytest.raises(alloc_mod.AllocatorConflict):
+        alloc_mod.publish_to_db(proposal)
+    assert db.lookup_shrink_id("bv384:alice") is None, "no partial publication"
+    assert db.lookup_shrink_id("bv384:bob") is None
+
+
+def test_the_epoch_moves_on_any_committed_change(temp_database):
+    """`max(id)` alone would not: a mapping can change without the maximum moving,
+    and a proposal validated against the old one would publish into a table it no
+    longer describes."""
+    before = db.shrink_mapping_epoch()
+    ts.intern_value(ADDR, 384)
+    assert db.shrink_mapping_epoch() != before

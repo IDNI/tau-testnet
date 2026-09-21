@@ -74,6 +74,30 @@ def width_for_max_id(max_id: int) -> int:
     return width
 
 
+class DbMappingSnapshot:
+    """A read-through view of the committed mapping, pinned at an epoch.
+
+    Read-through rather than loaded: the table is the node's whole address space
+    and a proposal touches a handful of keys. `epoch` is a version that moves on
+    any committed change, not a maximum -- a mapping could change without the
+    maximum moving, and a proposal validated against the old one would publish
+    into a table it no longer describes.
+    """
+
+    def __init__(self, store=None):
+        import db as _db
+        self._db = store or _db
+        self.epoch = self._db.shrink_mapping_epoch()
+        self._high_water = self._db.get_max_shrink_id()
+
+    def lookup(self, key: str):
+        return self._db.lookup_shrink_id(key)
+
+    @property
+    def high_water(self) -> int:
+        return int(self._high_water)
+
+
 @dataclass(frozen=True)
 class MappingSnapshot:
     """An immutable view of the committed mapping, pinned at an epoch."""
@@ -218,6 +242,27 @@ class Allocator:
     def delta(self) -> dict:
         """The allocations this context adds to the committed mapping."""
         return dict(self.retained_plan())
+
+
+class AllocationUnavailable(Exception):
+    """The allocator could not answer. Operational, never a verdict about a
+    transaction: storage down, worker gone, mapping unreadable."""
+
+
+def publish_to_db(allocator: "Allocator", store=None) -> dict:
+    """Publish a block's delta as EXACT bindings, in the store's transaction."""
+    import db as _db
+    store = store or _db
+    delta = allocator.delta()
+    if not delta:
+        return {}
+    try:
+        store.publish_shrink_ids(delta, allocator.epoch)
+    except ValueError as exc:
+        raise AllocatorConflict(str(exc)) from exc
+    except Exception as exc:
+        raise AllocationUnavailable(str(exc)) from exc
+    return delta
 
 
 def publish(store, allocator: Allocator) -> dict:

@@ -629,6 +629,9 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
         # shrink id from 0 to 1 -- permanently burning capacity and the mapping
         # epoch for a block that never existed. A private allocator mints in
         # memory and publishes nothing.
+        # One proposal-level overlay for the whole simulation. Transaction-level
+        # children belong with apply, which is not on the proposal branch yet;
+        # at this level the simulation is always discarded, so nothing publishes.
         allocation = tau_shrink.speculative_allocation() if sim_session is not None else None
         try:
             if allocation is not None:

@@ -574,6 +574,66 @@ def get_shrink_id(key: str) -> int:
         _db_conn.commit()
         return id_num
 
+def shrink_mapping_epoch() -> str:
+    """A version that changes on ANY committed change to the intern mapping.
+
+    Not `max(id)`: an operation could add and remove bindings, or rebind a key,
+    without moving the maximum, and a proposal validated against the old mapping
+    would publish into a table it no longer describes. Count and maximum together
+    move on every insert, and the table is insert-only.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT COUNT(*), COALESCE(MAX(id), 0) FROM tau_shrink_ids')
+        count, top = cur.fetchone()
+        return f"{int(count)}:{int(top)}"
+
+
+def publish_shrink_ids(delta: dict, expected_epoch: str) -> None:
+    """Insert an exact set of (key -> id) bindings in ONE transaction.
+
+    Exact, because the worker whose result was validated embedded THESE ids: a
+    publication that renumbered them would commit a representation nobody
+    evaluated. Aborts if the mapping moved underneath the proposal, or if any
+    binding is no longer available.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT COUNT(*), COALESCE(MAX(id), 0) FROM tau_shrink_ids')
+        count, top = cur.fetchone()
+        current = f"{int(count)}:{int(top)}"
+        if current != expected_epoch:
+            raise ValueError(
+                f"shrink mapping moved: expected epoch {expected_epoch}, found {current}"
+            )
+        try:
+            for key, id_num in sorted(delta.items(), key=lambda kv: kv[1]):
+                cur.execute('SELECT id FROM tau_shrink_ids WHERE key = ?', (key,))
+                row = cur.fetchone()
+                if row is not None:
+                    if int(row[0]) != int(id_num):
+                        raise ValueError(
+                            f"{key!r} is already bound to {int(row[0])}, plan says {id_num}"
+                        )
+                    continue
+                cur.execute('SELECT key FROM tau_shrink_ids WHERE id = ?', (int(id_num),))
+                taken = cur.fetchone()
+                if taken is not None:
+                    raise ValueError(f"id {id_num} already belongs to {taken[0]!r}")
+                cur.execute('INSERT INTO tau_shrink_ids(id, key) VALUES (?, ?)',
+                            (int(id_num), key))
+            _db_conn.commit()
+        except Exception:
+            _db_conn.rollback()
+            raise
+
+
 def lookup_shrink_id(key: str):
     """The id already interned for `key`, or None. READ ONLY.
 
