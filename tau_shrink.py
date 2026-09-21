@@ -269,7 +269,16 @@ def intern_value(hex_digits: str, width: int) -> int:
             id_num = int(_allocator.id_for(key))
         else:
             id_num = int(db.get_shrink_id(key))
+    except ShrinkWidthOverflow:
+        raise
     except Exception as exc:  # DB unavailable, malformed id, etc.
+        # An allocator may report something that is NOT a transient storage
+        # problem -- a replay whose journal references a value the committed
+        # mapping lacks is a disagreement between two anchors. Flattening that
+        # into ShrinkUnavailable turns it into a silent full-width fallback and
+        # hides the mismatch.
+        if type(exc).__name__ == "ReconstructionMismatch":
+            raise
         raise ShrinkUnavailable(f"intern failed: {exc}") from exc
     if id_num < 0:
         raise ShrinkUnavailable(f"interned id {id_num} is negative")

@@ -115,8 +115,16 @@ def semantic_result(outputs=None, outcome=None, progressed=None) -> dict:
     values = {}
     present = []
     for name, value in (outputs or {}).items():
-        present.append(str(name))
-        values[str(name)] = None if value is None else str(value)
+        label = str(name)
+        present.append(label)
+        # Values are recorded for OUTPUT streams only. The router echoes the
+        # accepted specification on `u`, which carries interned ids and runtime
+        # widths -- binding the semantic fingerprint to that would make every
+        # legitimate representation change look like divergence, which is exactly
+        # what the semantic/runtime split exists to avoid. Its PRESENCE still
+        # counts.
+        if label.startswith("o") and label[1:].isdigit():
+            values[label] = None if value is None else str(value)
     return {
         "outcome": outcome,
         "present": sorted(present),

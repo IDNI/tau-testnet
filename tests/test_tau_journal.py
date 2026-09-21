@@ -334,3 +334,13 @@ def test_identity_is_stable_for_the_same_candidate_and_context():
     a = tj.candidate_identity("R", mapping_epoch="e1", width=8, runtime_text="X")
     b = tj.candidate_identity("R", mapping_epoch="e1", width=8, runtime_text="X")
     assert a == b
+
+
+def test_the_session_and_the_journal_share_one_vocabulary():
+    """These were separate string literals, and a reconstruction compared a
+    journal entry's kind against the session's -- replaying every recorded
+    revision as an input step, so the rebuilt evaluator applied no rules at all
+    and still looked like it worked."""
+    import tau_session as ts
+    assert ts.RULE == tj.REVISION
+    assert ts.EVAL == tj.STEP

@@ -26,8 +26,12 @@ import tau_journal
 
 logger = logging.getLogger(__name__)
 
-RULE = "rule"
-EVAL = "eval"
+# One vocabulary, deliberately. These used to be separate string literals from
+# the journal's, and a reconstruction compared a journal entry's kind against
+# this module's -- replaying every recorded revision as an input step, so the
+# rebuilt evaluator applied no rules at all and still looked like it worked.
+RULE = tau_journal.REVISION
+EVAL = tau_journal.STEP
 
 
 def _shrink_width():
@@ -203,7 +207,7 @@ class WorkerSession(EvaluatorSession):
     is_speculative = True
 
     def __init__(self, spec_session, log=None, normalize=None, journal=None,
-                 allocation=None):
+                 allocation=None, plan=None):
         self._spec = spec_session
         self.log = log if log is not None else StepLog()
         self.last_outcome = None
@@ -219,6 +223,11 @@ class WorkerSession(EvaluatorSession):
                 label="proposal",
             )
         self.allocation = allocation
+        # The representation this session runs under. The session encodes
+        # canonical inputs itself: letting a caller supply pre-encoded values
+        # alongside canonical rules is exactly how the miner ended up feeding
+        # full-width rule literals against interned input values.
+        self.plan = plan
         # A proposal journal: accepted speculative execution for the candidate
         # block, adopted into the committed record only if the block commits.
         self.journal = journal if journal is not None else tau_journal.Journal(
@@ -232,7 +241,7 @@ class WorkerSession(EvaluatorSession):
 
     @classmethod
     def spawn(cls, baseline_spec, *, cwd=None, env=None, trace=None, normalize=None,
-              allocation=None):
+              allocation=None, plan=None):
         """Build a worker at `baseline_spec`, replaying `trace` onto it.
 
         Replay is how a worker reaches a state at all: reconstruction from
@@ -246,13 +255,57 @@ class WorkerSession(EvaluatorSession):
         env["PYTHONPATH"] = cwd + _os.pathsep + env.get("PYTHONPATH", "")
         spec_session = tau_speculation.SpeculationSession(cwd=cwd, env=env)
         spec_session.init(baseline_spec)
-        session = cls(spec_session, normalize=normalize, allocation=allocation)
+        session = cls(spec_session, normalize=normalize, allocation=allocation,
+                      plan=plan)
         for entry in (trace or []):
             if entry.get("kind") == RULE:
                 session.apply_rule(entry.get("rule_text") or "")
             else:
                 session.evaluate(entry.get("inputs") or {}, target=entry.get("target"))
         return session
+
+    @classmethod
+    def reconstruct(cls, baseline_spec, *, journal, plan, snapshot, descriptor=None,
+                    cwd=None, env=None, verify=True):
+        """Rebuild an authoritative evaluator from ONE anchor.
+
+        Replay runs against a READ-ONLY view of the committed mapping, so a
+        canonical value the journal references and the mapping lacks is reported
+        as a disagreement between the two anchors rather than quietly allocated.
+
+        Only SEMANTIC fingerprints are compared: a replay under a different
+        representation is expected to produce different runtime payloads and the
+        same meaning.
+        """
+        import tau_reconstruction
+
+        replay_alloc = tau_reconstruction.ReplayAllocator(snapshot)
+        session = cls.spawn(baseline_spec, cwd=cwd, env=env,
+                            allocation=replay_alloc, plan=plan)
+        session.descriptor = descriptor
+        for entry, (seq, expected) in zip(journal.entries(), journal.fingerprints()):
+            payload = entry.replayable()
+            # journal kinds, not session kinds: tau_journal.REVISION is
+            # "revision" while this module's RULE is "rule", and comparing
+            # against the wrong one replays every recorded revision as an input
+            # step -- a reconstruction that silently applies no rules at all
+            if payload["kind"] == tau_journal.REVISION:
+                session.apply_rule(payload["rule_text"], record=False)
+                observed = (session.last_outcome or {}).get("outputs")
+                outcome = (session.last_outcome or {}).get("outcome")
+            else:
+                observed = session.evaluate(payload["inputs"], multi=True, record=False)
+                outcome = None
+            if verify:
+                tau_journal.compare(expected, observed, seq=seq, outcome=outcome)
+        return session
+
+    def begin_proposal(self, allocation):
+        """Leave replay behind: from here new canonical values may be allocated,
+        in the proposal's own overlay."""
+        self.allocation = allocation
+        self.journal = tau_journal.Journal(authoritative=False)
+        return self
 
     def dispose(self):
         try:
@@ -270,7 +323,9 @@ class WorkerSession(EvaluatorSession):
         return text
 
     def _named_inputs(self, inputs):
-        if self._normalize is not None:
+        if self.plan is not None:
+            inputs = self._encode(inputs)
+        elif self._normalize is not None:
             try:
                 inputs = self._normalize(inputs)
             except Exception:
@@ -280,6 +335,19 @@ class WorkerSession(EvaluatorSession):
             name = key if isinstance(key, str) and key.startswith("i") else f"i{key}"
             named[name] = self._bare(value)
         return named
+
+    def _encode(self, inputs):
+        """Canonical values in, runtime values out, under THIS session's plan."""
+        import tau_shrink
+        encoded = {}
+        for key, value in (inputs or {}).items():
+            index = key
+            if isinstance(key, str):
+                index = int(key[1:]) if key.startswith("i") else int(key)
+            encoded[key] = tau_shrink.shrink_stream_value(
+                value, index, self.plan.interned
+            )
+        return encoded
 
     @staticmethod
     def _by_index(outputs):
@@ -303,8 +371,9 @@ class WorkerSession(EvaluatorSession):
         # interned input value, and the simulation rejects transfers the
         # authoritative path accepts.
         import tau_shrink
+        exclude = self.plan.excludes() if self.plan is not None else frozenset()
         with self._allocating():
-            prepared = tau_shrink.prepare_rule(rule_text)
+            prepared = tau_shrink.prepare_rule(rule_text, exclude_streams=exclude)
             runtime_text = prepared.runtime_text
             receipt = self._spec.revise(runtime_text, "apply")
         self.last_outcome = receipt
