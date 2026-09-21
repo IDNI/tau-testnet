@@ -413,7 +413,22 @@ class WorkerSession(EvaluatorSession):
         return "" if target is None else indexed.get(target, "")
 
     def last_receipt(self):
-        return self.last_outcome
+        """A plain dict with an explicit `accepted` KEY.
+
+        The worker's receipt exposes `accepted` as a property, and callers read
+        receipts with `.get("accepted")` -- which returns None and makes every
+        accepted rule look rejected. Normalizing here keeps that trap in one place
+        instead of at every reader.
+        """
+        receipt = self.last_outcome
+        if receipt is None:
+            return None
+        normalized = dict(receipt)
+        normalized["accepted"] = bool(
+            getattr(receipt, "accepted", False)
+            or normalized.get("outcome") in _ACCEPTED
+        )
+        return normalized
 
 
 _default_session = None

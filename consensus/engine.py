@@ -945,6 +945,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         parent_last_transfer_ts: Optional[Dict[str, int]] = None,
         target_last_transfer_ts: Optional[Dict[str, int]] = None,
         session=None,
+        proposal=None,
     ) -> TauExecutionResult:
         """
         Apply transactions to the current state.
@@ -967,6 +968,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         if block_timestamp is None:
             block_timestamp = 0
             
+        # Proposal mode owns ALL of its state. The `x if x is not None else
+        # <global>` conveniences below are exactly how committed state leaks back
+        # into a speculative execution, so in proposal mode a missing owned value
+        # is a programming error rather than a fallback.
+        if proposal is not None:
+            missing = [name for name, value in (
+                ("target_balances", target_balances),
+                ("target_sequences", target_sequences),
+                ("target_lifecycle", target_lifecycle),
+            ) if value is None]
+            if missing:
+                raise ValueError(
+                    "proposal execution requires owned state; missing: "
+                    + ", ".join(missing)
+                )
+            if session is None:
+                session = proposal.session
+
         lifecycle_mgr = target_lifecycle if target_lifecycle is not None else chain_state._lifecycle_manager
         # The evaluator this apply drives. The default binds to THIS module's
         # `tau_manager` reference rather than importing its own, so a caller that
@@ -977,6 +996,40 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             session if session is not None
             else tau_session.InProcessSession(manager=tau_manager)
         )
+
+        def _rules_state() -> str:
+            if proposal is not None:
+                return proposal.state.get("application_rules", "") or ""
+            return (chain_state.get_application_rules_state()
+                    if hasattr(chain_state, "get_application_rules_state") else "")
+
+        def _set_rules_state(text) -> None:
+            if proposal is not None:
+                proposal.state["application_rules"] = text
+                return
+            chain_state.save_application_rules_state(text)
+
+        def _sequence_of(address) -> int:
+            if proposal is not None:
+                return int(target_sequences.get(address, 0))
+            if target_sequences is not None and address in target_sequences:
+                return int(target_sequences[address])
+            return chain_state.get_sequence_number(address)
+
+        def _balance_of(address) -> int:
+            if proposal is not None:
+                return int(target_balances.get(address, 0))
+            if target_balances is not None and address in target_balances:
+                return target_balances[address]
+            return chain_state.get_balance(address)
+
+        def _commit_snapshot(snap):
+            # A proposal RETURNS a snapshot; publishing it is the commit owner's
+            # decision, made once, later. An apply that commits internally has no
+            # proposal boundary however well its transactions are staged.
+            if proposal is not None:
+                return snap
+            return self._state_store.commit(snap)
 
         accepted_txs = []
         rejected_txs = []
@@ -1101,6 +1154,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             return str(max(0, min(elapsed, tau_defs.COOLDOWN_NEVER_SENT)))
 
         for i, tx in enumerate(transactions):
+            # One branch per transaction. Its journal child, allocator child and
+            # state delta resolve together; a rejection that already stepped the
+            # evaluator rebuilds the proposal worker from the accepted prefix.
+            _branch = None
+            if proposal is not None:
+                _branch = proposal.transaction(
+                    str(tx.get("tx_id") or tx.get("tx_hash") or f"tx{i}")
+                )
+                _session = proposal.session
             tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
             operations = tx.get('operations', {})
             sender = tx.get('sender_pubkey')
@@ -1154,7 +1216,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if target_sequences is not None:
                     current_seq = target_sequences.get(sender, 0)
                 else:
-                    current_seq = chain_state.get_sequence_number(sender)
+                    current_seq = _sequence_of(sender)
                     
                 if sequence_number == current_seq:
                     should_increment_seq = True
@@ -1207,9 +1269,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 """Balance as seen through this tx's staged writes."""
                 if addr in staged_writes:
                     return staged_writes[addr]
-                if target_balances is not None and addr in target_balances:
-                    return target_balances[addr]
-                return chain_state.get_balance(addr)
+                return _balance_of(addr)
 
             def _apply_o5_clause_routing(rule_text):
                 """Register or revoke the sender's o5 clause. True when handled.
@@ -1983,7 +2043,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             _rule_touched_canonical = False
             try:
                 if hasattr(chain_state, "get_application_rules_state"):
-                    _rule_prior_rules_state = chain_state.get_application_rules_state()
+                    _rule_prior_rules_state = _rules_state()
             except Exception:
                 _rule_prior_rules_state = None
 
@@ -2079,12 +2139,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         hard_reject = True
                                         tx_receipt["reason"] = "rule_rejected"
                                 elif _session.is_speculative:
-                                    # A speculative session commits nothing, so
-                                    # there is no persistence to check for. The
-                                    # engine's own receipt is the evidence, and
-                                    # the canonical write happens on acceptance,
-                                    # on the authoritative path.
-                                    tx_receipt["logs"].append("Rule applied (speculative)")
+                                    # Persistence-as-proof does not survive this
+                                    # architecture: a speculative session commits
+                                    # nothing, so asking whether the rules handler
+                                    # persisted the text can only ever answer "no".
+                                    # The receipt is the evidence of engine
+                                    # acceptance; the canonical delta is STAGED
+                                    # here and merged only if the transaction
+                                    # survives every later stage.
+                                    staged = _rules_state()
+                                    unit = rule_text.strip()
+                                    units = [u for u in staged.split("\n") if u.strip()]
+                                    if unit not in units:
+                                        units.append(unit)
+                                    _set_rules_state("\n".join(units))
+                                    current_tau_bytes = "\n".join(units).encode("utf-8")
+                                    _rule_touched_canonical = True
+                                    tx_receipt["logs"].append("Rule applied (staged)")
                                 elif not _application_rule_landed(rule_text):
                                     # Live apply: the handler did not persist, so
                                     # this is a no-op that must not sit in the
@@ -2106,11 +2177,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 else:
                                     rules_text = None
                                     try:
-                                        val = (
-                                            chain_state.get_application_rules_state()
-                                            if hasattr(chain_state, "get_application_rules_state")
-                                            else None
-                                        )
+                                        val = _rules_state()
                                         if isinstance(val, str):
                                             rules_text = val
                                     except Exception:
@@ -2248,7 +2315,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         if from_addr in target_balances:
                                             current_from = target_balances[from_addr]
                                         else:
-                                            current_from = chain_state.get_balance(from_addr)
+                                            current_from = _balance_of(from_addr)
 
                                         if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
                                             current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
@@ -2262,7 +2329,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                             tx_receipt["logs"].append("Transfer balance state failed (insufficient)")
                                             break
                                             
-                                        current_to = target_balances.get(to_addr, chain_state.get_balance(to_addr))
+                                        current_to = _balance_of(to_addr)
                                         target_balances[from_addr] = current_from - amount
                                         target_balances[to_addr] = current_to + amount
                                     else:
@@ -2459,7 +2526,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if (_rule_prior_rules_state is not None
                         and hasattr(chain_state, "save_application_rules_state")):
                     try:
-                        chain_state.save_application_rules_state(_rule_prior_rules_state)
+                        _set_rules_state(_rule_prior_rules_state)
                         logger.warning(
                             "rolled back the canonical application rule of a rejected "
                             "transaction (reason=%s)", tx_receipt.get("reason")
@@ -2492,11 +2559,28 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         if target_sequences is not None:
                             target_sequences[sender] = target_sequences.get(sender, 0) + 1
                         else:
+                            if proposal is not None:
+                                raise ValueError("proposal execution owns its sequences")
                             chain_state.increment_sequence_number(sender)
                     except Exception:
                         logger.error("Failed to increment sequence number for %s", sender, exc_info=True)
                         tx_receipt["logs"].append("Error: failed to increment sequence number")
                         # execution_success = False ? No, sequence failure is bad but processed.
+
+            if _branch is not None:
+                # The verdict resolves the branch: accepted merges the journal
+                # child, the allocator child and the state delta together;
+                # rejected merges none of them and rebuilds the evaluator if this
+                # transaction stepped it.
+                _branch.state_delta["application_rules"] = _rules_state()
+                if accepted_in_block and not hard_reject:
+                    _branch.accept()
+                else:
+                    _branch.reject(tx_receipt.get("reason") or "rejected")
+                    # the staged canonical delta goes with it
+                    if _rule_touched_canonical:
+                        _set_rules_state(_rule_prior_rules_state or "")
+                        current_tau_bytes = _rule_prior_tau_bytes
 
             if accepted_in_block and not hard_reject:
                 accepted_txs.append(tx)
@@ -2521,7 +2605,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         )
         
         return TauExecutionResult(
-            snapshot=self._state_store.commit(new_snapshot),
+            snapshot=_commit_snapshot(new_snapshot),
             accepted_transactions=accepted_txs,
             rejected_transactions=rejected_txs,
             receipts=receipts,

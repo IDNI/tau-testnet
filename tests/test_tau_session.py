@@ -174,3 +174,27 @@ def test_the_default_session_follows_a_substituted_manager():
         session = ts.InProcessSession(manager=engine.tau_manager)
         session.apply_rule("RULE")
     assert fake.calls, "the substituted manager was bypassed"
+
+
+def test_a_worker_receipt_exposes_accepted_as_a_key():
+    """Callers read receipts with `.get("accepted")`. The worker's receipt has it
+    as a PROPERTY, so an un-normalized receipt makes every accepted rule look
+    rejected -- which is exactly what happened when apply first ran in proposal
+    mode."""
+    class _Spec:
+        def revise(self, text, cid):
+            import tau_speculation
+            return tau_speculation.RevisionReceipt(
+                {"outcome": "ACCEPTED_CHANGED", "ok": True})
+
+        def step(self, inputs):
+            return {"outputs": {}}
+
+        def kill(self):
+            pass
+
+    session = ts.WorkerSession(_Spec())
+    session.apply_rule("R")
+    receipt = session.last_receipt()
+    assert receipt["accepted"] is True
+    assert receipt.get("accepted") is True
