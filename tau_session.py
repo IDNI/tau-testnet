@@ -22,6 +22,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
+import tau_journal
+
 logger = logging.getLogger(__name__)
 
 RULE = "rule"
@@ -106,11 +108,19 @@ class InProcessSession(EvaluatorSession):
     explicitly rather than by accident.
     """
 
-    def __init__(self, manager=None, log: StepLog | None = None):
+    def __init__(self, manager=None, log: StepLog | None = None, journal=None,
+                 phase=tau_journal.PHASE_APPLY):
         if manager is None:
             import tau_manager as manager  # late: chain_state imports this module
         self._manager = manager
         self.log = log if log is not None else StepLog()
+        # The COMMITTED journal by default: this session drives the authoritative
+        # evaluator, so what it feeds defines the state a reconstruction has to
+        # reproduce. Advisory and validation work does not come through here --
+        # it runs on a different evaluator entirely, and only reaches the
+        # operational trace.
+        self._journal = journal if journal is not None else tau_journal.committed()
+        self._phase = phase
 
     # --- readiness ------------------------------------------------------------
 
@@ -129,11 +139,18 @@ class InProcessSession(EvaluatorSession):
             apply_rules_update=True,
         )
         receipt = self._manager.get_last_revision_receipt()
+        outcome = (receipt or {}).get("outcome")
         if record:
             self.log.record(StepRecord(
-                kind=RULE, rule_text=rule_text, target=target,
-                outcome=(receipt or {}).get("outcome"),
+                kind=RULE, rule_text=rule_text, target=target, outcome=outcome,
             ))
+            self._journal.record(
+                tau_journal.REVISION, phase=self._phase, rule_text=rule_text,
+                target=target, outcome=outcome, result=output,
+            )
+        else:
+            tau_journal.trace().record(self._phase,
+                                       {"kind": "revision", "recorded": False})
         return output
 
     def evaluate(self, inputs: dict, *, target=None, source: str = "unknown",
@@ -152,6 +169,11 @@ class InProcessSession(EvaluatorSession):
         if record:
             self.log.record(StepRecord(kind=EVAL, inputs=dict(inputs or {}),
                                        target=target))
+            self._journal.record(tau_journal.STEP, phase=self._phase,
+                                 inputs=inputs, target=target, result=out)
+        else:
+            tau_journal.trace().record(self._phase,
+                                       {"kind": "step", "recorded": False})
         return out
 
     def last_receipt(self):
@@ -175,10 +197,15 @@ class WorkerSession(EvaluatorSession):
 
     is_speculative = True
 
-    def __init__(self, spec_session, log=None, normalize=None):
+    def __init__(self, spec_session, log=None, normalize=None, journal=None):
         self._spec = spec_session
         self.log = log if log is not None else StepLog()
         self.last_outcome = None
+        # A proposal journal: accepted speculative execution for the candidate
+        # block, adopted into the committed record only if the block commits.
+        self.journal = journal if journal is not None else tau_journal.Journal(
+            authoritative=False
+        )
         # A worker seeded with the RUNTIME (possibly shrunk) spec has to receive
         # runtime-encoded values, or its comparisons silently never match. The
         # caller supplies the same encoder the authoritative path uses; without
@@ -256,6 +283,9 @@ class WorkerSession(EvaluatorSession):
         if record:
             self.log.record(StepRecord(kind=RULE, rule_text=rule_text, target=target,
                                        outcome=outcome))
+            self.journal.record(tau_journal.REVISION,
+                                phase=tau_journal.PHASE_SPECULATIVE,
+                                rule_text=rule_text, target=target, outcome=outcome)
         return "ok" if accepted else f"error: {outcome}"
 
     def evaluate(self, inputs, *, target=None, source="unknown", multi=False,
@@ -265,6 +295,9 @@ class WorkerSession(EvaluatorSession):
         if record:
             self.log.record(StepRecord(kind=EVAL, inputs=dict(inputs or {}),
                                        target=target))
+            self.journal.record(tau_journal.STEP,
+                                phase=tau_journal.PHASE_SPECULATIVE,
+                                inputs=inputs, target=target, result=indexed)
         if multi:
             return indexed
         return "" if target is None else indexed.get(target, "")

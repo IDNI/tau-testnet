@@ -538,6 +538,21 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
             return f"Unsupported fee_beneficiary inside host_contract_patch: {err}"
     return None
 
+
+_TEMPORAL_BACKREF_RE = re.compile(r"\b[io]\d+\s*\[\s*t\s*-\s*\d+\s*\]")
+
+
+def _temporal_backreference(revisions):
+    """The first `iN[t-k]` / `oN[t-k]` reference in a set of revisions, or None."""
+    for revision in revisions or []:
+        if not isinstance(revision, str):
+            continue
+        match = _TEMPORAL_BACKREF_RE.search(_strip_tau_comments(revision))
+        if match:
+            return match.group(0)
+    return None
+
+
 def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """
     Validate the core fields and parameters of a consensus_rule_update payload.
@@ -558,6 +573,26 @@ def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView)
 
     if sum(len(rev.encode("utf-8")) for rev in tx["rule_revisions"]) > MAX_RULE_REVISIONS_BYTES:
         return format_error(f"'rule_revisions' total size exceeds MAX_RULE_REVISIONS_BYTES ({MAX_RULE_REVISIONS_BYTES}).")
+
+    # Header verification runs on an ISOLATED evaluator, because stepping the
+    # authoritative one for a header that may be verified twice, rejected, or
+    # never become a block corrupts the history every later transaction reads
+    # (measured: an advisory step changed the next verdict from 5 to 255). That
+    # isolated evaluator is reconstructed from rules, not from the input history,
+    # so it cannot answer a consensus rule that reads a PREVIOUS step.
+    #
+    # This is a boundary rather than a comment on purpose: today's consensus rules
+    # contain no back-reference, and nothing should be able to introduce one while
+    # the verifier cannot reproduce the history it would read.
+    temporal = _temporal_backreference(tx["rule_revisions"])
+    if temporal:
+        return format_error(
+            f"consensus rule revision reads a previous step ({temporal}). Header "
+            "verification runs on an evaluator reconstructed from rules alone, so "
+            "it cannot reproduce that history; such a revision is refused until "
+            "verification replays the execution journal.",
+            code="TEMPORAL_CONSENSUS_RULE",
+        )
 
     h_activate = tx.get("activate_at_height")
     if not isinstance(h_activate, int) or h_activate < 1 or h_activate > 0xFFFFFFFFFFFFFFFF:

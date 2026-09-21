@@ -72,12 +72,32 @@ class AdvisoryEvaluator:
 
     # --- queries --------------------------------------------------------------
 
+    @staticmethod
+    def _trace(kind, inputs, targets):
+        """Advisory work reaches the OPERATIONAL TRACE and nothing else.
+
+        Recording it in the committed journal would put it on the authoritative
+        replay path, which is how the contamination this evaluator exists to
+        remove would come back: replaying an advisory step reproduces its effect
+        on the next transaction's history rather than eliminating it.
+        """
+        try:
+            import tau_journal
+            tau_journal.trace().record(
+                tau_journal.PHASE_ADVISORY,
+                {"kind": kind, "streams": sorted(str(k) for k in (inputs or {})),
+                 "targets": list(targets)},
+            )
+        except Exception:
+            pass
+
     def evaluate_many(self, canonical_spec: str, inputs: dict, targets):
         """Answer several advisory questions from ONE step, or None.
 
         One step, because asking twice would advance this evaluator between the
         two answers and they are meant to describe the same moment.
         """
+        self._trace("evaluate_many", inputs, targets)
         try:
             session = self._ensure(canonical_spec)
             result = session.step(self._named(inputs))
@@ -103,6 +123,7 @@ class AdvisoryEvaluator:
         is None, which callers already treat as "no opinion". It must not be able
         to take down mining or admission.
         """
+        self._trace("evaluate", inputs, (target,))
         try:
             session = self._ensure(canonical_spec)
             result = session.step(self._named(inputs))
