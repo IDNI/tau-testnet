@@ -251,6 +251,23 @@ def _restore_per_sender_sequence_order(transactions, execution_transactions, res
 
 
 
+
+def _program_baseline():
+    """The interpreter's starting spec: the program file the node boots from."""
+    import os as _os
+    path = getattr(config, "TAU_PROGRAM_FILE", None) or "genesis.tau"
+    if not _os.path.isabs(path):
+        path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), path)
+    try:
+        with open(path) as fh:
+            text = fh.read().strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    return text if text.lstrip().startswith("always") else f"always ( {text} )."
+
+
 def _speculative_session():
     """A disposable evaluator for the miner simulation, or None to stay in-process.
 
@@ -268,14 +285,33 @@ def _speculative_session():
     iface = getattr(tau_manager, "tau_direct_interface", None)
     if iface is None:
         return None
-    baseline = None
+    # Seeding matters more than it looks. A worker loaded with the CURRENT
+    # composed spec is measurably MORE PERMISSIVE than the authoritative
+    # interpreter: a stream typed by a rule that has since been superseded keeps
+    # its commitment, and that commitment is invisible in the spec text. Measured
+    # -- authoritative REJECTED_RULE, fresh-from-spec ACCEPTED_CHANGED for the
+    # same candidate. A miner simulating on the permissive one would put a
+    # transaction in a block that the authoritative re-apply then rejects, and the
+    # block would fail on its state hash.
+    #
+    # So the worker is built by REPLAYING the accepted units in order, which
+    # re-establishes the same commitments (pinned by the replay-fidelity tests),
+    # rather than by loading the text they left behind.
     try:
-        baseline = iface.get_current_spec()
-    except Exception:
-        baseline = None
-    baseline = baseline or getattr(tau_manager, "last_known_tau_spec", None)
+        import chain_state as _chain_state
+        plan = _chain_state.get_tau_restore_plan()
+    except Exception as exc:
+        logger.warning("createblock: no restore plan for the simulation worker (%s)", exc)
+        return None
+    units = [str(step.get("text") or "") for step in (plan or []) if str(step.get("text") or "").strip()]
+    # The plan is a list of i0 updates to apply AFTER the interpreter has been
+    # initialized from the program file -- it does not include the router itself.
+    # Seeding from its first unit instead leaves the worker with no i0 stream at
+    # all, so every revision comes back INCOMPLETE and every rule looks rejected.
+    baseline = _program_baseline()
     if not baseline:
         return None
+    trace = [{"kind": tau_session.RULE, "rule_text": unit} for unit in units]
     # The baseline is the RUNTIME spec, so the worker needs runtime-encoded
     # inputs: the same encoder the authoritative path uses, against the same
     # node-local intern table.
@@ -285,7 +321,7 @@ def _speculative_session():
         return tau_manager._normalize_inputs(inputs, shrunk) or inputs
 
     try:
-        return tau_session.WorkerSession.spawn(baseline, normalize=normalize)
+        return tau_session.WorkerSession.spawn(baseline, trace=trace, normalize=normalize)
     except Exception as exc:
         logger.warning("createblock: no simulation worker (%s); simulating in-process", exc)
         return None
