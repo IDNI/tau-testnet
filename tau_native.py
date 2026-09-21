@@ -92,10 +92,17 @@ def load_tau_module():
     tau_lang_dir = os.path.join(workspace_dir, "tau-lang")
     
     # Candidate build paths relative to tau-lang root
+    # Lowercase entries are the CMake preset layout (./dev preset
+    # release-binding-python -> build/release); the rest are the legacy
+    # ./dev build layout. Both are in use, so both are searched.
     candidate_paths = [
         "build/bindings/python/nanobind",
+        "build/release/bindings/python/nanobind",
         "build/Release/bindings/python/nanobind",
         "build-Release/bindings/python/nanobind",
+        "build/devel/bindings/python/nanobind",
+        "build/relwithdebinfo/bindings/python/nanobind",
+        "build/debug/bindings/python/nanobind",
         "build/Debug/bindings/python/nanobind",
         "build-Debug/bindings/python/nanobind",
     ]
