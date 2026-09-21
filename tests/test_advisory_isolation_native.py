@@ -126,3 +126,54 @@ def test_an_advisory_failure_is_no_opinion_not_an_exception():
     finally:
         advisor.dispose()
         tau_advisory.reset()
+
+
+# --- the call-site audit ------------------------------------------------------
+
+def test_every_evaluator_call_site_is_classified():
+    """`query_eligibility` was the obvious leak, not the only one. Every caller of
+    the stateful evaluator is classified here, and anything that is not committed
+    execution must not reach the authoritative session.
+
+    authoritative : _apply_composite_rule, apply_block governance activation,
+                    replay_tau_restore_plan, tick_governance
+    advisory      : query_eligibility            -> isolated
+    validation    : verify_block_header          -> isolated
+    speculative   : the miner simulation         -> disposable worker
+    """
+    import re
+
+    source = open(os.path.join(REPO, "consensus", "engine.py")).read()
+    lines = source.split("\n")
+    owners = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^\s*def (\w+)", line)
+        if m:
+            owners.append((i, m.group(1)))
+
+    def owner_of(idx):
+        found = None
+        for i, name in owners:
+            if i <= idx:
+                found = name
+            else:
+                break
+        return found
+
+    direct = set()
+    for i, line in enumerate(lines):
+        if "tau_manager.communicate_with_tau" in line and not line.strip().startswith("#"):
+            direct.add(owner_of(i))
+
+    authoritative = {"_apply_composite_rule", "apply_block"}
+    isolated_with_fallback = {"query_eligibility", "verify_block_header"}
+    assert direct <= authoritative | isolated_with_fallback, (
+        f"unclassified evaluator call sites: {direct - authoritative - isolated_with_fallback}"
+    )
+    # the two isolated ones must ASK the advisory evaluator first. Take the LAST
+    # definition: the abstract base declares these names too.
+    for name in isolated_with_fallback:
+        starts = [i for i, n in owners if n == name]
+        assert starts, f"{name} not found"
+        body = "\n".join(lines[starts[-1]:starts[-1] + 140])
+        assert "tau_advisory.evaluator()" in body, f"{name} does not use the isolated evaluator"

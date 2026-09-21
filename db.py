@@ -574,6 +574,23 @@ def get_shrink_id(key: str) -> int:
         _db_conn.commit()
         return id_num
 
+def lookup_shrink_id(key: str):
+    """The id already interned for `key`, or None. READ ONLY.
+
+    Speculative evaluation needs to reuse committed ids without minting new ones:
+    `get_shrink_id` inserts and commits, so a proposal that is later rejected
+    would permanently burn capacity and move the mapping epoch.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT id FROM tau_shrink_ids WHERE key = ?', (key,))
+        row = cur.fetchone()
+        return int(row[0]) if row else None
+
+
 def get_max_shrink_id() -> int:
     """Largest assigned shrink id (0 if none). Used to pick the smallest bv
     shrink width that covers the ids in use.

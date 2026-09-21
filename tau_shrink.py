@@ -212,6 +212,62 @@ def canonical_intern_key(hex_digits: str, width: int) -> str:
     return f"bv{width}:{cleaned.zfill(pad)}"
 
 
+# An allocator override, installed for the duration of a speculative evaluation.
+# `db.get_shrink_id` inserts and COMMITS, so without this a proposal that is later
+# rejected permanently burns an id and moves the mapping epoch -- the interpreter
+# would be isolated while the allocator was not.
+_allocator = None
+
+
+class _SpeculativeAllocator:
+    """Reads committed ids; mints new ones in memory only.
+
+    Equality semantics are invariant under any injective relabeling, which is the
+    property this whole module rests on, so a speculative id that never leaves the
+    worker may differ from the one the authoritative path later commits.
+    """
+
+    def __init__(self, high_water: int):
+        self._local = {}
+        self._next = int(high_water)
+
+    def __call__(self, key: str) -> int:
+        committed = db.lookup_shrink_id(key)
+        if committed is not None:
+            return committed
+        if key not in self._local:
+            self._next += 1
+            self._local[key] = self._next
+        return self._local[key]
+
+    @property
+    def minted(self) -> dict:
+        return dict(self._local)
+
+
+class speculative_allocation:
+    """Install a private allocator for the duration of a speculative evaluation."""
+
+    def __init__(self, high_water=None):
+        self._high_water = (
+            db.get_max_shrink_id() if high_water is None else int(high_water)
+        )
+        self.allocator = None
+        self._previous = None
+
+    def __enter__(self):
+        global _allocator
+        self.allocator = _SpeculativeAllocator(self._high_water)
+        self._previous = _allocator
+        _allocator = self.allocator
+        return self.allocator
+
+    def __exit__(self, *exc):
+        global _allocator
+        _allocator = self._previous
+        return False
+
+
 def intern_value(hex_digits: str, width: int) -> int:
     """Intern a hex bitvector value to its small id. Zero -> RESERVED_EMPTY_ID.
 
@@ -223,7 +279,8 @@ def intern_value(hex_digits: str, width: int) -> int:
         return RESERVED_EMPTY_ID
     key = canonical_intern_key(hex_digits, width)
     try:
-        id_num = int(db.get_shrink_id(key))
+        allocate = _allocator if _allocator is not None else db.get_shrink_id
+        id_num = int(allocate(key))
     except Exception as exc:  # DB unavailable, malformed id, etc.
         raise ShrinkUnavailable(f"intern failed: {exc}") from exc
     if id_num < 0:

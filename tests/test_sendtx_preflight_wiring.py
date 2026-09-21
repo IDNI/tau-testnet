@@ -29,7 +29,11 @@ def _wire(verdict, *, detail="", test_mode=False, baseline="always ( x ).",
     else:
         manager._prepare_rule_for_tau.return_value = _Prepared()
     result = pf.PreflightResult(verdict, detail=detail)
+    # The suite runs under TAU_ENV=test; these cases are about a PRODUCTION node,
+    # where an absent native evaluator is an operational failure rather than an
+    # exemption.
     with patch.dict("sys.modules", {"tau_manager": manager}), \
+         patch.object(sendtx, "_test_mode_was_requested", return_value=test_mode), \
          patch.object(pf, "preflight_rule", return_value=result) as called:
         return sendtx._preflight_prepared_rule(RULE), called
 
@@ -57,24 +61,29 @@ def test_unavailable_is_reported_not_swallowed():
     assert "TX_REJECTED" not in out["code"], "an operational failure is not a verdict"
 
 
-def test_a_node_without_a_native_interface_skips_the_preflight():
-    """Applicability is a node fact decided before anything is attempted, so it
-    is not an operational failure and does not change the verdict."""
+def test_a_production_node_without_a_native_evaluator_is_unavailable():
+    """Expected-but-absent is operational, not exempt."""
     out, called = _wire(pf.REJECT, has_interface=False)
-    assert out is None
+    assert out is not None and out["code"] == "ADMISSION_UNAVAILABLE"
     assert called.call_count == 0
 
 
-def test_mock_mode_skips_the_preflight_entirely():
+def test_only_an_explicitly_requested_test_mode_skips_the_preflight():
+    """`tau_manager` flips tau_test_mode on when the native interface fails to
+    build, so reading that flag alone would turn a broken production node into one
+    that silently stops validating."""
     out, called = _wire(pf.REJECT, test_mode=True)
     assert out is None
-    assert called.call_count == 0, "mock mode has no interpreter to be compatible with"
-
-
-def test_no_baseline_means_nothing_to_be_compatible_with():
-    out, called = _wire(pf.REJECT, baseline="")
-    assert out is None
     assert called.call_count == 0
+
+
+def test_an_empty_baseline_still_validates_the_candidate():
+    """The first rule on a fresh chain is the one least likely to have been seen
+    before. An empty baseline used to skip the check entirely -- validating
+    nothing precisely when there is nothing to validate against."""
+    out, called = _wire(pf.REJECT, baseline="")
+    assert called.call_count == 1, "the candidate was not validated at all"
+    assert out is not None and out["code"] == "TX_REJECTED"
 
 
 def test_a_representation_conflict_is_node_local_not_a_rule_rejection():

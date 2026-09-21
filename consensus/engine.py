@@ -551,12 +551,26 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # is an RLock, so this outer hold is a (harmless) wider atomic
                 # region. Missing o7 parses to 0 -> fail closed (a non-member's
                 # block is rejected).
-                with tau_manager.tau_comm_lock:
-                    outputs = tau_manager.communicate_with_tau_multi(
-                        input_stream_values=tau_inputs,
-                        source="consensus_verify",
-                        apply_rules_update=False,
+                # VALIDATION, not committed execution. A header can be verified
+                # more than once, verified and rejected, arrive from a peer, or be
+                # checked without ever becoming the next block -- none of which
+                # should move the authoritative history. Stepping is not
+                # read-only, so this runs on the isolated evaluator when there is
+                # one. (The shipped consensus rules carry no `[t-N]` reference, so
+                # a history-free evaluator answers identically; a governance
+                # update that introduced one would need this revisited.)
+                outputs = None
+                if _advisory_is_available():
+                    outputs = tau_advisory.evaluator().evaluate_many(
+                        tau_manager.get_canonical_spec() or "", tau_inputs, (6, 7)
                     )
+                if outputs is None:
+                    with tau_manager.tau_comm_lock:
+                        outputs = tau_manager.communicate_with_tau_multi(
+                            input_stream_values=tau_inputs,
+                            source="consensus_verify",
+                            apply_rules_update=False,
+                        )
                 o6_raw = outputs.get(6, "")
                 o7_raw = outputs.get(7, "")
                 output = str(o6_raw)
@@ -567,11 +581,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if verdict:
                     return True
             else:
-                output = tau_manager.communicate_with_tau(
-                    target_output_stream_index=6,
-                    input_stream_values=tau_inputs,
-                    apply_rules_update=False
-                )
+                # Same category: validation must not mutate authoritative state.
+                output = None
+                if _advisory_is_available():
+                    output = tau_advisory.evaluator().evaluate(
+                        tau_manager.get_canonical_spec() or "", tau_inputs, target=6
+                    )
+                if output is None:
+                    output = tau_manager.communicate_with_tau(
+                        target_output_stream_index=6,
+                        input_stream_values=tau_inputs,
+                        apply_rules_update=False
+                    )
                 verdict = tau_manager.parse_tau_output(str(output)) != 0
                 if verdict:
                     return True

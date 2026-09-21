@@ -72,6 +72,30 @@ class AdvisoryEvaluator:
 
     # --- queries --------------------------------------------------------------
 
+    def evaluate_many(self, canonical_spec: str, inputs: dict, targets):
+        """Answer several advisory questions from ONE step, or None.
+
+        One step, because asking twice would advance this evaluator between the
+        two answers and they are meant to describe the same moment.
+        """
+        try:
+            session = self._ensure(canonical_spec)
+            result = session.step(self._named(inputs))
+            outputs = result.get("outputs") or {}
+            return {t: outputs.get(f"o{t}") for t in targets}
+        except Exception as exc:
+            logger.warning("advisory evaluation unavailable: %s", exc)
+            self.dispose()
+            return None
+
+    @staticmethod
+    def _named(inputs: dict) -> dict:
+        named = {}
+        for key, value in (inputs or {}).items():
+            name = key if isinstance(key, str) and key.startswith("i") else f"i{key}"
+            named[name] = "" if value is None else str(value)
+        return named
+
     def evaluate(self, canonical_spec: str, inputs: dict, target: int):
         """Answer one advisory question. Returns the target stream's value or None.
 
@@ -81,11 +105,7 @@ class AdvisoryEvaluator:
         """
         try:
             session = self._ensure(canonical_spec)
-            named = {}
-            for key, value in (inputs or {}).items():
-                name = key if isinstance(key, str) and key.startswith("i") else f"i{key}"
-                named[name] = "" if value is None else str(value)
-            result = session.step(named)
+            result = session.step(self._named(inputs))
             outputs = result.get("outputs") or {}
             return outputs.get(f"o{target}")
         except Exception as exc:

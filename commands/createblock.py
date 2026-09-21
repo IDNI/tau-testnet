@@ -16,6 +16,7 @@ from consensus.lanes import TAU_EVALUATING_TX_TYPES
 
 
 import tau_manager
+import tau_shrink
 from tau_manager import parse_tau_output
 import tau_defs
 import logging
@@ -585,12 +586,24 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
         # A worker cannot contaminate anything, and disposal is the only rollback
         # the engine offers.
         sim_session = _speculative_session()
+        # Isolating the interpreter is not enough on its own: the encoder the
+        # worker shares with the authoritative path is DB-backed, and
+        # `db.get_shrink_id` inserts and commits. Measured: a rejected proposal
+        # that mentioned one never-before-seen address moved the committed max
+        # shrink id from 0 to 1 -- permanently burning capacity and the mapping
+        # epoch for a block that never existed. A private allocator mints in
+        # memory and publishes nothing.
+        allocation = tau_shrink.speculative_allocation() if sim_session is not None else None
         try:
+            if allocation is not None:
+                allocation.__enter__()
             # Call the unified path
             apply_result = engine.apply_block(
                 active_view, candidate_block, parent_snapshot, session=sim_session
             )
         finally:
+            if allocation is not None:
+                allocation.__exit__(None, None, None)
             if sim_session is not None:
                 try:
                     sim_session.dispose()
