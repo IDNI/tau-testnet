@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 RULE = "rule"
 EVAL = "eval"
 
+
+def _shrink_width():
+    import tau_shrink
+    return tau_shrink.current_shrink_width()
+
 #: Revision outcomes that mean the engine took the candidate.
 _ACCEPTED = ("ACCEPTED_CHANGED", "ACCEPTED_NOOP")
 
@@ -197,10 +202,23 @@ class WorkerSession(EvaluatorSession):
 
     is_speculative = True
 
-    def __init__(self, spec_session, log=None, normalize=None, journal=None):
+    def __init__(self, spec_session, log=None, normalize=None, journal=None,
+                 allocation=None):
         self._spec = spec_session
         self.log = log if log is not None else StepLog()
         self.last_outcome = None
+        # A speculative session OWNS its allocation overlay and installs it around
+        # every dispatch. Leaving that to the caller is how a speculative path
+        # quietly interns into the live table: the session looks isolated, the
+        # encoder is not. There is deliberately no "if no context, use the
+        # committed allocator" fallback here.
+        if allocation is None:
+            import tau_allocator
+            allocation = tau_allocator.Allocator(
+                tau_allocator.DbMappingSnapshot(), width=_shrink_width(),
+                label="proposal",
+            )
+        self.allocation = allocation
         # A proposal journal: accepted speculative execution for the candidate
         # block, adopted into the committed record only if the block commits.
         self.journal = journal if journal is not None else tau_journal.Journal(
@@ -213,7 +231,8 @@ class WorkerSession(EvaluatorSession):
         self._normalize = normalize
 
     @classmethod
-    def spawn(cls, baseline_spec, *, cwd=None, env=None, trace=None, normalize=None):
+    def spawn(cls, baseline_spec, *, cwd=None, env=None, trace=None, normalize=None,
+              allocation=None):
         """Build a worker at `baseline_spec`, replaying `trace` onto it.
 
         Replay is how a worker reaches a state at all: reconstruction from
@@ -227,7 +246,7 @@ class WorkerSession(EvaluatorSession):
         env["PYTHONPATH"] = cwd + _os.pathsep + env.get("PYTHONPATH", "")
         spec_session = tau_speculation.SpeculationSession(cwd=cwd, env=env)
         spec_session.init(baseline_spec)
-        session = cls(spec_session, normalize=normalize)
+        session = cls(spec_session, normalize=normalize, allocation=allocation)
         for entry in (trace or []):
             if entry.get("kind") == RULE:
                 session.apply_rule(entry.get("rule_text") or "")
@@ -273,9 +292,26 @@ class WorkerSession(EvaluatorSession):
     def ready(self, timeout=5.0):
         return self._spec is not None
 
+    def _allocating(self):
+        import tau_shrink
+        return tau_shrink.speculative_allocation(allocator=self.allocation)
+
     def apply_rule(self, rule_text, *, target=0, record=True):
-        receipt = self._spec.revise(rule_text, "apply")
+        # The rule is PREPARED here, under this session's own overlay. Feeding
+        # canonical rule text to a worker whose inputs are runtime-encoded mixes
+        # representations: a granted sender's full-width literal never matches its
+        # interned input value, and the simulation rejects transfers the
+        # authoritative path accepts.
+        import tau_shrink
+        with self._allocating():
+            prepared = tau_shrink.prepare_rule(rule_text)
+            runtime_text = prepared.runtime_text
+            receipt = self._spec.revise(runtime_text, "apply")
         self.last_outcome = receipt
+        identity = tau_journal.candidate_identity(
+            rule_text, mapping_epoch=self.allocation.epoch,
+            width=getattr(self.allocation, "width", None), runtime_text=runtime_text,
+        )
         outcome = receipt.get("outcome")
         # `accepted` is a property on the receipt, not a key: reading it with
         # .get() silently returns None and turns every acceptance into an error.
@@ -283,14 +319,19 @@ class WorkerSession(EvaluatorSession):
         if record:
             self.log.record(StepRecord(kind=RULE, rule_text=rule_text, target=target,
                                        outcome=outcome))
+            # canonical text in the record, runtime payload only inside the
+            # identity: ids are private to an allocation context, so runtime text
+            # is not a portable name for anything
             self.journal.record(tau_journal.REVISION,
                                 phase=tau_journal.PHASE_SPECULATIVE,
-                                rule_text=rule_text, target=target, outcome=outcome)
+                                rule_text=rule_text, target=target, outcome=outcome,
+                                identity=identity)
         return "ok" if accepted else f"error: {outcome}"
 
     def evaluate(self, inputs, *, target=None, source="unknown", multi=False,
                  apply_rules_update=False, record=True):
-        result = self._spec.step(self._named_inputs(inputs))
+        with self._allocating():
+            result = self._spec.step(self._named_inputs(inputs))
         indexed = self._by_index(result.get("outputs") or {})
         if record:
             self.log.record(StepRecord(kind=EVAL, inputs=dict(inputs or {}),

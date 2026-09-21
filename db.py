@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -577,19 +578,29 @@ def get_shrink_id(key: str) -> int:
 def shrink_mapping_epoch() -> str:
     """A version that changes on ANY committed change to the intern mapping.
 
-    Not `max(id)`: an operation could add and remove bindings, or rebind a key,
-    without moving the maximum, and a proposal validated against the old mapping
-    would publish into a table it no longer describes. Count and maximum together
-    move on every insert, and the table is insert-only.
+    A digest of the mapping ITSELF, not `(count, max)`: those are unchanged by a
+    swap --
+
+        before: A -> 1, B -> 2
+        after:  A -> 2, B -> 1
+
+    -- yet the mapping identity is different, and a proposal validated against the
+    old one would publish into a table it no longer describes. The table is
+    insert-only today, so a swap should be impossible; the guard costs one scan at
+    block cadence and does not depend on that remaining true.
     """
     global _db_conn
     if _db_conn is None:
         init_db()
     with _db_lock:
         cur = _db_conn.cursor()
-        cur.execute('SELECT COUNT(*), COALESCE(MAX(id), 0) FROM tau_shrink_ids')
-        count, top = cur.fetchone()
-        return f"{int(count)}:{int(top)}"
+        cur.execute('SELECT id, key FROM tau_shrink_ids ORDER BY id')
+        digest = hashlib.sha256()
+        count = 0
+        for id_num, key in cur.fetchall():
+            digest.update(f"{int(id_num)}\x00{key}\x00".encode("utf-8"))
+            count += 1
+        return f"{count}:{digest.hexdigest()[:32]}"
 
 
 def publish_shrink_ids(delta: dict, expected_epoch: str) -> None:
@@ -605,9 +616,13 @@ def publish_shrink_ids(delta: dict, expected_epoch: str) -> None:
         init_db()
     with _db_lock:
         cur = _db_conn.cursor()
-        cur.execute('SELECT COUNT(*), COALESCE(MAX(id), 0) FROM tau_shrink_ids')
-        count, top = cur.fetchone()
-        current = f"{int(count)}:{int(top)}"
+        cur.execute('SELECT id, key FROM tau_shrink_ids ORDER BY id')
+        digest = hashlib.sha256()
+        count = 0
+        for id_num, key in cur.fetchall():
+            digest.update(f"{int(id_num)}\x00{key}\x00".encode("utf-8"))
+            count += 1
+        current = f"{count}:{digest.hexdigest()[:32]}"
         if current != expected_epoch:
             raise ValueError(
                 f"shrink mapping moved: expected epoch {expected_epoch}, found {current}"

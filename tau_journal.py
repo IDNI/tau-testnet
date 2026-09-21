@@ -80,6 +80,29 @@ def canonical_stream_key(key) -> str:
     return f"i{int(key)}"
 
 
+def candidate_identity(canonical_text, *, mapping_epoch=None, width=None,
+                      runtime_text=None) -> dict:
+    """What identifies a prepared candidate.
+
+    A runtime payload hash alone is NOT an identity. Ids are private to an
+    allocation context, so a discarded transaction B and a later transaction C can
+    hold byte-identical runtime text meaning different things -- C legitimately
+    reuses B's freed number for a different canonical value. A receipt or journal
+    entry keyed on the runtime hash would let a stale B validate C.
+
+    Identity is therefore canonical value, plus the mapping context that gives the
+    ids meaning, plus the representation, plus the payload actually executed.
+    """
+    parts = {
+        "canonical": fingerprint(canonical_text),
+        "mapping_epoch": mapping_epoch,
+        "width": width,
+        "runtime": None if runtime_text is None else fingerprint(runtime_text),
+    }
+    parts["id"] = fingerprint(parts)
+    return parts
+
+
 def semantic_result(outputs=None, outcome=None, progressed=None) -> dict:
     """What an execution MEANS, independent of representation.
 
@@ -123,6 +146,7 @@ class JournalEntry:
     result_fingerprint: str | None = None        # SEMANTIC: survives a valid
                                                  # representation change
     runtime_fingerprint: str | None = None       # optional, same-representation
+    identity: dict | None = None                 # canonical + context + payload
     prev: str | None = None        # previous entry's link
     link: str | None = None        # this entry's link: H(content, prev)
 
@@ -132,6 +156,7 @@ class JournalEntry:
             "rule_text": self.rule_text, "inputs": self.inputs,
             "target": self.target, "outcome": self.outcome,
             "result": self.result_fingerprint,
+            "identity": None if self.identity is None else self.identity.get("id"),
         })
 
     def compute_link(self) -> str:
@@ -190,7 +215,8 @@ class Journal:
     # --- recording ------------------------------------------------------------
 
     def record(self, kind: str, *, phase: str, rule_text=None, inputs=None,
-               target=None, outcome=None, result=None, runtime=None) -> JournalEntry:
+               target=None, outcome=None, result=None, runtime=None,
+               identity=None) -> JournalEntry:
         if self._discarded:
             raise ValueError(
                 f"journal {self.label!r} was discarded; its execution is not part "
@@ -219,6 +245,7 @@ class Journal:
             outcome=outcome,
             result_fingerprint=semantic,
             runtime_fingerprint=None if runtime is None else fingerprint(runtime),
+            identity=identity,
             prev=self._entries[-1].link if self._entries else None,
         )
         entry = replace(entry, link=entry.compute_link())

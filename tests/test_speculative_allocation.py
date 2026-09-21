@@ -196,3 +196,50 @@ def test_the_epoch_moves_on_any_committed_change(temp_database):
     before = db.shrink_mapping_epoch()
     ts.intern_value(ADDR, 384)
     assert db.shrink_mapping_epoch() != before
+
+
+def test_the_epoch_is_a_mapping_digest_not_a_count(temp_database):
+    """`(count, max)` is unchanged by a swap -- A->1,B->2 becoming A->2,B->1 --
+    yet the mapping identity is different, and a proposal validated against the
+    old one would publish into a table it no longer describes."""
+    ts.intern_value(ADDR, 384)
+    ts.intern_value(OTHER, 384)
+    before = db.shrink_mapping_epoch()
+
+    key_a = ts.canonical_intern_key(ADDR, 384)
+    key_b = ts.canonical_intern_key(OTHER, 384)
+    id_a, id_b = db.lookup_shrink_id(key_a), db.lookup_shrink_id(key_b)
+    with db._db_lock:
+        cur = db._db_conn.cursor()
+        cur.execute('UPDATE tau_shrink_ids SET key = ? WHERE id = ?', ("tmp", id_a))
+        cur.execute('UPDATE tau_shrink_ids SET key = ? WHERE id = ?', (key_a, id_b))
+        cur.execute('UPDATE tau_shrink_ids SET key = ? WHERE id = ?', (key_b, id_a))
+        db._db_conn.commit()
+
+    assert db.shrink_mapping_epoch() != before, "a swap left the epoch unchanged"
+
+
+def test_a_speculative_session_cannot_intern_into_the_live_table(temp_database, monkeypatch):
+    """The API invariant: a speculative session owns its overlay and installs it
+    around every dispatch, so a caller cannot forget to. There is deliberately no
+    "no context, use the committed allocator" fallback."""
+    import tau_session
+
+    class _FakeSpec:
+        def revise(self, text, cid):
+            ts.intern_value(ADDR, 384)          # the encoder runs here
+            return {"outcome": "ACCEPTED_CHANGED"}
+
+        def step(self, inputs):
+            ts.intern_value(OTHER, 384)
+            return {"outputs": {}}
+
+        def kill(self):
+            pass
+
+    before = db.shrink_mapping_epoch()
+    session = tau_session.WorkerSession(_FakeSpec())
+    session.apply_rule("R")
+    session.evaluate({12: "x"}, multi=True)
+    assert db.shrink_mapping_epoch() == before, "a speculative dispatch reached the live table"
+    assert sorted(session.allocation.delta().values()) == [1, 2]

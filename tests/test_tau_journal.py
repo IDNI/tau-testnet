@@ -298,3 +298,39 @@ def test_an_altered_canonical_input_is_detected():
 def test_the_chain_survives_serialization():
     journal = _three_entry_journal()
     tj.Journal.deserialize(journal.serialize()).verify_chain()
+
+
+# --- candidate identity -------------------------------------------------------
+
+def test_a_runtime_payload_hash_is_not_an_identity():
+    """Ids are private to an allocation context, so a discarded transaction B and
+    a later transaction C can hold byte-identical runtime text meaning different
+    things -- C legitimately reuses B's freed number for a different canonical
+    value. Keying on the runtime hash would let a stale B validate C."""
+    same_runtime = "always ( i12[t]:bv[8] = { 2 }:bv[8] -> o5[t]:bv[24] = { #x000001 }:bv[24] )."
+    b = tj.candidate_identity("RULE FOR BOB", mapping_epoch="e1", width=8,
+                              runtime_text=same_runtime)
+    c = tj.candidate_identity("RULE FOR CAROL", mapping_epoch="e1", width=8,
+                              runtime_text=same_runtime)
+    assert b["runtime"] == c["runtime"], "the payloads really are identical"
+    assert b["id"] != c["id"], "identity must not collapse to the payload"
+
+
+def test_identity_binds_the_mapping_context():
+    """The same canonical rule prepared against a different mapping is a
+    different thing to have validated."""
+    first = tj.candidate_identity("R", mapping_epoch="e1", width=8, runtime_text="X")
+    second = tj.candidate_identity("R", mapping_epoch="e2", width=8, runtime_text="X")
+    assert first["id"] != second["id"]
+
+
+def test_identity_binds_the_representation():
+    narrow = tj.candidate_identity("R", mapping_epoch="e1", width=8, runtime_text="X")
+    wide = tj.candidate_identity("R", mapping_epoch="e1", width=16, runtime_text="X")
+    assert narrow["id"] != wide["id"]
+
+
+def test_identity_is_stable_for_the_same_candidate_and_context():
+    a = tj.candidate_identity("R", mapping_epoch="e1", width=8, runtime_text="X")
+    b = tj.candidate_identity("R", mapping_epoch="e1", width=8, runtime_text="X")
+    assert a == b

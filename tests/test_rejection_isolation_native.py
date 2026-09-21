@@ -182,3 +182,33 @@ def test_the_miner_simulation_runs_somewhere_disposable(tmp_path):
     assert kind == "WorkerSession", f"the miner simulated in-process: {line}"
     assert before == after, f"the simulation advanced the authoritative evaluator: {line}"
     assert o5 == "1", f"the simulated blocking rule leaked into the live policy: {line}"
+
+
+def test_the_worker_prepares_rules_in_its_own_representation():
+    """Feeding canonical rule text to a worker whose inputs are runtime-encoded
+    mixes representations: a granted sender's full-width literal never matches its
+    interned input value, so the simulation rejects transfers the authoritative
+    path accepts. Measured before the fix: o5 = 0 for a sender the rule grants."""
+    import tau_manager
+    import tau_shrink
+
+    pk = "aa" * 48
+    rule = (f"always ( i12[t]:bv[384] = {{ #x{pk} }}:bv[384] -> "
+            f"o5[t]:bv[24] = {{ #x000001 }}:bv[24] ).")
+    session = ts.WorkerSession.spawn(_router(), cwd=REPO, env=_env(),
+                                     normalize=lambda i: tau_manager._normalize_inputs(
+                                         i, frozenset({12})) or i)
+    try:
+        session.apply_rule(rule)
+        out = session.evaluate({12: "{ #x" + pk + " }:bv[384]"}, multi=True)
+        assert out.get(5) == "1", (
+            f"granted sender was not allowed: {out} -- rule and input disagree "
+            "on representation"
+        )
+        # and the journal keeps the CANONICAL text, with the runtime payload
+        # only inside the identity
+        entry = session.journal.entries()[0]
+        assert "bv[384]" in entry.rule_text
+        assert entry.identity is not None and entry.identity["runtime"] is not None
+    finally:
+        session.dispose()
