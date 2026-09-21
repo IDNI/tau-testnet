@@ -40,20 +40,6 @@ COLOR_GREEN = "\033[92m"
 COLOR_MAGENTA = "\033[95m"
 COLOR_RESET = "\033[0m"
 _INPUT_STREAM_NAME_RE = re.compile(r"^i\d+$")
-# tau-lang prints the size in the marker now -- "Updated specification (1110
-# chars): always ..." -- so the old `specification:` form matched nothing on
-# current builds. `_extract_latest_updated_spec` then never rebuilt the
-# interpreter from the printed spec, `get_current_spec()` stayed at the boot
-# router, and `createblock`'s post-simulation restore replaced the live spec with
-# that router, wiping o6/o7: every block carrying a transaction was rejected with
-# "o6: 0" and no block ever landed.
-#
-# The optional group must NOT swallow the sibling warning
-# "Updated specification size N chars exceeds ...", which has no colon after the
-# marker -- there is a test for exactly that.
-_UPDATED_SPEC_LINE_RE = re.compile(
-    r"^Updated\s*specification\s*(?:\([^)]*\))?\s*\:\s*(.*)$"
-)
 _HEX_LITERAL_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 def get_memory_rss_mb() -> float:
@@ -476,6 +462,7 @@ class TauInterface:
                  logger.error(f"Dumped Tau crash log to {filepath}")
             raise TauEngineCrash(msg)
         self.accumulated_spec = prepared
+        self._last_spec_revision = interpreter.spec_revision
         return interpreter
 
     def _rebuild_interpreter_from_spec(self, spec_text: str, *, reason: str):
@@ -486,50 +473,6 @@ class TauInterface:
         del old_interpreter
         mem_after = get_memory_rss_mb()
         logger.debug(f"[MEM] _rebuild_interpreter_from_spec ({reason}): {mem_before:.2f} MB -> {mem_after:.2f} MB (Diff: {mem_after - mem_before:.2f} MB)")
-
-    def _extract_latest_updated_spec(self, captured_output: str) -> str | None:
-        if not captured_output:
-            return None
-
-        latest_spec = None
-        lines = captured_output.splitlines()
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-            match = _UPDATED_SPEC_LINE_RE.match(line)
-            if not match:
-                i += 1
-                continue
-
-            block_lines = []
-            inline_spec = (match.group(1) or "").strip()
-            if inline_spec:
-                block_lines.append(inline_spec)
-
-            i += 1
-            while i < len(lines):
-                candidate = lines[i].strip()
-                if not candidate:
-                    if block_lines:
-                        break
-                    i += 1
-                    continue
-                if candidate.startswith("Execution step:"):
-                    break
-                if _UPDATED_SPEC_LINE_RE.match(candidate):
-                    # Let the outer loop process a newer marker if present.
-                    i -= 1
-                    break
-                block_lines.append(candidate)
-                i += 1
-
-            if block_lines:
-                latest_spec = " ".join(block_lines)
-            i += 1
-
-        if not latest_spec:
-            return None
-        return self._ensure_trailing_period(latest_spec)
 
     @staticmethod
     def _coerce_stream_name(raw_key) -> str | None:
@@ -718,19 +661,19 @@ class TauInterface:
                  result_value = str(value)
                  found = True
         
-        # 4. Process Spec Updates from STDOUT (not 'u' stream)
+        # 4. Process Spec Updates
         try:
-            updated_spec = self._extract_latest_updated_spec(captured_output)
-            if updated_spec:
+            if self.interpreter.spec_revision != self._last_spec_revision:
+                updated_spec = self.interpreter.current_spec()
                 logger.info(
-                    f"{COLOR_YELLOW}[TAU_DIRECT] Spec Replaced from STDOUT: {updated_spec}{COLOR_RESET}"
+                    f"{COLOR_YELLOW}[TAU_DIRECT] Spec Replaced: {updated_spec}{COLOR_RESET}"
                 )
                 self._rebuild_interpreter_from_spec(
                     updated_spec,
                     reason="updated specification from step output",
                 )
         except Exception as e:
-            logger.error("Failed to process updated specification from stdout: %s", e)
+            logger.error("Failed to process updated specification: %s", e)
             raise
 
         
@@ -856,19 +799,19 @@ class TauInterface:
                     val_str = str(v)
                     logger.debug(f"  {k.name}: {COLOR_BLUE}{val_str}{COLOR_RESET}")
 
-        # Process Spec Updates from STDOUT
+        # Process Spec Updates
         try:
-            updated_spec = self._extract_latest_updated_spec(captured_output)
-            if updated_spec:
+            if self.interpreter.spec_revision != self._last_spec_revision:
+                updated_spec = self.interpreter.current_spec()
                 logger.info(
-                    f"{COLOR_YELLOW}[TAU_DIRECT] Spec Replaced from STDOUT: {updated_spec}{COLOR_RESET}"
+                    f"{COLOR_YELLOW}[TAU_DIRECT] Spec Replaced: {updated_spec}{COLOR_RESET}"
                 )
                 self._rebuild_interpreter_from_spec(
                     updated_spec,
                     reason="updated specification from step output",
                 )
         except Exception as e:
-            logger.error("Failed to process updated specification from stdout: %s", e)
+            logger.error("Failed to process updated specification: %s", e)
             raise
 
         # Build result: only actually emitted outputs, keyed by stream index
