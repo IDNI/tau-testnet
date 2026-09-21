@@ -66,7 +66,9 @@ def test_a_divergent_replay_is_detected():
     seq, expected = journal.fingerprints()[0]
     tj.compare(expected, {"o5": "66"}, seq=seq)          # same -> fine
     with pytest.raises(tj.DivergenceError):
-        tj.compare(expected, {"o5": "0"}, seq=seq)       # different -> caught
+        tj.compare(expected, {"o5": "0"}, seq=seq)       # different value -> caught
+    with pytest.raises(tj.DivergenceError):
+        tj.compare(expected, {}, seq=seq)                # stream stopped -> caught
 
 
 def test_a_proposal_branch_records_separately():
@@ -152,3 +154,147 @@ def test_a_worker_session_writes_only_to_its_proposal_journal():
     assert len(session.journal) == 2
     assert len(tj.committed()) == before, "a proposal must not touch the committed record"
     assert all(e.phase == tj.PHASE_SPECULATIVE for e in session.journal.entries())
+
+
+# --- transaction children -----------------------------------------------------
+
+def test_a_rejected_transaction_never_enters_the_proposal():
+    """Rejection is a discard, not a filter. Appending a transaction's steps
+    straight into the proposal means rebuilding the accepted prefix requires
+    taking them back out -- the problem the speculative session exists to avoid,
+    reproduced one layer up."""
+    committed = tj.Journal()
+    proposal = committed.branch()
+
+    a = proposal.child("A")
+    a.record(tj.REVISION, phase=tj.PHASE_SPECULATIVE, rule_text="A")
+    proposal.merge(a)
+
+    b = proposal.child("B")
+    b.record(tj.REVISION, phase=tj.PHASE_SPECULATIVE, rule_text="B")
+    proposal.discard(b)                       # fee rejected B
+
+    c = proposal.child("C")
+    c.record(tj.REVISION, phase=tj.PHASE_SPECULATIVE, rule_text="C")
+    proposal.merge(c)
+
+    assert [e.rule_text for e in proposal.entries()] == ["A", "C"]
+    # rebuilding the accepted prefix is a replay, with no filtering step
+    assert [t["rule_text"] for t in proposal.replay_trace()] == ["A", "C"]
+
+
+def test_a_discarded_transaction_journal_refuses_further_use():
+    committed = tj.Journal()
+    proposal = committed.branch()
+    b = proposal.child("B")
+    b.record(tj.STEP, phase=tj.PHASE_SPECULATIVE, inputs={1: "5"})
+    proposal.discard(b)
+    with pytest.raises(ValueError):
+        b.record(tj.STEP, phase=tj.PHASE_SPECULATIVE, inputs={1: "6"})
+    with pytest.raises(ValueError):
+        proposal.merge(b)
+
+
+def test_merging_preserves_order_and_relinks():
+    committed = tj.Journal()
+    proposal = committed.branch()
+    for name in ("A", "B"):
+        tx = proposal.child(name)
+        tx.record(tj.REVISION, phase=tj.PHASE_SPECULATIVE, rule_text=name)
+        tx.record(tj.STEP, phase=tj.PHASE_SPECULATIVE, inputs={1: name})
+        proposal.merge(tx)
+    assert [e.seq for e in proposal.entries()] == [1, 2, 3, 4]
+    proposal.verify_chain()
+
+
+# --- alias collisions ---------------------------------------------------------
+
+def test_alias_spellings_of_one_stream_are_the_same_stream():
+    journal = tj.Journal()
+    journal.record(tj.STEP, phase=tj.PHASE_APPLY, inputs={12: "x", "i12": "x"})
+    assert journal.entries()[0].inputs == {"i12": "x"}
+
+
+def test_conflicting_aliases_are_rejected_not_resolved():
+    """Letting dict or JSON normalization pick a winner would record an input
+    nobody supplied."""
+    journal = tj.Journal()
+    with pytest.raises(tj.AliasCollision):
+        journal.record(tj.STEP, phase=tj.PHASE_APPLY, inputs={12: "a", "i12": "b"})
+    with pytest.raises(tj.AliasCollision):
+        journal.record(tj.STEP, phase=tj.PHASE_APPLY, inputs={"12": "a", "i12": "b"})
+
+
+# --- semantic vs runtime fingerprints -----------------------------------------
+
+def test_the_durable_fingerprint_survives_a_representation_change():
+    """A reconstruction may legitimately change representation -- a capacity retry
+    at a wider width -- so the divergence criterion must not bind to a node-local
+    id or a runtime width."""
+    journal = tj.Journal()
+    journal.record(tj.STEP, phase=tj.PHASE_APPLY, inputs={1: "5"},
+                   result={"o5": "66"},
+                   runtime={"width": 8, "ids": {"i12": 3}, "epoch": 1})
+    seq, expected = journal.fingerprints()[0]
+    # same meaning, different runtime encoding -> NOT divergence
+    tj.compare(expected, {"o5": "66"}, seq=seq)
+    entry = journal.entries()[0]
+    assert entry.runtime_fingerprint is not None
+    assert entry.runtime_fingerprint != entry.result_fingerprint
+
+
+def test_output_presence_is_part_of_the_meaning():
+    journal = tj.Journal()
+    journal.record(tj.STEP, phase=tj.PHASE_APPLY, inputs={1: "5"},
+                   result={"o5": "1", "o8": "0"})
+    seq, expected = journal.fingerprints()[0]
+    with pytest.raises(tj.DivergenceError):
+        tj.compare(expected, {"o5": "1"}, seq=seq)   # o8 stopped materializing
+
+
+# --- structural tamper detection ----------------------------------------------
+
+def _three_entry_journal():
+    journal = tj.Journal()
+    journal.record(tj.REVISION, phase=tj.PHASE_APPLY, rule_text="R")
+    journal.record(tj.STEP, phase=tj.PHASE_APPLY, inputs={1: "5"}, result={"o5": "0"})
+    journal.record(tj.STEP, phase=tj.PHASE_APPLY, inputs={1: "9"}, result={"o5": "5"})
+    return journal
+
+
+def test_an_intact_journal_verifies():
+    _three_entry_journal().verify_chain()
+
+
+def test_a_swapped_pair_is_detected():
+    journal = _three_entry_journal()
+    journal._entries[1], journal._entries[2] = journal._entries[2], journal._entries[1]
+    with pytest.raises(tj.DivergenceError):
+        journal.verify_chain()
+
+
+def test_a_duplicated_entry_is_detected():
+    journal = _three_entry_journal()
+    journal._entries.insert(2, journal._entries[1])
+    with pytest.raises(tj.DivergenceError):
+        journal.verify_chain()
+
+
+def test_a_dropped_entry_is_detected():
+    journal = _three_entry_journal()
+    del journal._entries[1]
+    with pytest.raises(tj.DivergenceError):
+        journal.verify_chain()
+
+
+def test_an_altered_canonical_input_is_detected():
+    import dataclasses
+    journal = _three_entry_journal()
+    journal._entries[1] = dataclasses.replace(journal._entries[1], inputs={"i1": "999"})
+    with pytest.raises(tj.DivergenceError):
+        journal.verify_chain()
+
+
+def test_the_chain_survives_serialization():
+    journal = _three_entry_journal()
+    tj.Journal.deserialize(journal.serialize()).verify_chain()

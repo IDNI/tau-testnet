@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 
 REVISION = "revision"
 STEP = "step"
@@ -43,6 +43,30 @@ PHASE_SPECULATIVE = "speculative"     # proposal only
 AUTHORITATIVE_PHASES = frozenset({PHASE_APPLY, PHASE_GOVERNANCE, PHASE_RESTORE})
 
 
+class AliasCollision(ValueError):
+    """Two spellings of one stream arrived with different values.
+
+    `12`, `"12"` and `"i12"` are the same stream. Letting dict or JSON
+    normalization pick a winner would record an input nobody supplied.
+    """
+
+
+def canonical_inputs(inputs) -> dict:
+    """Canonicalize input keys, refusing a collision rather than resolving it."""
+    out = {}
+    origin = {}
+    for key, value in (inputs or {}).items():
+        name = canonical_stream_key(key)
+        if name in out and out[name] != value:
+            raise AliasCollision(
+                f"{origin[name]!r} and {key!r} both name {name} but carry "
+                f"{out[name]!r} and {value!r}"
+            )
+        out[name] = value
+        origin[name] = key
+    return out
+
+
 def canonical_stream_key(key) -> str:
     """Stream identity as a name, e.g. `i12`.
 
@@ -54,6 +78,28 @@ def canonical_stream_key(key) -> str:
         text = key.strip()
         return text if text.startswith("i") else f"i{text}"
     return f"i{int(key)}"
+
+
+def semantic_result(outputs=None, outcome=None, progressed=None) -> dict:
+    """What an execution MEANS, independent of representation.
+
+    A valid reconstruction may legitimately change representation -- interned
+    bv[8] to bv[16] after a capacity retry, or interned to plain full width -- so
+    the durable divergence criterion must not bind to a node-local id or a runtime
+    width. Output PRESENCE is part of it: a stream that stopped materializing is a
+    different computation even when the value that remains is equal.
+    """
+    values = {}
+    present = []
+    for name, value in (outputs or {}).items():
+        present.append(str(name))
+        values[str(name)] = None if value is None else str(value)
+    return {
+        "outcome": outcome,
+        "present": sorted(present),
+        "values": values,
+        "progressed": progressed,
+    }
 
 
 def fingerprint(payload) -> str:
@@ -74,7 +120,22 @@ class JournalEntry:
     inputs: dict = field(default_factory=dict)   # canonical logical values
     target: int | None = None
     outcome: str | None = None     # the revision outcome, when known
-    result_fingerprint: str | None = None
+    result_fingerprint: str | None = None        # SEMANTIC: survives a valid
+                                                 # representation change
+    runtime_fingerprint: str | None = None       # optional, same-representation
+    prev: str | None = None        # previous entry's link
+    link: str | None = None        # this entry's link: H(content, prev)
+
+    def content_digest(self) -> str:
+        return fingerprint({
+            "seq": self.seq, "kind": self.kind, "phase": self.phase,
+            "rule_text": self.rule_text, "inputs": self.inputs,
+            "target": self.target, "outcome": self.outcome,
+            "result": self.result_fingerprint,
+        })
+
+    def compute_link(self) -> str:
+        return fingerprint({"content": self.content_digest(), "prev": self.prev})
 
     def replayable(self) -> dict:
         """What a reconstruction re-feeds. Outputs are NOT included: a replay has
@@ -120,29 +181,47 @@ class Journal:
     def __init__(self, anchor: str | None = None, authoritative: bool = True):
         self.anchor = anchor
         self.authoritative = authoritative
+        self.label = "committed" if authoritative else "proposal"
         self._entries: list = []
         self._seq = 0
+        self._parent = None
+        self._discarded = False
 
     # --- recording ------------------------------------------------------------
 
     def record(self, kind: str, *, phase: str, rule_text=None, inputs=None,
-               target=None, outcome=None, result=None) -> JournalEntry:
+               target=None, outcome=None, result=None, runtime=None) -> JournalEntry:
+        if self._discarded:
+            raise ValueError(
+                f"journal {self.label!r} was discarded; its execution is not part "
+                "of any branch"
+            )
         if self.authoritative and phase not in AUTHORITATIVE_PHASES:
             raise ValueError(
                 f"phase {phase!r} is not authoritative; it belongs in the "
                 "operational trace or a proposal journal"
             )
         self._seq += 1
+        semantic = None
+        if result is not None or outcome is not None:
+            semantic = fingerprint(
+                result if isinstance(result, dict) and "present" in result
+                else semantic_result(outputs=result if isinstance(result, dict) else None,
+                                     outcome=outcome)
+            )
         entry = JournalEntry(
             seq=self._seq,
             kind=kind,
             phase=phase,
             rule_text=rule_text,
-            inputs={canonical_stream_key(k): v for k, v in (inputs or {}).items()},
+            inputs=canonical_inputs(inputs),
             target=target,
             outcome=outcome,
-            result_fingerprint=None if result is None else fingerprint(result),
+            result_fingerprint=semantic,
+            runtime_fingerprint=None if runtime is None else fingerprint(runtime),
+            prev=self._entries[-1].link if self._entries else None,
         )
+        entry = replace(entry, link=entry.compute_link())
         self._entries.append(entry)
         return entry
 
@@ -161,6 +240,65 @@ class Journal:
         return len(self._entries)
 
     # --- lifecycle ------------------------------------------------------------
+
+    def verify_chain(self) -> None:
+        """Order corruption must be impossible to mistake for valid history.
+
+        A history-dependent rule catches many reorderings behaviourally, but the
+        format itself should not permit a swapped, duplicated or altered entry to
+        look like a legitimate record.
+        """
+        prev = None
+        expected_seq = 0
+        for entry in self._entries:
+            expected_seq += 1
+            if entry.seq != expected_seq:
+                raise DivergenceError(
+                    f"journal sequence broken at {entry.seq}: expected {expected_seq}"
+                )
+            if entry.prev != prev:
+                raise DivergenceError(f"journal link broken at entry {entry.seq}")
+            if entry.link != entry.compute_link():
+                raise DivergenceError(f"journal entry {entry.seq} was altered")
+            prev = entry.link
+
+    def child(self, label: str = "tx") -> "Journal":
+        """A transaction-private journal.
+
+        Rejection has to be a discard, not a filter: appending a transaction's
+        steps straight into the proposal means rebuilding the accepted prefix
+        requires taking them back out again, which is the problem the speculative
+        session exists to avoid, reproduced one layer up.
+        """
+        child = Journal(anchor=self.anchor, authoritative=False)
+        child._parent = self
+        child.label = label
+        return child
+
+    def merge(self, child: "Journal") -> None:
+        """Accept a transaction: its execution becomes part of this branch."""
+        if getattr(child, "_parent", None) is not self:
+            raise ValueError("cannot merge a journal from another parent")
+        if child._discarded:
+            raise ValueError("cannot merge a discarded journal")
+        for entry in child.entries():
+            self.record(entry.kind, phase=self._phase_for(entry), rule_text=entry.rule_text,
+                        inputs=entry.inputs, target=entry.target, outcome=entry.outcome)
+            if entry.result_fingerprint is not None:
+                self._entries[-1] = replace(self._entries[-1],
+                                            result_fingerprint=entry.result_fingerprint)
+                self._entries[-1] = replace(self._entries[-1],
+                                            link=self._entries[-1].compute_link())
+        child._discarded = True
+
+    def discard(self, child: "Journal") -> None:
+        """Reject a transaction: nothing it executed is part of this branch."""
+        if getattr(child, "_parent", None) is not self:
+            raise ValueError("cannot discard a journal from another parent")
+        child._discarded = True
+
+    def _phase_for(self, entry) -> str:
+        return entry.phase if not self.authoritative else PHASE_APPLY
 
     def reset(self, anchor: str | None = None) -> None:
         self.anchor = anchor
@@ -213,10 +351,16 @@ class DivergenceError(RuntimeError):
     """
 
 
-def compare(expected, observed, *, seq: int) -> None:
+def compare(expected, observed_outputs, *, seq: int, outcome=None) -> None:
+    """Compare a replayed execution against its recorded SEMANTIC fingerprint.
+
+    Semantic, so a reconstruction that legitimately changes representation -- a
+    capacity retry at a wider width, say -- is not mistaken for divergence, while
+    a changed value or a stream that stopped materializing still is.
+    """
     if expected is None:
         return
-    got = fingerprint(observed)
+    got = fingerprint(semantic_result(outputs=observed_outputs, outcome=outcome))
     if got != expected:
         raise DivergenceError(
             f"replay diverged at entry {seq}: expected {expected}, observed {got}"

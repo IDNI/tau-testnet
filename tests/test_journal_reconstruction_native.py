@@ -95,7 +95,8 @@ def _replay(session, journal):
         payload = entry.replayable()
         if payload["kind"] == tj.REVISION:
             receipt = session.revise(payload["rule_text"], "r")
-            tj.compare(expected, receipt.get("outputs"), seq=seq)
+            tj.compare(expected, receipt.get("outputs"), seq=seq,
+                       outcome=receipt.get("outcome"))
         else:
             result = session.step(payload["inputs"])
             tj.compare(expected, result.get("outputs"), seq=seq)

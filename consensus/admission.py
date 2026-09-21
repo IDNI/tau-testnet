@@ -539,17 +539,38 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
     return None
 
 
-_TEMPORAL_BACKREF_RE = re.compile(r"\b[io]\d+\s*\[\s*t\s*-\s*\d+\s*\]")
-
-
 def _temporal_backreference(revisions):
-    """The first `iN[t-k]` / `oN[t-k]` reference in a set of revisions, or None."""
+    """The first stream reference whose time expression is not exactly `t`.
+
+    Grammar-based rather than string-matched: `i7[t-1]`, `i7[t - 1]` and `i7[3]`
+    are all references to something other than the current step, and a screen that
+    recognised only one spelling would be a screen in name only. Reuses the
+    structural scanner, which already parses a reference into stream, time
+    expression and annotation.
+
+    Fails closed on a stream-shaped token it cannot parse: an occurrence the
+    scanner does not understand cannot be shown to be current.
+    """
+    import tau_shrink
+
     for revision in revisions or []:
         if not isinstance(revision, str):
             continue
-        match = _TEMPORAL_BACKREF_RE.search(_strip_tau_comments(revision))
-        if match:
-            return match.group(0)
+        text = _strip_tau_comments(revision)
+        try:
+            tokens = tau_shrink._tokenize(text)
+        except Exception:
+            return "unparsable rule text"
+        for pos, token in enumerate(tokens):
+            if token.kind == "streamref":
+                ref = tau_shrink._ref_of(token, pos)
+                if ref is None:
+                    return token.text.strip()
+                if ref.time_expr != "t":
+                    return f"{ref.io}{ref.index}[{ref.time_expr}]"
+            elif token.kind == "ident" and re.fullmatch(r"[io]\d+", token.text):
+                # a stream name the scanner could not resolve into a reference
+                return token.text
     return None
 
 
