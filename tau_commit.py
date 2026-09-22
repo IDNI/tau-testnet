@@ -160,7 +160,10 @@ class PreparedBlockCommit:
         entries = tuple(proposal.journal.entries())
         delta = dict(proposal.allocator.delta())
         base_digest = getattr(proposal.allocator, "epoch", None)
-        state = _worker_state(session)
+        # Strict: a worker that cannot answer has died, and freezing an artifact
+        # that names None for every counter would pass the gate by comparing
+        # None to None and then have nothing to promote.
+        state = _worker_state(session, strict=True)
 
         return cls(
             parent_tip_id=parent_tip_id,
@@ -281,18 +284,39 @@ class PreparedBlockCommit:
         }
 
 
-def _worker_state(session) -> dict:
-    """The evaluator's own counters, or an empty reading if it cannot answer.
+class WorkerUnavailable(RuntimeError):
+    """The evaluator could not report its own state.
 
-    Empty rather than raising: a worker that has died is a real condition the
-    gate should report as a mismatch, not an exception from a helper.
+    Distinct from "this session type has no counters": a session that HAS a spec
+    and cannot answer through it has died, and an artifact naming a dead worker
+    is one nothing can promote. Operational, and it arrives while the proposal is
+    still disposable.
+    """
+
+
+def _worker_state(session, *, strict=False) -> dict:
+    """The evaluator's own counters.
+
+    A session with no `_spec` is a type that does not report counters -- the
+    in-process one -- and gets an empty reading. A session WITH a spec that
+    cannot answer through it has died, which `strict` turns into a refusal
+    rather than an empty reading that would freeze an artifact naming None for
+    every counter and pass the gate by comparing None to None.
     """
     spec = getattr(session, "_spec", None)
     if spec is None or not hasattr(spec, "state"):
         return {}
     try:
         state = dict(spec.state() or {})
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise WorkerUnavailable(
+                f"the proposal's evaluator could not report its state: {exc}"
+            ) from exc
+        return {}
+    if state.get("session_healthy") is False:
+        if strict:
+            raise WorkerUnavailable("the proposal's evaluator reports itself unhealthy")
         return {}
     if "session_revision" not in state:
         state["session_revision"] = getattr(spec, "state_revision", None)

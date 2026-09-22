@@ -237,3 +237,89 @@ def test_a_stale_artifact_is_refused_before_anything_durable(temp_database):
     assert db.committed_journal_head() == (None, 0)
     assert owner.session is old, "a refused commit took the evaluator out of service"
     assert ready.is_set()
+
+
+# --- the rest of the failure matrix -------------------------------------------
+
+def test_a_worker_that_died_before_prepared_cannot_be_frozen(temp_database):
+    """Discard the proposal; committed state untouched. Freezing an artifact
+    that names None for every counter would pass the gate by comparing None to
+    None, and then have nothing to promote."""
+    class _Dead:
+        def state(self):
+            raise RuntimeError("worker gone")
+
+    worker = _Worker("dying")
+    worker._spec = _Dead()
+    ctx = _proposal(worker)
+    before = (db.committed_journal_head(), db.get_max_shrink_id())
+
+    with pytest.raises(tc.WorkerUnavailable, match="could not report its state"):
+        tc.PreparedBlockCommit.freeze(ctx, execution_id="exec-1",
+                                      next_snapshot=object())
+    assert (db.committed_journal_head(), db.get_max_shrink_id()) == before
+
+
+def test_a_worker_reporting_itself_unhealthy_cannot_be_frozen(temp_database):
+    worker = _Worker("sick")
+    worker._spec._state["session_healthy"] = False
+    ctx = _proposal(worker)
+    with pytest.raises(tc.WorkerUnavailable, match="unhealthy"):
+        tc.PreparedBlockCommit.freeze(ctx, execution_id="exec-1",
+                                      next_snapshot=object())
+
+
+def test_a_session_without_counters_is_not_treated_as_dead(temp_database):
+    """The in-process session reports no counters at all. That is a session
+    TYPE, not a dead worker, and refusing it would make the artifact unusable
+    for the authoritative path."""
+    class _NoSpec:
+        journal = None
+        allocation = None
+
+    ctx = _proposal(_NoSpec())
+    frozen = tc.PreparedBlockCommit.freeze(ctx, execution_id="exec-1",
+                                           next_snapshot=object())
+    assert frozen.proposal_spec_revision is None
+    frozen.verify(proposal=ctx)
+
+
+def test_dying_just_before_the_durable_commit_leaves_the_old_state(temp_database):
+    """The gate passed and the process died before the transaction. On restart
+    there is no commit record, so the block did not happen -- and the old
+    evaluator is still the right one to serve."""
+    old, new, ready, owner, ctx, prepared = _setup()
+    before = (db.committed_journal_head(), db.get_max_shrink_id(),
+              db.find_block_commit(prepared.execution_id))
+
+    # Everything the coordinator does up to, but not including, the irreversible
+    # step.
+    prepared.verify(proposal=ctx, execution_id=prepared.execution_id)
+
+    assert (db.committed_journal_head(), db.get_max_shrink_id(),
+            db.find_block_commit(prepared.execution_id)) == before
+    assert owner.session is old, "the old evaluator was retired before it had to be"
+    assert ready.is_set(), "readiness went down before anything was durable"
+    assert db.find_block_commit(prepared.execution_id) is None
+
+
+def test_an_artifact_for_a_different_block_is_refused(temp_database):
+    """A stale local proposal presented for a block that was rebuilt. The
+    execution id covers the timestamp and the transaction list, so a block with
+    the same parent but a dropped transaction does not match."""
+    old, new, ready, owner, ctx, prepared_unused = _setup()
+    mined = tc.block_execution_id(parent="H", height=1, timestamp=1700000000,
+                                  proposer="d4" * 48,
+                                  transactions=[{"tx_id": "A"}, {"tx_id": "B"}])
+    rebuilt = tc.block_execution_id(parent="H", height=1, timestamp=1700000000,
+                                    proposer="d4" * 48,
+                                    transactions=[{"tx_id": "A"}])
+    prepared = tc.PreparedBlockCommit.freeze(ctx, execution_id=mined,
+                                             next_snapshot=object())
+    coord = tc.PreparedCommitCoordinator(owner)
+
+    with pytest.raises(tc.PreparedCommitMismatch, match="execution"):
+        coord.commit(prepared, proposal=ctx, tip="H+1", execution_id=rebuilt)
+    assert db.find_block_commit(mined) is None
+    assert db.find_block_commit(rebuilt) is None
+    assert owner.session is old
