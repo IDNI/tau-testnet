@@ -23,6 +23,7 @@ Two facts drive the reconstruction rule:
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import logging
 
@@ -32,6 +33,33 @@ import tau_reconstruction
 logger = logging.getLogger(__name__)
 
 MAX_REPRESENTATION_RETRIES = 3
+
+
+@contextlib.contextmanager
+def boundary(proposal=None, *, label="proposal"):
+    """The ONE deliberate terminal catch for an isolation breach.
+
+    `GlobalStateLeak` is a BaseException so that no broad `except Exception`
+    inside transaction logic can absorb it and report a valid transaction as
+    invalid. That property must stop at the boundary that owns the proposal:
+    left unbounded it behaves like KeyboardInterrupt, unwinding the node over a
+    node-local integration failure.
+
+    So every owner of a proposal wraps its execution in this, and the leak
+    becomes a typed operational error -- after the caller's own cleanup has run,
+    since a `finally` inside the wrapped block completes before the exception
+    reaches here.
+    """
+    import tau_guard
+    from errors import ProposalIsolationFailure
+
+    try:
+        yield
+    except tau_guard.GlobalStateLeak as leak:
+        if proposal is not None and not getattr(proposal, "poisoned", None):
+            proposal.poison(f"isolation breach: {leak}")
+        logger.error("%s: isolation breach, abandoning the proposal: %s", label, leak)
+        raise ProposalIsolationFailure(str(leak)) from None
 
 
 class ProposalPoisoned(RuntimeError):

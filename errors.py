@@ -44,6 +44,20 @@ class TauSpecIntegrationError(TauTestnetError):
     """
 
 
+class ProposalIsolationFailure(TauTestnetError):
+    """Speculative execution reached state it does not own.
+
+    The typed, catchable form of `tau_guard.GlobalStateLeak`, raised at the one
+    deliberate terminal catch after the proposal has been disposed. The leak
+    itself is a BaseException so no broad `except Exception` inside transaction
+    logic can absorb it and report a valid transaction as invalid; this is what
+    it becomes once it reaches the boundary that owns the proposal, so it does
+    not go on behaving like KeyboardInterrupt and unwind the node.
+
+    Operational and node-local. Never a verdict about a transaction or a block.
+    """
+
+
 class BlockchainBug(TauTestnetError):
     """Raised for internal errors, invalid states, or unhandled exceptions in the Python blockchain routing/logic."""
 

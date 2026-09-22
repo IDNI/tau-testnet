@@ -12,6 +12,7 @@ import pytest
 import tau_allocator as alloc
 import tau_guard
 import tau_journal as tj
+import tau_proposal
 import tau_proposal as tp
 import tau_reconstruction as tr
 import tau_session as ts
@@ -138,3 +139,70 @@ def test_non_proposal_apply_installs_no_guard(temp_database):
             block_height=1,
         )
     assert seen, "the authoritative path was not allowed to reach the evaluator"
+
+
+# --- the terminal boundary ----------------------------------------------------
+
+def test_the_boundary_converts_a_leak_into_a_typed_operational_failure():
+    """GlobalStateLeak bypasses `except Exception` on purpose, which means
+    nothing between the breach and the proposal's owner will stop it. Left
+    unbounded it unwinds the node over a node-local integration failure, the way
+    KeyboardInterrupt would."""
+    import chain_state
+    from errors import ProposalIsolationFailure
+
+    proposal = MagicMock()
+    proposal.poisoned = None
+    with pytest.raises(ProposalIsolationFailure) as excinfo:
+        with tau_proposal.boundary(proposal, label="test"):
+            with tau_guard.ProposalIsolationGuard(strict=True):
+                chain_state.save_application_rules_state("x")
+
+    assert "chain_state.save_application_rules_state" in str(excinfo.value)
+    proposal.poison.assert_called_once()
+    assert "isolation breach" in proposal.poison.call_args[0][0]
+
+
+def test_the_typed_failure_is_an_ordinary_exception():
+    """So a caller's existing error handling can report it, which is the whole
+    point of converting it here rather than letting the BaseException run."""
+    from errors import ProposalIsolationFailure, TauTestnetError
+
+    assert issubclass(ProposalIsolationFailure, Exception)
+    assert issubclass(ProposalIsolationFailure, TauTestnetError)
+    assert not issubclass(tau_guard.GlobalStateLeak, Exception)
+
+
+def test_cleanup_runs_before_the_failure_leaves_the_owner():
+    """A `finally` inside the wrapped block completes first, so the worker is
+    disposed whether or not the block leaked."""
+    import chain_state
+    from errors import ProposalIsolationFailure
+
+    disposed = []
+    proposal = MagicMock()
+    proposal.poisoned = None
+    proposal.dispose.side_effect = lambda: disposed.append(True)
+
+    with pytest.raises(ProposalIsolationFailure):
+        with tau_proposal.boundary(proposal, label="test"):
+            try:
+                with tau_guard.ProposalIsolationGuard(strict=True):
+                    chain_state.save_application_rules_state("x")
+            finally:
+                proposal.dispose()
+    assert disposed == [True], "the proposal was not disposed before the failure surfaced"
+
+
+def test_an_already_poisoned_proposal_keeps_its_first_reason():
+    """The first breach is the one that explains what happened."""
+    import chain_state
+    from errors import ProposalIsolationFailure
+
+    proposal = MagicMock()
+    proposal.poisoned = "the original reason"
+    with pytest.raises(ProposalIsolationFailure):
+        with tau_proposal.boundary(proposal, label="test"):
+            with tau_guard.ProposalIsolationGuard(strict=True):
+                chain_state.save_application_rules_state("x")
+    proposal.poison.assert_not_called()

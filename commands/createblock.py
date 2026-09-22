@@ -16,6 +16,7 @@ from consensus.lanes import TAU_EVALUATING_TX_TYPES
 
 
 import tau_manager
+import tau_proposal
 import tau_shrink
 from tau_manager import parse_tau_output
 import tau_defs
@@ -697,12 +698,24 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
         ]
         sim_proposal = _speculative_proposal(candidate_rules=candidate_rules)
         sim_session = sim_proposal.session if sim_proposal is not None else None
+        # The terminal catch for an isolation breach. Inside apply the leak is a
+        # BaseException precisely so no broad handler can turn it into a rejected
+        # transaction; here, where the proposal is owned and about to be
+        # disposed, it becomes an ordinary operational failure. Without this it
+        # would unwind the node over something node-local.
         try:
-            # Call the unified path
-            apply_result = engine.apply_block(
-                active_view, candidate_block, parent_snapshot,
-                session=sim_session, proposal=sim_proposal,
-            )
+            # The terminal catch for an isolation breach. Inside apply the leak
+            # is a BaseException precisely so no broad handler can turn it into
+            # a rejected transaction; here, where the proposal is owned, it
+            # becomes an ordinary operational failure -- and the `finally` below
+            # still runs first, so the worker is disposed either way. Without
+            # this the node would unwind over something node-local.
+            with tau_proposal.boundary(sim_proposal, label="createblock"):
+                # Call the unified path
+                apply_result = engine.apply_block(
+                    active_view, candidate_block, parent_snapshot,
+                    session=sim_session, proposal=sim_proposal,
+                )
         finally:
             if sim_proposal is not None:
                 try:
@@ -736,7 +749,7 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
                             "createblock: failed to restore db full_tau_spec after miner simulation",
                             exc_info=True,
                         )
-        
+
         # Extract accepted/skipped outcomes
         final_txs = []
         final_reserved_ids = []
