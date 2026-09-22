@@ -142,6 +142,29 @@ def fingerprint(payload) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
+def verify_entries(entries, *, start_prev=None, start_seq=0) -> None:
+    """Verify a hash-chained run of entries, detached from any Journal.
+
+    Detached because a frozen commit artifact holds a tuple of entries rather
+    than the journal they came out of, and re-attaching them to a Journal just to
+    check them would mean building the very mutable object the artifact exists to
+    stop being consulted.
+    """
+    prev = start_prev
+    expected_seq = start_seq
+    for entry in entries:
+        expected_seq += 1
+        if entry.seq != expected_seq:
+            raise DivergenceError(
+                f"journal sequence broken at {entry.seq}: expected {expected_seq}"
+            )
+        if entry.prev != prev:
+            raise DivergenceError(f"journal link broken at entry {entry.seq}")
+        if entry.link != entry.compute_link():
+            raise DivergenceError(f"journal entry {entry.seq} was altered")
+        prev = entry.link
+
+
 @dataclass(frozen=True)
 class JournalEntry:
     seq: int
@@ -292,19 +315,7 @@ class Journal:
         format itself should not permit a swapped, duplicated or altered entry to
         look like a legitimate record.
         """
-        prev = None
-        expected_seq = 0
-        for entry in self._entries:
-            expected_seq += 1
-            if entry.seq != expected_seq:
-                raise DivergenceError(
-                    f"journal sequence broken at {entry.seq}: expected {expected_seq}"
-                )
-            if entry.prev != prev:
-                raise DivergenceError(f"journal link broken at entry {entry.seq}")
-            if entry.link != entry.compute_link():
-                raise DivergenceError(f"journal entry {entry.seq} was altered")
-            prev = entry.link
+        verify_entries(self._entries)
 
     def child(self, label: str = "tx") -> "Journal":
         """A transaction-private journal.
