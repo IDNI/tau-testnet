@@ -717,3 +717,69 @@ def _journal_sequence(store) -> int:
         return int(head()[1])
     except Exception:
         return 0
+
+
+class ProposalRegistry:
+    """Hands a locally-built commit artifact to the ingestion path.
+
+    Single-slot and process-local. A node builds one block at a time (block
+    production holds `_chain_lock`), so a second offer means the first block was
+    abandoned somewhere that did not say so -- it is disposed rather than kept,
+    because an artifact whose proposal is still alive holds a worker process.
+
+    Keyed by execution identity, and claiming is destructive: an artifact is
+    usable exactly once, for exactly the block it describes.
+    """
+
+    def __init__(self):
+        self._key = None
+        self._entry = None
+
+    def offer(self, execution_id: str, prepared, proposal) -> None:
+        if self._entry is not None:
+            logger.warning(
+                "commit artifact %s was never claimed; disposing it", self._key
+            )
+            self._dispose(self._entry)
+        self._key = execution_id
+        self._entry = (prepared, proposal)
+
+    def claim(self, execution_id: str):
+        """Take the artifact for this execution, or None.
+
+        None is always a valid answer: the caller falls back to evaluating the
+        block itself. That is what keeps a miss from being a failure.
+        """
+        if self._entry is None or self._key != execution_id:
+            return None
+        entry, self._entry, self._key = self._entry, None, None
+        return entry
+
+    def discard(self, execution_id=None) -> None:
+        if self._entry is None:
+            return
+        if execution_id is not None and self._key != execution_id:
+            return
+        self._dispose(self._entry)
+        self._entry = None
+        self._key = None
+
+    @staticmethod
+    def _dispose(entry) -> None:
+        _, proposal = entry
+        try:
+            proposal.dispose()
+        except Exception:
+            logger.warning("could not dispose an unclaimed proposal", exc_info=True)
+
+    @property
+    def pending(self):
+        return self._key
+
+
+#: The node's registry. One per process, like the chain it serves.
+_REGISTRY = ProposalRegistry()
+
+
+def registry() -> ProposalRegistry:
+    return _REGISTRY

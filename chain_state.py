@@ -608,8 +608,79 @@ def _process_new_block_locked(block: Block) -> bool:
             # new revision afterwards (see reload_consensus_interpreter_from_state).
             _cons_rules_before = _consensus_rules_state
 
+            # 4a. A locally-built block arrives here already evaluated. Reusing
+            # that evaluation is what removes the second execution of every block
+            # this node mines -- the miner's proposal and this path were running
+            # the same transactions against the same parent twice.
+            #
+            # A miss is always fine: the block is evaluated below exactly as
+            # before. So this can only ever save work, never change an outcome.
+            #
+            # What it does give up, for locally mined blocks only, is the
+            # state-hash CROSS-CHECK: the header was filled in from this same
+            # snapshot, so comparing them would be comparing a value to itself.
+            # The artifact's gate -- execution identity, parent, mapping epoch,
+            # journal head, allocator delta, plan, worker counters -- is what
+            # replaces it.
+            _artifact = None
+            _execution_id = None
+            try:
+                import tau_commit as _tau_commit
+                _execution_id = _tau_commit.block_execution_id(
+                    parent=block.header.previous_hash,
+                    height=block.header.block_number,
+                    timestamp=block.header.timestamp,
+                    proposer=block.header.proposer_pubkey,
+                    transactions=block.transactions,
+                    consensus_context=(active_view.consensus_rules or ""
+                                       if active_view is not None else ""),
+                )
+                _artifact = _tau_commit.registry().claim(_execution_id)
+            except Exception:
+                logger.debug("[BLOCKCHAIN] no commit artifact lookup", exc_info=True)
+                _artifact = None
+
+            apply_result = None
+            if _artifact is not None:
+                _prepared, _proposal = _artifact
+                try:
+                    _prepared.verify(proposal=_proposal, execution_id=_execution_id)
+                    next_snapshot = _prepared.next_snapshot
+                    logger.info(
+                        "[BLOCKCHAIN] block #%s reuses its own evaluation "
+                        "(execution %s)", block.header.block_number,
+                        _execution_id[:12],
+                    )
+                    # The worker is disposed here because nothing downstream can
+                    # use it yet: the node's authoritative evaluator is still the
+                    # in-process interpreter, not a session. This is where
+                    # PROMOTION goes when that changes -- the worker that
+                    # computed this state would become the one serving it,
+                    # instead of being thrown away and the same state reached
+                    # again by a different route.
+                    try:
+                        _proposal.dispose()
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    # Stale or mismatched: evaluate the block properly. This is
+                    # the safe direction, and the one that must stay cheap to
+                    # take.
+                    logger.warning(
+                        "[BLOCKCHAIN] commit artifact for block #%s rejected "
+                        "(%s); evaluating the block instead",
+                        block.header.block_number, exc,
+                    )
+                    try:
+                        _proposal.dispose()
+                    except Exception:
+                        pass
+                    _artifact = None
+
             # 4. Pure Apply Block Executor
-            if active_view is not None and hasattr(engine, "apply_block"):
+            if _artifact is not None:
+                pass
+            elif active_view is not None and hasattr(engine, "apply_block"):
                 try:
                     apply_result = engine.apply_block(active_view, block, parent_snapshot)
                 except FeeRuleError as exc:

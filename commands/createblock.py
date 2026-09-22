@@ -15,6 +15,7 @@ from consensus.state import compute_state_hash
 from consensus.lanes import TAU_EVALUATING_TX_TYPES
 
 
+import tau_commit
 import tau_manager
 import tau_proposal
 import tau_shrink
@@ -717,11 +718,11 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
                     session=sim_session, proposal=sim_proposal,
                 )
         finally:
-            if sim_proposal is not None:
-                try:
-                    sim_proposal.dispose()
-                except Exception:
-                    logger.warning("createblock: failed to dispose the simulation worker")
+            # Deliberately NOT disposed here. The worker that evaluated this
+            # block is what ingestion reuses instead of evaluating it again, so
+            # it is disposed by whoever ends up owning the outcome: the registry
+            # if the artifact is never claimed, or the error paths below.
+            pass
             # Restore the interpreter + cached rules state so `process_new_block`
             # below re-applies the block from the same baseline the miner saw.
             # Only meaningful when the simulation ran IN-PROCESS: a proposal wrote
@@ -793,13 +794,74 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
             print(f"[ERROR][createblock] Failed to generate consensus proof: {e}")
             import db as _db
             _db.unreserve_mempool_txs(reserved_ids)
+            if sim_proposal is not None:
+                try:
+                    sim_proposal.dispose()
+                except Exception:
+                    pass
             msg = f"Failed to sign block: {e}"
             return {"error": msg, "message": msg}
+
+        # Hand the evaluated block to ingestion instead of making it evaluate the
+        # block again. The artifact is keyed on the block AS IT WILL BE
+        # INGESTED -- after the rejected transactions have been dropped from it --
+        # so a block rebuilt with a different transaction list, timestamp or
+        # proposer simply does not match and ingestion evaluates it itself.
+        #
+        # Worth being explicit about why reusing it is sound at all: the executed
+        # set included transactions this block does not contain, and the two are
+        # equivalent only because a rejected transaction now leaves nothing
+        # behind -- journal, allocator, lifecycle and evaluator. That is exactly
+        # what the A/B/C/D comparison establishes. Without that property this
+        # reuse would be wrong.
+        block_execution = None
+        if sim_proposal is not None and not sim_proposal.poisoned:
+            try:
+                # A rejection in the LAST transaction leaves the proposal owing a
+                # reconstruction -- an earlier one is repaired by the next
+                # transaction's branch on its way in, but nothing follows the
+                # last. Measured: without this, any block whose final
+                # transaction was rejected after stepping the evaluator produced
+                # no artifact at all and ingestion re-evaluated the whole block.
+                # Rebuilding here costs one replay of the accepted prefix; not
+                # rebuilding costs a second execution of every transaction.
+                if sim_proposal.dirty:
+                    sim_proposal.reconstruct()
+                block_execution = tau_commit.block_execution_id(
+                    parent=candidate_block.header.previous_hash,
+                    height=candidate_block.header.block_number,
+                    timestamp=candidate_block.header.timestamp,
+                    proposer=candidate_block.header.proposer_pubkey,
+                    transactions=candidate_block.transactions,
+                    consensus_context=active_view.consensus_rules or "",
+                )
+                prepared = tau_commit.PreparedBlockCommit.freeze(
+                    sim_proposal,
+                    execution_id=block_execution,
+                    next_snapshot=apply_result.next_snapshot,
+                    parent_tip_id=candidate_block.header.previous_hash,
+                )
+                tau_commit.registry().offer(block_execution, prepared, sim_proposal)
+            except Exception as exc:
+                # Never fatal: ingestion evaluating the block itself is the
+                # behaviour that shipped, and it is still correct.
+                logger.warning("createblock: no commit artifact for ingestion (%s)", exc)
+                block_execution = None
+                try:
+                    sim_proposal.dispose()
+                except Exception:
+                    pass
+        elif sim_proposal is not None:
+            try:
+                sim_proposal.dispose()
+            except Exception:
+                pass
 
         # 5. Full Final Acceptance Path
         # The node runs standard process_new_block ingestion as if we imported it over network.
         # This guarantees path equivalence.
         if not chain_state.process_new_block(candidate_block):
+             tau_commit.registry().discard(block_execution)
              import db as _db
              # No block was persisted, so NOTHING may be disposed of: the batch
              # goes back to pending exactly as it was. The engine's accept/skip/
