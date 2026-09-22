@@ -218,6 +218,44 @@ def init_db():
                     key TEXT    NOT NULL UNIQUE
                 );
             ''')
+            # The COMMITTED journal: the authoritative record of evaluator
+            # execution. A reconstruction replays this, so it is the thing the
+            # node's Tau state is defined by -- not the spec text, which was
+            # measured to come back with the history gone.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS tau_journal_v1 (
+                    seq        INTEGER PRIMARY KEY,
+                    kind       TEXT NOT NULL,
+                    phase      TEXT NOT NULL,
+                    rule_text  TEXT,
+                    inputs     TEXT NOT NULL DEFAULT '{}',
+                    target     INTEGER,
+                    accumulate INTEGER NOT NULL DEFAULT 1,
+                    outcome    TEXT,
+                    result_fp  TEXT,
+                    identity   TEXT,
+                    prev       TEXT,
+                    link       TEXT NOT NULL,
+                    tip        TEXT
+                );
+            ''')
+            # Commit records. A durable answer to "did this exact block execution
+            # cross the irreversible boundary", written in the SAME transaction as
+            # the state it describes -- so a crash between the two is not
+            # representable, and a restart can tell without guessing.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS block_commits_v1 (
+                    execution_id TEXT PRIMARY KEY,
+                    tip          TEXT NOT NULL,
+                    parent       TEXT,
+                    journal_head TEXT,
+                    allocator_digest TEXT,
+                    plan_id      TEXT,
+                    spec_revision INTEGER,
+                    time_point   INTEGER,
+                    committed_at INTEGER NOT NULL
+                );
+            ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS mempool (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -603,6 +641,189 @@ def shrink_mapping_epoch() -> str:
         return f"{count}:{digest.hexdigest()[:32]}"
 
 
+def _publish_shrink_rows(cur, delta: dict, expected_epoch: str) -> None:
+    """Exact-id bindings, WITHOUT a transaction of its own.
+
+    Callers own the transaction. `publish_shrink_ids` gives it one; the block
+    commit puts these rows in the same transaction as the canonical snapshot,
+    the journal delta and the tip -- otherwise a crash between the two leaves a
+    published mapping for a block that does not exist, which is the one way to
+    permanently burn ids for nothing.
+    """
+    cur.execute('SELECT id, key FROM tau_shrink_ids ORDER BY id')
+    digest = hashlib.sha256()
+    count = 0
+    for id_num, key in cur.fetchall():
+        digest.update(f"{int(id_num)}\x00{key}\x00".encode("utf-8"))
+        count += 1
+    current = f"{count}:{digest.hexdigest()[:32]}"
+    if current != expected_epoch:
+        raise ValueError(
+            f"shrink mapping moved: expected epoch {expected_epoch}, found {current}"
+        )
+    for key, id_num in sorted(delta.items(), key=lambda kv: kv[1]):
+        cur.execute('SELECT id FROM tau_shrink_ids WHERE key = ?', (key,))
+        row = cur.fetchone()
+        if row is not None:
+            if int(row[0]) != int(id_num):
+                raise ValueError(
+                    f"{key!r} is already bound to {int(row[0])}, plan says {id_num}"
+                )
+            continue
+        cur.execute('SELECT key FROM tau_shrink_ids WHERE id = ?', (int(id_num),))
+        taken = cur.fetchone()
+        if taken is not None:
+            raise ValueError(f"id {id_num} already belongs to {taken[0]!r}")
+        cur.execute('INSERT INTO tau_shrink_ids(id, key) VALUES (?, ?)',
+                    (int(id_num), key))
+
+
+def committed_journal_head():
+    """(head link, sequence) of the committed journal, or (None, 0)."""
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute('SELECT link, seq FROM tau_journal_v1 ORDER BY seq DESC LIMIT 1')
+        row = cur.fetchone()
+    if row is None:
+        return None, 0
+    return row[0], int(row[1])
+
+
+def committed_journal_entries(limit=None):
+    """The committed journal in order. This is what a reconstruction replays."""
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        sql = ('SELECT seq, kind, phase, rule_text, inputs, target, accumulate, '
+               'outcome, result_fp, identity, prev, link FROM tau_journal_v1 '
+               'ORDER BY seq')
+        if limit is not None:
+            sql += f' LIMIT {int(limit)}'
+        cur.execute(sql)
+        rows = cur.fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "seq": int(r[0]), "kind": r[1], "phase": r[2], "rule_text": r[3],
+            "inputs": json.loads(r[4] or "{}"), "target": r[5],
+            "accumulate": bool(r[6]), "outcome": r[7], "result_fingerprint": r[8],
+            "identity": json.loads(r[9]) if r[9] else None,
+            "prev": r[10], "link": r[11],
+        })
+    return out
+
+
+def find_block_commit(execution_id: str):
+    """The durable answer to "did this exact execution cross the boundary"."""
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT execution_id, tip, parent, journal_head, allocator_digest, '
+            'plan_id, spec_revision, time_point, committed_at '
+            'FROM block_commits_v1 WHERE execution_id = ?', (execution_id,)
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    keys = ("execution_id", "tip", "parent", "journal_head", "allocator_digest",
+            "plan_id", "spec_revision", "time_point", "committed_at")
+    return dict(zip(keys, row))
+
+
+def commit_prepared_block(*, execution_id, tip, parent, journal_entries,
+                          expected_journal_seq, allocation_delta, expected_epoch,
+                          journal_head, allocator_digest, plan_id,
+                          spec_revision=None, time_point=None,
+                          canonical=None, timestamp=None) -> dict:
+    """The irreversible step, as ONE transaction.
+
+    Canonical snapshot, journal delta, exact-id allocator delta, commit record
+    and tip become durable together or not at all. They share one SQLite file
+    behind one connection, so this is a real transaction rather than a sequence
+    of best-effort writes with a recovery story bolted on.
+
+    Returns {"committed": True, ...} on success, or {"committed": False,
+    "already": <record>} when this exact execution is already durable -- a retry
+    must not apply fees or lifecycle changes a second time.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    import time as _time
+
+    with _db_lock:
+        cur = _db_conn.cursor()
+        existing = cur.execute(
+            'SELECT execution_id, tip, parent, journal_head, allocator_digest, '
+            'plan_id, spec_revision, time_point, committed_at '
+            'FROM block_commits_v1 WHERE execution_id = ?', (execution_id,)
+        ).fetchone()
+        if existing is not None:
+            keys = ("execution_id", "tip", "parent", "journal_head",
+                    "allocator_digest", "plan_id", "spec_revision", "time_point",
+                    "committed_at")
+            return {"committed": False, "already": dict(zip(keys, existing))}
+
+        with _db_conn:  # ONE transaction for everything below
+            cur = _db_conn.cursor()
+
+            # The journal must extend exactly the sequence the proposal was
+            # built on. A gap or an overlap means some other execution committed
+            # in between, and appending anyway would record a history that never
+            # ran.
+            row = cur.execute(
+                'SELECT seq FROM tau_journal_v1 ORDER BY seq DESC LIMIT 1'
+            ).fetchone()
+            current_seq = int(row[0]) if row is not None else 0
+            if current_seq != int(expected_journal_seq):
+                raise ValueError(
+                    f"journal base moved: expected sequence {expected_journal_seq}, "
+                    f"found {current_seq}"
+                )
+
+            for entry in journal_entries:
+                current_seq += 1
+                cur.execute(
+                    'INSERT INTO tau_journal_v1 (seq, kind, phase, rule_text, '
+                    'inputs, target, accumulate, outcome, result_fp, identity, '
+                    'prev, link, tip) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (current_seq, entry["kind"], entry["phase"],
+                     entry.get("rule_text"),
+                     json.dumps(entry.get("inputs") or {}, sort_keys=True),
+                     entry.get("target"),
+                     1 if entry.get("accumulate", True) else 0,
+                     entry.get("outcome"), entry.get("result_fingerprint"),
+                     json.dumps(entry["identity"]) if entry.get("identity") else None,
+                     entry.get("prev"), entry["link"], tip),
+                )
+
+            if allocation_delta:
+                _publish_shrink_rows(cur, dict(allocation_delta), expected_epoch)
+
+            if canonical:
+                _write_canonical_state_rows(**canonical)
+
+            cur.execute(
+                'INSERT INTO block_commits_v1 (execution_id, tip, parent, '
+                'journal_head, allocator_digest, plan_id, spec_revision, '
+                'time_point, committed_at) VALUES (?,?,?,?,?,?,?,?,?)',
+                (execution_id, tip, parent, journal_head, allocator_digest,
+                 plan_id, spec_revision, time_point,
+                 int(timestamp if timestamp is not None else _time.time())),
+            )
+
+    return {"committed": True, "execution_id": execution_id, "tip": tip,
+            "journal_head": journal_head, "allocator_digest": allocator_digest}
+
+
 def publish_shrink_ids(delta: dict, expected_epoch: str) -> None:
     """Insert an exact set of (key -> id) bindings in ONE transaction.
 
@@ -610,39 +831,18 @@ def publish_shrink_ids(delta: dict, expected_epoch: str) -> None:
     publication that renumbered them would commit a representation nobody
     evaluated. Aborts if the mapping moved underneath the proposal, or if any
     binding is no longer available.
+
+    Standalone use only. The block commit calls `_publish_shrink_rows` directly
+    so the bindings land in the same transaction as everything else they belong
+    with.
     """
     global _db_conn
     if _db_conn is None:
         init_db()
     with _db_lock:
         cur = _db_conn.cursor()
-        cur.execute('SELECT id, key FROM tau_shrink_ids ORDER BY id')
-        digest = hashlib.sha256()
-        count = 0
-        for id_num, key in cur.fetchall():
-            digest.update(f"{int(id_num)}\x00{key}\x00".encode("utf-8"))
-            count += 1
-        current = f"{count}:{digest.hexdigest()[:32]}"
-        if current != expected_epoch:
-            raise ValueError(
-                f"shrink mapping moved: expected epoch {expected_epoch}, found {current}"
-            )
         try:
-            for key, id_num in sorted(delta.items(), key=lambda kv: kv[1]):
-                cur.execute('SELECT id FROM tau_shrink_ids WHERE key = ?', (key,))
-                row = cur.fetchone()
-                if row is not None:
-                    if int(row[0]) != int(id_num):
-                        raise ValueError(
-                            f"{key!r} is already bound to {int(row[0])}, plan says {id_num}"
-                        )
-                    continue
-                cur.execute('SELECT key FROM tau_shrink_ids WHERE id = ?', (int(id_num),))
-                taken = cur.fetchone()
-                if taken is not None:
-                    raise ValueError(f"id {id_num} already belongs to {taken[0]!r}")
-                cur.execute('INSERT INTO tau_shrink_ids(id, key) VALUES (?, ?)',
-                            (int(id_num), key))
+            _publish_shrink_rows(cur, delta, expected_epoch)
             _db_conn.commit()
         except Exception:
             _db_conn.rollback()
@@ -1721,203 +1921,241 @@ def set_chain_state_value(key: str, value: str) -> None:
 def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
+
+    A thin wrapper around `_write_canonical_state_rows` so the SAME row
+    writes can also run inside a LARGER transaction -- the block commit needs
+    the canonical snapshot, the journal delta, the allocator delta and the tip
+    to become durable together or not at all, and a nested `with _db_conn:`
+    would commit this half early.
     """
     if _db_conn is None:
         init_db()
-        
+
     with _db_lock:
-        with _db_conn: # Transaction
-            _db_conn.execute(
-                'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                ('application_rules', application_rules)
+        with _db_conn:  # Transaction
+            _write_canonical_state_rows(
+                head_hash=head_hash,
+                head_num=head_num,
+                balances=balances,
+                sequences=sequences,
+                application_rules=application_rules,
+                consensus_rules=consensus_rules,
+                active_consensus_id=active_consensus_id,
+                pending_updates=pending_updates,
+                votes=votes,
+                scheduled=scheduled,
+                archival=archival,
+                active_validators=active_validators,
+                quorum_policy=quorum_policy,
+                eligibility_mode=eligibility_mode,
+                fee_beneficiary=fee_beneficiary,
+                last_transfer_ts=last_transfer_ts,
+                rule_offers=rule_offers,
+                rule_clauses=rule_clauses,
+                max_rule_txs_per_block=max_rule_txs_per_block,
+                approval_requests=approval_requests,
+                approval_slots_active=approval_slots_active,
             )
-            _db_conn.execute(
-                'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                ('consensus_rules', consensus_rules)
+
+
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None):
+    """The row writes, WITHOUT a transaction of its own.
+
+    Callers own the transaction. `save_canonical_state_atomically` gives it
+    one; the block commit puts these writes in the same transaction as the
+    journal delta, the allocator delta and the tip.
+    """
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        ('application_rules', application_rules)
+    )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        ('consensus_rules', consensus_rules)
+    )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        ('active_consensus_id', active_consensus_id)
+    )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        ('canonical_head_hash', head_hash)
+    )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        ('canonical_head_number', str(head_num))
+    )
+    if active_validators is not None:
+        _db_conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('active_validators', json.dumps(sorted(active_validators)))
+        )
+    if quorum_policy is not None:
+        # Persist the (possibly governance-activated) quorum policy so a
+        # node reloading from disk reproduces the same approval threshold
+        # as a freshly-rebuilt or freshly-synced peer. Stored verbatim,
+        # including "" (genesis did not pin) — get_chain_state_value
+        # returns its default only when the row is absent.
+        _db_conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('quorum_policy', quorum_policy)
+        )
+    if eligibility_mode is not None:
+        # Persist the (possibly governance-activated) eligibility mode so a
+        # node reloading from disk reproduces the same proposer-eligibility
+        # regime as a freshly-rebuilt or freshly-synced peer. Stored
+        # verbatim, including "" (genesis did not pin).
+        _db_conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('eligibility_mode', eligibility_mode)
+        )
+    if fee_beneficiary is not None:
+        # Same reasoning as eligibility_mode: a node reloading from disk
+        # must route the levy exactly as a freshly-synced peer does, or
+        # the two compute different balances. Stored verbatim, including
+        # "" (no beneficiary pinned -> credit the proposer).
+        _db_conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('fee_beneficiary', fee_beneficiary)
+        )
+
+    _db_conn.execute('DELETE FROM accounts')
+    # Persist a row for EVERY account that has a balance OR a sequence
+    # number. Iterating balances.items() alone dropped "sequence-only"
+    # accounts — validators who submitted a governance tx (proposal or
+    # vote) but hold no funds, so they exist in `sequences` (seq
+    # incremented) but never in `balances`. compute_consensus_state_hash's
+    # accounts_hash keys on balances∪sequences, so losing those rows on
+    # persist made a node reload a state with a SMALLER account set than
+    # a from-genesis replay reconstructs. The node would then mine the
+    # next block against that reduced state, producing a state hash that
+    # every follower's replay rejected (Bug A / Phase 9B: the
+    # mine-vs-replay divergence at the first post-restart block).
+    # The key union must cover every per-account map, or an account
+    # present in only one of them is dropped on restart (Bug A above).
+    _lts = last_transfer_ts or {}
+    for address in set(balances.keys()) | set(sequences.keys()) | set(_lts.keys()):
+        _db_conn.execute(
+            'INSERT INTO accounts (address, balance, sequence_number, last_transfer_ts) '
+            'VALUES (?, ?, ?, ?)',
+            (address, int(balances.get(address, 0)), int(sequences.get(address, 0)),
+             int(_lts.get(address, 0)))
+        )
+
+    # Full Replace v2 arrays
+    _db_conn.execute('DELETE FROM consensus_updates_v2')
+    for p in pending_updates:
+        _db_conn.execute(
+            'INSERT INTO consensus_updates_v2 (update_id, rule_revisions, activate_at_height, host_contract_patch, proposer_pubkey) VALUES (?, ?, ?, ?, ?)',
+            (
+                p['update_id'],
+                json.dumps(p['rule_revisions']),
+                p['activate_at_height'],
+                json.dumps(p['host_contract_patch']) if p['host_contract_patch'] else None,
+                p.get('proposer_pubkey'),
             )
+        )
+
+    _db_conn.execute('DELETE FROM consensus_votes_v2')
+    for v in votes:
+        _db_conn.execute(
+            'INSERT INTO consensus_votes_v2 (update_id, voter_pubkey) VALUES (?, ?)',
+            (v['update_id'], v['voter_pubkey'])
+        )
+
+    _db_conn.execute('DELETE FROM consensus_scheduled')
+    for activation_height, update_id in scheduled:
+        _db_conn.execute(
+            'INSERT INTO consensus_scheduled (activation_height, update_id) VALUES (?, ?)',
+            (activation_height, update_id)
+        )
+
+    _db_conn.execute('DELETE FROM consensus_archival')
+    for uid in archival:
+        _db_conn.execute(
+            'INSERT INTO consensus_archival (update_id) VALUES (?)',
+            (uid,)
+        )
+
+    # Rule sharing, same full-replace semantics and same transaction as
+    # accounts. Both must be written here: the offer book and clause
+    # registry are bound into consensus_meta_hash, so a node whose
+    # in-memory managers disagree with disk computes a different state
+    # hash after a restart than a peer replaying from genesis.
+    if rule_offers is not None:
+        _db_conn.execute('DELETE FROM rule_offers_v1')
+        for offer in rule_offers:
             _db_conn.execute(
-                'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                ('active_consensus_id', active_consensus_id)
+                'INSERT OR REPLACE INTO rule_offers_v1 '
+                '(offer_id, offerer_pubkey, recipient_pubkey, rule_text, '
+                'expire_at_height, status) VALUES (?, ?, ?, ?, ?, ?)',
+                (
+                    offer['offer_id'],
+                    offer.get('offerer_pubkey', ''),
+                    offer.get('recipient_pubkey', ''),
+                    offer.get('rule_text', ''),
+                    int(offer.get('expire_at_height', 0)),
+                    offer.get('status', 'offered'),
+                )
             )
+
+    if rule_clauses is not None:
+        _db_conn.execute('DELETE FROM rule_clauses_v1')
+        for clause in rule_clauses:
             _db_conn.execute(
-                'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                ('canonical_head_hash', head_hash)
+                'INSERT OR REPLACE INTO rule_clauses_v1 '
+                '(acceptor_pubkey, target_stream, clause_body) VALUES (?, ?, ?)',
+                (
+                    clause['acceptor_pubkey'],
+                    int(clause['target_stream']),
+                    clause['clause_body'],
+                )
             )
+
+    # Approval requests, same full-replace semantics and same
+    # transaction as accounts, for the same reason: the request book root
+    # is bound into consensus_meta_hash, so a node whose in-memory
+    # manager disagrees with disk computes a different state hash after a
+    # restart than a peer replaying from genesis.
+    if approval_requests is not None:
+        _db_conn.execute('DELETE FROM approval_requests_v1')
+        for req in approval_requests:
             _db_conn.execute(
-                'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                ('canonical_head_number', str(head_num))
+                'INSERT OR REPLACE INTO approval_requests_v1 '
+                '(request_id, sender_pubkey, recipient_pubkey, amount, '
+                'expire_at_height, approvers_json, custom_inputs_json, '
+                'voted_json, declined_json, status) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (
+                    req['request_id'],
+                    req.get('sender_pubkey', ''),
+                    req.get('recipient_pubkey', ''),
+                    int(req.get('amount', 0)),
+                    int(req.get('expire_at_height', 0)),
+                    req.get('approvers_json', '{}'),
+                    req.get('custom_inputs_json', '{}'),
+                    req.get('voted_json', '{}'),
+                    req.get('declined_json', '[]'),
+                    int(req.get('status', 0)),
+                )
             )
-            if active_validators is not None:
-                _db_conn.execute(
-                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                    ('active_validators', json.dumps(sorted(active_validators)))
-                )
-            if quorum_policy is not None:
-                # Persist the (possibly governance-activated) quorum policy so a
-                # node reloading from disk reproduces the same approval threshold
-                # as a freshly-rebuilt or freshly-synced peer. Stored verbatim,
-                # including "" (genesis did not pin) — get_chain_state_value
-                # returns its default only when the row is absent.
-                _db_conn.execute(
-                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                    ('quorum_policy', quorum_policy)
-                )
-            if eligibility_mode is not None:
-                # Persist the (possibly governance-activated) eligibility mode so a
-                # node reloading from disk reproduces the same proposer-eligibility
-                # regime as a freshly-rebuilt or freshly-synced peer. Stored
-                # verbatim, including "" (genesis did not pin).
-                _db_conn.execute(
-                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                    ('eligibility_mode', eligibility_mode)
-                )
-            if fee_beneficiary is not None:
-                # Same reasoning as eligibility_mode: a node reloading from disk
-                # must route the levy exactly as a freshly-synced peer does, or
-                # the two compute different balances. Stored verbatim, including
-                # "" (no beneficiary pinned -> credit the proposer).
-                _db_conn.execute(
-                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                    ('fee_beneficiary', fee_beneficiary)
-                )
 
-            _db_conn.execute('DELETE FROM accounts')
-            # Persist a row for EVERY account that has a balance OR a sequence
-            # number. Iterating balances.items() alone dropped "sequence-only"
-            # accounts — validators who submitted a governance tx (proposal or
-            # vote) but hold no funds, so they exist in `sequences` (seq
-            # incremented) but never in `balances`. compute_consensus_state_hash's
-            # accounts_hash keys on balances∪sequences, so losing those rows on
-            # persist made a node reload a state with a SMALLER account set than
-            # a from-genesis replay reconstructs. The node would then mine the
-            # next block against that reduced state, producing a state hash that
-            # every follower's replay rejected (Bug A / Phase 9B: the
-            # mine-vs-replay divergence at the first post-restart block).
-            # The key union must cover every per-account map, or an account
-            # present in only one of them is dropped on restart (Bug A above).
-            _lts = last_transfer_ts or {}
-            for address in set(balances.keys()) | set(sequences.keys()) | set(_lts.keys()):
-                _db_conn.execute(
-                    'INSERT INTO accounts (address, balance, sequence_number, last_transfer_ts) '
-                    'VALUES (?, ?, ?, ?)',
-                    (address, int(balances.get(address, 0)), int(sequences.get(address, 0)),
-                     int(_lts.get(address, 0)))
-                )
-                
-            # Full Replace v2 arrays
-            _db_conn.execute('DELETE FROM consensus_updates_v2')
-            for p in pending_updates:
-                _db_conn.execute(
-                    'INSERT INTO consensus_updates_v2 (update_id, rule_revisions, activate_at_height, host_contract_patch, proposer_pubkey) VALUES (?, ?, ?, ?, ?)',
-                    (
-                        p['update_id'],
-                        json.dumps(p['rule_revisions']),
-                        p['activate_at_height'],
-                        json.dumps(p['host_contract_patch']) if p['host_contract_patch'] else None,
-                        p.get('proposer_pubkey'),
-                    )
-                )
-                
-            _db_conn.execute('DELETE FROM consensus_votes_v2')
-            for v in votes:
-                _db_conn.execute(
-                    'INSERT INTO consensus_votes_v2 (update_id, voter_pubkey) VALUES (?, ?)',
-                    (v['update_id'], v['voter_pubkey'])
-                )
-                
-            _db_conn.execute('DELETE FROM consensus_scheduled')
-            for activation_height, update_id in scheduled:
-                _db_conn.execute(
-                    'INSERT INTO consensus_scheduled (activation_height, update_id) VALUES (?, ?)',
-                    (activation_height, update_id)
-                )
-                
-            _db_conn.execute('DELETE FROM consensus_archival')
-            for uid in archival:
-                _db_conn.execute(
-                    'INSERT INTO consensus_archival (update_id) VALUES (?)',
-                    (uid,)
-                )
+    if approval_slots_active is not None:
+        # One-way activation flag. Persisted so a restart does not
+        # silently un-reserve i18..i25 and let a sender write their own
+        # approval slots.
+        _db_conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('approval_slots_active', '1' if approval_slots_active else '0')
+        )
 
-            # Rule sharing, same full-replace semantics and same transaction as
-            # accounts. Both must be written here: the offer book and clause
-            # registry are bound into consensus_meta_hash, so a node whose
-            # in-memory managers disagree with disk computes a different state
-            # hash after a restart than a peer replaying from genesis.
-            if rule_offers is not None:
-                _db_conn.execute('DELETE FROM rule_offers_v1')
-                for offer in rule_offers:
-                    _db_conn.execute(
-                        'INSERT OR REPLACE INTO rule_offers_v1 '
-                        '(offer_id, offerer_pubkey, recipient_pubkey, rule_text, '
-                        'expire_at_height, status) VALUES (?, ?, ?, ?, ?, ?)',
-                        (
-                            offer['offer_id'],
-                            offer.get('offerer_pubkey', ''),
-                            offer.get('recipient_pubkey', ''),
-                            offer.get('rule_text', ''),
-                            int(offer.get('expire_at_height', 0)),
-                            offer.get('status', 'offered'),
-                        )
-                    )
-
-            if rule_clauses is not None:
-                _db_conn.execute('DELETE FROM rule_clauses_v1')
-                for clause in rule_clauses:
-                    _db_conn.execute(
-                        'INSERT OR REPLACE INTO rule_clauses_v1 '
-                        '(acceptor_pubkey, target_stream, clause_body) VALUES (?, ?, ?)',
-                        (
-                            clause['acceptor_pubkey'],
-                            int(clause['target_stream']),
-                            clause['clause_body'],
-                        )
-                    )
-
-            # Approval requests, same full-replace semantics and same
-            # transaction as accounts, for the same reason: the request book root
-            # is bound into consensus_meta_hash, so a node whose in-memory
-            # manager disagrees with disk computes a different state hash after a
-            # restart than a peer replaying from genesis.
-            if approval_requests is not None:
-                _db_conn.execute('DELETE FROM approval_requests_v1')
-                for req in approval_requests:
-                    _db_conn.execute(
-                        'INSERT OR REPLACE INTO approval_requests_v1 '
-                        '(request_id, sender_pubkey, recipient_pubkey, amount, '
-                        'expire_at_height, approvers_json, custom_inputs_json, '
-                        'voted_json, declined_json, status) '
-                        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                        (
-                            req['request_id'],
-                            req.get('sender_pubkey', ''),
-                            req.get('recipient_pubkey', ''),
-                            int(req.get('amount', 0)),
-                            int(req.get('expire_at_height', 0)),
-                            req.get('approvers_json', '{}'),
-                            req.get('custom_inputs_json', '{}'),
-                            req.get('voted_json', '{}'),
-                            req.get('declined_json', '[]'),
-                            int(req.get('status', 0)),
-                        )
-                    )
-
-            if approval_slots_active is not None:
-                # One-way activation flag. Persisted so a restart does not
-                # silently un-reserve i18..i25 and let a sender write their own
-                # approval slots.
-                _db_conn.execute(
-                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                    ('approval_slots_active', '1' if approval_slots_active else '0')
-                )
-
-            if max_rule_txs_per_block is not None:
-                # Governance-activated value; persisted verbatim so a reload
-                # reproduces the same per-block budget as a from-genesis replay.
-                _db_conn.execute(
-                    'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
-                    ('max_rule_txs_per_block', str(int(max_rule_txs_per_block)))
-                )
+    if max_rule_txs_per_block is not None:
+        # Governance-activated value; persisted verbatim so a reload
+        # reproduces the same per-block budget as a from-genesis replay.
+        _db_conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('max_rule_txs_per_block', str(int(max_rule_txs_per_block)))
+        )
 
 
 def load_approval_requests() -> List[Dict]:
