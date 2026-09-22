@@ -23,6 +23,7 @@ Two facts drive the reconstruction rule:
 """
 from __future__ import annotations
 
+import copy
 import logging
 
 import tau_journal
@@ -55,9 +56,67 @@ class TxBranch:
         # which surfaces as a confusing intern failure somewhere unrelated.
         self._bind()
         self.state_delta: dict = {}
-        self.lifecycle_delta: dict = {}
+        self._lifecycle = None
+        self._lifecycle_parent = None
         self.resolved = False
         self.accepted = False
+
+    # --- lifecycle ------------------------------------------------------------
+
+    @property
+    def lifecycle(self):
+        """This transaction's private lifecycle state, cloned on first use.
+
+        Replacement, not undo. The registered-clause registry, the approval book
+        and the offer book are mutated in place by the paths that own them --
+        `resolve_all_for_sender` marks requests failed, `accepted_clauses[key]`
+        is overwritten -- and there is no inverse for any of it that survives
+        contact with the next change. So the transaction gets its own copy and
+        the proposal keeps the parent until the transaction is accepted.
+
+        Cloned lazily because most transactions never touch lifecycle state and
+        a deepcopy per transfer would be paid for nothing.
+        """
+        if self._lifecycle is None:
+            # The parent is captured HERE, by identity. Adoption later checks
+            # that the proposal still holds this exact object: a clone taken
+            # from one lifecycle and adopted into another would write a history
+            # that never happened, and a type check cannot see that.
+            self._lifecycle_parent = self.proposal.lifecycle
+            self._lifecycle = copy.deepcopy(self._lifecycle_parent)
+        return self._lifecycle
+
+    @property
+    def touched_lifecycle(self) -> bool:
+        return self._lifecycle is not None
+
+    def _adopt_lifecycle(self) -> None:
+        """Make the child's state the proposal's, in one rebind.
+
+        The contents are replaced wholesale; object IDENTITY is preserved on
+        purpose. The block builder holds this same manager and hashes it after
+        apply returns, so handing the proposal a different object would leave the
+        caller hashing the parent -- accepted lifecycle changes silently missing
+        from the consensus state hash.
+        """
+        child = self._lifecycle
+        if child is None:
+            return
+        parent = self.proposal.lifecycle
+        if parent is None:
+            self.proposal.lifecycle = child
+            return
+        if parent is not self._lifecycle_parent:
+            raise ProposalPoisoned(
+                f"{self.tx_id}: the proposal's lifecycle was replaced while this "
+                "transaction held a clone of the previous one"
+            )
+        try:
+            parent.__dict__ = dict(child.__dict__)
+        except (AttributeError, TypeError):
+            # __slots__ or a type that refuses the rebind. Identity is worth
+            # keeping but not at the price of a half-adopted object.
+            self.proposal.lifecycle = child
 
     def _bind(self) -> None:
         session = getattr(self.proposal, "session", None)
@@ -102,7 +161,7 @@ class TxBranch:
             self.proposal.poison(f"{self.tx_id}: partial merge ({exc})")
             raise
         self.proposal.state.update(self.state_delta)
-        self.proposal.lifecycle.update(self.lifecycle_delta)
+        self._adopt_lifecycle()
         self.resolved = True
         self.accepted = True
         self._unbind()
@@ -113,7 +172,9 @@ class TxBranch:
         self.proposal.journal.discard(self.journal)
         self.proposal.allocator.discard(self.allocation)
         self.state_delta.clear()
-        self.lifecycle_delta.clear()
+        # Dropped, never unwound: the parent was never mutated.
+        self._lifecycle = None
+        self._lifecycle_parent = None
         self.resolved = True
         self.accepted = False
         self._unbind()
@@ -140,7 +201,7 @@ class ProposalContext:
     """The owner of everything a candidate block touches before it commits."""
 
     def __init__(self, *, session, journal, allocator, plan, descriptor=None,
-                 rebuild=None, label="proposal"):
+                 rebuild=None, lifecycle=None, label="proposal"):
         self.session = session
         self.journal = journal
         self.allocator = allocator
@@ -148,7 +209,10 @@ class ProposalContext:
         self.descriptor = descriptor
         self.label = label
         self.state: dict = {}
-        self.lifecycle: dict = {}
+        # The proposal's lifecycle manager: clause registry, approval book, offer
+        # book, governance queues. Owned like every other proposal state -- a
+        # transaction mutates a clone and the proposal adopts it on acceptance.
+        self.lifecycle = lifecycle
         self._rebuild = rebuild
         self._dirty = False
         self._poisoned = None

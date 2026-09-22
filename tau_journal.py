@@ -150,6 +150,12 @@ class JournalEntry:
     rule_text: str | None = None   # canonical rule payload
     inputs: dict = field(default_factory=dict)   # canonical logical values
     target: int | None = None
+    #: Whether the authoritative path ALSO accumulated this revision into the
+    #: application-rules state. A regenerated o5 composite is fed with
+    #: accumulate=False -- it changes the evaluator but the clause registry, not
+    #: the accumulation, is what a restore rebuilds it from. Recorded because the
+    #: two produce different canonical state from the same evaluator history.
+    accumulate: bool = True
     outcome: str | None = None     # the revision outcome, when known
     result_fingerprint: str | None = None        # SEMANTIC: survives a valid
                                                  # representation change
@@ -162,7 +168,8 @@ class JournalEntry:
         return fingerprint({
             "seq": self.seq, "kind": self.kind, "phase": self.phase,
             "rule_text": self.rule_text, "inputs": self.inputs,
-            "target": self.target, "outcome": self.outcome,
+            "target": self.target, "accumulate": self.accumulate,
+            "outcome": self.outcome,
             "result": self.result_fingerprint,
             "identity": None if self.identity is None else self.identity.get("id"),
         })
@@ -179,6 +186,7 @@ class JournalEntry:
             "rule_text": self.rule_text,
             "inputs": dict(self.inputs),
             "target": self.target,
+            "accumulate": self.accumulate,
         }
 
     def to_dict(self) -> dict:
@@ -224,7 +232,7 @@ class Journal:
 
     def record(self, kind: str, *, phase: str, rule_text=None, inputs=None,
                target=None, outcome=None, result=None, runtime=None,
-               identity=None) -> JournalEntry:
+               identity=None, accumulate=True) -> JournalEntry:
         if self._discarded:
             raise ValueError(
                 f"journal {self.label!r} was discarded; its execution is not part "
@@ -250,6 +258,7 @@ class Journal:
             rule_text=rule_text,
             inputs=canonical_inputs(inputs),
             target=target,
+            accumulate=bool(accumulate),
             outcome=outcome,
             result_fingerprint=semantic,
             runtime_fingerprint=None if runtime is None else fingerprint(runtime),

@@ -68,3 +68,60 @@ def test_an_explicit_allowance_is_respected():
             allow={"chain_state.get_application_rules_state"}) as guard:
         chain_state.get_application_rules_state()
     guard.assert_clean()
+
+
+# --- nesting ------------------------------------------------------------------
+
+def test_a_lax_outer_guard_cannot_relax_a_strict_inner_one():
+    """Proposal mode installs its own strict guard.
+
+    A caller that wraps it in a recording guard -- to collect violations rather
+    than raise -- must not thereby turn the proposal's integration failure into
+    a logged warning. The strictest ACTIVE guard decides.
+    """
+    import chain_state
+    outer = tau_guard.ProposalIsolationGuard(strict=False)
+    with outer:
+        with tau_guard.ProposalIsolationGuard(strict=True):
+            with pytest.raises(tau_guard.GlobalStateLeak):
+                chain_state.save_application_rules_state("x")
+
+
+def test_a_strict_outer_guard_still_sees_calls_under_a_lax_inner_one():
+    import chain_state
+    with pytest.raises(tau_guard.GlobalStateLeak):
+        with tau_guard.ProposalIsolationGuard(strict=True):
+            with tau_guard.ProposalIsolationGuard(strict=False):
+                chain_state.save_application_rules_state("x")
+
+
+def test_an_inner_guard_exit_does_not_untrap_the_outer_one():
+    """The failure this prevents is silent: the inner __exit__ restores the
+    module attribute, and everything after it inside the outer guard runs
+    unwatched."""
+    import chain_state
+    outer = tau_guard.ProposalIsolationGuard(strict=False)
+    with outer:
+        with tau_guard.ProposalIsolationGuard(strict=False):
+            pass
+        chain_state.save_application_rules_state("x")
+    assert "chain_state.save_application_rules_state" in outer.calls()
+
+
+def test_every_active_guard_records_the_same_call():
+    import chain_state
+    outer = tau_guard.ProposalIsolationGuard(strict=False)
+    inner = tau_guard.ProposalIsolationGuard(strict=False)
+    with outer, inner:
+        chain_state.save_application_rules_state("x")
+    assert outer.calls() == inner.calls() == ["chain_state.save_application_rules_state"]
+
+
+def test_originals_are_restored_after_the_outermost_exit():
+    import chain_state
+    original = chain_state.save_application_rules_state
+    with tau_guard.ProposalIsolationGuard(strict=False):
+        with tau_guard.ProposalIsolationGuard(strict=False):
+            pass
+        assert chain_state.save_application_rules_state is not original
+    assert chain_state.save_application_rules_state is original

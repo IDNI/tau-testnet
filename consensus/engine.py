@@ -63,6 +63,7 @@ FEE_BEARING_TX_TYPES = frozenset(
 from consensus.tx_signing import verify_tx_signature
 import tau_native
 import tau_advisory
+import tau_guard
 import tau_session
 import tau_shrink
 
@@ -189,7 +190,8 @@ class ConsensusEngine(ABC):
         """
         pass
 
-def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict) -> Tuple[bool, str]:
+def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict,
+                          session=None) -> Tuple[bool, str]:
     """Route a regenerated composite rule through i0, as an op-"0" rule would.
 
     Returns (ok, detail). `composite` is None only when the acceptor's clause
@@ -199,32 +201,38 @@ def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict) -> Tuple[b
     A rejection is deterministic: every node applying this block composes the
     same text from the same registry and feeds it to the same engine, so all of
     them either accept or hard-reject the transaction identically.
+
+    `session` is the evaluator this composite belongs to and is NOT optional in
+    proposal mode -- it is defaulted only so the live apply path and the existing
+    callers keep working unchanged. Reaching `tau_manager` from inside a proposal
+    would step the authoritative interpreter for a block that may never commit,
+    which is the one thing the whole speculative path exists to prevent; the
+    isolation guard traps that call, so the default here is a convenience for the
+    authoritative path and a hard error for a proposal.
     """
     if not composite:
         return False, "composite is empty"
 
-    if not tau_manager.tau_ready.is_set():
-        tau_manager.tau_ready.wait(timeout=5)
-    if not tau_manager.tau_ready.is_set():
+    _session = (
+        session if session is not None
+        else tau_session.InProcessSession(manager=tau_manager)
+    )
+
+    if not _session.ready(timeout=5):
         # Soft failure shape is not available here: the clause is already
-        # registered in the manager, so refusing the tx is the only way to keep
-        # the emitted spec and the registry consistent.
+        # registered in the caller's registry, so refusing the tx is the only way
+        # to keep the emitted spec and the registry consistent.
         return False, "Tau not ready"
 
     try:
-        output = tau_manager.communicate_with_tau(
-            rule_text=composite,
-            target_output_stream_index=0,
-            # NOT accumulated: apply_rules_update=False feeds the interpreter
-            # but skips the rules handler, so the composite never enters the
-            # application-rules accumulation. save_effective_tau_spec only
-            # dedups EXACT units, so appending left every earlier composite in
-            # place -- several per stream, net effect dependent on replay order,
-            # and the spec growing with every acceptance. The clause registry is
-            # the consensus-bound source of truth and chain_state's restore plan
-            # rebuilds the composite from it.
-            apply_rules_update=False,
-        )
+        # NOT accumulated: the composite feeds the interpreter but skips the
+        # rules handler, so it never enters the application-rules accumulation.
+        # save_effective_tau_spec only dedups EXACT units, so appending left
+        # every earlier composite in place -- several per stream, net effect
+        # dependent on replay order, and the spec growing with every acceptance.
+        # The clause registry is the consensus-bound source of truth and
+        # chain_state's restore plan rebuilds the composite from it.
+        output = _session.apply_rule(composite, target=0, accumulate=False)
     except Exception as exc:  # noqa: BLE001 - deliberately broad, see below
         # A deterministic parse/compile failure surfaces as an engine error in
         # the exception text. Anything else (transient outage) is equally fatal
@@ -232,6 +240,17 @@ def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict) -> Tuple[b
         return False, str(exc)
 
     tx_receipt["logs"].append(f"Tau(composite) o0: {output}")
+
+    # W6, same correction the ordinary rule path got: the engine's own verdict
+    # rather than a guess at the formatted output. The string test cannot tell an
+    # accepted no-op from a composite the engine never routed -- an unsatisfiable
+    # one lands in the no-revision branch and prints nothing that looks like an
+    # error -- and it is blind to ANSI-wrapped diagnostics besides.
+    receipt = _session.last_receipt()
+    if receipt is not None:
+        if not receipt.get("accepted", False):
+            return False, f"{receipt.get('outcome')}: {output}"
+        return True, ""
     if "error" in str(output).lower() and "x1001" not in str(output).lower():
         return False, str(output)
     return True, ""
@@ -947,6 +966,65 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         session=None,
         proposal=None,
     ) -> TauExecutionResult:
+        """Apply transactions; in proposal mode, behind the isolation guard.
+
+        The guard is installed HERE rather than by the caller on purpose. Whether
+        a speculative block can reach committed state is not something a call
+        site should be able to forget: the leak this prevents is the convenience
+        fallback, and every one of those was written by someone who believed the
+        path was unreachable. A violation aborts the proposal as an integration
+        failure -- it is never a verdict about the transaction that happened to
+        be executing.
+        """
+        kwargs = dict(
+            snapshot=snapshot,
+            transactions=transactions,
+            block_timestamp=block_timestamp,
+            target_balances=target_balances,
+            target_sequences=target_sequences,
+            target_lifecycle=target_lifecycle,
+            replay_mode=replay_mode,
+            proposer_pubkey=proposer_pubkey,
+            block_height=block_height,
+            parent_balances=parent_balances,
+            parent_last_transfer_ts=parent_last_transfer_ts,
+            target_last_transfer_ts=target_last_transfer_ts,
+            session=session,
+            proposal=proposal,
+        )
+        if proposal is None:
+            return self._apply(**kwargs)
+        with tau_guard.ProposalIsolationGuard(
+            strict=True, label=getattr(proposal, "label", "proposal")
+        ):
+            try:
+                return self._apply(**kwargs)
+            except tau_guard.GlobalStateLeak as leak:
+                # The proposal was evaluated against state it does not own, so
+                # nothing it produced can be trusted -- including the parts that
+                # looked fine. Poisoning it makes that non-negotiable rather than
+                # leaving a caller free to keep going with a plausible-looking
+                # result.
+                proposal.poison(f"isolation breach: {leak}")
+                raise
+
+    def _apply(
+        self,
+        snapshot: TauStateSnapshot,
+        transactions: Sequence[Dict[str, Any]],
+        block_timestamp: int | None = None,
+        target_balances: Optional[Dict[str, int]] = None,
+        target_sequences: Optional[Dict[str, int]] = None,
+        target_lifecycle: Optional[Any] = None,
+        replay_mode: bool = False,
+        proposer_pubkey: Optional[str] = None,
+        block_height: Optional[int] = None,
+        parent_balances: Optional[Dict[str, int]] = None,
+        parent_last_transfer_ts: Optional[Dict[str, int]] = None,
+        target_last_transfer_ts: Optional[Dict[str, int]] = None,
+        session=None,
+        proposal=None,
+    ) -> TauExecutionResult:
         """
         Apply transactions to the current state.
 
@@ -986,7 +1064,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if session is None:
                 session = proposal.session
 
-        lifecycle_mgr = target_lifecycle if target_lifecycle is not None else chain_state._lifecycle_manager
+        _block_lifecycle = (
+            target_lifecycle if target_lifecycle is not None
+            else chain_state._lifecycle_manager
+        )
+        if proposal is not None:
+            # The proposal owns it from here. Identity is kept deliberately: the
+            # block builder holds this same object and hashes it after apply
+            # returns, so the proposal adopts a transaction's clone INTO it
+            # rather than swapping in a different manager.
+            proposal.lifecycle = _block_lifecycle
+        lifecycle_mgr = _block_lifecycle
         # The evaluator this apply drives. The default binds to THIS module's
         # `tau_manager` reference rather than importing its own, so a caller that
         # substitutes the manager -- which is how much of the suite drives apply --
@@ -1158,11 +1246,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # state delta resolve together; a rejection that already stepped the
             # evaluator rebuilds the proposal worker from the accepted prefix.
             _branch = None
+            lifecycle_mgr = _block_lifecycle
             if proposal is not None:
                 _branch = proposal.transaction(
                     str(tx.get("tx_id") or tx.get("tx_hash") or f"tx{i}")
                 )
                 _session = proposal.session
+                # Lifecycle state is branched like everything else. The routed
+                # o5 path resolves the sender's open approval requests and
+                # replaces their registered clause BEFORE the composite is even
+                # evaluated, and the offer path does the same on accept -- both
+                # mutate in place, with no inverse worth trusting. So the
+                # transaction mutates a clone, derives its composite from THAT
+                # clone, and the proposal adopts it only on acceptance.
+                lifecycle_mgr = _branch.lifecycle
             tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
             operations = tx.get('operations', {})
             sender = tx.get('sender_pubkey')
@@ -1369,7 +1466,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     # verdict.
                     composite = "always ( %s )." % NEUTRAL_O5_CLAUSE_BODY
 
-                ok_apply, detail = _apply_composite_rule(composite, tx_receipt)
+                ok_apply, detail = _apply_composite_rule(
+                    composite, tx_receipt, session=_session
+                )
                 if not ok_apply:
                     accepted_in_block = False
                     hard_reject = True
@@ -1751,7 +1850,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         )
                                 composite = offers.composite_for_stream(target_stream)
                                 ok_apply, detail = _apply_composite_rule(
-                                    composite, tx_receipt
+                                    composite, tx_receipt, session=_session
                                 )
                                 if not ok_apply:
                                     accepted_in_block = False

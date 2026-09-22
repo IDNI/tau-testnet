@@ -98,7 +98,8 @@ class EvaluatorSession:
     def ready(self, timeout: float = 5.0) -> bool:
         raise NotImplementedError
 
-    def apply_rule(self, rule_text: str, *, target: int = 0):
+    def apply_rule(self, rule_text: str, *, target: int = 0,
+                   accumulate: bool = True):
         raise NotImplementedError
 
     def evaluate(self, inputs: dict, *, target=None, source: str = "unknown"):
@@ -141,11 +142,20 @@ class InProcessSession(EvaluatorSession):
 
     # --- dispatch -------------------------------------------------------------
 
-    def apply_rule(self, rule_text: str, *, target: int = 0, record: bool = True):
+    def apply_rule(self, rule_text: str, *, target: int = 0, record: bool = True,
+                   accumulate: bool = True):
+        """`accumulate=False` feeds the interpreter without the rules handler.
+
+        That is how a regenerated o5 composite is applied: it changes the
+        evaluator but is not part of the application-rules accumulation, because
+        the clause registry is what the restore plan rebuilds it from. It still
+        goes in the journal -- an unrecorded revision that changed the evaluator
+        is precisely what makes a replay diverge.
+        """
         output = self._manager.communicate_with_tau(
             rule_text=rule_text,
             target_output_stream_index=target,
-            apply_rules_update=True,
+            apply_rules_update=accumulate,
         )
         receipt = self._manager.get_last_revision_receipt()
         outcome = (receipt or {}).get("outcome")
@@ -156,6 +166,7 @@ class InProcessSession(EvaluatorSession):
             self._journal.record(
                 tau_journal.REVISION, phase=self._phase, rule_text=rule_text,
                 target=target, outcome=outcome, result=output,
+                accumulate=accumulate,
             )
         else:
             tau_journal.trace().record(self._phase,
@@ -290,7 +301,8 @@ class WorkerSession(EvaluatorSession):
             # against the wrong one replays every recorded revision as an input
             # step -- a reconstruction that silently applies no rules at all
             if payload["kind"] == tau_journal.REVISION:
-                session.apply_rule(payload["rule_text"], record=False)
+                session.apply_rule(payload["rule_text"], record=False,
+                                   accumulate=payload.get("accumulate", True))
                 observed = (session.last_outcome or {}).get("outputs")
                 outcome = (session.last_outcome or {}).get("outcome")
             else:
@@ -364,7 +376,11 @@ class WorkerSession(EvaluatorSession):
         import tau_shrink
         return tau_shrink.speculative_allocation(allocator=self.allocation)
 
-    def apply_rule(self, rule_text, *, target=0, record=True):
+    def apply_rule(self, rule_text, *, target=0, record=True, accumulate=True):
+        # `accumulate` has no worker-side meaning: a worker owns no rules
+        # handler and persists nothing, so every revision it takes is already
+        # evaluator-only. Accepted for interface parity and recorded, so the
+        # journal says how the authoritative path would have fed it.
         # The rule is PREPARED here, under this session's own overlay. Feeding
         # canonical rule text to a worker whose inputs are runtime-encoded mixes
         # representations: a granted sender's full-width literal never matches its
@@ -394,7 +410,7 @@ class WorkerSession(EvaluatorSession):
             self.journal.record(tau_journal.REVISION,
                                 phase=tau_journal.PHASE_SPECULATIVE,
                                 rule_text=rule_text, target=target, outcome=outcome,
-                                identity=identity)
+                                identity=identity, accumulate=accumulate)
         return "ok" if accepted else f"error: {outcome}"
 
     def evaluate(self, inputs, *, target=None, source="unknown", multi=False,
