@@ -142,6 +142,30 @@ def fingerprint(payload) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
+def journal_from_rows(rows, *, authoritative=True) -> "Journal":
+    """Rebuild a Journal from committed storage rows.
+
+    The committed journal IS the definition of the node's evaluator state, so
+    recovery reads it back and replays it. Reconstructed entries keep their
+    stored links rather than recomputing them: a row whose link does not match
+    its content is corruption to be DETECTED, and recomputing would quietly
+    repair it into something that verifies.
+    """
+    journal = Journal(authoritative=authoritative)
+    for row in rows:
+        entry = JournalEntry(
+            seq=int(row["seq"]), kind=row["kind"], phase=row["phase"],
+            rule_text=row.get("rule_text"), inputs=dict(row.get("inputs") or {}),
+            target=row.get("target"), accumulate=bool(row.get("accumulate", True)),
+            outcome=row.get("outcome"),
+            result_fingerprint=row.get("result_fingerprint"),
+            identity=row.get("identity"), prev=row.get("prev"), link=row["link"],
+        )
+        journal._entries.append(entry)
+        journal._seq = entry.seq
+    return journal
+
+
 def verify_entries(entries, *, start_prev=None, start_seq=0) -> None:
     """Verify a hash-chained run of entries, detached from any Journal.
 
