@@ -650,6 +650,41 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         *,
         session=None,
         replay_mode: bool = False,
+        proposal=None,
+    ) -> ApplyBlockResult:
+        """Execute a full block; in proposal mode, behind the isolation guard.
+
+        Governance activation is BLOCK-level, not a transaction child: the
+        height transition happens once, after the transaction loop, and belongs
+        to the block rather than to whichever transaction ran last. In proposal
+        mode it therefore runs against the proposal's own lifecycle and session,
+        and the revisions it generates are proposal-journal events. Nothing
+        reaches committed state here either -- that is Step 5's boundary.
+        """
+        kwargs = dict(
+            active_view=active_view, block=block, parent_snapshot=parent_snapshot,
+            session=session, replay_mode=replay_mode, proposal=proposal,
+        )
+        if proposal is None:
+            return self._apply_block(**kwargs)
+        with tau_guard.ProposalIsolationGuard(
+            strict=True, label=getattr(proposal, "label", "proposal")
+        ):
+            try:
+                return self._apply_block(**kwargs)
+            except tau_guard.GlobalStateLeak as leak:
+                proposal.poison(f"isolation breach: {leak}")
+                raise
+
+    def _apply_block(
+        self,
+        active_view: ActiveConsensusView,
+        block: Any,
+        parent_snapshot: TauStateSnapshot,
+        *,
+        session=None,
+        replay_mode: bool = False,
+        proposal=None,
     ) -> ApplyBlockResult:
         """
         Executes a full block over the consensus boundaries.
@@ -679,6 +714,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # Fallback if somehow not provided (tests, legacy)
             from consensus.governance import ConsensusLifecycleManager
             lm = ConsensusLifecycleManager(active_validators=[bytes.fromhex(v) for v in self._validators])
+        if proposal is not None:
+            # The block's lifecycle IS the proposal's from here: transactions
+            # adopt their clones into this object, and the activation below
+            # mutates it directly because it is block-level, not per-transaction.
+            proposal.lifecycle = lm
         
         # 2. Pure Transaction Simulation (Internal Layer)
         # We pass target_balances and target_sequences to self.apply which mutates them internally.
@@ -701,6 +741,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             parent_last_transfer_ts=metadata.get('last_transfer_ts'),
             session=session,
             target_last_transfer_ts=t_lts,
+            proposal=proposal,
         )
 
         # Conservation invariant: the native fee model debits the sender and
@@ -796,12 +837,27 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     if not isinstance(rev, str) or not rev.strip():
                         continue
                     try:
-                        output = tau_manager.communicate_with_tau(
-                            rule_text=rev,
-                            target_output_stream_index=0,
-                            source=tag,
-                            apply_rules_update=False,
-                        )
+                        if proposal is not None:
+                            # A proposal's activation runs on the proposal's own
+                            # evaluator and is recorded in its journal, so a
+                            # block that is later abandoned leaves no activated
+                            # consensus rule behind in the node's interpreter.
+                            output = proposal.session.apply_rule(
+                                rev, target=0, accumulate=False,
+                            )
+                            receipt = proposal.session.last_receipt()
+                            if receipt is not None and not receipt.get("accepted", False):
+                                raise FeeRuleError(
+                                    "Governance rule activation revision rejected "
+                                    f"by the proposal evaluator: {receipt.get('outcome')}"
+                                )
+                        else:
+                            output = tau_manager.communicate_with_tau(
+                                rule_text=rev,
+                                target_output_stream_index=0,
+                                source=tag,
+                                apply_rules_update=False,
+                            )
                         if output and "error" in output.lower() and "x1001" not in output.lower():
                             raise FeeRuleError(
                                 f"Governance rule activation revision rejected by live Tau interpreter: {output}"

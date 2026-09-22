@@ -135,11 +135,18 @@ def test_every_evaluator_call_site_is_classified():
     the stateful evaluator is classified here, and anything that is not committed
     execution must not reach the authoritative session.
 
-    authoritative : _apply_composite_rule, apply_block governance activation,
-                    replay_tau_restore_plan, tick_governance
+    authoritative : _apply_block governance activation, replay_tau_restore_plan,
+                    tick_governance
     advisory      : query_eligibility            -> isolated
     validation    : verify_block_header          -> isolated
     speculative   : the miner simulation         -> disposable worker
+                    _apply_block in proposal mode -> the proposal's session
+
+    `_apply_composite_rule` is deliberately NOT here any more: it takes the
+    session explicitly, so its authoritative behaviour comes from the session it
+    is given rather than from a hard-wired manager reference. `_apply_block`
+    stays, because the governance activation still drives the manager directly
+    when no proposal owns the block -- which is the committed path.
     """
     import re
 
@@ -165,7 +172,7 @@ def test_every_evaluator_call_site_is_classified():
         if "tau_manager.communicate_with_tau" in line and not line.strip().startswith("#"):
             direct.add(owner_of(i))
 
-    authoritative = {"_apply_composite_rule", "apply_block"}
+    authoritative = {"_apply_block"}
     isolated_with_fallback = {"query_eligibility", "verify_block_header"}
     assert direct <= authoritative | isolated_with_fallback, (
         f"unclassified evaluator call sites: {direct - authoritative - isolated_with_fallback}"

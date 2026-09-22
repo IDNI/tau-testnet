@@ -209,6 +209,13 @@ class ProposalContext:
         self.descriptor = descriptor
         self.label = label
         self.state: dict = {}
+        # Point the session at THIS proposal's journal and allocation overlay.
+        # Without it a session created by `begin_proposal` keeps the private
+        # journal that call gave it, and anything recorded outside a transaction
+        # branch -- block-level governance activation, most importantly -- lands
+        # in a journal nobody reads. A reconstruction from `self.journal` would
+        # then come back missing the activated consensus rule.
+        self._bind_session()
         # The proposal's lifecycle manager: clause registry, approval book, offer
         # book, governance queues. Owned like every other proposal state -- a
         # transaction mutates a clone and the proposal adopts it on acceptance.
@@ -217,6 +224,14 @@ class ProposalContext:
         self._dirty = False
         self._poisoned = None
         self._retries = 0
+
+    def _bind_session(self) -> None:
+        if self.session is None:
+            return
+        if hasattr(self.session, "journal"):
+            self.session.journal = self.journal
+        if hasattr(self.session, "allocation"):
+            self.session.allocation = self.allocator
 
     # --- health ---------------------------------------------------------------
 
@@ -276,6 +291,10 @@ class ProposalContext:
         except Exception as exc:
             self.poison(f"reconstruction failed: {exc}")
             raise
+        # The replacement session is a different object, so it needs the same
+        # binding the original got. Missing it is silent: everything works until
+        # the NEXT reconstruction, which replays a journal with a hole in it.
+        self._bind_session()
         self._dirty = False
 
     def replan(self, required_plain) -> None:
