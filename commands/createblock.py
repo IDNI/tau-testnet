@@ -268,12 +268,28 @@ def _program_baseline():
     return text if text.lstrip().startswith("always") else f"always ( {text} )."
 
 
-def _speculative_session():
-    """A disposable evaluator for the miner simulation, or None to stay in-process.
+def _speculative_proposal(candidate_rules=()):
+    """A proposal owning a disposable evaluator, or None to stay in-process.
 
     None whenever there is nothing to isolate from -- mock mode, no native
     interface -- or when a worker cannot be built. Falling back is safe: it is
     exactly today's behaviour, including its save/restore.
+
+    What the proposal adds over a bare worker is ownership of the CANONICAL
+    deltas, not just of the interpreter. Today's simulation writes
+    `chain_state._application_rules_state` and the db `full_tau_spec` row for
+    every rule-bearing transaction and undoes it in a `finally` afterwards. That
+    works until it does not: a crash, or any raise that escapes the block,
+    between simulating and restoring leaves the node's canonical rules state
+    carrying rules from a block that was never mined. In proposal mode those
+    writes never happen -- the rules state is staged in the proposal and thrown
+    away with it -- so there is nothing to restore and nothing to lose.
+
+    NOTE for whoever reads this next: a proposal here makes speculative block
+    construction load-bearing, but this worker is NOT the authoritative
+    committed evaluator. It is discarded, and `process_new_block` re-applies the
+    block on the authoritative path. Promotion -- the worker that evaluated the
+    block becoming the one that serves it -- is Step 5, after durable commit.
     """
     try:
         import tau_manager
@@ -312,19 +328,64 @@ def _speculative_session():
     if not baseline:
         return None
     trace = [{"kind": tau_session.RULE, "rule_text": unit} for unit in units]
-    # The baseline is the RUNTIME spec, so the worker needs runtime-encoded
-    # inputs: the same encoder the authoritative path uses, against the same
-    # node-local intern table.
-    shrunk = tau_manager.get_runtime_shrunk_streams()
 
-    def normalize(inputs):
-        return tau_manager._normalize_inputs(inputs, shrunk) or inputs
+    # ONE representation for the replayed history and the candidates together.
+    # Deciding from history alone and meeting a candidate afterwards is how the
+    # pin conflict this design exists to avoid gets reproduced -- and the plan
+    # also replaces the DB-backed input encoder, so the session is canonical in
+    # and runtime out under a representation it chose itself.
+    import tau_allocator
+    import tau_journal
+    import tau_proposal
+    import tau_reconstruction
+    try:
+        plan = tau_reconstruction.plan_representation(
+            history_rules=units, candidate_rules=list(candidate_rules),
+        )
+    except Exception as exc:
+        logger.warning("createblock: could not plan a representation (%s); "
+                       "simulating in-process", exc)
+        return None
+
+    snapshot = tau_allocator.DbMappingSnapshot()
+
+    def _spawn(replay_trace, current_plan):
+        session = tau_session.WorkerSession.spawn(
+            baseline, trace=replay_trace, plan=current_plan,
+            allocation=tau_allocator.Allocator(snapshot, width=current_plan.width,
+                                               label="proposal"),
+        )
+        return session
+
+    def rebuild(proposal_journal, current_plan):
+        """Re-run the accepted prefix after a rejection stepped the evaluator.
+
+        The committed history is replayed first, then the block-local prefix the
+        proposal journal holds -- which by construction never contained the
+        rejected transaction.
+        """
+        session = _spawn(trace, current_plan)
+        for entry in proposal_journal.entries():
+            if entry.kind == tau_journal.REVISION:
+                session.apply_rule(entry.rule_text, record=False,
+                                   accumulate=entry.accumulate)
+            else:
+                session.evaluate(entry.inputs, multi=True, record=False)
+        return session
 
     try:
-        return tau_session.WorkerSession.spawn(baseline, trace=trace, normalize=normalize)
+        session = _spawn(trace, plan)
     except Exception as exc:
         logger.warning("createblock: no simulation worker (%s); simulating in-process", exc)
         return None
+
+    return tau_proposal.ProposalContext(
+        session=session,
+        journal=tau_journal.Journal(authoritative=False),
+        allocator=tau_allocator.Allocator(snapshot, width=plan.width,
+                                          label="proposal"),
+        plan=plan, rebuild=rebuild, label="miner",
+    )
 
 
 def create_block_from_mempool(allow_empty: bool = False) -> Dict:
@@ -621,48 +682,60 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
         # after -- the block is chosen under one state and applied under another.
         # A worker cannot contaminate anything, and disposal is the only rollback
         # the engine offers.
-        sim_session = _speculative_session()
         # Isolating the interpreter is not enough on its own: the encoder the
         # worker shares with the authoritative path is DB-backed, and
-        # `db.get_shrink_id` inserts and commits. Measured: a rejected proposal
-        # that mentioned one never-before-seen address moved the committed max
-        # shrink id from 0 to 1 -- permanently burning capacity and the mapping
-        # epoch for a block that never existed. A private allocator mints in
-        # memory and publishes nothing.
+        # `db.get_shrink_id` inserts and commits. The session installs its own
+        # allocation overlay around every dispatch for that reason -- verified:
+        # encoding a never-before-seen address through the worker puts id 1 in
+        # the private overlay and leaves the committed max id and mapping epoch
+        # untouched. The proposal extends the same ownership to the canonical
+        # deltas, which is what makes the save/restore below unnecessary.
+        candidate_rules = [
+            (tx.get("operations") or {}).get("0")
+            for tx in execution_transactions
+            if isinstance((tx.get("operations") or {}).get("0"), str)
+        ]
+        sim_proposal = _speculative_proposal(candidate_rules=candidate_rules)
+        sim_session = sim_proposal.session if sim_proposal is not None else None
         try:
             # Call the unified path
             apply_result = engine.apply_block(
-                active_view, candidate_block, parent_snapshot, session=sim_session
+                active_view, candidate_block, parent_snapshot,
+                session=sim_session, proposal=sim_proposal,
             )
         finally:
-            if sim_session is not None:
+            if sim_proposal is not None:
                 try:
-                    sim_session.dispose()
+                    sim_proposal.dispose()
                 except Exception:
                     logger.warning("createblock: failed to dispose the simulation worker")
             # Restore the interpreter + cached rules state so `process_new_block`
             # below re-applies the block from the same baseline the miner saw.
-            # Only meaningful when the simulation ran IN-PROCESS; a worker leaves
-            # nothing to restore.
-            try:
-                if sim_session is None and saved_full_spec is not None:
-                    tau_manager.restore_full_tau_spec(
-                        saved_full_spec, runtime_shrunk_streams=saved_shrunk_streams
-                    )
-            except Exception as restore_err:
-                logger.warning(
-                    "createblock: failed to restore Tau spec after miner simulation: %s",
-                    restore_err,
-                )
-            chain_state.save_application_rules_state(saved_app_rules)
-            if saved_db_full_spec is not None:
+            # Only meaningful when the simulation ran IN-PROCESS: a proposal wrote
+            # none of this, so there is nothing to put back -- and the restore
+            # itself was never reliable, since `restore_full_tau_spec` was
+            # measured to come back with time_point reset and a different
+            # interpreter object.
+            if sim_proposal is None:
                 try:
-                    db.set_chain_state_value("full_tau_spec", saved_db_full_spec)
-                except Exception:
+                    if saved_full_spec is not None:
+                        tau_manager.restore_full_tau_spec(
+                            saved_full_spec, runtime_shrunk_streams=saved_shrunk_streams
+                        )
+                except Exception as restore_err:
                     logger.warning(
-                        "createblock: failed to restore db full_tau_spec after miner simulation",
-                        exc_info=True,
+                        "createblock: failed to restore Tau spec after miner simulation: %s",
+                        restore_err,
                     )
+                chain_state.save_application_rules_state(saved_app_rules)
+                if saved_db_full_spec is not None:
+                    try:
+                        db.set_chain_state_value("full_tau_spec", saved_db_full_spec)
+                    except Exception:
+                        logger.warning(
+                            "createblock: failed to restore db full_tau_spec after miner simulation",
+                            exc_info=True,
+                        )
         
         # Extract accepted/skipped outcomes
         final_txs = []

@@ -36,7 +36,7 @@ import config
 config.set_database_path(os.environ["PROBE_DB"])
 import db; db.init_db()
 import tau_native, tau_manager, chain_state
-from commands.createblock import _speculative_session
+from commands.createblock import _speculative_proposal
 
 boot = tempfile.NamedTemporaryFile("w", suffix=".tau", delete=False)
 boot.write(open(os.path.join(os.environ["REPO_ROOT"], "genesis.tau")).read()); boot.close()
@@ -60,11 +60,12 @@ for unit in (PIN20, REPLACE):
     tau_manager.communicate_with_tau(rule_text=unit, target_output_stream_index=0)
     chain_state.save_effective_tau_spec(unit)
 
-sess = _speculative_session()
+prop = _speculative_proposal(candidate_rules=[WIDE20])
+sess = prop.session
 kind = type(sess).__name__
 seeded = len(sess.log)
 worker_verdict = sess.apply_rule(WIDE20)
-sess.dispose()
+prop.dispose()
 print("EQUIV_RESULT", kind, seeded, worker_verdict.replace(" ", "_"))
 sys.stdout.flush()
 os._exit(0)

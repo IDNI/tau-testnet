@@ -134,7 +134,7 @@ import config
 config.set_database_path(os.environ["PROBE_DB"])
 import db; db.init_db()
 import tau_native, tau_manager
-from commands.createblock import _speculative_session
+from commands.createblock import _speculative_proposal
 
 boot = tempfile.NamedTemporaryFile("w", suffix=".tau", delete=False)
 boot.write(open(os.path.join(os.environ["REPO_ROOT"], "genesis.tau")).read()); boot.close()
@@ -147,11 +147,12 @@ tau_manager.communicate_with_tau(
     target_output_stream_index=0)
 
 before = iface.interpreter.time_point
-sess = _speculative_session()
+prop = _speculative_proposal()
+sess = prop.session if prop is not None else None
 kind = type(sess).__name__ if sess is not None else "None"
 sess.apply_rule("always ( o5[t]:bv[24] = { #x000000 }:bv[24] ).")
 sess.evaluate({1: "{ #x000007 }:bv[24]"}, multi=True)
-sess.dispose()
+prop.dispose()
 after = iface.interpreter.time_point
 o5 = tau_manager.parse_tau_output(str(tau_manager.communicate_with_tau(
     input_stream_values={1: "#x000001"}, target_output_stream_index=5)))
