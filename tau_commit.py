@@ -467,3 +467,229 @@ class BlockCommitCoordinator:
             self._result["state"] = ACTIVE
             self._result.pop("unavailable_reason", None)
         return {"state": ACTIVE, "recovered_from": "committed canonical state"}
+
+
+class EvaluatorOwner:
+    """Holds the ONE authoritative evaluator, and can take it out of service.
+
+    Separate from the coordinator because the dangerous interval belongs to it:
+    once persistence succeeds the old evaluator is obsolete, and it must stop
+    being usable BEFORE promotion is attempted -- not after promotion fails.
+    Otherwise a failed promotion leaves the node happily serving a worker that
+    describes the state before the block that is now committed.
+    """
+
+    def __init__(self, session=None, *, ready=None, state=None):
+        self.session = session
+        self._ready = ready
+        self._state = state
+        self.generation = 0
+        self.gated_reason = None
+
+    # --- service ---------------------------------------------------------------
+
+    @property
+    def serving(self) -> bool:
+        return self.session is not None and self.gated_reason is None
+
+    def gate_off(self, reason: str) -> None:
+        """Take the evaluator out of service. Idempotent.
+
+        Readiness goes down first, then the generation advances so any result
+        prepared against the old one is refused rather than published.
+        """
+        self.gated_reason = reason
+        if self._ready is not None:
+            try:
+                self._ready.clear()
+            except Exception:
+                logger.error("could not clear the readiness flag", exc_info=True)
+        if self._state is not None:
+            try:
+                self.generation = self._state.new_generation(reason)
+            except Exception:
+                self.generation += 1
+        else:
+            self.generation += 1
+        logger.warning("authoritative evaluator out of service: %s", reason)
+
+    def serve(self, session) -> None:
+        """Publish an evaluator as authoritative and readiness with it."""
+        self.session = session
+        self.gated_reason = None
+        if self._ready is not None:
+            try:
+                self._ready.set()
+            except Exception:
+                logger.error("could not set the readiness flag", exc_info=True)
+
+    # --- promotion -------------------------------------------------------------
+
+    def promote(self, proposal, prepared) -> None:
+        """Transfer ownership of the EXACT worker that computed the state.
+
+        Not "commit, then build another worker, then replay the journal into it":
+        that throws away the reason all of this exists and adds one more chance
+        to diverge. The worker that evaluated the block serves it.
+
+        The proposal releases the session first, so the `finally` that disposes
+        the proposal -- which knows nothing about whether the block committed --
+        cannot kill the evaluator the node is now serving.
+        """
+        worker = proposal.release() if proposal is not None else prepared.worker
+        if worker is None:
+            raise CommitStateError(
+                "the proposal has already released its evaluator; promotion is "
+                "one-shot"
+            )
+        if prepared.worker is not None and worker is not prepared.worker:
+            raise PreparedCommitMismatch(
+                "the proposal released a different evaluator than the one this "
+                "commit was prepared from"
+            )
+        old = self.session
+        self.serve(worker)
+        if old is not None and old is not worker:
+            try:
+                old.dispose()
+            except Exception:
+                logger.warning("could not dispose the superseded evaluator",
+                               exc_info=True)
+
+
+class PreparedCommitCoordinator:
+    """Commits exactly one PreparedBlockCommit, then promotes its worker.
+
+        PREPARED -> DURABLY_COMMITTED -> ACTIVE
+                          \\-> COMMITTED_BUT_UNAVAILABLE
+
+    Before the durable point everything is disposable. After it nothing is
+    reversible: the worker that computed the committed state either becomes
+    authoritative, or the node is unavailable until that committed state is
+    reconstructed. It is never "rejected" and never "abandoned", and the old
+    evaluator is never an answer.
+    """
+
+    def __init__(self, owner, *, store=None, reconstruct=None):
+        import db as _db
+
+        self.owner = owner
+        self._store = store or _db
+        self._reconstruct = reconstruct
+        self.state = PREPARED
+        self._result = None
+
+    # --- commit ---------------------------------------------------------------
+
+    def commit(self, prepared, *, proposal=None, tip, execution_id=None):
+        if self.state in _TERMINAL and self._result is not None:
+            logger.info("commit %s already completed; returning the first result",
+                        prepared.execution_id)
+            return dict(self._result)
+
+        # The gate. Every anchor together, immediately before the irreversible
+        # step -- a partial check is how a proposal that agrees about its parent
+        # and disagrees about its mapping gets published.
+        prepared.verify(proposal=proposal,
+                        execution_id=execution_id or prepared.execution_id,
+                        store=self._store)
+
+        canonical = prepared.canonical.get("__snapshot_rows__")
+        outcome = self._store.commit_prepared_block(
+            execution_id=prepared.execution_id,
+            tip=tip,
+            parent=prepared.parent_tip_id,
+            journal_entries=[_entry_row(e) for e in prepared.journal_delta],
+            expected_journal_seq=_journal_sequence(self._store),
+            allocation_delta=prepared.allocation,
+            expected_epoch=prepared.allocator_base_digest,
+            journal_head=prepared.journal_final_head,
+            allocator_digest=prepared.allocator_final_digest,
+            plan_id=prepared.representation_plan_id,
+            spec_revision=prepared.proposal_spec_revision,
+            time_point=prepared.proposal_time_point,
+            canonical=canonical,
+        )
+
+        if not outcome.get("committed"):
+            # Already durable. Report what happened the first time rather than
+            # applying fees or lifecycle changes a second time.
+            self.state = DURABLY_COMMITTED
+            self._result = {"state": DURABLY_COMMITTED, "tip": outcome["already"]["tip"],
+                            "execution_id": prepared.execution_id, "retried": True}
+            return dict(self._result)
+
+        # Past this line the block exists. Nothing below may report it otherwise.
+        self.state = DURABLY_COMMITTED
+        self._result = {"state": DURABLY_COMMITTED, "tip": tip,
+                        "execution_id": prepared.execution_id, "retried": False}
+
+        # The old evaluator is obsolete the instant persistence succeeds. It goes
+        # out of service HERE, before promotion can fail -- otherwise a failed
+        # promotion leaves the node serving a worker that describes the state
+        # before the block that is now committed.
+        self.owner.gate_off(f"superseded by committed block {tip}")
+
+        try:
+            self.owner.promote(proposal, prepared)
+            self.state = ACTIVE
+            self._result["state"] = ACTIVE
+        except Exception as exc:
+            self.state = COMMITTED_BUT_UNAVAILABLE
+            self._result["state"] = COMMITTED_BUT_UNAVAILABLE
+            self._result["unavailable_reason"] = repr(exc)
+            logger.error(
+                "block %s is durably committed but its evaluator could not be "
+                "promoted: %s", tip, exc,
+            )
+        return dict(self._result)
+
+    # --- recovery -------------------------------------------------------------
+
+    @property
+    def committed(self) -> bool:
+        return self.state in (DURABLY_COMMITTED, ACTIVE, COMMITTED_BUT_UNAVAILABLE)
+
+    @property
+    def ready(self) -> bool:
+        """Serving, which is not the same as having committed."""
+        return self.state == ACTIVE and self.owner.serving
+
+    def recover(self) -> dict:
+        """Rebuild from the COMMITTED anchors, never from the old worker.
+
+        The block stays committed throughout. Falling back to the evaluator that
+        was authoritative before it would be serving a state the chain no longer
+        has.
+        """
+        if not self.committed:
+            raise CommitStateError(f"nothing to recover from in {self.state}")
+        if self._reconstruct is None:
+            raise CommitStateError("no reconstruction available")
+        session = self._reconstruct(self._store)
+        self.owner.serve(session)
+        self.state = ACTIVE
+        if self._result is not None:
+            self._result["state"] = ACTIVE
+            self._result.pop("unavailable_reason", None)
+        return {"state": ACTIVE, "recovered_from": "committed anchors"}
+
+
+def _entry_row(entry) -> dict:
+    return {
+        "kind": entry.kind, "phase": entry.phase, "rule_text": entry.rule_text,
+        "inputs": dict(entry.inputs), "target": entry.target,
+        "accumulate": entry.accumulate, "outcome": entry.outcome,
+        "result_fingerprint": entry.result_fingerprint,
+        "identity": entry.identity, "prev": entry.prev, "link": entry.link,
+    }
+
+
+def _journal_sequence(store) -> int:
+    head = getattr(store, "committed_journal_head", None)
+    if head is None:
+        return 0
+    try:
+        return int(head()[1])
+    except Exception:
+        return 0

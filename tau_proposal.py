@@ -366,6 +366,18 @@ class ProposalContext:
             "poisoned": self._poisoned,
         }
 
+    def release(self):
+        """Give up ownership of the evaluator, returning it.
+
+        Promotion is an ownership TRANSFER, not a copy: the exact worker that
+        computed the committed state becomes authoritative. After that this
+        proposal must not be able to kill it -- and `dispose()` is called on
+        proposals routinely, in `finally` blocks that know nothing about whether
+        the block committed. One-shot: a second release answers None.
+        """
+        session, self.session = self.session, None
+        return session
+
     def dispose(self) -> None:
         if self.session is not None:
             try:
