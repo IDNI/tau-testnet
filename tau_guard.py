@@ -58,6 +58,8 @@ FORBIDDEN_WRITES = (
     ("chain_state", "save_effective_tau_spec", "canonical application rules"),
     ("chain_state", "save_application_rules_state", "canonical application rules"),
     ("chain_state", "commit_state_to_db", "canonical state"),
+    ("chain_state", "save_consensus_rules_state", "canonical consensus rules"),
+    ("chain_state", "increment_sequence_number", "canonical sequence numbers"),
     ("db", "get_shrink_id", "committed allocator (inserts and commits)"),
     ("db", "publish_shrink_ids", "committed allocator publication"),
     ("db", "add_block", "committed chain"),
@@ -65,10 +67,22 @@ FORBIDDEN_WRITES = (
 )
 
 #: Reads of MUTABLE canonical state. A proposal owns its own copy of each.
+#:
+#: As aggressive as the write list on purpose. A proposal that writes only to
+#: private state but reads a live balance instead of its captured parent's is
+#: not corrupting anything -- it is evaluating a block against a state that
+#: never existed, which is worse, because it looks fine. `get_tau_restore_plan`
+#: is deliberately absent: it is read to BUILD a proposal, before the proposal
+#: is running.
 FORBIDDEN_READS = (
     ("chain_state", "get_application_rules_state", "application rules"),
+    ("chain_state", "get_consensus_rules_state", "consensus rules"),
+    ("chain_state", "get_balance", "balances"),
     ("chain_state", "get_committed_balance", "balances"),
+    ("chain_state", "get_sequence_number", "sequence numbers"),
     ("chain_state", "get_rules_state", "rules state"),
+    ("chain_state", "get_persisted_full_tau_spec", "the committed spec"),
+    ("tau_manager", "get_canonical_spec", "the authoritative spec"),
 )
 
 #: The authoritative evaluator. A proposal drives its own worker.
