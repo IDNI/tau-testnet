@@ -266,3 +266,31 @@ def test_a_received_extension_is_committed_not_rebuilt(authority):
     assert len(after) > len(journal_before)
     assert authority.state == auth.ACTIVE and served_before == auth.UNAVAILABLE, (
         authority.state, served_before)
+
+
+def test_a_rule_block_extends_the_application_rules_it_inherits(authority):
+    """A proposal's state began empty, so each block that carried a rule
+    REPLACED the hashed application-rules accumulation with that block's rules
+    alone. Every node computed the same wrong text until one restarted: the
+    restart re-extended the accumulation from disk and hashed something else,
+    and its next block no longer matched anyone's."""
+    before = chain_state.get_application_rules_state()
+    first = "always ( o12[t]:bv[24] = i1[t]:bv[24] )."
+    second = "always ( o13[t]:bv[24] = i1[t-1]:bv[24] )."
+    sk, pk = _sender("accumulate")
+    assert _submit(sk, pk, {"0": first}).get("ok")
+    assert "error" not in createblock.create_block_from_mempool()
+    assert _submit(sk, pk, {"0": second}, seq=1).get("ok")
+    assert "error" not in createblock.create_block_from_mempool()
+
+    rules = chain_state.get_application_rules_state()
+    units = [u for u in rules.split("\n") if u.strip()]
+    for unit in [u for u in before.split("\n") if u.strip()]:
+        assert unit in units, f"a block dropped an inherited unit: {unit[:60]}"
+    assert first in units and second in units, units
+    assert units.index(first) < units.index(second)
+    head = db.get_canonical_head()
+    assert rules == db.get_chain_state_value("application_rules", ""), (
+        "the persisted accumulation is not the one in memory"
+    )
+    assert head is not None

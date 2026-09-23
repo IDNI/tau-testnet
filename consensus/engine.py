@@ -1237,6 +1237,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # snapshot. In tests/mocks (no rules handler), fall back to concatenating
         # rule payloads for determinism.
         current_tau_bytes = snapshot.tau_bytes
+        if proposal is not None and "application_rules" not in proposal.state:
+            # The block's application rules START where the parent's end. A
+            # proposal's state began empty, so every block that carried a rule
+            # replaced the whole hashed accumulation with that block's own
+            # rules -- the router, the builtins and every earlier rule gone from
+            # canonical state -- and a restart, which reloads and re-extends the
+            # accumulation, then hashed a different text than a node that never
+            # restarted: two honest nodes, one block, two state hashes.
+            proposal.state["application_rules"] = (
+                (snapshot.tau_bytes or b"").decode("utf-8", errors="ignore")
+                if isinstance(snapshot.tau_bytes, (bytes, bytearray))
+                else str(snapshot.tau_bytes or "")
+            )
 
         # Fee charging requires the isolated balance overlay: there is no
         # proposer-credit primitive on the direct chain_state mutation path
@@ -2354,7 +2367,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     # here and merged only if the transaction
                                     # survives every later stage.
                                     staged = _rules_state()
-                                    unit = rule_text.strip()
+                                    # the unit exactly as the rules handler
+                                    # appends it (save_effective_tau_spec), so
+                                    # the accumulation has one canonical form
+                                    unit = (chain_state._preprocess_tau_spec_text(rule_text)
+                                            or rule_text).strip()
                                     units = [u for u in staged.split("\n") if u.strip()]
                                     if unit not in units:
                                         units.append(unit)
