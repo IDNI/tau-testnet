@@ -344,3 +344,19 @@ def test_the_session_and_the_journal_share_one_vocabulary():
     import tau_session as ts
     assert ts.RULE == tj.REVISION
     assert ts.EVAL == tj.STEP
+
+
+def test_a_step_fingerprint_covers_output_values_not_just_presence():
+    """A worker's step outputs are indexed by stream number. Named `5` rather
+    than `o5`, no step value ever reached the fingerprint: replay compared
+    WHICH streams a step produced and never WHAT, so a reconstruction computing
+    o5=1 where the original computed o5=0 verified clean."""
+    import tau_journal as tj
+    journal = tj.Journal(authoritative=False)
+    journal.record(tj.STEP, phase=tj.PHASE_SPECULATIVE, inputs={1: "5"},
+                   result={5: "0", 9: "10"})
+    (seq, expected), = journal.fingerprints()
+    tj.compare(expected, {5: "0", 9: "10"}, seq=seq)          # same meaning
+    tj.compare(expected, {"o5": "0", "o9": "10"}, seq=seq)    # same, named
+    with pytest.raises(tj.DivergenceError):
+        tj.compare(expected, {5: "1", 9: "10"}, seq=seq)

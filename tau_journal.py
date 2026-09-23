@@ -126,6 +126,12 @@ def semantic_result(outputs=None, outcome=None, progressed=None) -> dict:
     present = []
     for name, value in (outputs or {}).items():
         label = str(name)
+        # A worker's step outputs are indexed (5), a revision's are named (o5):
+        # the same stream. Left as "5", no step value ever reached a fingerprint
+        # -- replay compared WHICH streams a step produced and never WHAT, so a
+        # reconstruction computing o5=1 where the original computed o5=0 passed.
+        if label.isdigit():
+            label = f"o{label}"
         present.append(label)
         # Values are recorded for OUTPUT streams only. The router echoes the
         # accepted specification on `u`, which carries interned ids and runtime
