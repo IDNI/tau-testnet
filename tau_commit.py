@@ -58,6 +58,24 @@ class PreparedCommitMismatch(RuntimeError):
     """
 
 
+def _tx_identity(tx) -> str:
+    """A transaction's CONTENT hash -- the one the block's `tx_ids` carry.
+
+    Not its `tx_id` field: that is a synthetic label createblock adds to its
+    execution copies and deliberately keeps out of the persisted block body, so
+    both the miner (hashing the block it built) and ingestion (hashing the block
+    it received) saw no `tx_id` at all. Every transaction then contributed the
+    same `("", "user_tx")`, and two different blocks built in the same second on
+    the same parent shared one execution id -- the artifact for one was claimed
+    for the other, and only the state-hash comparison caught it.
+    """
+    import block as _block
+    if not isinstance(tx, dict):
+        return _block.sha256_hex(json.dumps(tx, sort_keys=True, default=str).encode())
+    body = {k: v for k, v in tx.items() if k != "tx_id"}
+    return _block.compute_tx_hash(body)
+
+
 def block_execution_id(*, parent, height, timestamp, proposer, transactions,
                        consensus_context=None) -> str:
     """Identify an EXACT block execution, not merely its parent.
@@ -73,10 +91,7 @@ def block_execution_id(*, parent, height, timestamp, proposer, transactions,
         "height": height,
         "timestamp": timestamp,
         "proposer": proposer,
-        "transactions": [
-            (tx.get("tx_id") or tx.get("tx_hash") or "", tx.get("tx_type") or "user_tx")
-            for tx in (transactions or [])
-        ],
+        "transactions": [_tx_identity(tx) for tx in (transactions or [])],
         "consensus": consensus_context or "",
     }
     blob = json.dumps(payload, sort_keys=True, default=str)

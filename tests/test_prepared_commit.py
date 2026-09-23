@@ -59,9 +59,14 @@ def _freeze(ctx, **kw):
 
 # --- the execution identity ---------------------------------------------------
 
+TX_A = {"sender_pubkey": "a" * 96, "sequence_number": 0, "operations": {"1": []}}
+TX_B = {"sender_pubkey": "b" * 96, "sequence_number": 0, "operations": {"1": []}}
+
+
 def _exec(**kw):
+    # Transactions as a block persists them: content, no `tx_id` label.
     base = dict(parent="p0", height=5, timestamp=1700000000, proposer="d4" * 48,
-                transactions=[{"tx_id": "A"}, {"tx_id": "B"}])
+                transactions=[TX_A, TX_B])
     base.update(kw)
     return tc.block_execution_id(**base)
 
@@ -76,9 +81,14 @@ def test_the_execution_id_covers_every_evaluator_relevant_field():
     assert _exec(timestamp=1700000001) != base
     assert _exec(proposer="ee" * 48) != base
     assert _exec(parent="p1") != base
-    assert _exec(transactions=[{"tx_id": "A"}]) != base, "a dropped transaction"
-    assert _exec(transactions=[{"tx_id": "B"}, {"tx_id": "A"}]) != base, "reordered"
+    assert _exec(transactions=[TX_A]) != base, "a dropped transaction"
+    assert _exec(transactions=[TX_B, TX_A]) != base, "reordered"
+    assert _exec(transactions=[TX_A, {**TX_B, "sequence_number": 1}]) != base, (
+        "a transaction whose content changed"
+    )
     assert _exec(consensus_context="v2") != base
+    # the label createblock adds to its execution copies is not content
+    assert _exec(transactions=[{**TX_A, "tx_id": "x"}, {**TX_B, "tx_id": "y"}]) == base
 
 
 # --- freezing -----------------------------------------------------------------
