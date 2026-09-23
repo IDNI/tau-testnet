@@ -546,10 +546,16 @@ def _revision_refusal(receipt: dict):
         return None
     outcome = receipt.get("outcome") or "NOT_ACCEPTED"
     detail = ""
+    try:
+        from tau_native import strip_ansi
+    except Exception:  # pragma: no cover - the binding's helpers are optional here
+        def strip_ansi(text):
+            return text
     for key in ("diagnostics", "deferred_diagnostics"):
         for line in str(receipt.get(key) or "").splitlines():
             if "rror" in line:
-                detail = line.strip()
+                # the engine colours its diagnostics; a client gets plain text
+                detail = strip_ansi(line).strip()
                 break
         if detail:
             break

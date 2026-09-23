@@ -600,6 +600,15 @@ def _run(root, keys, chain, nodes, args):
                  if new_addr in k]
     check(6, "the allocator published the new address exactly once", len(bound) == 1, bound)
     check(7, "no crash artifact for the deterministic rejection", a.crash_dumps() == dumps_a0)
+    # A RULE the engine refuses outright: i1 is typed bv[24] by the builtin
+    # rules, this one types it bv[16]. It is refused where apply would refuse
+    # it -- in an evaluator carrying the committed type history -- and nothing
+    # on the node treats that as a crash.
+    clash = chain.send(a, "erin", {"0": "always ( o13[t]:bv[16] = i1[t]:bv[16] )."})
+    check(7, "a rule the engine refuses is rejected at admission, with its reason",
+          not ok(clash) and err(clash).get("code") == "TX_REJECTED"
+          and "i1" in err(clash).get("message", ""), clash)
+    check(7, "and leaves no crash artifact", a.crash_dumps() == dumps_a0, a.crash_dumps())
     follow("after A/B/C/D")
 
     # ---------------------------------------------------------------- 8
