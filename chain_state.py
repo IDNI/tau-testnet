@@ -2243,6 +2243,14 @@ def tick_governance(height: int):
     this helper exists to support tests and out-of-band lifecycle ticks. Both
     paths must agree, so we route revisions through `i0` here as well.
     """
+    # Legacy, outside any block: it steps the in-process interpreter directly.
+    # Under worker-backed authority activation happens inside apply_block's
+    # proposal, and this path would make the in-process interpreter authoritative.
+    if tau_authority.owner().enabled:
+        raise tau_authority.AuthorityUnavailable(
+            "tick_governance is not available under worker-backed authority; "
+            "activation runs inside the block's proposal"
+        )
     global _active_consensus_id, _consensus_rules_state
 
     # Snapshot the activated set without holding _rules_lock across the Tau

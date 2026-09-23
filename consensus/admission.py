@@ -6,7 +6,6 @@ import logging
 
 import config
 import tau_defs
-from tau_manager import communicate_with_tau
 from consensus.serialization import compute_update_id, compute_offer_id
 from consensus.rule_offers import (
     MAX_ACCEPTORS_PER_STREAM,

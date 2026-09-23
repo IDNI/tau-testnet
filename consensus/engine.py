@@ -257,6 +257,22 @@ def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict,
 
 
 
+def _refuse_in_process_authority(entry: str) -> None:
+    """With worker-backed authority there is no in-process block application.
+
+    Without a proposal, apply() drives the in-process interpreter as though it
+    were authoritative -- which, once the owner is enabled, it is not. Refusing
+    here makes "no second source of evaluator truth" a property of the engine
+    rather than of every caller remembering to pass a proposal.
+    """
+    import tau_authority
+    if tau_authority.owner().enabled:
+        raise tau_authority.AuthorityUnavailable(
+            f"{entry}() without a proposal would evaluate on the in-process "
+            "interpreter, which is not the authority under worker-backed authority"
+        )
+
+
 def _advisory_is_available() -> bool:
     """Whether a separate advisory evaluator can run at all.
 
@@ -666,6 +682,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             session=session, replay_mode=replay_mode, proposal=proposal,
         )
         if proposal is None:
+            _refuse_in_process_authority("apply_block")
             return self._apply_block(**kwargs)
         with tau_guard.ProposalIsolationGuard(
             strict=True, label=getattr(proposal, "label", "proposal")
@@ -1072,6 +1089,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             proposal=proposal,
         )
         if proposal is None:
+            _refuse_in_process_authority("apply")
             return self._apply(**kwargs)
         with tau_guard.ProposalIsolationGuard(
             strict=True, label=getattr(proposal, "label", "proposal")

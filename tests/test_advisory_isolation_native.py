@@ -184,3 +184,98 @@ def test_every_evaluator_call_site_is_classified():
         assert starts, f"{name} not found"
         body = "\n".join(lines[starts[-1]:starts[-1] + 140])
         assert "tau_advisory.evaluator()" in body, f"{name} does not use the isolated evaluator"
+
+
+def test_every_in_process_stepping_site_in_the_node_is_classified():
+    """The whole node, not just the engine.
+
+    Under worker-backed authority the in-process interpreter is an ADVISORY
+    mirror. Every place that still steps it has to be one of:
+
+      advisory      admission estimates, previews, keeping the mirror current,
+                    and the header/eligibility fallbacks after the isolated
+                    evaluator -- none of them decide committed state;
+      legacy        the path that exists for the mock/test configuration, and
+                    which refuses to run once the owner is enabled;
+
+    and anything else is a new authoritative use of an interpreter that is not
+    the authority. Moving startup and block application alone would not stop
+    some governance or tick path from advancing it; this is what does.
+    """
+    import ast
+
+    classified = {
+        # advisory: the mirror, never consulted by consensus
+        ("chain_state.py", "_sync_advisory_mirror"),
+        ("chain_state.py", "replay_tau_restore_plan"),
+        ("commands/sendtx.py", "queue_transaction"),
+        ("commands/getapprovalpreview.py", "_step"),
+        ("consensus/engine.py", "query_eligibility"),
+        ("consensus/engine.py", "verify_block_header"),
+        # legacy: refuses to run under worker-backed authority
+        ("chain_state.py", "tick_governance"),
+        ("consensus/engine.py", "_apply_block"),
+        ("commands/createblock.py", "execute_batch"),
+        # the in-process session the not-enabled engine path uses
+        ("tau_session.py", "apply_rule"),
+        ("tau_session.py", "evaluate"),
+    }
+    legacy_guarded = {
+        ("chain_state.py", "tick_governance"): "tau_authority.owner().enabled",
+        ("consensus/engine.py", "_apply_block"): "proposal",
+    }
+
+    class _Sites(ast.NodeVisitor):
+        """Attribute every call to its INNERMOST enclosing function, so a
+        closure's call is not credited to (or excused by) the function around
+        it."""
+
+        def __init__(self, rel):
+            self.rel = rel
+            self.stack = []
+            self.sites = set()
+
+        def _function(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_FunctionDef = _function
+        visit_AsyncFunctionDef = _function
+
+        def visit_Call(self, node):
+            if (isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("communicate_with_tau",
+                                           "communicate_with_tau_multi")
+                    and self.stack):
+                self.sites.add((self.rel, self.stack[-1]))
+            self.generic_visit(node)
+
+    found = set()
+    for rel in ("chain_state.py", "consensus/engine.py", "consensus/admission.py",
+                "commands/sendtx.py", "commands/createblock.py",
+                "commands/getapprovalpreview.py", "tau_session.py",
+                "tau_authority.py", "tau_commit.py", "tau_proposal.py"):
+        path = os.path.join(REPO, rel)
+        if not os.path.exists(path):
+            continue
+        visitor = _Sites(rel)
+        visitor.visit(ast.parse(open(path).read()))
+        found |= visitor.sites
+
+    unclassified = found - classified
+    assert not unclassified, (
+        "unclassified in-process stepping sites -- decide whether each is "
+        f"advisory or legacy-and-guarded: {sorted(unclassified)}"
+    )
+
+    # the new modules must not step it at all
+    for rel, _ in found:
+        assert rel not in ("tau_authority.py", "tau_commit.py", "tau_proposal.py"), (
+            f"{rel} steps the in-process interpreter; the authority and the commit "
+            "protocol must only ever drive workers"
+        )
+
+    # the admission module no longer even imports it
+    admission = open(os.path.join(REPO, "consensus/admission.py")).read()
+    assert "from tau_manager import communicate_with_tau" not in admission

@@ -230,3 +230,57 @@ def test_a_corrupt_committed_journal_is_a_mismatch_not_a_retry(temp_database):
     with pytest.raises(auth.AuthorityMismatch, match="journal"):
         owner.reconstruct_from_committed()
     assert owner.state == auth.UNAVAILABLE
+
+
+# --- no in-process block application once the owner is enabled ----------------
+
+@pytest.fixture
+def enabled_owner():
+    owner = auth.AuthoritativeTauOwner(ready=threading.Event())
+    owner.enabled = True
+    auth.reset(owner)
+    yield owner
+    auth.reset(None)
+
+
+def test_apply_without_a_proposal_is_refused_under_the_owner(enabled_owner, temp_database):
+    """Without a proposal apply() drives the in-process interpreter as though it
+    were authoritative. Refusing in the engine makes "one source of evaluator
+    truth" a property of the engine rather than of every caller."""
+    from unittest.mock import MagicMock
+    from consensus.engine import TauConsensusEngine
+    from consensus.state import TauStateSnapshot
+
+    engine = TauConsensusEngine(state_store=MagicMock())
+    with pytest.raises(auth.AuthorityUnavailable, match="without a proposal"):
+        engine.apply(TauStateSnapshot(b"h", b"", {}), [], 1700000000,
+                     target_balances={}, target_sequences={})
+
+
+def test_apply_block_without_a_proposal_is_refused_under_the_owner(enabled_owner):
+    from unittest.mock import MagicMock
+    from consensus.engine import TauConsensusEngine
+
+    engine = TauConsensusEngine(state_store=MagicMock())
+    with pytest.raises(auth.AuthorityUnavailable, match="without a proposal"):
+        engine.apply_block(MagicMock(), MagicMock(), MagicMock())
+
+
+def test_tick_governance_is_refused_under_the_owner(enabled_owner):
+    import chain_state
+    with pytest.raises(auth.AuthorityUnavailable, match="tick_governance"):
+        chain_state.tick_governance(1)
+
+
+def test_the_not_enabled_path_is_unchanged(temp_database):
+    """Guard the guard: the mock/test configuration still applies in-process."""
+    from unittest.mock import MagicMock
+    from consensus.engine import TauConsensusEngine
+    from consensus.state import TauStateSnapshot
+
+    auth.reset(None)
+    assert not auth.owner().enabled
+    engine = TauConsensusEngine(state_store=MagicMock())
+    engine._state_store.commit.side_effect = lambda snap: snap
+    engine.apply(TauStateSnapshot(b"h", b"", {}), [], 1700000000,
+                 target_balances={}, target_sequences={})
