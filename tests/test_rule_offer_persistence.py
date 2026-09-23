@@ -216,34 +216,27 @@ def test_malformed_offer_rows_are_skipped(temp_database):
 
 
 def test_every_commit_site_persists_rule_offers():
-    """Static audit: each `save_canonical_state_atomically` call in chain_state
-    must pass the rule-sharing arguments.
+    """Static audit: every canonical commit in chain_state must persist the
+    rule-sharing and approval arguments.
 
-    There are three commit paths (block apply, commit_state_to_db, reorg
-    rebuild). A path that omits them leaves the offer/clause tables holding an
-    older block's rows, so a restart rehydrates a stale book and computes a
-    state hash no peer agrees with. This is a source audit rather than a
-    behavioural test because the failure only shows up after a restart on one
-    specific path, which is exactly how the Phase 9B/9C bugs escaped.
+    A path that omits them leaves the offer/clause/request tables holding an
+    older block's rows, so a restart rehydrates a stale book and computes a state
+    hash no peer agrees with. This is a source audit rather than a behavioural
+    test because the failure only shows up after a restart on one specific path,
+    which is exactly how the Phase 9B/9C bugs escaped.
+
+    A commit site may pass the arguments explicitly, or delegate to
+    `_canonical_state_kwargs` -- in which case the BUILDER is audited instead,
+    so centralising the arguments cannot quietly drop one. Both the two-step
+    `save_canonical_state_atomically` sites and the one-transaction
+    `commit_prepared_block` site are covered; a naive audit of the former alone
+    would never see the latter.
     """
     import ast
     import inspect
 
     source = inspect.getsource(chain_state)
     tree = ast.parse(source)
-
-    calls = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if isinstance(func, ast.Attribute) and func.attr == "save_canonical_state_atomically":
-            calls.append(node)
-
-    assert len(calls) == 3, (
-        f"expected 3 commit sites in chain_state, found {len(calls)}; a new one "
-        "must also pass every hash-bound snapshot argument"
-    )
     required = {
         "rule_offers", "rule_clauses", "max_rule_txs_per_block",
         # Co-signature approvals: the request book root (including which
@@ -251,12 +244,72 @@ def test_every_commit_site_persists_rule_offers():
         # that omits it rehydrates a stale book after a restart.
         "approval_requests", "approval_slots_active",
     }
-    for call in calls:
-        kwargs = {kw.arg for kw in call.keywords}
-        missing = required - kwargs
+
+    # Names bound from the audited builder, anywhere in the module.
+    builder_names = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "_canonical_state_kwargs"):
+            builder_names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+
+    def _delegates(call, *, via):
+        for kw in call.keywords:
+            if via == "**" and kw.arg is None and isinstance(kw.value, ast.Name):
+                if kw.value.id in builder_names:
+                    return True
+            if via == "canonical" and kw.arg == "canonical" and isinstance(kw.value, ast.Name):
+                if kw.value.id in builder_names:
+                    return True
+        return False
+
+    saves, commits = [], []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr == "save_canonical_state_atomically":
+            saves.append(node)
+        elif node.func.attr == "commit_prepared_block":
+            commits.append(node)
+
+    assert len(saves) == 3, (
+        f"expected 3 save_canonical_state_atomically sites in chain_state, found "
+        f"{len(saves)}; a new one must also pass every hash-bound argument"
+    )
+    assert len(commits) == 1, (
+        f"expected 1 commit_prepared_block site in chain_state, found {len(commits)}"
+    )
+    delegated = False
+    for call in saves:
+        if _delegates(call, via="**"):
+            delegated = True
+            continue
+        missing = required - {kw.arg for kw in call.keywords}
         assert not missing, (
             f"chain_state.py:{call.lineno} omits {sorted(missing)} when persisting "
             "canonical state; a restart would rehydrate a stale rule-offer book"
+        )
+    for call in commits:
+        assert _delegates(call, via="canonical"), (
+            f"chain_state.py:{call.lineno}: the one-transaction commit must take its "
+            "canonical rows from _canonical_state_kwargs"
+        )
+        delegated = True
+
+    if delegated:
+        builder = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_canonical_state_kwargs"
+        )
+        returned = set()
+        for n in ast.walk(builder):
+            if (isinstance(n, ast.Return) and isinstance(n.value, ast.Call)
+                    and isinstance(n.value.func, ast.Name) and n.value.func.id == "dict"):
+                returned |= {kw.arg for kw in n.value.keywords}
+        missing = required - returned
+        assert not missing, (
+            f"_canonical_state_kwargs omits {sorted(missing)}; every commit site "
+            "that delegates to it would rehydrate a stale book after a restart"
         )
 
 

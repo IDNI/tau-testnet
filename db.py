@@ -231,6 +231,7 @@ def init_db():
                     inputs     TEXT NOT NULL DEFAULT '{}',
                     target     INTEGER,
                     accumulate INTEGER NOT NULL DEFAULT 1,
+                    units      TEXT,
                     outcome    TEXT,
                     result_fp  TEXT,
                     identity   TEXT,
@@ -706,7 +707,7 @@ def committed_journal_entries(limit=None):
     with _db_lock:
         cur = _db_conn.cursor()
         sql = ('SELECT seq, kind, phase, rule_text, inputs, target, accumulate, '
-               'outcome, result_fp, identity, prev, link FROM tau_journal_v1 '
+               'units, outcome, result_fp, identity, prev, link FROM tau_journal_v1 '
                'ORDER BY seq')
         if limit is not None:
             sql += f' LIMIT {int(limit)}'
@@ -717,9 +718,11 @@ def committed_journal_entries(limit=None):
         out.append({
             "seq": int(r[0]), "kind": r[1], "phase": r[2], "rule_text": r[3],
             "inputs": json.loads(r[4] or "{}"), "target": r[5],
-            "accumulate": bool(r[6]), "outcome": r[7], "result_fingerprint": r[8],
-            "identity": json.loads(r[9]) if r[9] else None,
-            "prev": r[10], "link": r[11],
+            "accumulate": bool(r[6]),
+            "units": [tuple(u) for u in json.loads(r[7] or "[]")],
+            "outcome": r[8], "result_fingerprint": r[9],
+            "identity": json.loads(r[10]) if r[10] else None,
+            "prev": r[11], "link": r[12],
         })
     return out
 
@@ -829,15 +832,25 @@ def commit_prepared_block(*, execution_id, tip, parent, journal_entries,
 
             for entry in journal_entries:
                 current_seq += 1
+                # The entry's own sequence number is part of its hashed content,
+                # so it must be the one stored. A mismatch means the delta was
+                # recorded against a different base than the committed journal.
+                if entry.get("seq") is not None and int(entry["seq"]) != current_seq:
+                    raise ValueError(
+                        f"journal entry carries sequence {entry['seq']}, the next "
+                        f"committed sequence is {current_seq}"
+                    )
                 cur.execute(
                     'INSERT INTO tau_journal_v1 (seq, kind, phase, rule_text, '
-                    'inputs, target, accumulate, outcome, result_fp, identity, '
-                    'prev, link, tip) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    'inputs, target, accumulate, units, outcome, result_fp, '
+                    'identity, prev, link, tip) '
+                    'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                     (current_seq, entry["kind"], entry["phase"],
                      entry.get("rule_text"),
                      json.dumps(entry.get("inputs") or {}, sort_keys=True),
                      entry.get("target"),
                      1 if entry.get("accumulate", True) else 0,
+                     json.dumps([list(u) for u in (entry.get("units") or ())]),
                      entry.get("outcome"), entry.get("result_fingerprint"),
                      json.dumps(entry["identity"]) if entry.get("identity") else None,
                      entry.get("prev"), entry["link"], tip),

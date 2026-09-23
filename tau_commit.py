@@ -113,6 +113,7 @@ class PreparedBlockCommit:
     journal_base_head: str | None
     journal_delta: tuple = ()
     journal_final_head: str | None = None
+    journal_base_seq: int = 0
 
     allocator_base_digest: str | None = None
     allocator_delta: tuple = ()
@@ -160,6 +161,12 @@ class PreparedBlockCommit:
             raise PreparedCommitMismatch("the proposal has no evaluator")
 
         entries = tuple(proposal.journal.entries())
+        # The chain this delta continues. Taken from the journal itself rather
+        # than trusted from the caller: a delta is only meaningful relative to
+        # the head it was recorded on top of.
+        if journal_base_head is None:
+            journal_base_head = getattr(proposal.journal, "base_head", None)
+        journal_base_seq = int(getattr(proposal.journal, "base_seq", 0) or 0)
         delta = dict(proposal.allocator.delta())
         base_digest = getattr(proposal.allocator, "epoch", None)
         # Strict: a worker that cannot answer has died, and freezing an artifact
@@ -174,6 +181,7 @@ class PreparedBlockCommit:
             journal_base_head=journal_base_head,
             journal_delta=entries,
             journal_final_head=entries[-1].link if entries else journal_base_head,
+            journal_base_seq=journal_base_seq,
             allocator_base_digest=base_digest,
             allocator_delta=tuple(sorted(delta.items())),
             allocator_final_digest=_allocator_digest(base_digest, delta),
@@ -261,9 +269,29 @@ class PreparedBlockCommit:
         # The journal's own structure, not just its head: a swapped or altered
         # entry that happens to end at the same link would otherwise pass.
         try:
-            tau_journal.verify_entries(self.journal_delta)
+            tau_journal.verify_entries(self.journal_delta,
+                                       start_prev=self.journal_base_head,
+                                       start_seq=self.journal_base_seq)
         except Exception as exc:
             problems.append(f"journal chain: {exc}")
+
+        # The committed journal must still END where this delta begins. A delta
+        # recorded on top of a head that is no longer the committed one would
+        # append a history that never ran after the real one.
+        head_fn = getattr(store, "committed_journal_head", None)
+        if head_fn is not None:
+            try:
+                committed_head, committed_seq = head_fn()
+            except Exception:
+                committed_head, committed_seq = None, None
+            if committed_seq is not None and (
+                    committed_head != self.journal_base_head
+                    or int(committed_seq) != int(self.journal_base_seq)):
+                problems.append(
+                    f"committed journal moved: prepared on "
+                    f"({self.journal_base_seq}, {self.journal_base_head}), "
+                    f"committed is ({committed_seq}, {committed_head})"
+                )
 
         if problems:
             raise PreparedCommitMismatch("; ".join(problems))
@@ -615,6 +643,19 @@ class PreparedCommitCoordinator:
                         prepared.execution_id)
             return dict(self._result)
 
+        # A retry is answered from the DURABLE record, before the gate. After a
+        # crash the in-memory state machine is gone, and the anchors this
+        # artifact was prepared against have moved precisely because the first
+        # attempt succeeded -- gating first would report a committed block as a
+        # stale proposal.
+        finder = getattr(self._store, "find_block_commit", None)
+        existing = finder(prepared.execution_id) if finder is not None else None
+        if existing is not None:
+            self.state = DURABLY_COMMITTED
+            self._result = {"state": DURABLY_COMMITTED, "tip": existing["tip"],
+                            "execution_id": prepared.execution_id, "retried": True}
+            return dict(self._result)
+
         # The gate. Every anchor together, immediately before the irreversible
         # step -- a partial check is how a proposal that agrees about its parent
         # and disagrees about its mapping gets published.
@@ -628,7 +669,7 @@ class PreparedCommitCoordinator:
             tip=tip,
             parent=prepared.parent_tip_id,
             journal_entries=[_entry_row(e) for e in prepared.journal_delta],
-            expected_journal_seq=_journal_sequence(self._store),
+            expected_journal_seq=prepared.journal_base_seq,
             allocation_delta=prepared.allocation,
             expected_epoch=prepared.allocator_base_digest,
             journal_head=prepared.journal_final_head,
@@ -706,9 +747,11 @@ class PreparedCommitCoordinator:
 
 def _entry_row(entry) -> dict:
     return {
+        "seq": entry.seq,
         "kind": entry.kind, "phase": entry.phase, "rule_text": entry.rule_text,
         "inputs": dict(entry.inputs), "target": entry.target,
-        "accumulate": entry.accumulate, "outcome": entry.outcome,
+        "accumulate": entry.accumulate, "units": [list(u) for u in entry.units],
+        "outcome": entry.outcome,
         "result_fingerprint": entry.result_fingerprint,
         "identity": entry.identity, "prev": entry.prev, "link": entry.link,
     }

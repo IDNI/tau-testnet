@@ -875,6 +875,29 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # so the resulting state hash is independent of the live interpreter.
             next_cons_rules = "\n".join(last_update.rule_revisions)
             next_active_consensus_id = last_update.update_id_hex[:16]
+
+            if proposal is not None:
+                # Collapse the proposal's evaluator to "the last activation
+                # only", the state the hash above declares. Fed through i0 the
+                # activated revisions LAYER on the previous consensus rules; the
+                # in-process path therefore rebuilt its interpreter after every
+                # activation, and a running node and a restarted one disagreed
+                # on o6/o7 until it did. Here the collapse happens before
+                # anything is durable, is recorded as a RESET, and the worker
+                # that gets promoted is the collapsed one.
+                import chain_state as _chain_state
+                units = _chain_state.restore_plan_for(
+                    next_cons_rules, next_app_rules, lifecycle=lm,
+                )
+                try:
+                    proposal.reset(units)
+                except Exception as exc:
+                    # Deterministic: every node composes the same plan from the
+                    # same hashed state. Existing block-failure semantics.
+                    raise FeeRuleError(
+                        f"Governance activation at height {block.header.block_number} "
+                        f"could not collapse the evaluator: {exc}"
+                    )
         
         # Finalize Hashes
         acc_hash = compute_accounts_hash(t_bals, t_seqs)

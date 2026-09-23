@@ -62,23 +62,22 @@ def _proposal():
     plan = tr.plan_representation(candidate_rules=[ACTIVATION_RULE])
     snapshot = alloc.DbMappingSnapshot()
 
-    def rebuild(proposal_journal, current_plan):
+    def respawn(current_plan):
         session = ts.WorkerSession.spawn(_router(), cwd=REPO, env=_env(),
                                          plan=current_plan)
         session.begin_proposal(alloc.Allocator(snapshot, width=current_plan.width))
-        for entry in proposal_journal.entries():
-            if entry.kind == tj.REVISION:
-                session.apply_rule(entry.rule_text, record=False,
-                                   accumulate=entry.accumulate)
-            else:
-                session.evaluate(entry.inputs, multi=True, record=False)
         return session
 
+    def rebuild(proposal_journal, current_plan):
+        # the node's own replay, which understands RESET
+        return ts.replay_entries(None, proposal_journal.entries(),
+                                 respawn=lambda: respawn(current_plan))
+
     return tp.ProposalContext(
-        session=rebuild(tj.Journal(authoritative=False), plan),
+        session=respawn(plan),
         journal=tj.Journal(authoritative=False),
         allocator=alloc.Allocator(snapshot, width=plan.width, label="proposal"),
-        plan=plan, rebuild=rebuild,
+        plan=plan, rebuild=rebuild, respawn=respawn,
     )
 
 
@@ -91,7 +90,7 @@ def _run():
     lm.update_payloads[update.update_id] = update
     lm.scheduled_updates = [(update.activate_at_height, update.update_id)]
     parent = TauStateSnapshot(
-        state_hash="0" * 64, tau_bytes=b"always ( o0[t]=1 ).",
+        state_hash="0" * 64, tau_bytes=b"",
         metadata={"balances": {PROPOSER: 1000}, "sequence_numbers": {},
                   "last_transfer_ts": {}, "lifecycle_manager": lm,
                   "active_consensus_id": ""},

@@ -34,7 +34,18 @@ logger = logging.getLogger(__name__)
 
 UNINITIALIZED = "UNINITIALIZED"
 ACTIVE = "ACTIVE"
+#: The authoritative worker is on loan to a proposal. Not serving: it is being
+#: stepped with a block that has not committed. It comes back only through
+#: promotion (the block committed) or not at all (the proposal was abandoned and
+#: the owner rebuilds from the journal).
+LENT = "LENT"
 UNAVAILABLE = "UNAVAILABLE"
+
+#: Readiness of the AUTHORITY -- separate from tau_manager.tau_ready, which keeps
+#: meaning "the in-process interpreter is up" for the admission paths that still
+#: use it as an advisory mirror. Conflating the two would make every block's
+#: proposal (which takes the authority out of service) stall admission.
+authority_ready = threading.Event()
 
 
 class AuthorityUnavailable(RuntimeError):
@@ -279,7 +290,7 @@ class AuthoritativeTauOwner:
     # --- proposals ------------------------------------------------------------
 
     def build_proposal(self, *, candidate_rules=(), label="proposal",
-                       baseline=None, cwd=None, env=None):
+                       baseline=None, cwd=None, env=None, lend=True):
         """A proposal seeded from the COMMITTED journal.
 
         Not from the restore plan. The restore plan carries rules only, so a
@@ -313,51 +324,120 @@ class AuthoritativeTauOwner:
         fingerprints = committed.fingerprints()
         history = [e.rule_text for e in committed.entries()
                    if e.kind == tau_journal.REVISION and e.rule_text]
-        plan = tau_reconstruction.plan_representation(
-            history_rules=history, candidate_rules=list(candidate_rules),
-        )
+
+        lent = self._try_lend(committed, candidate_rules, label) if lend else None
+        if lent is not None:
+            plan = lent.plan
+        else:
+            plan = tau_reconstruction.plan_representation(
+                history_rules=history, candidate_rules=list(candidate_rules),
+            )
         snapshot = tau_allocator.DbMappingSnapshot()
         allocator = tau_allocator.Allocator(snapshot, width=plan.width,
                                             label="proposal")
 
-        def _replay(session, entries, expected=None):
-            for index, entry in enumerate(entries):
-                if entry.kind == tau_journal.REVISION:
-                    session.apply_rule(entry.rule_text, record=False,
-                                       accumulate=entry.accumulate)
-                    observed = (session.last_outcome or {}).get("outputs")
-                    outcome = (session.last_outcome or {}).get("outcome")
-                else:
-                    observed = session.evaluate(entry.inputs, multi=True,
-                                                record=False)
-                    outcome = None
-                if expected is not None:
-                    seq, fingerprint = expected[index]
-                    # Semantic, so a replay under a different representation
-                    # still has to MEAN the same thing. A proposal built on a
-                    # state the committed journal does not describe is worse
-                    # than no proposal.
-                    tau_journal.compare(fingerprint, observed, seq=seq,
-                                        outcome=outcome)
-
-        def _spawn(current_plan):
-            session = tau_session.WorkerSession.spawn(
+        def _respawn(current_plan):
+            return tau_session.WorkerSession.spawn(
                 baseline, cwd=cwd, env=env, plan=current_plan, allocation=allocator,
             )
-            _replay(session, committed.entries(), expected=fingerprints)
-            return session
+
+        def _spawn(current_plan):
+            # Semantic fingerprints, so a replay under a different representation
+            # still has to MEAN the same thing. A proposal built on a state the
+            # committed journal does not describe is worse than no proposal.
+            return tau_session.replay_entries(
+                None, committed.entries(), respawn=lambda: _respawn(current_plan),
+                expected=fingerprints, start_at_last_reset=True,
+            )
 
         def rebuild(proposal_journal, current_plan):
             session = _spawn(current_plan)
-            _replay(session, proposal_journal.entries())
-            return session
+            return tau_session.replay_entries(
+                session, proposal_journal.entries(),
+                respawn=lambda: _respawn(current_plan),
+            )
+
+        committed_entries = committed.entries()
+
+        def _continuation():
+            # The proposal journal CONTINUES the committed chain: first entry
+            # links to the committed head, sequence numbers carry on.
+            return tau_journal.Journal(
+                authoritative=False,
+                start_seq=len(committed_entries),
+                start_prev=committed_entries[-1].link if committed_entries else None,
+            )
+
+        if lent is not None:
+            # The exact worker that computed the committed state, not an
+            # equivalent rebuilt by replay. Its history is already the committed
+            # history, so there is nothing to replay and nothing to diverge.
+            proposal = tau_proposal.ProposalContext(
+                session=lent,
+                journal=_continuation(),
+                allocator=allocator,
+                plan=plan, rebuild=rebuild, label=label, respawn=_respawn,
+            )
+            proposal.on_abandon = self._lent_abandoned
+            logger.info("proposal %s runs on the authoritative worker (lent)", label)
+            return proposal
 
         return tau_proposal.ProposalContext(
             session=_spawn(plan),
-            journal=tau_journal.Journal(authoritative=False),
+            journal=_continuation(),
             allocator=allocator,
-            plan=plan, rebuild=rebuild, label=label,
+            plan=plan, rebuild=rebuild, label=label, respawn=_respawn,
         )
+
+    def _try_lend(self, committed, candidate_rules, label):
+        """Lend the authoritative worker to a proposal, or answer None.
+
+        Only when it provably holds the committed state -- its descriptor names
+        the committed journal head -- and the candidates can run under its
+        representation: none of them needs a stream PLAIN that this worker has
+        interned. A candidate that merely could be optimized further runs
+        unoptimized, which costs time and not correctness; one that conflicts
+        needs a worker planned for it from the start.
+        """
+        import tau_reconstruction
+
+        with self._lock:
+            if not self.active:
+                return None
+            session = self._session
+            plan = getattr(session, "plan", None)
+            if plan is None:
+                return None
+            head = committed.entries()[-1].link if len(committed) else None
+            if self.descriptor is None or self.descriptor.journal_head_hash != head:
+                return None
+            if candidate_rules:
+                needs = tau_reconstruction.plan_representation(
+                    candidate_rules=list(candidate_rules))
+                if set(needs.plain) & set(plan.interned):
+                    return None
+            self._session = None
+            self.state = LENT
+            self.reason = f"lent to {label}"
+            self.generation += 1
+            if self._ready is not None:
+                try:
+                    self._ready.clear()
+                except Exception:
+                    pass
+            return session
+
+    def _lent_abandoned(self, proposal) -> None:
+        """The proposal holding the authoritative worker was disposed without
+        being promoted. That worker has been stepped with a block that will
+        never commit, and there is no undo -- so the owner stops claiming to
+        serve committed state, and the next proposal rebuilds from the journal.
+        """
+        with self._lock:
+            if self.state == LENT:
+                self.mark_unavailable(
+                    f"the lent authoritative worker was abandoned with {proposal.label}"
+                )
 
     # --- startup --------------------------------------------------------------
 
@@ -560,8 +640,7 @@ def owner() -> AuthoritativeTauOwner:
     """The process's authoritative owner."""
     global _owner
     if _owner is None:
-        import tau_manager
-        _owner = AuthoritativeTauOwner(ready=tau_manager.tau_ready)
+        _owner = AuthoritativeTauOwner(ready=authority_ready)
     return _owner
 
 

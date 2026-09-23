@@ -298,6 +298,16 @@ def _speculative_proposal(candidate_rules=()):
         import tau_session
     except Exception:
         return None
+    import tau_authority
+    owner = tau_authority.owner()
+    if owner.enabled:
+        # Worker-backed authority: the proposal starts from the COMMITTED
+        # journal (or runs on the lent authoritative worker itself). There is no
+        # in-process simulation to fall back to -- if this raises, block
+        # production reports unavailability rather than simulating somewhere
+        # that is no longer the authority.
+        return owner.build_proposal(candidate_rules=list(candidate_rules),
+                                    label="miner")
     if getattr(tau_manager, "tau_test_mode", False):
         return None
     iface = getattr(tau_manager, "tau_direct_interface", None)

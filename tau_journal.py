@@ -31,6 +31,16 @@ from dataclasses import dataclass, field, asdict, replace
 
 REVISION = "revision"
 STEP = "step"
+#: Re-initialize the evaluator from the program baseline, then apply `units`.
+#:
+#: What a governance activation does to the evaluator. Every activated revision
+#: goes through i0 and would otherwise LAYER on the previous consensus rules,
+#: while the chain's hashed consensus state says "the last activation only" --
+#: which is why the in-process path collapsed its interpreter after every
+#: activation. Recording the collapse as an entry makes a running evaluator and
+#: a reconstructed one collapse at the same point, and it bounds replay: nothing
+#: before the last RESET can affect the evaluator.
+RESET = "reset"
 
 # Why an entry is authoritative -- or why it is not.
 PHASE_APPLY = "apply"                 # committed block execution
@@ -157,6 +167,7 @@ def journal_from_rows(rows, *, authoritative=True) -> "Journal":
             seq=int(row["seq"]), kind=row["kind"], phase=row["phase"],
             rule_text=row.get("rule_text"), inputs=dict(row.get("inputs") or {}),
             target=row.get("target"), accumulate=bool(row.get("accumulate", True)),
+            units=tuple((str(t), bool(p)) for t, p in (row.get("units") or ())),
             outcome=row.get("outcome"),
             result_fingerprint=row.get("result_fingerprint"),
             identity=row.get("identity"), prev=row.get("prev"), link=row["link"],
@@ -164,6 +175,14 @@ def journal_from_rows(rows, *, authoritative=True) -> "Journal":
         journal._entries.append(entry)
         journal._seq = entry.seq
     return journal
+
+
+def last_reset_index(entries):
+    """Index of the last RESET entry, or None. Replay can start there."""
+    for index in range(len(entries) - 1, -1, -1):
+        if entries[index].kind == RESET:
+            return index
+    return None
 
 
 def verify_entries(entries, *, start_prev=None, start_seq=0) -> None:
@@ -203,6 +222,8 @@ class JournalEntry:
     #: the accumulation, is what a restore rebuilds it from. Recorded because the
     #: two produce different canonical state from the same evaluator history.
     accumulate: bool = True
+    #: RESET only: the (rule text, persist) units applied after re-initializing.
+    units: tuple = ()
     outcome: str | None = None     # the revision outcome, when known
     result_fingerprint: str | None = None        # SEMANTIC: survives a valid
                                                  # representation change
@@ -216,6 +237,7 @@ class JournalEntry:
             "seq": self.seq, "kind": self.kind, "phase": self.phase,
             "rule_text": self.rule_text, "inputs": self.inputs,
             "target": self.target, "accumulate": self.accumulate,
+            "units": [list(u) for u in self.units],
             "outcome": self.outcome,
             "result": self.result_fingerprint,
             "identity": None if self.identity is None else self.identity.get("id"),
@@ -234,6 +256,7 @@ class JournalEntry:
             "inputs": dict(self.inputs),
             "target": self.target,
             "accumulate": self.accumulate,
+            "units": [list(u) for u in self.units],
         }
 
     def to_dict(self) -> dict:
@@ -266,20 +289,40 @@ class OperationalTrace:
 class Journal:
     """An ordered record of execution that defines an evaluator's state."""
 
-    def __init__(self, anchor: str | None = None, authoritative: bool = True):
+    def __init__(self, anchor: str | None = None, authoritative: bool = True,
+                 *, start_seq: int = 0, start_prev: str | None = None):
+        """`start_seq`/`start_prev` continue an existing chain.
+
+        A proposal journal is a CONTINUATION of the committed journal, not a new
+        chain: its first entry has to link to the committed head and carry the
+        next committed sequence number. Starting fresh would make the committed
+        journal a string of independently-chained segments -- each fine on its
+        own, and a record that no longer proves anything about order across them.
+        """
         self.anchor = anchor
         self.authoritative = authoritative
         self.label = "committed" if authoritative else "proposal"
         self._entries: list = []
-        self._seq = 0
+        self._seq = int(start_seq)
+        self._start_seq = int(start_seq)
+        self._start_prev = start_prev
         self._parent = None
         self._discarded = False
+
+    @property
+    def base_head(self):
+        """The link this journal continues from (None for a fresh chain)."""
+        return self._start_prev
+
+    @property
+    def base_seq(self) -> int:
+        return self._start_seq
 
     # --- recording ------------------------------------------------------------
 
     def record(self, kind: str, *, phase: str, rule_text=None, inputs=None,
                target=None, outcome=None, result=None, runtime=None,
-               identity=None, accumulate=True) -> JournalEntry:
+               identity=None, accumulate=True, units=()) -> JournalEntry:
         if self._discarded:
             raise ValueError(
                 f"journal {self.label!r} was discarded; its execution is not part "
@@ -306,11 +349,12 @@ class Journal:
             inputs=canonical_inputs(inputs),
             target=target,
             accumulate=bool(accumulate),
+            units=tuple((str(t), bool(p)) for t, p in (units or ())),
             outcome=outcome,
             result_fingerprint=semantic,
             runtime_fingerprint=None if runtime is None else fingerprint(runtime),
             identity=identity,
-            prev=self._entries[-1].link if self._entries else None,
+            prev=self._entries[-1].link if self._entries else self._start_prev,
         )
         entry = replace(entry, link=entry.compute_link())
         self._entries.append(entry)
@@ -339,7 +383,8 @@ class Journal:
         format itself should not permit a swapped, duplicated or altered entry to
         look like a legitimate record.
         """
-        verify_entries(self._entries)
+        verify_entries(self._entries, start_prev=self._start_prev,
+                       start_seq=self._start_seq)
 
     def child(self, label: str = "tx") -> "Journal":
         """A transaction-private journal.
@@ -361,13 +406,21 @@ class Journal:
         if child._discarded:
             raise ValueError("cannot merge a discarded journal")
         for entry in child.entries():
+            # Every field that is part of the record, not just the ones replay
+            # reads. Dropping `accumulate` recorded a merged o5 composite as part
+            # of the application-rules accumulation, and dropping `identity`
+            # erased which prepared payload the worker actually evaluated.
             self.record(entry.kind, phase=self._phase_for(entry), rule_text=entry.rule_text,
-                        inputs=entry.inputs, target=entry.target, outcome=entry.outcome)
-            if entry.result_fingerprint is not None:
-                self._entries[-1] = replace(self._entries[-1],
-                                            result_fingerprint=entry.result_fingerprint)
-                self._entries[-1] = replace(self._entries[-1],
-                                            link=self._entries[-1].compute_link())
+                        inputs=entry.inputs, target=entry.target, outcome=entry.outcome,
+                        identity=entry.identity, accumulate=entry.accumulate,
+                        units=entry.units)
+            self._entries[-1] = replace(
+                self._entries[-1],
+                result_fingerprint=entry.result_fingerprint,
+                runtime_fingerprint=entry.runtime_fingerprint,
+            )
+            self._entries[-1] = replace(self._entries[-1],
+                                        link=self._entries[-1].compute_link())
         child._discarded = True
 
     def discard(self, child: "Journal") -> None:

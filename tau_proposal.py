@@ -229,7 +229,7 @@ class ProposalContext:
     """The owner of everything a candidate block touches before it commits."""
 
     def __init__(self, *, session, journal, allocator, plan, descriptor=None,
-                 rebuild=None, lifecycle=None, label="proposal"):
+                 rebuild=None, lifecycle=None, label="proposal", respawn=None):
         self.session = session
         self.journal = journal
         self.allocator = allocator
@@ -249,9 +249,18 @@ class ProposalContext:
         # transaction mutates a clone and the proposal adopts it on acceptance.
         self.lifecycle = lifecycle
         self._rebuild = rebuild
+        # A fresh worker at the program baseline, NO history, under a given plan.
+        # What a governance activation's collapse is built from.
+        self._respawn = respawn
         self._dirty = False
         self._poisoned = None
         self._retries = 0
+        #: Called when the proposal is disposed while still holding its session
+        #: -- i.e. abandoned rather than promoted. The authoritative owner uses it
+        #: when it LENT its own worker to this proposal: that worker has now been
+        #: stepped with a block that will never commit, so the owner must stop
+        #: claiming to serve committed state.
+        self.on_abandon = None
 
     def _bind_session(self) -> None:
         if self.session is None:
@@ -325,6 +334,52 @@ class ProposalContext:
         self._bind_session()
         self._dirty = False
 
+    def reset(self, units) -> None:
+        """Collapse the evaluator to the program baseline plus `units`, recorded.
+
+        What a governance activation does. The activated revisions layer on the
+        previous consensus rules when fed through i0, while the chain's hashed
+        consensus state says "the last activation only" -- so the in-process
+        path rebuilt its interpreter after every activation. Here the collapse
+        happens inside the proposal, before anything is durable, and is recorded
+        as a RESET so a reconstruction collapses at exactly the same point. The
+        worker that gets promoted is the collapsed one.
+        """
+        import tau_journal as _tau_journal
+
+        self._check_usable()
+        if self._respawn is None:
+            raise ProposalPoisoned("this proposal cannot re-initialize its evaluator")
+        normalized = []
+        for unit in units:
+            if isinstance(unit, dict):
+                normalized.append((str(unit.get("text") or ""), bool(unit.get("persist"))))
+            else:
+                normalized.append((str(unit[0]), bool(unit[1])))
+        normalized = [(t, p) for t, p in normalized if t.strip()]
+
+        fresh = self._respawn(self.plan)
+        for text, persist in normalized:
+            fresh.apply_rule(text, record=False, accumulate=persist)
+            receipt = fresh.last_receipt() or {}
+            if not receipt.get("accepted"):
+                try:
+                    fresh.dispose()
+                except Exception:
+                    pass
+                raise ProposalPoisoned(
+                    f"reset could not apply a unit: {receipt.get('outcome')}"
+                )
+        old, self.session = self.session, fresh
+        self._bind_session()
+        self.journal.record(_tau_journal.RESET, phase=_tau_journal.PHASE_SPECULATIVE,
+                            units=normalized, outcome=f"RESET:{len(normalized)}")
+        if old is not None and old is not fresh:
+            try:
+                old.dispose()
+            except Exception:
+                pass
+
     def replan(self, required_plain) -> None:
         """Extend the representation and rebuild, keeping the accepted prefix.
 
@@ -376,6 +431,9 @@ class ProposalContext:
         the block committed. One-shot: a second release answers None.
         """
         session, self.session = self.session, None
+        # Promoted, not abandoned: whoever lent the worker gets it back through
+        # promotion, so the abandon hook must not fire on a later dispose().
+        self.on_abandon = None
         return session
 
     def dispose(self) -> None:
@@ -385,3 +443,10 @@ class ProposalContext:
             except Exception:
                 pass
             self.session = None
+            hook, self.on_abandon = self.on_abandon, None
+            if hook is not None:
+                try:
+                    hook(self)
+                except Exception:
+                    logger.warning("proposal %s: abandon hook failed", self.label,
+                                   exc_info=True)

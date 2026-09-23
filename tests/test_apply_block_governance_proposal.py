@@ -32,9 +32,9 @@ class _Session:
 
     is_speculative = True
 
-    def __init__(self, rule_accepted=True):
+    def __init__(self, rule_accepted=True, rules_seen=None):
         self.rule_accepted = rule_accepted
-        self.rules_seen = []
+        self.rules_seen = rules_seen if rules_seen is not None else []
         self.allocation = None
         self.journal = None
 
@@ -94,12 +94,17 @@ def _block():
 def _proposal(session):
     plan = tr.plan_representation(candidate_rules=[ACTIVATION_RULE])
     snapshot = alloc.DbMappingSnapshot()
-    return tp.ProposalContext(
+    ctx = tp.ProposalContext(
         session=session,
         journal=tj.Journal(authoritative=False),
         allocator=alloc.Allocator(snapshot, width=plan.width, label="proposal"),
         plan=plan,
+        # The activation collapses the evaluator onto a fresh one; the scripted
+        # stand-in shares the original's call record so the test can see both.
+        respawn=lambda current_plan: _Session(rule_accepted=session.rule_accepted,
+                                              rules_seen=session.rules_seen),
     )
+    return ctx
 
 
 def _run(*, rule_accepted=True):
@@ -168,3 +173,21 @@ def test_the_lifecycle_the_block_hashes_is_the_proposal_s(temp_database):
         "the activation did not land on the lifecycle the proposal owns"
     )
     assert proposal.lifecycle.scheduled_updates == []
+
+
+def test_an_activation_collapses_the_evaluator_and_records_it(temp_database):
+    """Fed through i0 the activated revision LAYERS on the previous consensus
+    rules; the chain's hashed state says "the last activation only". The
+    collapse must happen in the proposal and be RECORDED, or a reconstruction
+    and the running evaluator part ways at the first activation."""
+    proposal, session, result, live, update = _run()
+
+    kinds = [e.kind for e in proposal.journal.entries()]
+    assert kinds[-1] == tj.RESET, f"no collapse recorded after the activation: {kinds}"
+    reset = proposal.journal.entries()[-1]
+    texts = [t for t, _ in reset.units]
+    assert ACTIVATION_RULE.strip() in " ".join(texts) or any(
+        "o9" in t for t in texts), (
+        f"the collapse did not re-apply the newly activated consensus rules: {texts}"
+    )
+    assert proposal.session is not session, "the evaluator was not re-initialized"

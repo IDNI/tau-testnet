@@ -291,25 +291,17 @@ class WorkerSession(EvaluatorSession):
         import tau_reconstruction
 
         replay_alloc = tau_reconstruction.ReplayAllocator(snapshot)
-        session = cls.spawn(baseline_spec, cwd=cwd, env=env,
-                            allocation=replay_alloc, plan=plan)
+
+        def respawn():
+            return cls.spawn(baseline_spec, cwd=cwd, env=env,
+                             allocation=replay_alloc, plan=plan)
+
+        session = replay_entries(
+            None, journal.entries(), respawn=respawn,
+            expected=journal.fingerprints() if verify else None,
+            start_at_last_reset=True,
+        )
         session.descriptor = descriptor
-        for entry, (seq, expected) in zip(journal.entries(), journal.fingerprints()):
-            payload = entry.replayable()
-            # journal kinds, not session kinds: tau_journal.REVISION is
-            # "revision" while this module's RULE is "rule", and comparing
-            # against the wrong one replays every recorded revision as an input
-            # step -- a reconstruction that silently applies no rules at all
-            if payload["kind"] == tau_journal.REVISION:
-                session.apply_rule(payload["rule_text"], record=False,
-                                   accumulate=payload.get("accumulate", True))
-                observed = (session.last_outcome or {}).get("outputs")
-                outcome = (session.last_outcome or {}).get("outcome")
-            else:
-                observed = session.evaluate(payload["inputs"], multi=True, record=False)
-                outcome = None
-            if verify:
-                tau_journal.compare(expected, observed, seq=seq, outcome=outcome)
         return session
 
     def begin_proposal(self, allocation):
@@ -452,6 +444,65 @@ class WorkerSession(EvaluatorSession):
             or normalized.get("outcome") in _ACCEPTED
         )
         return normalized
+
+
+def replay_entries(session, entries, *, respawn, expected=None,
+                   start_at_last_reset=False):
+    """Replay journal entries, returning the session that holds the result.
+
+    ONE implementation for every place that rebuilds an evaluator from a
+    journal -- startup reconstruction, proposal seeding, proposal rebuilds --
+    because three hand-written loops that each understand a different subset of
+    entry kinds is how a reconstruction quietly stops matching the evaluator it
+    reconstructs.
+
+    A RESET replaces the session: `respawn()` gives a fresh worker at the
+    program baseline, the entry's units are applied, and replay continues on
+    that. With `start_at_last_reset`, everything before the last RESET is
+    skipped -- it cannot affect the evaluator -- which is what bounds replay
+    for a chain with activations in its history.
+
+    `expected` is the full list of (seq, semantic fingerprint), aligned with
+    `entries`; each replayed entry is checked against it.
+    """
+    begin = 0
+    if start_at_last_reset:
+        last = tau_journal.last_reset_index(entries)
+        if last is not None:
+            begin = last
+    if session is None and (begin >= len(entries) or entries[begin].kind != tau_journal.RESET):
+        session = respawn()
+    for index in range(begin, len(entries)):
+        entry = entries[index]
+        if entry.kind == tau_journal.RESET:
+            fresh = respawn()
+            for text, persist in entry.units:
+                fresh.apply_rule(text, record=False, accumulate=persist)
+                receipt = fresh.last_receipt() or {}
+                if not receipt.get("accepted"):
+                    fresh.dispose()
+                    raise tau_journal.DivergenceError(
+                        f"reset at entry {entry.seq} could not re-apply a unit: "
+                        f"{receipt.get('outcome')}"
+                    )
+            if session is not None and session is not fresh:
+                session.dispose()
+            session = fresh
+            observed, outcome = None, f"RESET:{len(entry.units)}"
+        elif entry.kind == tau_journal.REVISION:
+            session.apply_rule(entry.rule_text, record=False,
+                               accumulate=entry.accumulate)
+            observed = (session.last_outcome or {}).get("outputs")
+            outcome = (session.last_outcome or {}).get("outcome")
+        else:
+            observed = session.evaluate(entry.inputs, multi=True, record=False)
+            outcome = None
+        if expected is not None:
+            seq, fingerprint = expected[index]
+            tau_journal.compare(fingerprint, observed, seq=seq, outcome=outcome)
+    if session is None:
+        session = respawn()
+    return session
 
 
 _default_session = None
