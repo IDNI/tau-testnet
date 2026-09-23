@@ -276,8 +276,9 @@ def test_every_commit_site_persists_rule_offers():
         f"expected 3 save_canonical_state_atomically sites in chain_state, found "
         f"{len(saves)}; a new one must also pass every hash-bound argument"
     )
-    assert len(commits) == 1, (
-        f"expected 1 commit_prepared_block site in chain_state, found {len(commits)}"
+    assert len(commits) == 2, (
+        f"expected 2 commit_prepared_block sites in chain_state (block apply, "
+        f"journal rebuild), found {len(commits)}"
     )
     delegated = False
     for call in saves:
@@ -289,12 +290,24 @@ def test_every_commit_site_persists_rule_offers():
             f"chain_state.py:{call.lineno} omits {sorted(missing)} when persisting "
             "canonical state; a restart would rehydrate a stale rule-offer book"
         )
+    journal_only = 0
     for call in commits:
-        assert _delegates(call, via="canonical"), (
-            f"chain_state.py:{call.lineno}: the one-transaction commit must take its "
-            "canonical rows from _canonical_state_kwargs"
+        if _delegates(call, via="canonical"):
+            delegated = True
+            continue
+        # A journal-only commit must SAY so. Omitting `canonical=` is exactly how
+        # a site forgets the rows; `canonical=None` written out is a decision.
+        explicit_none = any(
+            kw.arg == "canonical" and isinstance(kw.value, ast.Constant)
+            and kw.value.value is None
+            for kw in call.keywords
         )
-        delegated = True
+        assert explicit_none, (
+            f"chain_state.py:{call.lineno}: a commit must either take its canonical "
+            "rows from _canonical_state_kwargs or declare canonical=None explicitly"
+        )
+        journal_only += 1
+    assert journal_only <= 1, "more than one journal-only commit site"
 
     if delegated:
         builder = next(

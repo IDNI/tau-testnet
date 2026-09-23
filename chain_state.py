@@ -1032,6 +1032,20 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
     print(f"[INFO][chain_state] Starting blockchain state reconstruction from block {start_block}...")
     global _canonical_head_hash, _tau_engine_state_hash, _application_rules_state, _consensus_rules_state
     global _active_consensus_id, _lifecycle_manager
+
+    # With worker-backed authority a rebuild goes through the SAME commit
+    # protocol as live blocks: every replayed block is evaluated in a proposal,
+    # its journal delta and commit record made durable, and its worker promoted.
+    # Replaying on the in-process interpreter instead would quietly make that
+    # interpreter the authority again -- the second source of truth.
+    _owner = tau_authority.owner()
+    _enabled = _owner.enabled
+    if _enabled and start_block != 0:
+        return RebuildResult(
+            ok=False, stopped_at_block=start_block,
+            reason="an incremental rebuild cannot be expressed on the committed "
+                   "journal; rebuild from genesis",
+        )
     
     if start_block == 0:
         # Clear current state for a full rebuild
@@ -1057,6 +1071,16 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
         print("[INFO][chain_state] Cleared existing in-memory state for full rebuild.")
+
+        if _enabled:
+            import db as _db
+            try:
+                _db.reset_committed_journal()
+                _owner.rebuild_genesis(_db.get_genesis_hash() or None)
+            except Exception as exc:
+                logger.error("[chain_state] rebuild could not re-commit genesis: %s", exc)
+                return RebuildResult(ok=False, stopped_at_block=0,
+                                     reason=f"genesis re-commit failed: {exc}")
 
         # Reset the live Tau interpreter to the genesis consensus spec before
         # replay. `engine.apply_block` routes activation revisions through `i0`
@@ -1180,12 +1204,38 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                 print(f"[WARN][chain_state] Tau unavailable during rebuild; skipping header verification for block #{block_number}.")
             
             # 4. Execute Core Block Application Natively
+            _proposal = None
             try:
-                apply_result = engine.apply_block(active_view, block, parent_snapshot, replay_mode=True)
+                if _enabled:
+                    _candidates = [
+                        (tx.get("operations") or {}).get("0")
+                        for tx in (block.transactions or [])
+                        if isinstance(tx, dict)
+                        and isinstance((tx.get("operations") or {}).get("0"), str)
+                    ]
+                    _proposal = _owner.build_proposal(
+                        candidate_rules=_candidates, label=f"rebuild-{block_number}")
+                    with tau_proposal.boundary(_proposal, label="rebuild"):
+                        apply_result = engine.apply_block(
+                            active_view, block, parent_snapshot, replay_mode=True,
+                            session=_proposal.session, proposal=_proposal,
+                        )
+                    if _proposal.dirty:
+                        _proposal.reconstruct()
+                else:
+                    apply_result = engine.apply_block(active_view, block, parent_snapshot, replay_mode=True)
             except FeeRuleError as e:
+                _dispose_quietly(_proposal)
                 print(f"[ERROR][chain_state] Fee rule failure replaying block #{block_number}: {e}")
                 return RebuildResult(ok=False, stopped_at_block=block_number,
                                      reason=f"fee rule failure: {e}")
+            except Exception as e:
+                if not _enabled:
+                    raise
+                _dispose_quietly(_proposal)
+                print(f"[ERROR][chain_state] Could not evaluate block #{block_number} during rebuild: {e}")
+                return RebuildResult(ok=False, stopped_at_block=block_number,
+                                     reason=f"evaluation failed: {e}")
             next_snapshot = apply_result.next_snapshot
             
             # 5. Execute Required Invariant Replay Checks (comparing state hashes)
@@ -1202,11 +1252,60 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                  # Legacy blocks generated prior to Phase 2 might lack this.
                  print(f"[ERROR][chain_state] Block #{block_number} state_hash invariant mismatch!")
                  print(f"  Computed: {next_snapshot.state_hash}\n  Block: {block.header.state_hash}")
+                 _dispose_quietly(_proposal)
                  return RebuildResult(ok=False, stopped_at_block=block_number,
                                       computed_hash=next_snapshot.state_hash,
                                       stored_hash=block.header.state_hash,
                                       reason="state_hash invariant mismatch")
-                 
+
+            if _enabled:
+                # The block's evaluator history becomes durable exactly as a live
+                # block's does. Canonical rows are written once, by the caller, for
+                # the head the rebuild actually reached.
+                try:
+                    _execution_id = tau_commit.block_execution_id(
+                        parent=block.header.previous_hash,
+                        height=block.header.block_number,
+                        timestamp=block.header.timestamp,
+                        proposer=block.header.proposer_pubkey,
+                        transactions=block.transactions,
+                        consensus_context=active_view.consensus_rules or "",
+                    )
+                    _prepared = tau_commit.PreparedBlockCommit.freeze(
+                        _proposal, execution_id=_execution_id,
+                        next_snapshot=next_snapshot,
+                        parent_tip_id=block.header.previous_hash,
+                    )
+                    db.commit_prepared_block(
+                        execution_id=_prepared.execution_id,
+                        tip=block.block_hash,
+                        parent=block.header.previous_hash,
+                        journal_entries=[tau_commit._entry_row(e)
+                                         for e in _prepared.journal_delta],
+                        expected_journal_seq=_prepared.journal_base_seq,
+                        allocation_delta=_prepared.allocation,
+                        expected_epoch=_prepared.allocator_base_digest,
+                        journal_head=_prepared.journal_final_head,
+                        allocator_digest=_prepared.allocator_final_digest,
+                        plan_id=_prepared.representation_plan_id,
+                        plan_json=_prepared.representation_plan_json,
+                        spec_revision=_prepared.proposal_spec_revision,
+                        time_point=_prepared.proposal_time_point,
+                        # Journal-only, deliberately: the rebuild commits canonical
+                        # rows once, for the head it actually reached. Spelled out
+                        # so the commit-site audit can tell this from a site that
+                        # forgot them.
+                        canonical=None,
+                    )
+                    _owner.mark_unavailable(f"superseded by rebuilt block #{block_number}")
+                    _owner.promote(_proposal, _prepared)
+                    _sync_advisory_mirror(_prepared)
+                except Exception as e:
+                    _dispose_quietly(_proposal)
+                    print(f"[ERROR][chain_state] Could not commit rebuilt block #{block_number}: {e}")
+                    return RebuildResult(ok=False, stopped_at_block=block_number,
+                                         reason=f"commit failed: {e}")
+
             # 6. Atomically Replace In-Memory State
             with _balance_lock, _sequence_lock, _rules_lock:
                 _balances.clear()

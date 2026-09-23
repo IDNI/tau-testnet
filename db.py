@@ -778,6 +778,23 @@ def current_tip():
     return get_chain_state_value("canonical_head_hash", "") or None
 
 
+def reset_committed_journal() -> None:
+    """Forget the committed journal and its commit records, in one transaction.
+
+    For a full rebuild from genesis only: the journal is about to be re-derived
+    by replaying the stored blocks through the commit protocol. The allocator's
+    exact-id bindings are deliberately KEPT -- an id is never recycled, and a
+    replay that needs a value finds it bound where it always was.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        with _db_conn:
+            _db_conn.execute('DELETE FROM tau_journal_v1')
+            _db_conn.execute('DELETE FROM block_commits_v1')
+
+
 def commit_prepared_block(*, execution_id, tip, parent, journal_entries,
                           expected_journal_seq, allocation_delta, expected_epoch,
                           journal_head, allocator_digest, plan_id,

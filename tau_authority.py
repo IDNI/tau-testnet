@@ -119,6 +119,11 @@ class AuthoritativeTauOwner:
         with self._lock:
             self.state = UNAVAILABLE
             self.reason = reason
+            # An owner that is not serving describes nothing. Keeping the old
+            # descriptor would make the next start compare the committed journal
+            # against the evaluator it is rebuilding precisely because that
+            # evaluator is gone -- and refuse to rebuild.
+            self.descriptor = None
             if self._ready is not None:
                 try:
                     self._ready.clear()
@@ -441,7 +446,8 @@ class AuthoritativeTauOwner:
 
     # --- startup --------------------------------------------------------------
 
-    def initialize(self, *, baseline=None, cwd=None, env=None, genesis_hash=None):
+    def initialize(self, *, baseline=None, cwd=None, env=None, genesis_hash=None,
+                   rebuild_if_needed=False):
         """Make this node's authority worker-backed, from committed state alone.
 
         Three cases, decided by durable state and nothing else:
@@ -465,12 +471,15 @@ class AuthoritativeTauOwner:
             if latest is None:
                 if not tip or tip == genesis:
                     return self._commit_genesis(genesis, cwd=cwd, env=env)
-                self.mark_unavailable(
-                    "the chain has blocks the committed journal never recorded; "
-                    "its Tau state was built by the in-process interpreter. "
-                    "Rebuild from genesis to use worker-backed authority."
-                )
-                raise AuthorityMismatch(self.reason)
+                if not rebuild_if_needed:
+                    self.mark_unavailable(
+                        "the chain has blocks the committed journal never recorded; "
+                        "its Tau state was built by the in-process interpreter. "
+                        "Rebuild from genesis to use worker-backed authority "
+                        "(start once with TAU_REBUILD_JOURNAL=1)."
+                    )
+                    raise AuthorityMismatch(self.reason)
+                return self._rebuild_journal(cwd=cwd, env=env)
 
             try:
                 self.verify_committed_anchors()
@@ -479,7 +488,47 @@ class AuthoritativeTauOwner:
                 raise
             return self.reconstruct_from_committed(cwd=cwd, env=env)
 
-    def _commit_genesis(self, genesis_hash, *, cwd=None, env=None):
+    def _rebuild_journal(self, *, cwd=None, env=None):
+        """Derive the committed journal by replaying the stored blocks.
+
+        The one migration there is: explicit, requested by the operator, and
+        through the same commit protocol every live block takes. Afterwards the
+        anchors are verified like any other start.
+        """
+        import chain_state
+        import db as _db
+
+        logger.warning("rebuilding the committed journal from the stored blocks")
+        result = chain_state.rebuild_state_from_blockchain(start_block=0)
+        if not result.ok:
+            self.mark_unavailable(
+                f"journal rebuild stopped at block {result.stopped_at_block}: "
+                f"{result.reason}"
+            )
+            raise AuthorityMismatch(self.reason)
+        latest = _db.get_canonical_head_block()
+        if latest:
+            chain_state.commit_state_to_db(
+                latest["block_hash"], int(latest["header"]["block_number"]))
+        self.verify_committed_anchors()
+        return self._session
+
+    def rebuild_genesis(self, genesis_hash, *, cwd=None, env=None):
+        """Re-commit genesis at the start of a full rebuild.
+
+        The caller has already reset the committed journal and the genesis
+        globals. Canonical state is NOT written here: a rebuild commits it once,
+        at the end, for the head it actually replayed -- writing it now would put
+        the canonical head back at genesis in the middle of the rebuild.
+        """
+        with self._lock:
+            self.enabled = True
+            self.mark_unavailable("rebuilding from genesis")
+            return self._commit_genesis(genesis_hash, cwd=cwd, env=env,
+                                        persist_canonical=False)
+
+    def _commit_genesis(self, genesis_hash, *, cwd=None, env=None,
+                        persist_canonical=True):
         """The genesis rules become the first committed journal entries.
 
         Mirrors what the in-process startup did -- the same restore plan, in the
@@ -534,7 +583,7 @@ class AuthoritativeTauOwner:
         persisted = [u["text"] for u in units if u.get("persist")]
         for text in persisted:
             chain_state.save_effective_tau_spec(text)
-        if persisted:
+        if persisted and persist_canonical:
             chain_state.commit_state_to_db(genesis_hash or "", 0)
 
         entries = journal.entries()
