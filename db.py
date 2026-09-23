@@ -1778,8 +1778,11 @@ def _write_block_rows(cur, new_block) -> None:
     block whose evaluator history was never recorded, or the reverse.
     """
     block_data_json = json.dumps(new_block.to_dict())
+    # OR IGNORE: a block received from a peer is STORED by ingestion before fork
+    # choice decides to commit it, and a block's hash is its content -- the row
+    # already there is this block.
     cur.execute(
-        'INSERT INTO blocks (block_hash, block_number, previous_hash, timestamp, block_data) VALUES (?, ?, ?, ?, ?)',
+        'INSERT OR IGNORE INTO blocks (block_hash, block_number, previous_hash, timestamp, block_data) VALUES (?, ?, ?, ?, ?)',
         (
             new_block.block_hash,
             new_block.header.block_number,

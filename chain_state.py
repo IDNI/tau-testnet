@@ -2454,6 +2454,33 @@ def maybe_update_canonical_head() -> Optional[bool]:
             return reorg_to(best_hash)
     return None
 
+def _extend_through_commit_protocol(new_suffix, new_head_hash: str) -> bool:
+    """Commit blocks that extend the head, in order, through process_new_block.
+
+    Stops at the first block that does not commit; the blocks before it are
+    durable, and the head stays at the last of them. Returns True only when the
+    head reached `new_head_hash`.
+    """
+    import db
+    from block import Block, compute_tx_hash
+
+    applied = []
+    for block_hash in new_suffix:
+        data = db.get_block_by_hash(block_hash)
+        if data is None or not _process_new_block_locked(Block.from_dict(data)):
+            logger.error(
+                "[chain_state] extension to %s... stopped at %s...: the block did "
+                "not commit", new_head_hash[:16], block_hash[:16],
+            )
+            break
+        applied.append(data)
+    included = [compute_tx_hash(tx) for data in applied
+                for tx in (data.get("transactions") or []) if isinstance(tx, dict)]
+    if included:
+        db.remove_mempool_by_hashes(included)
+    return len(applied) == len(new_suffix)
+
+
 def reorg_to(new_head_hash: str) -> Optional[bool]:
     """Reorg the canonical head to `new_head_hash`.
 
@@ -2515,6 +2542,16 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 
     # Phase 3: Apply State Rebuild
     db.reset_mempool_reservations()
+
+    # A pure EXTENSION is not a reorg: nothing is rolled back. Every block a
+    # peer sends that builds on this head used to take the full rebuild below --
+    # which, with worker-backed authority, resets the committed journal and
+    # derives it again from genesis, for every received block, and leaves the
+    # committed metadata contradictory if the node dies part-way. Such a block is
+    # committed the way a locally built one is: one block, one prepared commit.
+    if not old_suffix and new_suffix and tau_authority.owner().enabled:
+        return _extend_through_commit_protocol(new_suffix, new_head_hash)
+
     rebuild = _rebuild_state_from_blockchain_internal(0, path_hashes=new_path)
 
     # Phase 3b: Abort guard (Bug B). If the replay failed, the in-memory state

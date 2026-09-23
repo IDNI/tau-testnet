@@ -233,3 +233,36 @@ def test_a_stale_loan_returned_late_does_not_take_the_authority_out_of_service(a
         current.dispose()
     # the CURRENT borrower's abandonment still does
     assert authority.state == auth.UNAVAILABLE
+
+
+# --- a block received from a peer --------------------------------------------------
+
+def test_a_received_extension_is_committed_not_rebuilt(authority):
+    """Every block a peer sends reaches chain_state through ingestion and fork
+    choice. For a block that simply extends the head, that meant a full rebuild
+    from genesis -- the committed journal reset and derived again, per block.
+    It is committed now the way a locally built block is, and only a real fork
+    rebuilds."""
+    from network.service import NetworkService
+
+    sk, pk = _sender("received")
+    assert _submit(sk, pk, {"0": HISTORY_RULE}).get("ok")
+    block, _, _, _ = _hold_candidate()
+    tc.registry().discard()                  # the receiving node built nothing
+    journal_before = db.committed_journal_entries()
+    served_before = authority.state
+
+    with patch.object(chain_state, "_rebuild_state_from_blockchain_internal",
+                      side_effect=AssertionError("an extension was rebuilt")):
+        ingested = NetworkService._ingest_blocks([block.to_dict()], "peer-x")
+    assert ingested == 1
+    head = db.get_canonical_head()
+    assert head["block_hash"] == block.block_hash, "the received block did not commit"
+    assert db.latest_block_commit()["tip"] == block.block_hash
+    after = db.committed_journal_entries()
+    assert after[:len(journal_before)] == journal_before, (
+        "the committed journal was rewritten, not extended"
+    )
+    assert len(after) > len(journal_before)
+    assert authority.state == auth.ACTIVE and served_before == auth.UNAVAILABLE, (
+        authority.state, served_before)
