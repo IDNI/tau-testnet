@@ -80,6 +80,25 @@ def configure(logging_settings: Optional[Any] = None, *, force: bool = True) -> 
         "app",
         "miner",
         "tau_native",
+        # The consensus engine and the authority stack. Logger names are
+        # dot-hierarchical, so "tau" does not cover "tau_authority": without
+        # these, a production node logged none of its authority lifecycle --
+        # genesis commit, reconstruction, loans, promotion -- below WARNING.
+        "consensus",
+        "tau_admission",
+        "tau_advisory",
+        "tau_allocator",
+        "tau_authority",
+        "tau_commit",
+        "tau_evaluator_state",
+        "tau_guard",
+        "tau_journal",
+        "tau_preflight",
+        "tau_proposal",
+        "tau_reconstruction",
+        "tau_session",
+        "tau_shrink",
+        "tau_speculation",
     ]
 
     for pattern in tau_logger_patterns:
