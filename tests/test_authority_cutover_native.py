@@ -501,7 +501,7 @@ def test_a_lost_journal_is_rebuilt_from_the_stored_blocks(authority, monkeypatch
 
     rebuilt, _ = _fresh_owner()
     auth.reset(rebuilt)
-    rebuilt.initialize(cwd=REPO, env=_env(), rebuild_if_needed=True)
+    rebuilt.initialize(cwd=REPO, env=_env(), rebuild=auth.REBUILD_MISSING)
     try:
         assert db.get_canonical_head()["block_hash"] == head_before
         assert db.latest_block_commit()["tip"] == head_before
