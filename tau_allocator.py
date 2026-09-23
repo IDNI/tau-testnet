@@ -98,6 +98,39 @@ class DbMappingSnapshot:
         return int(self._high_water)
 
 
+class PinnedDbMappingSnapshot:
+    """A read-through view of the committed mapping that STAYS where it was pinned.
+
+    `DbMappingSnapshot` reads the live table, which is right for a proposal --
+    it runs under the chain lock, so nothing commits underneath it -- and wrong
+    for anything that runs beside block production. There a block can commit
+    mid-evaluation and add bindings above the high-water mark this view minted
+    from; an overlay that had already handed the same number to a different value
+    would then see two values share one id, and every equality between them
+    answer true.
+
+    Committed ids only extend the table upward (publication refuses a moved
+    epoch, and mints above the high-water mark it was planned against), so the
+    pinned state is exactly the bindings at or below the pin.
+    """
+
+    def __init__(self, *, epoch, high_water: int, store=None):
+        import db as _db
+        self._db = store or _db
+        self.epoch = epoch
+        self._high_water = int(high_water)
+
+    def lookup(self, key: str):
+        found = self._db.lookup_shrink_id(key)
+        if found is None or int(found) > self._high_water:
+            return None
+        return int(found)
+
+    @property
+    def high_water(self) -> int:
+        return self._high_water
+
+
 @dataclass(frozen=True)
 class MappingSnapshot:
     """An immutable view of the committed mapping, pinned at an epoch."""

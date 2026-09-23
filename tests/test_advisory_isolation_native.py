@@ -192,11 +192,15 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
     Under worker-backed authority the in-process interpreter is an ADVISORY
     mirror. Every place that still steps it has to be one of:
 
-      advisory      admission estimates, previews, keeping the mirror current,
-                    and the header/eligibility fallbacks after the isolated
-                    evaluator -- none of them decide committed state;
+      advisory      previews, keeping the mirror current, and the
+                    header/eligibility fallbacks after the isolated evaluator --
+                    none of them decide committed state or an admission verdict;
       legacy        the path that exists for the mock/test configuration, and
-                    which refuses to run once the owner is enabled;
+                    which refuses to run -- or is routed around -- once the
+                    owner is enabled. Admission is here since Step 5F: with the
+                    owner enabled every request runs in its own context
+                    (tau_admission), and the in-process calls are the
+                    not-isolated branch only;
 
     and anything else is a new authoritative use of an interpreter that is not
     the authority. Moving startup and block application alone would not stop
@@ -205,24 +209,31 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
     import ast
 
     classified = {
-        # advisory: the mirror, never consulted by consensus
+        # advisory: the mirror, never consulted by consensus or admission
         ("chain_state.py", "_sync_advisory_mirror"),
         ("chain_state.py", "replay_tau_restore_plan"),
-        ("commands/sendtx.py", "queue_transaction"),
         ("commands/getapprovalpreview.py", "_step"),
         ("consensus/engine.py", "query_eligibility"),
         ("consensus/engine.py", "verify_block_header"),
-        # legacy: refuses to run under worker-backed authority
+        # legacy: refuses to run, or is routed around, under worker-backed
+        # authority
         ("chain_state.py", "tick_governance"),
         ("consensus/engine.py", "_apply_block"),
         ("commands/createblock.py", "execute_batch"),
+        ("commands/sendtx.py", "queue_transaction"),
+        ("commands/sendtx.py", "step_multi"),
         # the in-process session the not-enabled engine path uses
         ("tau_session.py", "apply_rule"),
         ("tau_session.py", "evaluate"),
     }
+    # The guard each legacy site must carry. Checked below: a site that stops
+    # carrying its guard is a new authoritative -- or admission -- use of an
+    # interpreter that is neither.
     legacy_guarded = {
         ("chain_state.py", "tick_governance"): "tau_authority.owner().enabled",
         ("consensus/engine.py", "_apply_block"): "proposal",
+        ("commands/sendtx.py", "queue_transaction"): "admission_tau.isolated",
+        ("commands/sendtx.py", "step_multi"): "if not self.isolated",
     }
 
     class _Sites(ast.NodeVisitor):
@@ -230,13 +241,17 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
         closure's call is not credited to (or excused by) the function around
         it."""
 
-        def __init__(self, rel):
+        def __init__(self, rel, source):
             self.rel = rel
+            self.source = source
             self.stack = []
             self.sites = set()
+            self.bodies = {}
 
         def _function(self, node):
             self.stack.append(node.name)
+            self.bodies.setdefault((self.rel, node.name), []).append(
+                ast.get_source_segment(self.source, node) or "")
             self.generic_visit(node)
             self.stack.pop()
 
@@ -252,16 +267,27 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
             self.generic_visit(node)
 
     found = set()
+    bodies = {}
     for rel in ("chain_state.py", "consensus/engine.py", "consensus/admission.py",
                 "commands/sendtx.py", "commands/createblock.py",
                 "commands/getapprovalpreview.py", "tau_session.py",
-                "tau_authority.py", "tau_commit.py", "tau_proposal.py"):
+                "tau_authority.py", "tau_commit.py", "tau_proposal.py",
+                "tau_admission.py"):
         path = os.path.join(REPO, rel)
         if not os.path.exists(path):
             continue
-        visitor = _Sites(rel)
-        visitor.visit(ast.parse(open(path).read()))
+        source = open(path).read()
+        visitor = _Sites(rel, source)
+        visitor.visit(ast.parse(source))
         found |= visitor.sites
+        bodies.update(visitor.bodies)
+
+    for site, guard in legacy_guarded.items():
+        if site not in found:
+            continue
+        assert any(guard in body for body in bodies.get(site, ())), (
+            f"{site} steps the in-process interpreter without its guard {guard!r}"
+        )
 
     unclassified = found - classified
     assert not unclassified, (
@@ -271,7 +297,8 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
 
     # the new modules must not step it at all
     for rel, _ in found:
-        assert rel not in ("tau_authority.py", "tau_commit.py", "tau_proposal.py"), (
+        assert rel not in ("tau_authority.py", "tau_commit.py", "tau_proposal.py",
+                           "tau_admission.py"), (
             f"{rel} steps the in-process interpreter; the authority and the commit "
             "protocol must only ever drive workers"
         )

@@ -5,6 +5,7 @@ import os
 from typing import Dict, List, Optional
 import db
 import tau_manager
+import tau_admission
 import tau_authority
 import tau_commit
 import tau_proposal
@@ -984,6 +985,9 @@ def _process_new_block_locked(block: Block) -> bool:
                         _owner.mark_unavailable(f"promotion failed: {exc}")
                         _dispose_quietly(_proposal)
                     _sync_advisory_mirror(_prepared)
+                    # A context pre-built for admission describes the state
+                    # before this block. Best effort; never raises.
+                    tau_admission.committed()
                 else:
                     logger.info(
                         "[BLOCKCHAIN] block #%s was already committed (%s)",
