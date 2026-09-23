@@ -93,6 +93,22 @@ class RepresentationPlan:
         """Streams the optimizer must leave alone under this plan."""
         return frozenset(self.plain)
 
+    def to_json(self) -> str:
+        import json
+        return json.dumps({"width": self.width, "interned": sorted(self.interned),
+                           "plain": sorted(self.plain)}, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, text: str) -> "RepresentationPlan":
+        """Rebuild a stored plan, refusing one whose contents do not hash to the
+        id it was stored under -- a plan is only worth storing if it cannot drift
+        from the record that names it."""
+        import json
+        data = json.loads(text)
+        return cls(width=int(data["width"]),
+                   interned=frozenset(int(x) for x in data.get("interned", ())),
+                   plain=frozenset(int(x) for x in data.get("plain", ())))
+
 
 def plan_representation(*, history_rules=(), candidate_rules=(), width=None):
     """Choose ONE representation for committed history and the candidate together.

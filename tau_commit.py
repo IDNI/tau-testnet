@@ -119,6 +119,8 @@ class PreparedBlockCommit:
     allocator_final_digest: str | None = None
 
     representation_plan_id: str | None = None
+    #: The plan's contents, so the commit can store exactly what ran.
+    representation_plan_json: str | None = None
 
     worker: object = None
     worker_session_revision: int | None = None
@@ -177,6 +179,8 @@ class PreparedBlockCommit:
             allocator_final_digest=_allocator_digest(base_digest, delta),
             representation_plan_id=(proposal.plan.plan_id
                                     if proposal.plan is not None else None),
+            representation_plan_json=(proposal.plan.to_json()
+                                      if proposal.plan is not None else None),
             worker=session,
             worker_session_revision=state.get("session_revision"),
             proposal_time_point=state.get("time_point"),
@@ -633,6 +637,7 @@ class PreparedCommitCoordinator:
             spec_revision=prepared.proposal_spec_revision,
             time_point=prepared.proposal_time_point,
             canonical=canonical,
+            plan_json=prepared.representation_plan_json,
         )
 
         if not outcome.get("committed"):

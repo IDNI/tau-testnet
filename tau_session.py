@@ -407,9 +407,16 @@ class WorkerSession(EvaluatorSession):
             # canonical text in the record, runtime payload only inside the
             # identity: ids are private to an allocation context, so runtime text
             # is not a portable name for anything
+            # `result` is the revision's OUTPUTS, the same thing `reconstruct`
+            # compares against. Recording only the outcome fingerprinted
+            # f(outputs=None, outcome) while replay checked f(outputs, outcome),
+            # so a journal written by this method could never be verified by
+            # this module's own reconstruction -- invisible until the journal
+            # became the thing a restarted node is rebuilt from.
             self.journal.record(tau_journal.REVISION,
                                 phase=tau_journal.PHASE_SPECULATIVE,
                                 rule_text=rule_text, target=target, outcome=outcome,
+                                result=receipt.get("outputs"),
                                 identity=identity, accumulate=accumulate)
         return "ok" if accepted else f"error: {outcome}"
 

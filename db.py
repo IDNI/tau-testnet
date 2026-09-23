@@ -251,6 +251,12 @@ def init_db():
                     journal_head TEXT,
                     allocator_digest TEXT,
                     plan_id      TEXT,
+                    -- The representation the committed journal was executed
+                    -- under. Stored rather than re-derived: a proposal plans over
+                    -- the candidates it CONSIDERED, rejected ones included, so a
+                    -- plan derived later from committed history alone can differ
+                    -- from the one that actually ran.
+                    plan_json    TEXT,
                     spec_revision INTEGER,
                     time_point   INTEGER,
                     committed_at INTEGER NOT NULL
@@ -727,22 +733,54 @@ def find_block_commit(execution_id: str):
         cur = _db_conn.cursor()
         cur.execute(
             'SELECT execution_id, tip, parent, journal_head, allocator_digest, '
-            'plan_id, spec_revision, time_point, committed_at '
+            'plan_id, plan_json, spec_revision, time_point, committed_at '
             'FROM block_commits_v1 WHERE execution_id = ?', (execution_id,)
         )
         row = cur.fetchone()
     if row is None:
         return None
     keys = ("execution_id", "tip", "parent", "journal_head", "allocator_digest",
-            "plan_id", "spec_revision", "time_point", "committed_at")
+            "plan_id", "plan_json", "spec_revision", "time_point",
+            "committed_at")
     return dict(zip(keys, row))
+
+
+def latest_block_commit():
+    """The most recent commit record, or None.
+
+    The durable statement of what the node last committed. Startup checks the
+    journal, the allocator and the tip against it before publishing readiness.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT execution_id, tip, parent, journal_head, allocator_digest, '
+            'plan_id, plan_json, spec_revision, time_point, committed_at '
+            'FROM block_commits_v1 ORDER BY committed_at DESC, rowid DESC LIMIT 1'
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    keys = ("execution_id", "tip", "parent", "journal_head", "allocator_digest",
+            "plan_id", "plan_json", "spec_revision", "time_point",
+            "committed_at")
+    return dict(zip(keys, row))
+
+
+def current_tip():
+    """The canonical head hash, or None. Named for the commit protocol."""
+    return get_chain_state_value("canonical_head_hash", "") or None
 
 
 def commit_prepared_block(*, execution_id, tip, parent, journal_entries,
                           expected_journal_seq, allocation_delta, expected_epoch,
                           journal_head, allocator_digest, plan_id,
                           spec_revision=None, time_point=None,
-                          canonical=None, timestamp=None) -> dict:
+                          canonical=None, block=None, plan_json=None,
+                          timestamp=None) -> dict:
     """The irreversible step, as ONE transaction.
 
     Canonical snapshot, journal delta, exact-id allocator delta, commit record
@@ -763,13 +801,13 @@ def commit_prepared_block(*, execution_id, tip, parent, journal_entries,
         cur = _db_conn.cursor()
         existing = cur.execute(
             'SELECT execution_id, tip, parent, journal_head, allocator_digest, '
-            'plan_id, spec_revision, time_point, committed_at '
+            'plan_id, plan_json, spec_revision, time_point, committed_at '
             'FROM block_commits_v1 WHERE execution_id = ?', (execution_id,)
         ).fetchone()
         if existing is not None:
             keys = ("execution_id", "tip", "parent", "journal_head",
-                    "allocator_digest", "plan_id", "spec_revision", "time_point",
-                    "committed_at")
+                    "allocator_digest", "plan_id", "plan_json", "spec_revision",
+                    "time_point", "committed_at")
             return {"committed": False, "already": dict(zip(keys, existing))}
 
         with _db_conn:  # ONE transaction for everything below
@@ -808,15 +846,19 @@ def commit_prepared_block(*, execution_id, tip, parent, journal_entries,
             if allocation_delta:
                 _publish_shrink_rows(cur, dict(allocation_delta), expected_epoch)
 
+            if block is not None:
+                _write_block_rows(cur, block)
+
             if canonical:
                 _write_canonical_state_rows(**canonical)
 
             cur.execute(
                 'INSERT INTO block_commits_v1 (execution_id, tip, parent, '
-                'journal_head, allocator_digest, plan_id, spec_revision, '
-                'time_point, committed_at) VALUES (?,?,?,?,?,?,?,?,?)',
+                'journal_head, allocator_digest, plan_id, plan_json, '
+                'spec_revision, time_point, committed_at) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?)',
                 (execution_id, tip, parent, journal_head, allocator_digest,
-                 plan_id, spec_revision, time_point,
+                 plan_id, plan_json, spec_revision, time_point,
                  int(timestamp if timestamp is not None else _time.time())),
             )
 
@@ -1649,6 +1691,36 @@ def clear_mempool():
         cur.execute('DELETE FROM mempool')
         _db_conn.commit()
         logger.info("Mempool cleared.")
+
+def _write_block_rows(cur, new_block) -> None:
+    """The block row and its tx index, WITHOUT a transaction of its own.
+
+    Callers own the transaction. `add_block` gives it one; the block commit puts
+    these rows in the same transaction as the canonical snapshot, the journal
+    delta, the allocator delta and the commit record -- so a crash cannot leave a
+    block whose evaluator history was never recorded, or the reverse.
+    """
+    block_data_json = json.dumps(new_block.to_dict())
+    cur.execute(
+        'INSERT INTO blocks (block_hash, block_number, previous_hash, timestamp, block_data) VALUES (?, ?, ?, ?, ?)',
+        (
+            new_block.block_hash,
+            new_block.header.block_number,
+            new_block.header.previous_hash,
+            new_block.header.timestamp,
+            block_data_json,
+        )
+    )
+    tx_hashes = getattr(new_block, "tx_ids", None) or [
+        block_module.compute_tx_hash(tx)
+        for tx in (getattr(new_block, "transactions", None) or [])
+    ]
+    for th in tx_hashes:
+        cur.execute(
+            'INSERT OR IGNORE INTO tx_index (tx_hash, block_hash, block_number) VALUES (?, ?, ?)',
+            (th, new_block.block_hash, new_block.header.block_number),
+        )
+
 
 def add_block(new_block: block_module.Block):
     """Adds a new block to the database."""
