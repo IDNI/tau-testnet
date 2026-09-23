@@ -291,6 +291,9 @@ def test_a_failed_promotion_leaves_the_block_committed_and_nothing_served(author
         return prepared
 
     def _die(self, proposal, prepared):
+        # Past the durable commit, so stepping the proposal worker here cannot
+        # change what was committed; it records what that exact worker answers.
+        evaluated["continuation"] = _continue(prepared.worker)
         raise RuntimeError("the worker died between commit and promotion")
 
     with patch.object(tc.PreparedBlockCommit, "freeze", classmethod(_capture)), \
@@ -312,6 +315,11 @@ def test_a_failed_promotion_leaves_the_block_committed_and_nothing_served(author
     st = rebuilt._spec.state()
     assert (st["spec_revision"], st["time_point"]) == \
         (evaluated["state"]["spec_revision"], evaluated["state"]["time_point"])
+    # 8. and it answers exactly as the proposal worker that computed the block
+    assert _continue(rebuilt) == evaluated["continuation"], (
+        "the evaluator rebuilt from the committed journal answers differently "
+        "from the worker that computed the committed state"
+    )
 
 
 # --- idempotent reprocessing --------------------------------------------------
@@ -321,18 +329,22 @@ def test_reprocessing_the_same_block_applies_nothing_twice(authority):
     assert _submit(sk, pk, {"1": [[pk, "aa" * 48, "9"]]}).get("ok")
     _mine()
     head = db.get_canonical_head()
-    snapshot = (db.committed_journal_head(), db.get_max_shrink_id(),
+    def _observe():
+        return (db.committed_journal_head(), db.get_max_shrink_id(),
                 db.shrink_mapping_epoch(), dict(chain_state._balances),
-                dict(chain_state._sequence_numbers))
+                dict(chain_state._sequence_numbers),
+                chain_state._lifecycle_manager.consensus_meta_hash(),
+                db.latest_block_commit()["execution_id"],
+                authority.descriptor.journal_head_hash)
+
+    snapshot = _observe()
 
     from block import Block
     chain_state.process_new_block(Block.from_dict(head))
 
-    assert (db.committed_journal_head(), db.get_max_shrink_id(),
-            db.shrink_mapping_epoch(), dict(chain_state._balances),
-            dict(chain_state._sequence_numbers)) == snapshot, (
+    assert _observe() == snapshot, (
         "reprocessing a committed block changed the journal, the mapping, "
-        "balances or sequences"
+        "balances, sequences, lifecycle state, the commit record or the authority"
     )
 
 
@@ -501,3 +513,36 @@ def test_a_lost_journal_is_rebuilt_from_the_stored_blocks(authority, monkeypatch
         assert _continue(rebuilt.current()) == continuation_before
     finally:
         rebuilt.dispose()
+
+
+
+# --- stale artifact -----------------------------------------------------------
+
+def test_an_artifact_for_a_different_block_is_never_reused(authority):
+    """An artifact offered for one execution must not be committed for another,
+    and its worker must not be partially reused: the block is evaluated in a
+    proposal of its own, and the stale artifact is left for its own execution
+    (and disposed by the next offer)."""
+    sk, pk = _sender("stale_art")
+    assert _submit(sk, pk, {"0": HISTORY_RULE}).get("ok")
+
+    offered = {}
+    real_offer = tc.ProposalRegistry.offer
+
+    def _mislabel(self, key, prepared, proposal):
+        # the artifact arrives keyed to some OTHER execution
+        offered["worker"] = prepared.worker
+        return real_offer(self, "not-this-block", prepared, proposal)
+
+    with patch.object(tc.ProposalRegistry, "offer", _mislabel):
+        _mine()
+
+    head = db.get_canonical_head()
+    assert db.latest_block_commit()["tip"] == head["block_hash"]
+    assert authority.state == auth.ACTIVE
+    assert authority.current() is not offered["worker"], (
+        "the stale artifact's worker was promoted for a block it did not describe"
+    )
+    assert tc.registry().pending == "not-this-block", (
+        "the stale artifact was consumed by the wrong block"
+    )
