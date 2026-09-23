@@ -506,8 +506,14 @@ def start_and_manage_tau_process():
                 _state_restore_callback()
                 logger.info("State restore callback completed successfully.")
             except Exception as e:
-                logger.error("State restore callback failed in Direct Mode: %s", e)
-                pass
+                # Fail closed. A restore that did not complete leaves an
+                # interpreter that describes some other state; publishing
+                # readiness for it is how a node answers for a chain it never
+                # loaded. Readiness stays down and startup reports it.
+                logger.critical("State restore callback failed in Direct Mode: %s", e)
+                while not server_should_stop.is_set():
+                    time.sleep(0.05)
+                return
 
         tau_ready.set()
         
@@ -516,13 +522,14 @@ def start_and_manage_tau_process():
             
         logger.info("Server shutdown requested, Tau manager exiting (Direct Mode).")
     except Exception as e:
+        # Fail closed. This used to switch the node into MOCK mode and publish
+        # readiness -- a production node with a broken native binding went on
+        # accepting transactions against fabricated Tau verdicts. Mock execution
+        # is only ever the explicitly requested test configuration.
         logger.critical(f"Failed to initialize Tau Native Interface: {e}")
-        tau_test_mode = True
-        tau_process_ready.set()
-        tau_ready.set()
         while not server_should_stop.is_set():
             time.sleep(0.05)
-        logger.info("Server shutdown requested, Tau manager exiting (Fallback Test Mode).")
+        logger.info("Server shutdown requested, Tau manager exiting (native init failed).")
         return
 
 

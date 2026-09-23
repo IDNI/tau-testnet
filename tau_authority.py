@@ -633,6 +633,30 @@ class AuthoritativeTauOwner:
                 "commit": latest}
 
 
+def program_baseline():
+    """The interpreter's starting spec: the program file the node boots from.
+
+    One definition for everything that builds an evaluator from scratch -- the
+    owner's genesis commit, its reconstruction and every proposal -- because
+    two slightly different baselines would be two different starting states.
+    """
+    import os as _os
+
+    import config
+
+    path = getattr(config, "TAU_PROGRAM_FILE", None) or "genesis.tau"
+    if not _os.path.isabs(path):
+        path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), path)
+    try:
+        with open(path) as fh:
+            text = fh.read().strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    return text if text.lstrip().startswith("always") else f"always ( {text} )."
+
+
 _owner = None
 
 

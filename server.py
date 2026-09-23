@@ -690,6 +690,30 @@ def _run_server(container: ServiceContainer):
     logger.info("Initializing and loading chain state...")
     chain_state_module.initialize_persistent_state()
 
+    # Worker-backed authority whenever native Tau is expected -- i.e. unless the
+    # mock configuration was explicitly requested. The authoritative evaluator is
+    # reconstructed from the COMMITTED journal and verified against every
+    # committed anchor before anything is served; on a fresh chain the genesis
+    # rules become the first journal entries. A mismatch refuses to start rather
+    # than falling back to the in-process restore: that fallback is the second
+    # source of evaluator truth this exists to remove.
+    import tau_authority
+    authority_enabled = not tau_module.is_force_test_enabled()
+    if authority_enabled:
+        baseline = tau_authority.program_baseline()
+        if not baseline:
+            raise ConfigurationError(
+                f"Tau program file '{config.TAU_PROGRAM_FILE}' is empty or unreadable."
+            )
+        logger.info("Initializing the authoritative evaluator from the committed journal...")
+        try:
+            tau_authority.owner().initialize(baseline=baseline)
+        except Exception as exc:
+            raise TauEngineCrash(
+                f"The authoritative evaluator could not be initialized: {exc}"
+            ) from exc
+        logger.info("Authoritative evaluator ready (%s).", tau_authority.owner().state)
+
     # Define the State Restore Callback
     # This will be called by the Tau Manager thread whenever the process comes up (fresh or restart)
     def _restore_callback():
@@ -726,7 +750,10 @@ def _run_server(container: ServiceContainer):
                     restore_plan, source_prefix="startup"
                 )
 
-                if persist_needed:
+                if persist_needed and not authority_enabled:
+                    # With worker-backed authority the in-process interpreter is
+                    # an advisory mirror; canonical state is written by the
+                    # commit protocol and by nothing else.
                     latest = db_module.get_canonical_head_block()
                     latest_hash = ""
                     latest_num = 0
@@ -744,8 +771,11 @@ def _run_server(container: ServiceContainer):
     # Register the callback BEFORE starting the manager
     tau_module.set_state_restore_callback(_restore_callback)
     
-    # Register Rules Handler to persist updates from Tau to DB
-    tau_module.set_rules_handler(chain_state_module.save_effective_tau_spec)
+    # Register Rules Handler to persist updates from Tau to DB -- only when the
+    # in-process interpreter IS the authority. As an advisory mirror it must not
+    # be able to write canonical state, even by accident.
+    if not authority_enabled:
+        tau_module.set_rules_handler(chain_state_module.save_effective_tau_spec)
 
     logger.info("Starting Tau Process Manager Thread...")
     manager_thread = threading.Thread(target=tau_module.start_and_manage_tau_process, daemon=True)

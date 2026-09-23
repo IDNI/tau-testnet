@@ -255,19 +255,9 @@ def _restore_per_sender_sequence_order(transactions, execution_transactions, res
 
 
 def _program_baseline():
-    """The interpreter's starting spec: the program file the node boots from."""
-    import os as _os
-    path = getattr(config, "TAU_PROGRAM_FILE", None) or "genesis.tau"
-    if not _os.path.isabs(path):
-        path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), path)
-    try:
-        with open(path) as fh:
-            text = fh.read().strip()
-    except Exception:
-        return None
-    if not text:
-        return None
-    return text if text.lstrip().startswith("always") else f"always ( {text} )."
+    """The interpreter's starting spec. See tau_authority.program_baseline."""
+    import tau_authority
+    return tau_authority.program_baseline()
 
 
 def _speculative_proposal(candidate_rules=()):
