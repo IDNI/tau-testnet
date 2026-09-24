@@ -100,7 +100,9 @@ locality rule below differ.
 
 The WebSocket listener scans `65433`–`65442` for the first free port, so on a
 host already running a node the browser wallet may need a port other than the
-default. It also enforces an `Origin` allowlist: missing/`null` origins and
+default. The node binds its libp2p listener first, and both scans (the TCP
+one from `65432`) skip its ports: a p2p port inside either range moves the
+WebSocket or TCP listener, never the p2p one. It also enforces an `Origin` allowlist: missing/`null` origins and
 anything containing `localhost` or `127.0.0.1` pass, otherwise the origin must
 match an entry in the comma-separated `TAU_WS_ALLOWED_ORIGINS` (`*` allows
 all). A rejected connection gets the plain-text `error disallowed_origin` and

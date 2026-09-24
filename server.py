@@ -12,7 +12,7 @@ import subprocess
 
 
 from app.container import ServiceContainer
-from network import NetworkService
+from network import NetworkListenError, NetworkService
 
 # Project modules
 import config
@@ -269,12 +269,37 @@ def process_command(raw_command: str, container: ServiceContainer, client_label:
 
 
 # --- NetworkService helpers ---
-def _start_network_background(container: ServiceContainer) -> None:
+# How long the main thread waits for the libp2p listener before it starts the
+# WebSocket and RPC servers regardless.
+_NETWORK_LISTEN_WAIT = 30.0
+
+
+class _NetworkStartup:
+    """How NetworkService.start() went on the network thread, for the main thread."""
+
+    def __init__(self, configured_addrs) -> None:
+        self._done = threading.Event()
+        self.configured_addrs = list(configured_addrs)
+        self.listen_addrs = []
+        self.error = None
+
+    def finish(self, *, listen_addrs=(), error=None) -> None:
+        self.listen_addrs = list(listen_addrs)
+        self.error = error
+        self._done.set()
+
+    def wait(self, timeout: float) -> bool:
+        return self._done.wait(timeout)
+
+
+def _start_network_background(container: ServiceContainer) -> _NetworkStartup:
     """
-    Start NetworkService in a dedicated Trio thread.
+    Start NetworkService in a dedicated Trio thread. The returned handle says
+    when start() has returned (libp2p listening) or failed.
     """
     global NETWORK_THREAD
     cfg = container.build_network_config()
+    startup = _NetworkStartup(cfg.listen_addrs)
 
     def _runner():
         service = NetworkService(cfg)
@@ -288,7 +313,16 @@ def _start_network_background(container: ServiceContainer) -> None:
             container.chain_state.set_dht_client(service._dht_manager)
             
         async def main() -> None:
-            await service.start()
+            try:
+                await service.start()
+            except NetworkListenError as exc:
+                # Fatal, and reported by the main thread; nothing to unwind here.
+                startup.finish(error=exc)
+                return
+            except BaseException as exc:
+                startup.finish(error=exc)
+                raise
+            startup.finish(listen_addrs=service.listen_addrs())
             
             # Re-set DHT client to trigger hydration now that DHT is fully initialized
             if hasattr(container.chain_state, "set_dht_client"):
@@ -305,6 +339,47 @@ def _start_network_background(container: ServiceContainer) -> None:
     t = threading.Thread(target=_runner, name="NetworkServiceThread", daemon=True)
     t.start()
     NETWORK_THREAD = t
+    return startup
+
+
+def _tcp_ports(addrs) -> set:
+    ports = set()
+    for addr in addrs:
+        try:
+            port = int(addr.value_for_protocol("tcp"))
+        except Exception:
+            continue
+        if port:
+            ports.add(port)
+    return ports
+
+
+def _await_network_listening(startup: _NetworkStartup, timeout: float = _NETWORK_LISTEN_WAIT) -> frozenset:
+    """
+    Block until libp2p has bound its listen addresses; return their TCP ports.
+
+    The WebSocket and RPC servers each take the first free port upward from
+    PORT+1 / PORT. Started first, either could take the p2p port: libp2p then
+    had no listener, yet the node advertised that port, and every peer's dial
+    reached the WebSocket server ("failed to negotiate the secure protocol").
+    Binding libp2p first settles an exact collision; the scans must still skip
+    these ports, because on macOS a wildcard and a specific bind of one port
+    coexist.
+
+    Raises ConfigurationError when libp2p bound none of its addresses.
+    """
+    if not startup.wait(timeout):
+        logger.warning(
+            "NetworkService did not report listening within %.0fs; starting RPC/WS anyway.",
+            timeout,
+        )
+    elif isinstance(startup.error, NetworkListenError):
+        raise ConfigurationError(
+            f"{startup.error}. Point TAU_NETWORK_LISTEN at a free address."
+        ) from startup.error
+    elif startup.error is not None:
+        logger.error("NetworkService failed to start: %r", startup.error)
+    return frozenset(_tcp_ports(startup.configured_addrs) | _tcp_ports(startup.listen_addrs))
 
 
 # --- WebSocket Server ---
@@ -419,9 +494,10 @@ async def websocket_handler(request):
         logger.info("WS Client disconnected: %s", client_label)
 
 
-def _start_websocket_server(container: ServiceContainer) -> None:
+def _start_websocket_server(container: ServiceContainer, reserved_ports=frozenset()) -> None:
     """
-    Starts the Trio WebSocket server in a separate daemon thread.
+    Starts the Trio WebSocket server in a separate daemon thread. Its port scan
+    skips `reserved_ports` (the libp2p listen ports).
     """
     def _ws_runner():
         ws_port = config.PORT + 1
@@ -483,6 +559,9 @@ def _start_websocket_server(container: ServiceContainer) -> None:
             async with trio.open_nursery() as handler_n:
                 for i in range(10):
                     p = actual_ws_port + i
+                    if p in reserved_ports:
+                        logger.warning("WS Port %s is the libp2p listen port, trying next...", p)
+                        continue
                     try:
                         logger.info("Attempting to bind %s to %s:%s", scheme, config.HOST, p)
                         # serve_websocket blocks until cancelled.
@@ -663,6 +742,18 @@ def handle_client(conn, addr, container: ServiceContainer):
 
 
 # --- Main Server Execution ---
+def _start_network_and_websocket(container: ServiceContainer) -> frozenset:
+    """Start the NetworkService, then the WebSocket server. Returns the libp2p
+    ports, which the RPC port scan must skip as well."""
+    logger.info("Starting NetworkService background thread...")
+    # libp2p binds before the WebSocket and RPC servers scan for their ports.
+    p2p_ports = _await_network_listening(_start_network_background(container))
+
+    logger.info("Starting WebSocket Server background thread...")
+    _start_websocket_server(container, p2p_ports)
+    return p2p_ports
+
+
 def _run_server(container: ServiceContainer):
     """Runs the main server loop. The caller is responsible for exception handling."""
     logger.info("Bootstrapping server in '%s' environment", container.settings.env)
@@ -798,12 +889,7 @@ def _run_server(container: ServiceContainer):
     
     # (Removed old restore logic block here as it's now handled by the callback)
 
-    logger.info("Starting NetworkService background thread...")
-    _start_network_background(container)
-
-    # Start WebSocket Server
-    logger.info("Starting WebSocket Server background thread...")
-    _start_websocket_server(container)
+    p2p_ports = _start_network_and_websocket(container)
 
     # Start Miner if configured
     if container.miner:
@@ -821,8 +907,11 @@ def _run_server(container: ServiceContainer):
 
         max_port_attempts = 10
         for port_offset in range(max_port_attempts):
+            test_port = config.PORT + port_offset
+            if test_port in p2p_ports:
+                logger.warning("Port %s:%s is the libp2p listen port, trying next port...", config.HOST, test_port)
+                continue
             try:
-                test_port = config.PORT + port_offset
                 server_socket.bind((config.HOST, test_port))
                 actual_port = test_port
                 break

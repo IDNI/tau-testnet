@@ -10,7 +10,7 @@ from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo
 
 from .config import NetworkConfig
-from .host import HostManager
+from .host import HostManager, NetworkListenError
 from .dht_manager import DHTManager
 from .discovery import DiscoveryManager
 from .gossip import GossipManager
@@ -570,6 +570,10 @@ class NetworkService:
         # fetch listen addrs and dial immediately (tests rely on this).
         try:
             await self._host_manager.wait_listening(timeout=5.0)
+        except NetworkListenError:
+            # Nothing bound: a node nobody can dial must not look started.
+            self._runner_stop.set()
+            raise
         except Exception:
             logger.debug("NetworkService: timed out waiting for host to start listening", exc_info=True)
 
@@ -1542,6 +1546,10 @@ class NetworkService:
 
     def get_connected_peers(self):
         return self._host_manager.get_connected_peers()
+
+    def listen_addrs(self) -> List[Any]:
+        """Addresses the libp2p listener actually holds, ports resolved."""
+        return self._host_manager.listen_addrs
 
     # Proxies for internal attributes used by tests
     @property
