@@ -17,6 +17,9 @@ import pytest
 from tau_testnet_cli import cli, keys as keys_mod, tx as tx_mod
 
 
+# A canned getsequence answer carries tip_height, as a node's does: without it
+# the CLI takes the node for one too old to report the tip, asks getblocks as
+# well, and that extra call takes the response queued for sendtx.
 def _run_cli(argv, *, send_responses=None, recorded=None):
     responses = list(send_responses or [])
 
