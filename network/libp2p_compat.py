@@ -15,7 +15,8 @@ API surface lands incrementally per the unification plan
 (`.claude/plans/we-need-to-unify-cozy-corbato.md`):
 - A2 — identity adapters
 - A3 — host lifecycle (NetworkNotifee, PeerstorePersistence, build_tau_resource_manager,
-        attach_resource_manager, collect_listen_addrs, wait_for_listening)
+        attach_resource_manager, collect_listen_addrs, wait_for_listening,
+        split_listen_outcome, describe_bind_failure)
 - A4 — discovery (ensure_peer_id, seed_peerstore)
 - A5 — stream primitives (bounded_stream_read, close_stream_safely)
 - A6 — DHT validator wrap (install_validating_dht)
@@ -25,7 +26,7 @@ API surface lands incrementally per the unification plan
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import multiaddr
 import nacl.utils
@@ -285,6 +286,71 @@ async def wait_for_listening(host: IHost, *, timeout: float = 5.0) -> List[multi
             if addrs:
                 return addrs
             await trio.sleep(0.05)
+
+
+def split_listen_outcome(
+    host: IHost, configured: Iterable[multiaddr.Multiaddr]
+) -> Tuple[List[multiaddr.Multiaddr], List[multiaddr.Multiaddr]]:
+    """Return `(bound, unbound)` once `host.run(configured)` has been entered.
+
+    `bound` holds the observed listen addrs (real ports, so `/tcp/0` resolves);
+    `unbound` holds the configured addrs libp2p has no socket for.
+
+    py-libp2p swallows a failed bind: `Swarm.listen` catches the OSError and logs
+    it at DEBUG on the libp2p logger (which drops records unless LIBP2P_DEBUG is
+    set), and `BasicHost.run` ignores `listen()` returning False. A node whose
+    port was taken therefore runs with no listener, and dials to that port reach
+    whatever process does hold it.
+
+    Swarm keeps one listener per configured addr in `network.listeners`, keyed by
+    `str(maddr)`, including the ones that failed to bind.
+    """
+    configured = list(configured)
+    listeners = getattr(host.get_network(), "listeners", None)
+    if not isinstance(listeners, dict):
+        # Unknown shape: all or nothing on what is observable.
+        bound = collect_listen_addrs(host)
+        return bound, ([] if bound else configured)
+    bound: List[multiaddr.Multiaddr] = []
+    unbound: List[multiaddr.Multiaddr] = []
+    for addr in configured:
+        listener = listeners.get(str(addr))
+        try:
+            got = list(listener.get_addrs() or []) if listener is not None else []
+        except Exception:
+            got = []
+        if got:
+            bound.extend(_strip_p2p_suffix(a) for a in got)
+        else:
+            unbound.append(addr)
+    return bound, unbound
+
+
+def describe_bind_failure(addr: multiaddr.Multiaddr) -> str:
+    """Best-effort reason a TCP listen addr did not bind, for the error log.
+
+    libp2p discards the OSError, so repeat the bind trio made (same
+    SO_REUSEADDR) and report what the OS says, e.g. "Address already in use".
+    """
+    import socket
+    import sys
+
+    from libp2p.utils.multiaddr_utils import extract_ip_from_multiaddr
+
+    try:
+        port = int(addr.value_for_protocol("tcp"))
+    except Exception:
+        return "libp2p did not report why"
+    ip = extract_ip_from_multiaddr(addr) or ""
+    family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            if sys.platform != "win32":
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind((ip, port))
+    except OSError as exc:
+        return exc.strerror or str(exc)
+    return "the address binds now, so the conflict was transient"
 
 
 def ensure_peer_id(peer_id: Any) -> ID:
@@ -618,6 +684,8 @@ __all__ = [
     "attach_resource_manager",
     "collect_listen_addrs",
     "wait_for_listening",
+    "split_listen_outcome",
+    "describe_bind_failure",
     "seed_peerstore_persisted",
     # Discovery (A4)
     "ensure_peer_id",

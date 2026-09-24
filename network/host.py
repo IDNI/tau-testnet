@@ -14,8 +14,10 @@ from .libp2p_compat import (
     PeerstorePersistence,
     attach_resource_manager,
     build_tau_resource_manager,
+    describe_bind_failure,
     keypair_from_seed,
     seed_peerstore_persisted,
+    split_listen_outcome,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,10 @@ logger = logging.getLogger(__name__)
 _NetworkNotifee = NetworkNotifee
 
 
+class NetworkListenError(RuntimeError):
+    """libp2p holds a socket for none of the configured listen addresses."""
+
+
 class HostManager:
     def __init__(self, config: NetworkConfig, event_callback=None) -> None:
         self._config = config
@@ -33,10 +39,12 @@ class HostManager:
         self._host_context: Optional[Any] = None
         self._peerstore_persist = PeerstorePersistence(config.peerstore_path)
         self._notifee = NetworkNotifee(event_callback)
-        # Set once the libp2p host has actually entered its listening context.
+        # Set once host.run() has attempted every listen addr, bound or not.
         # `NetworkService.start()` should not return "ready" until this is set,
         # otherwise callers may see `/tcp/0` or empty addrs and fail to connect.
-        self._listening = trio.Event()
+        self._listen_settled = trio.Event()
+        self._listen_error: Optional[NetworkListenError] = None
+        self._bound_addrs: List[Any] = []
 
     async def set_host(self, host: IHost, context: Any) -> None:
         """Sets the host instance (created externally or by a factory)."""
@@ -84,26 +92,34 @@ class HostManager:
     async def run_loop(self) -> None:
         if self._host is None:
             return
-        async with self._host.run(self._config.listen_addrs):
-            try:
-                listen_addrs = getattr(self._host.get_network(), "listen_addrs", None)
-                # Logging-only fallback: some libp2p shims expose `listen_addrs`
-                # but keep it empty even when the host is actually listening. Fall
-                # back to the configured addrs so the log line is useful. Callers
-                # that need observed addrs should use libp2p_compat.collect_listen_addrs.
-                if not listen_addrs:
-                    listen_addrs = self._config.listen_addrs
-                listen_strs = [str(a) for a in (listen_addrs or [])]
-            except Exception:
-                listen_strs = [str(a) for a in self._config.listen_addrs]
+        configured = list(self._config.listen_addrs)
+        async with self._host.run(configured):
+            # host.run() does not fail when a bind does: libp2p drops the error
+            # (see split_listen_outcome). Judge by what is actually bound; the
+            # configured addrs prove nothing. Logging them is how a node whose
+            # own WebSocket server held its p2p port looked healthy while every
+            # peer's dial reached that server.
+            bound, unbound = split_listen_outcome(self._host, configured)
+            failures = [f"{addr} ({describe_bind_failure(addr)})" for addr in unbound]
+            for failure in failures:
+                logger.error("libp2p could not listen on %s", failure)
+            self._bound_addrs = bound
+            if configured and not bound:
+                self._listen_error = NetworkListenError(
+                    "libp2p could not listen on any configured address: "
+                    + ", ".join(failures)
+                )
+                self._listen_settled.set()
+                return
             try:
                 peer_id_str = str(self.get_id())
             except Exception:
                 peer_id_str = "<unknown>"
+            listen_strs = [str(a) for a in bound]
             announce = getattr(self._config, "announce_addrs", None)
             hint_addrs = [str(a) for a in announce] if isinstance(announce, (list, tuple)) and announce else listen_strs
             connect_hints = [f"{addr}/p2p/{peer_id_str}" for addr in hint_addrs]
-            self._listening.set()
+            self._listen_settled.set()
             logger.info(
                 "NetworkService listening peer_id=%s addrs=%s connect=%s",
                 peer_id_str,
@@ -113,9 +129,20 @@ class HostManager:
             await trio.sleep_forever()
 
     async def wait_listening(self, timeout: float = 5.0) -> None:
-        """Wait until the host has actually started listening (i.e. entered host.run())."""
+        """Wait until host.run() has tried every listen addr.
+
+        Raises NetworkListenError if none of them bound, trio.TooSlowError if
+        the host has not got that far within `timeout`.
+        """
         with trio.fail_after(timeout):
-            await self._listening.wait()
+            await self._listen_settled.wait()
+        if self._listen_error is not None:
+            raise self._listen_error
+
+    @property
+    def listen_addrs(self) -> List[Any]:
+        """Addresses libp2p actually holds a socket for (ports resolved)."""
+        return list(self._bound_addrs)
 
     @property
     def host(self) -> Optional[IHost]:
