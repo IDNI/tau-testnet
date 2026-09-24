@@ -1994,11 +1994,41 @@ def get_canonical_locator(max_entries: int = 32) -> List[str]:
         
     return locator
 
-def get_chain_path(start_hash: str, target_ancestor: str, max_depth: int = 2000) -> List[str]:
+class ChainAncestryError(ValueError):
+    """An ancestry walk could not connect a block to the one it was looking for.
+
+    `kind` says why:
+      "missing"  -- a block on the way is not stored: an orphan branch whose
+                    parent has not arrived yet (routine while syncing), or a
+                    row lost from the DB
+      "corrupt"  -- the stored links are malformed: a cycle, or a block whose
+                    parent's block_number is not its own minus one
+      "disjoint" -- the lineage is complete but never reaches the target: it
+                    roots at another height-0 block
+      "depth"    -- the caller's max_depth ran out first
+    `side` is set by find_fork_point: "a" or "b" for the lineage at fault, None
+    when both are well formed but share no ancestor.
+    """
+
+    def __init__(self, message: str, *, kind: str,
+                 block_hash: Optional[str] = None, side: Optional[str] = None):
+        super().__init__(message)
+        self.kind = kind
+        self.block_hash = block_hash
+        self.side = side
+
+
+def get_chain_path(start_hash: str, target_ancestor: str, max_depth: Optional[int] = None) -> List[str]:
     """
     Walks backwards from start_hash to target_ancestor. Returns the path in chronological order
-    (target_ancestor+1 ... start_hash). 
-    Raises ValueError if target_ancestor is not found or path exceeds max_depth.
+    (target_ancestor+1 ... start_hash).
+
+    Unbounded unless max_depth is given: a walk to genesis is as long as the
+    chain, and the callers that replay or serve the canonical chain need all of
+    it. (A fixed cap of 2000 used to stop every such walk on a deeper chain.) To
+    find where two chains diverge, use find_fork_point, which stops there.
+    Raises ChainAncestryError (a ValueError) if target_ancestor is not found or
+    the path exceeds max_depth.
     """
     if _db_conn is None:
         init_db()
@@ -2011,26 +2041,97 @@ def get_chain_path(start_hash: str, target_ancestor: str, max_depth: int = 2000)
         cur = _db_conn.cursor()
         while current_hash != target_ancestor:
             if current_hash in visited:
-                raise ValueError(f"Cycle detected in blockchain graph at {current_hash}")
+                raise ChainAncestryError(
+                    f"Cycle detected in blockchain graph at {current_hash}",
+                    kind="corrupt", block_hash=current_hash)
             visited.add(current_hash)
             
-            if len(path) > max_depth:
-                raise ValueError(f"Ancestry search exceeded max_depth of {max_depth}")
+            if max_depth is not None and len(path) > max_depth:
+                raise ChainAncestryError(
+                    f"Ancestry search exceeded max_depth of {max_depth}",
+                    kind="depth", block_hash=current_hash)
                 
             path.append(current_hash)
             
-            cur.execute('SELECT previous_hash FROM blocks WHERE block_hash = ?', (current_hash,))
+            cur.execute('SELECT previous_hash, block_number FROM blocks WHERE block_hash = ?', (current_hash,))
             row = cur.fetchone()
             if not row:
-                raise ValueError(f"Block not found during ancestry walk: {current_hash} (searching for {target_ancestor})")
+                raise ChainAncestryError(
+                    f"Block not found during ancestry walk: {current_hash} (searching for {target_ancestor})",
+                    kind="missing", block_hash=current_hash)
             
-            if not row[0]:
-                raise ValueError(f"Target ancestor {target_ancestor} not found in path from {start_hash}")
+            if not row[0] or row[1] == 0:
+                raise ChainAncestryError(
+                    f"Target ancestor {target_ancestor} not found in path from {start_hash}",
+                    kind="disjoint", block_hash=current_hash)
                 
             current_hash = row[0]
             
     path.reverse()
     return path
+
+
+def find_fork_point(hash_a: str, hash_b: str) -> tuple[str, List[str], List[str]]:
+    """
+    Walks hash_a and hash_b back until their lineages meet. Returns
+    (ancestor, a_path, b_path): each path is in chronological order, ancestor+1
+    ... start, like get_chain_path, and is empty when that start IS the ancestor.
+
+    The higher block steps down until the two are level, then both step
+    together, so the cost is the distance to the fork point, not the depth of the
+    chain. Every step checks that the parent's block_number is one less than the
+    child's: that is what makes lining up by height sound, and it rules out
+    cycles.
+
+    Raises ChainAncestryError: kind "missing" when a lineage reaches a block that
+    is not stored, "corrupt" when a parent's block_number is not the child's
+    minus one (side names the lineage), "disjoint" when both reach height 0 on
+    different blocks (side None).
+    """
+    if _db_conn is None:
+        init_db()
+
+    with _db_lock:
+        cur = _db_conn.cursor()
+
+        def link(block_hash: str, side: str) -> tuple[str, int]:
+            cur.execute('SELECT previous_hash, block_number FROM blocks WHERE block_hash = ?', (block_hash,))
+            row = cur.fetchone()
+            if not row:
+                raise ChainAncestryError(
+                    f"Block not found during ancestry walk: {block_hash}",
+                    kind="missing", block_hash=block_hash, side=side)
+            return row[0], int(row[1])
+
+        def step(block_hash: str, prev_hash: str, number: int, side: str) -> tuple[str, str, int]:
+            parent_prev, parent_number = link(prev_hash, side)
+            if parent_number != number - 1:
+                raise ChainAncestryError(
+                    f"Block {block_hash} is #{number} but its parent {prev_hash} is #{parent_number}",
+                    kind="corrupt", block_hash=block_hash, side=side)
+            return prev_hash, parent_prev, parent_number
+
+        a, b = hash_a, hash_b
+        a_prev, a_num = link(a, "a")
+        b_prev, b_num = link(b, "b")
+        a_path: List[str] = []
+        b_path: List[str] = []
+        while a != b:
+            if a_num == 0 and b_num == 0:
+                raise ChainAncestryError(
+                    f"{hash_a} and {hash_b} share no ancestor: their chains root at {a} and {b}",
+                    kind="disjoint", block_hash=b)
+            level = a_num == b_num
+            if a_num > b_num or level:
+                a_path.append(a)
+                a, a_prev, a_num = step(a, a_prev, a_num, "a")
+            if b_num > a_num or level:
+                b_path.append(b)
+                b, b_prev, b_num = step(b, b_prev, b_num, "b")
+
+    a_path.reverse()
+    b_path.reverse()
+    return a, a_path, b_path
 
 
 

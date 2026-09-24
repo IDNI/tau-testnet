@@ -1988,24 +1988,67 @@ def load_builtin_rules_from_disk() -> list[str]:
     return rules
 
 
-def _is_reachable_from_genesis(b_hash: str) -> bool:
-    import config, db
+def _resolve_fork(old_head_hash: str, new_head_hash: str,
+                  genesis_hash: str) -> tuple[str, list[str], list[str]]:
+    """Where the chain ending at `new_head_hash` leaves the one ending at
+    `old_head_hash`: (ancestor, old_suffix, new_suffix), as db.find_fork_point
+    returns it. The walk stops at the fork point, so a block that extends the
+    head costs one step however deep the chain is.
+
+    Raises db.ChainAncestryError when `new_head_hash` does not reach genesis.
+    When it is the *current* head's lineage that is broken instead (no fork
+    point, yet `new_head_hash` walks back to genesis by itself), that is logged
+    at ERROR and genesis is taken as the fork point, so the node can still move
+    onto the sound chain; the rebuild checks every block of it from genesis.
+    """
+    import db
     try:
-        path = db.get_chain_path(b_hash, db.get_genesis_hash())
+        return db.find_fork_point(old_head_hash, new_head_hash)
+    except db.ChainAncestryError as exc:
+        if exc.side == "b":
+            raise
+        head_error = exc
+    new_path = db.get_chain_path(new_head_hash, genesis_hash)
+    logger.error(
+        "[chain_state] Canonical head %s... has broken ancestry (%s: %s); %s... "
+        "reaches genesis by itself, so it is treated as forking at genesis.",
+        (old_head_hash or '')[:16], head_error.kind, head_error, new_head_hash[:16],
+    )
+    return genesis_hash, [], new_path
+
+
+def _connects_to_canonical_chain(cand_hash: str, head_hash: str, genesis_hash: str) -> bool:
+    """True if `cand_hash`'s lineage meets the chain ending at `head_hash`.
+
+    A branch whose parent has not arrived yet is routine while syncing and is
+    logged at DEBUG. A malformed or foreign lineage is logged at WARNING.
+    """
+    import db
+    try:
+        _resolve_fork(head_hash, cand_hash, genesis_hash)
         return True
-    except ValueError:
+    except db.ChainAncestryError as exc:
+        if exc.kind == "missing":
+            logger.debug("[chain_state] Candidate head %s... is not connected yet: %s",
+                         cand_hash[:16], exc)
+        else:
+            logger.warning("[chain_state] Ignoring candidate head %s... (%s): %s",
+                           cand_hash[:16], exc.kind, exc)
         return False
 
-def select_best_head(candidates: list[tuple[str, int]]) -> str | None:
-    if not candidates:
-        return None
-        
-    def score(cand):
-        block_hash, height = cand
-        return (-height, bytes.fromhex(block_hash))
-        
-    best = min(candidates, key=score)
-    return best[0]
+
+def _head_rank(cand: tuple[str, int]):
+    """Fork-choice order, best first: the higher block, then the lower hash.
+
+    A hash that is not hex can only belong to a stored block #0 (no other
+    block_hash survives Block.from_dict unverified); it ranks last at its
+    height rather than raising out of the sort.
+    """
+    block_hash, height = cand
+    try:
+        return (-height, 0, bytes.fromhex(block_hash))
+    except ValueError:
+        return (-height, 1, block_hash.encode())
 
 def ingest_block(block: Block) -> IngestResult:
     import db, config
@@ -2057,18 +2100,28 @@ def maybe_update_canonical_head() -> Optional[bool]:
         if not candidates:
             return None
 
-        valid_cands = []
-        for cand_hash, cand_height in candidates:
-            if _is_reachable_from_genesis(cand_hash):
-                valid_cands.append((cand_hash, cand_height))
-
-        best_hash = select_best_head(valid_cands)
-        if not best_hash:
-            return None
-
+        genesis_hash = db.get_genesis_hash()
         current_head = db.get_canonical_head()
         current_hash = current_head.get('block_hash') if current_head else ''
-        if best_hash != current_hash:
+        if current_hash and current_hash not in {h for h, _ in candidates}:
+            # Staying put is always an option. A head with a child is not
+            # childless, so without this a head whose only children are
+            # rejected below would lose to the tip of an old fork beneath it.
+            head_height = int((current_head.get('header') or {}).get('block_number', 0))
+            candidates = [*candidates, (current_hash, head_height)]
+
+        # Best first; the first candidate that connects is the best connected
+        # one, so nothing ranked below it is walked. The head connects by
+        # definition, so the tips of old forks below it -- walking one means
+        # walking the head down to its height -- are never reached.
+        best_hash = None
+        for cand_hash, _height in sorted(candidates, key=_head_rank):
+            if cand_hash == current_hash or _connects_to_canonical_chain(
+                    cand_hash, current_hash or genesis_hash, genesis_hash):
+                best_hash = cand_hash
+                break
+
+        if best_hash and best_hash != current_hash:
             return reorg_to(best_hash)
     return None
 
@@ -2081,38 +2134,32 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
     Returns True if the head advanced (state rebuilt + committed), False if the
     reorg was ABORTED because the rebuild replay failed (canonical head left
     unchanged; in-memory state restored to the prior head), or None for a no-op
-    (already at target, or the target path is unreachable).
+    (already at target, or the target's ancestry cannot be resolved -- logged
+    at ERROR).
     """
     import db, config
 
+    genesis_hash = db.get_genesis_hash()
     current_head = db.get_canonical_head()
-    old_head_hash = current_head.get('block_hash') if current_head else db.get_genesis_hash()
+    old_head_hash = current_head.get('block_hash') if current_head else genesis_hash
 
     if old_head_hash == new_head_hash:
         return None
 
+    # Walk the two heads back only to where they meet. Walking each back to
+    # genesis ran into get_chain_path's old 2000-block cap on any deeper chain,
+    # and the ValueError was swallowed: every reorg, and every synced block,
+    # became a silent no-op.
     try:
-        new_path = db.get_chain_path(new_head_hash, db.get_genesis_hash())
-    except ValueError:
+        ancestor, old_suffix, new_suffix = _resolve_fork(old_head_hash, new_head_hash, genesis_hash)
+    except db.ChainAncestryError as exc:
+        logger.error(
+            "[chain_state] Reorg to %s... REFUSED: its ancestry does not reach "
+            "the canonical chain (%s: %s). Canonical head stays at %s...",
+            new_head_hash[:16], exc.kind, exc, (old_head_hash or '')[:16],
+        )
         return None
 
-    old_path = []
-    if old_head_hash != db.get_genesis_hash():
-        try:
-            old_path = db.get_chain_path(old_head_hash, db.get_genesis_hash())
-        except ValueError:
-            pass
-            
-    common_prefix_len = 0
-    for n_h, o_h in zip(new_path, old_path):
-        if n_h == o_h:
-            common_prefix_len += 1
-        else:
-            break
-            
-    new_suffix = new_path[common_prefix_len:]
-    old_suffix = old_path[common_prefix_len:]
-    
     # Phase 2: Mempool Diffs
     old_txs = {}
     from block import compute_tx_hash
@@ -2133,6 +2180,21 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 
     # Phase 3: Apply State Rebuild
     db.reset_mempool_reservations()
+
+    # The rebuild replays from genesis, so it takes the whole path: the stretch
+    # both chains share up to the fork point, then the new chain's own blocks.
+    try:
+        shared = db.get_chain_path(ancestor, genesis_hash)
+    except db.ChainAncestryError as exc:
+        logger.error(
+            "[chain_state] Reorg to %s... REFUSED: the chain below fork point "
+            "%s... does not reach genesis (%s: %s). Canonical head stays at %s...",
+            new_head_hash[:16], ancestor[:16], exc.kind, exc, (old_head_hash or '')[:16],
+        )
+        return None
+    new_path = shared + new_suffix
+    old_path = shared + old_suffix
+
     rebuild = _rebuild_state_from_blockchain_internal(0, path_hashes=new_path)
 
     # Phase 3b: Abort guard (Bug B). If the replay failed, the in-memory state
@@ -2156,8 +2218,8 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
             (old_head_hash or '')[:16],
         )
         # Restore consistent state at the prior head. old_path==[] (prior head
-        # was genesis) resets to the genesis baseline; a non-empty old_path
-        # replays the known-good canonical chain.
+        # was genesis, or its own ancestry was broken) resets to the genesis
+        # baseline; a non-empty old_path replays the known-good canonical chain.
         restore = _rebuild_state_from_blockchain_internal(0, path_hashes=old_path)
         if restore is None or not restore.ok:
             logger.error(
