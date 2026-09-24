@@ -114,7 +114,7 @@ def test_gov_propose_builds_consensus_rule_update_payload(tmp_path, monkeypatch)
             str(update_file),
         ],
         send_responses=[
-            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}',
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}',
             '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"ok"}}',
         ],
         recorded=recorded,
@@ -133,6 +133,8 @@ def test_gov_propose_builds_consensus_rule_update_payload(tmp_path, monkeypatch)
     assert payload["host_contract_patch"]["proof_scheme"] == "bls_header_sig"
     assert payload["fee_limit"] == "0"
     assert "expiration_time" in payload
+    # Measured from the tip that came back with the sequence, not from 0.
+    assert payload["expire_at_height"] == 7 + tx_mod.DEFAULT_EXPIRY_BLOCKS
     assert len(payload["signature"]) == 192
     # Must NOT be nested.
     assert "payload" not in payload
@@ -158,7 +160,7 @@ def test_gov_propose_omits_host_contract_patch_when_null(tmp_path, monkeypatch):
     rc, _, _ = _run_cli(
         ["gov", "propose", "--key", "alice", "--file", str(update_file)],
         send_responses=[
-            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}',
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}',
             '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"ok"}}',
         ],
         recorded=recorded,
@@ -182,7 +184,7 @@ def test_gov_vote_builds_consensus_rule_vote_payload(tmp_path, monkeypatch):
     rc, _, _ = _run_cli(
         ["gov", "vote", "--key", "alice", "--update-id", "a" * 64],
         send_responses=[
-            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":3}}',
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":3,"tip_height":7}}',
             '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"ok"}}',
         ],
         recorded=recorded,
