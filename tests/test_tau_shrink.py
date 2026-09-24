@@ -202,9 +202,24 @@ def test_stream_value_shrinks_to_bare_id(temp_database):
     assert ts.shrink_stream_value("{ #x" + ZERO96 + " }:bv[384]", 12, frozenset({12})) == "0"
 
 
-def test_stream_value_idempotent(temp_database):
-    assert ts.shrink_stream_value("5", 12, frozenset({12})) == "5"
-    assert ts.shrink_stream_value("{ 5 }:bv[64]", 12, frozenset({12})) == "{ 5 }:bv[64]"
+def test_stream_value_reencoding_needs_an_explicit_marker(temp_database):
+    """W4 changed this contract deliberately.
+
+    A bare decimal used to be assumed to be an internal id and passed through, so
+    an externally supplied canonical "1" compared equal to whichever address held
+    interned id 1 -- a wrong verdict with no mixed widths anywhere. Apply forwards
+    user custom inputs through this path, so a bare decimal is untrusted input and
+    is now interned BY VALUE like any other canonical constant. Re-encoding an
+    already-encoded value is an explicit, typed operation.
+    """
+    # untrusted decimal -> interned as the VALUE 5, not read as id 5
+    assert ts.shrink_stream_value("5", 12, frozenset({12})) == str(ts.intern_value("5", 384))
+    # the collision the old contract allowed is gone: feeding the DECIMAL that
+    # happens to be an address's id now encodes the value, not that address
+    addr_id = ts.intern_value(HEX96, 384)
+    assert ts.shrink_stream_value(str(addr_id), 12, frozenset({12})) != str(addr_id)
+    # an already-encoded value passes through only when it says so
+    assert ts.shrink_stream_value(ts.RuntimeEncoded("5"), 12, frozenset({12})) == "5"
     # not in the shrink set -> untouched
     assert ts.shrink_stream_value(f"{{ #x{HEX96} }}:bv[384]", 12, frozenset()) == f"{{ #x{HEX96} }}:bv[384]"
 
@@ -245,14 +260,29 @@ def test_expand_output_value_identity_on_verdict(temp_database):
     assert ts.expand_output_value("0", 6) == "0"
 
 
-def test_expand_output_guard_warns_on_leaked_id(temp_database, caplog):
-    leaked = ts.intern_value(HEX96, 384)          # a real interned address id (>1)
-    assert leaked >= 1
-    # Make sure it is >1 so the heuristic fires.
-    leaked2 = ts.intern_value(HEX96_B, 384)
+def test_output_expansion_does_not_guess_from_numeric_overlap(temp_database, caplog):
+    """W4 replaced the heuristic with a restriction.
+
+    The guard used to flag any numeric output that happened to exist in the
+    intern table -- so an ordinary fee whose amount coincided with an allocated
+    id was reported as a node-local leak. Numeric overlap is not provenance.
+    Instead the optimizer refuses components that could put an encoded value on
+    an output at all (see the classifier test below), and expansion is identity.
+    """
+    leaked = ts.intern_value(HEX96_B, 384)
     with caplog.at_level("ERROR"):
-        ts.expand_output_value(str(leaked2), output_index=9)
-    assert any("looks like a shrunk address" in r.message for r in caplog.records)
+        out = ts.expand_output_value(str(leaked), output_index=9)
+    assert out == str(leaked)
+    assert not caplog.records
+
+
+def test_classifier_refuses_to_put_an_encoded_value_on_an_output(temp_database):
+    """The restriction that makes the guard above unnecessary: an equality whose
+    opposite operand is an OUTPUT stream disqualifies the component, so a shrunk
+    input value can never be copied out."""
+    p = ts.prepare_rule(_rule("o5[t]:bv[384] = i12[t]:bv[384]"))
+    assert not p.shrink_enabled
+    assert 12 not in p.shrunk_streams
 
 
 def test_expand_output_guard_ignores_consensus_yids(temp_database, caplog):

@@ -9,7 +9,12 @@ import sys
 import threading
 from collections import deque
 
-from errors import TauEngineBug, TauEngineCrash
+from errors import (
+    TauEngineBug,
+    TauEngineCrash,
+    TauSpecIntegrationError,
+    TauSpecRejected,
+)
 import tau_io_logger
 
 # Setup logging
@@ -276,6 +281,104 @@ def strip_ansi(text) -> str:
     if not text:
         return ""
     return _ANSI_ESCAPE_RE.sub("", str(text))
+
+
+# Engine diagnostics that mean "the text/value handed in was refused", as opposed
+# to "the engine itself failed". Measured against the real engine in W0: each of
+# these leaves spec_revision and time_point untouched and the interpreter usable.
+_INPUT_FAULT_MARKERS = (
+    "incompatible type information",
+    "spec failed to transform to tau tree",
+    "failed to parse input value",
+    "syntax error",
+    "overflow in bit-vector construction",
+)
+
+
+def _classify_step_error(msg: str, captured_output, node_generated: bool):
+    """Turn an engine diagnostic into the right exception, and dump a crash log
+    ONLY for a genuine engine fault."""
+    if tau_error_is_input_fault(captured_output):
+        if node_generated:
+            logger.error(
+                "Tau refused text this node generated from valid canonical input "
+                "(integration failure, not an invalid rule): %s", msg
+            )
+            return TauSpecIntegrationError(msg)
+        logger.warning("Tau refused the supplied rule/value: %s", msg)
+        return TauSpecRejected(msg)
+    filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
+    if filepath:
+        logger.error(f"Dumped Tau crash log to {filepath}")
+    return TauEngineBug(msg)
+
+
+ACCEPTED_CHANGED = "ACCEPTED_CHANGED"
+ACCEPTED_NOOP = "ACCEPTED_NOOP"
+REJECTED_NOT_ROUTED = "REJECTED_NOT_ROUTED"
+REJECTED_RULE = "REJECTED_RULE"
+INCOMPLETE = "INCOMPLETE"
+
+
+def _interpreter_spec_revision(interpreter):
+    """The engine's own revision counter, or None when the binding predates it."""
+    try:
+        return int(getattr(interpreter, "spec_revision"))
+    except Exception:
+        return None
+
+
+def _build_revision_receipt(*, delivered, outputs, before, after, diagnostics):
+    """Classify what the engine did with a revision.
+
+    Measured on the real engine, on the router the node boots:
+
+    * `o0='F'` means the revision branch was taken -- the candidate was consumed;
+    * `spec_revision` advancing means the specification actually changed;
+    * `o0='T'` with a candidate sent means it was NOT routed at all, which is how
+      an unsatisfiable rule is treated -- a rejection, not a no-op;
+    * `step` returning None means it was refused outright, and nothing advanced;
+    * the engine never asking for i0 means the candidate was never submitted, so
+      a returned output says nothing about it.
+    """
+    named = {}
+    if outputs:
+        for key, value in outputs.items():
+            named[getattr(key, "name", str(key))] = str(value)
+    if not delivered:
+        outcome = INCOMPLETE
+    elif not outputs:
+        outcome = REJECTED_RULE
+    elif named.get("o0") != "F":
+        outcome = REJECTED_NOT_ROUTED
+    elif before is not None and after is not None and after > before:
+        outcome = ACCEPTED_CHANGED
+    elif before is None or after is None:
+        # No counter to read: fall back to "it was consumed and did not error".
+        outcome = ACCEPTED_CHANGED if not tau_reports_error(diagnostics) else REJECTED_RULE
+    else:
+        outcome = ACCEPTED_NOOP
+    return {
+        "outcome": outcome,
+        "accepted": outcome in (ACCEPTED_CHANGED, ACCEPTED_NOOP),
+        "changed": outcome == ACCEPTED_CHANGED,
+        "delivered": delivered,
+        "outputs": named or None,
+        "spec_revision_before": before,
+        "spec_revision_after": after,
+    }
+
+
+def tau_error_is_input_fault(text) -> bool:
+    """True when the engine's diagnostic blames the input, not the engine.
+
+    ANSI-aware on purpose: the engine colours its severity marker, which is why a
+    literal `"(Error)" in output` screen matches nothing.
+    """
+    if not tau_reports_error(text):
+        return False
+    flat = strip_ansi("" if text is None else str(text)).lower()
+    return any(marker in flat for marker in _INPUT_FAULT_MARKERS)
 
 
 def tau_reports_error(text) -> bool:
@@ -550,7 +653,8 @@ class TauInterface:
                    target_output_stream_index=0,
                    input_stream_values=None,
                    source="unknown",
-                   apply_rules_update=True):
+                   apply_rules_update=True,
+                   node_generated=False):
         """
         Simulate the `communicate_with_tau` signature but using direct bindings.
         
@@ -606,7 +710,16 @@ class TauInterface:
         # We must loop to provide inputs since Tau asks for them lazily.
         captured_output = ""
         outputs = None
-        
+        # W6: what the engine actually did with the revision, captured HERE --
+        # before the stdout-driven rebuild below replaces the interpreter and
+        # resets spec_revision to 0. The caller otherwise has to infer acceptance
+        # from a formatted string, which cannot distinguish a no-op from a rule
+        # that was never routed.
+        self.last_revision_receipt = None
+        _revision_candidate = rule_text is not None
+        _revision_delivered = False
+        _revision_before = _interpreter_spec_revision(self.interpreter)
+
         for _ in range(100):
             required_inputs = self.tau.get_inputs_for_step(self.interpreter)
             input_assignments = {}
@@ -624,6 +737,7 @@ class TauInterface:
                 elif name == "i0" and normalized_rule_text is not None:
                     value_to_assign = normalized_rule_text
                     normalized_rule_text = None
+                    _revision_delivered = True
                     reason = "Sending rule text"
                 else:
                     value_to_assign = self._fallback_value_for_stream(name)
@@ -669,6 +783,15 @@ class TauInterface:
             if tau_reports_error(capture.output):
                 break # Native engine reported a parsing/logic error, don't loop forever
 
+        if _revision_candidate:
+            self.last_revision_receipt = _build_revision_receipt(
+                delivered=_revision_delivered,
+                outputs=outputs,
+                before=_revision_before,
+                after=_interpreter_spec_revision(self.interpreter),
+                diagnostics=captured_output,
+            )
+
         # Re-print accumulated captured output to real stdout so logs are visible
         if captured_output:
             print(captured_output, end='')
@@ -676,10 +799,7 @@ class TauInterface:
             
             if tau_reports_error(captured_output):
                 msg = f"Tau native step reported an error: {captured_output.strip()}"
-                filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
-                if filepath:
-                     logger.error(f"Dumped Tau crash log to {filepath}")
-                raise TauEngineBug(msg)
+                raise _classify_step_error(msg, captured_output, node_generated)
 
         if outputs is None:
             msg = "Tau step failed (returned None after 100 iterations)"
@@ -743,7 +863,8 @@ class TauInterface:
                           rule_text=None,
                           input_stream_values=None,
                           source="unknown",
-                          apply_rules_update=True) -> dict[int, str]:
+                          apply_rules_update=True,
+                          node_generated=False) -> dict[int, str]:
         """
         Run one Tau step and return ALL actually-emitted output streams.
 
@@ -833,10 +954,7 @@ class TauInterface:
 
             if tau_reports_error(captured_output):
                 msg = f"Tau native step reported an error: {captured_output.strip()}"
-                filepath = tau_io_logger.dump_crash_log("TauEngineBug", msg)
-                if filepath:
-                    logger.error(f"Dumped Tau crash log to {filepath}")
-                raise TauEngineBug(msg)
+                raise _classify_step_error(msg, captured_output, node_generated)
 
         if outputs is None:
             msg = "Tau step failed (returned None after 100 iterations)"

@@ -1,4 +1,5 @@
 from .service import NetworkService
+from .host import NetworkListenError
 from .protocols import (
     TAU_PROTOCOL_HANDSHAKE,
     TAU_PROTOCOL_PING,
@@ -13,6 +14,7 @@ from .config import NetworkConfig, BootstrapPeer
 
 __all__ = [
     "NetworkService",
+    "NetworkListenError",
     "NetworkConfig",
     "BootstrapPeer",
     "TAU_PROTOCOL_HANDSHAKE",

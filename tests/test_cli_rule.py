@@ -17,6 +17,9 @@ from tau_testnet_cli import cli, keys as keys_mod, tx as tx_mod
 RULE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
 OFFER_ID = "ab" * 32
 OTHER = "bb" * 48
+# The tip a node reports alongside the sequence. A getsequence answer without
+# one reads as a node too old to report it, and the CLI asks getblocks instead.
+TIP = 7
 
 
 def _run_cli(argv, *, send_responses=None, recorded=None):
@@ -121,7 +124,7 @@ def test_rule_offer_builds_the_payload(alice, tmp_path):
         ["rule", "offer", "--key", "alice", "--to", OTHER,
          "--rule-file", str(rule_file), "--expire-at-height", "500"],
         send_responses=[
-            _ok({"sequence_number": 3}),   # getsequence
+            _ok({"sequence_number": 3, "tip_height": TIP}),  # getsequence
             _ok({"tx_hash": "deadbeef"}),  # sendtx
         ],
         recorded=recorded,
@@ -143,22 +146,52 @@ def test_rule_offer_resolves_expire_in_against_the_tip(alice):
         ["rule", "offer", "--key", "alice", "--to", OTHER, "--rule", RULE,
          "--expire-in", "50"],
         send_responses=[
-            _ok({"blocks": [{"header": {"block_number": 9}}]}),  # getblocks
-            _ok({"sequence_number": 0}),
+            _ok({"sequence_number": 0, "tip_height": 9}),
             _ok({"tx_hash": "deadbeef"}),
         ],
         recorded=recorded,
     )
     assert rc == 0, err
-    # tip 9 -> next height 10 -> +50
+    # tip 9 -> next height 10 -> +50; the tip rides on getsequence, so no
+    # getblocks (which, bare, would ship the whole chain) is ever sent.
     assert _sent_payload(recorded)["expire_at_height"] == 60
+    assert not any(str(c).startswith("getblocks") for c in recorded)
+
+
+def test_rule_offer_on_an_old_node_asks_for_one_block(alice):
+    """A node that does not report tip_height answers 0; the fallback asks for
+    the most recent block, not the whole chain."""
+    recorded = []
+    rc, _, err = _run_cli(
+        ["rule", "offer", "--key", "alice", "--to", OTHER, "--rule", RULE,
+         "--expire-in", "50"],
+        send_responses=[
+            _ok({"sequence_number": 0}),
+            _ok({"blocks": [{"header": {"block_number": 9}}]}),
+            _ok({"tx_hash": "deadbeef"}),
+        ],
+        recorded=recorded,
+    )
+    assert rc == 0, err
+    assert "getblocks 1" in [str(c) for c in recorded]
+    assert _sent_payload(recorded)["expire_at_height"] == 60
+
+
+def test_rule_offer_refuses_expire_in_zero(alice):
+    with pytest.raises(SystemExit) as exc:
+        _run_cli(
+            ["rule", "offer", "--key", "alice", "--to", OTHER, "--rule", RULE,
+             "--expire-in", "0"],
+            send_responses=[],
+        )
+    assert exc.value.code == 2
 
 
 def test_rule_offer_rejects_self_offer(alice):
     rc, _, err = _run_cli(
         ["rule", "offer", "--key", "alice", "--to", alice, "--rule", RULE,
          "--expire-at-height", "500"],
-        send_responses=[_ok({"sequence_number": 0})],
+        send_responses=[_ok({"sequence_number": 0, "tip_height": TIP})],
     )
     assert rc == cli.EXIT_LOCAL
     assert "differ" in err
@@ -181,7 +214,8 @@ def test_rule_reject_builds_the_payload(alice):
     recorded = []
     rc, _, err = _run_cli(
         ["rule", "reject", "--key", "alice", OFFER_ID],
-        send_responses=[_ok({"sequence_number": 1}), _ok({"tx_hash": "x"})],
+        send_responses=[_ok({"sequence_number": 1, "tip_height": TIP}),
+                        _ok({"tx_hash": "x"})],
         recorded=recorded,
     )
     assert rc == 0, err
@@ -190,6 +224,8 @@ def test_rule_reject_builds_the_payload(alice):
     assert payload["offer_id"] == OFFER_ID
     # A rejection compiles nothing, so it carries no rule text.
     assert "rule_text" not in payload
+    # Measured from the tip that came back with the sequence, not from 0.
+    assert payload["expire_at_height"] == TIP + 1 + tx_mod.DEFAULT_EXPIRY_BLOCKS
 
 
 # --- accept -----------------------------------------------------------------
@@ -198,7 +234,7 @@ def _accept_responses(verdict, rule_text=RULE):
     return [
         _ok({"offer_id": OFFER_ID, "rule_text": rule_text}),   # getruleoffer
         _ok({"verdict": verdict, "layers": []}),               # getruleconflict
-        _ok({"sequence_number": 2}),                           # getsequence
+        _ok({"sequence_number": 2, "tip_height": TIP}),        # getsequence
         _ok({"tx_hash": "x"}),                                 # sendtx
     ]
 
@@ -267,7 +303,7 @@ def test_rule_accept_reports_conflict_layers(alice):
                 {"layer": "registry_collision", "status": "warn",
                  "detail": "accepting REPLACES it"},
             ]}),
-            _ok({"sequence_number": 0}),
+            _ok({"sequence_number": 0, "tip_height": TIP}),
             _ok({"tx_hash": "x"}),
         ],
         recorded=recorded,

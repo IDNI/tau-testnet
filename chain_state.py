@@ -5,6 +5,9 @@ import os
 from typing import Dict, List, Optional
 import db
 import tau_manager
+import tau_authority
+import tau_commit
+import tau_proposal
 import config
 import tau_native
 from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
@@ -512,6 +515,119 @@ def _validate_block_timestamp(block: Block, parent_block_data: Optional[Dict]) -
     return True, ""
 
 
+def _dispose_quietly(proposal) -> None:
+    if proposal is None:
+        return
+    try:
+        proposal.dispose()
+    except Exception:
+        logger.warning("could not dispose a block proposal", exc_info=True)
+
+
+def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
+    """The canonical rows for a block, computed from its SNAPSHOT.
+
+    From the snapshot rather than from the module globals, so the durable write
+    can happen BEFORE memory is swapped: publishing memory first is how a node
+    ends up serving a state its own disk does not have. Produces exactly what the
+    old write-after-swap computed -- the swap merges transfer times and keeps the
+    active consensus id unless the snapshot names one, and so does this.
+    """
+    meta = next_snapshot.metadata
+    lm = meta["lifecycle_manager"]
+    merged_ts = dict(_last_transfer_ts)
+    merged_ts.update(meta.get("last_transfer_ts", {}) or {})
+    app_rules = next_snapshot.tau_bytes.decode("utf-8", errors="ignore")
+    return dict(
+        head_hash=head_hash,
+        head_num=head_num,
+        balances=dict(meta["balances"]),
+        sequences=dict(meta["sequence_numbers"]),
+        application_rules=app_rules,
+        consensus_rules=meta["consensus_rules_state"],
+        active_consensus_id=meta.get("active_consensus_id", _active_consensus_id),
+        pending_updates=_persistable_update_payloads(lm),
+        votes=[{"update_id": uid.hex() if isinstance(uid, bytes) else uid,
+                "voter_pubkey": p.hex() if isinstance(p, bytes) else p}
+               for uid, ps in lm.votes.items() for p in ps],
+        scheduled=[(h, uid.hex() if isinstance(uid, bytes) else uid)
+                   for h, uid in lm.scheduled_updates],
+        archival=[uid.hex() if isinstance(uid, bytes) else uid
+                  for uid in lm.archival_updates],
+        active_validators=sorted(normalize_validator_set(lm.active_validators)),
+        # Governance-mutable consensus params and the rule-sharing / approval
+        # books, on the block-apply path too -- omitting any of them leaves the
+        # tables holding the previous block's rows while memory moved on.
+        quorum_policy=lm.quorum_policy,
+        rule_offers=lm.rule_offers.snapshot_offers(),
+        rule_clauses=lm.rule_offers.snapshot_clauses(),
+        max_rule_txs_per_block=lm.max_rule_txs_per_block,
+        approval_requests=lm.approval_requests.snapshot_requests(),
+        approval_slots_active=lm.approval_slots_active,
+        eligibility_mode=lm.eligibility_mode,
+        fee_beneficiary=lm.fee_beneficiary,
+        last_transfer_ts=merged_ts,
+    )
+
+
+def _swap_in_memory_state(next_snapshot, block) -> None:
+    """Publish a committed block's state to the module globals."""
+    global _lifecycle_manager, _application_rules_state, _consensus_rules_state
+    global _tau_engine_state_hash, _canonical_head_hash, _active_consensus_id
+    with _balance_lock, _sequence_lock, _rules_lock:
+        _balances.clear()
+        _balances.update(next_snapshot.metadata["balances"])
+        _sequence_numbers.clear()
+        _sequence_numbers.update(next_snapshot.metadata["sequence_numbers"])
+        _last_transfer_ts.update(next_snapshot.metadata.get("last_transfer_ts", {}) or {})
+
+        _lifecycle_manager = next_snapshot.metadata["lifecycle_manager"]
+
+        new_app_rules = next_snapshot.tau_bytes.decode('utf-8', errors='ignore')
+        if new_app_rules != _application_rules_state:
+            _application_rules_state = new_app_rules
+
+        _consensus_rules_state = next_snapshot.metadata["consensus_rules_state"]
+        if "active_consensus_id" in next_snapshot.metadata:
+            _active_consensus_id = next_snapshot.metadata["active_consensus_id"]
+
+        _tau_engine_state_hash = next_snapshot.state_hash
+        _canonical_head_hash = block.block_hash
+
+
+def _sync_advisory_mirror(prepared) -> None:
+    """Keep the in-process interpreter current as an ADVISORY mirror.
+
+    With worker-backed authority it is no longer what blocks are evaluated
+    against, but admission estimates and previews still read it, and without
+    this they would answer against whatever state it had when the node started.
+    It receives the block's revisions in order and nothing else; it is never
+    consulted by consensus, so a failure here degrades advisory answers and
+    nothing more.
+    """
+    import tau_journal as _tau_journal
+
+    if getattr(tau_manager, "tau_test_mode", False):
+        return
+    if getattr(tau_manager, "tau_direct_interface", None) is None:
+        return
+    for entry in prepared.journal_delta:
+        if entry.kind != _tau_journal.REVISION or not entry.rule_text:
+            continue
+        try:
+            tau_manager.communicate_with_tau(
+                rule_text=entry.rule_text, target_output_stream_index=0,
+                source="advisory_mirror", apply_rules_update=False,
+                wait_for_ready=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[BLOCKCHAIN] advisory mirror could not take a committed revision "
+                "(%s); admission estimates may be stale until it is rebuilt", exc,
+            )
+            return
+
+
 def process_new_block(block: Block) -> bool:
     """
     Standard network/import block ingestion path.
@@ -596,7 +712,12 @@ def _process_new_block_locked(block: Block) -> bool:
             and tx.get("tx_type", "user_tx") in TAU_EVALUATING_TX_TYPES
                 for tx in (block.transactions or [])
             )
-            if has_user_tx and not tau_manager.tau_ready.wait(timeout=5):
+            # With worker-backed authority this gate does not apply: a locally
+            # mined block arrives while the authority is LENT to its own
+            # proposal, and a received block gets a proposal built from the
+            # committed journal, which reports unavailability itself.
+            if (has_user_tx and not tau_authority.owner().enabled
+                    and not tau_manager.tau_ready.wait(timeout=5)):
                 logger.error(
                     "[BLOCKCHAIN] Tau unavailable; deferring block #%s (cannot evaluate fees for user transactions).",
                     block.header.block_number,
@@ -608,123 +729,275 @@ def _process_new_block_locked(block: Block) -> bool:
             # new revision afterwards (see reload_consensus_interpreter_from_state).
             _cons_rules_before = _consensus_rules_state
 
-            # 4. Pure Apply Block Executor
-            if active_view is not None and hasattr(engine, "apply_block"):
+            # 4. Obtain the block's evaluation.
+            #
+            # With worker-backed authority there is ONE protocol for every block,
+            # mined here or received: a proposal evaluates it, the result is
+            # frozen into a PreparedBlockCommit, and that exact artifact is
+            # committed and its worker promoted. A locally mined block arrives
+            # with its proposal already built; a received one gets a proposal
+            # built from the committed anchor. Past that point the two are
+            # indistinguishable -- there is no "mined block commit path" and
+            # "imported block commit path" with different Tau semantics.
+            _owner = tau_authority.owner()
+            _enabled = _owner.enabled
+            _prepared = None
+            _proposal = None
+            _execution_id = None
+            apply_result = None
+            try:
+                _execution_id = tau_commit.block_execution_id(
+                    parent=block.header.previous_hash,
+                    height=block.header.block_number,
+                    timestamp=block.header.timestamp,
+                    proposer=block.header.proposer_pubkey,
+                    transactions=block.transactions,
+                    consensus_context=(active_view.consensus_rules or ""
+                                       if active_view is not None else ""),
+                )
+            except Exception:
+                logger.debug("[BLOCKCHAIN] could not compute the execution id",
+                             exc_info=True)
+
+            # 4a. A locally built block: claim the artifact its miner left, once.
+            # Claiming is destructive, so no second attempt and no later block can
+            # see it. A mismatch disposes it whole -- a mismatched artifact's worker
+            # is never partially reused.
+            _artifact = (tau_commit.registry().claim(_execution_id)
+                         if _execution_id is not None else None)
+            if _artifact is not None:
+                _prepared, _proposal = _artifact
                 try:
-                    apply_result = engine.apply_block(active_view, block, parent_snapshot)
+                    _prepared.verify(proposal=_proposal, execution_id=_execution_id)
+                    if (getattr(block.header, "state_hash", "")
+                            and _prepared.next_snapshot.state_hash
+                            != block.header.state_hash):
+                        raise tau_commit.PreparedCommitMismatch(
+                            "the artifact's resulting state is not the one the "
+                            "block commits to"
+                        )
+                    next_snapshot = _prepared.next_snapshot
+                    logger.info(
+                        "[BLOCKCHAIN] block #%s reuses its own evaluation "
+                        "(execution %s)", block.header.block_number,
+                        _execution_id[:12],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[BLOCKCHAIN] commit artifact for block #%s rejected "
+                        "(%s); evaluating the block instead",
+                        block.header.block_number, exc,
+                    )
+                    _dispose_quietly(_proposal)
+                    _prepared = _proposal = None
+
+            if _prepared is None and _enabled:
+                # 4b. No usable artifact: evaluate the block in a proposal built
+                # from the committed anchor. For a received block this is THE
+                # verification -- the state hash check below compares the
+                # proposal's result against the block's claim.
+                _candidates = [
+                    (tx.get("operations") or {}).get("0")
+                    for tx in (block.transactions or [])
+                    if isinstance(tx, dict)
+                    and isinstance((tx.get("operations") or {}).get("0"), str)
+                ]
+                try:
+                    _proposal = _owner.build_proposal(
+                        candidate_rules=_candidates,
+                        label=f"block-{block.header.block_number}",
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "[BLOCKCHAIN] cannot evaluate block #%s: the authoritative "
+                        "evaluator is unavailable (%s)",
+                        block.header.block_number, exc,
+                    )
+                    return False
+                try:
+                    with tau_proposal.boundary(_proposal, label="process_new_block"):
+                        apply_result = engine.apply_block(
+                            active_view, block, parent_snapshot,
+                            session=_proposal.session, proposal=_proposal,
+                        )
+                    if _proposal.dirty:
+                        # A rejection in the last transaction; nothing followed it
+                        # to trigger the rebuild, and the artifact must name a
+                        # worker that corresponds to the accepted journal.
+                        _proposal.reconstruct()
+                    next_snapshot = apply_result.next_snapshot
+                    _prepared = tau_commit.PreparedBlockCommit.freeze(
+                        _proposal, execution_id=_execution_id,
+                        next_snapshot=next_snapshot,
+                        parent_tip_id=block.header.previous_hash,
+                    )
                 except FeeRuleError as exc:
-                    # Voted consensus rules emitted an invalid fee (o9).
-                    # Strict: reject/defer rather than guess.
                     logger.error(
                         "[BLOCKCHAIN] Fee rule failure applying block #%s: %s",
                         block.header.block_number, exc,
                     )
+                    _dispose_quietly(_proposal)
                     return False
                 except ValueError as exc:
-                    # e.g. a governance activation that would empty the validator set:
-                    # reject the block instead of crashing ingestion.
                     logger.error(
                         "[BLOCKCHAIN] Governance activation failed for block #%s: %s",
                         block.header.block_number, exc,
                     )
+                    _dispose_quietly(_proposal)
                     return False
-                next_snapshot = apply_result.next_snapshot
-            else:
-                temp_balances = dict(_balances)
-                temp_sequences = dict(_sequence_numbers)
-                exec_result = engine.apply(
-                    parent_snapshot,
-                    block.transactions,
-                    block.header.timestamp,
-                    target_balances=temp_balances,
-                    target_sequences=temp_sequences,
-                )
-                next_app_rules = exec_result.snapshot.tau_bytes.decode('utf-8', errors='ignore')
-                next_cons_rules = _consensus_rules_state
-                next_acc_hash = compute_accounts_hash(temp_balances, temp_sequences)
-                next_meta_hash = _lifecycle_manager.consensus_meta_hash()
-                next_state_hash = block.header.state_hash or compute_consensus_state_hash(
-                    next_cons_rules.encode('utf-8'),
-                    next_app_rules.encode('utf-8'),
-                    next_acc_hash,
-                    next_meta_hash,
-                )
-                next_snapshot = TauStateSnapshot(
-                    state_hash=next_state_hash,
-                    tau_bytes=exec_result.snapshot.tau_bytes,
-                    metadata={
-                        "balances": temp_balances,
-                        "sequence_numbers": temp_sequences,
-                        "last_transfer_ts": dict(_last_transfer_ts),
-                        "lifecycle_manager": _lifecycle_manager,
-                        "consensus_rules_state": next_cons_rules,
-                    },
-                )
+                except Exception as exc:
+                    # Operational: the proposal could not be evaluated or frozen.
+                    # Nothing is durable yet, so the block is simply not accepted
+                    # now; it is not judged invalid.
+                    logger.error(
+                        "[BLOCKCHAIN] could not evaluate block #%s: %s",
+                        block.header.block_number, exc,
+                    )
+                    _dispose_quietly(_proposal)
+                    return False
+            elif _prepared is None:
+                # NOT enabled -- the explicitly requested mock/test configuration,
+                # where there is no native engine to be authoritative about. The
+                # path that shipped, unchanged.
+                if active_view is not None and hasattr(engine, "apply_block"):
+                    try:
+                        apply_result = engine.apply_block(active_view, block, parent_snapshot)
+                    except FeeRuleError as exc:
+                        # Voted consensus rules emitted an invalid fee (o9).
+                        # Strict: reject/defer rather than guess.
+                        logger.error(
+                            "[BLOCKCHAIN] Fee rule failure applying block #%s: %s",
+                            block.header.block_number, exc,
+                        )
+                        return False
+                    except ValueError as exc:
+                        # e.g. a governance activation that would empty the validator set:
+                        # reject the block instead of crashing ingestion.
+                        logger.error(
+                            "[BLOCKCHAIN] Governance activation failed for block #%s: %s",
+                            block.header.block_number, exc,
+                        )
+                        return False
+                    next_snapshot = apply_result.next_snapshot
+                else:
+                    temp_balances = dict(_balances)
+                    temp_sequences = dict(_sequence_numbers)
+                    exec_result = engine.apply(
+                        parent_snapshot,
+                        block.transactions,
+                        block.header.timestamp,
+                        target_balances=temp_balances,
+                        target_sequences=temp_sequences,
+                    )
+                    next_app_rules = exec_result.snapshot.tau_bytes.decode('utf-8', errors='ignore')
+                    next_cons_rules = _consensus_rules_state
+                    next_acc_hash = compute_accounts_hash(temp_balances, temp_sequences)
+                    next_meta_hash = _lifecycle_manager.consensus_meta_hash()
+                    next_state_hash = block.header.state_hash or compute_consensus_state_hash(
+                        next_cons_rules.encode('utf-8'),
+                        next_app_rules.encode('utf-8'),
+                        next_acc_hash,
+                        next_meta_hash,
+                    )
+                    next_snapshot = TauStateSnapshot(
+                        state_hash=next_state_hash,
+                        tau_bytes=exec_result.snapshot.tau_bytes,
+                        metadata={
+                            "balances": temp_balances,
+                            "sequence_numbers": temp_sequences,
+                            "last_transfer_ts": dict(_last_transfer_ts),
+                            "lifecycle_manager": _lifecycle_manager,
+                            "consensus_rules_state": next_cons_rules,
+                        },
+                    )
             
+
             # 5. Invariant Checks
-            # Fast path ensures the block is valid, but the generated state hash MUST match exactly.
+            # The generated state hash MUST match the block's claim exactly. For a
+            # received block evaluated in a proposal, this is the verification.
             if getattr(block.header, 'state_hash', "") and next_snapshot.state_hash != block.header.state_hash:
                  logger.error(f"[BLOCKCHAIN] State hash mismatch for extending block #{block.header.block_number}")
+                 _dispose_quietly(_proposal)
                  return False
-                 
-            # 6. Atomically persist block + returned post state
-            db.add_block(block)
-            
-            with _balance_lock, _sequence_lock, _rules_lock:
-                _balances.clear()
-                _balances.update(next_snapshot.metadata["balances"])
-                _sequence_numbers.clear()
-                _sequence_numbers.update(next_snapshot.metadata["sequence_numbers"])
-                _last_transfer_ts.update(next_snapshot.metadata.get("last_transfer_ts", {}) or {})
-                
-                _lifecycle_manager = next_snapshot.metadata["lifecycle_manager"]
-                
-                new_app_rules = next_snapshot.tau_bytes.decode('utf-8', errors='ignore')
-                if new_app_rules != _application_rules_state:
-                    # We already hold _rules_lock here, so avoid re-entering it
-                    # via save_application_rules_state().
-                    _application_rules_state = new_app_rules
-                    
-                _consensus_rules_state = next_snapshot.metadata["consensus_rules_state"]
-                
-                # Fetch active_consensus_id if it's updated in the consensus component natively
-                if "active_consensus_id" in next_snapshot.metadata:
-                    _active_consensus_id = next_snapshot.metadata["active_consensus_id"]
-                
-                _tau_engine_state_hash = next_snapshot.state_hash
-                _canonical_head_hash = block.block_hash
-                
-            db.save_canonical_state_atomically(
-                head_hash=_canonical_head_hash,
+
+            # 6. Persist.
+            _canonical_rows = _canonical_state_kwargs(
+                next_snapshot, head_hash=block.block_hash,
                 head_num=block.header.block_number,
-                balances=_balances,
-                sequences=_sequence_numbers,
-                application_rules=_application_rules_state,
-                consensus_rules=_consensus_rules_state,
-                active_consensus_id=_active_consensus_id,
-                pending_updates=_persistable_update_payloads(_lifecycle_manager),
-                votes=[{"update_id": uid.hex() if isinstance(uid, bytes) else uid, "voter_pubkey": p.hex() if isinstance(p, bytes) else p} for uid, ps in _lifecycle_manager.votes.items() for p in ps],
-                scheduled=[(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates],
-                archival=[uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates],
-                active_validators=sorted(normalize_validator_set(_lifecycle_manager.active_validators)),
-                # Persist the governance-mutable consensus params on the block-apply
-                # path too (not just commit_state_to_db); otherwise an activated
-                # quorum_policy / eligibility_mode change is lost on restart.
-                quorum_policy=_lifecycle_manager.quorum_policy,
-                # Rule sharing on the block-apply path too. Omitting these
-                # would leave the offer/clause tables holding the PREVIOUS
-                # block's rows while memory moved on, so a restart would
-                # rehydrate a stale book and compute a state hash no peer
-                # agrees with.
-                rule_offers=_lifecycle_manager.rule_offers.snapshot_offers(),
-                rule_clauses=_lifecycle_manager.rule_offers.snapshot_clauses(),
-                max_rule_txs_per_block=_lifecycle_manager.max_rule_txs_per_block,
-                approval_requests=_lifecycle_manager.approval_requests.snapshot_requests(),
-                approval_slots_active=_lifecycle_manager.approval_slots_active,
-                eligibility_mode=_lifecycle_manager.eligibility_mode,
-                fee_beneficiary=_lifecycle_manager.fee_beneficiary,
-                last_transfer_ts=dict(_last_transfer_ts),
             )
+            if _enabled and _prepared is not None:
+                # Durable FIRST, as ONE transaction: the block row, the journal
+                # delta, the exact-id allocator delta, the canonical snapshot and
+                # the commit record. Memory second. Publishing memory before the
+                # durable write succeeds is how a node ends up serving a state its
+                # own disk does not have.
+                try:
+                    _commit_outcome = db.commit_prepared_block(
+                        execution_id=_prepared.execution_id,
+                        tip=block.block_hash,
+                        parent=block.header.previous_hash,
+                        journal_entries=[tau_commit._entry_row(e)
+                                         for e in _prepared.journal_delta],
+                        # the base the artifact was recorded on, so a journal
+                        # that moved since is refused rather than appended to
+                        expected_journal_seq=_prepared.journal_base_seq,
+                        allocation_delta=_prepared.allocation,
+                        expected_epoch=_prepared.allocator_base_digest,
+                        journal_head=_prepared.journal_final_head,
+                        allocator_digest=_prepared.allocator_final_digest,
+                        plan_id=_prepared.representation_plan_id,
+                        plan_json=_prepared.representation_plan_json,
+                        spec_revision=_prepared.proposal_spec_revision,
+                        time_point=_prepared.proposal_time_point,
+                        canonical=_canonical_rows,
+                        block=block,
+                    )
+                except Exception as exc:
+                    # One transaction: nothing durable happened. Discard.
+                    logger.error(
+                        "[BLOCKCHAIN] commit of block #%s failed; nothing was "
+                        "persisted: %s", block.header.block_number, exc,
+                    )
+                    _dispose_quietly(_proposal)
+                    return False
+
+                if _commit_outcome.get("committed"):
+                    _swap_in_memory_state(next_snapshot, block)
+                    # The previous evaluator is obsolete the instant persistence
+                    # succeeds, so it goes out of service BEFORE promotion can
+                    # fail. Otherwise a failed promotion leaves the node serving a
+                    # worker that describes the state before this block.
+                    _owner.mark_unavailable(
+                        f"superseded by committed block {block.block_hash[:12]}"
+                    )
+                    try:
+                        _owner.promote(_proposal, _prepared)
+                    except Exception as exc:
+                        # COMMITTED_BUT_UNAVAILABLE. The block stays committed; the
+                        # node cannot serve it until it is reconstructed, and must
+                        # never answer from the superseded evaluator.
+                        logger.error(
+                            "[BLOCKCHAIN] block #%s is committed but its evaluator "
+                            "could not be promoted: %s",
+                            block.header.block_number, exc,
+                        )
+                        _owner.mark_unavailable(f"promotion failed: {exc}")
+                        _dispose_quietly(_proposal)
+                    _sync_advisory_mirror(_prepared)
+                else:
+                    logger.info(
+                        "[BLOCKCHAIN] block #%s was already committed (%s)",
+                        block.header.block_number, _prepared.execution_id[:12],
+                    )
+                    _dispose_quietly(_proposal)
+            else:
+                # Not enabled. An artifact reused here has no promotion to go to --
+                # the authority is the in-process interpreter -- so its worker is
+                # disposed rather than leaked.
+                _dispose_quietly(_proposal)
+                db.add_block(block)
+                _swap_in_memory_state(next_snapshot, block)
+                db.save_canonical_state_atomically(**_canonical_rows)
 
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
@@ -759,6 +1032,20 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
     print(f"[INFO][chain_state] Starting blockchain state reconstruction from block {start_block}...")
     global _canonical_head_hash, _tau_engine_state_hash, _application_rules_state, _consensus_rules_state
     global _active_consensus_id, _lifecycle_manager
+
+    # With worker-backed authority a rebuild goes through the SAME commit
+    # protocol as live blocks: every replayed block is evaluated in a proposal,
+    # its journal delta and commit record made durable, and its worker promoted.
+    # Replaying on the in-process interpreter instead would quietly make that
+    # interpreter the authority again -- the second source of truth.
+    _owner = tau_authority.owner()
+    _enabled = _owner.enabled
+    if _enabled and start_block != 0:
+        return RebuildResult(
+            ok=False, stopped_at_block=start_block,
+            reason="an incremental rebuild cannot be expressed on the committed "
+                   "journal; rebuild from genesis",
+        )
     
     if start_block == 0:
         # Clear current state for a full rebuild
@@ -784,6 +1071,16 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
         print("[INFO][chain_state] Cleared existing in-memory state for full rebuild.")
+
+        if _enabled:
+            import db as _db
+            try:
+                _db.reset_committed_journal()
+                _owner.rebuild_genesis(_db.get_genesis_hash() or None)
+            except Exception as exc:
+                logger.error("[chain_state] rebuild could not re-commit genesis: %s", exc)
+                return RebuildResult(ok=False, stopped_at_block=0,
+                                     reason=f"genesis re-commit failed: {exc}")
 
         # Reset the live Tau interpreter to the genesis consensus spec before
         # replay. `engine.apply_block` routes activation revisions through `i0`
@@ -907,12 +1204,38 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                 print(f"[WARN][chain_state] Tau unavailable during rebuild; skipping header verification for block #{block_number}.")
             
             # 4. Execute Core Block Application Natively
+            _proposal = None
             try:
-                apply_result = engine.apply_block(active_view, block, parent_snapshot, replay_mode=True)
+                if _enabled:
+                    _candidates = [
+                        (tx.get("operations") or {}).get("0")
+                        for tx in (block.transactions or [])
+                        if isinstance(tx, dict)
+                        and isinstance((tx.get("operations") or {}).get("0"), str)
+                    ]
+                    _proposal = _owner.build_proposal(
+                        candidate_rules=_candidates, label=f"rebuild-{block_number}")
+                    with tau_proposal.boundary(_proposal, label="rebuild"):
+                        apply_result = engine.apply_block(
+                            active_view, block, parent_snapshot, replay_mode=True,
+                            session=_proposal.session, proposal=_proposal,
+                        )
+                    if _proposal.dirty:
+                        _proposal.reconstruct()
+                else:
+                    apply_result = engine.apply_block(active_view, block, parent_snapshot, replay_mode=True)
             except FeeRuleError as e:
+                _dispose_quietly(_proposal)
                 print(f"[ERROR][chain_state] Fee rule failure replaying block #{block_number}: {e}")
                 return RebuildResult(ok=False, stopped_at_block=block_number,
                                      reason=f"fee rule failure: {e}")
+            except Exception as e:
+                if not _enabled:
+                    raise
+                _dispose_quietly(_proposal)
+                print(f"[ERROR][chain_state] Could not evaluate block #{block_number} during rebuild: {e}")
+                return RebuildResult(ok=False, stopped_at_block=block_number,
+                                     reason=f"evaluation failed: {e}")
             next_snapshot = apply_result.next_snapshot
             
             # 5. Execute Required Invariant Replay Checks (comparing state hashes)
@@ -929,11 +1252,60 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                  # Legacy blocks generated prior to Phase 2 might lack this.
                  print(f"[ERROR][chain_state] Block #{block_number} state_hash invariant mismatch!")
                  print(f"  Computed: {next_snapshot.state_hash}\n  Block: {block.header.state_hash}")
+                 _dispose_quietly(_proposal)
                  return RebuildResult(ok=False, stopped_at_block=block_number,
                                       computed_hash=next_snapshot.state_hash,
                                       stored_hash=block.header.state_hash,
                                       reason="state_hash invariant mismatch")
-                 
+
+            if _enabled:
+                # The block's evaluator history becomes durable exactly as a live
+                # block's does. Canonical rows are written once, by the caller, for
+                # the head the rebuild actually reached.
+                try:
+                    _execution_id = tau_commit.block_execution_id(
+                        parent=block.header.previous_hash,
+                        height=block.header.block_number,
+                        timestamp=block.header.timestamp,
+                        proposer=block.header.proposer_pubkey,
+                        transactions=block.transactions,
+                        consensus_context=active_view.consensus_rules or "",
+                    )
+                    _prepared = tau_commit.PreparedBlockCommit.freeze(
+                        _proposal, execution_id=_execution_id,
+                        next_snapshot=next_snapshot,
+                        parent_tip_id=block.header.previous_hash,
+                    )
+                    db.commit_prepared_block(
+                        execution_id=_prepared.execution_id,
+                        tip=block.block_hash,
+                        parent=block.header.previous_hash,
+                        journal_entries=[tau_commit._entry_row(e)
+                                         for e in _prepared.journal_delta],
+                        expected_journal_seq=_prepared.journal_base_seq,
+                        allocation_delta=_prepared.allocation,
+                        expected_epoch=_prepared.allocator_base_digest,
+                        journal_head=_prepared.journal_final_head,
+                        allocator_digest=_prepared.allocator_final_digest,
+                        plan_id=_prepared.representation_plan_id,
+                        plan_json=_prepared.representation_plan_json,
+                        spec_revision=_prepared.proposal_spec_revision,
+                        time_point=_prepared.proposal_time_point,
+                        # Journal-only, deliberately: the rebuild commits canonical
+                        # rows once, for the head it actually reached. Spelled out
+                        # so the commit-site audit can tell this from a site that
+                        # forgot them.
+                        canonical=None,
+                    )
+                    _owner.mark_unavailable(f"superseded by rebuilt block #{block_number}")
+                    _owner.promote(_proposal, _prepared)
+                    _sync_advisory_mirror(_prepared)
+                except Exception as e:
+                    _dispose_quietly(_proposal)
+                    print(f"[ERROR][chain_state] Could not commit rebuilt block #{block_number}: {e}")
+                    return RebuildResult(ok=False, stopped_at_block=block_number,
+                                         reason=f"commit failed: {e}")
+
             # 6. Atomically Replace In-Memory State
             with _balance_lock, _sequence_lock, _rules_lock:
                 _balances.clear()
@@ -1348,23 +1720,31 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
         with _rules_lock:
             consensus_snapshot = _consensus_rules_state or ""
             application_snapshot = _application_rules_state or ""
-    else:
-        genesis_path = os.path.join(os.path.dirname(__file__), "data", "genesis.json")
-        try:
-            with open(genesis_path, "r", encoding="utf-8") as f:
-                genesis_data = json.load(f)
-        except Exception:
-            logger.exception("Failed to load genesis data from %s", genesis_path)
-            return []
-        consensus_snapshot = genesis_data.get("consensus_rules", "")
-        application_snapshot = ""
+        return restore_plan_for(consensus_snapshot, application_snapshot,
+                                lifecycle=_lifecycle_manager)
+    genesis_path = os.path.join(os.path.dirname(__file__), "data", "genesis.json")
+    try:
+        with open(genesis_path, "r", encoding="utf-8") as f:
+            genesis_data = json.load(f)
+    except Exception:
+        logger.exception("Failed to load genesis data from %s", genesis_path)
+        return []
+    return restore_plan_for(genesis_data.get("consensus_rules", ""), "",
+                            lifecycle=None)
 
-    normalized_consensus = _preprocess_tau_spec_text(consensus_snapshot)
-    # The application snapshot is now a canonical raw accumulation of newline-
-    # separated rule units. Replay them ONE-BY-ONE in order (preserves u-state
-    # override/retraction semantics; the interpreter re-shrinks each on the way in).
+
+def restore_plan_for(consensus_rules: str, application_rules: str, *,
+                     lifecycle=None) -> List[Dict[str, object]]:
+    """The restore plan for GIVEN rule state, not the module globals.
+
+    A governance activation inside a proposal needs the POST-block plan -- the
+    newly activated consensus rules, the block's application rules, its clause
+    registry -- while the globals still describe the parent. Same construction as
+    the startup plan, so a collapse at activation and a restart agree.
+    """
+    normalized_consensus = _preprocess_tau_spec_text(consensus_rules or "")
     application_units = [
-        u for u in (application_snapshot or "").split("\n") if u.strip()
+        u for u in (application_rules or "").split("\n") if u.strip()
     ]
     application_unit_set = set(application_units)
 
@@ -1386,7 +1766,6 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
         normalized_rule = _preprocess_tau_spec_text(rule_text)
         if not normalized_rule:
             continue
-        # Exact-unit dedup (NOT substring) against the application accumulation.
         if normalized_rule in application_unit_set:
             continue
         plan.append({
@@ -1395,24 +1774,14 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
             "persist": True,
         })
 
-    # Rule-sharing composites are DERIVED, never accumulated. The clause
-    # registry is the consensus-bound source of truth (rule_clauses_root), and
-    # the composite is a pure function of it, so it is rebuilt here instead of
-    # being appended to the application accumulation.
-    #
-    # Appending was tried first and is wrong: `save_effective_tau_spec` only
-    # dedups EXACT units, so every acceptance left the previous composite in
-    # place too. The stream then had several composites whose net effect
-    # depended on replay order, and the spec grew with every accept -- which
-    # feeds straight into the interpreter-rebuild cost.
-    if use_persisted_state:
-        for label, text in _rule_composite_plan_entries():
+    if lifecycle is not None:
+        for label, text in _rule_composite_plan_entries(lifecycle):
             plan.append({"label": label, "text": text, "persist": False})
 
     return plan
 
 
-def _rule_composite_plan_entries() -> List[tuple]:
+def _rule_composite_plan_entries(lifecycle=None) -> List[tuple]:
     """(label, text) for one composite per output stream with accepted clauses.
 
     Ordered by stream index so every node replays them identically.
@@ -1420,7 +1789,8 @@ def _rule_composite_plan_entries() -> List[tuple]:
     from consensus.rule_offers import ALLOWED_TARGET_STREAMS
 
     entries: List[tuple] = []
-    manager = getattr(_lifecycle_manager, "rule_offers", None)
+    manager = getattr(lifecycle if lifecycle is not None else _lifecycle_manager,
+                      "rule_offers", None)
     if manager is None:
         return entries
     for stream in sorted(ALLOWED_TARGET_STREAMS):
@@ -1873,6 +2243,14 @@ def tick_governance(height: int):
     this helper exists to support tests and out-of-band lifecycle ticks. Both
     paths must agree, so we route revisions through `i0` here as well.
     """
+    # Legacy, outside any block: it steps the in-process interpreter directly.
+    # Under worker-backed authority activation happens inside apply_block's
+    # proposal, and this path would make the in-process interpreter authoritative.
+    if tau_authority.owner().enabled:
+        raise tau_authority.AuthorityUnavailable(
+            "tick_governance is not available under worker-backed authority; "
+            "activation runs inside the block's proposal"
+        )
     global _active_consensus_id, _consensus_rules_state
 
     # Snapshot the activated set without holding _rules_lock across the Tau
@@ -1988,24 +2366,67 @@ def load_builtin_rules_from_disk() -> list[str]:
     return rules
 
 
-def _is_reachable_from_genesis(b_hash: str) -> bool:
-    import config, db
+def _resolve_fork(old_head_hash: str, new_head_hash: str,
+                  genesis_hash: str) -> tuple[str, list[str], list[str]]:
+    """Where the chain ending at `new_head_hash` leaves the one ending at
+    `old_head_hash`: (ancestor, old_suffix, new_suffix), as db.find_fork_point
+    returns it. The walk stops at the fork point, so a block that extends the
+    head costs one step however deep the chain is.
+
+    Raises db.ChainAncestryError when `new_head_hash` does not reach genesis.
+    When it is the *current* head's lineage that is broken instead (no fork
+    point, yet `new_head_hash` walks back to genesis by itself), that is logged
+    at ERROR and genesis is taken as the fork point, so the node can still move
+    onto the sound chain; the rebuild checks every block of it from genesis.
+    """
+    import db
     try:
-        path = db.get_chain_path(b_hash, db.get_genesis_hash())
+        return db.find_fork_point(old_head_hash, new_head_hash)
+    except db.ChainAncestryError as exc:
+        if exc.side == "b":
+            raise
+        head_error = exc
+    new_path = db.get_chain_path(new_head_hash, genesis_hash)
+    logger.error(
+        "[chain_state] Canonical head %s... has broken ancestry (%s: %s); %s... "
+        "reaches genesis by itself, so it is treated as forking at genesis.",
+        (old_head_hash or '')[:16], head_error.kind, head_error, new_head_hash[:16],
+    )
+    return genesis_hash, [], new_path
+
+
+def _connects_to_canonical_chain(cand_hash: str, head_hash: str, genesis_hash: str) -> bool:
+    """True if `cand_hash`'s lineage meets the chain ending at `head_hash`.
+
+    A branch whose parent has not arrived yet is routine while syncing and is
+    logged at DEBUG. A malformed or foreign lineage is logged at WARNING.
+    """
+    import db
+    try:
+        _resolve_fork(head_hash, cand_hash, genesis_hash)
         return True
-    except ValueError:
+    except db.ChainAncestryError as exc:
+        if exc.kind == "missing":
+            logger.debug("[chain_state] Candidate head %s... is not connected yet: %s",
+                         cand_hash[:16], exc)
+        else:
+            logger.warning("[chain_state] Ignoring candidate head %s... (%s): %s",
+                           cand_hash[:16], exc.kind, exc)
         return False
 
-def select_best_head(candidates: list[tuple[str, int]]) -> str | None:
-    if not candidates:
-        return None
-        
-    def score(cand):
-        block_hash, height = cand
-        return (-height, bytes.fromhex(block_hash))
-        
-    best = min(candidates, key=score)
-    return best[0]
+
+def _head_rank(cand: tuple[str, int]):
+    """Fork-choice order, best first: the higher block, then the lower hash.
+
+    A hash that is not hex can only belong to a stored block #0 (no other
+    block_hash survives Block.from_dict unverified); it ranks last at its
+    height rather than raising out of the sort.
+    """
+    block_hash, height = cand
+    try:
+        return (-height, 0, bytes.fromhex(block_hash))
+    except ValueError:
+        return (-height, 1, block_hash.encode())
 
 def ingest_block(block: Block) -> IngestResult:
     import db, config
@@ -2057,18 +2478,28 @@ def maybe_update_canonical_head() -> Optional[bool]:
         if not candidates:
             return None
 
-        valid_cands = []
-        for cand_hash, cand_height in candidates:
-            if _is_reachable_from_genesis(cand_hash):
-                valid_cands.append((cand_hash, cand_height))
-
-        best_hash = select_best_head(valid_cands)
-        if not best_hash:
-            return None
-
+        genesis_hash = db.get_genesis_hash()
         current_head = db.get_canonical_head()
         current_hash = current_head.get('block_hash') if current_head else ''
-        if best_hash != current_hash:
+        if current_hash and current_hash not in {h for h, _ in candidates}:
+            # Staying put is always an option. A head with a child is not
+            # childless, so without this a head whose only children are
+            # rejected below would lose to the tip of an old fork beneath it.
+            head_height = int((current_head.get('header') or {}).get('block_number', 0))
+            candidates = [*candidates, (current_hash, head_height)]
+
+        # Best first; the first candidate that connects is the best connected
+        # one, so nothing ranked below it is walked. The head connects by
+        # definition, so the tips of old forks below it -- walking one means
+        # walking the head down to its height -- are never reached.
+        best_hash = None
+        for cand_hash, _height in sorted(candidates, key=_head_rank):
+            if cand_hash == current_hash or _connects_to_canonical_chain(
+                    cand_hash, current_hash or genesis_hash, genesis_hash):
+                best_hash = cand_hash
+                break
+
+        if best_hash and best_hash != current_hash:
             return reorg_to(best_hash)
     return None
 
@@ -2081,38 +2512,32 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
     Returns True if the head advanced (state rebuilt + committed), False if the
     reorg was ABORTED because the rebuild replay failed (canonical head left
     unchanged; in-memory state restored to the prior head), or None for a no-op
-    (already at target, or the target path is unreachable).
+    (already at target, or the target's ancestry cannot be resolved -- logged
+    at ERROR).
     """
     import db, config
 
+    genesis_hash = db.get_genesis_hash()
     current_head = db.get_canonical_head()
-    old_head_hash = current_head.get('block_hash') if current_head else db.get_genesis_hash()
+    old_head_hash = current_head.get('block_hash') if current_head else genesis_hash
 
     if old_head_hash == new_head_hash:
         return None
 
+    # Walk the two heads back only to where they meet. Walking each back to
+    # genesis ran into get_chain_path's old 2000-block cap on any deeper chain,
+    # and the ValueError was swallowed: every reorg, and every synced block,
+    # became a silent no-op.
     try:
-        new_path = db.get_chain_path(new_head_hash, db.get_genesis_hash())
-    except ValueError:
+        ancestor, old_suffix, new_suffix = _resolve_fork(old_head_hash, new_head_hash, genesis_hash)
+    except db.ChainAncestryError as exc:
+        logger.error(
+            "[chain_state] Reorg to %s... REFUSED: its ancestry does not reach "
+            "the canonical chain (%s: %s). Canonical head stays at %s...",
+            new_head_hash[:16], exc.kind, exc, (old_head_hash or '')[:16],
+        )
         return None
 
-    old_path = []
-    if old_head_hash != db.get_genesis_hash():
-        try:
-            old_path = db.get_chain_path(old_head_hash, db.get_genesis_hash())
-        except ValueError:
-            pass
-            
-    common_prefix_len = 0
-    for n_h, o_h in zip(new_path, old_path):
-        if n_h == o_h:
-            common_prefix_len += 1
-        else:
-            break
-            
-    new_suffix = new_path[common_prefix_len:]
-    old_suffix = old_path[common_prefix_len:]
-    
     # Phase 2: Mempool Diffs
     old_txs = {}
     from block import compute_tx_hash
@@ -2133,6 +2558,21 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 
     # Phase 3: Apply State Rebuild
     db.reset_mempool_reservations()
+
+    # The rebuild replays from genesis, so it takes the whole path: the stretch
+    # both chains share up to the fork point, then the new chain's own blocks.
+    try:
+        shared = db.get_chain_path(ancestor, genesis_hash)
+    except db.ChainAncestryError as exc:
+        logger.error(
+            "[chain_state] Reorg to %s... REFUSED: the chain below fork point "
+            "%s... does not reach genesis (%s: %s). Canonical head stays at %s...",
+            new_head_hash[:16], ancestor[:16], exc.kind, exc, (old_head_hash or '')[:16],
+        )
+        return None
+    new_path = shared + new_suffix
+    old_path = shared + old_suffix
+
     rebuild = _rebuild_state_from_blockchain_internal(0, path_hashes=new_path)
 
     # Phase 3b: Abort guard (Bug B). If the replay failed, the in-memory state
@@ -2156,8 +2596,8 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
             (old_head_hash or '')[:16],
         )
         # Restore consistent state at the prior head. old_path==[] (prior head
-        # was genesis) resets to the genesis baseline; a non-empty old_path
-        # replays the known-good canonical chain.
+        # was genesis, or its own ancestry was broken) resets to the genesis
+        # baseline; a non-empty old_path replays the known-good canonical chain.
         restore = _rebuild_state_from_blockchain_internal(0, path_hashes=old_path)
         if restore is None or not restore.ok:
             logger.error(

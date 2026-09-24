@@ -261,7 +261,9 @@ class TestMempoolAdmission:
         happens deterministically across nodes at activation time
         (`engine.apply_block`), so admission must NOT touch Tau at all.
         """
-        with patch("consensus.admission.communicate_with_tau") as mock_tau:
+        # admission no longer even imports it; patch the real function so a
+        # call by ANY route still shows up here
+        with patch("tau_manager.communicate_with_tau") as mock_tau:
             tx = get_update_tx()
             res = validate_mempool_admission(tx, tip_view)
             assert res.is_valid

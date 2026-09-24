@@ -100,7 +100,9 @@ locality rule below differ.
 
 The WebSocket listener scans `65433`–`65442` for the first free port, so on a
 host already running a node the browser wallet may need a port other than the
-default. It also enforces an `Origin` allowlist: missing/`null` origins and
+default. The node binds its libp2p listener first, and both scans (the TCP
+one from `65432`) skip its ports: a p2p port inside either range moves the
+WebSocket or TCP listener, never the p2p one. It also enforces an `Origin` allowlist: missing/`null` origins and
 anything containing `localhost` or `127.0.0.1` pass, otherwise the origin must
 match an entry in the comma-separated `TAU_WS_ALLOWED_ORIGINS` (`*` allows
 all). A rejected connection gets the plain-text `error disallowed_origin` and
@@ -375,7 +377,8 @@ Send a Tau rule to another user; they check its conflict status and then accept
 it into their own specification or reject it.
 
 ```bash
-# Offer a rule. --expire-in is resolved against the node's current tip;
+# Offer a rule. --expire-in N gives it N blocks to land, counted from the next
+# block (expire_at_height = tip + 1 + N);
 # --expire-at-height sets an absolute height instead.
 tau-testnet rule offer --key alice --to <bob_pubkey> --rule-file policy.tau
 tau-testnet rule offer --key alice --to <bob_pubkey> --rule 'always ( o5[t]:bv[24] = { #x000000 }:bv[24] ).' \
@@ -447,8 +450,8 @@ tau-testnet gov vote --key alice --update-id <update_id_hex>
 The CLI wraps this with `tx_type`, `sender_pubkey`, `sequence_number`,
 `expiration_time`, `expire_at_height`, `fee_limit`, and the BLS `signature` —
 all flat at the top level (matching `tests/test_gov_integration.py`). The CLI
-fills `expire_at_height` from the node's tip (`--expire-in` blocks ahead,
-default 1000); every transaction must carry one.
+fills `expire_at_height` from the node's tip (`tip + 1 + 1000`: 1000 blocks
+to land in, counted from the next one); every transaction must carry one.
 
 ### Prerequisite: the proposer/voter must be an active validator
 

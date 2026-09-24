@@ -313,6 +313,139 @@ def _process_transfers_operation(transfers, sender_pubkey):
     return True, {"transfers": validated_transfers, "tau_inputs": tau_inputs}, None
 
 
+
+
+def _test_mode_was_requested() -> bool:
+    """True only when test/mock mode was asked for, not when it was fallen back to.
+
+    `tau_manager` flips `tau_test_mode` on when the native interface fails to
+    build, so reading that flag alone would turn a broken production node into a
+    node that silently stops validating.
+    """
+    import os as _os
+    if str(_os.environ.get("TAU_FORCE_TEST", "")).strip() in ("1", "true", "True"):
+        return True
+    if str(_os.environ.get("TAU_ENV", "")).strip() == "test":
+        return True
+    try:
+        import config as _config
+        env = getattr(getattr(_config, "settings", None), "env", None)
+        if env == "test":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _genesis_baseline():
+    """The context a FIRST rule is validated against, when nothing has accumulated.
+
+    An empty baseline used to skip the check entirely, which is precisely the
+    wrapper regression of validating nothing when there is nothing to validate
+    against: the first rule on a fresh chain is the one least likely to have been
+    seen before.
+    """
+    import os as _os
+    try:
+        import chain_state
+        prior = chain_state.get_rules_state()
+        if prior and str(prior).strip():
+            return str(prior)
+    except Exception:
+        pass
+    try:
+        here = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        with open(_os.path.join(here, "genesis.tau")) as fh:
+            router = fh.read().strip()
+        return f"always ( {router} )." if router else None
+    except Exception:
+        return None
+
+
+def _preflight_prepared_rule(rule_text: str):
+    """Validate the PREPARED rule against the live runtime baseline.
+
+    Returns an error envelope to return to the caller, or None to continue.
+
+    Admission stays node-local policy here: this can only reject a transaction
+    that apply would have refused anyway, turning "admitted, then silently never
+    applied" into a reason at submit time. It never admits anything new, and an
+    operational failure is never reported as a rule rejection.
+    """
+    try:
+        import tau_manager
+        import tau_preflight
+    except Exception:  # pragma: no cover - import-time environment problem
+        return None
+
+    # Applicability is narrow on purpose. Only an EXPLICIT request for test mode
+    # means "no native evaluator is expected here"; a production node that wanted
+    # native and has none is operationally unavailable, not exempt. And an empty
+    # baseline is not a reason to skip: the first rule on a fresh chain is exactly
+    # the one nobody has validated yet. It is validated against the genesis
+    # context instead.
+    if _test_mode_was_requested():
+        return None
+    if getattr(tau_manager, "tau_direct_interface", None) is None:
+        logger.warning("Rule preflight: native evaluator expected but unavailable")
+        return _qt_err(
+            "ADMISSION_UNAVAILABLE",
+            "Rule validation is temporarily unavailable; please resubmit.",
+        )
+
+    try:
+        prepared = tau_manager._prepare_rule_for_tau(rule_text)
+    except Exception as exc:
+        # ShrinkTypeConflict and friends: this process cannot represent the rule.
+        # Node-local, so reject with a distinct code rather than TX_REJECTED.
+        logger.warning("Rule cannot be represented in this process: %s", exc)
+        return _qt_err(
+            "ADMISSION_UNAVAILABLE",
+            f"This node cannot currently represent that rule: {exc}",
+        )
+    if prepared is None:
+        return None
+
+    # The interpreter's own composed spec -- deliberately the RUNTIME form, since
+    # that is the representation the prepared rule has to be compatible with.
+    baseline = tau_manager.last_known_tau_spec
+    if not baseline:
+        baseline = _genesis_baseline()
+    if not baseline:
+        logger.warning("Rule preflight: no baseline available to validate against")
+        return _qt_err(
+            "ADMISSION_UNAVAILABLE",
+            "Rule validation is temporarily unavailable; please resubmit.",
+        )
+
+    result = tau_preflight.preflight_rule(
+        baseline,
+        prepared.runtime_text,
+        context=tau_preflight.capture_context(
+            tau_manager.get_evaluator_state(), mapping_epoch=None
+        ),
+    )
+    if result.verdict == tau_preflight.REJECT:
+        logger.warning("Rule preflight rejected the prepared text: %s", result.detail)
+        return _qt_err(
+            "TX_REJECTED",
+            f"Transaction rejected by Tau (rule preflight). {result.detail}",
+        )
+    if result.verdict == tau_preflight.UNAVAILABLE:
+        # "Could not validate" is not "validated". It is also not "invalid rule":
+        # the caller gets a distinct operational code and can resubmit, and the
+        # author is not blamed for a worker that would not spawn or a diagnostic
+        # capture that could not be read. Returning the previous successful-looking
+        # verdict instead would let an unvalidated rule into the mempool while
+        # reporting that it passed.
+        logger.warning("Rule preflight unavailable: %s", result.detail)
+        return _qt_err(
+            "ADMISSION_UNAVAILABLE",
+            "Rule validation is temporarily unavailable; please resubmit.",
+        )
+    return None
+
+
 def queue_transaction(json_blob: str, propagate: bool = True, *,
                       dry_run: bool = False, skip_tau_eval: bool = False) -> dict:
     """Validate a transaction and (unless dry_run) queue it in the mempool.
@@ -693,6 +826,15 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                                     f"Transaction rejected by Tau (rule validation). {compile_err}",
                                 )
                             logger.info("Tau rule validation successful (isolated compile).")
+
+                            # The canonical compile above runs in a FRESH process,
+                            # which has no type commitments and does no shrinking,
+                            # so it passes text the live process cannot type. Now
+                            # validate what apply will actually feed: the PREPARED
+                            # runtime rule against the runtime baseline.
+                            preflight_err = _preflight_prepared_rule(rule_text)
+                            if preflight_err is not None:
+                                return preflight_err
 
             # Step 2: Custom Input Validation (transfer-less user_tx only).
             # For txs WITH transfers the custom streams are merged into the

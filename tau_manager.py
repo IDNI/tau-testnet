@@ -6,9 +6,15 @@ import time
 import config
 import tau_defs
 import utils
-from errors import TauCommunicationError, TauEngineCrash
+from errors import (
+    TauCommunicationError,
+    TauEngineCrash,
+    TauSpecIntegrationError,
+    TauSpecRejected,
+)
 import tau_native
 import tau_shrink
+import tau_evaluator_state
 import tau_io_logger
 
 logger = logging.getLogger(__name__)
@@ -114,6 +120,41 @@ tau_direct_interface: tau_native.TauInterface | None = None
 # only AFTER a successful interpreter update, under `tau_comm_lock`.
 _current_prepared_spec: "tau_shrink.PreparedTauSpec | None" = None
 _runtime_shrunk_streams: frozenset = frozenset()
+# W2: the full state model. `_runtime_shrunk_streams` stays as a derived view for
+# existing callers; this carries what that set cannot -- per-stream canonical vs
+# runtime width, encoding kind, mapping identity, PROCESS type commitments (which
+# outlive the rules that created them and survive an interface replacement), the
+# interface generation and an execution revision.
+_evaluator_state = tau_evaluator_state.EvaluatorState()
+
+
+_last_revision_receipt = None
+
+
+def get_last_revision_receipt():
+    """What the engine did with the most recent revision, or None.
+
+    W6: the apply path used to infer acceptance from a formatted output string,
+    which cannot tell a genuine no-op from a rule the engine never routed.
+    """
+    return _last_revision_receipt
+
+
+def get_evaluator_state() -> "tau_evaluator_state.EvaluatorState":
+    return _evaluator_state
+
+
+def reset_evaluator_state() -> None:
+    """Drop ALL evaluator state, including process type commitments.
+
+    Only honest when the native process really is gone (a fresh process, or a
+    test). Never call it to imitate a rollback inside a live process: the engine
+    does not forget a width just because our bookkeeping did.
+    """
+    global _evaluator_state, _runtime_shrunk_streams, _current_prepared_spec
+    _evaluator_state = tau_evaluator_state.EvaluatorState()
+    _runtime_shrunk_streams = frozenset()
+    _current_prepared_spec = None
 
 
 # Watchdog monitors in-flight Tau communication; limit is config.COMM_TIMEOUT (TAU_COMM_TIMEOUT).
@@ -192,15 +233,49 @@ def _shrink_exclude() -> frozenset:
     return frozenset(getattr(config, "TAU_SHRINK_STREAM_EXCLUDE", frozenset()))
 
 
+def _assert_representation_compatible(prepared) -> None:
+    """Refuse any representation this process cannot type.
+
+    Applies to EVERY preparation exit, including the whole-rule fallbacks: a
+    fallback widens every stream it touches, not just the one whose optimization
+    was refused, and the engine commits a stream's width on the first accepted
+    revision and never re-types it. Checking only the stream that caused the
+    fallback would let the others through.
+    """
+    wide = frozenset(getattr(prepared, "wide_streams_unshrunk", ()) or ())
+    conflict = wide & frozenset(_runtime_shrunk_streams)
+    conflict |= _evaluator_state.conflicts(
+        prepared, width=tau_shrink.current_shrink_width()
+    )
+    if conflict:
+        raise tau_shrink.ShrinkTypeConflict(
+            "rule references "
+            + ", ".join(f"i{i}" for i in sorted(conflict))
+            + " at a width this process has already committed differently; no "
+            "representation of it can be typed here. A fresh process rebuilds "
+            "from the canonical full-width state."
+        )
+
+
 def _prepare_rule_for_tau(rule_text: str | None) -> "tau_shrink.PreparedTauSpec | None":
     """Canonical/runtime split for a rule. canonical_text is persisted; the
-    interpreter is fed runtime_text. Disabled => canonical == runtime."""
+    interpreter is fed runtime_text. Disabled => canonical == runtime.
+
+    W3: this layer -- not tau_shrink, which stays stateless about the live
+    interpreter -- owns the compatibility decision. Falling back to full width is
+    the right answer at process start and a guaranteed engine error once the
+    stream is typed: the engine commits a stream's width on the first ACCEPTED
+    revision that mentions it and never re-types it, so a wide occurrence of an
+    already-shrunk stream cannot be dispatched in either form.
+    """
     canonical = _preprocess_rule_for_tau(rule_text)
     if canonical is None:
         return None
     if not getattr(config, "TAU_SHRINK_ENABLED", False):
         return tau_shrink.PreparedTauSpec(canonical, canonical, False, frozenset())
-    return tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
+    prepared = tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
+    _assert_representation_compatible(prepared)
+    return prepared
 
 
 def get_canonical_spec() -> str | None:
@@ -222,43 +297,107 @@ def _normalize_tau_input_value(value: str | None) -> str | None:
     return text
 
 
-def _collect_i0_prepared(input_stream_values) -> list:
-    """Prepare any rule(s) supplied via the i0 input stream (rare). Returns the
-    PreparedTauSpec for each so the caller can union shrink sets and commit."""
-    out = []
+class AmbiguousStreamKey(ValueError):
+    """Two input-stream keys in one request resolve to the same stream index."""
+
+
+def normalize_stream_key(key):
+    """Canonical input-stream index for a request key, or None if it is not one.
+
+    W4: `"i12"` and `12` must resolve identically. The manager used to do a bare
+    `int(k)`, so a string key like `"i12"` silently skipped value encoding while
+    the native adapter happily accepted it. Leading-zero spellings are ambiguous
+    and are rejected rather than normalised.
+    """
+    if isinstance(key, bool):
+        return None
+    if isinstance(key, int):
+        return key if key >= 0 else None
+    if not isinstance(key, str):
+        return None
+    text = key.strip()
+    if text[:1].lower() == "i":
+        text = text[1:]
+    if not text.isdigit():
+        return None
+    if len(text) > 1 and text[0] == "0":
+        return None
+    return int(text)
+
+
+def _resolve_stream_keys(input_stream_values):
+    """Map each request key to its stream index, rejecting duplicate aliases.
+
+    Runs BEFORE any merge of user-supplied and host-owned inputs, so a user key
+    can never override a consensus field just because two layers spell the same
+    stream differently.
+    """
+    resolved = {}
+    seen = {}
+    for key in input_stream_values:
+        idx = normalize_stream_key(key)
+        resolved[key] = idx
+        if idx is None:
+            continue
+        if idx in seen and seen[idx] != key:
+            raise AmbiguousStreamKey(
+                f"input keys {seen[idx]!r} and {key!r} both name stream i{idx}"
+            )
+        seen[idx] = key
+    return resolved
+
+
+def _collect_i0_prepared(input_stream_values):
+    """Prepare any rule(s) supplied via the i0 input stream (rare), ONCE.
+
+    W5: `_normalize_inputs` used to prepare the same text a second time. A probe
+    made the first preparation narrow and the second fall back, so the wrapper
+    dispatched wide text while committing narrow bookkeeping. The preparation is
+    now cached per (key, position) and the normaliser reuses it, so the bytes that
+    are validated are the bytes that are dispatched.
+
+    Returns (preps, by_slot) -- the ordered list, and the cache the normaliser
+    reads.
+    """
+    preps = []
+    by_slot = {}
     if not input_stream_values:
-        return out
+        return preps, by_slot
+    key_index = _resolve_stream_keys(input_stream_values)
     for k, v in input_stream_values.items():
-        if str(k) not in {"0", "i0"}:
+        if key_index.get(k) != 0:
             continue
         items = v if isinstance(v, (list, tuple)) else [v]
-        for p in items:
+        for pos, p in enumerate(items):
             prep = _prepare_rule_for_tau(str(p).replace('\n', ' '))
             if prep is not None:
-                out.append(prep)
-    return out
+                preps.append(prep)
+                by_slot[(k, pos)] = prep
+    return preps, by_slot
 
 
-def _normalize_inputs(input_stream_values, effective_shrunk: frozenset):
-    """Normalize every stream value, shrinking allowlisted address streams.
+def _normalize_inputs(input_stream_values, effective_shrunk: frozenset, i0_prepared=None):
+    """Normalize every stream value, encoding allowlisted address streams.
 
     May raise tau_shrink.ShrinkUnavailable if a value that MUST shrink (its index
-    is in effective_shrunk) cannot be interned -- the caller fails closed."""
+    is in effective_shrunk) cannot be interned -- the caller fails closed -- or
+    AmbiguousStreamKey if two keys name the same stream."""
     if not input_stream_values:
         return None
 
-    def _one(k, p):
-        idx = None
-        try:
-            idx = int(k)
-        except (TypeError, ValueError):
-            idx = None
+    key_index = _resolve_stream_keys(input_stream_values)
+    cache = i0_prepared or {}
+
+    def _one(k, p, pos=0):
+        idx = key_index.get(k)
         p_str = str(p).replace('\n', ' ')
-        if str(k) in {"0", "i0"}:
-            prep = _prepare_rule_for_tau(p_str)
-            return (prep.runtime_text if prep else p_str) or ""
-        if p_str.lstrip().startswith("always"):
-            prep = _prepare_rule_for_tau(p_str)
+        # The rule stream is i0, identified by its KEY. Never by sniffing the
+        # value for a leading "always": dispatch comes from the typed input
+        # contract, not from the first word of a user-supplied string.
+        if idx == 0:
+            prep = cache.get((k, pos))
+            if prep is None:                    # no cache supplied (direct callers)
+                prep = _prepare_rule_for_tau(p_str)
             return (prep.runtime_text if prep else p_str) or ""
         base = _normalize_tau_input_value(p_str) or ""
         if idx is not None:
@@ -268,7 +407,7 @@ def _normalize_inputs(input_stream_values, effective_shrunk: frozenset):
     normalized = {}
     for k, v in input_stream_values.items():
         if isinstance(v, (list, tuple)):
-            normalized[k] = [_one(k, p) for p in v]
+            normalized[k] = [_one(k, p, pos) for pos, p in enumerate(v)]
         else:
             normalized[k] = _one(k, v)
     return normalized
@@ -291,6 +430,14 @@ def _commit_runtime_spec(prepared, *, accumulate: bool = False) -> None:
     rebuilds from a complete spec / re-pins explicitly.)"""
     global _current_prepared_spec, _runtime_shrunk_streams
     _current_prepared_spec = prepared
+    try:
+        _evaluator_state.apply_prepared(prepared, width=tau_shrink.current_shrink_width())
+        _evaluator_state.advance()
+    except ValueError as exc:
+        # The engine never re-types a stream in-process; a disagreement here means
+        # our bookkeeping and the interpreter have diverged.
+        logger.error("tau_manager: evaluator state rejected a commitment: %s", exc)
+        _evaluator_state.mark_unusable(str(exc))
     if accumulate:
         _runtime_shrunk_streams = frozenset(_runtime_shrunk_streams) | frozenset(prepared.shrunk_streams)
     else:
@@ -359,8 +506,14 @@ def start_and_manage_tau_process():
                 _state_restore_callback()
                 logger.info("State restore callback completed successfully.")
             except Exception as e:
-                logger.error("State restore callback failed in Direct Mode: %s", e)
-                pass
+                # Fail closed. A restore that did not complete leaves an
+                # interpreter that describes some other state; publishing
+                # readiness for it is how a node answers for a chain it never
+                # loaded. Readiness stays down and startup reports it.
+                logger.critical("State restore callback failed in Direct Mode: %s", e)
+                while not server_should_stop.is_set():
+                    time.sleep(0.05)
+                return
 
         tau_ready.set()
         
@@ -369,13 +522,14 @@ def start_and_manage_tau_process():
             
         logger.info("Server shutdown requested, Tau manager exiting (Direct Mode).")
     except Exception as e:
+        # Fail closed. This used to switch the node into MOCK mode and publish
+        # readiness -- a production node with a broken native binding went on
+        # accepting transactions against fabricated Tau verdicts. Mock execution
+        # is only ever the explicitly requested test configuration.
         logger.critical(f"Failed to initialize Tau Native Interface: {e}")
-        tau_test_mode = True
-        tau_process_ready.set()
-        tau_ready.set()
         while not server_should_stop.is_set():
             time.sleep(0.05)
-        logger.info("Server shutdown requested, Tau manager exiting (Fallback Test Mode).")
+        logger.info("Server shutdown requested, Tau manager exiting (native init failed).")
         return
 
 
@@ -453,6 +607,11 @@ def communicate_with_tau(
              filepath = tau_io_logger.dump_crash_log("TauEngineCrash", msg)
              raise TauEngineCrash(msg)
 
+        # A receipt describes ONE call; never let a previous one answer for this
+        # one if this call raises before recording its own.
+        global _last_revision_receipt
+        _last_revision_receipt = None
+
         # --- Shrink: canonical (persisted) vs runtime (interpreter) split ---
         prepared = None
         if rule_text is not None:
@@ -460,7 +619,7 @@ def communicate_with_tau(
             if prepared is not None:
                 rule_text = prepared.runtime_text  # feed the interpreter the shrunk form
 
-        i0_stream_preps = _collect_i0_prepared(input_stream_values)
+        i0_stream_preps, i0_by_slot = _collect_i0_prepared(input_stream_values)
 
         # Effective shrink set for THIS evaluation: a spec update redefines it,
         # otherwise use the committed runtime set.
@@ -476,7 +635,9 @@ def communicate_with_tau(
         effective_shrunk = frozenset(effective_shrunk)
 
         try:
-            normalized_inputs = _normalize_inputs(input_stream_values, effective_shrunk)
+            normalized_inputs = _normalize_inputs(
+                input_stream_values, effective_shrunk, i0_prepared=i0_by_slot
+            )
         except tau_shrink.ShrinkUnavailable as exc:
             # A stream value that must shrink could not be interned while a shrunk
             # convention is active. Abort rather than feed a mixed-width wrong verdict.
@@ -496,8 +657,19 @@ def communicate_with_tau(
                 target_output_stream_index=target_output_stream_index,
                 input_stream_values=normalized_inputs or input_stream_values,
                 source=source,
-                apply_rules_update=apply_rules_update
+                apply_rules_update=apply_rules_update,
+                # W9: if we rewrote the author's text, an engine type/parse
+                # refusal is OUR integration failure, not an invalid rule.
+                node_generated=bool(
+                    (prepared is not None and prepared.shrink_enabled)
+                    or any(p.shrink_enabled for p in i0_stream_preps)
+                ),
             )
+        except (TauSpecRejected, TauSpecIntegrationError):
+            # W9: typed, deterministic verdicts about the INPUT. Flattening these
+            # into TauCommunicationError erased the only signal that said whose
+            # fault the failure was.
+            raise
         except Exception as ex:
             raise TauCommunicationError(f"Direct Tau communication failed: {ex}", last_state=last_known_tau_spec)
 
@@ -512,6 +684,10 @@ def communicate_with_tau(
                 )
         except Exception:
             pass
+
+        _last_revision_receipt = getattr(
+            tau_direct_interface, "last_revision_receipt", None
+        )
 
         # Commit runtime shrink state (shrunk-stream set) AFTER a successful
         # interpreter update.
@@ -615,14 +791,16 @@ def communicate_with_tau_multi(
     tau_comm_lock.acquire()
     _write_status(start=True, source=source)
     try:
-        i0_stream_preps = _collect_i0_prepared(input_stream_values)
+        i0_stream_preps, i0_by_slot = _collect_i0_prepared(input_stream_values)
         effective_shrunk = set(_runtime_shrunk_streams)
         for p in i0_stream_preps:
             effective_shrunk |= set(p.shrunk_streams)
         effective_shrunk = frozenset(effective_shrunk)
 
         try:
-            normalized_inputs = _normalize_inputs(input_stream_values, effective_shrunk)
+            normalized_inputs = _normalize_inputs(
+                input_stream_values, effective_shrunk, i0_prepared=i0_by_slot
+            )
         except tau_shrink.ShrinkUnavailable as exc:
             raise TauCommunicationError(
                 f"Shrink unavailable for stream value: {exc}", last_state=last_known_tau_spec
@@ -742,6 +920,10 @@ def restore_full_tau_spec(spec_text: str, *, runtime_shrunk_streams: "frozenset 
             # "Incompatible type information in i12:untyped, expected :bv[8],
             # found :bv[16]". Widening is only safe via re-exec.
             prepared = tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
+            # The restore path builds its own preparation, so it needs the same
+            # gate: the engine's type commitments are process-global and survive
+            # the interpreter rebuild this function performs.
+            _assert_representation_compatible(prepared)
         else:
             prepared = tau_shrink.PreparedTauSpec(canonical, canonical, False, frozenset())
         _print_tau_send("restore_full_tau_spec update_spec", prepared.runtime_text)
@@ -782,6 +964,13 @@ def request_shutdown():
         tau_direct_interface = None
         tau_ready.clear()
         tau_process_ready.clear()
+
+
+def _note_interface_replaced(reason: str) -> None:
+    """The interface object changed. W2: process type commitments are NOT cleared
+    -- `kill_tau_process` builds another interface in the SAME process, and the
+    engine's committed widths do not go away with the old object."""
+    _evaluator_state.new_generation(reason)
 
 
 def kill_tau_process():
