@@ -19,6 +19,9 @@ OFFER_ID = "ab" * 32
 OTHER = "bb" * 48
 
 
+# A canned getsequence answer carries tip_height, as a node's does: without it
+# the CLI takes the node for one too old to report the tip, asks getblocks as
+# well, and that extra call takes the response queued for sendtx.
 def _run_cli(argv, *, send_responses=None, recorded=None):
     responses = list(send_responses or [])
 
@@ -121,8 +124,8 @@ def test_rule_offer_builds_the_payload(alice, tmp_path):
         ["rule", "offer", "--key", "alice", "--to", OTHER,
          "--rule-file", str(rule_file), "--expire-at-height", "500"],
         send_responses=[
-            _ok({"sequence_number": 3}),   # getsequence
-            _ok({"tx_hash": "deadbeef"}),  # sendtx
+            _ok({"sequence_number": 3, "tip_height": 9}),  # getsequence
+            _ok({"tx_hash": "deadbeef"}),                  # sendtx
         ],
         recorded=recorded,
     )
@@ -144,7 +147,7 @@ def test_rule_offer_resolves_expire_in_against_the_tip(alice):
          "--expire-in", "50"],
         send_responses=[
             _ok({"blocks": [{"header": {"block_number": 9}}]}),  # getblocks
-            _ok({"sequence_number": 0}),
+            _ok({"sequence_number": 0, "tip_height": 9}),
             _ok({"tx_hash": "deadbeef"}),
         ],
         recorded=recorded,
@@ -158,7 +161,7 @@ def test_rule_offer_rejects_self_offer(alice):
     rc, _, err = _run_cli(
         ["rule", "offer", "--key", "alice", "--to", alice, "--rule", RULE,
          "--expire-at-height", "500"],
-        send_responses=[_ok({"sequence_number": 0})],
+        send_responses=[_ok({"sequence_number": 0, "tip_height": 9})],
     )
     assert rc == cli.EXIT_LOCAL
     assert "differ" in err
@@ -181,7 +184,8 @@ def test_rule_reject_builds_the_payload(alice):
     recorded = []
     rc, _, err = _run_cli(
         ["rule", "reject", "--key", "alice", OFFER_ID],
-        send_responses=[_ok({"sequence_number": 1}), _ok({"tx_hash": "x"})],
+        send_responses=[_ok({"sequence_number": 1, "tip_height": 9}),
+                        _ok({"tx_hash": "x"})],
         recorded=recorded,
     )
     assert rc == 0, err
@@ -198,7 +202,7 @@ def _accept_responses(verdict, rule_text=RULE):
     return [
         _ok({"offer_id": OFFER_ID, "rule_text": rule_text}),   # getruleoffer
         _ok({"verdict": verdict, "layers": []}),               # getruleconflict
-        _ok({"sequence_number": 2}),                           # getsequence
+        _ok({"sequence_number": 2, "tip_height": 9}),          # getsequence
         _ok({"tx_hash": "x"}),                                 # sendtx
     ]
 
@@ -267,7 +271,7 @@ def test_rule_accept_reports_conflict_layers(alice):
                 {"layer": "registry_collision", "status": "warn",
                  "detail": "accepting REPLACES it"},
             ]}),
-            _ok({"sequence_number": 0}),
+            _ok({"sequence_number": 0, "tip_height": 9}),
             _ok({"tx_hash": "x"}),
         ],
         recorded=recorded,

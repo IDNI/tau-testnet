@@ -157,6 +157,11 @@ def _run_cli(argv, *, send_responses=None, recorded=None):
     ``send_responses`` is a list of canned responses (in order); each call to
     ``rpc.send_command`` pops one. ``recorded`` (if given) is a list that will
     receive the ``command`` argument of each call.
+
+    A canned ``getsequence`` answer carries ``tip_height``, as a node's does:
+    without it the CLI takes the node for one too old to report the tip, asks
+    ``getblocks`` as well, and that extra call takes the response queued for
+    ``sendtx``.
     """
     responses = list(send_responses or [])
 
@@ -195,7 +200,7 @@ def test_tx_send_builds_signed_payload(tmp_path, monkeypatch):
             "--amount",
             "10",
         ],
-        send_responses=['{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":5}}', '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"deadbeef"}}'],
+        send_responses=['{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":5,"tip_height":7}}', '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"deadbeef"}}'],
         recorded=recorded,
     )
     assert rc == 0, err
@@ -238,7 +243,7 @@ def test_tx_send_no_operations_exits_4():
     """No --to/--amount/--transfer/--rule-file/--operations-json → no operations."""
     rc, _, err = _run_cli(
         ["tx", "send", "--privkey", "1" * 64],
-        send_responses=['{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}'],
+        send_responses=['{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}'],
     )
     assert rc == 4
     assert "operation" in err.lower()
@@ -259,7 +264,7 @@ def test_tx_send_error_response_exits_1(tmp_path, monkeypatch):
             "1",
         ],
         send_responses=[
-            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}',
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}',
             '{"status":"error","command":"sendtx","error":{"code":"TX_REJECTED","message":"insufficient funds"}}',
         ],
     )
@@ -324,7 +329,7 @@ def test_tx_send_multiple_transfers_combine(tmp_path, monkeypatch):
             f"{b}:2",
         ],
         send_responses=[
-            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}',
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}',
             '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"abcd"}}',
         ],
         recorded=recorded,

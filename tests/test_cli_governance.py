@@ -17,6 +17,9 @@ import pytest
 from tau_testnet_cli import cli, keys as keys_mod, tx as tx_mod
 
 
+# A canned getsequence answer carries tip_height, as a node's does: without it
+# the CLI takes the node for one too old to report the tip, asks getblocks as
+# well, and that extra call takes the response queued for sendtx.
 def _run_cli(argv, *, send_responses=None, recorded=None):
     responses = list(send_responses or [])
 
@@ -114,7 +117,7 @@ def test_gov_propose_builds_consensus_rule_update_payload(tmp_path, monkeypatch)
             str(update_file),
         ],
         send_responses=[
-            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}',
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}',
             '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"ok"}}',
         ],
         recorded=recorded,
@@ -158,7 +161,7 @@ def test_gov_propose_omits_host_contract_patch_when_null(tmp_path, monkeypatch):
     rc, _, _ = _run_cli(
         ["gov", "propose", "--key", "alice", "--file", str(update_file)],
         send_responses=[
-            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}',
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}',
             '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"ok"}}',
         ],
         recorded=recorded,
@@ -182,7 +185,7 @@ def test_gov_vote_builds_consensus_rule_vote_payload(tmp_path, monkeypatch):
     rc, _, _ = _run_cli(
         ["gov", "vote", "--key", "alice", "--update-id", "a" * 64],
         send_responses=[
-            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":3}}',
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":3,"tip_height":7}}',
             '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"ok"}}',
         ],
         recorded=recorded,
