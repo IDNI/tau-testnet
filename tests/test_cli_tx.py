@@ -157,6 +157,10 @@ def _run_cli(argv, *, send_responses=None, recorded=None):
     ``send_responses`` is a list of canned responses (in order); each call to
     ``rpc.send_command`` pops one. ``recorded`` (if given) is a list that will
     receive the ``command`` argument of each call.
+
+    A canned getsequence answer carries ``tip_height``, as a node's does:
+    without one the CLI takes the node for one too old to report it, and asks
+    getblocks for the tip before it sends.
     """
     responses = list(send_responses or [])
 
@@ -195,7 +199,7 @@ def test_tx_send_builds_signed_payload(tmp_path, monkeypatch):
             "--amount",
             "10",
         ],
-        send_responses=['{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":5}}', '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"deadbeef"}}'],
+        send_responses=['{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":5,"tip_height":7}}', '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"deadbeef"}}'],
         recorded=recorded,
     )
     assert rc == 0, err
@@ -208,12 +212,44 @@ def test_tx_send_builds_signed_payload(tmp_path, monkeypatch):
     assert payload["sender_pubkey"] == pk_hex
     assert payload["sequence_number"] == 5
     assert payload["operations"]["1"] == [[pk_hex, recipient, "10"]]
+    # Measured from the tip that came back with the sequence, not from 0.
+    assert payload["expire_at_height"] == 7 + 1 + tx_mod.DEFAULT_EXPIRY_BLOCKS
     assert len(payload["signature"]) == 192
 
     parsed = json.loads(out)
     assert parsed["sequence_number"] == 5
     # The submitted echo must include the signature.
     assert "signature" in parsed["submitted"]
+
+
+def test_tx_send_falls_back_to_getblocks_for_the_tip(tmp_path, monkeypatch):
+    """A node too old to report ``tip_height`` answers getsequence without one.
+    The deadline must still come from the real tip, which getblocks has: from
+    0 it would already be past on a chain at height 5,000."""
+    monkeypatch.setattr(keys_mod, "KEY_DIR_DEFAULT", tmp_path)
+    keys_mod.save_key("alice", tmp_path)
+    # The CLI asks for one block; a node this old ignores the limit and sends
+    # the whole chain, and the tip must still be found in it.
+    chain = json.dumps({
+        "status": "ok",
+        "command": "getblocks",
+        "data": {"blocks": [{"header": {"block_number": n}} for n in range(5_001)]},
+    })
+
+    recorded = []
+    rc, _, err = _run_cli(
+        ["tx", "send", "--key", "alice", "--to", "ab" * 48, "--amount", "1"],
+        send_responses=[
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}',
+            chain,
+            '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"abcd"}}',
+        ],
+        recorded=recorded,
+    )
+    assert rc == 0, err
+    assert recorded[1] == "getblocks 1"
+    payload = json.loads(recorded[2][len("sendtx '") : -1])
+    assert payload["expire_at_height"] == 5_000 + 1 + tx_mod.DEFAULT_EXPIRY_BLOCKS
 
 
 def test_tx_send_negative_amount_exits_4():
@@ -238,7 +274,7 @@ def test_tx_send_no_operations_exits_4():
     """No --to/--amount/--transfer/--rule-file/--operations-json → no operations."""
     rc, _, err = _run_cli(
         ["tx", "send", "--privkey", "1" * 64],
-        send_responses=['{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}'],
+        send_responses=['{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}'],
     )
     assert rc == 4
     assert "operation" in err.lower()
@@ -259,7 +295,7 @@ def test_tx_send_error_response_exits_1(tmp_path, monkeypatch):
             "1",
         ],
         send_responses=[
-            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}',
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}',
             '{"status":"error","command":"sendtx","error":{"code":"TX_REJECTED","message":"insufficient funds"}}',
         ],
     )
@@ -324,7 +360,7 @@ def test_tx_send_multiple_transfers_combine(tmp_path, monkeypatch):
             f"{b}:2",
         ],
         send_responses=[
-            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}',
+            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}',
             '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"abcd"}}',
         ],
         recorded=recorded,

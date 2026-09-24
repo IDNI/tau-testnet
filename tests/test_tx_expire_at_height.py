@@ -383,17 +383,35 @@ class TestResolveExpireAtHeight:
         from tau_testnet_cli import cli
 
         monkeypatch.setattr(cli, "_tip_height", lambda a: pytest.fail("asked the node"))
-        assert cli._resolve_expire_at_height(self.Args(), tip=300) == 300 + 1000
+        assert cli._resolve_expire_at_height(self.Args(), tip=300) == 300 + 1 + 1000
 
     def test_a_zero_tip_falls_back_to_asking_the_chain(self, monkeypatch):
         from tau_testnet_cli import cli
 
         monkeypatch.setattr(cli, "_tip_height", lambda a: 5_000)
-        assert cli._resolve_expire_at_height(self.Args(), tip=0) == 5_000 + 1000
+        assert cli._resolve_expire_at_height(self.Args(), tip=0) == 5_000 + 1 + 1000
 
     def test_expire_in_is_honoured(self, monkeypatch):
         from tau_testnet_cli import cli
 
         args = self.Args()
         args.expire_in = 7
-        assert cli._resolve_expire_at_height(args, tip=100) == 107
+        assert cli._resolve_expire_at_height(args, tip=100) == 108
+
+    def test_expire_in_one_clears_admission(self):
+        """Admission refuses expire_at_height <= tip + 1: the smallest window
+        must still be one block the transaction can land in."""
+        from tau_testnet_cli import cli
+
+        args = self.Args()
+        args.expire_in = 1
+        tip = 100
+        assert cli._resolve_expire_at_height(args, tip=tip) > tip + 1
+
+    def test_expire_in_zero_is_refused_not_defaulted(self):
+        from tau_testnet_cli import cli
+
+        args = self.Args()
+        args.expire_in = 0
+        with pytest.raises(ValueError):
+            cli._resolve_expire_at_height(args, tip=100)

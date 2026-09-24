@@ -91,7 +91,44 @@ class TestWalletConsole(unittest.TestCase):
             self.assertEqual(data["sequence_number"], 5)
             # Counted from the tip the node reported, not from nothing.
             self.assertEqual(data["expire_at_height"],
-                             7 + tau_defs.DEFAULT_TX_EXPIRY_BLOCKS)
+                             7 + 1 + tau_defs.DEFAULT_TX_EXPIRY_BLOCKS)
+
+    def _send_with_expire_in(self, mock_rpc, expire_in_blocks):
+        self.mock_args.to = None
+        self.mock_args.amount = None
+        self.mock_args.rule = None
+        self.mock_args.transfer = None
+        self.mock_args.operation = ["100:x"]
+        self.mock_args.operations_json = None
+        self.mock_args.expire_in_blocks = expire_in_blocks
+
+        def rpc_side_effect(cmd, host, port):
+            if "getsequence" in cmd:
+                return ('{"status":"ok","command":"getsequence","data":'
+                        '{"address":"x","sequence_number":5,"tip_height":7}}')
+            return '{"status":"ok","command":"sendtx","data":{"tx_hash":"txid"}}'
+
+        mock_rpc.side_effect = rpc_side_effect
+        with patch('builtins.print'):
+            wallet.cmd_send(self.mock_args)
+        return [c[0][0] for c in mock_rpc.call_args_list]
+
+    @patch('wallet.rpc_command')
+    @patch('wallet.G2Basic.Sign', return_value=b"\x00" * 96)
+    def test_expire_in_one_leaves_the_next_block(self, _sign, mock_rpc):
+        """Admission refuses expire_at_height <= tip + 1: one block is the
+        smallest window, and it must still be a block the tx can land in."""
+        sent = self._send_with_expire_in(mock_rpc, 1)
+        sendtx = sent[1]
+        data = json.loads(sendtx[sendtx.find("'{") + 1:sendtx.rfind("}'") + 1])
+        self.assertEqual(data["expire_at_height"], 7 + 1 + 1)
+
+    @patch('wallet.rpc_command')
+    @patch('wallet.G2Basic.Sign', return_value=b"\x00" * 96)
+    def test_expire_in_zero_is_refused_not_defaulted(self, _sign, mock_rpc):
+        sent = self._send_with_expire_in(mock_rpc, 0)
+        self.assertFalse(any("sendtx" in c for c in sent))
+
 
 if __name__ == '__main__':
     unittest.main()
