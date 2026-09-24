@@ -137,7 +137,7 @@ def test_gov_propose_builds_consensus_rule_update_payload(tmp_path, monkeypatch)
     assert payload["fee_limit"] == "0"
     assert "expiration_time" in payload
     # Measured from the tip that came back with the sequence, not from 0.
-    assert payload["expire_at_height"] == 7 + tx_mod.DEFAULT_EXPIRY_BLOCKS
+    assert payload["expire_at_height"] == 7 + 1 + tx_mod.DEFAULT_EXPIRY_BLOCKS
     assert len(payload["signature"]) == 192
     # Must NOT be nested.
     assert "payload" not in payload

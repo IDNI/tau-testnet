@@ -213,7 +213,7 @@ def test_tx_send_builds_signed_payload(tmp_path, monkeypatch):
     assert payload["sequence_number"] == 5
     assert payload["operations"]["1"] == [[pk_hex, recipient, "10"]]
     # Measured from the tip that came back with the sequence, not from 0.
-    assert payload["expire_at_height"] == 7 + tx_mod.DEFAULT_EXPIRY_BLOCKS
+    assert payload["expire_at_height"] == 7 + 1 + tx_mod.DEFAULT_EXPIRY_BLOCKS
     assert len(payload["signature"]) == 192
 
     parsed = json.loads(out)
@@ -228,6 +228,8 @@ def test_tx_send_falls_back_to_getblocks_for_the_tip(tmp_path, monkeypatch):
     0 it would already be past on a chain at height 5,000."""
     monkeypatch.setattr(keys_mod, "KEY_DIR_DEFAULT", tmp_path)
     keys_mod.save_key("alice", tmp_path)
+    # The CLI asks for one block; a node this old ignores the limit and sends
+    # the whole chain, and the tip must still be found in it.
     chain = json.dumps({
         "status": "ok",
         "command": "getblocks",
@@ -245,9 +247,9 @@ def test_tx_send_falls_back_to_getblocks_for_the_tip(tmp_path, monkeypatch):
         recorded=recorded,
     )
     assert rc == 0, err
-    assert recorded[1] == "getblocks"
+    assert recorded[1] == "getblocks 1"
     payload = json.loads(recorded[2][len("sendtx '") : -1])
-    assert payload["expire_at_height"] == 5_000 + tx_mod.DEFAULT_EXPIRY_BLOCKS
+    assert payload["expire_at_height"] == 5_000 + 1 + tx_mod.DEFAULT_EXPIRY_BLOCKS
 
 
 def test_tx_send_negative_amount_exits_4():

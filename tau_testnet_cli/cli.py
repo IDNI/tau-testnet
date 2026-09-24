@@ -708,30 +708,15 @@ def cmd_rule_offer(args: argparse.Namespace) -> int:
         print_error(str(exc))
         return EXIT_LOCAL
 
-    expire_at = args.expire_at_height
-    if expire_at is None:
-        # Resolve --expire-in against the node's current height so the caller
-        # does not have to look the tip up first.
-        response = _send(args, "getblocks")
-        try:
-            blocks = parse_json_response(response)["data"]["blocks"]
-            tip = max(int(b["header"]["block_number"]) for b in blocks)
-        except Exception:
-            print_error(
-                "could not determine chain height; pass --expire-at-height explicitly"
-            )
-            return EXIT_APP_ERROR
-        expire_at = tip + 1 + int(args.expire_in)
-
     return _submit_rule_tx(
         args,
-        lambda pubkey, seq, _height: tx_mod.build_rule_offer_tx(
+        lambda pubkey, seq, height: tx_mod.build_rule_offer_tx(
             sender_pubkey=pubkey,
             sequence_number=seq,
             expiration_time=int(_now()) + args.expiry,
             recipient_pubkey=args.to,
             rule_text=rule_text,
-            expire_at_height=expire_at,
+            expire_at_height=height,
             fee_limit=args.fee,
         ),
     )
@@ -1460,9 +1445,9 @@ def _add_tx_subparsers(sub) -> None:
     # block timestamp, which the proposer picks, while a height cannot be moved.
     p_send.add_argument(
         "--expire-in",
-        type=int,
+        type=_block_count,
         default=tx_mod.DEFAULT_EXPIRY_BLOCKS,
-        help="Blocks past the tip until expire_at_height (default: %(default)s)",
+        help="Blocks the transaction may land in, from the next one (default: %(default)s)",
     )
     p_send.add_argument(
         "--expire-at-height",
@@ -1510,9 +1495,15 @@ def _parse_kv_pairs(values, what, sep="="):
 
 
 def _tip_height(args) -> int:
-    """The node's tip, from getblocks. Last resort: `getsequence` carries it."""
+    """The node's tip, from getblocks. Last resort: `getsequence` carries it.
+
+    Asks for the most recent block only: a bare `getblocks` returns the whole
+    chain, which on a long one outgrows the 4 MiB read ceiling. A node old
+    enough to ignore the limit answers with every block, and the max below
+    still finds the tip.
+    """
     response = rpc_mod.send_command(
-        "getblocks", host=args.host, port=args.port, timeout=args.timeout
+        "getblocks 1", host=args.host, port=args.port, timeout=args.timeout
     )
     parsed = parse_json_response(response)
     blocks = ((parsed or {}).get("data") or {}).get("blocks") or []
@@ -1525,8 +1516,25 @@ def _tip_height(args) -> int:
     return tip
 
 
+def _block_count(text: str) -> int:
+    """argparse type for --expire-in: 0 would build a transaction that is
+    expired before it is sent."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}")
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
+
+
 def _resolve_expire_at_height(args, *, tip: int | None = None) -> int:
-    """--expire-at-height wins; otherwise tip + --expire-in.
+    """--expire-at-height wins; otherwise next height + --expire-in.
+
+    Admission refuses `expire_at_height <= tip + 1` and a block at height H
+    takes a transaction only while H < expire_at_height, so counting from the
+    next height makes --expire-in the number of blocks the transaction can land
+    in: `--expire-in 1` means "the next block or never", never "already dead".
 
     A `tip` of 0 is not trusted: a node too old to report `tip_height` with the
     sequence answers 0, and measuring the deadline from there on a chain at
@@ -1535,12 +1543,15 @@ def _resolve_expire_at_height(args, *, tip: int | None = None) -> int:
     side of that trade.
     """
     explicit = getattr(args, "expire_at_height", None)
-    if explicit:
+    if explicit is not None:
         return int(explicit)
+    expire_in = getattr(args, "expire_in", None)
+    expire_in = tx_mod.DEFAULT_EXPIRY_BLOCKS if expire_in is None else int(expire_in)
+    if expire_in < 1:
+        raise ValueError(f"--expire-in must be at least 1, got {expire_in}")
     if not tip:
         tip = _tip_height(args)
-    return tip + int(getattr(args, "expire_in", None)
-                     or tx_mod.DEFAULT_EXPIRY_BLOCKS)
+    return tip + 1 + expire_in
 
 
 def _auto_discover_approvers(args, sender_pubkey, amount, recipient) -> dict:
@@ -1783,8 +1794,8 @@ def _add_approval_subparsers(sub) -> None:
             "--input 26='rent for Q3'. PUBLIC and permanent. Repeatable."
         ),
     )
-    p_req.add_argument("--expire-in", type=int, default=1000,
-                       help="Blocks from the tip until the request expires")
+    p_req.add_argument("--expire-in", type=_block_count, default=1000,
+                       help="Blocks the request may land in, from the next one")
     p_req.add_argument("--expire-at-height", type=int,
                        help="Absolute expiry height (overrides --expire-in)")
     p_req.add_argument("--yes", action="store_true",
@@ -1891,9 +1902,9 @@ def _add_rule_subparsers(sub) -> None:
     window = p_offer.add_mutually_exclusive_group()
     window.add_argument(
         "--expire-in",
-        type=int,
+        type=_block_count,
         default=1000,
-        help="Blocks from the current tip until the offer expires (default: %(default)s)",
+        help="Blocks the offer may land in, from the next one (default: %(default)s)",
     )
     window.add_argument(
         "--expire-at-height", type=int, help="Absolute height at which the offer expires"

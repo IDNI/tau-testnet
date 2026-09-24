@@ -167,8 +167,15 @@ def cmd_send(args):
     if tip_height is None:
         print("Error: node did not report tip_height; cannot set expire_at_height.")
         return
-    expire_at_height = tip_height + int(getattr(args, "expire_in_blocks", 0)
-                                        or tau_defs.DEFAULT_TX_EXPIRY_BLOCKS)
+    # Counted from the next height: admission refuses expire_at_height <=
+    # tip + 1, so --expire-in-blocks N is the number of blocks the transaction
+    # can land in, and 1 still leaves it the next one.
+    expire_in = getattr(args, "expire_in_blocks", None)
+    expire_in = tau_defs.DEFAULT_TX_EXPIRY_BLOCKS if expire_in is None else int(expire_in)
+    if expire_in < 1:
+        print(f"Error: --expire-in-blocks must be at least 1, got {expire_in}.")
+        return
+    expire_at_height = tip_height + 1 + expire_in
     
     # Build operations dictionary
     operations = {}
@@ -299,7 +306,7 @@ def main():
     p_send.add_argument("--expiry", "-e", default=3600, type=int, help="Expiration seconds from now")
     p_send.add_argument("--expire-in-blocks", default=tau_defs.DEFAULT_TX_EXPIRY_BLOCKS,
                         type=int, dest="expire_in_blocks",
-                        help="Blocks from the current tip after which the transaction expires")
+                        help="Blocks the transaction may land in, counted from the next one")
     p_send.set_defaults(func=cmd_send)
     
     # Create block command

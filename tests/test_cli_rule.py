@@ -146,15 +146,45 @@ def test_rule_offer_resolves_expire_in_against_the_tip(alice):
         ["rule", "offer", "--key", "alice", "--to", OTHER, "--rule", RULE,
          "--expire-in", "50"],
         send_responses=[
-            _ok({"blocks": [{"header": {"block_number": 9}}]}),  # getblocks
-            _ok({"sequence_number": 0, "tip_height": 9}),        # getsequence: the same tip
+            _ok({"sequence_number": 0, "tip_height": 9}),
             _ok({"tx_hash": "deadbeef"}),
         ],
         recorded=recorded,
     )
     assert rc == 0, err
-    # tip 9 -> next height 10 -> +50
+    # tip 9 -> next height 10 -> +50; the tip rides on getsequence, so no
+    # getblocks (which, bare, would ship the whole chain) is ever sent.
     assert _sent_payload(recorded)["expire_at_height"] == 60
+    assert not any(str(c).startswith("getblocks") for c in recorded)
+
+
+def test_rule_offer_on_an_old_node_asks_for_one_block(alice):
+    """A node that does not report tip_height answers 0; the fallback asks for
+    the most recent block, not the whole chain."""
+    recorded = []
+    rc, _, err = _run_cli(
+        ["rule", "offer", "--key", "alice", "--to", OTHER, "--rule", RULE,
+         "--expire-in", "50"],
+        send_responses=[
+            _ok({"sequence_number": 0}),
+            _ok({"blocks": [{"header": {"block_number": 9}}]}),
+            _ok({"tx_hash": "deadbeef"}),
+        ],
+        recorded=recorded,
+    )
+    assert rc == 0, err
+    assert "getblocks 1" in [str(c) for c in recorded]
+    assert _sent_payload(recorded)["expire_at_height"] == 60
+
+
+def test_rule_offer_refuses_expire_in_zero(alice):
+    with pytest.raises(SystemExit) as exc:
+        _run_cli(
+            ["rule", "offer", "--key", "alice", "--to", OTHER, "--rule", RULE,
+             "--expire-in", "0"],
+            send_responses=[],
+        )
+    assert exc.value.code == 2
 
 
 def test_rule_offer_rejects_self_offer(alice):
@@ -195,7 +225,7 @@ def test_rule_reject_builds_the_payload(alice):
     # A rejection compiles nothing, so it carries no rule text.
     assert "rule_text" not in payload
     # Measured from the tip that came back with the sequence, not from 0.
-    assert payload["expire_at_height"] == TIP + tx_mod.DEFAULT_EXPIRY_BLOCKS
+    assert payload["expire_at_height"] == TIP + 1 + tx_mod.DEFAULT_EXPIRY_BLOCKS
 
 
 # --- accept -----------------------------------------------------------------
