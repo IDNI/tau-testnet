@@ -54,8 +54,40 @@ def test_nesting_restores_the_previous_allocator(temp_database):
         ts.intern_value(ADDR, 384)
         with ts.speculative_allocation():
             ts.intern_value(OTHER, 384)
-        assert ts._allocator is outer
-    assert ts._allocator is None
+        assert ts.current_allocator() is outer
+    assert ts.current_allocator() is None
+
+
+def test_an_overlay_belongs_to_the_thread_that_installed_it(temp_database):
+    """A block proposal (chain thread) and an admission context (request
+    thread) prepare rules at the same time. With one process-wide slot, the
+    request thread's exit restored ITS predecessor underneath the proposal, whose
+    next literal then went to the wrong overlay -- or into the committed table."""
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    seen = {}
+
+    def _request_thread():
+        with ts.speculative_allocation() as mine:
+            entered.set()
+            release.wait(5)
+            seen["request"] = ts.current_allocator() is mine
+        seen["after"] = ts.current_allocator()
+
+    worker = threading.Thread(target=_request_thread)
+    worker.start()
+    assert entered.wait(5)
+    with ts.speculative_allocation() as proposal:
+        release.set()
+        worker.join(5)
+        # the request thread has exited its block; this thread's overlay stands
+        assert ts.current_allocator() is proposal
+        before = db.get_max_shrink_id()
+        ts.intern_value(ADDR, 384)
+        assert db.get_max_shrink_id() == before, "interned into the committed table"
+        assert ts.canonical_intern_key(ADDR, 384) in proposal.delta()
+    assert seen == {"request": True, "after": None}
 
 
 def test_a_rejected_proposal_leaves_the_epoch_untouched(temp_database):

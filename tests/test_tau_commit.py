@@ -234,3 +234,18 @@ def test_readiness_is_about_serving_not_about_having_committed():
     c.commit("block1")
     assert c.committed is True
     assert c.ready is False
+
+
+def test_the_execution_id_binds_transaction_content():
+    """Persisted block transactions carry no `tx_id`; identifying them by it gave
+    every transaction the same identity, so two different blocks in the same
+    second on the same parent shared one execution id."""
+    base = dict(parent="p", height=1, timestamp=10, proposer="x",
+                consensus_context="c")
+    one = {"tx_type": "user_tx", "sender_pubkey": "a", "operations": {"1": []}}
+    other = {"tx_type": "user_tx", "sender_pubkey": "b", "operations": {"1": []}}
+    a = tau_commit.block_execution_id(transactions=[one], **base)
+    assert a != tau_commit.block_execution_id(transactions=[other], **base)
+    # the synthetic label createblock adds to its execution copies is not
+    # part of what was executed
+    assert a == tau_commit.block_execution_id(transactions=[{**one, "tx_id": "label"}], **base)

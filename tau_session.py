@@ -42,6 +42,25 @@ def _shrink_width():
 _ACCEPTED = ("ACCEPTED_CHANGED", "ACCEPTED_NOOP")
 
 
+class StepRefused(RuntimeError):
+    """The engine refused one evaluation step: it produced no outputs at all.
+
+    Never the same thing as a step whose streams happen to be absent. Carries
+    the engine's diagnostics.
+    """
+
+    def __init__(self, message, *, diagnostics=""):
+        super().__init__(message + (f": {_first_error(diagnostics)}" if diagnostics else ""))
+        self.diagnostics = diagnostics
+
+
+def _first_error(text: str) -> str:
+    for line in (text or "").splitlines():
+        if "rror" in line:
+            return line.strip()
+    return ""
+
+
 @dataclass
 class StepRecord:
     """One thing fed to the evaluator, in the order it was fed."""
@@ -234,6 +253,7 @@ class WorkerSession(EvaluatorSession):
                 label="proposal",
             )
         self.allocation = allocation
+        self.last_step = None
         # The representation this session runs under. The session encodes
         # canonical inputs itself: letting a caller supply pre-encoded values
         # alongside canonical rules is exactly how the miner ended up feeding
@@ -326,7 +346,26 @@ class WorkerSession(EvaluatorSession):
             return text[1:text.index("}")].strip()
         return text
 
+    @staticmethod
+    def _single(value):
+        """ONE value per stream per step.
+
+        Custom inputs arrive as lists (`operations["13"] = ["5"]` normalizes to a
+        one-element list at admission and at apply). The in-process wrapper
+        treats a list as a queue and, for a step that completes, consumes only
+        its head; this session used to stringify the whole list and feed the
+        engine `['5']`, which it cannot parse -- so every custom-input step under
+        worker-backed authority came back with no outputs at all.
+        """
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                if item is not None:
+                    return item
+            return ""
+        return value
+
     def _named_inputs(self, inputs):
+        inputs = {key: self._single(value) for key, value in (inputs or {}).items()}
         if self.plan is not None:
             inputs = self._encode(inputs)
         elif self._normalize is not None:
@@ -379,9 +418,18 @@ class WorkerSession(EvaluatorSession):
         # interned input value, and the simulation rejects transfers the
         # authoritative path accepts.
         import tau_shrink
-        exclude = self.plan.excludes() if self.plan is not None else frozenset()
+        exclude = self._excluded_streams(rule_text)
         with self._allocating():
             prepared = tau_shrink.prepare_rule(rule_text, exclude_streams=exclude)
+            if self.plan is not None and not (
+                    set(prepared.shrunk_streams) <= set(self.plan.interned)):
+                import tau_reconstruction
+                raise tau_reconstruction.RepresentationConflict(
+                    "prepared text shrinks "
+                    f"{sorted(set(prepared.shrunk_streams) - set(self.plan.interned))}, "
+                    "which this session feeds plain",
+                    plan=self.plan,
+                )
             runtime_text = prepared.runtime_text
             receipt = self._spec.revise(runtime_text, "apply")
         self.last_outcome = receipt
@@ -412,10 +460,40 @@ class WorkerSession(EvaluatorSession):
                                 identity=identity, accumulate=accumulate)
         return "ok" if accepted else f"error: {outcome}"
 
+    def _excluded_streams(self, rule_text):
+        """Streams this rule must leave at full width under this session's plan.
+
+        EVERY wide stream the plan does not intern -- not just the ones it names
+        plain. `_encode` interns input values only for `plan.interned`, so a
+        stream the plan never mentioned is fed full-width; letting the optimizer
+        shrink it in a candidate anyway typed it bv[8] against 384-bit values.
+        Measured on a lent worker: the first sender-scoped rule shrank i12, and
+        from then on every step feeding i12 was refused by the engine -- no o5
+        verdict, no o9 fee -- and read as "no outputs".
+        """
+        if self.plan is None:
+            return frozenset()
+        import tau_shrink
+        return frozenset(self.plan.plain) | (
+            frozenset(tau_shrink.wide_input_streams(rule_text or ""))
+            - frozenset(self.plan.interned)
+        )
+
     def evaluate(self, inputs, *, target=None, source="unknown", multi=False,
                  apply_rules_update=False, record=True):
         with self._allocating():
             result = self._spec.step(self._named_inputs(inputs))
+        self.last_step = result
+        if not result.get("ok", True):
+            # The engine REFUSED the step: nothing advanced, nothing was
+            # produced. Reading that as "no outputs" made a policy that never
+            # ran look like no policy, and a fee that was never computed look
+            # like a fee of zero. The in-process wrapper raises here; so does
+            # this. Not recorded: a refused step leaves no trace to replay.
+            raise StepRefused(
+                "the engine refused the step's inputs",
+                diagnostics=str(result.get("diagnostics") or ""),
+            )
         indexed = self._by_index(result.get("outputs") or {})
         if record:
             self.log.record(StepRecord(kind=EVAL, inputs=dict(inputs or {}),

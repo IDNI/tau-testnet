@@ -192,11 +192,15 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
     Under worker-backed authority the in-process interpreter is an ADVISORY
     mirror. Every place that still steps it has to be one of:
 
-      advisory      admission estimates, previews, keeping the mirror current,
-                    and the header/eligibility fallbacks after the isolated
-                    evaluator -- none of them decide committed state;
+      advisory      previews, keeping the mirror current, and the
+                    header/eligibility fallbacks after the isolated evaluator --
+                    none of them decide committed state or an admission verdict;
       legacy        the path that exists for the mock/test configuration, and
-                    which refuses to run once the owner is enabled;
+                    which refuses to run -- or is routed around -- once the
+                    owner is enabled. Admission is here since Step 5F: with the
+                    owner enabled every request runs in its own context
+                    (tau_admission), and the in-process calls are the
+                    not-isolated branch only;
 
     and anything else is a new authoritative use of an interpreter that is not
     the authority. Moving startup and block application alone would not stop
@@ -205,24 +209,31 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
     import ast
 
     classified = {
-        # advisory: the mirror, never consulted by consensus
+        # advisory: the mirror, never consulted by consensus or admission
         ("chain_state.py", "_sync_advisory_mirror"),
         ("chain_state.py", "replay_tau_restore_plan"),
-        ("commands/sendtx.py", "queue_transaction"),
         ("commands/getapprovalpreview.py", "_step"),
         ("consensus/engine.py", "query_eligibility"),
         ("consensus/engine.py", "verify_block_header"),
-        # legacy: refuses to run under worker-backed authority
+        # legacy: refuses to run, or is routed around, under worker-backed
+        # authority
         ("chain_state.py", "tick_governance"),
         ("consensus/engine.py", "_apply_block"),
         ("commands/createblock.py", "execute_batch"),
+        ("commands/sendtx.py", "queue_transaction"),
+        ("commands/sendtx.py", "step_multi"),
         # the in-process session the not-enabled engine path uses
         ("tau_session.py", "apply_rule"),
         ("tau_session.py", "evaluate"),
     }
+    # The guard each legacy site must carry. Checked below: a site that stops
+    # carrying its guard is a new authoritative -- or admission -- use of an
+    # interpreter that is neither.
     legacy_guarded = {
         ("chain_state.py", "tick_governance"): "tau_authority.owner().enabled",
         ("consensus/engine.py", "_apply_block"): "proposal",
+        ("commands/sendtx.py", "queue_transaction"): "admission_tau.isolated",
+        ("commands/sendtx.py", "step_multi"): "if not self.isolated",
     }
 
     class _Sites(ast.NodeVisitor):
@@ -230,13 +241,17 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
         closure's call is not credited to (or excused by) the function around
         it."""
 
-        def __init__(self, rel):
+        def __init__(self, rel, source):
             self.rel = rel
+            self.source = source
             self.stack = []
             self.sites = set()
+            self.bodies = {}
 
         def _function(self, node):
             self.stack.append(node.name)
+            self.bodies.setdefault((self.rel, node.name), []).append(
+                ast.get_source_segment(self.source, node) or "")
             self.generic_visit(node)
             self.stack.pop()
 
@@ -252,16 +267,27 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
             self.generic_visit(node)
 
     found = set()
+    bodies = {}
     for rel in ("chain_state.py", "consensus/engine.py", "consensus/admission.py",
                 "commands/sendtx.py", "commands/createblock.py",
                 "commands/getapprovalpreview.py", "tau_session.py",
-                "tau_authority.py", "tau_commit.py", "tau_proposal.py"):
+                "tau_authority.py", "tau_commit.py", "tau_proposal.py",
+                "tau_admission.py"):
         path = os.path.join(REPO, rel)
         if not os.path.exists(path):
             continue
-        visitor = _Sites(rel)
-        visitor.visit(ast.parse(open(path).read()))
+        source = open(path).read()
+        visitor = _Sites(rel, source)
+        visitor.visit(ast.parse(source))
         found |= visitor.sites
+        bodies.update(visitor.bodies)
+
+    for site, guard in legacy_guarded.items():
+        if site not in found:
+            continue
+        assert any(guard in body for body in bodies.get(site, ())), (
+            f"{site} steps the in-process interpreter without its guard {guard!r}"
+        )
 
     unclassified = found - classified
     assert not unclassified, (
@@ -271,7 +297,8 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
 
     # the new modules must not step it at all
     for rel, _ in found:
-        assert rel not in ("tau_authority.py", "tau_commit.py", "tau_proposal.py"), (
+        assert rel not in ("tau_authority.py", "tau_commit.py", "tau_proposal.py",
+                           "tau_admission.py"), (
             f"{rel} steps the in-process interpreter; the authority and the commit "
             "protocol must only ever drive workers"
         )
@@ -279,3 +306,76 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
     # the admission module no longer even imports it
     admission = open(os.path.join(REPO, "consensus/admission.py")).read()
     assert "from tau_manager import communicate_with_tau" not in admission
+
+
+# --- what the consensus answers are seeded from ------------------------------------
+
+_CHILD_REVISED = r'''
+import os, sys, tempfile, json
+sys.path.insert(0, os.environ["REPO_ROOT"])
+import tau_native, chain_state
+tau = tau_native.load_tau_module()
+def cap(fn):
+    s1, s2 = os.dup(1), os.dup(2); t1, t2 = tempfile.TemporaryFile(), tempfile.TemporaryFile()
+    os.dup2(t1.fileno(), 1); os.dup2(t2.fileno(), 2)
+    try: return fn()
+    finally:
+        os.dup2(s1, 1); os.dup2(s2, 2); os.close(s1); os.close(s2)
+router = "always ( " + open(os.path.join(os.environ["REPO_ROOT"], "genesis.tau")).read().strip() + " )."
+consensus = chain_state._preprocess_tau_spec_text(
+    open(os.path.join(os.environ["REPO_ROOT"], "genesis_consensus.tau")).read())
+itp = cap(lambda: tau.get_interpreter(router))
+def step(i0=None):
+    ins = cap(lambda: tau.get_inputs_for_step(itp))
+    vals = {s: (i0 if (s.name == "i0" and i0) else ("F" if s.name == "i0" else "0")) for s in ins}
+    return cap(lambda: tau.step(itp, vals))
+step(consensus)
+step("always ( o13[t]:bv[24] = i1[t-1]:bv[24] ).")
+step()
+print("REVISED", json.dumps(itp.current_spec()))
+sys.stdout.flush(); os._exit(0)
+'''
+
+
+def test_consensus_answers_do_not_come_from_a_revised_spec_text(tmp_path, temp_database):
+    """The in-process interpreter's spec text is the spec as the engine REVISED
+    it, with the previous state encoded through `[t-1]`. An interpreter built
+    fresh from that text answered o7 = 0 at its first step, so the first
+    eligibility query after every rule change said "not our turn" -- and the
+    first header check after one could judge a valid block invalid."""
+    import json
+    import subprocess
+    import sys
+    import chain_state
+    from consensus.engine import TauConsensusEngine
+
+    script = tmp_path / "revised.py"
+    script.write_text(_CHILD_REVISED)
+    env = _env()
+    env["REPO_ROOT"] = REPO
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                          env=env, timeout=120)
+    line = next(l for l in proc.stdout.splitlines() if l.startswith("REVISED "))
+    revised = json.loads(line[len("REVISED "):])
+
+    inputs = TauConsensusEngine()._build_consensus_input_streams(
+        proposer_pubkey="aa" * 48, block_number=1, timestamp=1700000000,
+        previous_hash="0" * 64, proof_ok=True, claims={}, proposer_stake=0,
+        stake_mode=False, feed_proposer_pubkey=False,
+    )
+    consensus = open(os.path.join(REPO, "genesis_consensus.tau")).read()
+
+    stale = tau_advisory.AdvisoryEvaluator(cwd=REPO, env=_env())
+    fixed = tau_advisory.AdvisoryEvaluator(cwd=REPO, env=_env())
+    try:
+        # the defect, pinned: the old seed's FIRST answer
+        assert stale.evaluate_many(revised, inputs, (7,)) == {7: "0"}, (
+            "an interpreter built from the revised text now answers o7 at its "
+            "first step -- the engine changed; the consensus seed is still right"
+        )
+        # the fix: right from the first query, and after it
+        assert fixed.evaluate_consensus(consensus, inputs, (6, 7)) == {6: "1", 7: "1"}
+        assert fixed.evaluate_consensus(consensus, inputs, (6, 7)) == {6: "1", 7: "1"}
+    finally:
+        stale.dispose()
+        fixed.dispose()

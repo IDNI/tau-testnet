@@ -638,14 +638,18 @@ def shrink_mapping_epoch() -> str:
     if _db_conn is None:
         init_db()
     with _db_lock:
-        cur = _db_conn.cursor()
-        cur.execute('SELECT id, key FROM tau_shrink_ids ORDER BY id')
-        digest = hashlib.sha256()
-        count = 0
-        for id_num, key in cur.fetchall():
-            digest.update(f"{int(id_num)}\x00{key}\x00".encode("utf-8"))
-            count += 1
-        return f"{count}:{digest.hexdigest()[:32]}"
+        return _mapping_epoch(_db_conn.cursor())
+
+
+def _mapping_epoch(cur) -> str:
+    """The epoch digest, on a cursor the caller already holds the lock for."""
+    cur.execute('SELECT id, key FROM tau_shrink_ids ORDER BY id')
+    digest = hashlib.sha256()
+    count = 0
+    for id_num, key in cur.fetchall():
+        digest.update(f"{int(id_num)}\x00{key}\x00".encode("utf-8"))
+        count += 1
+    return f"{count}:{digest.hexdigest()[:32]}"
 
 
 def _publish_shrink_rows(cur, delta: dict, expected_epoch: str) -> None:
@@ -657,13 +661,7 @@ def _publish_shrink_rows(cur, delta: dict, expected_epoch: str) -> None:
     published mapping for a block that does not exist, which is the one way to
     permanently burn ids for nothing.
     """
-    cur.execute('SELECT id, key FROM tau_shrink_ids ORDER BY id')
-    digest = hashlib.sha256()
-    count = 0
-    for id_num, key in cur.fetchall():
-        digest.update(f"{int(id_num)}\x00{key}\x00".encode("utf-8"))
-        count += 1
-    current = f"{count}:{digest.hexdigest()[:32]}"
+    current = _mapping_epoch(cur)
     if current != expected_epoch:
         raise ValueError(
             f"shrink mapping moved: expected epoch {expected_epoch}, found {current}"
@@ -705,14 +703,18 @@ def committed_journal_entries(limit=None):
     if _db_conn is None:
         init_db()
     with _db_lock:
-        cur = _db_conn.cursor()
-        sql = ('SELECT seq, kind, phase, rule_text, inputs, target, accumulate, '
-               'units, outcome, result_fp, identity, prev, link FROM tau_journal_v1 '
-               'ORDER BY seq')
-        if limit is not None:
-            sql += f' LIMIT {int(limit)}'
-        cur.execute(sql)
-        rows = cur.fetchall()
+        return _journal_rows(_db_conn.cursor(), limit=limit)
+
+
+def _journal_rows(cur, limit=None):
+    """The committed journal, on a cursor the caller already holds the lock for."""
+    sql = ('SELECT seq, kind, phase, rule_text, inputs, target, accumulate, '
+           'units, outcome, result_fp, identity, prev, link FROM tau_journal_v1 '
+           'ORDER BY seq')
+    if limit is not None:
+        sql += f' LIMIT {int(limit)}'
+    cur.execute(sql)
+    rows = cur.fetchall()
     out = []
     for r in rows:
         out.append({
@@ -725,6 +727,51 @@ def committed_journal_entries(limit=None):
             "prev": r[11], "link": r[12],
         })
     return out
+
+
+def committed_anchor(rows: bool = True) -> dict:
+    """The committed journal and the mapping it was executed against, read as ONE.
+
+    Under the same lock `commit_prepared_block` holds for its whole transaction,
+    so the rows, the mapping epoch and the id high-water mark all describe the
+    same committed state. Read separately, a block could commit in between and
+    an evaluation would replay one history against another's mapping.
+
+    `rows=False` reads only the identifying head, for a caller that already
+    holds an evaluator and needs to know whether it is still current.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        if rows:
+            entries = _journal_rows(cur)
+            head = entries[-1]["link"] if entries else None
+            sequence = entries[-1]["seq"] if entries else 0
+        else:
+            entries = None
+            cur.execute('SELECT link, seq FROM tau_journal_v1 ORDER BY seq DESC LIMIT 1')
+            row = cur.fetchone()
+            head, sequence = (row[0], int(row[1])) if row else (None, 0)
+        epoch = _mapping_epoch(cur)
+        cur.execute('SELECT MAX(id) FROM tau_shrink_ids')
+        row = cur.fetchone()
+        high_water = int(row[0]) if row and row[0] is not None else 0
+        cur.execute('SELECT plan_id, plan_json FROM block_commits_v1 '
+                    'ORDER BY committed_at DESC, rowid DESC LIMIT 1')
+        row = cur.fetchone()
+        plan_id, plan_json = (row[0], row[1]) if row else (None, None)
+    return {
+        "rows": entries,
+        "journal_head": head,
+        "journal_sequence": sequence,
+        "epoch": epoch,
+        "high_water": high_water,
+        # the representation the committed journal was executed under
+        "plan_id": plan_id,
+        "plan_json": plan_json,
+    }
 
 
 def find_block_commit(execution_id: str):
@@ -1731,8 +1778,11 @@ def _write_block_rows(cur, new_block) -> None:
     block whose evaluator history was never recorded, or the reverse.
     """
     block_data_json = json.dumps(new_block.to_dict())
+    # OR IGNORE: a block received from a peer is STORED by ingestion before fork
+    # choice decides to commit it, and a block's hash is its content -- the row
+    # already there is this block.
     cur.execute(
-        'INSERT INTO blocks (block_hash, block_number, previous_hash, timestamp, block_data) VALUES (?, ?, ?, ?, ?)',
+        'INSERT OR IGNORE INTO blocks (block_hash, block_number, previous_hash, timestamp, block_data) VALUES (?, ?, ?, ?, ?)',
         (
             new_block.block_hash,
             new_block.header.block_number,

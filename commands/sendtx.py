@@ -8,6 +8,7 @@ import time
 import config
 import chain_state
 import db
+import tau_admission
 import tau_defs
 import tau_manager
 from tau_manager import parse_tau_output
@@ -446,6 +447,125 @@ def _preflight_prepared_rule(rule_text: str):
     return None
 
 
+def _admission_timestamp() -> int:
+    """Advisory block timestamp for i5 at admission.
+
+    Apply re-checks against the AUTHORITATIVE block timestamp, so this is a soft
+    pre-check only: a tx may pass admission yet be rejected at inclusion near a
+    time threshold (and vice versa). The chain tip's timestamp (deterministic
+    across this node's view, no wall-clock skew); wall clock if unavailable.
+    """
+    try:
+        head = db.get_canonical_head_block()
+        if isinstance(head, dict):
+            header = head.get("header")
+            if isinstance(header, dict) and header.get("timestamp") is not None:
+                return int(header.get("timestamp"))
+    except Exception:
+        pass
+    return int(time.time())
+
+
+class _AdmissionTau:
+    """Where ONE request's Tau steps run.
+
+    With worker-backed authority: a context of this request's own, rebuilt from
+    the committed journal and disposed of when the request returns. Nothing one
+    submission feeds can become the history another is judged against, and no
+    address this request mentions is interned into the committed mapping.
+
+    Otherwise -- mock and unit-test configurations, where no native evaluator
+    holds a history worth protecting -- the in-process path, unchanged.
+
+    The context is opened lazily: a request that never reaches a Tau step never
+    pays for a replay.
+    """
+
+    def __init__(self, *, candidate_rules=()):
+        import tau_admission
+        self.isolated = tau_admission.enabled()
+        self.budget = tau_admission.default_budget()
+        self._candidates = tuple(c for c in candidate_rules if c)
+        self._context = None
+
+    def _ctx(self):
+        if self._context is None:
+            import tau_admission
+            self._context = tau_admission.open_context(
+                candidate_rules=self._candidates, budget=self.budget,
+                label="admission",
+            )
+        return self._context
+
+    def revise(self, rule_text: str) -> dict:
+        return self._ctx().revise(rule_text)
+
+    def step_multi(self, inputs: dict, *, source: str) -> dict:
+        if not self.isolated:
+            return tau_manager.communicate_with_tau_multi(
+                input_stream_values=inputs, source=source, apply_rules_update=False,
+            )
+        return self._ctx().step(inputs)
+
+    def close(self) -> None:
+        context, self._context = self._context, None
+        if context is not None:
+            context.dispose()
+
+
+def _routed_o5_composite(tip_view, sender_pubkey: str, action: str, body: str):
+    """The o5 composite apply feeds for a routed policy rule -- not the rule.
+
+    A routed rule never enters the specification as written: apply registers
+    (or revokes) the sender's clause and feeds the regenerated composite, the
+    neutral one when the registry ends up empty. Validating the raw text instead
+    would admit or refuse something apply never runs.
+    """
+    from consensus.rule_offers import NEUTRAL_O5_CLAUSE_BODY, compose_stream_rule
+
+    stream = tau_defs.USER_POLICY_STREAM_INDEX
+    clauses = dict(tip_view.clauses_for_stream(stream))
+    key = str(sender_pubkey or "").lower()
+    if action == "revoke":
+        clauses.pop(key, None)
+    else:
+        clauses[key] = body
+    composite = compose_stream_rule(stream, clauses) if clauses else None
+    return composite or "always ( %s )." % NEUTRAL_O5_CLAUSE_BODY
+
+
+def _revision_refusal(receipt: dict):
+    """The rejection envelope for a revision the context did not accept, or None.
+
+    Every non-accepted outcome refuses, because apply refuses every one of them:
+    an unsatisfiable rule evaluated into the no-revision branch used to be
+    admitted here and then rejected at inclusion -- `sendtx` and the block
+    disagreeing is exactly the failure this path exists to remove.
+    """
+    if receipt.get("accepted"):
+        return None
+    outcome = receipt.get("outcome") or "NOT_ACCEPTED"
+    detail = ""
+    try:
+        from tau_native import strip_ansi
+    except Exception:  # pragma: no cover - the binding's helpers are optional here
+        def strip_ansi(text):
+            return text
+    for key in ("diagnostics", "deferred_diagnostics"):
+        for line in str(receipt.get(key) or "").splitlines():
+            if "rror" in line:
+                # the engine colours its diagnostics; a client gets plain text
+                detail = strip_ansi(line).strip()
+                break
+        if detail:
+            break
+    return _qt_err(
+        "TX_REJECTED",
+        f"Transaction rejected by Tau (rule validation). {detail or outcome}",
+        outcome=outcome,
+    )
+
+
 def queue_transaction(json_blob: str, propagate: bool = True, *,
                       dry_run: bool = False, skip_tau_eval: bool = False) -> dict:
     """Validate a transaction and (unless dry_run) queue it in the mempool.
@@ -673,6 +793,32 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
 
     tau_force_test = tau_manager.is_force_test_enabled()
 
+    # The revision this request would make, if any, known BEFORE its context is
+    # built so the representation is planned for it (see tau_admission).
+    admission_candidate = None
+    try:
+        if not tau_admission.enabled():
+            pass
+        elif tx_type == TX_TYPE_RULE_OFFER_ACCEPT:
+            admission_candidate = (admission_eval.data or {}).get("composite_rule")
+        elif tx_type == "user_tx" and has_rules:
+            _rule_value = operations.get("0")
+            if isinstance(_rule_value, str) and _rule_value.strip():
+                _action = (admission_eval.data or {}).get("o5_clause_action")
+                admission_candidate = (
+                    _routed_o5_composite(
+                        tip_view, sender_pubkey, _action,
+                        (admission_eval.data or {}).get("o5_clause_body") or "",
+                    )
+                    if _action else _rule_value.strip()
+                )
+    except Exception as e:
+        logger.exception("Could not derive the admission candidate: %s", e)
+        return _qt_err("INTERNAL_ERROR", "An unexpected server error occurred.")
+    admission_tau = _AdmissionTau(
+        candidate_rules=(admission_candidate,) if admission_candidate else ()
+    )
+
     try:
         if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RULE_OFFER_ACCEPT):
             # Compile the COMPOSED rule, not the offered clause on its own.
@@ -681,7 +827,20 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
             # the only text whose compilability tells us anything. Admission
             # already built it (see consensus/admission._compose_with_clause).
             composite_rule = (admission_eval.data or {}).get("composite_rule")
-            if composite_rule and not tau_force_test:
+            if (composite_rule and not tau_force_test and admission_tau.isolated
+                    and tx_type == TX_TYPE_RULE_OFFER_ACCEPT):
+                # Accepting folds the clause into the stream's composite, and
+                # apply feeds that composite to an evaluator carrying the
+                # committed type history. Validate it there -- a fresh process
+                # has none, and passes text the block then refuses.
+                refusal = _revision_refusal(admission_tau.revise(composite_rule))
+                if refusal is not None:
+                    return refusal
+                logger.info(
+                    "Rule offer composite validated for o%s (admission context).",
+                    (admission_eval.data or {}).get("target_stream"),
+                )
+            elif composite_rule and not tau_force_test:
                 if tau_manager.tau_ready.is_set() and not getattr(
                     tau_manager, "tau_test_mode", False
                 ):
@@ -747,6 +906,21 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                 if rule_text:
                     if tau_force_test:
                         logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")
+                    elif admission_tau.isolated:
+                        # The revision apply will make -- the rule itself, or the
+                        # composite a routed o5 rule becomes -- offered to an
+                        # evaluator rebuilt from the committed journal, so it
+                        # meets every type commitment the chain has made,
+                        # superseded rules' included. This replaces both the
+                        # fresh-process compile, which has no such history, and
+                        # the preflight against the in-process mirror, whose
+                        # representation is not the one the authority runs.
+                        refusal = _revision_refusal(
+                            admission_tau.revise(admission_candidate or rule_text)
+                        )
+                        if refusal is not None:
+                            return refusal
+                        logger.info("Tau rule validation successful (admission context).")
                     else:
                         # Deterministic gate: compile the rule against an
                         # isolated interpreter seeded from the current
@@ -836,6 +1010,11 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                             if preflight_err is not None:
                                 return preflight_err
 
+            # Advisory block timestamp for i5 at admission (see
+            # _admission_timestamp). Read once: every step of one request is
+            # judged at the same moment.
+            admission_ts = _admission_timestamp()
+
             # Step 2: Custom Input Validation (transfer-less user_tx only).
             # For txs WITH transfers the custom streams are merged into the
             # per-transfer step below (mirrors apply, where the custom-only
@@ -843,7 +1022,18 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
             # i13+ together with the transfer fields. Keeping a separate custom
             # step for transfer txs would create an admission-only rejection
             # surface that apply never runs -> divergence and a wasted roundtrip.
-            if custom_tau_inputs and not all_validated_transfers and not skip_tau_eval:
+            if admission_tau.isolated:
+                # Apply's unified custom step, where apply runs it: after the
+                # rule, before the fee query, whenever there are no transfers and
+                # there is a rule or a custom input -- with i5, as apply feeds it.
+                # A context replays apply's schedule, so a fee estimate that
+                # depends on history sees the history the block will.
+                if (not all_validated_transfers and (custom_tau_inputs or has_rules)
+                        and not skip_tau_eval and not tau_force_test):
+                    unified_inputs = dict(custom_tau_inputs)
+                    unified_inputs[5] = str(admission_ts)
+                    admission_tau.step_multi(unified_inputs, source=sender_pubkey)
+            elif custom_tau_inputs and not all_validated_transfers and not skip_tau_eval:
                 if tau_force_test:
                     logger.info("TAU_FORCE_TEST=1: skipping Tau custom input validation.")
                 else:
@@ -862,24 +1052,6 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                             f"Transaction rejected by Tau (custom input validation). Output: {tau_output_custom}",
                         )
                     logger.info("Tau custom input validation successful.")
-
-            # Advisory block timestamp for i5 at admission. Apply re-checks
-            # against the AUTHORITATIVE block timestamp, so this is a soft
-            # pre-check only: a tx may pass admission yet be rejected at
-            # inclusion near a time threshold (and vice versa). Source the
-            # chain tip's timestamp (deterministic across this node's view,
-            # avoids wall-clock skew); fall back to wall-clock if unavailable.
-            admission_ts = None
-            try:
-                _head = db.get_canonical_head_block()
-                if isinstance(_head, dict):
-                    _hdr = _head.get("header")
-                    if isinstance(_hdr, dict):
-                        admission_ts = _hdr.get("timestamp")
-            except Exception:
-                admission_ts = None
-            if admission_ts is None:
-                admission_ts = int(time.time())
 
             # Step 3: Transfer Validation
             if has_transfers and all_validated_transfers and not skip_tau_eval:
@@ -946,10 +1118,8 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                             i + 1,
                             tau_input_stream_values,
                         )
-                        tau_outputs = tau_manager.communicate_with_tau_multi(
-                            input_stream_values=tau_input_stream_values,
-                            source=sender_pubkey,
-                            apply_rules_update=False,
+                        tau_outputs = admission_tau.step_multi(
+                            tau_input_stream_values, source=sender_pubkey,
                         )
 
                         # --- Built-in Transfer Validation (o1) ---
@@ -1009,7 +1179,7 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                 and not all_validated_transfers
                 and not tau_force_test
                 and not skip_tau_eval
-                and tau_manager.tau_ready.is_set()
+                and (admission_tau.isolated or tau_manager.tau_ready.is_set())
             ):
                 try:
                     # i2 is the sender's head balance here too, matching the
@@ -1022,10 +1192,8 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                     # fee-query overlay order in consensus/engine.py.
                     for k, v in custom_tau_inputs.items():
                         fee_query_inputs[k] = v
-                    fee_outputs = tau_manager.communicate_with_tau_multi(
-                        input_stream_values=fee_query_inputs,
-                        source=sender_pubkey,
-                        apply_rules_update=False,
+                    fee_outputs = admission_tau.step_multi(
+                        fee_query_inputs, source=sender_pubkey,
                     )
                     estimated_fee_total += fees.parse_consensus_fee(
                         fee_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
@@ -1040,10 +1208,18 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                         f"Consensus fee rule failure: {fee_exc}",
                     )
                 except Exception:
+                    if admission_tau.isolated:
+                        # A context that could not answer is not an estimate of
+                        # zero: admitting on it would quote a fee the block then
+                        # charges differently. Reported by the handlers below.
+                        raise
                     logger.warning(
                         "Fee-query estimation failed; estimate stays %s (engine is authoritative).",
                         estimated_fee_total, exc_info=True,
                     )
+
+        # Evaluation is over; the context goes before anything is queued.
+        admission_tau.close()
 
         # --- Post-Tau Processing ---
         # Note: We do NOT increment sequence number or update balances here anymore.
@@ -1153,9 +1329,31 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
     except TauCommunicationError as e:
         logger.error("Tau rule validation failed: %s", e)
         return _qt_err("TX_REJECTED", f"Transaction rejected by Tau. {e}")
+    except tau_admission.StepRefused as e:
+        # The engine refused this request's own inputs, against committed state:
+        # the same refusal wherever they run.
+        return _qt_err("TX_REJECTED", f"Transaction rejected by Tau. {e}")
+    except tau_admission.AdmissionTimeout as e:
+        logger.warning("Admission evaluation timed out: %s", e)
+        return _qt_err(
+            "ADMISSION_TIMEOUT",
+            f"Transaction evaluation timed out after {admission_tau.budget:g}s "
+            f"and was rejected.",
+            timeout_seconds=admission_tau.budget,
+        )
+    except tau_admission.AdmissionUnavailable as e:
+        # Operational. Never answered from the in-process interpreter instead:
+        # that is the shared evaluator an admission context exists to replace.
+        logger.warning("Admission evaluation unavailable: %s", e)
+        return _qt_err(
+            "ADMISSION_UNAVAILABLE",
+            "Transaction validation is temporarily unavailable; please resubmit.",
+        )
     except Exception as e:
         logger.exception("An unexpected error occurred in queue_transaction: %s", e)
         return _qt_err("INTERNAL_ERROR", "An unexpected server error occurred.")
+    finally:
+        admission_tau.close()
 
 
 def execute(raw_command: str, container):

@@ -61,6 +61,60 @@ class AdvisoryEvaluator:
         self._fingerprint = fingerprint
         return session
 
+    def _ensure_consensus(self, consensus_rules: str):
+        """A session holding the CONSENSUS rules, applied the way the authority
+        applies them: the program router, then the rules as a revision.
+
+        Not seeded from the in-process interpreter's spec text. That text is the
+        spec as the engine REVISED it, and revision encodes the previous state
+        with `[t-1]` references: an interpreter built fresh from it answers
+        o7 = 0 at its first step -- measured: the first eligibility query after
+        every rule change said "not our turn". o6 and o7 are defined by the
+        consensus rules alone (user rules may not write them), so nothing else
+        belongs in this session.
+        """
+        import tau_speculation
+
+        unit = _normalize_consensus(consensus_rules)
+        fingerprint = _spec_fingerprint("consensus\x00" + unit)
+        if self._session is not None and self._fingerprint == fingerprint:
+            return self._session
+        self.dispose()
+        import tau_authority
+        baseline = tau_authority.program_baseline()
+        if not baseline or not unit:
+            raise tau_speculation.SpeculationError("no consensus rules to evaluate")
+        env = dict(self._env or os.environ)
+        env.setdefault("PYTHONPATH", "")
+        if self._cwd not in env["PYTHONPATH"].split(os.pathsep):
+            env["PYTHONPATH"] = self._cwd + os.pathsep + env["PYTHONPATH"]
+        session = tau_speculation.SpeculationSession(cwd=self._cwd, env=env)
+        try:
+            session.init(baseline)
+            receipt = session.revise(unit, "consensus")
+            if not receipt.accepted:
+                raise tau_speculation.SpeculationError(
+                    f"consensus rules not accepted: {receipt.get('outcome')}")
+        except BaseException:
+            session.kill()
+            raise
+        self._session = session
+        self._fingerprint = fingerprint
+        return session
+
+    def evaluate_consensus(self, consensus_rules: str, inputs: dict, targets):
+        """o6/o7 (or any consensus output) for one step, or None."""
+        self._trace("evaluate_consensus", inputs, targets)
+        try:
+            session = self._ensure_consensus(consensus_rules)
+            result = session.step(self._named(inputs))
+            outputs = result.get("outputs") or {}
+            return {t: outputs.get(f"o{t}") for t in targets}
+        except Exception as exc:
+            logger.warning("advisory consensus evaluation unavailable: %s", exc)
+            self.dispose()
+            return None
+
     def dispose(self) -> None:
         if self._session is not None:
             try:
@@ -133,6 +187,15 @@ class AdvisoryEvaluator:
             logger.warning("advisory evaluation unavailable: %s", exc)
             self.dispose()
             return None
+
+
+def _normalize_consensus(consensus_rules: str) -> str:
+    """The consensus rules as the authority's restore plan feeds them."""
+    try:
+        import chain_state
+        return chain_state._preprocess_tau_spec_text(consensus_rules or "").strip()
+    except Exception:
+        return (consensus_rules or "").strip()
 
 
 def evaluator(*, cwd=None, env=None) -> AdvisoryEvaluator:

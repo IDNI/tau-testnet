@@ -64,6 +64,29 @@ class AuthorityMismatch(RuntimeError):
     """
 
 
+#: What an operator may ask of startup (`TAU_REBUILD_JOURNAL`).
+REBUILD_MISSING = "missing"      # =1: a chain from before the journal existed
+REBUILD_DISCARD = "discard"      # an explicit repair of contradictory metadata
+REBUILD_MODES = (None, REBUILD_MISSING, REBUILD_DISCARD)
+
+
+def rebuild_mode_from_env(value):
+    """`TAU_REBUILD_JOURNAL` -> a rebuild mode. An unknown value is refused
+    rather than read as "no": a typo must not be the difference between a
+    repair and a node that silently refuses to start for another reason."""
+    text = str(value or "").strip()
+    if text in ("", "0"):
+        return None
+    if text == "1":
+        return REBUILD_MISSING
+    if text == REBUILD_DISCARD:
+        return REBUILD_DISCARD
+    raise ValueError(
+        f"TAU_REBUILD_JOURNAL={text!r} is not understood; use 1 (rebuild a chain "
+        "that has no journal) or discard (replace a contradictory one)"
+    )
+
+
 class AuthoritativeTauOwner:
     """The only way consensus code gets the authoritative evaluator."""
 
@@ -77,6 +100,10 @@ class AuthoritativeTauOwner:
         self.state = UNINITIALIZED
         self.reason = None
         self.descriptor = None
+        # The proposal currently holding the lent worker. Only ITS abandonment
+        # takes the authority out of service: a stale proposal from an earlier
+        # loan, disposed while a newer one borrows, holds a different worker.
+        self._borrower = None
         # Set once, at startup, when this node's authority is worker-backed.
         # Everything that has a choice between "the owner" and "the old
         # in-process path" asks this, and once it is True there is no choice:
@@ -119,6 +146,7 @@ class AuthoritativeTauOwner:
         with self._lock:
             self.state = UNAVAILABLE
             self.reason = reason
+            self._borrower = None
             # An owner that is not serving describes nothing. Keeping the old
             # descriptor would make the next start compare the committed journal
             # against the evaluator it is rebuilding precisely because that
@@ -136,6 +164,7 @@ class AuthoritativeTauOwner:
         self._session = session
         self.state = ACTIVE
         self.reason = None
+        self._borrower = None
         if descriptor is not None:
             self.descriptor = descriptor
         if self._ready is not None:
@@ -384,6 +413,8 @@ class AuthoritativeTauOwner:
                 plan=plan, rebuild=rebuild, label=label, respawn=_respawn,
             )
             proposal.on_abandon = self._lent_abandoned
+            with self._lock:
+                self._borrower = proposal
             logger.info("proposal %s runs on the authoritative worker (lent)", label)
             return proposal
 
@@ -439,7 +470,7 @@ class AuthoritativeTauOwner:
         serve committed state, and the next proposal rebuilds from the journal.
         """
         with self._lock:
-            if self.state == LENT:
+            if self.state == LENT and proposal is self._borrower:
                 self.mark_unavailable(
                     f"the lent authoritative worker was abandoned with {proposal.label}"
                 )
@@ -447,18 +478,32 @@ class AuthoritativeTauOwner:
     # --- startup --------------------------------------------------------------
 
     def initialize(self, *, baseline=None, cwd=None, env=None, genesis_hash=None,
-                   rebuild_if_needed=False):
+                   rebuild=None):
         """Make this node's authority worker-backed, from committed state alone.
 
-        Three cases, decided by durable state and nothing else:
+        Decided by durable state and nothing else:
 
         * a fresh chain (tip is genesis, nothing committed): execute the genesis
           rules in a worker and commit them as the first journal entries;
         * a chain whose commit records cover its tip: reconstruct and verify;
-        * a chain with blocks the journal never recorded: NOT READY. Its history
-          was applied by the in-process interpreter, which is exactly what this
-          owner replaces; the remedy is a rebuild from genesis, not a guess.
+        * a chain with blocks and NO journal at all -- its Tau state was built by
+          the in-process interpreter, before there was a journal: not ready,
+          unless the operator asked for the one migration there is,
+          `rebuild="missing"` (TAU_REBUILD_JOURNAL=1), a replay of the stored
+          blocks through the commit protocol;
+        * anything else -- a journal no record describes, a record naming a head
+          or tip the journal does not have, a journal that does not reproduce
+          itself: CONTRADICTORY. Never repaired implicitly, whatever the flag
+          says, because nothing here can know which of the disagreeing records
+          the chain believes. Only `rebuild="discard"` (TAU_REBUILD_JOURNAL=
+          discard) -- a separate, explicit request -- throws the journal away and
+          derives it again from the stored blocks.
+
+        Both modes are idempotent: on a complete, consistent journal they do
+        nothing destructive, so a flag left in the environment costs a log line.
         """
+        if rebuild not in REBUILD_MODES:
+            raise ValueError(f"unknown rebuild mode {rebuild!r}")
         with self._lock:
             self.enabled = True
             if baseline:
@@ -467,11 +512,22 @@ class AuthoritativeTauOwner:
             tip = store.current_tip()
             genesis = genesis_hash or store.get_genesis_hash() or None
             latest = store.latest_block_commit()
+            _, sequence = store.committed_journal_head()
 
+            contradiction = None
             if latest is None:
-                if not tip or tip == genesis:
+                if sequence:
+                    contradiction = (
+                        f"the journal holds {sequence} entries but no commit "
+                        "record describes them"
+                    )
+                elif not tip or tip == genesis:
                     return self._commit_genesis(genesis, cwd=cwd, env=env)
-                if not rebuild_if_needed:
+                elif rebuild in (REBUILD_MISSING, REBUILD_DISCARD):
+                    logger.warning("the chain predates the committed journal; "
+                                   "rebuilding it from the stored blocks")
+                    return self._rebuild_journal(cwd=cwd, env=env)
+                else:
                     self.mark_unavailable(
                         "the chain has blocks the committed journal never recorded; "
                         "its Tau state was built by the in-process interpreter. "
@@ -479,14 +535,44 @@ class AuthoritativeTauOwner:
                         "(start once with TAU_REBUILD_JOURNAL=1)."
                     )
                     raise AuthorityMismatch(self.reason)
-                return self._rebuild_journal(cwd=cwd, env=env)
+            else:
+                try:
+                    self.verify_committed_anchors()
+                except AuthorityMismatch as exc:
+                    contradiction = f"committed anchors disagree: {exc}"
+                if contradiction is None:
+                    import tau_journal
+                    import tau_reconstruction
+                    try:
+                        session = self.reconstruct_from_committed(cwd=cwd, env=env)
+                    except (AuthorityMismatch, tau_journal.DivergenceError,
+                            tau_reconstruction.ReconstructionMismatch) as exc:
+                        # A journal that does not reproduce itself contradicts
+                        # its own fingerprints -- corruption, or a different
+                        # engine build. Either way nothing here can tell which.
+                        # Anything ELSE (a worker that would not start) is
+                        # operational and propagates as it is: offering to
+                        # discard a sound journal over a spawn failure would be
+                        # the worst possible advice.
+                        contradiction = f"the committed journal does not reconstruct: {exc}"
+                    else:
+                        if rebuild is not None:
+                            logger.info("TAU_REBUILD_JOURNAL=%s: the committed journal "
+                                        "is complete and consistent; nothing to rebuild",
+                                        rebuild)
+                        return session
 
-            try:
-                self.verify_committed_anchors()
-            except AuthorityMismatch as exc:
-                self.mark_unavailable(f"committed anchors disagree: {exc}")
-                raise
-            return self.reconstruct_from_committed(cwd=cwd, env=env)
+            if rebuild == REBUILD_DISCARD:
+                logger.warning("discarding the committed journal at the operator's "
+                               "request (%s); rebuilding it from the stored blocks",
+                               contradiction)
+                return self._rebuild_journal(cwd=cwd, env=env)
+            self.mark_unavailable(
+                f"{contradiction}. Contradictory committed metadata is never "
+                "repaired implicitly; to discard the journal and derive it again "
+                "from the stored blocks, start once with TAU_REBUILD_JOURNAL=discard"
+            )
+            raise AuthorityMismatch(self.reason)
 
     def _rebuild_journal(self, *, cwd=None, env=None):
         """Derive the committed journal by replaying the stored blocks.

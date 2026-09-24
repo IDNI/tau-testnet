@@ -34,6 +34,7 @@ import config
 import db
 import chain_state
 import tau_manager
+import tau_authority
 from chain_state import GENESIS_ADDRESS, GENESIS_BALANCE
 from block import Block, compute_tx_hash
 
@@ -392,6 +393,56 @@ class TestUnresolvableAncestry(DeepChainTestCase):
         with quiet():
             self.assertTrue(chain_state.maybe_update_canonical_head())
         self.assertEqual(self.head(), nxt[-1].block_hash)
+
+
+
+class TestExtensionFastPathUnderAuthority(DeepChainTestCase):
+    """With worker-backed authority, a block that extends the head commits
+    through the commit protocol instead of the rebuild. The two fork-choice
+    lines met in one merge: the fast path asked only for an empty old suffix,
+    and `_resolve_fork` returns exactly that -- forking at genesis -- when the
+    CURRENT head's ancestry is broken. That is a rebuild, never an extension.
+
+    The decision is what is under test, so both outcomes are stubbed: the
+    extension helper records its calls, and the rebuild reports failure, which
+    reorg_to answers by keeping the head where it was.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.main = self.extend(self.genesis_hash, 0, 20)
+        self.adopt(self.main)
+        owner = type("Owner", (), {"enabled": True})()
+        self.patches = [
+            patch.object(tau_authority, "owner", return_value=owner),
+            patch.object(chain_state, "_extend_through_commit_protocol", return_value=True),
+            patch.object(chain_state, "_rebuild_state_from_blockchain_internal", return_value=None),
+        ]
+        self.owner_patch, self.extension, self.rebuild = (p.start() for p in self.patches)
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+        super().tearDown()
+
+    def test_a_block_on_the_head_takes_the_extension(self):
+        nxt = self.extend(self.main[-1].block_hash, 20, 1)
+        self.ingest(nxt)
+        with quiet():
+            self.assertTrue(chain_state.reorg_to(nxt[-1].block_hash))
+        self.extension.assert_called_once_with([nxt[-1].block_hash], nxt[-1].block_hash)
+        self.rebuild.assert_not_called()
+
+    def test_a_head_with_broken_ancestry_is_rebuilt_not_extended(self):
+        branch = self.extend(self.main[9].block_hash, 10, 12, proposer="b" * 96)
+        self.ingest(branch)
+        self.drop_block(self.main[14])
+        with self.assertLogs('chain_state', level='ERROR'), quiet():
+            chain_state.reorg_to(branch[-1].block_hash)
+        self.extension.assert_not_called()
+        self.assertTrue(self.rebuild.called, "the broken-ancestry reorg never reached the rebuild")
+        self.assertEqual(self.rebuild.call_args_list[0].kwargs["path_hashes"][-1],
+                         branch[-1].block_hash)
 
 
 if __name__ == '__main__':

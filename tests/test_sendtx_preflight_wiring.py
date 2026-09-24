@@ -94,3 +94,23 @@ def test_a_representation_conflict_is_node_local_not_a_rule_rejection():
     assert out is not None
     assert out["code"] == "ADMISSION_UNAVAILABLE"
     assert called.call_count == 0
+
+
+def test_a_revision_refusal_reaches_the_client_as_plain_text():
+    """The isolated admission context refuses with the engine's own diagnostic,
+    which the engine colours. The wallet shows the message verbatim, so the
+    escape codes must not reach it."""
+    out = sendtx._revision_refusal({
+        "accepted": False,
+        "outcome": "REJECTED_RULE",
+        "diagnostics": "(\x1b[31;1mError\x1b[0m) Incompatible type information in i1, "
+                       "expected :bv[24], found :bv[16]\n",
+    })
+    assert out["code"] == "TX_REJECTED"
+    assert "\x1b" not in out["message"]
+    assert "(Error) Incompatible type information in i1" in out["message"]
+    assert out["details"] == {"outcome": "REJECTED_RULE"}
+
+
+def test_an_accepted_revision_is_not_a_refusal():
+    assert sendtx._revision_refusal({"accepted": True, "outcome": "ACCEPTED_CHANGED"}) is None

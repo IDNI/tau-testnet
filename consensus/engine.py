@@ -273,6 +273,16 @@ def _refuse_in_process_authority(entry: str) -> None:
         )
 
 
+def _consensus_rules_for(active_view) -> str:
+    """The consensus rules that decide o6/o7 here: the view's, when there is
+    one (the rules in force at the block being judged), else the committed."""
+    rules = getattr(active_view, "consensus_rules", None) if active_view is not None else None
+    if rules:
+        return rules
+    import chain_state
+    return getattr(chain_state, "_consensus_rules_state", "") or ""
+
+
 def _advisory_is_available() -> bool:
     """Whether a separate advisory evaluator can run at all.
 
@@ -596,8 +606,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # update that introduced one would need this revisited.)
                 outputs = None
                 if _advisory_is_available():
-                    outputs = tau_advisory.evaluator().evaluate_many(
-                        tau_manager.get_canonical_spec() or "", tau_inputs, (6, 7)
+                    outputs = tau_advisory.evaluator().evaluate_consensus(
+                        _consensus_rules_for(active_view), tau_inputs, (6, 7)
                     )
                 if outputs is None:
                     with tau_manager.tau_comm_lock:
@@ -619,9 +629,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # Same category: validation must not mutate authoritative state.
                 output = None
                 if _advisory_is_available():
-                    output = tau_advisory.evaluator().evaluate(
-                        tau_manager.get_canonical_spec() or "", tau_inputs, target=6
+                    answered = tau_advisory.evaluator().evaluate_consensus(
+                        _consensus_rules_for(active_view), tau_inputs, (6,)
                     )
+                    output = None if answered is None else answered.get(6)
                 if output is None:
                     output = tau_manager.communicate_with_tau(
                         target_output_stream_index=6,
@@ -1024,11 +1035,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # answer, fall back to the old path rather than stop mining.
             output = None
             if _advisory_is_available():
-                output = tau_advisory.evaluator().evaluate(
-                    tau_manager.get_canonical_spec() or "",
-                    tau_inputs,
-                    target=7,
+                answered = tau_advisory.evaluator().evaluate_consensus(
+                    _consensus_rules_for(None), tau_inputs, (7,)
                 )
+                output = None if answered is None else answered.get(7)
             if output is None:
                 output = tau_manager.communicate_with_tau(
                     target_output_stream_index=7,
@@ -1227,6 +1237,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # snapshot. In tests/mocks (no rules handler), fall back to concatenating
         # rule payloads for determinism.
         current_tau_bytes = snapshot.tau_bytes
+        if proposal is not None and "application_rules" not in proposal.state:
+            # The block's application rules START where the parent's end. A
+            # proposal's state began empty, so every block that carried a rule
+            # replaced the whole hashed accumulation with that block's own
+            # rules -- the router, the builtins and every earlier rule gone from
+            # canonical state -- and a restart, which reloads and re-extends the
+            # accumulation, then hashed a different text than a node that never
+            # restarted: two honest nodes, one block, two state hashes.
+            proposal.state["application_rules"] = (
+                (snapshot.tau_bytes or b"").decode("utf-8", errors="ignore")
+                if isinstance(snapshot.tau_bytes, (bytes, bytearray))
+                else str(snapshot.tau_bytes or "")
+            )
 
         # Fee charging requires the isolated balance overlay: there is no
         # proposer-credit primitive on the direct chain_state mutation path
@@ -2344,7 +2367,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     # here and merged only if the transaction
                                     # survives every later stage.
                                     staged = _rules_state()
-                                    unit = rule_text.strip()
+                                    # the unit exactly as the rules handler
+                                    # appends it (save_effective_tau_spec), so
+                                    # the accumulation has one canonical form
+                                    unit = (chain_state._preprocess_tau_spec_text(rule_text)
+                                            or rule_text).strip()
                                     units = [u for u in staged.split("\n") if u.strip()]
                                     if unit not in units:
                                         units.append(unit)

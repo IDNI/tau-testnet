@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from dataclasses import dataclass
 
 import db
@@ -216,7 +217,18 @@ def canonical_intern_key(hex_digits: str, width: int) -> str:
 # `db.get_shrink_id` inserts and COMMITS, so without this a proposal that is later
 # rejected permanently burns an id and moves the mapping epoch -- the interpreter
 # would be isolated while the allocator was not.
-_allocator = None
+#
+# PER THREAD. A block proposal runs on the chain thread while admission contexts
+# run on request threads, each with an overlay of its own. One module global
+# would let a request thread's `__exit__` restore its predecessor underneath a
+# proposal that is mid-preparation, and the proposal's next literal would be
+# interned into the admission overlay -- or into the committed table.
+_local = threading.local()
+
+
+def current_allocator():
+    """The overlay installed on THIS thread, or None."""
+    return getattr(_local, "allocator", None)
 
 
 class speculative_allocation:
@@ -235,7 +247,6 @@ class speculative_allocation:
         self._previous = None
 
     def __enter__(self):
-        global _allocator
         if self._explicit is not None:
             self.allocator = self._explicit
         else:
@@ -244,13 +255,12 @@ class speculative_allocation:
             self.allocator = tau_allocator.Allocator(
                 snapshot, width=_current_shrink_width, label="proposal"
             )
-        self._previous = _allocator
-        _allocator = self.allocator
+        self._previous = current_allocator()
+        _local.allocator = self.allocator
         return self.allocator
 
     def __exit__(self, *exc):
-        global _allocator
-        _allocator = self._previous
+        _local.allocator = self._previous
         return False
 
 
@@ -264,9 +274,10 @@ def intern_value(hex_digits: str, width: int) -> int:
     if _hex_is_zero(hex_digits):
         return RESERVED_EMPTY_ID
     key = canonical_intern_key(hex_digits, width)
+    allocator = current_allocator()
     try:
-        if _allocator is not None:
-            id_num = int(_allocator.id_for(key))
+        if allocator is not None:
+            id_num = int(allocator.id_for(key))
         else:
             id_num = int(db.get_shrink_id(key))
     except ShrinkWidthOverflow:

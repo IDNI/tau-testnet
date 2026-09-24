@@ -800,17 +800,23 @@ def _run_server(container: ServiceContainer):
         try:
             tau_authority.owner().initialize(
                 baseline=baseline,
-                # The one migration: explicit, never automatic. A chain whose
-                # Tau state was built by the in-process interpreter has no
-                # journal to reconstruct from until its blocks are replayed
-                # through the commit protocol.
-                rebuild_if_needed=os.environ.get("TAU_REBUILD_JOURNAL") == "1",
+                # Explicit, never automatic. =1: a chain whose Tau state was
+                # built by the in-process interpreter has no journal until its
+                # blocks are replayed through the commit protocol. =discard: an
+                # operator's request to replace a contradictory journal.
+                rebuild=tau_authority.rebuild_mode_from_env(
+                    os.environ.get("TAU_REBUILD_JOURNAL")),
             )
         except Exception as exc:
             raise TauEngineCrash(
                 f"The authoritative evaluator could not be initialized: {exc}"
             ) from exc
         logger.info("Authoritative evaluator ready (%s).", tau_authority.owner().state)
+        # One admission context kept pre-built at the committed head, so a
+        # request does not wait for a replay of the journal (see tau_admission).
+        if os.environ.get("TAU_ADMISSION_STANDBY", "1") != "0":
+            import tau_admission
+            tau_admission.enable_standby(True)
 
     # Define the State Restore Callback
     # This will be called by the Tau Manager thread whenever the process comes up (fresh or restart)
