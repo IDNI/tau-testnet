@@ -299,6 +299,39 @@ class TestEngineFeeCharging(EngineFeeBase):
         self.assertEqual(inputs[2], "0")
         self.assertIn("#x" + SENDER, inputs[12])
 
+    def test_faucet_account_pays_fee_on_a_transfer_less_tx(self):
+        """Admission credits an unseen account with the faucet balance, so a
+        rule-only tx from it is queued. Proposal-mode apply (the production
+        path) reads plain target_balances, and refused the same tx as
+        insufficient_funds_for_fee: "need 10, have 0"."""
+        config.TESTNET_AUTO_FAUCET = True
+        amount = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+        session = MagicMock(is_speculative=True)
+        session.ready.return_value = True
+        session.evaluate.return_value = {9: "10"}
+        proposal = MagicMock(session=session, label="test")
+        proposal.lifecycle = MagicMock(approval_slots_active=False)
+        balances = {}
+        tx = {
+            "tx_id": "tx_fresh",
+            "tx_type": "user_tx",
+            "sender_pubkey": SENDER,
+            "sequence_number": 0,
+            "fee_limit": "10",
+            "operations": {"100": "42"},
+        }
+        result = self.engine.apply(
+            self.snapshot, [tx], 1700000000,
+            target_balances=balances, target_sequences={},
+            target_lifecycle=proposal.lifecycle,
+            proposer_pubkey=PROPOSER, block_height=1,
+            proposal=proposal, session=session,
+        )
+        receipt = result.receipts["tx_fresh"]
+        self.assertEqual(receipt.get("reason"), None, receipt)
+        self.assertEqual(receipt["fee_charged"], 10)
+        self.assertEqual(balances[SENDER], amount - 10)
+
     def test_o8_garbage_charges_consensus_fee_only(self):
         self.mock_multi.return_value = {1: "1", 8: "junk", 9: "10"}
         balances = {SENDER: 1000}

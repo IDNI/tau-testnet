@@ -2669,9 +2669,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             f"Fee {total_fee} exceeds fee_limit {fee_limit_int}"
                         )
                 else:
-                    # No faucet shim here: fee settlement reads plain
-                    # balances; a 0-balance faucet sender cannot pay fees.
+                    # Same faucet shim as the transfer debit and admission's
+                    # get_balance. Without it admission accepted a rule-only tx
+                    # from a fresh account (faucet-funded there) that apply
+                    # then refused as insufficient_funds_for_fee: a transfer
+                    # materializes the faucet balance before the fee, a rule
+                    # alone never did.
                     sender_bal = _read_bal(sender) if sender else 0
+                    if sender and sender_bal == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
+                        sender_bal = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
                     if sender is None or sender_bal < total_fee:
                         if replay_mode:
                             logger.error(
