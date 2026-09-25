@@ -125,3 +125,28 @@ def test_originals_are_restored_after_the_outermost_exit():
             pass
         assert chain_state.save_application_rules_state is not original
     assert chain_state.save_application_rules_state is original
+
+
+def test_another_thread_reading_committed_state_is_not_a_leak():
+    """While a block executes, the node keeps serving RPC and gossip on other
+    threads. A `sendtx` admission reading a live balance there is not the
+    proposal reaching past its snapshot, and must not be refused."""
+    import threading
+    import chain_state
+    outcome = {}
+
+    def admission():
+        try:
+            chain_state.get_balance("00" * 48)
+            outcome["ok"] = True
+        except BaseException as exc:  # GlobalStateLeak is a BaseException
+            outcome["exc"] = exc
+
+    with tau_guard.ProposalIsolationGuard() as guard:
+        worker = threading.Thread(target=admission)
+        worker.start()
+        worker.join()
+        assert outcome == {"ok": True}
+        assert guard.violations == []
+        with pytest.raises(tau_guard.GlobalStateLeak):
+            chain_state.get_balance("00" * 48)
