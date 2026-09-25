@@ -106,6 +106,24 @@ def test_dropped_reasons(temp_database, container):
     assert _status(container, "ee" * 32)["status"] == "evicted"
 
 
+def test_rejected_reports_the_apply_reason(temp_database, container):
+    db.record_dropped_txs(
+        ["cd" * 32], "rejected",
+        {"cd" * 32: ("rule_not_applied", "Rule did not land in the spec")},
+    )
+    data = _status(container, "cd" * 32)
+    assert data["status"] == "rejected"
+    assert data["reason"] == "rule_not_applied"
+    assert data["detail"] == "Rule did not land in the spec"
+
+
+def test_rejected_without_a_recorded_reason_omits_it(temp_database, container):
+    db.record_dropped_txs(["ce" * 32], "rejected")
+    data = _status(container, "ce" * 32)
+    assert data["status"] == "rejected"
+    assert "reason" not in data and "detail" not in data
+
+
 def test_unknown(temp_database, container):
     assert _status(container, "ab" * 32)["status"] == "unknown"
 

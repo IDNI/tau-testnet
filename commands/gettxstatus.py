@@ -7,7 +7,10 @@ Resolution order:
                  (with block_hash/number and confirmation depth). Fork-only
                  locations fall through (a reorged-out tx is re-queued into the
                  mempool, so step 1 usually catches it).
-  3. mempool_dropped -> "expired" / "evicted" / "rejected".
+  3. mempool_dropped -> "expired" / "evicted" / "rejected". A "rejected" row
+                 may carry the apply receipt's `reason` code and a `detail`
+                 log trail. Only the node that built the block records these;
+                 other nodes see the tx stay queued until it expires.
   4. "unknown".
 
 "unknown" is a valid answer, not an error; the envelope stays ok. Only a
@@ -95,11 +98,18 @@ def execute(raw_command: str, container):
         # 3. Dropped without being mined?
         dropped = db.get_dropped_tx(tx_hash)
         if dropped is not None:
-            return api_response.success_response("gettxstatus", {
+            data = {
                 "tx_hash": tx_hash,
                 "status": dropped["reason"],  # expired | evicted | rejected
                 "dropped_at": _iso_from_ms(dropped.get("dropped_at", 0)),
-            })
+            }
+            # Apply-time rejection cause, when the node that mined the block
+            # recorded one (e.g. rule_not_applied, width_mismatch).
+            if dropped.get("reject_code"):
+                data["reason"] = dropped["reject_code"]
+            if dropped.get("reject_detail"):
+                data["detail"] = dropped["reject_detail"]
+            return api_response.success_response("gettxstatus", data)
 
         # 4. Never seen.
         return api_response.success_response("gettxstatus", {

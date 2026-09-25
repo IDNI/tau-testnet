@@ -117,3 +117,40 @@ def test_record_dropped_txs_public(temp_database):
     d = db.get_dropped_tx("33" * 32)
     assert d["reason"] == "rejected"
     assert db.get_dropped_tx("44" * 32) is None
+
+
+def test_record_dropped_txs_keeps_the_reject_reason(temp_database):
+    db.record_dropped_txs(
+        ["55" * 32], "rejected", {"55" * 32: ("rule_not_applied", "x" * 2000)}
+    )
+    d = db.get_dropped_tx("55" * 32)
+    assert d["reason"] == "rejected"
+    assert d["reject_code"] == "rule_not_applied"
+    assert d["reject_detail"] == "x" * db._REJECT_DETAIL_MAX_CHARS
+    # Rows recorded without details keep NULLs.
+    db.record_dropped_txs(["66" * 32], "evicted")
+    d = db.get_dropped_tx("66" * 32)
+    assert d["reject_code"] is None and d["reject_detail"] is None
+
+
+def test_mempool_dropped_gains_reject_columns_on_upgrade(temp_database):
+    """A database created before the reject columns existed is migrated in
+    place and its old rows stay readable."""
+    with db._db_lock:
+        db._db_conn.execute("DROP TABLE mempool_dropped;")
+        db._db_conn.execute(
+            "CREATE TABLE mempool_dropped (tx_hash TEXT PRIMARY KEY, "
+            "reason TEXT NOT NULL, dropped_at INTEGER NOT NULL);"
+        )
+        db._db_conn.execute(
+            "INSERT INTO mempool_dropped VALUES (?, 'rejected', 1);", ("77" * 32,)
+        )
+        db._db_conn.commit()
+    db._db_conn.close()
+    db._db_conn = None
+    db.init_db()
+
+    d = db.get_dropped_tx("77" * 32)
+    assert d["reason"] == "rejected" and d["reject_code"] is None
+    db.record_dropped_txs(["88" * 32], "rejected", {"88" * 32: ("width_mismatch", "w")})
+    assert db.get_dropped_tx("88" * 32)["reject_code"] == "width_mismatch"

@@ -34,7 +34,7 @@ import config
 import db
 from commands import createblock, sendtx
 from commands.sendtx import _get_signing_message_bytes
-from consensus.engine import ApplyBlockResult, TauConsensusEngine
+from consensus.engine import ApplyBlockResult, TauConsensusEngine, TransactionOutcome
 from consensus.state import TauStateSnapshot
 
 
@@ -300,7 +300,7 @@ def test_chain_lock_is_reentrant(node_state):
 # --------------------------------------------------------------------------
 # Mempool safety
 # --------------------------------------------------------------------------
-def _forced_apply_result(execution_ids):
+def _forced_apply_result(execution_ids, outcomes=()):
     """An apply_block result that accepts/skips/rejects one tx each."""
     accepted, skipped, invalid = execution_ids[0:1], execution_ids[1:2], execution_ids[2:3]
 
@@ -318,7 +318,7 @@ def _forced_apply_result(execution_ids):
                     "active_consensus_id": chain_state._active_consensus_id,
                 },
             ),
-            outcomes=[],
+            outcomes=list(outcomes),
             accepted_tx_ids=list(accepted),
             skipped_tx_ids=list(skipped),
             invalid_tx_ids=list(invalid),
@@ -357,6 +357,31 @@ def test_failed_persist_returns_every_transaction_to_pending(node_state, monkeyp
         assert db.get_dropped_tx(tx_hash) is None, (
             f"{tx_hash[:12]} recorded as dropped without a persisted block"
         )
+
+
+def test_a_persisted_block_records_why_a_tx_was_rejected(node_state, monkeypatch):
+    """gettxstatus can only name the cause if createblock keeps it: the
+    receipt's machine reason and its log trail go into mempool_dropped."""
+    senders = _seed_senders(3, "reject_reason")
+    recipient = bls.SkToPk(bls.KeyGen(b"reject_reason_recipient")).hex()
+    hashes = _submit(senders, recipient)
+    rejected = TransactionOutcome(
+        tx_id=hashes[2], status="invalid", reason="rule_not_applied",
+        receipt_logs=["Rule did not land", "cleanup"],
+    )
+
+    monkeypatch.setattr(chain_state, "process_new_block", lambda blk: True)
+    monkeypatch.setattr(
+        TauConsensusEngine, "apply_block", _forced_apply_result(hashes, [rejected])
+    )
+
+    with _mining_allowed():
+        createblock.create_block_from_mempool()
+
+    dropped = db.get_dropped_tx(hashes[2])
+    assert dropped is not None and dropped["reason"] == "rejected"
+    assert dropped["reject_code"] == "rule_not_applied"
+    assert dropped["reject_detail"] == "Rule did not land | cleanup"
 
 
 def test_malformed_mempool_row_is_dropped_and_recorded(node_state):

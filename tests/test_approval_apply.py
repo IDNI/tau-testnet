@@ -277,6 +277,16 @@ def test_a_request_whose_sender_cannot_cover_the_fee_is_not_parked():
     assert "un-parked" in _logs(result)
 
 
+def test_a_rejected_outcome_carries_the_receipt_reason():
+    """The machine reason reaches the block's outcomes, so createblock can
+    record it for gettxstatus. It used to read the receipt's non-existent
+    "error" key and always come back None."""
+    result, _, _ = _apply([request_tx(_request(), fee_limit=3)], fee=7)
+    (outcome,) = [o for o in result.outcomes if o.status == "invalid"]
+    assert outcome.reason == "fee_limit_exceeded"
+    assert "Fee 7 exceeds fee_limit 3" in outcome.receipt_logs
+
+
 def test_an_un_parked_request_may_be_submitted_again():
     """withdraw_request forgets the id outright -- it is not a terminal state,
     so the sender can retry with a fee_limit that actually covers the fee."""

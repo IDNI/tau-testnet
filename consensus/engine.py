@@ -806,7 +806,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             elif tx in exec_result.rejected_transactions:
                 status = "invalid"
                 receipt = exec_result.receipts.get(tx_id, {})
-                outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, reason=receipt.get("error"), receipt_logs=receipt.get("logs", [])))
+                outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, reason=receipt.get("reason"), receipt_logs=receipt.get("logs", [])))
 
         # 3. Post-State Materialization Layer
         

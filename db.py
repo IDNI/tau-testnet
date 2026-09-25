@@ -448,13 +448,23 @@ def init_db():
             # mined (expired, evicted under cap pressure, or rejected at apply),
             # so gettxstatus can distinguish "expired/evicted/rejected" from
             # "never seen". Self-pruning (24h TTL + row cap) on insert.
+            # `reject_code` / `reject_detail` carry the apply receipt's machine
+            # reason and log trail for `rejected` rows (NULL otherwise).
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS mempool_dropped (
-                    tx_hash    TEXT PRIMARY KEY,
-                    reason     TEXT NOT NULL,
-                    dropped_at INTEGER NOT NULL
+                    tx_hash       TEXT PRIMARY KEY,
+                    reason        TEXT NOT NULL,
+                    dropped_at    INTEGER NOT NULL,
+                    reject_code   TEXT,
+                    reject_detail TEXT
                 );
             ''')
+            dropped_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(mempool_dropped);").fetchall()
+            }
+            for col in ("reject_code", "reject_detail"):
+                if col not in dropped_cols:
+                    conn.execute(f"ALTER TABLE mempool_dropped ADD COLUMN {col} TEXT;")
 
             # Backfill tx_index for databases created before it existed: if the
             # index is empty but blocks exist, populate it once from stored block
@@ -1371,15 +1381,27 @@ _DROPPED_TTL_MS = 24 * 60 * 60 * 1000  # keep drop records ~24h
 _DROPPED_MAX_ROWS = 5000
 
 
-def _record_dropped_locked(cur, tx_hashes, reason: str, now_ms: int) -> None:
+_REJECT_DETAIL_MAX_CHARS = 500
+
+
+def _record_dropped_locked(cur, tx_hashes, reason: str, now_ms: int, details=None) -> None:
     """Record dropped tx hashes with the given reason, then self-prune. Uses the
-    provided cursor (caller already holds _db_lock)."""
+    provided cursor (caller already holds _db_lock).
+
+    `details` optionally maps tx_hash -> (code, detail): the apply receipt's
+    machine reason (e.g. `rule_not_applied`) and its human-readable log
+    trail, truncated to _REJECT_DETAIL_MAX_CHARS."""
     if not tx_hashes:
         return
+    details = details or {}
     for th in tx_hashes:
+        code, detail = details.get(th) or (None, None)
+        if isinstance(detail, str) and len(detail) > _REJECT_DETAIL_MAX_CHARS:
+            detail = detail[:_REJECT_DETAIL_MAX_CHARS]
         cur.execute(
-            "INSERT OR REPLACE INTO mempool_dropped (tx_hash, reason, dropped_at) VALUES (?, ?, ?)",
-            (th, reason, now_ms),
+            "INSERT OR REPLACE INTO mempool_dropped "
+            "(tx_hash, reason, dropped_at, reject_code, reject_detail) VALUES (?, ?, ?, ?, ?)",
+            (th, reason, now_ms, code, detail),
         )
     # TTL prune, then cap to the newest rows.
     cur.execute("DELETE FROM mempool_dropped WHERE dropped_at < ?", (now_ms - _DROPPED_TTL_MS,))
@@ -1391,9 +1413,10 @@ def _record_dropped_locked(cur, tx_hashes, reason: str, now_ms: int) -> None:
     )
 
 
-def record_dropped_txs(tx_hashes, reason: str) -> None:
+def record_dropped_txs(tx_hashes, reason: str, details=None) -> None:
     """Public: record txs that left the mempool without being mined (e.g.
-    rejected at block apply). Acquires the db lock."""
+    rejected at block apply). Acquires the db lock. `details` as in
+    `_record_dropped_locked`."""
     if not tx_hashes:
         return
     if _db_conn is None:
@@ -1402,24 +1425,31 @@ def record_dropped_txs(tx_hashes, reason: str) -> None:
     now_ms = int(_time.time() * 1000)
     with _db_lock:
         cur = _db_conn.cursor()
-        _record_dropped_locked(cur, list(tx_hashes), reason, now_ms)
+        _record_dropped_locked(cur, list(tx_hashes), reason, now_ms, details)
         _db_conn.commit()
 
 
 def get_dropped_tx(tx_hash: str) -> Optional[Dict]:
-    """Return {'reason', 'dropped_at'} for a dropped tx, or None."""
+    """Return {'reason', 'dropped_at', 'reject_code', 'reject_detail'} for a
+    dropped tx, or None. The reject_* fields are None unless recorded."""
     if _db_conn is None:
         init_db()
     with _db_lock:
         cur = _db_conn.cursor()
         cur.execute(
-            "SELECT reason, dropped_at FROM mempool_dropped WHERE tx_hash = ? LIMIT 1",
+            "SELECT reason, dropped_at, reject_code, reject_detail "
+            "FROM mempool_dropped WHERE tx_hash = ? LIMIT 1",
             (tx_hash,),
         )
         row = cur.fetchone()
     if not row:
         return None
-    return {"reason": row[0], "dropped_at": row[1]}
+    return {
+        "reason": row[0],
+        "dropped_at": row[1],
+        "reject_code": row[2],
+        "reject_detail": row[3],
+    }
 
 
 def get_tx_block_locations(tx_hash: str) -> List[Dict]:

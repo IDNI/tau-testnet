@@ -766,6 +766,18 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
              if tx_id in apply_result.invalid_tx_ids:
                  rejected_hashes.append(tx_id)
 
+        # Why each rejected tx failed, for gettxstatus: the receipt's machine
+        # reason plus its log trail. The whole trail, not the last line: the
+        # cause is often followed by cleanup lines ("... un-parked").
+        rejected_details = {}
+        for outcome in getattr(apply_result, "outcomes", None) or []:
+             if outcome.tx_id in apply_result.invalid_tx_ids:
+                 logs = [str(line) for line in (outcome.receipt_logs or [])]
+                 rejected_details[outcome.tx_id] = (
+                     outcome.reason,
+                     " | ".join(logs) or None,
+                 )
+
         # NOTE: the apply verdicts above are recorded/disposed only after the
         # block actually persists (step 6). They are relative to THIS parent
         # state -- if the block never lands, "invalid" is not a durable verdict.
@@ -880,7 +892,7 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
         # Record before removing: a tx that is in neither `mempool` nor
         # `mempool_dropped` reads as "unknown" to gettxstatus.
         if rejected_hashes:
-            _db.record_dropped_txs(rejected_hashes, "rejected")
+            _db.record_dropped_txs(rejected_hashes, "rejected", rejected_details)
         if final_reserved_ids:
              _db.remove_transactions(final_reserved_ids)
         # Parsed but claimed by no verdict: return them to pending instead of
