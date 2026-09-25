@@ -20,10 +20,18 @@ own, which is why the trap is shared rather than nested: the patching happens
 once, and EVERY active guard sees every call. A lax outer guard therefore cannot
 relax the strict one proposal mode installs inside it, and a strict outer guard
 still raises for calls made under a lax inner one.
+
+A guard watches only the thread that entered it. The traps are process-wide
+(they are module attributes), but a node serves RPC, gossip and the miner on
+other threads while a block executes, and those threads legitimately read
+committed state -- a `sendtx` admission reading a live balance is not a
+proposal leak. Watching them turned every overlapping `sendtx`/`getbalance`
+into a `GlobalStateLeak` that killed the client thread mid-request.
 """
 from __future__ import annotations
 
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +40,7 @@ logger = logging.getLogger(__name__)
 #: last, so the module attributes are patched exactly once no matter how the
 #: guards nest.
 _STACK: list = []
+_STACK_LOCK = threading.Lock()
 
 
 class GlobalStateLeak(BaseException):
@@ -129,7 +138,8 @@ def _trap(module_name, attribute, why, kind, original):
     where = f"{module_name}.{attribute}"
 
     def trapped(*args, **kwargs):
-        watching = [g for g in _STACK if g.watches(where, kind)]
+        me = threading.get_ident()
+        watching = [g for g in list(_STACK) if g.thread == me and g.watches(where, kind)]
         if not watching:
             return original(*args, **kwargs)
         message = (
@@ -165,6 +175,7 @@ class ProposalIsolationGuard:
         self.strict = strict
         self.label = label
         self.violations: list = []
+        self.thread = None
         self._allow = set(allow)
         self._kinds = set()
         if writes:
@@ -178,18 +189,21 @@ class ProposalIsolationGuard:
         return kind in self._kinds and where not in self._allow
 
     def __enter__(self) -> "ProposalIsolationGuard":
-        if not _STACK:
-            _install()
-        _STACK.append(self)
+        self.thread = threading.get_ident()
+        with _STACK_LOCK:
+            if not _STACK:
+                _install()
+            _STACK.append(self)
         return self
 
     def __exit__(self, *exc):
-        try:
-            _STACK.remove(self)
-        except ValueError:
-            pass
-        if not _STACK:
-            _uninstall()
+        with _STACK_LOCK:
+            try:
+                _STACK.remove(self)
+            except ValueError:
+                pass
+            if not _STACK:
+                _uninstall()
         return False
 
     # --- reporting ------------------------------------------------------------
