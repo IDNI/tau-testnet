@@ -73,14 +73,14 @@ class TimeoutSettings:
     comm_timeout: int = 60
     client_wait_timeout: int = 10
     shutdown_timeout: int = 1
-    # Ceiling for a single isolated rule/revision compile on the ADMISSION path,
-    # deliberately below the shipped client's own socket timeout
-    # (tau_testnet_cli.rpc.DEFAULT_TIMEOUT = 10s). comm_timeout (60s) is far
-    # above it, so a compile bounded only by that would still outlive the caller:
-    # the client gives up first and never sees the structured ADMISSION_TIMEOUT,
-    # which is the symptom reported in issue #23. Block apply is not bounded by
-    # this — the activation-height compile there must run to completion.
-    admission_budget: int = 8
+    # Ceiling for a single isolated rule/revision compile on the ADMISSION path.
+    # Must stay below the shipped client's own socket timeout
+    # (tau_testnet_cli.rpc.DEFAULT_TIMEOUT = 75s), or the client gives up first
+    # and never sees the structured ADMISSION_TIMEOUT (issue #23). It is also
+    # capped at comm_timeout by tau_native.admission_compile_timeout(). Block
+    # apply is not bounded by this — the activation-height compile there must
+    # run to completion.
+    admission_budget: int = 60
 
     def validate(self) -> None:
         for name, value in asdict(self).items():

@@ -408,9 +408,10 @@ class TestAdmissionLimits:
                     self._staging_tx(), self._tip_view())
 
         assert result.is_valid, result.error
-        # Bounded below the shipped client's 10s socket timeout, or the caller
+        # Bounded below the shipped client's socket timeout, or the caller
         # gives up before the structured error can reach it.
-        assert seen["timeout"] <= 10
+        from tau_testnet_cli import rpc
+        assert seen["timeout"] < rpc.DEFAULT_TIMEOUT
 
     def test_staging_compile_timeout_maps_to_admission_timeout(self):
         import tau_native

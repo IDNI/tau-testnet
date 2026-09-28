@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import socket
 
-DEFAULT_TIMEOUT = 10.0
+DEFAULT_TIMEOUT = 75.0
 DEFAULT_MAX_BYTES = 4 * 1024 * 1024
 _RECV_CHUNK = 64 * 1024
 

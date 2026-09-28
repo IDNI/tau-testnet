@@ -223,12 +223,13 @@ class TestSendTxMapping(unittest.TestCase):
             result = sendtx.queue_transaction(json.dumps(tx))
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "ADMISSION_TIMEOUT")
-        # The admission budget, shared with the consensus-revision path — not
-        # COMM_TIMEOUT (60s), which outlives the client that is waiting.
+        # The admission budget, shared with the consensus-revision path, and
+        # below the timeout of the client that is waiting.
+        from tau_testnet_cli import rpc
         self.assertEqual(
             result["details"]["timeout_seconds"], tau_native.admission_compile_timeout()
         )
-        self.assertLess(result["details"]["timeout_seconds"], config.COMM_TIMEOUT)
+        self.assertLess(result["details"]["timeout_seconds"], rpc.DEFAULT_TIMEOUT)
 
     # 12. Admission unavailable: the isolated compile could not run
     # (NativeTauUnavailable) -> ADMISSION_UNAVAILABLE. Crucially it must NOT fall
