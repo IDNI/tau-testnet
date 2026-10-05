@@ -651,6 +651,14 @@ def _process_new_block_locked(block: Block) -> bool:
     import db
     
     try:
+        body_ok, body_reason = block.verify_body()
+        if not body_ok:
+            logger.error(
+                "[BLOCKCHAIN] Block #%s rejected: its body does not match its header (%s).",
+                block.header.block_number, body_reason,
+            )
+            return False
+
         current_head = db.get_canonical_head()
         current_head_hash = current_head.get('block_hash') if current_head else ''
         
@@ -2434,6 +2442,13 @@ def _head_rank(cand: tuple[str, int]):
 
 def ingest_block(block: Block) -> IngestResult:
     import db, config
+    body_ok, body_reason = block.verify_body()
+    if not body_ok:
+        logger.warning(
+            "[chain_state] Block #%s %s... not ingested: its body does not match its header (%s).",
+            block.header.block_number, block.block_hash[:16], body_reason,
+        )
+        return IngestResult('invalid', f"Block body verification failed: {body_reason}")
     engine = TauConsensusEngine()
     # NOTE: legacy verify signature (no active_view): membership/stake gates and
     # the parent-state stake input do NOT run here. This pre-filter only checks
@@ -2520,7 +2535,12 @@ def _extend_through_commit_protocol(new_suffix, new_head_hash: str) -> bool:
     applied = []
     for block_hash in new_suffix:
         data = db.get_block_by_hash(block_hash)
-        if data is None or not _process_new_block_locked(Block.from_dict(data)):
+        try:
+            block = Block.from_dict(data) if data is not None else None
+        except ValueError as exc:
+            logger.error("[chain_state] stored block %s... is not a valid block: %s", block_hash[:16], exc)
+            block = None
+        if block is None or not _process_new_block_locked(block):
             logger.error(
                 "[chain_state] extension to %s... stopped at %s...: the block did "
                 "not commit", new_head_hash[:16], block_hash[:16],

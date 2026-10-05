@@ -37,7 +37,6 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
             timestamp=10,
             proposer_pubkey="a"*96
         )
-        block.tx_ids = ["tx-1"]
 
         block_dict = block.to_dict()
 

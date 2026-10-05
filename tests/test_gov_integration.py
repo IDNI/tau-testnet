@@ -757,13 +757,14 @@ def test_rebuild_state_aborts_on_fee_rule_error():
     from unittest.mock import patch as _patch
     from chain_state import rebuild_state_from_blockchain
     from consensus.fees import FeeRuleError
-    from block import BlockHeader, sha256_hex
+    from block import BlockHeader, compute_merkle_root, sha256_hex
 
+    empty_root = compute_merkle_root([])
     hdr = BlockHeader(
         block_number=1,
         previous_hash="0" * 64,
         timestamp=100,
-        merkle_root="0" * 64,
+        merkle_root=empty_root,
         state_hash="0" * 64,
         proposer_pubkey="a" * 96
     )
@@ -774,7 +775,7 @@ def test_rebuild_state_aborts_on_fee_rule_error():
             "block_number": 1,
             "previous_hash": "0" * 64,
             "timestamp": 100,
-            "merkle_root": "0" * 64,
+            "merkle_root": empty_root,
             "state_hash": "0" * 64,
             "proposer_pubkey": "a" * 96
         },
@@ -786,7 +787,10 @@ def test_rebuild_state_aborts_on_fee_rule_error():
     with _patch("db.get_canonical_blocks_at_or_after_height", return_value=[mock_block_data]):
         with _patch("consensus.engine.TauConsensusEngine.apply_block", side_effect=FeeRuleError("mock error")):
             # This should catch FeeRuleError and return cleanly without raising.
-            rebuild_state_from_blockchain(start_block=1)
+            result = rebuild_state_from_blockchain(start_block=1)
+
+    assert not result.ok
+    assert "fee rule failure" in result.reason
 
 
 

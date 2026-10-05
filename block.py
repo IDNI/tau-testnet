@@ -166,7 +166,11 @@ class Block:
         # Accept both so genesis.json remains a stable golden vector.
         block_hash = str(payload.get("block_hash") or payload.get("hash") or "")
         tx_ids = payload.get("tx_ids")
-        if not isinstance(tx_ids, list) or not all(isinstance(x, str) for x in tx_ids):
+        # Past block #0 a supplied tx_ids is kept as-is, however malformed, so verify_body rejects it.
+        if header.block_number == 0:
+            if not isinstance(tx_ids, list) or not all(isinstance(x, str) for x in tx_ids):
+                tx_ids = [compute_tx_hash(tx) for tx in transactions]
+        elif tx_ids is None:
             tx_ids = [compute_tx_hash(tx) for tx in transactions]
         block = cls(
             header=header,
@@ -180,7 +184,32 @@ class Block:
             raise ValueError("Block hash mismatch for block_number %s" % header.block_number)
         if not block.block_hash:
             block.block_hash = canonical_hash
+        body_ok, body_reason = block.verify_body()
+        if not body_ok:
+            raise ValueError(
+                "Block body mismatch for block_number %s: %s" % (header.block_number, body_reason)
+            )
         return block
+
+    def verify_body(self) -> tuple[bool, str]:
+        """Check that ``transactions`` and ``tx_ids`` are what the header's
+        ``merkle_root`` commits to. Never raises; block #0 is exempt, as in the
+        block-hash check of ``from_dict``."""
+        if self.header.block_number == 0:
+            return True, ""
+        try:
+            ids = [compute_tx_hash(tx) for tx in self.transactions]
+            root = compute_merkle_root(ids)
+        except Exception as exc:
+            return False, "transactions cannot be hashed (%s)" % exc
+        # An odd level repeats its last node, so [a, b, c] and [a, b, c, c] share a root.
+        if len(set(ids)) != len(ids):
+            return False, "duplicate transaction in block body"
+        if self.tx_ids != ids:
+            return False, "tx_ids do not match the transactions"
+        if root != self.header.merkle_root:
+            return False, "merkle_root does not match the transactions"
+        return True, ""
 
     def to_dict(self) -> Dict:
         return {
