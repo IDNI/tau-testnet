@@ -2714,14 +2714,14 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
     # Phase 5: Mempool Restore
     if new_txs:
         db.remove_mempool_by_hashes(list(new_txs))
-        
-    import time, json
-    for tx_id, tx in old_txs.items():
-        if tx_id not in new_txs:
-            try:
-                db.add_mempool_tx(json.dumps(tx, separators=(",", ":")), tx_id, int(time.time() * 1000))
-            except Exception as e:
-                logger.error(f"[chain_state] Failed to restore tx {tx_id} to mempool: {e}")
+
+    orphaned = [tx for tx_id, tx in old_txs.items() if tx_id not in new_txs]
+    if orphaned:
+        try:
+            from commands import sendtx
+            sendtx.readmit_orphaned_transactions(orphaned)
+        except Exception as e:
+            logger.error(f"[chain_state] Failed to restore orphaned txs to mempool: {e}")
 
     return True
 

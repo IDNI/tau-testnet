@@ -566,37 +566,9 @@ def _revision_refusal(receipt: dict):
     )
 
 
-def queue_transaction(json_blob: str, propagate: bool = True, *,
-                      dry_run: bool = False, skip_tau_eval: bool = False) -> dict:
-    """Validate a transaction and (unless dry_run) queue it in the mempool.
-
-    `dry_run` returns the verdict just before the two mutations
-    (db.add_mempool_tx, broadcast_transaction), so checktx (#26) answers "would
-    this be admitted?" with byte-identical codes and details to what sendtx would
-    have produced. It is a flag on this function rather than an extracted pure
-    copy deliberately: there are 34 distinct error returns and three outer
-    exception handlers here, so verdict parity is worth guaranteeing by
-    construction instead of by test.
-
-    `skip_tau_eval` additionally skips Tau steps 2/3/3b. Those are NOT
-    side-effect-free — they intern addresses into SQLite, advance the live
-    interpreter's logical time by up to 100 steps per call (up to 64 transfers
-    per tx), can rebuild the interpreter from stdout, and on intern-width
-    overflow re-exec the process. An unauthenticated, fee-free RPC must not
-    reach them. The rule-compile step is unaffected: it already runs in a
-    SIGKILL-able subprocess and is genuinely pure.
-    """
-    blob = json_blob.strip()
-    if len(blob) >= 2 and ((blob[0] == '"' and blob[-1] == '"') or (blob[0] == "'" and blob[-1] == "'")):
-        blob = blob[1:-1]
-    try:
-        payload = json.loads(blob)
-    except Exception as e:
-        return _qt_err("PARSE_ERROR", f"Invalid JSON payload: {e}")
-    if not isinstance(payload, dict):
-        return _qt_err("INVALID_PARAMS", "Transaction must be a JSON object.")
-
-    # --- Structural and Cryptographic Validation ---
+def _check_tx_envelope(payload: dict) -> dict | None:
+    """Shape, wall-clock expiry and BLS signature checks, in the order sendtx
+    reports them. The `_qt_err` verdict, or None when the envelope is sound."""
     if 'sender_pubkey' not in payload:
         return _qt_err("INVALID_PARAMS", "Missing 'sender_pubkey' in transaction.")
     sender_pubkey = payload['sender_pubkey']
@@ -676,6 +648,167 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
     sig_ok, sig_reason = verify_tx_signature(payload, g2=globals().get("G2Basic"))
     if not sig_ok:
         return _qt_err("INVALID_SIGNATURE", f"Invalid signature: {sig_reason}")
+    return None
+
+
+_RESTORE_EVICTED_CODES = frozenset({"RESTORE_LIMIT", "MEMPOOL_FULL"})
+
+
+def readmit_orphaned_transactions(txs: list) -> dict:
+    """Put an orphaned branch's transactions back in the mempool, but only the
+    ones this node would still admit: block building never checks signatures, so
+    whatever lands here can be mined as it stands.
+
+    No Tau steps, no broadcast, no eviction of rows already queued. Returns
+    {"restored": [tx_hash], "dropped": {tx_hash: code}}; every drop is also
+    recorded for gettxstatus. Never raises.
+    """
+    restored: list = []
+    dropped: dict = {}
+    details: dict = {}
+
+    def drop(tx_hash: str, code: str, message: str) -> None:
+        dropped[tx_hash] = code
+        details[tx_hash] = (code, message)
+
+    try:
+        from consensus.admission import validate_mempool_admission
+        from consensus.facade import TipAdmissionView
+
+        tip_view = TipAdmissionView()
+        budget = int(config.REORG_RESTORE_MAX_VERIFY)
+        verified = 0
+        survivors = []
+        for tx in txs:
+            if not isinstance(tx, dict):
+                continue
+            try:
+                tx_hash, blob = _compute_transaction_message_id(tx)
+            except Exception:
+                logger.warning("Orphaned transaction could not be hashed; skipped.", exc_info=True)
+                continue
+            if verified >= budget:
+                drop(tx_hash, "RESTORE_LIMIT",
+                     f"Reorg restore verifies at most {budget} transactions.")
+                continue
+            verified += 1
+            try:
+                verdict = _check_tx_envelope(tx)
+                if verdict is None:
+                    admission = validate_mempool_admission(tx, tip_view, compile_rules=False)
+                    if not admission.is_valid:
+                        verdict = _qt_err(admission.code or "TX_REJECTED", admission.error)
+            except Exception as exc:
+                logger.exception("Orphaned transaction %s could not be re-admitted: %s", tx_hash, exc)
+                verdict = _qt_err("INTERNAL_ERROR", "An unexpected server error occurred.")
+            if verdict is not None:
+                drop(tx_hash, verdict["code"], verdict["message"])
+                continue
+            survivors.append((tx_hash, tx, blob))
+
+        by_sender: dict = {}
+        for entry in survivors:
+            by_sender.setdefault(entry[1]["sender_pubkey"], []).append(entry)
+        for sender, entries in by_sender.items():
+            chain_seq = chain_state.get_sequence_number(sender)
+            available = db.get_pending_sequences(sender)
+            stalled = False
+            for tx_hash, tx, blob in sorted(entries, key=lambda e: e[1]["sequence_number"]):
+                seq = tx["sequence_number"]
+                reach = chain_seq
+                while reach in available:
+                    reach += 1
+                if seq < chain_seq:
+                    drop(tx_hash, "INVALID_SEQUENCE",
+                         f"Sequence {seq} was used on the winning branch (next is {chain_seq}).")
+                    continue
+                if seq > reach:
+                    drop(tx_hash, "INVALID_SEQUENCE",
+                         f"Sequence gap: {seq} would wait on {reach}, which is not queued.")
+                    continue
+                if db.get_mempool_entry(tx_hash) is not None:
+                    restored.append(tx_hash)
+                    continue
+                lane = classify_lane(tx)
+                if stalled or not db.mempool_has_room(lane):
+                    stalled = True
+                    drop(tx_hash, "MEMPOOL_FULL", "Mempool is full; restore never evicts.")
+                    continue
+                try:
+                    db.add_mempool_tx(
+                        blob, tx_hash, int(time.time() * 1000),
+                        fee_limit=fees.parse_fee_limit(tx["fee_limit"]),
+                        estimated_fee=0,
+                        lane=lane,
+                    )
+                except Exception as exc:
+                    logger.exception("Orphaned transaction %s could not be restored: %s", tx_hash, exc)
+                    drop(tx_hash, "INTERNAL_ERROR", "An unexpected server error occurred.")
+                    continue
+                available.add(seq)
+                restored.append(tx_hash)
+    except Exception as exc:
+        logger.exception("Mempool restore after a reorg failed part-way: %s", exc)
+
+    try:
+        by_reason: dict = {}
+        for tx_hash, (code, _message) in details.items():
+            if code == "TX_EXPIRED":
+                reason = "expired"
+            elif code in _RESTORE_EVICTED_CODES:
+                reason = "evicted"
+            else:
+                reason = "rejected"
+            by_reason.setdefault(reason, []).append(tx_hash)
+        for reason, hashes in by_reason.items():
+            db.record_dropped_txs(hashes, reason, details={h: details[h] for h in hashes})
+    except Exception as exc:
+        logger.exception("Could not record dropped orphaned transactions: %s", exc)
+
+    if dropped:
+        logger.warning("Reorg restore kept %d and dropped %d orphaned transactions.",
+                       len(restored), len(dropped))
+    return {"restored": restored, "dropped": dropped}
+
+
+def queue_transaction(json_blob: str, propagate: bool = True, *,
+                      dry_run: bool = False, skip_tau_eval: bool = False) -> dict:
+    """Validate a transaction and (unless dry_run) queue it in the mempool.
+
+    `dry_run` returns the verdict just before the two mutations
+    (db.add_mempool_tx, broadcast_transaction), so checktx (#26) answers "would
+    this be admitted?" with byte-identical codes and details to what sendtx would
+    have produced. It is a flag on this function rather than an extracted pure
+    copy deliberately: there are 34 distinct error returns and three outer
+    exception handlers here, so verdict parity is worth guaranteeing by
+    construction instead of by test.
+
+    `skip_tau_eval` additionally skips Tau steps 2/3/3b. Those are NOT
+    side-effect-free — they intern addresses into SQLite, advance the live
+    interpreter's logical time by up to 100 steps per call (up to 64 transfers
+    per tx), can rebuild the interpreter from stdout, and on intern-width
+    overflow re-exec the process. An unauthenticated, fee-free RPC must not
+    reach them. The rule-compile step is unaffected: it already runs in a
+    SIGKILL-able subprocess and is genuinely pure.
+    """
+    blob = json_blob.strip()
+    if len(blob) >= 2 and ((blob[0] == '"' and blob[-1] == '"') or (blob[0] == "'" and blob[-1] == "'")):
+        blob = blob[1:-1]
+    try:
+        payload = json.loads(blob)
+    except Exception as e:
+        return _qt_err("PARSE_ERROR", f"Invalid JSON payload: {e}")
+    if not isinstance(payload, dict):
+        return _qt_err("INVALID_PARAMS", "Transaction must be a JSON object.")
+
+    # --- Structural and Cryptographic Validation ---
+    envelope_error = _check_tx_envelope(payload)
+    if envelope_error is not None:
+        return envelope_error
+    sender_pubkey = payload['sender_pubkey']
+    sequence_number = payload['sequence_number']
+    fee_limit_int = fees.parse_fee_limit(payload['fee_limit'])
+    tx_type = payload.get("tx_type", "user_tx")
 
     expected_seq = chain_state.get_sequence_number(sender_pubkey)
 

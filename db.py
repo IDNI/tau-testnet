@@ -1347,6 +1347,48 @@ def get_pending_sequence(sender_pubkey: str) -> Optional[int]:
     return max_seq
 
 
+def get_pending_sequences(sender_pubkey: str) -> set:
+    """Every sequence number this sender holds in the mempool, any status."""
+    if _db_conn is None:
+        init_db()
+
+    found = set()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        rows = cur.execute(
+            'SELECT payload FROM mempool WHERE sender_pubkey = ? OR sender_pubkey IS NULL',
+            (sender_pubkey,),
+        ).fetchall()
+    for (payload,) in rows:
+        try:
+            data = json.loads(payload)
+            seq = data.get('sequence_number')
+            if data.get('sender_pubkey') == sender_pubkey and isinstance(seq, int):
+                found.add(seq)
+        except Exception:
+            continue
+    return found
+
+
+def mempool_has_room(lane: int) -> bool:
+    """True when a row in `lane` fits without add_mempool_tx evicting anyone."""
+    if _db_conn is None:
+        init_db()
+    cap = _configured_mempool_max()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        pending = cur.execute("SELECT COUNT(*) FROM mempool WHERE status='pending'").fetchone()[0]
+        if pending >= cap:
+            return False
+        if int(lane) == LANE_SLOW:
+            slow_pending = cur.execute(
+                "SELECT COUNT(*) FROM mempool WHERE status='pending' AND lane = ?",
+                (LANE_SLOW,),
+            ).fetchone()[0]
+            return slow_pending < _slow_lane_cap(cap)
+    return True
+
+
 def get_min_pending_sequence(sender_pubkey: str) -> Optional[int]:
     """Lowest sequence number this sender has waiting in the mempool.
 

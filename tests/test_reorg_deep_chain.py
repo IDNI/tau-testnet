@@ -18,6 +18,7 @@ patched the way test_state_reconstruction.py does it): what is under test is the
 ancestry walk and the head it picks, not Tau.
 """
 import contextlib
+import hashlib
 import io
 import logging
 import os
@@ -35,8 +36,10 @@ import db
 import chain_state
 import tau_manager
 import tau_authority
+from py_ecc.bls import G2Basic
 from chain_state import GENESIS_ADDRESS, GENESIS_BALANCE
 from block import Block, compute_tx_hash
+from consensus.tx_signing import signing_message_bytes
 
 ADDR2 = "893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2"
 ADDR3 = "aabbccddee1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678"
@@ -57,6 +60,14 @@ def _tx(sender, seq, transfers):
         "fee_limit": "0",
         "signature": "dummy_signature_for_testing",
     }
+
+
+def _signed_tx(sk, seq, transfers):
+    """A transaction whose signature verifies, from the account of key `sk`."""
+    tx = _tx(G2Basic.SkToPk(sk).hex(), seq, transfers)
+    digest = hashlib.sha256(signing_message_bytes(tx)).digest()
+    tx["signature"] = G2Basic.Sign(sk, digest).hex()
+    return tx
 
 
 @contextlib.contextmanager
@@ -179,9 +190,12 @@ class TestDeepChainSync(DeepChainTestCase):
 class TestDeepReorg(DeepChainTestCase):
     def test_real_fork_deep_in_the_chain_still_rebuilds_from_genesis(self):
         fork_at = DEEP - 10
-        lost_tx = _tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, ADDR2, "5"]])
-        won_tx = _tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, ADDR3, "7"]])
-        main = self.extend(self.genesis_hash, 0, DEEP, txs={DEEP - 5: [lost_tx]})
+        sk = 4242
+        keyed = G2Basic.SkToPk(sk).hex()
+        funding = _tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, keyed, "100"]])
+        lost_tx = _signed_tx(sk, 0, [[keyed, ADDR2, "5"]])
+        won_tx = _tx(GENESIS_ADDRESS, 1, [[GENESIS_ADDRESS, ADDR3, "7"]])
+        main = self.extend(self.genesis_hash, 0, DEEP, txs={1: [funding], DEEP - 5: [lost_tx]})
         self.adopt(main)
         self.assertEqual(chain_state.get_balance(ADDR2), 5)
 

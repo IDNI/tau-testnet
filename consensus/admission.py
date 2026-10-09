@@ -649,7 +649,9 @@ def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView)
 
     return success({"update_id": update_id.hex()})
 
-def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+def stage_and_validate_consensus_revisions(
+    tx: Dict, tip_view: TipAdmissionView, *, compile_rules: bool = True
+) -> AdmissionResult:
     """
     Structural and isolated-compile checks for a consensus_rule_update payload.
 
@@ -670,7 +672,8 @@ def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView)
       2. warn-only shadowing check on reserved consensus streams,
       3. HARD reject of revisions reading apply-time-mocked inputs (i2/i3/i4),
       4. per-revision preprocessing (syntax shape, normalization),
-      5. isolated staging compile against current consensus rules.
+      5. isolated staging compile against current consensus rules, skipped when
+         `compile_rules` is False.
     """
     revisions = tx["rule_revisions"]
 
@@ -723,7 +726,7 @@ def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView)
     # without native bindings): admission stays available and the
     # activation-height compile in apply_block remains the correctness backstop.
     import tau_manager
-    if tau_manager.tau_ready.is_set():
+    if compile_rules and tau_manager.tau_ready.is_set():
         timeout = tau_native.admission_compile_timeout()
         try:
             err = tau_native.compile_revisions_isolated_subprocess(
@@ -1315,10 +1318,15 @@ def validate_expire_at_height(payload: Dict, tip_view: TipAdmissionView) -> Opti
     return None
 
 
-def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+def validate_mempool_admission(
+    payload: Dict, tip_view: TipAdmissionView, *, compile_rules: bool = True
+) -> AdmissionResult:
     """
     Primary Orchestrator Endpoint for Network Admission logic.
     Delegates dynamic logic independently based cleanly on `tx_type` exclusively.
+
+    `compile_rules=False` skips the one subprocess compile this path can spawn;
+    every other check still runs.
     """
     tx_type = payload.get("tx_type", "user_tx")
     
@@ -1337,7 +1345,9 @@ def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> Adm
          if not phase_1_eval.is_valid:
               return phase_1_eval
               
-         phase_2_eval = stage_and_validate_consensus_revisions(payload, tip_view)
+         phase_2_eval = stage_and_validate_consensus_revisions(
+             payload, tip_view, compile_rules=compile_rules
+         )
          if not phase_2_eval.is_valid:
               return phase_2_eval
               

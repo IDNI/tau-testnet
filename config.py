@@ -185,6 +185,10 @@ class AuthoritySettings:
     # validators mine via the internal SoleMiner loop, never via remote RPC).
     allow_remote_createblock: bool = False
     max_mempool_txs: int = 5000
+    # Signature checks a single reorg may spend re-admitting the orphaned
+    # branch's transactions while holding the chain lock (~0.4 s each); the
+    # rest of that branch is dropped.
+    reorg_restore_max_verify: int = 64
     # Share of the mempool the slow (rule-bearing) lane may occupy. Bounds how
     # much of the queue rule work can hold, so a burst of it cannot crowd out
     # fee-paying transfers. Node-local policy: it affects which transactions
@@ -364,6 +368,7 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_CONN_GRACE_PERIOD": ("network", "conn_grace_period", float),
     "TAU_MAX_CONNECTIONS": ("network", "max_connections", int),
     "TAU_MAX_MEMPOOL_TXS": ("authority", "max_mempool_txs", int),
+    "TAU_REORG_RESTORE_MAX_VERIFY": ("authority", "reorg_restore_max_verify", int),
     "TAU_MEMPOOL_RULE_LANE_MAX_FRACTION": ("authority", "mempool_rule_lane_max_fraction", float),
     "TAU_BLOCK_MAX_RULE_TXS": ("authority", "block_max_rule_txs", int),
     "TAU_RATE_LIMIT_PER_PEER": ("network", "rate_limit_per_peer", float),
@@ -573,6 +578,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     global MINER_PUBKEY, MINER_PUBKEYS, MINER_PRIVKEY, BLOCK_SIGNATURE_SCHEME, STATE_LOCATOR_NAMESPACE
     global OPEN_GOVERNANCE_ADMISSION
     global MAX_MEMPOOL_TXS, MEMPOOL_RULE_LANE_MAX_FRACTION, BLOCK_MAX_RULE_TXS
+    global REORG_RESTORE_MAX_VERIFY
     global TESTNET_AUTO_FAUCET, TESTNET_AUTO_FAUCET_AMOUNT
 
     HOST = current.server.host
@@ -612,6 +618,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     STATE_LOCATOR_NAMESPACE = current.authority.state_locator_namespace
     OPEN_GOVERNANCE_ADMISSION = current.authority.open_governance_admission
     MAX_MEMPOOL_TXS = current.authority.max_mempool_txs
+    REORG_RESTORE_MAX_VERIFY = current.authority.reorg_restore_max_verify
     MEMPOOL_RULE_LANE_MAX_FRACTION = current.authority.mempool_rule_lane_max_fraction
     BLOCK_MAX_RULE_TXS = current.authority.block_max_rule_txs
     TESTNET_AUTO_FAUCET = current.authority.auto_faucet
@@ -682,6 +689,7 @@ __all__ = [
     "STATE_LOCATOR_NAMESPACE",
     "OPEN_GOVERNANCE_ADMISSION",
     "MAX_MEMPOOL_TXS",
+    "REORG_RESTORE_MAX_VERIFY",
     "MEMPOOL_RULE_LANE_MAX_FRACTION",
     "BLOCK_MAX_RULE_TXS",
     "TESTNET_AUTO_FAUCET",
