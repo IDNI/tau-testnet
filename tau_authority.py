@@ -30,6 +30,8 @@ from __future__ import annotations
 import logging
 import threading
 
+import tau_speculation
+
 logger = logging.getLogger(__name__)
 
 UNINITIALIZED = "UNINITIALIZED"
@@ -276,6 +278,9 @@ class AuthoritativeTauOwner:
                     baseline, journal=journal, plan=plan, snapshot=snapshot,
                     cwd=cwd, env=env, verify=verify,
                 )
+            except tau_speculation.WorkerLost as exc:
+                self.mark_unavailable(f"reconstruction failed: {exc}")
+                raise AuthorityUnavailable(self.reason) from exc
             except Exception as exc:
                 self.mark_unavailable(f"reconstruction failed: {exc}")
                 raise
@@ -386,10 +391,14 @@ class AuthoritativeTauOwner:
 
         def rebuild(proposal_journal, current_plan):
             session = _spawn(current_plan)
-            return tau_session.replay_entries(
-                session, proposal_journal.entries(),
-                respawn=lambda: _respawn(current_plan),
-            )
+            try:
+                return tau_session.replay_entries(
+                    session, proposal_journal.entries(),
+                    respawn=lambda: _respawn(current_plan),
+                )
+            except BaseException:
+                session.dispose()
+                raise
 
         committed_entries = committed.entries()
 
@@ -649,14 +658,22 @@ class AuthoritativeTauOwner:
         try:
             session = tau_session.WorkerSession.spawn(
                 self._baseline, cwd=cwd, env=env, plan=plan, allocation=allocator)
+        except tau_speculation.WorkerLost as exc:
+            self.mark_unavailable(f"could not start the genesis worker: {exc}")
+            raise AuthorityUnavailable(self.reason) from exc
         except Exception as exc:
             self.mark_unavailable(f"could not start the genesis worker: {exc}")
             raise
         session.journal = journal
 
         for unit in units:
-            session.apply_rule(unit["text"], target=0, record=True,
-                               accumulate=bool(unit.get("persist")))
+            try:
+                session.apply_rule(unit["text"], target=0, record=True,
+                                   accumulate=bool(unit.get("persist")))
+            except tau_speculation.WorkerLost as exc:
+                session.dispose()
+                self.mark_unavailable(f"the genesis worker was lost: {exc}")
+                raise AuthorityUnavailable(self.reason) from exc
             receipt = session.last_receipt() or {}
             if not receipt.get("accepted"):
                 session.dispose()

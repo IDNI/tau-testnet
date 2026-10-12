@@ -24,6 +24,8 @@ import hashlib
 import logging
 import os
 
+import tau_speculation
+
 logger = logging.getLogger(__name__)
 
 _evaluator = None
@@ -110,7 +112,7 @@ class AdvisoryEvaluator:
             result = session.step(self._named(inputs))
             outputs = result.get("outputs") or {}
             return {t: outputs.get(f"o{t}") for t in targets}
-        except Exception as exc:
+        except (Exception, tau_speculation.WorkerLost) as exc:
             logger.warning("advisory consensus evaluation unavailable: %s", exc)
             self.dispose()
             return None
@@ -157,7 +159,7 @@ class AdvisoryEvaluator:
             result = session.step(self._named(inputs))
             outputs = result.get("outputs") or {}
             return {t: outputs.get(f"o{t}") for t in targets}
-        except Exception as exc:
+        except (Exception, tau_speculation.WorkerLost) as exc:
             logger.warning("advisory evaluation unavailable: %s", exc)
             self.dispose()
             return None
@@ -183,7 +185,7 @@ class AdvisoryEvaluator:
             result = session.step(self._named(inputs))
             outputs = result.get("outputs") or {}
             return outputs.get(f"o{target}")
-        except Exception as exc:
+        except (Exception, tau_speculation.WorkerLost) as exc:
             logger.warning("advisory evaluation unavailable: %s", exc)
             self.dispose()
             return None

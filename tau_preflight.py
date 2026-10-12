@@ -83,7 +83,7 @@ def preflight_rule(baseline_spec: str, runtime_rule_text: str, *, context=None,
             baseline_spec, runtime_rule_text, cwd=cwd, env=env,
             timeout=timeout, worker=worker,
         )
-    except tau_speculation.SpeculationError as exc:
+    except (tau_speculation.SpeculationError, tau_speculation.WorkerLost) as exc:
         # The worker could not answer. Operational: never a verdict about a rule.
         logger.warning("rule preflight unavailable: %s", exc)
         return PreflightResult(UNAVAILABLE, detail=str(exc), context=context)

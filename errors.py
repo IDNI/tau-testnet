@@ -58,6 +58,14 @@ class ProposalIsolationFailure(TauTestnetError):
     """
 
 
+class EvaluatorLost(TauTestnetError):
+    """The speculative evaluator's worker went away mid-request.
+
+    The typed, catchable form of `tau_speculation.WorkerLost`, raised at the
+    boundary that owns the proposal. Operational and node-local, never a verdict.
+    """
+
+
 class BlockchainBug(TauTestnetError):
     """Raised for internal errors, invalid states, or unhandled exceptions in the Python blockchain routing/logic."""
 

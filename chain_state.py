@@ -811,11 +811,12 @@ def _process_new_block_locked(block: Block) -> bool:
                     if isinstance(tx, dict)
                     and isinstance((tx.get("operations") or {}).get("0"), str)
                 ]
+                _label = f"block-{block.header.block_number}"
                 try:
-                    _proposal = _owner.build_proposal(
-                        candidate_rules=_candidates,
-                        label=f"block-{block.header.block_number}",
-                    )
+                    with tau_proposal.boundary(label=_label):
+                        _proposal = _owner.build_proposal(
+                            candidate_rules=_candidates, label=_label,
+                        )
                 except Exception as exc:
                     logger.error(
                         "[BLOCKCHAIN] cannot evaluate block #%s: the authoritative "
@@ -829,17 +830,17 @@ def _process_new_block_locked(block: Block) -> bool:
                             active_view, block, parent_snapshot,
                             session=_proposal.session, proposal=_proposal,
                         )
-                    if _proposal.dirty:
-                        # A rejection in the last transaction; nothing followed it
-                        # to trigger the rebuild, and the artifact must name a
-                        # worker that corresponds to the accepted journal.
-                        _proposal.reconstruct()
-                    next_snapshot = apply_result.next_snapshot
-                    _prepared = tau_commit.PreparedBlockCommit.freeze(
-                        _proposal, execution_id=_execution_id,
-                        next_snapshot=next_snapshot,
-                        parent_tip_id=block.header.previous_hash,
-                    )
+                        if _proposal.dirty:
+                            # A rejection in the last transaction; nothing followed
+                            # it to trigger the rebuild, and the artifact must name
+                            # a worker that corresponds to the accepted journal.
+                            _proposal.reconstruct()
+                        next_snapshot = apply_result.next_snapshot
+                        _prepared = tau_commit.PreparedBlockCommit.freeze(
+                            _proposal, execution_id=_execution_id,
+                            next_snapshot=next_snapshot,
+                            parent_tip_id=block.header.previous_hash,
+                        )
                 except FeeRuleError as exc:
                     logger.error(
                         "[BLOCKCHAIN] Fee rule failure applying block #%s: %s",
@@ -1235,15 +1236,17 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                         if isinstance(tx, dict)
                         and isinstance((tx.get("operations") or {}).get("0"), str)
                     ]
-                    _proposal = _owner.build_proposal(
-                        candidate_rules=_candidates, label=f"rebuild-{block_number}")
+                    _label = f"rebuild-{block_number}"
+                    with tau_proposal.boundary(label=_label):
+                        _proposal = _owner.build_proposal(
+                            candidate_rules=_candidates, label=_label)
                     with tau_proposal.boundary(_proposal, label="rebuild"):
                         apply_result = engine.apply_block(
                             active_view, block, parent_snapshot, replay_mode=True,
                             session=_proposal.session, proposal=_proposal,
                         )
-                    if _proposal.dirty:
-                        _proposal.reconstruct()
+                        if _proposal.dirty:
+                            _proposal.reconstruct()
                 else:
                     apply_result = engine.apply_block(active_view, block, parent_snapshot, replay_mode=True)
             except FeeRuleError as e:
@@ -1293,11 +1296,12 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                         transactions=block.transactions,
                         consensus_context=active_view.consensus_rules or "",
                     )
-                    _prepared = tau_commit.PreparedBlockCommit.freeze(
-                        _proposal, execution_id=_execution_id,
-                        next_snapshot=next_snapshot,
-                        parent_tip_id=block.header.previous_hash,
-                    )
+                    with tau_proposal.boundary(_proposal, label="rebuild"):
+                        _prepared = tau_commit.PreparedBlockCommit.freeze(
+                            _proposal, execution_id=_execution_id,
+                            next_snapshot=next_snapshot,
+                            parent_tip_id=block.header.previous_hash,
+                        )
                     db.commit_prepared_block(
                         execution_id=_prepared.execution_id,
                         tip=block.block_hash,
