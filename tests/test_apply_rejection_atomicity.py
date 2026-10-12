@@ -7,15 +7,19 @@ guarded only by the reserved-stream error, so a transaction already rejected by
 the sequence check still had its policy replaced and its pending approvals
 cancelled -- a "rejected" transaction with visible side effects.
 """
+import hashlib
 from unittest.mock import MagicMock, patch
 
 import pytest
+from py_ecc.bls import G2Basic
 
 import tau_defs
 from consensus.engine import TauConsensusEngine
 from consensus.state import TauStateSnapshot
+from consensus.tx_signing import signing_message_bytes
 
-SENDER = "aa" * 48
+SK_SENDER = 33333
+SENDER = G2Basic.SkToPk(SK_SENDER).hex()
 PROPOSER = "bb" * 48
 STREAM = tau_defs.USER_POLICY_STREAM_INDEX
 # A registered clause carries NO i12 guard -- the composer supplies the scope.
@@ -59,9 +63,13 @@ def _apply(*, sequence_number, seq_state=None):
         "tx_type": "user_tx",
         "sender_pubkey": SENDER,
         "sequence_number": sequence_number,
+        "expiration_time": 9999999999,
         "fee_limit": "100",
         "operations": {"0": CLAUSE},
     }
+    tx["signature"] = G2Basic.Sign(
+        SK_SENDER, hashlib.sha256(signing_message_bytes(tx)).digest()
+    ).hex()
     with patch("tau_manager.tau_ready") as ready, \
          patch("tau_manager.communicate_with_tau", return_value="ok"), \
          patch("tau_manager.communicate_with_tau_multi", return_value={9: "7"}), \

@@ -254,16 +254,17 @@ def test_an_affordable_offer_still_lands(temp_database):
         "an accepted offer was not recorded"
 
 
-def _accept_tx(offer, fee_limit="10000"):
-    return {
+def _accept_tx(offer, fee_limit="10000", sk=SK_BOB):
+    return _sign({
         "tx_id": f"accept-{next(_TX_SEQ)}",
         "tx_type": "rule_offer_accept",
         "sender_pubkey": offer.recipient_pubkey,
         "sequence_number": 0,
+        "expiration_time": 9999999999,
         "offer_id": offer.offer_id_hex,
         "rule_text": offer.rule_text,
         "fee_limit": str(fee_limit),
-    }
+    }, sk)
 
 
 def test_a_rejected_composite_leaves_the_offer_book_untouched(temp_database):
@@ -305,3 +306,16 @@ def test_an_accepted_offer_still_registers_its_clause(temp_database):
     assert (BOB.lower(), tau_defs.USER_POLICY_STREAM_INDEX) \
         in lifecycle.rule_offers.accepted_clauses, \
         "an accepted offer did not register the acceptor's clause"
+
+
+def test_a_forged_accept_never_reaches_the_evaluator(temp_database):
+    lifecycle = _lifecycle()
+    offer = _offer()
+    _run([_offer_tx(offer, fee_limit="10000")], lifecycle)
+
+    proposal, result, session = _run([_accept_tx(offer, sk=SK_AUTH)], lifecycle)
+
+    assert result.rejected_transactions, "a forged accept must hard-reject"
+    assert session.rules_seen == []
+    assert offer.offer_id in lifecycle.rule_offers.offered
+    assert lifecycle.rule_offers.accepted_clauses == {}
