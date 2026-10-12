@@ -115,6 +115,19 @@ def _streams_referenced(rule_text: str, tokens) -> List[str]:
     return [tok for tok in tokens if re.search(rf"\b{re.escape(tok)}\b", scrubbed)]
 
 
+CONSENSUS_OWNED_OUTPUT_STREAMS = ("o6", "o7", "o9")
+
+
+def screen_reserved_rule_outputs(rule_text: str) -> Optional[str]:
+    """Error text when a user_tx rule writes a consensus-owned output stream."""
+    forbidden_out = _streams_referenced(rule_text, CONSENSUS_OWNED_OUTPUT_STREAMS)
+    if forbidden_out:
+        return (
+            f"user_tx rule text references reserved consensus output stream '{forbidden_out[0]}'."
+        )
+    return None
+
+
 class AdmissionResult:
     def __init__(self, is_valid: bool, error: Optional[str] = None, data: Optional[Dict] = None,
                  code: Optional[str] = None, details: Optional[Dict] = None):
@@ -272,11 +285,9 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         if routing is not None:
             return routing
 
-        forbidden_out = _streams_referenced(rule_text, ("o6", "o7", "o9"))
-        if forbidden_out:
-            return format_error(
-                f"user_tx rule text references reserved consensus output stream '{forbidden_out[0]}'."
-            )
+        reserved_error = screen_reserved_rule_outputs(rule_text)
+        if reserved_error:
+            return format_error(reserved_error)
         # i2 (balance) is now fed from the parent-block snapshot at apply, frozen
         # for the whole block, so proposer and verifier agree and a POLICY rule
         # reading it is deterministic (issue #20). What remains is
@@ -903,7 +914,7 @@ def _screen_clause_domains(body: str) -> Optional[str]:
     consensus-owned verdict/fee streams, must not read an input the apply path
     mocks, and must not type a reserved input stream.
     """
-    writes = _streams_referenced(body, ("o6", "o7", "o9"))
+    writes = _streams_referenced(body, CONSENSUS_OWNED_OUTPUT_STREAMS)
     if writes:
         return (
             "Shared rules may not write consensus-owned streams: "

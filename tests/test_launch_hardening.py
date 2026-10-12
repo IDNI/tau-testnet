@@ -886,3 +886,39 @@ class TestApplyRuleHonesty:
         assert result.receipts["r1"].get("fee_charged") == 0
         comm.assert_not_called()
 
+    def _reserved_rule(self, stream, width=24):
+        return (
+            f"always ({stream}[t]:bv[{width}] = {{ #x000001 }}:bv[{width}])."
+        )
+
+    def test_apply_rejects_rule_writing_consensus_outputs(self):
+        for stream, width in (("o6", 16), ("o7", 16), ("o9", 24)):
+            result, comm = self._apply(self._reserved_rule(stream, width))
+            assert result.accepted_transactions == []
+            receipt = result.receipts["r1"]
+            assert receipt.get("reason") == "reserved_output_stream"
+            assert receipt.get("fee_charged") == 0
+            assert stream in " | ".join(receipt["logs"])
+            comm.assert_not_called()
+
+    def test_replay_keeps_rule_writing_consensus_output(self):
+        rule = self._reserved_rule("o9")
+        result, comm = self._apply(rule, app_rules=rule, replay_mode=True)
+        comm.assert_called()
+        assert result.accepted_transactions
+        assert result.receipts["r1"].get("reason") != "reserved_output_stream"
+
+    def test_word_boundary_does_not_match_custom_streams(self):
+        for stream in ("o90", "o60"):
+            rule = self._reserved_rule(stream, 16)
+            result, _ = self._apply(rule, app_rules=rule)
+            assert result.receipts["r1"].get("reason") != "reserved_output_stream"
+            assert result.accepted_transactions
+
+    def test_admission_screen_message_is_unchanged(self):
+        from consensus.admission import screen_reserved_rule_outputs
+
+        assert screen_reserved_rule_outputs(self._reserved_rule("o7", 16)) == (
+            "user_tx rule text references reserved consensus output stream 'o7'."
+        )
+        assert screen_reserved_rule_outputs(self._reserved_rule("o70", 16)) is None
