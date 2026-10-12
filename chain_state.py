@@ -1395,7 +1395,7 @@ def rebuild_state_from_blockchain(start_block=0) -> RebuildResult:
 def _hex_bytes(h: str) -> bytes:
     return bytes.fromhex(h)
 
-def load_genesis(genesis_json_path: str):
+def load_genesis(genesis_json_path: str, authority: bool = False):
     import json
     import os
     import db
@@ -1529,29 +1529,36 @@ def load_genesis(genesis_json_path: str):
     if loaded:
         if not _lifecycle_manager.active_validators:
             meta = genesis_data["consensus_meta"]
-            _lifecycle_manager.active_validators = normalize_validator_set(meta.get("active_validators", []))
-            # Genesis may pin the quorum policy network-wide; overrides the local config knob.
-            _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
-            _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
-            _lifecycle_manager.fee_beneficiary = meta.get("mechanism_specific_metadata", {}).get("fee_beneficiary", "")
-            # A fresh chain may ship with co-signature approval slots already
-            # reserved (scripts/gen_genesis.py --approval-slots). One-way, so
-            # this only ever turns it on.
-            if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
-                _lifecycle_manager.activate_approval_slots()
-                # Persist immediately. TipAdmissionView reads this key, not the
-                # manager, so without it admission treats a genesis-activated
-                # chain as INACTIVE until the first block commits -- and rejects
-                # every co-signature policy in the meantime. Found by the
-                # live-node e2e.
-                try:
-                    db.set_chain_state_value("approval_slots_active", "1")
-                except Exception:
-                    logger.warning(
-                        "could not persist approval_slots_active from genesis",
-                        exc_info=True)
-            _lifecycle_manager.recompute_approval_threshold()
-            commit_state_to_db(_canonical_head_hash, latest["header"]["block_number"] if latest else 0)
+            genesis_validators = normalize_validator_set(meta.get("active_validators", []))
+            if authority:
+                # Only the commit protocol writes canonical state here, and it never
+                # persists an empty set: an empty row on a committed chain is damage.
+                if genesis_validators and db.latest_block_commit() is not None:
+                    raise ValueError(
+                        "FATAL: Persisted active validator set is missing or unreadable "
+                        "on a committed chain; refusing to start. "
+                        "Restore the database or resync the node."
+                    )
+            else:
+                _lifecycle_manager.active_validators = genesis_validators
+                # A fresh chain may ship with co-signature approval slots already
+                # reserved (scripts/gen_genesis.py --approval-slots). One-way, so
+                # this only ever turns it on.
+                if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
+                    _lifecycle_manager.activate_approval_slots()
+                    # Persist immediately. TipAdmissionView reads this key, not the
+                    # manager, so without it admission treats a genesis-activated
+                    # chain as INACTIVE until the first block commits -- and rejects
+                    # every co-signature policy in the meantime. Found by the
+                    # live-node e2e.
+                    try:
+                        db.set_chain_state_value("approval_slots_active", "1")
+                    except Exception:
+                        logger.warning(
+                            "could not persist approval_slots_active from genesis",
+                            exc_info=True)
+                _lifecycle_manager.recompute_approval_threshold()
+                commit_state_to_db(_canonical_head_hash, latest["header"]["block_number"] if latest else 0)
         print(f"[INFO][chain_state] State loaded successfully. Last known block hash: '{_canonical_head_hash[:16]}...'")
     else:
         print("[WARN][chain_state] DB has blocks but no canonical state! Rebuilding.")
@@ -2336,7 +2343,7 @@ def initialize_persistent_state(genesis_json_path: str = "data/genesis.json",
     """
     print("[DEBUG][chain_state] > initialize_persistent_state started")
     
-    load_genesis(genesis_json_path)
+    load_genesis(genesis_json_path, authority=authority)
 
     print("[DEBUG][chain_state] Verifying consistency between loaded state and blockchain head...")
     latest = db.get_canonical_head_block()
