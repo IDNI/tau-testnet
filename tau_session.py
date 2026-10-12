@@ -285,14 +285,20 @@ class WorkerSession(EvaluatorSession):
         env = dict(env or _os.environ)
         env["PYTHONPATH"] = cwd + _os.pathsep + env.get("PYTHONPATH", "")
         spec_session = tau_speculation.SpeculationSession(cwd=cwd, env=env)
-        spec_session.init(baseline_spec)
-        session = cls(spec_session, normalize=normalize, allocation=allocation,
-                      plan=plan)
-        for entry in (trace or []):
-            if entry.get("kind") == RULE:
-                session.apply_rule(entry.get("rule_text") or "")
-            else:
-                session.evaluate(entry.get("inputs") or {}, target=entry.get("target"))
+        try:
+            spec_session.init(baseline_spec)
+            session = cls(spec_session, normalize=normalize, allocation=allocation,
+                          plan=plan)
+            for entry in (trace or []):
+                if entry.get("kind") == RULE:
+                    session.apply_rule(entry.get("rule_text") or "")
+                else:
+                    session.evaluate(entry.get("inputs") or {},
+                                     target=entry.get("target"))
+        except BaseException:
+            # The caller never receives the session, so nobody else can dispose it.
+            spec_session.kill()
+            raise
         return session
 
     @classmethod
@@ -543,6 +549,28 @@ def replay_entries(session, entries, *, respawn, expected=None,
     `expected` is the full list of (seq, semantic fingerprint), aligned with
     `entries`; each replayed entry is checked against it.
     """
+    spawned = []
+
+    def _tracked():
+        fresh = respawn()
+        spawned.append(fresh)
+        return fresh
+
+    try:
+        return _replay(session, entries, respawn=_tracked, expected=expected,
+                       start_at_last_reset=start_at_last_reset)
+    except BaseException:
+        # Nobody receives these, so nobody else can dispose them. A session the
+        # caller passed in stays the caller's.
+        for fresh in spawned:
+            try:
+                fresh.dispose()
+            except Exception:
+                pass
+        raise
+
+
+def _replay(session, entries, *, respawn, expected, start_at_last_reset):
     begin = 0
     if start_at_last_reset:
         last = tau_journal.last_reset_index(entries)

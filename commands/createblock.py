@@ -19,6 +19,7 @@ import tau_commit
 import tau_manager
 import tau_proposal
 import tau_shrink
+import tau_speculation
 from tau_manager import parse_tau_output
 import tau_defs
 import logging
@@ -377,7 +378,7 @@ def _speculative_proposal(candidate_rules=()):
 
     try:
         session = _spawn(trace, plan)
-    except Exception as exc:
+    except (Exception, tau_speculation.WorkerLost) as exc:
         logger.warning("createblock: no simulation worker (%s); simulating in-process", exc)
         return None
 
@@ -599,6 +600,7 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
 
     # Flips once the candidate is canonical; gates the reclaim in `except`.
     persisted = False
+    sim_proposal = None
 
     try:
         from consensus.engine import TauConsensusEngine
@@ -697,7 +699,8 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
             for tx in execution_transactions
             if isinstance((tx.get("operations") or {}).get("0"), str)
         ]
-        sim_proposal = _speculative_proposal(candidate_rules=candidate_rules)
+        with tau_proposal.boundary(label="createblock"):
+            sim_proposal = _speculative_proposal(candidate_rules=candidate_rules)
         sim_session = sim_proposal.session if sim_proposal is not None else None
         # The terminal catch for an isolation breach. Inside apply the leak is a
         # BaseException precisely so no broad handler can turn it into a rejected
@@ -837,22 +840,23 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
                 # no artifact at all and ingestion re-evaluated the whole block.
                 # Rebuilding here costs one replay of the accepted prefix; not
                 # rebuilding costs a second execution of every transaction.
-                if sim_proposal.dirty:
-                    sim_proposal.reconstruct()
-                block_execution = tau_commit.block_execution_id(
-                    parent=candidate_block.header.previous_hash,
-                    height=candidate_block.header.block_number,
-                    timestamp=candidate_block.header.timestamp,
-                    proposer=candidate_block.header.proposer_pubkey,
-                    transactions=candidate_block.transactions,
-                    consensus_context=active_view.consensus_rules or "",
-                )
-                prepared = tau_commit.PreparedBlockCommit.freeze(
-                    sim_proposal,
-                    execution_id=block_execution,
-                    next_snapshot=apply_result.next_snapshot,
-                    parent_tip_id=candidate_block.header.previous_hash,
-                )
+                with tau_proposal.boundary(sim_proposal, label="createblock"):
+                    if sim_proposal.dirty:
+                        sim_proposal.reconstruct()
+                    block_execution = tau_commit.block_execution_id(
+                        parent=candidate_block.header.previous_hash,
+                        height=candidate_block.header.block_number,
+                        timestamp=candidate_block.header.timestamp,
+                        proposer=candidate_block.header.proposer_pubkey,
+                        transactions=candidate_block.transactions,
+                        consensus_context=active_view.consensus_rules or "",
+                    )
+                    prepared = tau_commit.PreparedBlockCommit.freeze(
+                        sim_proposal,
+                        execution_id=block_execution,
+                        next_snapshot=apply_result.next_snapshot,
+                        parent_tip_id=candidate_block.header.previous_hash,
+                    )
                 tau_commit.registry().offer(block_execution, prepared, sim_proposal)
             except Exception as exc:
                 # Never fatal: ingestion evaluating the block itself is the
@@ -910,6 +914,8 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
         # block; unreserving them here would re-mine them into a later one.
         if not persisted:
             _db.unreserve_mempool_txs(reserved_ids)
+            if sim_proposal is not None:
+                sim_proposal.dispose()
         msg = str(e)
         return {"error": msg, "message": msg}
         

@@ -51,6 +51,7 @@ class AdmissionTimeout(AdmissionUnavailable):
 from tau_session import StepRefused  # noqa: E402 - re-exported: the engine refused
 # one step's inputs. The same inputs against the same history are refused
 # wherever they run, so it is about the request, not the node.
+from tau_speculation import WorkerLost  # noqa: E402
 
 
 #: Contexts evaluating at once. Each is a process holding a native interpreter,
@@ -173,7 +174,7 @@ class AdmissionContext:
         self._check()
         try:
             self._session.apply_rule(rule_text, target=0, record=False)
-        except Exception as exc:
+        except (Exception, WorkerLost) as exc:
             # Preparation that cannot represent the rule, a capacity overflow, a
             # dead worker: all node-local, none of them the author's fault.
             raise self._operational(exc) from exc
@@ -186,7 +187,7 @@ class AdmissionContext:
             return self._session.evaluate(inputs, multi=True, record=False)
         except StepRefused:
             raise
-        except Exception as exc:
+        except (Exception, WorkerLost) as exc:
             raise self._operational(exc) from exc
 
     # --- disposal -----------------------------------------------------------------
@@ -300,7 +301,7 @@ def _build(*, candidate_rules, label, deadline, cwd, env, store):
         )
     except AdmissionUnavailable:
         raise
-    except Exception as exc:
+    except (Exception, WorkerLost) as exc:
         if deadline is not None and deadline.expired:
             raise AdmissionTimeout("the admission budget ran out during replay") from exc
         raise AdmissionUnavailable(
@@ -407,7 +408,7 @@ class _Standby:
                     candidate_rules=(), label="admission-standby", deadline=None,
                     cwd=cwd, env=env, store=store,
                 )
-            except Exception as exc:
+            except (Exception, WorkerLost) as exc:
                 logger.info("admission standby not built: %s", exc)
                 with self._lock:
                     self._building = False

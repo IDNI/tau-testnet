@@ -37,6 +37,11 @@ class SpeculationProtocolError(SpeculationError):
     """A malformed, mismatched or stale response. Fails closed."""
 
 
+class WorkerLost(BaseException):
+    """The worker is gone. A BaseException so that no broad `except Exception`
+    can report this node-local loss as a verdict on a rule or a transaction."""
+
+
 class RevisionReceipt(dict):
     """Positive evidence about ONE revision request."""
 
@@ -89,28 +94,40 @@ class SpeculationSession:
     def _send(self, payload: dict) -> None:
         blob = json.dumps(payload).encode("utf-8")
         assert self._proc.stdin is not None
-        self._proc.stdin.write(_HDR.pack(len(blob)) + blob)
-        self._proc.stdin.flush()
+        try:
+            self._proc.stdin.write(_HDR.pack(len(blob)) + blob)
+            self._proc.stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise WorkerLost(f"worker closed its request channel: {exc}") from exc
 
     def _recv(self) -> dict:
-        head = self._result.read(_HDR.size)
-        if not head or len(head) < _HDR.size:
-            raise SpeculationProtocolError("worker closed the result channel")
-        (size,) = _HDR.unpack(head)
-        body = self._result.read(size)
+        try:
+            head = self._result.read(_HDR.size)
+            if not head or len(head) < _HDR.size:
+                raise WorkerLost("worker closed the result channel")
+            (size,) = _HDR.unpack(head)
+            body = self._result.read(size)
+        except (OSError, ValueError) as exc:
+            raise WorkerLost(f"result channel unreadable: {exc}") from exc
         if body is None or len(body) < size:
-            raise SpeculationProtocolError("truncated result frame")
+            raise WorkerLost("truncated result frame")
         return json.loads(body.decode("utf-8"))
 
     def _request(self, payload: dict) -> dict:
         with self._lock:
             if self._closed:
-                raise SpeculationError("session is closed")
+                raise WorkerLost("session is closed")
             self._next_id += 1
             rid = self._next_id
             payload["request_id"] = rid
-            self._send(payload)
-            resp = self._recv()
+            try:
+                self._send(payload)
+                resp = self._recv()
+            except WorkerLost:
+                # Closes the session too, so a later request fails at once
+                # instead of waiting on a channel nobody will write to.
+                self.kill()
+                raise
         if resp.get("request_id") != rid:
             raise SpeculationProtocolError(
                 f"response is for request {resp.get('request_id')!r}, expected {rid}"
@@ -161,7 +178,7 @@ class SpeculationSession:
         try:
             self._send({"op": "close", "request_id": -1})
             self._proc.stdin.close()
-        except Exception:
+        except (Exception, WorkerLost):
             pass
         try:
             return self._proc.wait(timeout=timeout)

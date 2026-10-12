@@ -14,6 +14,8 @@ import struct
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 
 import pytest
 
@@ -75,24 +77,126 @@ def test_a_backwards_state_revision_is_rejected(tmp_path):
     s.kill()
 
 
-def test_a_truncated_frame_is_rejected(tmp_path):
+def _assert_lost_and_reaped(s):
+    """The loss is reported once, the worker is gone for good, and the session
+    refuses every following request the same way instead of reading a dead channel."""
+    assert s._proc.returncode is not None, "the dead worker was not reaped"
+    with pytest.raises(spec.WorkerLost):
+        s.state()
+
+
+def test_worker_loss_is_not_an_exception():
+    """The point of the type: no `except Exception` in transaction logic may
+    absorb it and report a verdict."""
+    assert issubclass(spec.WorkerLost, BaseException)
+    assert not issubclass(spec.WorkerLost, Exception)
+    assert issubclass(spec.SpeculationProtocolError, Exception)
+    assert not issubclass(spec.SpeculationProtocolError, spec.WorkerLost)
+
+
+def test_a_truncated_frame_is_a_lost_worker(tmp_path):
     s = _session(tmp_path, '''
         req = read()
         blob = json.dumps({"ok": True, "request_id": req["request_id"], "state_revision": 1}).encode()
         os.write(FD, _HDR.pack(len(blob) + 50) + blob)   # claims more than it sends
     ''')
-    with pytest.raises(spec.SpeculationProtocolError):
+    with pytest.raises(spec.WorkerLost, match="truncated"):
         s.state()
-    s.kill()
+    _assert_lost_and_reaped(s)
 
 
 def test_a_dead_worker_is_an_operational_failure(tmp_path):
     s = _session(tmp_path, '''
         sys.exit(3)
     ''')
-    with pytest.raises(spec.SpeculationProtocolError):
+    with pytest.raises(spec.WorkerLost):
         s.state()
+    _assert_lost_and_reaped(s)
+
+
+def test_a_worker_that_reads_the_request_and_exits_without_answering(tmp_path):
+    s = _session(tmp_path, '''
+        read()
+        os._exit(0)
+    ''')
+    with pytest.raises(spec.WorkerLost, match="result channel"):
+        s.state()
+    _assert_lost_and_reaped(s)
+
+
+def test_a_worker_killed_from_another_thread_unblocks_the_caller(tmp_path):
+    """The caller is parked in a blocking read when the process dies -- an OOM
+    kill, or another thread disposing the session. It must come back promptly
+    and with the loss, not hang and not read a verdict out of it."""
+    s = _session(tmp_path, '''
+        import time
+        read()
+        time.sleep(60)
+    ''')
+    seen = {}
+
+    def _call():
+        try:
+            s.state()
+        except BaseException as exc:    # noqa: BLE001 - the type is the subject
+            seen["exc"] = exc
+
+    caller = threading.Thread(target=_call, daemon=True)
+    caller.start()
+    time.sleep(0.5)
+    assert caller.is_alive(), "the request was not blocked on the worker"
+    started = time.monotonic()
+    s._proc.kill()
+    caller.join(timeout=10)
+    assert not caller.is_alive(), "the caller stayed blocked after the worker died"
+    assert time.monotonic() - started < 5
+    assert isinstance(seen.get("exc"), spec.WorkerLost), seen
+    _assert_lost_and_reaped(s)
+
+
+def test_a_session_disposed_from_another_thread_unblocks_the_caller(tmp_path):
+    s = _session(tmp_path, '''
+        import time
+        read()
+        time.sleep(60)
+    ''')
+    seen = {}
+
+    def _call():
+        try:
+            s.state()
+        except BaseException as exc:    # noqa: BLE001
+            seen["exc"] = exc
+
+    caller = threading.Thread(target=_call, daemon=True)
+    caller.start()
+    time.sleep(0.5)
     s.kill()
+    caller.join(timeout=10)
+    assert not caller.is_alive()
+    assert isinstance(seen.get("exc"), spec.WorkerLost), seen
+    _assert_lost_and_reaped(s)
+
+
+def test_a_request_on_a_closed_session_is_a_lost_worker(tmp_path):
+    s = _session(tmp_path, '''
+        while True:
+            req = read()
+            if req is None: break
+            write({"ok": True, "request_id": req["request_id"], "state_revision": 1})
+    ''')
+    assert s.state()["ok"]
+    s.close()
+    with pytest.raises(spec.WorkerLost, match="closed"):
+        s.state()
+
+
+def test_closing_a_session_whose_worker_already_died_does_not_raise(tmp_path):
+    s = _session(tmp_path, '''
+        sys.exit(0)
+    ''')
+    s._proc.wait(timeout=10)
+    assert s.close() == 0
 
 
 def test_unavailable_native_is_operational_not_a_verdict(tmp_path):

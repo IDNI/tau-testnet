@@ -26,6 +26,7 @@ from types import MappingProxyType
 
 import tau_allocator
 import tau_journal
+import tau_speculation
 
 logger = logging.getLogger(__name__)
 
@@ -355,7 +356,7 @@ def _worker_state(session, *, strict=False) -> dict:
         return {}
     try:
         state = dict(spec.state() or {})
-    except Exception as exc:
+    except (Exception, tau_speculation.WorkerLost) as exc:
         if strict:
             raise WorkerUnavailable(
                 f"the proposal's evaluator could not report its state: {exc}"

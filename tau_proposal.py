@@ -49,9 +49,13 @@ def boundary(proposal=None, *, label="proposal"):
     becomes a typed operational error -- after the caller's own cleanup has run,
     since a `finally` inside the wrapped block completes before the exception
     reaches here.
+
+    `WorkerLost` takes the same road for the same reason: a worker that died is
+    not a verdict on whichever transaction it was evaluating.
     """
     import tau_guard
-    from errors import ProposalIsolationFailure
+    import tau_speculation
+    from errors import EvaluatorLost, ProposalIsolationFailure
 
     try:
         yield
@@ -60,6 +64,11 @@ def boundary(proposal=None, *, label="proposal"):
             proposal.poison(f"isolation breach: {leak}")
         logger.error("%s: isolation breach, abandoning the proposal: %s", label, leak)
         raise ProposalIsolationFailure(str(leak)) from None
+    except tau_speculation.WorkerLost as lost:
+        if proposal is not None and not getattr(proposal, "poisoned", None):
+            proposal.poison(f"evaluator lost: {lost}")
+        logger.error("%s: evaluator lost, abandoning the proposal: %s", label, lost)
+        raise EvaluatorLost(f"evaluator lost: {lost}") from None
 
 
 class ProposalPoisoned(RuntimeError):
