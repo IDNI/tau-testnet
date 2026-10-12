@@ -1513,6 +1513,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if tau_defs.USER_POLICY_STREAM_INDEX not in clause_output_streams(rule_text):
                     return False
 
+                sig_ok, sig_reason = verify_tx_signature(tx)
+                if not sig_ok:
+                    _did_not_land(
+                        f"o5 clause signature invalid: {sig_reason}",
+                        reason="invalid_signature",
+                    )
+                    return True
+
                 if not isinstance(sender, str):
                     _did_not_land("o5 clause ignored (no sender)")
                     return True
@@ -1921,11 +1929,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                 else:
                     accept = tx_type == TX_TYPE_RULE_OFFER_ACCEPT
+                    sig_ok, sig_reason = (
+                        verify_tx_signature(tx) if accept and approval_slots_on
+                        else (True, "")
+                    )
                     decision = (
-                        parse_rule_offer_accept(tx) if accept
+                        None if not sig_ok
+                        else parse_rule_offer_accept(tx) if accept
                         else parse_rule_offer_reject(tx)
                     )
-                    if decision is None:
+                    if not sig_ok:
+                        tx_receipt["logs"].append(
+                            f"Rule offer accept signature invalid: {sig_reason}"
+                        )
+                        accepted_in_block = False
+                        hard_reject = True
+                        execution_success = False
+                        tx_receipt["reason"] = "invalid_signature"
+                    elif decision is None:
                         tx_receipt["logs"].append("Invalid rule offer decision format")
                         accepted_in_block = False
                     elif not isinstance(sender, str) or sender.lower() != decision.actor_pubkey:
@@ -2004,13 +2025,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
                     accepted_in_block = False
                 else:
-                    # Signatures are otherwise verified at mempool admission ONLY;
-                    # neither chain_state nor this engine re-checks them. For a
-                    # feature whose whole promise is independent co-signatures
-                    # that is not enough: a malicious proposer could mint a vote
-                    # bearing an approver's sender_pubkey and release parked funds
-                    # with no approver involved. Height-gated on activation, so
-                    # historical replay is untouched.
+                    # Apart from the policy-setting paths, signatures are checked
+                    # only at admission; a forged vote would release parked funds
+                    # with no approver involved.
                     sig_ok, sig_reason = verify_tx_signature(tx)
                     if not sig_ok:
                         logger.error(
@@ -2023,6 +2040,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         accepted_in_block = False
                         hard_reject = True
                         execution_success = False
+                        tx_receipt["reason"] = "invalid_signature"
 
                     elif tx_type == TX_TYPE_APPROVAL_REQUEST:
                         request = parse_approval_request(tx)

@@ -7,7 +7,9 @@ The second golden pins a block of genuine txs on an activated chain. Keys,
 signatures, tx ids and the block timestamp are fixed so the hashes are stable.
 """
 import hashlib
+import json
 
+import pytest
 from unittest.mock import patch
 from py_ecc.bls import G2Basic
 
@@ -95,13 +97,13 @@ def accept_tx(tx_id, offer, *, sender, seq, sk):
     return _sign(tx, sk)
 
 
-def _apply(txs, lm, *, replay_mode=False):
+def _apply(txs, lm, *, replay_mode=False, sequences=None):
     parent = TauStateSnapshot(
         state_hash="0" * 64,
         tau_bytes=b"always (o0[t]=1).",
         metadata={
             "balances": {ALICE: 100000, AUTH: 10, BOB: 0, CAROL: 0, MALLORY: 0},
-            "sequence_numbers": {},
+            "sequence_numbers": dict(sequences or {}),
             "last_transfer_ts": {},
             "lifecycle_manager": lm,
             "consensus_rules_state": "always (o6[t]:bv[16] = i10[t]:bv[16]).",
@@ -236,3 +238,138 @@ def test_post_activation_genuine_policy_txs_are_all_accepted():
         "balances": {"alice": 99500, "auth": 10, "bob": 500, "carol": 0, "mallory": 0},
     }
     assert post.approval_requests.terminal_status[request.request_id] == STATUS_FAILED
+
+
+# --- forged policy txs on an activated chain -----------------------------------
+
+def _victim_lm(*, open_request=True):
+    lm = ConsensusLifecycleManager(active_validators=[MALLORY])
+    lm.activate_approval_slots()
+    lm.rule_offers.accepted_clauses[(ALICE, 5)] = tier_body(AUTH)
+    request = ApprovalRequest(sender_pubkey=ALICE, recipient_pubkey=BOB, amount=5000,
+                              sequence_number=0, expire_at_height=500,
+                              approvers={18: AUTH}, custom_inputs={})
+    if open_request:
+        lm.approval_requests.submit_request(request)
+    return lm, request
+
+
+def _reason(result, tx_id):
+    return next(o.reason for o in result.outcomes if o.tx_id == tx_id)
+
+
+def _assert_victim_untouched(result, post, request, tx_id):
+    assert result.invalid_tx_ids == [tx_id]
+    assert _reason(result, tx_id) == "invalid_signature"
+    assert post.rule_offers.accepted_clauses == {(ALICE, 5): tier_body(AUTH)}
+    assert request.request_id in post.approval_requests.open_requests
+    balances = result.next_snapshot.metadata["balances"]
+    assert balances[ALICE] == 100000
+    assert result.next_snapshot.metadata["sequence_numbers"].get(ALICE, 0) == 0
+
+
+@pytest.mark.parametrize("replay_mode", [False, True])
+@pytest.mark.parametrize("rule", [NEUTRAL_RULE, "always ( %s )." % tier_body(BOB)],
+                         ids=["revoke", "replace"])
+def test_forged_routed_o5_clause_is_refused(rule, replay_mode):
+    lm, request = _victim_lm()
+    forged = rule_tx("forged-clause", rule, sender=ALICE, seq=0, sk=SK_STRANGER)
+    result, post = _apply([forged], lm, replay_mode=replay_mode)
+    _assert_victim_untouched(result, post, request, "forged-clause")
+    assert "signature invalid" in _logs(result, "forged-clause")
+
+
+def test_forged_register_is_refused():
+    lm, _ = _victim_lm(open_request=False)
+    forged = rule_tx("forged-register", "always ( %s )." % tier_body(AUTH),
+                     sender=BOB, seq=0, sk=SK_STRANGER)
+    result, post = _apply([forged], lm)
+    assert result.invalid_tx_ids == ["forged-register"]
+    assert _reason(result, "forged-register") == "invalid_signature"
+    assert (BOB, 5) not in post.rule_offers.accepted_clauses
+
+
+def test_genuine_routed_o5_clause_still_registers():
+    lm, _ = _victim_lm(open_request=False)
+    genuine = rule_tx("bob-clause", "always ( %s )." % tier_body(AUTH),
+                      sender=BOB, seq=0, sk=SK_BOB)
+    result, post = _apply([genuine], lm)
+    assert result.accepted_tx_ids == ["bob-clause"]
+    assert post.rule_offers.accepted_clauses[(BOB, 5)] == tier_body(AUTH)
+
+
+def test_forged_revoke_does_not_unlock_a_forged_transfer():
+    lm, request = _victim_lm()
+    revoke = rule_tx("forged-revoke", NEUTRAL_RULE, sender=ALICE, seq=0, sk=SK_STRANGER)
+    steal = transfer_tx("forged-steal", MALLORY, 50000, sender=ALICE, seq=0, sk=SK_STRANGER)
+    result, post = _apply([revoke, steal], lm)
+    assert sorted(result.invalid_tx_ids) == ["forged-revoke", "forged-steal"]
+    assert _reason(result, "forged-revoke") == "invalid_signature"
+    assert post.rule_offers.accepted_clauses == {(ALICE, 5): tier_body(AUTH)}
+    assert request.request_id in post.approval_requests.open_requests
+    balances = result.next_snapshot.metadata["balances"]
+    assert (balances[ALICE], balances[MALLORY]) == (100000, 0)
+
+
+def _offer_to_alice():
+    return RuleOffer(offerer_pubkey=MALLORY, recipient_pubkey=ALICE,
+                     rule_text=ALLOW_OFFER_RULE, expire_at_height=500)
+
+
+def test_forged_accept_is_refused_and_leaves_the_acceptor_untouched():
+    lm, request = _victim_lm()
+    offer = _offer_to_alice()
+    genuine_offer = offer_tx("offer", offer, seq=0, sk=SK_MALLORY)
+    forged = accept_tx("forged-accept", offer, sender=ALICE, seq=0, sk=SK_STRANGER)
+    result, post = _apply([genuine_offer, forged], lm)
+    assert result.invalid_tx_ids == ["forged-accept"]
+    assert _reason(result, "forged-accept") == "invalid_signature"
+    assert offer.offer_id in post.rule_offers.offered
+    assert offer.offer_id not in post.rule_offers.resolved
+    assert post.rule_offers.accepted_clauses == {(ALICE, 5): tier_body(AUTH)}
+    assert request.request_id in post.approval_requests.open_requests
+    assert result.next_snapshot.metadata["sequence_numbers"].get(ALICE, 0) == 0
+
+
+def test_genuine_accept_still_lands():
+    lm, _ = _victim_lm()
+    offer = _offer_to_alice()
+    txs = [offer_tx("offer", offer, seq=0, sk=SK_MALLORY),
+           accept_tx("accept", offer, sender=ALICE, seq=0, sk=SK_ALICE)]
+    result, post = _apply(txs, lm)
+    assert sorted(result.accepted_tx_ids) == ["accept", "offer"]
+    assert offer.offer_id in post.rule_offers.resolved
+    assert post.rule_offers.accepted_clauses[(ALICE, 5)] == "o5[t]:bv[24] = { #x000001 }:bv[24]"
+
+
+def test_a_forged_routed_clause_leaves_no_trace_in_the_state_hash():
+    lm, _ = _victim_lm()
+    empty, _ = _apply([], lm)
+    lm, _ = _victim_lm()
+    forged = rule_tx("forged-clause", NEUTRAL_RULE, sender=ALICE, seq=0, sk=SK_STRANGER)
+    result, _ = _apply([forged], lm)
+    assert result.next_snapshot.state_hash == empty.next_snapshot.state_hash
+
+
+def test_a_forged_accept_leaves_no_trace_in_the_state_hash():
+    offer = _offer_to_alice()
+    genuine_offer = offer_tx("offer", offer, seq=0, sk=SK_MALLORY)
+    lm, _ = _victim_lm()
+    alone, _ = _apply([genuine_offer], lm)
+    lm, _ = _victim_lm()
+    forged = accept_tx("forged-accept", offer, sender=ALICE, seq=0, sk=SK_STRANGER)
+    result, _ = _apply([genuine_offer, forged], lm)
+    assert result.next_snapshot.state_hash == alone.next_snapshot.state_hash
+
+
+def test_admission_refuses_the_same_forgeries():
+    from commands import sendtx
+
+    offer = _offer_to_alice()
+    forgeries = [
+        rule_tx("forged-clause", NEUTRAL_RULE, sender=ALICE, seq=0, sk=SK_STRANGER),
+        accept_tx("forged-accept", offer, sender=ALICE, seq=0, sk=SK_STRANGER),
+    ]
+    for forged in forgeries:
+        response = sendtx.queue_transaction(json.dumps(forged))
+        assert response["code"] == "INVALID_SIGNATURE", response
