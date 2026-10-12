@@ -1429,6 +1429,11 @@ def load_genesis(genesis_json_path: str):
     latest = db.get_canonical_head_block()
     
     if not latest:
+        if db.get_genesis_hash():
+            raise ValueError(
+                "FATAL: Canonical head is missing or unreadable while blocks exist; "
+                "refusing to re-provision genesis. Restore the database or resync the node."
+            )
         print("[INFO][chain_state] No persistent state found, provisioning Genesis Block 0.")
         block_0_payload = genesis_data["block_0"]
         genesis_block = block_module.Block.from_dict(block_0_payload)
@@ -2320,11 +2325,14 @@ def tick_governance(height: int):
         _active_consensus_id = last_update.update_id_hex[:16]
 
 
-def initialize_persistent_state(genesis_json_path: str = "data/genesis.json"):
+def initialize_persistent_state(genesis_json_path: str = "data/genesis.json",
+                                authority: bool = False):
     """
     Initializes persistent chain state from the database and verifies it against the blockchain.
     On first startup (no state and no blocks), initializes genesis state from the genesis artifact.
-    On mismatch between stored state and blockchain, rebuilds and commits state.
+    On mismatch between stored state and blockchain, rebuilds and commits state; under
+    worker-backed `authority` it raises instead, since only the commit protocol writes
+    canonical state there.
     """
     print("[DEBUG][chain_state] > initialize_persistent_state started")
     
@@ -2336,6 +2344,11 @@ def initialize_persistent_state(genesis_json_path: str = "data/genesis.json"):
     latest_num = latest['header']['block_number'] if latest else 0
     
     if _canonical_head_hash != latest_hash:
+        if authority:
+            raise ValueError(
+                f"FATAL: Canonical head '{_canonical_head_hash}' disagrees with its stored "
+                f"block row '{latest_hash}'. Restore the database or resync the node."
+            )
         print(f"[WARN][chain_state] State-DB mismatch! State hash: '{_canonical_head_hash[:16]}...', DB hash: '{latest_hash[:16]}...'.")
         print("[INFO][chain_state] Triggering full state rebuild due to mismatch.")
         rebuild = rebuild_state_from_blockchain(start_block=0)
