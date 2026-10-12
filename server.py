@@ -777,19 +777,21 @@ def _run_server(container: ServiceContainer):
     logger.info("Initializing database at %s", config.STRING_DB_PATH)
     db_module.init_db()
 
-    # Initialize Chain State EARLY (so we can restore it on first boot if needed)
-    logger.info("Initializing and loading chain state...")
-    chain_state_module.initialize_persistent_state()
-
     # Worker-backed authority whenever native Tau is expected -- i.e. unless the
-    # mock configuration was explicitly requested. The authoritative evaluator is
-    # reconstructed from the COMMITTED journal and verified against every
-    # committed anchor before anything is served; on a fresh chain the genesis
-    # rules become the first journal entries. A mismatch refuses to start rather
-    # than falling back to the in-process restore: that fallback is the second
-    # source of evaluator truth this exists to remove.
+    # mock configuration was explicitly requested.
     import tau_authority
     authority_enabled = not tau_module.is_force_test_enabled()
+
+    # Initialize Chain State EARLY (so we can restore it on first boot if needed)
+    logger.info("Initializing and loading chain state...")
+    chain_state_module.initialize_persistent_state(authority=authority_enabled)
+
+    # The authoritative evaluator is reconstructed from the COMMITTED journal
+    # and verified against every committed anchor before anything is served; on
+    # a fresh chain the genesis rules become the first journal entries. A
+    # mismatch refuses to start rather than falling back to the in-process
+    # restore: that fallback is the second source of evaluator truth this
+    # exists to remove.
     if authority_enabled:
         baseline = tau_authority.program_baseline()
         if not baseline:
