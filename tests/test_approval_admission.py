@@ -296,6 +296,25 @@ def test_a_non_policy_rule_may_not_type_a_slot(tip_view):
     assert "reserved consensus input stream" in result.error
 
 
+def test_a_user_rule_may_not_write_a_transfer_verdict_stream(tip_view):
+    """o1 is shared by every sender; a rule that writes it, even behind a sender
+    guard, displaces the builtin and stalls every transfer on the network."""
+    for stream in ("o0", "o1", "o2", "o3", "o4"):
+        rule = ("always ( (i12[t]:bv[384] = { #x" + A + " }:bv[384]) -> "
+                "(" + stream + "[t]:bv[24] = { #x000000 }:bv[24]) ).")
+        result = validate_user_tx_reserved_domains(_user_tx(operations={"0": rule}), tip_view)
+        assert result.is_valid is False, stream
+        assert f"reserved consensus output stream '{stream}'" in result.error
+
+
+def test_a_user_rule_may_write_free_output_streams(tip_view):
+    for stream in ("o10", "o12"):
+        rule = ("always ( (i12[t]:bv[384] = { #x" + A + " }:bv[384]) -> "
+                "(" + stream + "[t]:bv[24] = { #x000000 }:bv[24]) ).")
+        result = validate_user_tx_reserved_domains(_user_tx(operations={"0": rule}), tip_view)
+        assert result.is_valid is True, result.error
+
+
 def test_a_guarded_o5_rule_is_refused_by_routing_not_by_the_slot_screen(tip_view):
     """Ordering matters here and a live node proved it. An o5 rule is ROUTED
     before any user-rule screen runs, because the two are screened by opposite
