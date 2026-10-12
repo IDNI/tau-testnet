@@ -85,8 +85,8 @@ def chain(node_state, monkeypatch):
     _mine()
     assert _submit(sk_b, pk_b, {"1": [[pk_b, "aa" * 48, "4"]]}).get("ok")
     _mine()
-    # A production chain always has validators persisted; without them the genesis
-    # backfill in load_genesis commits at boot, which is not what is under test.
+    # A production chain always has validators persisted; without them boot under
+    # authority refuses, which is not what the other cases are testing.
     with open(os.path.join(REPO, GENESIS), encoding="utf-8") as f:
         validators = json.load(f)["consensus_meta"]["active_validators"]
     db.set_chain_state_value("active_validators", json.dumps(validators))
@@ -216,3 +216,21 @@ def test_a_head_key_behind_the_tip_is_left_to_the_authority(chain, fresh_process
         owner.initialize(cwd=REPO, env=_env())
     assert owner.state == auth.UNAVAILABLE and not owner.active
     assert _committed() == before, "a refused authority changed the committed rows"
+
+
+@pytest.mark.parametrize("damage", ["deleted", "malformed"])
+def test_a_damaged_validator_row_refuses_boot_before_the_authority_starts(
+        chain, fresh_process, damage):
+    if damage == "deleted":
+        _exec("DELETE FROM chain_state WHERE key = 'active_validators'")
+    else:
+        _exec("UPDATE chain_state SET value = ? WHERE key = 'active_validators'",
+              "{not json")
+    before = _committed()
+    with patch.object(auth.AuthoritativeTauOwner, "initialize",
+                      side_effect=AssertionError("authority started after a refused boot")) as init:
+        with pytest.raises(ValueError, match="FATAL: Persisted active validator set"):
+            _boot_state()
+            _boot_authority()
+    assert not init.called
+    assert _committed() == before, "a refused boot changed the committed rows"

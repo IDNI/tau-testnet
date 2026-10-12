@@ -68,3 +68,87 @@ def test_a_mismatch_fails_closed_under_authority(node_state, monkeypatch):
             chain_state.initialize_persistent_state(GENESIS, authority=True)
     assert not rebuild.called and not commit.called
     assert _rows() == before
+
+
+def _exec(sql, *args):
+    with db._db_lock:
+        db._db_conn.execute(sql, args)
+        db._db_conn.commit()
+
+
+def _damage_validator_row(damage):
+    assert json.loads(db.get_chain_state_value("active_validators", ""))
+    if damage == "deleted":
+        _exec("DELETE FROM chain_state WHERE key = 'active_validators'")
+    else:
+        _exec("UPDATE chain_state SET value = ? WHERE key = 'active_validators'", "{not json")
+
+
+def _genesis_validators():
+    with open(GENESIS, encoding="utf-8") as f:
+        return json.load(f)["consensus_meta"]["active_validators"]
+
+
+@pytest.mark.parametrize("damage", ["deleted", "malformed"])
+def test_a_damaged_validator_row_on_a_committed_chain_refuses_under_authority(
+        node_state, monkeypatch, damage):
+    _damage_validator_row(damage)
+    monkeypatch.setattr(db, "latest_block_commit", lambda: {"tip": "ab" * 32})
+    before = _rows()
+    with patch.object(chain_state, "commit_state_to_db") as commit:
+        with pytest.raises(ValueError, match="FATAL: "):
+            chain_state.load_genesis(GENESIS, authority=True)
+    assert not commit.called
+    assert _rows() == before
+
+
+@pytest.mark.parametrize("damage", ["deleted", "malformed"])
+def test_a_damaged_validator_row_without_a_commit_record_is_left_to_the_authority(
+        node_state, damage):
+    _damage_validator_row(damage)
+    assert db.latest_block_commit() is None
+    before = _rows()
+    with patch.object(chain_state, "commit_state_to_db") as commit:
+        chain_state.load_genesis(GENESIS, authority=True)
+    assert not commit.called
+    assert _rows() == before
+    assert not chain_state._lifecycle_manager.active_validators
+
+
+def test_a_genesis_without_validators_has_nothing_to_restore_under_authority(
+        node_state, monkeypatch, tmp_path):
+    with open(GENESIS, encoding="utf-8") as f:
+        genesis = json.load(f)
+    genesis["consensus_meta"]["active_validators"] = []
+    path = tmp_path / "genesis.json"
+    path.write_text(json.dumps(genesis), encoding="utf-8")
+    for name in ("_genesis_accounts_state", "_genesis_active_validators",
+                 "_genesis_vote_quorum", "_genesis_eligibility_mode",
+                 "_genesis_fee_beneficiary", "_genesis_application_rules",
+                 "_genesis_consensus_rules"):
+        monkeypatch.setattr(chain_state, name, getattr(chain_state, name))
+    _damage_validator_row("deleted")
+    monkeypatch.setattr(db, "latest_block_commit", lambda: {"tip": "ab" * 32})
+    before = _rows()
+    chain_state.load_genesis(str(path), authority=True)
+    assert _rows() == before
+
+
+@pytest.mark.parametrize("damage", ["deleted", "malformed"])
+def test_a_validator_backfill_without_authority_keeps_the_persisted_policy_rows(
+        node_state, damage):
+    persisted = {
+        "quorum_policy": "majority",
+        "eligibility_mode": "tau_validator_set",
+        "fee_beneficiary": "ab" * 48,
+    }
+    for key, value in persisted.items():
+        db.set_chain_state_value(key, value)
+    _damage_validator_row(damage)
+    chain_state.load_genesis(GENESIS)
+    validators = _genesis_validators()
+    assert json.loads(db.get_chain_state_value("active_validators", "")) == sorted(validators)
+    assert chain_state._lifecycle_manager.active_validators == set(validators)
+    for key, value in persisted.items():
+        assert db.get_chain_state_value(key, None) == value
+        assert getattr(chain_state._lifecycle_manager, key) == value
