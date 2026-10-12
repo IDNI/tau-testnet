@@ -144,6 +144,7 @@ def test_a_validator_backfill_without_authority_keeps_the_persisted_policy_rows(
     }
     for key, value in persisted.items():
         db.set_chain_state_value(key, value)
+    db.set_chain_state_value("approval_slots_active", "1")
     _damage_validator_row(damage)
     chain_state.load_genesis(GENESIS)
     validators = _genesis_validators()
@@ -152,3 +153,5 @@ def test_a_validator_backfill_without_authority_keeps_the_persisted_policy_rows(
     for key, value in persisted.items():
         assert db.get_chain_state_value(key, None) == value
         assert getattr(chain_state._lifecycle_manager, key) == value
+    assert db.get_chain_state_value("approval_slots_active", None) == "1"
+    assert chain_state._lifecycle_manager.approval_slots_active is True
