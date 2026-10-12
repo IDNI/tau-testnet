@@ -115,7 +115,10 @@ def _streams_referenced(rule_text: str, tokens) -> List[str]:
     return [tok for tok in tokens if re.search(rf"\b{re.escape(tok)}\b", scrubbed)]
 
 
-CONSENSUS_OWNED_OUTPUT_STREAMS = ("o6", "o7", "o9")
+# o0 is the revision ack and o1-o4 the builtin transfer verdicts; a user rule
+# writing one displaces the builtin for every sender. o8 stays open: it is the
+# user custom-fee lane.
+CONSENSUS_OWNED_OUTPUT_STREAMS = ("o0", "o1", "o2", "o3", "o4", "o6", "o7", "o9")
 
 
 def screen_reserved_rule_outputs(rule_text: str) -> Optional[str]:

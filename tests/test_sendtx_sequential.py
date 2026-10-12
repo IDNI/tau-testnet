@@ -98,7 +98,7 @@ def run_test_sequential_ops():
         ) 
     ])
     operations1 = {
-        "0": "o2[t]=i1[t]",
+        "0": "o12[t]=i1[t]",
         "1": [[sender_pub_key, recipient_pub_key, "5"]]
     }
     tx_json1 = _create_signed_tx_json(sender_priv_key, operations1, 0)
@@ -106,7 +106,7 @@ def run_test_sequential_ops():
     print(f"Result1: {result1}")
     assert "SUCCESS" in result1
     assert len(mock_tau_manager.tau_call_history) == 2
-    assert mock_tau_manager.tau_call_history[0] == "o2[t]=i1[t]."
+    assert mock_tau_manager.tau_call_history[0] == "o12[t]=i1[t]."
     # Second call should be F \n <transfer_sbf>
     assert mock_tau_manager.tau_call_history[1].startswith("F\n")
     assert chain_state.get_balance(recipient_pub_key) == 5
@@ -141,7 +141,7 @@ def run_test_sequential_ops():
         tau_defs.TAU_VALUE_ZERO # Op 1 (transfer) fails
     ])
     operations3 = {
-        "0": "o2[t]=i1[t]",
+        "0": "o12[t]=i1[t]",
         "1": [[sender_pub_key, recipient_pub_key, "50"]]
     }
     tx_json3 = _create_signed_tx_json(sender_priv_key, operations3, 1)
