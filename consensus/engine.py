@@ -2309,6 +2309,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["logs"].append(
                                 f"Error: {width_error or conj_error}"
                             )
+                        # Lazy: consensus.admission imports chain_state, which imports this module.
+                        from consensus.admission import screen_reserved_rule_outputs
+                        output_error = (
+                            None if replay_mode
+                            else screen_reserved_rule_outputs(rule_text)
+                        )
+                        if output_error and not hard_reject:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = "reserved_output_stream"
+                            tx_receipt["logs"].append(f"Error: {output_error}")
                         if execution_success and accepted_in_block and not hard_reject:
                           try:
                             # The rule goes through the evaluator SESSION rather
