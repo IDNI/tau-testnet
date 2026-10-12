@@ -52,13 +52,13 @@ python wallet.py send --privkey <private_key> --to <recipient_address> --amount 
 
 ### Rule-Only Transaction
 ```bash
-python wallet.py send --privkey <private_key> --rule "o2[t]=i1[t]"
+python wallet.py send --privkey <private_key> --rule "o12[t]=i1[t]"
 ```
 
 ### Rule + Transfer
 ```bash
 python wallet.py send --privkey <private_key> \
-  --rule "o2[t]=i1[t]" \
+  --rule "o12[t]=i1[t]" \
   --transfer "recipient_address:amount"
 ```
 
@@ -87,7 +87,7 @@ python wallet.py send --privkey <private_key> \
 ### Complex Multi-Operation Transaction
 ```bash
 python wallet.py send --privkey <private_key> \
-  --rule "o2[t]=i1[t]" \
+  --rule "o12[t]=i1[t]" \
   --transfer "recipient_address:5" \
   --operation "13:custom_data" \
   --operation "14:more_data"
@@ -96,7 +96,7 @@ python wallet.py send --privkey <private_key> \
 ### Raw JSON Operations (Advanced)
 ```bash
 python wallet.py send --privkey <private_key> \
-  --operations-json '{"0": "o2[t]=i1[t]", "1": [["sender", "receiver", "10"]], "13": "custom_op"}'
+  --operations-json '{"0": "o12[t]=i1[t]", "1": [["sender", "receiver", "10"]], "13": "custom_op"}'
 ```
 
 ## Command Line Options
@@ -107,7 +107,7 @@ python wallet.py send --privkey <private_key> \
 ### Operation Options (at least one required)
 - `--to`, `-t`: Recipient address for simple transfers
 - `--amount`, `-m`: Amount for simple transfers  
-- `--rule`, `-r`: Rule to add as operation 0 (e.g., 'o2[t]=i1[t]')
+- `--rule`, `-r`: Rule to add as operation 0 (e.g., 'o12[t]=i1[t]')
 - `--transfer`: Transfer in format 'to_address:amount' (can be used multiple times)
 - `--operation`, `-o`: Custom operation in format 'op_number:data' (can be used multiple times)
 - `--operations-json`: Raw JSON operations object (overrides other operation options)
@@ -276,19 +276,19 @@ exists. Read the rule text before accepting it.
 ```bash
 python wallet.py send \
   --privkey "0x1234567890abcdef..." \
-  --rule "o2[t]=i1[t]" \
+  --rule "o12[t]=i1[t]" \
   --transfer "0000000000000000000000000000000011cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09:1"
 ```
 
 This creates a transaction with:
-- Operation "0": The rule "o2[t]=i1[t]"
+- Operation "0": The rule "o12[t]=i1[t]"
 - Operation "1": A transfer of 1 unit to the specified address
 
 ### Example 2: Multiple Operations Transaction
 ```bash
 python wallet.py send \
   --privkey "0x1234567890abcdef..." \
-  --rule "o2[t]=i1[t]" \
+  --rule "o12[t]=i1[t]" \
   --transfer "recipient1:5" \
   --operation "13:custom_asset_data" \
   --operation "14:extra_input"

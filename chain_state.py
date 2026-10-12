@@ -1205,10 +1205,20 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             active_view = engine.derive_active_consensus(parent_snapshot, block_number)
             
             # 3. Verify Block Header
-            # We must not bypass verification during rebuild.
-            # Passing proof_ok bypasses independent cryptography re-checks here because db integrity guarantees it,
-            # but consensus verdicts on Tau rules (o6) will run.
-            if tau_manager.tau_ready.is_set():
+            # proof_ok skips the cryptography re-checks (db integrity covers them); o6/o7 still run.
+            # Under worker-backed authority they run on the advisory evaluator, so a down interpreter is no reason to skip.
+            if _enabled:
+                if block_number == 0:
+                    # Genesis carries no consensus proof; it is anchored by identity.
+                    if block.block_hash != db.get_genesis_hash():
+                        print("[ERROR][chain_state] Block #0 is not the genesis block. Aborting rebuild!")
+                        return RebuildResult(ok=False, stopped_at_block=0,
+                                             reason="block 0 does not match the genesis hash")
+                elif not engine.verify_block_header(active_view, block, {"proof_ok": True}):
+                    print(f"[ERROR][chain_state] Block #{block_number} verification failed. Aborting rebuild!")
+                    return RebuildResult(ok=False, stopped_at_block=block_number,
+                                         reason="header verification failed")
+            elif tau_manager.tau_ready.is_set():
                 if not engine.verify_block_header(active_view, block, {"proof_ok": True}):
                     print(f"[ERROR][chain_state] Block #{block_number} verification failed. Aborting rebuild!")
                     return RebuildResult(ok=False, stopped_at_block=block_number,
@@ -1389,7 +1399,7 @@ def rebuild_state_from_blockchain(start_block=0) -> RebuildResult:
 def _hex_bytes(h: str) -> bytes:
     return bytes.fromhex(h)
 
-def load_genesis(genesis_json_path: str):
+def load_genesis(genesis_json_path: str, authority: bool = False):
     import json
     import os
     import db
@@ -1423,6 +1433,11 @@ def load_genesis(genesis_json_path: str):
     latest = db.get_canonical_head_block()
     
     if not latest:
+        if db.get_genesis_hash():
+            raise ValueError(
+                "FATAL: Canonical head is missing or unreadable while blocks exist; "
+                "refusing to re-provision genesis. Restore the database or resync the node."
+            )
         print("[INFO][chain_state] No persistent state found, provisioning Genesis Block 0.")
         block_0_payload = genesis_data["block_0"]
         genesis_block = block_module.Block.from_dict(block_0_payload)
@@ -1518,29 +1533,20 @@ def load_genesis(genesis_json_path: str):
     if loaded:
         if not _lifecycle_manager.active_validators:
             meta = genesis_data["consensus_meta"]
-            _lifecycle_manager.active_validators = normalize_validator_set(meta.get("active_validators", []))
-            # Genesis may pin the quorum policy network-wide; overrides the local config knob.
-            _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
-            _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
-            _lifecycle_manager.fee_beneficiary = meta.get("mechanism_specific_metadata", {}).get("fee_beneficiary", "")
-            # A fresh chain may ship with co-signature approval slots already
-            # reserved (scripts/gen_genesis.py --approval-slots). One-way, so
-            # this only ever turns it on.
-            if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
-                _lifecycle_manager.activate_approval_slots()
-                # Persist immediately. TipAdmissionView reads this key, not the
-                # manager, so without it admission treats a genesis-activated
-                # chain as INACTIVE until the first block commits -- and rejects
-                # every co-signature policy in the meantime. Found by the
-                # live-node e2e.
-                try:
-                    db.set_chain_state_value("approval_slots_active", "1")
-                except Exception:
-                    logger.warning(
-                        "could not persist approval_slots_active from genesis",
-                        exc_info=True)
-            _lifecycle_manager.recompute_approval_threshold()
-            commit_state_to_db(_canonical_head_hash, latest["header"]["block_number"] if latest else 0)
+            genesis_validators = normalize_validator_set(meta.get("active_validators", []))
+            if authority:
+                # Only the commit protocol writes canonical state here, and it never
+                # persists an empty set: an empty row on a committed chain is damage.
+                if genesis_validators and db.latest_block_commit() is not None:
+                    raise ValueError(
+                        "FATAL: Persisted active validator set is missing or unreadable "
+                        "on a committed chain; refusing to start. "
+                        "Restore the database or resync the node."
+                    )
+            else:
+                _lifecycle_manager.active_validators = genesis_validators
+                _lifecycle_manager.recompute_approval_threshold()
+                commit_state_to_db(_canonical_head_hash, latest["header"]["block_number"] if latest else 0)
         print(f"[INFO][chain_state] State loaded successfully. Last known block hash: '{_canonical_head_hash[:16]}...'")
     else:
         print("[WARN][chain_state] DB has blocks but no canonical state! Rebuilding.")
@@ -2314,15 +2320,18 @@ def tick_governance(height: int):
         _active_consensus_id = last_update.update_id_hex[:16]
 
 
-def initialize_persistent_state(genesis_json_path: str = "data/genesis.json"):
+def initialize_persistent_state(genesis_json_path: str = "data/genesis.json",
+                                authority: bool = False):
     """
     Initializes persistent chain state from the database and verifies it against the blockchain.
     On first startup (no state and no blocks), initializes genesis state from the genesis artifact.
-    On mismatch between stored state and blockchain, rebuilds and commits state.
+    On mismatch between stored state and blockchain, rebuilds and commits state; under
+    worker-backed `authority` it raises instead, since only the commit protocol writes
+    canonical state there.
     """
     print("[DEBUG][chain_state] > initialize_persistent_state started")
     
-    load_genesis(genesis_json_path)
+    load_genesis(genesis_json_path, authority=authority)
 
     print("[DEBUG][chain_state] Verifying consistency between loaded state and blockchain head...")
     latest = db.get_canonical_head_block()
@@ -2330,6 +2339,11 @@ def initialize_persistent_state(genesis_json_path: str = "data/genesis.json"):
     latest_num = latest['header']['block_number'] if latest else 0
     
     if _canonical_head_hash != latest_hash:
+        if authority:
+            raise ValueError(
+                f"FATAL: Canonical head '{_canonical_head_hash}' disagrees with its stored "
+                f"block row '{latest_hash}'. Restore the database or resync the node."
+            )
         print(f"[WARN][chain_state] State-DB mismatch! State hash: '{_canonical_head_hash[:16]}...', DB hash: '{latest_hash[:16]}...'.")
         print("[INFO][chain_state] Triggering full state rebuild due to mismatch.")
         rebuild = rebuild_state_from_blockchain(start_block=0)
@@ -2718,14 +2732,14 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
     # Phase 5: Mempool Restore
     if new_txs:
         db.remove_mempool_by_hashes(list(new_txs))
-        
-    import time, json
-    for tx_id, tx in old_txs.items():
-        if tx_id not in new_txs:
-            try:
-                db.add_mempool_tx(json.dumps(tx, separators=(",", ":")), tx_id, int(time.time() * 1000))
-            except Exception as e:
-                logger.error(f"[chain_state] Failed to restore tx {tx_id} to mempool: {e}")
+
+    orphaned = [tx for tx_id, tx in old_txs.items() if tx_id not in new_txs]
+    if orphaned:
+        try:
+            from commands import sendtx
+            sendtx.readmit_orphaned_transactions(orphaned)
+        except Exception as e:
+            logger.error(f"[chain_state] Failed to restore orphaned txs to mempool: {e}")
 
     return True
 

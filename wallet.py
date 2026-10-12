@@ -296,7 +296,7 @@ def main():
     p_send.add_argument("--amount", "-m", type=int, help="Amount to send (for simple transfers)")
     
     # Multi-operation options
-    p_send.add_argument("--rule", "-r", help="Rule to add as operation 0 (e.g., 'o2[t]=i1[t]')")
+    p_send.add_argument("--rule", "-r", help="Rule to add as operation 0 (e.g., 'o12[t]=i1[t]')")
     p_send.add_argument("--transfer", action="append", help="Transfer in format 'to_address:amount' (can be used multiple times)")
     p_send.add_argument("--operation", "-o", action="append", help="Custom operation in format 'op_number:data' (can be used multiple times)")
     p_send.add_argument("--operations-json", help="Raw JSON operations object (overrides other operation options)")

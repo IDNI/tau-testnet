@@ -115,6 +115,22 @@ def _streams_referenced(rule_text: str, tokens) -> List[str]:
     return [tok for tok in tokens if re.search(rf"\b{re.escape(tok)}\b", scrubbed)]
 
 
+# o0 is the revision ack and o1-o4 the builtin transfer verdicts; a user rule
+# writing one displaces the builtin for every sender. o8 stays open: it is the
+# user custom-fee lane.
+CONSENSUS_OWNED_OUTPUT_STREAMS = ("o0", "o1", "o2", "o3", "o4", "o6", "o7", "o9")
+
+
+def screen_reserved_rule_outputs(rule_text: str) -> Optional[str]:
+    """Error text when a user_tx rule writes a consensus-owned output stream."""
+    forbidden_out = _streams_referenced(rule_text, CONSENSUS_OWNED_OUTPUT_STREAMS)
+    if forbidden_out:
+        return (
+            f"user_tx rule text references reserved consensus output stream '{forbidden_out[0]}'."
+        )
+    return None
+
+
 class AdmissionResult:
     def __init__(self, is_valid: bool, error: Optional[str] = None, data: Optional[Dict] = None,
                  code: Optional[str] = None, details: Optional[Dict] = None):
@@ -272,11 +288,9 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         if routing is not None:
             return routing
 
-        forbidden_out = _streams_referenced(rule_text, ("o6", "o7", "o9"))
-        if forbidden_out:
-            return format_error(
-                f"user_tx rule text references reserved consensus output stream '{forbidden_out[0]}'."
-            )
+        reserved_error = screen_reserved_rule_outputs(rule_text)
+        if reserved_error:
+            return format_error(reserved_error)
         # i2 (balance) is now fed from the parent-block snapshot at apply, frozen
         # for the whole block, so proposer and verifier agree and a POLICY rule
         # reading it is deterministic (issue #20). What remains is
@@ -649,7 +663,9 @@ def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView)
 
     return success({"update_id": update_id.hex()})
 
-def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+def stage_and_validate_consensus_revisions(
+    tx: Dict, tip_view: TipAdmissionView, *, compile_rules: bool = True
+) -> AdmissionResult:
     """
     Structural and isolated-compile checks for a consensus_rule_update payload.
 
@@ -670,7 +686,8 @@ def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView)
       2. warn-only shadowing check on reserved consensus streams,
       3. HARD reject of revisions reading apply-time-mocked inputs (i2/i3/i4),
       4. per-revision preprocessing (syntax shape, normalization),
-      5. isolated staging compile against current consensus rules.
+      5. isolated staging compile against current consensus rules, skipped when
+         `compile_rules` is False.
     """
     revisions = tx["rule_revisions"]
 
@@ -723,7 +740,7 @@ def stage_and_validate_consensus_revisions(tx: Dict, tip_view: TipAdmissionView)
     # without native bindings): admission stays available and the
     # activation-height compile in apply_block remains the correctness backstop.
     import tau_manager
-    if tau_manager.tau_ready.is_set():
+    if compile_rules and tau_manager.tau_ready.is_set():
         timeout = tau_native.admission_compile_timeout()
         try:
             err = tau_native.compile_revisions_isolated_subprocess(
@@ -900,7 +917,7 @@ def _screen_clause_domains(body: str) -> Optional[str]:
     consensus-owned verdict/fee streams, must not read an input the apply path
     mocks, and must not type a reserved input stream.
     """
-    writes = _streams_referenced(body, ("o6", "o7", "o9"))
+    writes = _streams_referenced(body, CONSENSUS_OWNED_OUTPUT_STREAMS)
     if writes:
         return (
             "Shared rules may not write consensus-owned streams: "
@@ -1315,10 +1332,15 @@ def validate_expire_at_height(payload: Dict, tip_view: TipAdmissionView) -> Opti
     return None
 
 
-def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+def validate_mempool_admission(
+    payload: Dict, tip_view: TipAdmissionView, *, compile_rules: bool = True
+) -> AdmissionResult:
     """
     Primary Orchestrator Endpoint for Network Admission logic.
     Delegates dynamic logic independently based cleanly on `tx_type` exclusively.
+
+    `compile_rules=False` skips the one subprocess compile this path can spawn;
+    every other check still runs.
     """
     tx_type = payload.get("tx_type", "user_tx")
     
@@ -1337,7 +1359,9 @@ def validate_mempool_admission(payload: Dict, tip_view: TipAdmissionView) -> Adm
          if not phase_1_eval.is_valid:
               return phase_1_eval
               
-         phase_2_eval = stage_and_validate_consensus_revisions(payload, tip_view)
+         phase_2_eval = stage_and_validate_consensus_revisions(
+             payload, tip_view, compile_rules=compile_rules
+         )
          if not phase_2_eval.is_valid:
               return phase_2_eval
               

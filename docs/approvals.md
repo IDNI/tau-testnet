@@ -349,9 +349,13 @@ historical replay is untouched:
 - post-activation `user_tx` routed into the `o5` registry;
 - post-activation `rule_offer_accept`.
 
-A failure sets `hard_reject`: the transaction lands in `rejected_transactions`,
-its effects are discarded, and the **block stays valid**. Every node reaches that
-verdict from the block bytes alone.
+A failure sets `hard_reject`: the transaction lands in `rejected_transactions`
+with the receipt reason `invalid_signature`, its effects are discarded, and the
+**block stays valid**. Every node reaches that verdict from the block bytes alone.
+
+Ordinary transfers are still verified at admission only. A malicious proposer can
+forge any transfer a victim's policy allows with no votes in: the policy bounds
+what a forgery can move; it does not stop forgery.
 
 ## Not in this release
 

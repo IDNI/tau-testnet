@@ -25,7 +25,11 @@ import tau_commit as tc
 import tau_journal as tj
 from commands import createblock, sendtx
 from commands.sendtx import _get_signing_message_bytes
+import tau_advisory
+import tau_manager
 from consensus.engine import TauConsensusEngine
+
+REAL_VERIFY = TauConsensusEngine.verify_block_header
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -305,3 +309,99 @@ def test_the_flag_is_read_exactly(value, mode):
 def test_an_unknown_flag_value_is_refused(value):
     with pytest.raises(ValueError):
         auth.rebuild_mode_from_env(value)
+
+
+# --- header verification while the in-process interpreter is down ---------------
+
+@pytest.fixture
+def interpreter_down():
+    """Authority starts before the interpreter does: `tau_ready` is unset, and
+    the real header check -- not the module's blanket pass -- runs."""
+    was_ready = tau_manager.tau_ready.is_set()
+    tau_manager.tau_ready.clear()
+    try:
+        yield
+    finally:
+        if was_ready:
+            tau_manager.tau_ready.set()
+        tau_advisory.evaluator().dispose()
+
+
+def _migrate_verifying(capsys):
+    """Migrate with the real verifier; returns (height, verdict) per verified
+    block, the advisory answers, and the number of 'skipping' warnings."""
+    db.reset_committed_journal()
+    verified, answers = [], []
+
+    def spy(self, active_view, block, *a, **k):
+        verdict = REAL_VERIFY(self, active_view, block, *a, **k)
+        verified.append((block.header.block_number, verdict))
+        return verdict
+
+    real_eval = tau_advisory.AdvisoryEvaluator.evaluate_consensus
+
+    def eval_spy(self, *a, **k):
+        answer = real_eval(self, *a, **k)
+        answers.append(answer)
+        return answer
+
+    with patch.object(TauConsensusEngine, "verify_block_header", spy), \
+         patch.object(tau_advisory.AdvisoryEvaluator, "evaluate_consensus", eval_spy):
+        owner, _ = _start(auth.REBUILD_MISSING)
+    owner.dispose()
+    return verified, answers, capsys.readouterr().out.count("skipping header verification")
+
+
+def test_migration_verifies_every_block_while_the_interpreter_is_down(
+        chain, interpreter_down, capsys):
+    verified, answers, skipped = _migrate_verifying(capsys)
+    assert verified == [(1, True), (2, True)], "genesis is anchored by identity, the rest verified"
+    assert len(answers) == 2 and all(a and a.get(6) == "1" for a in answers), (
+        "verification did not come from the advisory evaluator"
+    )
+    assert skipped == 0
+
+
+def test_migration_refuses_a_block_the_consensus_rules_reject(
+        chain, interpreter_down, monkeypatch):
+    """Block 1 was mined by a proposer the genesis validator set does not name:
+    hash-consistent, so only header verification can refuse it."""
+    monkeypatch.setattr(chain_state, "_genesis_active_validators", ["cd" * 48])
+    db.reset_committed_journal()
+    owner = _owner()
+    auth.reset(owner)
+    with patch.object(TauConsensusEngine, "verify_block_header", REAL_VERIFY):
+        with pytest.raises(auth.AuthorityMismatch, match="block 1.*header verification"):
+            owner.initialize(cwd=REPO, env=_env(), rebuild=auth.REBUILD_MISSING)
+    assert owner.state == auth.UNAVAILABLE and not owner.active
+
+
+def test_migration_refuses_at_once_when_nothing_can_verify(chain, interpreter_down):
+    db.reset_committed_journal()
+    owner = _owner()
+    auth.reset(owner)
+    started = time.monotonic()
+    with patch.object(TauConsensusEngine, "verify_block_header", REAL_VERIFY), \
+         patch.object(tau_advisory.AdvisoryEvaluator, "evaluate_consensus",
+                      lambda *a, **k: None):
+        with pytest.raises(auth.AuthorityMismatch, match="header verification"):
+            owner.initialize(cwd=REPO, env=_env(), rebuild=auth.REBUILD_MISSING)
+    assert time.monotonic() - started < 30, "migration waited for an interpreter"
+    assert not owner.active
+
+
+def test_migration_refuses_a_block_zero_that_is_not_the_genesis(chain):
+    db.reset_committed_journal()
+    owner = _owner()
+    auth.reset(owner)
+    real_from_dict = chain_state.Block.from_dict
+
+    def impostor(data, *a, **k):
+        block = real_from_dict(data, *a, **k)
+        if block.header.block_number == 0:
+            block.block_hash = "ee" * 32
+        return block
+
+    with patch.object(chain_state.Block, "from_dict", staticmethod(impostor)):
+        with pytest.raises(auth.AuthorityMismatch, match="block 0.*genesis"):
+            owner.initialize(cwd=REPO, env=_env(), rebuild=auth.REBUILD_MISSING)

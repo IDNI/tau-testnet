@@ -46,6 +46,14 @@ def _native_available():
 pytestmark = pytest.mark.skipif(not _native_available(),
                                 reason="native tau module not built")
 
+
+@pytest.fixture(autouse=True)
+def _signatures_not_under_test():
+    # These tests exercise evaluator and lifecycle mechanics, not signatures.
+    with patch("consensus.engine.verify_tx_signature", return_value=(True, "")):
+        yield
+
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 A_KEY = "a1" * 48
 B_KEY = "b2" * 48

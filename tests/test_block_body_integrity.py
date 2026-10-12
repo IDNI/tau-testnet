@@ -573,6 +573,11 @@ class TestMinedBlocksReverify(ChainTestCase):
         super().setUp()
         self.original_miner_privkey = config.MINER_PRIVKEY
         config.MINER_PRIVKEY = "11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09"
+        # Whatever validator the genesis in use names; header proofs are patched.
+        validators = sorted(chain_state._lifecycle_manager.active_validators)
+        self.original_miner_pubkey = config.MINER_PUBKEY
+        if validators:
+            config.MINER_PUBKEY = validators[0]
         self.mock_tau = MagicMock()
         self.mock_tau.tau_ready.is_set.return_value = True
         self.mock_tau.communicate_with_tau.return_value = "100"
@@ -590,6 +595,7 @@ class TestMinedBlocksReverify(ChainTestCase):
         for p in self.patches:
             p.stop()
         config.MINER_PRIVKEY = self.original_miner_privkey
+        config.MINER_PUBKEY = self.original_miner_pubkey
         super().tearDown()
 
     def test_mined_block_reverifies_from_its_stored_row(self):

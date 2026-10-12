@@ -30,7 +30,7 @@ def test_sendtx_ignores_force_test_outside_test_env(monkeypatch):
             "sequence_number": 0,
             "expiration_time": int(time.time()) + 1000,
             "expire_at_height": 5000,
-            "operations": {"0": "always o1[t] := i9[t]."},
+            "operations": {"0": "always o12[t] := i9[t]."},
             "fee_limit": "0",
             "signature": "00" * 48,
         }
