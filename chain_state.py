@@ -1204,10 +1204,20 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             active_view = engine.derive_active_consensus(parent_snapshot, block_number)
             
             # 3. Verify Block Header
-            # We must not bypass verification during rebuild.
-            # Passing proof_ok bypasses independent cryptography re-checks here because db integrity guarantees it,
-            # but consensus verdicts on Tau rules (o6) will run.
-            if tau_manager.tau_ready.is_set():
+            # proof_ok skips the cryptography re-checks (db integrity covers them); o6/o7 still run.
+            # Under worker-backed authority they run on the advisory evaluator, so a down interpreter is no reason to skip.
+            if _enabled:
+                if block_number == 0:
+                    # Genesis carries no consensus proof; it is anchored by identity.
+                    if block.block_hash != db.get_genesis_hash():
+                        print("[ERROR][chain_state] Block #0 is not the genesis block. Aborting rebuild!")
+                        return RebuildResult(ok=False, stopped_at_block=0,
+                                             reason="block 0 does not match the genesis hash")
+                elif not engine.verify_block_header(active_view, block, {"proof_ok": True}):
+                    print(f"[ERROR][chain_state] Block #{block_number} verification failed. Aborting rebuild!")
+                    return RebuildResult(ok=False, stopped_at_block=block_number,
+                                         reason="header verification failed")
+            elif tau_manager.tau_ready.is_set():
                 if not engine.verify_block_header(active_view, block, {"proof_ok": True}):
                     print(f"[ERROR][chain_state] Block #{block_number} verification failed. Aborting rebuild!")
                     return RebuildResult(ok=False, stopped_at_block=block_number,

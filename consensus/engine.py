@@ -288,9 +288,14 @@ def _advisory_is_available() -> bool:
 
     Mock mode has no interpreter to isolate from, and a node with no native
     interface has nothing to contaminate. Both keep the in-process path.
+    Worker-backed authority needs no in-process interpreter at all, so it can
+    verify before that interpreter is up.
     """
     if getattr(tau_manager, "tau_test_mode", False):
         return False
+    import tau_authority
+    if tau_authority.owner().enabled:
+        return True
     return getattr(tau_manager, "tau_direct_interface", None) is not None
 
 
@@ -560,7 +565,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
                     return False
 
-        if not tau_manager.tau_ready.is_set():
+        if not _advisory_is_available() and not tau_manager.tau_ready.is_set():
             logger.error("Consensus: Tau not ready for block verification.")
             return False
             
@@ -610,6 +615,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         _consensus_rules_for(active_view), tau_inputs, (6, 7)
                     )
                 if outputs is None:
+                    if not tau_manager.tau_ready.is_set():
+                        logger.error("Consensus: advisory evaluator gave no answer and the in-process interpreter is not ready.")
+                        return False
                     with tau_manager.tau_comm_lock:
                         outputs = tau_manager.communicate_with_tau_multi(
                             input_stream_values=tau_inputs,
@@ -634,6 +642,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
                     output = None if answered is None else answered.get(6)
                 if output is None:
+                    if not tau_manager.tau_ready.is_set():
+                        logger.error("Consensus: advisory evaluator gave no answer and the in-process interpreter is not ready.")
+                        return False
                     output = tau_manager.communicate_with_tau(
                         target_output_stream_index=6,
                         input_stream_values=tau_inputs,
