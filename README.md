@@ -110,6 +110,7 @@ tau-testnet node run --test
 ```bash
 # clone tau-lang as a SIBLING of this repo (../tau-lang is auto-discovered)
 git clone https://github.com/IDNI/tau-lang.git ../tau-lang
+git -C ../tau-lang checkout 3badb21a7c3ba258a43593dcf71c56d6966d29ba   # pinned; matches Dockerfile.standalone
 ( cd ../tau-lang && ./dev dep-cvc5 && ./dev dep-boost \
   && ./dev build Release -DTAU_BUILD_BINDING_PYTHON=ON )   # → build-Release/bindings/python/nanobind/tau*.so
 
@@ -166,6 +167,7 @@ pip install -e .
 
 # 2. build the tau-lang native engine once (prerequisites: see "Run from source")
 git clone https://github.com/IDNI/tau-lang.git ../tau-lang
+git -C ../tau-lang checkout 3badb21a7c3ba258a43593dcf71c56d6966d29ba   # pinned; matches Dockerfile.standalone
 ( cd ../tau-lang && ./dev dep-cvc5 && ./dev dep-boost \
   && ./dev build Release -DTAU_BUILD_BINDING_PYTHON=ON )
 # only if auto-discovery of ../tau-lang fails:
@@ -231,6 +233,8 @@ docker build --pull -f Dockerfile.standalone \
   --build-arg TAU_LANG_REF="$TAU_LANG_REF" --build-arg TAU_BUILD_JOBS=4 \
   -t tau-testnet-standalone:latest .
 ```
+
+The image is pinned to the SHA in `Dockerfile.standalone` (`TAU_LANG_REF`); overriding it (e.g. to tau-lang main as above) builds an untested engine, and every node on a network must run the same engine.
 
 `TAU_LANG_REF` accepts a branch, tag, or commit SHA. Keep `TAU_BUILD_JOBS` ≥ 1.
 

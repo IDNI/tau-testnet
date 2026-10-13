@@ -4,7 +4,7 @@ FROM ubuntu:24.04 AS tau-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TAU_LANG_REPO=https://github.com/IDNI/tau-lang.git
-ARG TAU_LANG_REF=main
+ARG TAU_LANG_REF=3badb21a7c3ba258a43593dcf71c56d6966d29ba
 ARG TAU_BUILD_JOBS=4
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
