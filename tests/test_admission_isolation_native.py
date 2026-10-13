@@ -454,3 +454,41 @@ def test_a_refused_step_is_never_read_as_no_outputs(authority):
         "a transfer whose step the engine refused was included as if its policy "
         "had allowed it"
     )
+
+
+# --- the approval preview reads the authority's policy ---------------------------
+
+def _tiered_policy(approver):
+    """Anything over 1000 needs slot i18 to carry `approver`. Unguarded: the
+    registry scopes a routed clause to its author."""
+    return ("always ( (i1[t]:bv[24] > { #x0003e8 }:bv[24] && !(i18[t]:bv[384] = { #x%s }:bv[384]))"
+            " ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
+            % approver)
+
+
+def test_the_approval_preview_sees_the_authoritys_policy(authority):
+    """The in-process interpreter holds consensus rules only, so a preview that
+    stepped it would read no o5 policy and call every transfer approval-free."""
+    from commands import getapprovalpreview
+
+    sk, pk = _sender("preview_owner")
+    approver = "ab" * 48
+    db.set_chain_state_value("approval_slots_active", "1")
+    assert _submit(sk, pk, {"0": _tiered_policy(approver)}).get("ok")
+    _mine()
+    # the mined block rewrites the flag from the in-memory lifecycle
+    db.set_chain_state_value("approval_slots_active", "1")
+
+    def preview(amount):
+        draft = {"sender_pubkey": pk, "recipient_pubkey": _recipient("p_to"),
+                 "amount": amount, "approvers": {"18": approver}}
+        out = json.loads(getapprovalpreview.execute(
+            "getapprovalpreview " + json.dumps(draft), None))
+        assert out.get("status") == "ok", out
+        return out["data"]
+
+    with patch.object(tau_manager, "communicate_with_tau_multi",
+                      side_effect=AssertionError("in-process interpreter stepped")):
+        small, large = preview(500), preview(5000)
+    assert small["needs_no_approval"] is True, small
+    assert large["required_slots"] == [18] and large["satisfiable"] is True, large

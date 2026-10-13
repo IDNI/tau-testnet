@@ -15,6 +15,7 @@ import itertools
 import json
 
 import api_response
+import tau_admission
 import tau_defs
 import tau_manager
 from consensus.approvals import (
@@ -27,15 +28,47 @@ from consensus.approvals import (
 _CMD = "getapprovalpreview"
 
 
-def _step(inputs):
-    outputs = tau_manager.communicate_with_tau_multi(
-        input_stream_values=inputs, apply_rules_update=False,
-    )
+def _o5_allows(outputs):
     o5 = outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
     # Same semantics as the transfer path: absent allows, BLOCK blocks,
     # unparseable fails closed.
     return not (o5 is not None
                 and tau_manager.parse_tau_output(o5) == tau_defs.USER_POLICY_BLOCK_VALUE)
+
+
+def _step(inputs):
+    # The in-process interpreter holds no user rules under worker-backed authority.
+    if tau_admission.enabled():
+        raise RuntimeError("the in-process interpreter cannot answer under authority")
+    return _o5_allows(tau_manager.communicate_with_tau_multi(
+        input_stream_values=inputs, apply_rules_update=False,
+    ))
+
+
+def _enumerate(slots, base, candidates, step):
+    """Probe subsets by increasing size until one allows; `step` -> allows."""
+    results = []
+    for size in range(0, len(slots) + 1):
+        for subset in itertools.combinations(slots, size):
+            inputs = dict(base)
+            for idx in tau_defs.approval_slot_indices():
+                inputs[idx] = "0"
+            for idx in subset:
+                # WRAPPED, exactly as i3/i4/i12 above. tau_shrink interns the
+                # bv[384] pubkey literals in a clause down to bv[8] ids and
+                # recognises a value to intern by this shape; bare hex skips
+                # interning and overflows the interned slot stream
+                # ("bit-vector size 8 too small to hold value ...").
+                inputs[idx] = (
+                    "{ #x" + candidates[idx] + " }:bv[%d]"
+                    % tau_defs.APPROVAL_SLOT_BV_WIDTH
+                )
+            results.append((list(subset), step(inputs)))
+        if any(allows for _s, allows in results):
+            # Smallest cardinality that works; ties break on lowest slot
+            # index because `combinations` yields them in that order.
+            break
+    return results
 
 
 def execute(raw_command: str, container):
@@ -110,36 +143,35 @@ def execute(raw_command: str, container):
     base[5] = str(int(_time.time()))
 
     slots = sorted(candidates)
-    results = []
-    # Hold the engine lock for the WHOLE probe so no other evaluation
-    # interleaves and re-types a stream between subsets.
-    with tau_manager.tau_comm_lock:
-        for size in range(0, len(slots) + 1):
-            for subset in itertools.combinations(slots, size):
-                inputs = dict(base)
-                for idx in tau_defs.approval_slot_indices():
-                    inputs[idx] = "0"
-                for idx in subset:
-                    # WRAPPED, exactly as i3/i4/i12 above. tau_shrink interns the
-                    # bv[384] pubkey literals in a clause down to bv[8] ids and
-                    # recognises a value to intern by this shape; bare hex skips
-                    # interning and overflows the interned slot stream
-                    # ("bit-vector size 8 too small to hold value ...").
-                    inputs[idx] = (
-                        "{ #x" + candidates[idx] + " }:bv[%d]"
-                        % tau_defs.APPROVAL_SLOT_BV_WIDTH
-                    )
-                try:
-                    allows = _step(inputs)
-                except Exception as exc:
-                    return api_response.error_response(
-                        _CMD, f"Evaluation failed: {exc}", "TAU_ERROR"
-                    )
-                results.append((list(subset), allows))
-            if any(allows for _s, allows in results):
-                # Smallest cardinality that works; ties break on lowest slot
-                # index because `combinations` yields them in that order.
-                break
+    if tau_admission.enabled():
+        # The in-process interpreter holds consensus rules only; the user's o5
+        # policy lives in the authority, so the probe runs in a context of its own.
+        try:
+            with tau_admission.open_context(label="approval_preview") as ctx:
+                results = _enumerate(
+                    slots, base, candidates,
+                    lambda inputs: _o5_allows(ctx.step(inputs)),
+                )
+        except (tau_admission.AdmissionUnavailable, tau_admission.StepRefused) as exc:
+            return api_response.success_response(_CMD, {
+                "advisory": True,
+                "available": False,
+                "reason": f"the approval preview could not be evaluated: {exc}",
+            })
+        except Exception as exc:
+            return api_response.error_response(
+                _CMD, f"Evaluation failed: {exc}", "TAU_ERROR"
+            )
+    else:
+        # Hold the engine lock for the WHOLE probe so no other evaluation
+        # interleaves and re-types a stream between subsets.
+        try:
+            with tau_manager.tau_comm_lock:
+                results = _enumerate(slots, base, candidates, _step)
+        except Exception as exc:
+            return api_response.error_response(
+                _CMD, f"Evaluation failed: {exc}", "TAU_ERROR"
+            )
 
     minimal = next((s for s, allows in results if allows), None)
     all_slots_allows = any(allows for s, allows in results if len(s) == len(slots))
