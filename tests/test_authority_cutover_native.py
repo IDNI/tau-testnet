@@ -351,9 +351,8 @@ def test_reprocessing_the_same_block_applies_nothing_twice(authority):
 # --- no authoritative in-process fallback -------------------------------------
 
 def test_block_production_never_steps_the_in_process_interpreter(authority):
-    """Admission may still read the in-process interpreter as an advisory
-    mirror. Block evaluation may not touch it at all, except to keep that mirror
-    current AFTER the block is committed."""
+    """The in-process interpreter only holds the consensus unit. Neither block
+    evaluation nor the post-commit sync may step it when no activation happened."""
     import tau_manager
 
     sk, pk = _sender("no_fallback")
@@ -375,13 +374,7 @@ def test_block_production_never_steps_the_in_process_interpreter(authority):
          patch.object(tau_manager, "communicate_with_tau_multi", _multi):
         _mine()
 
-    offending = [c for c in calls if c[1] != "advisory_mirror"]
-    assert not offending, (
-        f"block production stepped the in-process interpreter: {offending}"
-    )
-    assert all(c[2] is False for c in calls), (
-        f"the advisory mirror was asked to accumulate canonical state: {calls}"
-    )
+    assert not calls, f"block production stepped the in-process interpreter: {calls}"
 
 
 # --- process death at every point around the irreversible step ----------------
@@ -429,7 +422,7 @@ def test_the_outcome_of_a_crash_is_decided_by_durable_state_alone(
         "before the commit transaction": ("db.commit_prepared_block", None),
         "inside the commit transaction": ("db._write_canonical_state_rows", None),
         "right after the commit transaction": ("chain_state._swap_in_memory_state", None),
-        "after promotion, before returning": ("chain_state._sync_advisory_mirror", None),
+        "after promotion, before returning": ("chain_state._sync_inprocess_consensus", None),
     }
     target, _ = targets[point]
     with patch.object(tc.PreparedBlockCommit, "freeze", classmethod(_capture)), \

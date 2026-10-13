@@ -210,7 +210,7 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
 
     classified = {
         # advisory: the mirror, never consulted by consensus or admission
-        ("chain_state.py", "_sync_advisory_mirror"),
+        ("chain_state.py", "_sync_inprocess_consensus"),
         ("chain_state.py", "replay_tau_restore_plan"),
         ("commands/getapprovalpreview.py", "_step"),
         ("consensus/engine.py", "query_eligibility"),

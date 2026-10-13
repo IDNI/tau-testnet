@@ -596,21 +596,23 @@ def _swap_in_memory_state(next_snapshot, block) -> None:
         _canonical_head_hash = block.block_hash
 
 
-def _sync_advisory_mirror(prepared) -> None:
-    """Keep the in-process interpreter current as an ADVISORY mirror.
+def _sync_inprocess_consensus(prepared) -> None:
+    """Keep the in-process interpreter's consensus unit current.
 
-    With worker-backed authority it is no longer what blocks are evaluated
-    against, but admission estimates and previews still read it, and without
-    this they would answer against whatever state it had when the node started.
-    It receives the block's revisions in order and nothing else; it is never
-    consulted by consensus, so a failure here degrades advisory answers and
-    nothing more.
+    With worker-backed authority the in-process interpreter only answers the
+    header and eligibility fallbacks, which need the consensus rules and nothing
+    else, so no revision is fed to it; it is reloaded when the active consensus
+    text changed. Without authority the block's revisions are fed in order.
     """
     import tau_journal as _tau_journal
 
     if getattr(tau_manager, "tau_test_mode", False):
         return
     if getattr(tau_manager, "tau_direct_interface", None) is None:
+        return
+    if tau_authority.owner().enabled:
+        if _inprocess_consensus_stale():
+            reload_consensus_interpreter_from_state(source_prefix="advisory_sync")
         return
     for entry in prepared.journal_delta:
         if entry.kind != _tau_journal.REVISION or not entry.rule_text:
@@ -992,7 +994,7 @@ def _process_new_block_locked(block: Block) -> bool:
                         )
                         _owner.mark_unavailable(f"promotion failed: {exc}")
                         _dispose_quietly(_proposal)
-                    _sync_advisory_mirror(_prepared)
+                    _sync_inprocess_consensus(_prepared)
                     # A context pre-built for admission describes the state
                     # before this block. Best effort; never raises.
                     tau_admission.committed()
@@ -1116,10 +1118,13 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                 # re-seeded to their genesis values above, so use_persisted_state
                 # here yields exactly the genesis baseline (block-derived rule
                 # updates are re-applied by the per-block replay that follows).
-                replay_tau_restore_plan(
-                    get_tau_restore_plan(use_persisted_state=True),
-                    source_prefix="rebuild",
-                )
+                if tau_authority.owner().enabled:
+                    replay_advisory_restore_plan(source_prefix="rebuild")
+                else:
+                    replay_tau_restore_plan(
+                        get_tau_restore_plan(use_persisted_state=True),
+                        source_prefix="rebuild",
+                    )
                 print(f"[INFO][chain_state] Reset live Tau interpreter to {config.TAU_PROGRAM_FILE} + genesis consensus/builtin rules for replay.")
             except Exception:
                 logger.exception("Failed to reset Tau interpreter before rebuild; replay activation determinism is not guaranteed.")
@@ -1321,7 +1326,6 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                     )
                     _owner.mark_unavailable(f"superseded by rebuilt block #{block_number}")
                     _owner.promote(_proposal, _prepared)
-                    _sync_advisory_mirror(_prepared)
                 except Exception as e:
                     _dispose_quietly(_proposal)
                     print(f"[ERROR][chain_state] Could not commit rebuilt block #{block_number}: {e}")
@@ -1344,7 +1348,10 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                     
                 _consensus_rules_state = next_snapshot.metadata["consensus_rules_state"]
                 _tau_engine_state_hash = next_snapshot.state_hash
-            
+
+            if _enabled:
+                _sync_inprocess_consensus(_prepared)
+
             total_transactions_processed += len(apply_result.accepted_tx_ids)
             
             # Log results
@@ -1854,6 +1861,38 @@ def replay_tau_restore_plan(plan: List[Dict[str, object]], *, source_prefix: str
     return persist_needed
 
 
+# Consensus unit text the in-process interpreter currently holds under
+# worker-backed authority; None until something was loaded.
+_inprocess_consensus_text: Optional[str] = None
+
+
+def advisory_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, object]]:
+    """The restore plan reduced to the consensus unit.
+
+    The in-process interpreter is only a fallback for o6/o7 under worker-backed
+    authority; user rules and composites are the authority's business.
+    """
+    return [e for e in get_tau_restore_plan(use_persisted_state=use_persisted_state)
+            if e.get("label") == "consensus_rules"]
+
+
+def replay_advisory_restore_plan(plan: Optional[List[Dict[str, object]]] = None, *,
+                                 source_prefix: str = "restore") -> bool:
+    """Replay the consensus-only plan and record the text now loaded."""
+    global _inprocess_consensus_text
+    if plan is None:
+        plan = advisory_restore_plan()
+    persist_needed = replay_tau_restore_plan(plan, source_prefix=source_prefix)
+    _inprocess_consensus_text = str(plan[0].get("text") or "") if plan else ""
+    return persist_needed
+
+
+def _inprocess_consensus_stale() -> bool:
+    with _rules_lock:
+        wanted = _preprocess_tau_spec_text(_consensus_rules_state or "")
+    return wanted != _inprocess_consensus_text
+
+
 def reload_consensus_interpreter_from_state(*, source_prefix: str = "activation") -> None:
     """Rebuild the live Tau interpreter from the CURRENT persisted rule state
     (single active consensus revision + application units + builtin rules),
@@ -1871,14 +1910,20 @@ def reload_consensus_interpreter_from_state(*, source_prefix: str = "activation"
     plan acquires `_rules_lock` itself)."""
     if not tau_manager.tau_ready.is_set():
         return
+    authority_enabled = tau_authority.owner().enabled
+    if authority_enabled and not _inprocess_consensus_stale():
+        return
     try:
         with open(config.TAU_PROGRAM_FILE, "r", encoding="utf-8", errors="replace") as f:
             genesis_spec_text = f.read()
         tau_manager.restore_full_tau_spec(genesis_spec_text)
-        replay_tau_restore_plan(
-            get_tau_restore_plan(use_persisted_state=True),
-            source_prefix=source_prefix,
-        )
+        if authority_enabled:
+            replay_advisory_restore_plan(source_prefix=source_prefix)
+        else:
+            replay_tau_restore_plan(
+                get_tau_restore_plan(use_persisted_state=True),
+                source_prefix=source_prefix,
+            )
         logger.info("[chain_state] Reloaded live consensus interpreter to the single "
                     "active revision after governance activation.")
     except Exception:
