@@ -1901,10 +1901,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         block_height + len(lifecycle_mgr.active_validators)
                         if block_height is not None else None
                     )
+                    # Lazy: consensus.admission imports chain_state, which imports this module.
+                    from consensus.admission import _temporal_backreference
+
+                    temporal_ref = _temporal_backreference(update.rule_revisions)
                     if min_activation is not None and update.activate_at_height < min_activation:
                         tx_receipt["logs"].append(
                             "Update ignored (activation delay breached): "
                             f"{update.activate_at_height} < {min_activation}"
+                        )
+                    elif temporal_ref:
+                        # Activation would reset into a spec with lookback.
+                        tx_receipt["logs"].append(
+                            "Update ignored (consensus rule revision reads a "
+                            f"previous step): {temporal_ref}"
                         )
                     elif lifecycle_mgr.can_admit_update(update, is_mempool=False):
                         if lifecycle_mgr.submit_update(update):

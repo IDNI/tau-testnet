@@ -5,7 +5,9 @@ output is then 0 for the steps after each later revision or rebuild, for every
 account. So the screen covers every unit that can reach the evaluator -- op-0
 rules on any stream, routed o5 clauses, offered and accepted clauses -- and
 apply repeats it unconditionally, because a proposer can include a transaction
-that never went through admission.
+that never went through admission. A governance update whose revisions read
+another step is not recorded at apply, since activation would reset the
+evaluator into a spec with lookback.
 """
 import hashlib
 
@@ -343,6 +345,39 @@ def test_apply_hard_rejects_an_accept_reading_another_step(ref, slots):
     assert post.rule_offers.clause_for(ALICE, 5) is None
     assert post.rule_offers.get_offer(_offer(text).offer_id) is not None
     assert _never_fed(fed, ref, POLICY_STREAM)
+
+
+# --- governance updates -------------------------------------------------------
+
+def _update_tx(revision):
+    tx = _base("update", "consensus_rule_update", MALLORY, 0)
+    tx.update(rule_revisions=[revision], activate_at_height=HEIGHT + 10)
+    return _sign(tx, SK_MALLORY)
+
+
+def _consensus_rule(ref):
+    return f"always ( o6[t]:bv[16] = {ref}:bv[16] )."
+
+
+@pytest.mark.parametrize("replay_mode", [False, True])
+@pytest.mark.parametrize("ref", ["i10[t-1]", "i10[t - 1]", "i10[0]", "o6[t-1]"])
+def test_apply_does_not_record_a_consensus_update_reading_another_step(ref, replay_mode):
+    lm = _lifecycle(slots=False)
+    result, post, _ = _apply(_update_tx(_consensus_rule(ref)), lm, replay_mode=replay_mode)
+    assert "update" not in result.invalid_tx_ids
+    logs = " | ".join(str(x) for x in _outcome(result, "update").receipt_logs)
+    assert "reads a previous step" in logs
+    assert post.pending_updates == set()
+    assert post.update_payloads == {}
+
+
+@pytest.mark.parametrize("replay_mode", [False, True])
+def test_apply_records_a_current_step_consensus_update(replay_mode):
+    lm = _lifecycle(slots=False)
+    result, post, _ = _apply(_update_tx(_consensus_rule("i10[t]")), lm,
+                             replay_mode=replay_mode)
+    assert "update" not in result.invalid_tx_ids
+    assert len(post.pending_updates) == 1
 
 
 # --- current-step rules still apply -------------------------------------------
