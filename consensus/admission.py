@@ -19,6 +19,7 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_REJECT,
     NEUTRAL_O5_CLAUSE_BODY,
     RuleOfferShapeError,
+    clause_author_cap,
     clause_body_v1,
     clause_output_streams,
     compose_stream_rule,
@@ -880,7 +881,7 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
         tip_view, target_stream, offer.recipient_pubkey, body
     )
     if compose_error:
-        return format_error(compose_error)
+        return compose_error
 
     return success({
         "offer_id": offer_id_hex,
@@ -893,13 +894,17 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
 def _compose_with_clause(tip_view, target_stream: int, acceptor: str, body: str):
     """Composite for `target_stream` with `acceptor`'s clause set to `body`.
 
-    Returns (composite_text, error). An acceptor REPLACING their own clause
-    does not grow the composite, so the acceptor cap only applies to a
-    genuinely new one.
+    Returns (composite_text, error), where error is a ready AdmissionResult. An
+    acceptor REPLACING their own clause does not grow the composite, so the
+    acceptor cap only applies to a genuinely new one.
     """
     clauses = dict(tip_view.clauses_for_stream(target_stream))
-    if acceptor not in clauses and len(clauses) >= MAX_ACCEPTORS_PER_STREAM:
-        return None, (
+    cap = clause_author_cap(target_stream, approval_slots_active(tip_view))
+    if acceptor not in clauses and len(clauses) >= cap:
+        if cap == MAX_TIER_AUTHORS:
+            # The measured tier cap bound this stream, not the frozen ceiling.
+            return None, _registry_full_error(len(clauses))
+        return None, format_error(
             f"o{target_stream} already has the maximum "
             f"{MAX_ACCEPTORS_PER_STREAM} accepted clauses."
         )
@@ -907,7 +912,22 @@ def _compose_with_clause(tip_view, target_stream: int, acceptor: str, body: str)
     try:
         return compose_stream_rule(target_stream, clauses), None
     except RuleOfferShapeError as exc:
-        return None, f"Composed rule for o{target_stream} is invalid: {exc}"
+        return None, format_error(
+            f"Composed rule for o{target_stream} is invalid: {exc}"
+        )
+
+
+def _registry_full_error(authors: int) -> AdmissionResult:
+    return format_error(
+        f"The o5 policy registry is full: {authors} of "
+        f"{MAX_TIER_AUTHORS} author slots are taken. This is a MEASURED "
+        f"ceiling, not a quota: every author and every policy change makes "
+        f"the shared o5 rule dearer to rebuild, and a rebuild must finish "
+        f"inside the 60s COMM_TIMEOUT. An existing author can free a slot "
+        f"by submitting the neutral clause "
+        f"`always ( {NEUTRAL_O5_CLAUSE_BODY} ).`",
+        code="CLAUSE_REGISTRY_FULL",
+    )
 
 
 def _screen_clause_domains(body: str) -> Optional[str]:
@@ -1034,7 +1054,7 @@ def validate_rule_offer_decision_payload(
         tip_view, target_stream, decision.actor_pubkey, body
     )
     if compose_error:
-        return format_error(compose_error)
+        return compose_error
 
     return success({
         "offer_id": offer_id_hex,
@@ -1133,18 +1153,8 @@ def validate_o5_clause_routing(
     existing = tip_view.clause_for(sender_n, tau_defs.USER_POLICY_STREAM_INDEX)
     if existing is None:
         authors = tip_view.clause_author_count(tau_defs.USER_POLICY_STREAM_INDEX)
-        if authors >= MAX_TIER_AUTHORS:
-            return format_error(
-                f"The o5 policy registry is full: {authors} of "
-                f"{MAX_TIER_AUTHORS} author slots are taken. This is a MEASURED "
-                f"ceiling, not a quota — interpreter rebuild time grows about "
-                f"eightfold per additional author (about 2.5s at one, 13-22s at "
-                f"two, 110s at four) against a 60s COMM_TIMEOUT with a watchdog "
-                f"kill past it. An existing author can free a slot by submitting "
-                f"the neutral clause "
-                f"`always ( {NEUTRAL_O5_CLAUSE_BODY} ).`",
-                code="CLAUSE_REGISTRY_FULL",
-            )
+        if authors >= clause_author_cap(tau_defs.USER_POLICY_STREAM_INDEX, True):
+            return _registry_full_error(authors)
 
     return success({
         "o5_clause_action": "declare",

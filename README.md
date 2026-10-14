@@ -537,7 +537,7 @@ Acceptors are ordered by raw public-key bytes; the innermost else-branch is the 
 
 Offered rules must therefore be exactly one `always ( ... ).` unit, with balanced parentheses, no nested temporal operator, no reference to `i12` (the node supplies the guard), and exactly one target output stream drawn from a permitted set (`o5` today). Consensus-owned streams (`o0`–`o4`, `o6`–`o9`), apply-time-mocked inputs (`i2`), and reserved input streams are refused.
 
-**Caveats.** There is no retraction: an acceptor changes an accepted rule by accepting a different offer on the same stream, which replaces their clause. Accepting is irreversible otherwise. Caps are frozen constants, not config, because a per-node value would let honest nodes disagree about admissibility: 8 KiB per rule, 32 pending offers per recipient, 16 per offerer, a 100 000-block maximum offer window, and 64 acceptors per stream.
+**Caveats.** There is no retraction: an acceptor changes an accepted rule by accepting a different offer on the same stream, which replaces their clause. Accepting is irreversible otherwise. Caps are frozen constants, not config, because a per-node value would let honest nodes disagree about admissibility: 8 KiB per rule, 32 pending offers per recipient, 16 per offerer, a 100 000-block maximum offer window, and 64 acceptors per stream. On `o5`, once approval slots are active, `MAX_TIER_AUTHORS` (2) authors bound both this door and self-service policy rules.
 
 ### Checking conflict status
 

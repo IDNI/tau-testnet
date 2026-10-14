@@ -19,7 +19,6 @@ from . import fees
 from .fees import FeeRuleError
 from .approvals import (
     APPROVAL_TX_TYPES,
-    MAX_TIER_AUTHORS,
     STATUS_EXECUTED,
     STATUS_FAILED,
     STATUS_OPEN,
@@ -34,6 +33,7 @@ from .rule_offers import (
     NEUTRAL_O5_CLAUSE_BODY,
     RULE_OFFER_TX_TYPES,
     RuleOfferShapeError,
+    clause_author_cap,
     clause_body_v1,
     is_neutral_clause_body,
     TX_TYPE_RULE_OFFER,
@@ -1574,9 +1574,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         "o5 clause revocation ignored (nothing registered)")
                     return True
                 if not revoking and not registered:
-                    if len(offers.clauses_for_stream(stream)) >= MAX_TIER_AUTHORS:
+                    cap = clause_author_cap(stream, True)
+                    if len(offers.clauses_for_stream(stream)) >= cap:
                         _did_not_land(
-                            f"o5 clause ignored (registry full: {MAX_TIER_AUTHORS} authors)")
+                            f"o5 clause ignored (registry full: {cap} authors)")
                         return True
 
                 # A request snapshots its approvers but re-evaluates the CURRENT
@@ -1970,10 +1971,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 f"Offer decision ignored ({reason})"
                             )
                         else:
-                            target_stream = offers.submit_decision(decision)
+                            target_stream = offers.submit_decision(
+                                decision, approval_slots_active=approval_slots_on
+                            )
                             if target_stream is None:
+                                # An accept that registers nothing hit the cap.
                                 tx_receipt["logs"].append(
-                                    "Offer resolved: " + decision.offer_id_hex
+                                    ("Offer accept ignored (clause registry full): "
+                                     if accept else "Offer resolved: ")
+                                    + decision.offer_id_hex
                                 )
                             else:
                                 # Re-emit the whole composite for the stream.

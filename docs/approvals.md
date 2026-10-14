@@ -248,7 +248,7 @@ if one ever got through.
 
 | Constant | Value | Notes |
 |---|---|---|
-| `MAX_TIER_AUTHORS` | `2` | Policy authors on `o5`, **network-wide**. A measured ceiling, not a quota — see below. |
+| `MAX_TIER_AUTHORS` | `2` | Policy authors on `o5`, **network-wide**, counting clauses from both doors (self-service rules and accepted offers) once approval slots are active. A measured ceiling, not a quota — see below. |
 | `MAX_APPROVERS_PER_REQUEST` | `8` | Tiers use three; the rest are spare. |
 | `MAX_PENDING_REQUESTS_PER_SENDER` | `8` | |
 | `MAX_APPROVAL_WINDOW_BLOCKS` | `10_000` | CLI `--expire-in` defaults to `1000`. |
@@ -282,7 +282,7 @@ reserves, and the margin does not survive a slower host.
 | `UNSCOPED_USER_RULE` | An unguarded `o5` rule on a chain without activation, where the guarded form is still expected. |
 | `MIXED_OUTPUT_RULE` | The rule writes `o5` and something else. |
 | `RULE_WITH_TRANSFERS` | A routed `o5` rule shares a `user_tx` with transfers. Admission would judge those transfers against the policy being replaced. |
-| `CLAUSE_REGISTRY_FULL` | `MAX_TIER_AUTHORS` author slots are taken. An existing author frees one with the neutral clause. |
+| `CLAUSE_REGISTRY_FULL` | `MAX_TIER_AUTHORS` author slots are taken, counting clauses from both doors (self-service rules and accepted offers) once approval slots are active. Refused for a new author's rule, an offer to a recipient who holds no clause, and an accept by a new acceptor. An existing author frees one with the neutral clause. |
 | `TOO_MANY_REQUESTS` | `MAX_PENDING_REQUESTS_PER_SENDER` reached. |
 | `DUPLICATE_REQUEST` | A request with this id already exists. |
 | `NOT_AN_APPROVER` | The voter is not one of the request's declared approvers. |
