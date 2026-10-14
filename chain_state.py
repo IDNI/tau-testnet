@@ -604,7 +604,8 @@ def _sync_advisory_mirror(prepared) -> None:
     this they would answer against whatever state it had when the node started.
     It receives the block's revisions in order and nothing else; it is never
     consulted by consensus, so a failure here degrades advisory answers and
-    nothing more.
+    nothing more. A RESET in the delta re-initializes it first, because the
+    revisions before the last RESET no longer shape the authoritative evaluator.
     """
     import tau_journal as _tau_journal
 
@@ -612,21 +613,31 @@ def _sync_advisory_mirror(prepared) -> None:
         return
     if getattr(tau_manager, "tau_direct_interface", None) is None:
         return
-    for entry in prepared.journal_delta:
-        if entry.kind != _tau_journal.REVISION or not entry.rule_text:
-            continue
-        try:
+    entries = list(prepared.journal_delta)
+    reset_at = _tau_journal.last_reset_index(entries)
+    texts = []
+    if reset_at is not None:
+        texts = [text for text, _persist in entries[reset_at].units]
+        entries = entries[reset_at + 1:]
+    texts.extend(
+        entry.rule_text for entry in entries
+        if entry.kind == _tau_journal.REVISION and entry.rule_text
+    )
+    try:
+        if reset_at is not None:
+            with open(config.TAU_PROGRAM_FILE, "r", encoding="utf-8", errors="replace") as f:
+                tau_manager.restore_full_tau_spec(f.read())
+        for text in texts:
             tau_manager.communicate_with_tau(
-                rule_text=entry.rule_text, target_output_stream_index=0,
+                rule_text=text, target_output_stream_index=0,
                 source="advisory_mirror", apply_rules_update=False,
                 wait_for_ready=False,
             )
-        except Exception as exc:
-            logger.warning(
-                "[BLOCKCHAIN] advisory mirror could not take a committed revision "
-                "(%s); admission estimates may be stale until it is rebuilt", exc,
-            )
-            return
+    except Exception as exc:
+        logger.warning(
+            "[BLOCKCHAIN] advisory mirror could not take a committed revision "
+            "(%s); admission estimates may be stale until it is rebuilt", exc,
+        )
 
 
 def process_new_block(block: Block) -> bool:

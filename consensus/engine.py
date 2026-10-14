@@ -64,6 +64,7 @@ from consensus.tx_signing import verify_tx_signature
 import tau_native
 import tau_advisory
 import tau_guard
+import tau_journal
 import tau_session
 import tau_shrink
 
@@ -255,6 +256,14 @@ def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict,
         return False, str(output)
     return True, ""
 
+
+
+def _revised_policy_composite(proposal) -> bool:
+    # Only composites and activations are fed with accumulate=False; op-0 rules accumulate.
+    return any(
+        entry.kind == tau_journal.REVISION and not entry.accumulate
+        for entry in proposal.journal.entries()
+    )
 
 
 def _refuse_in_process_authority(entry: str) -> None:
@@ -915,29 +924,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             next_cons_rules = "\n".join(last_update.rule_revisions)
             next_active_consensus_id = last_update.update_id_hex[:16]
 
-            if proposal is not None:
-                # Collapse the proposal's evaluator to "the last activation
-                # only", the state the hash above declares. Fed through i0 the
-                # activated revisions LAYER on the previous consensus rules; the
-                # in-process path therefore rebuilt its interpreter after every
-                # activation, and a running node and a restarted one disagreed
-                # on o6/o7 until it did. Here the collapse happens before
-                # anything is durable, is recorded as a RESET, and the worker
-                # that gets promoted is the collapsed one.
-                import chain_state as _chain_state
-                units = _chain_state.restore_plan_for(
-                    next_cons_rules, next_app_rules, lifecycle=lm,
+        if proposal is not None and (newly_active or _revised_policy_composite(proposal)):
+            # Activations and composites fed through i0 layer instead of replacing;
+            # collapsing to the hashed state matches a restart and bounds apply cost.
+            units = chain_state.restore_plan_for(
+                next_cons_rules, next_app_rules, lifecycle=lm,
+            )
+            try:
+                proposal.reset(units)
+            except Exception as exc:
+                # Deterministic: every node composes the same plan from the same hashed state.
+                cause = "governance activation" if newly_active else "policy revision"
+                raise FeeRuleError(
+                    f"Block #{block.header.block_number} ({cause}) "
+                    f"could not collapse the evaluator: {exc}"
                 )
-                try:
-                    proposal.reset(units)
-                except Exception as exc:
-                    # Deterministic: every node composes the same plan from the
-                    # same hashed state. Existing block-failure semantics.
-                    raise FeeRuleError(
-                        f"Governance activation at height {block.header.block_number} "
-                        f"could not collapse the evaluator: {exc}"
-                    )
-        
+
         # Finalize Hashes
         acc_hash = compute_accounts_hash(t_bals, t_seqs)
         meta_hash = lm.consensus_meta_hash()
