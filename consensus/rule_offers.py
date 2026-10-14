@@ -57,6 +57,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import tau_defs
+from consensus.approvals import MAX_TIER_AUTHORS
 from consensus.serialization import (
     compute_offer_id,
     compute_clause_registry_root,
@@ -102,6 +103,18 @@ ALLOWED_TARGET_STREAMS: Dict[int, Dict[str, Any]] = {
         "neutral": tau_defs.USER_POLICY_ALLOW_VALUE,
     },
 }
+
+
+def clause_author_cap(stream_index: int, approval_slots_active: bool) -> int:
+    """Authors one stream's clause registry may hold, whichever door they enter by.
+
+    The o5 tier cap binds only while approval slots are active; without them
+    the frozen ceiling is the only bound.
+    """
+    if approval_slots_active and stream_index == tau_defs.USER_POLICY_STREAM_INDEX:
+        return MAX_TIER_AUTHORS
+    return MAX_ACCEPTORS_PER_STREAM
+
 
 # Streams a clause may never write: consensus-owned verdicts and fees, plus the
 # rule/ack channel. Kept as a frozen tuple so admission and apply screen the
@@ -648,11 +661,14 @@ class RuleOfferLifecycleManager:
             return False, str(exc)
         return True, ""
 
-    def submit_decision(self, decision: RuleOfferDecision) -> Optional[int]:
+    def submit_decision(
+        self, decision: RuleOfferDecision, *, approval_slots_active: bool = False
+    ) -> Optional[int]:
         """Resolve an offer.
 
         Returns the target stream index when an accept registered a clause
-        (so the caller knows which composite to re-emit), or None.
+        (so the caller knows which composite to re-emit), or None when the
+        offer was rejected or the stream's registry was full.
         """
         entry = self.offered.pop(decision.offer_id, None)
         if entry is None:
@@ -667,7 +683,7 @@ class RuleOfferLifecycleManager:
         key = (decision.actor_pubkey, target)
         if key not in self.accepted_clauses:
             existing = len(self.clauses_for_stream(target))
-            if existing >= MAX_ACCEPTORS_PER_STREAM:
+            if existing >= clause_author_cap(target, approval_slots_active):
                 # Soft no-op: the offer is consumed but no clause registers, so
                 # block validity stays deterministic across replays.
                 self.terminal_status[decision.offer_id] = STATUS_REJECTED
