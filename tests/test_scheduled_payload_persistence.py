@@ -16,11 +16,14 @@ pass the same active_validators/quorum_policy/eligibility_mode triple; verified
 by static audit.)
 """
 import chain_state
+import pytest
 from consensus.governance import (
     ConsensusLifecycleManager,
     ConsensusRuleUpdate,
     ConsensusRuleVote,
 )
+
+pytestmark = pytest.mark.usefixtures("isolated_chain_state")
 
 VALIDATORS = ["a" * 96, "b" * 96, "c" * 96]  # majority threshold = 2
 REV = "always ( o6[t]:bv[16] = i10[t]:bv[16] )."
