@@ -1,6 +1,6 @@
 attrs==26.1.0
-base58==1.0.3
-blake3==0.4.1
+base58==2.1.1
+blake3==1.0.11
 hypothesis==6.169.1
 idna==3.20
 iniconfig==2.3.1
