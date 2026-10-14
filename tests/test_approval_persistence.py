@@ -11,6 +11,7 @@ approvers have signed. The decline *reason* is the counterpart -- node-local
 colour that must NOT affect the hash.
 """
 import chain_state
+import pytest
 from consensus.approvals import (
     STATUS_EXECUTED,
     STATUS_EXPIRED,
@@ -19,6 +20,8 @@ from consensus.approvals import (
     TransferVote,
 )
 from consensus.governance import ConsensusLifecycleManager
+
+pytestmark = pytest.mark.usefixtures("isolated_chain_state")
 
 A = "1a" * 48        # sender
 B = "2b" * 48        # recipient
