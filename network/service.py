@@ -1352,7 +1352,7 @@ class NetworkService:
         await self._runner_stop.wait()
 
     async def stop(self) -> None:
-        if self._runner_stop:
+        if self._runner_stop is not None:
             self._runner_stop.set()
 
 
