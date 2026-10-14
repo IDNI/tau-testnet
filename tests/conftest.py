@@ -225,6 +225,33 @@ def temp_database(tmp_path) -> Iterator[str]:
         db._db_conn = None
     config.set_database_path(original_path)
 
+
+@pytest.fixture
+def isolated_chain_state(monkeypatch) -> Iterator[None]:
+    """Later modules read chain_state globals directly, so rebinds and refills must not leak."""
+    import chain_state
+
+    for name in (
+        "_lifecycle_manager",
+        "_application_rules_state",
+        "_consensus_rules_state",
+        "_active_consensus_id",
+        "_tau_engine_state_hash",
+        "_canonical_head_hash",
+    ):
+        monkeypatch.setattr(chain_state, name, getattr(chain_state, name))
+
+    shared_dicts = [
+        getattr(chain_state, name)
+        for name in ("_balances", "_sequence_numbers", "_last_transfer_ts")
+    ]
+    saved = [dict(d) for d in shared_dicts]
+    yield
+    for d, contents in zip(shared_dicts, saved):
+        d.clear()
+        d.update(contents)
+
+
 # --------------------------------------------------------------------------
 # libp2p test helpers (A8) — single source of truth, sourced from
 # network.libp2p_compat where possible.
