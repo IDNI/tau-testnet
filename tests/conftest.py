@@ -63,6 +63,18 @@ def mock_consensus_for_unrelated_tests(monkeypatch, request):
             pass
 
 
+@pytest.fixture
+def allow_history_rules(monkeypatch):
+    """Let a rule that reads an earlier step through admission and apply.
+
+    Evaluator-continuity tests need a stateful evaluator behind the real entry
+    points, which the temporal screen refuses for user rules.
+    """
+    import consensus.admission
+
+    monkeypatch.setattr(consensus.admission, "screen_temporal_rule", lambda _rule_text: None)
+
+
 class FakeEngine:
     """Stand-in for `tau_native.TauInterface` that fails on concurrent entry.
 

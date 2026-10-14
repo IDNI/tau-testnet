@@ -266,6 +266,16 @@ def _revised_policy_composite(proposal) -> bool:
     )
 
 
+TEMPORAL_REFERENCE_REASON = "temporal_reference"
+
+
+def _offered_rule_temporal_error(rule_text: str) -> Optional[str]:
+    # Lazy: consensus.admission imports chain_state, which imports this module.
+    from consensus.admission import screen_temporal_rule
+
+    return screen_temporal_rule(clause_body_v1(rule_text))
+
+
 def _refuse_in_process_authority(entry: str) -> None:
     """With worker-backed authority there is no in-process block application.
 
@@ -1555,15 +1565,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # clause bodies. Imported lazily: consensus.admission pulls in
                 # the facade and chain_state, and chain_state imports this
                 # module, so a module-level import would be a cycle.
-                from consensus.admission import _screen_clause_domains, _width_mismatch_details
+                from consensus.admission import (
+                    _screen_clause_domains,
+                    _width_mismatch_details,
+                    is_temporal_reference_error,
+                )
 
                 domain_error = _screen_clause_domains(body)
                 if domain_error:
-                    reason = (
-                        "width_mismatch"
-                        if _width_mismatch_details(domain_error)
-                        else "rule_not_applied"
-                    )
+                    if is_temporal_reference_error(domain_error):
+                        reason = TEMPORAL_REFERENCE_REASON
+                    elif _width_mismatch_details(domain_error):
+                        reason = "width_mismatch"
+                    else:
+                        reason = "rule_not_applied"
                     _did_not_land(f"o5 clause ignored ({domain_error})", reason=reason)
                     return True
 
@@ -1932,8 +1947,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             offer,
                             next_height=block_height if block_height is not None else 0,
                         )
+                        temporal_error = (
+                            _offered_rule_temporal_error(offer.rule_text) if ok else None
+                        )
                         if not ok:
                             tx_receipt["logs"].append(f"Offer ignored ({reason})")
+                        elif temporal_error:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = TEMPORAL_REFERENCE_REASON
+                            tx_receipt["logs"].append(f"Error: {temporal_error}")
                         elif offers.submit_offer(offer):
                             tx_receipt["logs"].append("Offer submitted: " + offer.offer_id_hex)
                         else:
@@ -1967,10 +1991,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         accepted_in_block = False
                     else:
                         ok, reason = offers.can_admit_decision(decision)
+                        temporal_error = (
+                            _offered_rule_temporal_error(decision.rule_text)
+                            if ok and accept else None
+                        )
                         if not ok:
                             tx_receipt["logs"].append(
                                 f"Offer decision ignored ({reason})"
                             )
+                        elif temporal_error:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = TEMPORAL_REFERENCE_REASON
+                            tx_receipt["logs"].append(f"Error: {temporal_error}")
                         else:
                             target_stream = offers.submit_decision(decision)
                             if target_stream is None:
@@ -2341,7 +2375,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 f"Error: {width_error or conj_error}"
                             )
                         # Lazy: consensus.admission imports chain_state, which imports this module.
-                        from consensus.admission import screen_reserved_rule_outputs
+                        from consensus.admission import (
+                            screen_reserved_rule_outputs,
+                            screen_temporal_rule,
+                        )
                         output_error = (
                             None if replay_mode
                             else screen_reserved_rule_outputs(rule_text)
@@ -2352,6 +2389,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             execution_success = False
                             tx_receipt["reason"] = "reserved_output_stream"
                             tx_receipt["logs"].append(f"Error: {output_error}")
+                        temporal_error = screen_temporal_rule(rule_text)
+                        if temporal_error and not hard_reject:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = TEMPORAL_REFERENCE_REASON
+                            tx_receipt["logs"].append(f"Error: {temporal_error}")
                         if execution_success and accepted_in_block and not hard_reject:
                           try:
                             # The rule goes through the evaluator SESSION rather

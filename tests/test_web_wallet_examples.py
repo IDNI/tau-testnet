@@ -28,9 +28,7 @@ def get_templates():
 
         f"always ( ((i{inA}[t]:bv[24] + i{inB}[t]:bv[24]) >= {hx(0x80)} && o{outA}[t] = {hx(1)}) || ((i{inA}[t]:bv[24] + i{inB}[t]:bv[24]) < {hx(0x80)} && o{outA}[t] = {hx(0)}) ).",
 
-        f"always ( o{outA}[t]:bv[24] = (i{inA}[t]:bv[24] >> {hx(sh1)}) + (i{inB}[t]:bv[24] << {hx(sh2)}) ).",
-
-        f"always ( ((i{inA}[t]:bv[24] > i{inA}[t-1]:bv[24]) && o{outA}[t] = {hx(1)}) || ((i{inA}[t]:bv[24] <= i{inA}[t-1]:bv[24]) && o{outA}[t] = {hx(0)}) )."
+        f"always ( o{outA}[t]:bv[24] = (i{inA}[t]:bv[24] >> {hx(sh1)}) + (i{inB}[t]:bv[24] << {hx(sh2)}) )."
     ]
 
 @pytest.mark.parametrize("rule_idx, rule_text", enumerate(get_templates()))

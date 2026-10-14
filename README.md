@@ -389,6 +389,7 @@ When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker)
 - `o5` — user policy on a transfer (`0` = block, `1`/absent = allow). User-deployed, sender-scoped rules; **consensus-enforced** at both admission and block apply. A block on any transfer rejects the whole `user_tx`. Lets users express recipient whitelists (`i4`), time-locks (`i5`), and spending limits (`i1`). See [WALLET_USAGE.md](WALLET_USAGE.md).
   Tiered co-signature approvals build on `o5`: a sender requires an approver's signature above an amount threshold, and the transfer parks on-chain until the rule is satisfied. See [docs/approvals.md](docs/approvals.md).
   **Sender scope is enforced at admission** (`UNSCOPED_USER_RULE`): `o5`/`o8` are shared streams composed across every deployed rule, so rule text writing them must reference `i12` (sender pubkey) or `i3` (from address). Without that, one `always (o5[t] = 0)` deploy would block every account on the network. The screen is textual — a reference is not proof the rule is genuinely gated by it — and applies at admission only, so rules already on chain are unaffected.
+  **User rules reference `[t]` only** (`TEMPORAL_REFERENCE`): `i1[t-1]` or `i1[0]` is refused at admission and again at block apply, on every stream and for rules offered, accepted or routed as clauses. One unit that reads another step gives the whole evaluator a lookback, and every output is then 0 for the steps after each later revision or rebuild, for every account.
 
 **Python host enforces _before_ Tau** (the inputs Tau trusts):
 - Transaction BLS signature verification + canonical decoding (`commands/sendtx.py`).
@@ -535,7 +536,7 @@ always ( (i12[t]:bv[384] = { #x<acceptor_1> }:bv[384]) ? ( <body_1> )
 
 Acceptors are ordered by raw public-key bytes; the innermost else-branch is the stream's neutral value (`o5` → allow). Each composite **replaces** the previous one, so the live spec keeps exactly one unit per stream, and an empty registry emits nothing at all — so the stream is never mentioned and never materializes for anybody.
 
-Offered rules must therefore be exactly one `always ( ... ).` unit, with balanced parentheses, no nested temporal operator, no reference to `i12` (the node supplies the guard), and exactly one target output stream drawn from a permitted set (`o5` today). Consensus-owned streams (`o0`–`o4`, `o6`–`o9`), apply-time-mocked inputs (`i2`), and reserved input streams are refused.
+Offered rules must therefore be exactly one `always ( ... ).` unit, with balanced parentheses, no nested temporal operator, no reference to `i12` (the node supplies the guard), no reference to any step but `[t]`, and exactly one target output stream drawn from a permitted set (`o5` today). Consensus-owned streams (`o0`–`o4`, `o6`–`o9`), apply-time-mocked inputs (`i2`), and reserved input streams are refused.
 
 **Caveats.** There is no retraction: an acceptor changes an accepted rule by accepting a different offer on the same stream, which replaces their clause. Accepting is irreversible otherwise. Caps are frozen constants, not config, because a per-node value would let honest nodes disagree about admissibility: 8 KiB per rule, 32 pending offers per recipient, 16 per offerer, a 100 000-block maximum offer window, and 64 acceptors per stream.
 
@@ -615,7 +616,7 @@ Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSoc
 
 - `status` is `"ok"` or `"error"`; `command` echoes the request; `data` on success, `error.code`/`error.message`(+`details`) on failure.
 - Types: addresses/hashes/IDs and token amounts are **strings** (overflow-safe); counts/heights/sequence numbers are integers; timestamps are ISO 8601 strings.
-- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `BLS_UNAVAILABLE`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `DUPLICATE_UPDATE`, `UNSCOPED_USER_RULE`, `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
+- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `BLS_UNAVAILABLE`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `DUPLICATE_UPDATE`, `UNSCOPED_USER_RULE`, `TEMPORAL_REFERENCE`, `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
 - `DUPLICATE_UPDATE` carries `details.update_id` and `details.lifecycle_state`, so a
   wallet retrying a `consensus_rule_update` can tell "already landed" from a real
   rejection. `ADMISSION_TIMEOUT` / `ADMISSION_UNAVAILABLE` mean the isolated rule

@@ -26,7 +26,6 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -808,9 +807,11 @@ def _run(root, keys, chain, nodes, args):
 
 
 def step15(root, keys, chain, nodes, *, patched):
-    """Repeated admission requests around a `[t-1]` o5 policy, on a chain of its
-    own: the policy is the only o5 rule there, so nothing else composes with it."""
-    say("== 15: admission requests cannot influence one another ==")
+    """A `[t-1]` o5 policy on a chain of its own. A patched tree refuses it at
+    admission; an unpatched one admits it, and then the admission requests of
+    unrelated senders become the policy's history."""
+    say("== 15: a rule reading another step is refused ==" if patched
+        else "== 15: admission requests cannot influence one another ==")
     pk = {n: keys[n]["pk"] for n in keys}
     tag = "15" if patched else "15-unpatched"
     tree = os.path.join(root, "nodeC" if patched else "nodeC-unpatched")
@@ -826,6 +827,17 @@ def step15(root, keys, chain, nodes, *, patched):
     check(tag, "a fresh node for the policy", node.wait_ready())
     chain.pending.clear()
     r = chain.send(node, "dave", {"0": history_policy_total(pk["dave"])})
+    if patched:
+        check(tag, "dave's [t-1] policy is refused at admission, with its reason",
+              not ok(r) and err(r).get("code") == "TEMPORAL_REFERENCE", r)
+        rt = chain.transfer(node, "erin", pk["alice"], 1)
+        check(tag, "a transfer is still admitted", ok(rt), rt)
+        _mine(chain, node)
+        check(tag, "and included: the refused rule left nothing behind",
+              tx_hash(rt) in block_txs(node))
+        check(tag, "no crash artifact", not node.crash_dumps())
+        node.stop()
+        return
     check(tag, "dave's [t-1] policy admitted", ok(r), r)
     _mine(chain, node)
     check(tag, "and included", tx_hash(r) in block_txs(node))
@@ -836,45 +848,9 @@ def step15(root, keys, chain, nodes, *, patched):
     check(tag, "influencers reach the Tau step (amount 90) and are refused after it",
           err(rinf).get("code") == "INSUFFICIENT_FUNDS", rinf)
     rd = chain.transfer(node, "dave", fresh_address("dave-target"), 5)
-    if patched:
-        check(tag, "dave is admitted: committed history ends at 1, not the influencers' 90",
-              ok(rd), rd)
-        _mine(chain, node)
-        check(tag, "and included: admission and inclusion agree", tx_hash(rd) in block_txs(node))
-        chain.transfer(node, "alice", fresh_address("x90"), 90)
-        _mine(chain, node)                              # history now ends at 90
-        for _ in range(3):
-            chain.transfer(node, "inf", fresh_address("elsewhere"), 5)
-        rd = chain.transfer(node, "dave", fresh_address("dave-target"), 5)
-        check(tag, "the other direction: history ends at 90, influencers feed 5 -- dave refused",
-              not ok(rd) and "user policy" in err(rd).get("message", ""), rd)
-        verdicts, threads, lock = [], [], threading.Lock()
-
-        def _one(who, amount):
-            out = chain.transfer(node, who, fresh_address(f"c-{who}"), amount)
-            with lock:
-                verdicts.append((who, "admitted" if ok(out) else err(out).get("code"),
-                                 err(out).get("message", "")[:60]))
-
-        for i in range(8):
-            threads.append(threading.Thread(
-                target=_one, args=(("dave", 5) if i % 2 else ("inf", 5))))
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(180)
-        EVIDENCE["concurrent_admission"] = verdicts
-        daves = [v for v in verdicts if v[0] == "dave"]
-        answered = [v for v in daves if v[1] not in ("ADMISSION_UNAVAILABLE", "ADMISSION_TIMEOUT")]
-        check(tag, "eight concurrent requests: no dave request got a verdict from anyone "
-                   "else's history", answered and all(v[1] == "TX_REJECTED" and
-                                                      "user policy" in v[2] for v in answered),
-              verdicts)
-        check(tag, "no crash artifact", not node.crash_dumps())
-    else:
-        EVIDENCE["unpatched_step15"] = rd
-        check(tag, "UNPATCHED: dave is falsely refused -- the influencers' 90 became his [t-1]",
-              not ok(rd) and "user policy" in err(rd).get("message", ""), rd)
+    EVIDENCE["unpatched_step15"] = rd
+    check(tag, "UNPATCHED: dave is falsely refused -- the influencers' 90 became his [t-1]",
+          not ok(rd) and "user policy" in err(rd).get("message", ""), rd)
     node.stop()
 
 

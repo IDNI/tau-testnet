@@ -1081,19 +1081,13 @@ function generateRandomTauRule() {
         ].join('\n'),
 
         () => [
-            `# Example 4 - Temporal check`,
-            `# If i${inA} increased vs previous step, set a flag (bv[24]).`,
-            `always ( ((i${inA}[t]:bv[24] > i${inA}[t-1]:bv[24]) && o${outA}[t] = ${hx(1)}) || ((i${inA}[t]:bv[24] <= i${inA}[t-1]:bv[24]) && o${outA}[t] = ${hx(0)}) ).`
-        ].join('\n'),
-
-        () => [
-            `# Example 5 - Multiple outputs`,
+            `# Example 4 - Multiple outputs`,
             `# Two deterministic arithmetic relations in one rule.`,
             `always ( (o${outA}[t]:bv[24] = i${inA}[t]:bv[24] + i${inB}[t]:bv[24]) && (o${outB}[t]:bv[24] = i${inC}[t]:bv[24] - i${inB}[t]:bv[24]) ).`
         ].join('\n'),
 
         () => [
-            `# Example 6 - "Network" style rule with local variables`,
+            `# Example 5 - "Network" style rule with local variables`,
             `# Computes two hidden gates and outputs:`,
             `# - o${outA}[t] allow flag (bv[24])`,
             `# - o${outB}[t] risk-ish score (bv[24])`,
@@ -1733,6 +1727,8 @@ always (
 #     o12+   : free outputs for your own computations
 #
 #   The aspirational sections below are PSEUDOCODE (not valid Tau today).
+#   User rules may reference [t] only, so sections reading earlier steps stay
+#   undeployable on this network.
 # ================================================================
 
 
