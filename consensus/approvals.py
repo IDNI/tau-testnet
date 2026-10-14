@@ -77,14 +77,9 @@ MAX_VOTE_REASON_BYTES = 256
 
 # How many principals may hold a registered o5 policy clause at once.
 #
-# MEASURED CEILING, not a preference. `get_interpreter` build time against the
-# number of tier authors in the derived composite, with tau_shrink on:
-#   1 author  ~2.5s      2 authors ~13-22s      4 authors ~110s
-# `config.COMM_TIMEOUT` is 60s and the watchdog SIGKILLs past it, so four
-# authors is fatal and three is already marginal. Raising this needs a fresh
-# measurement, not an opinion. Deliberately separate from rule_offers'
-# consensus-frozen MAX_ACCEPTORS_PER_STREAM (64), which must not be edited in
-# place; this is the activation-scoped cap that actually binds.
+# Composite rebuild cost grows with every author and policy change and must fit
+# config.COMM_TIMEOUT; raising this needs a fresh measurement. Separate from the
+# consensus-frozen MAX_ACCEPTORS_PER_STREAM; binds both doors once slots are active.
 MAX_TIER_AUTHORS = 2
 
 # --- Terminal status, encoded as a uint8 in the hashed root ------------------

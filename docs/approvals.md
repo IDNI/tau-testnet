@@ -257,12 +257,10 @@ if one ever got through.
 | `MAX_VOTE_REASON_BYTES` | `256` | Signed and merkle-covered, but excluded from the approval-state root. |
 | `MAX_PREVIEW_SLOTS` | `6` | Above this, `getapprovalpreview` returns `unavailable`. |
 
-`MAX_TIER_AUTHORS = 2` is the load-bearing limit and is measured, not guessed.
-Interpreter rebuild time grows roughly eightfold per additional policy author —
-about 2.5s at one, 13–22s at two, 110s at four — against a 60s `COMM_TIMEOUT`
-with a watchdog SIGKILL past it. Any design carrying per-user policy as rule
-text dies at four authors. The driver is conditional depth times comparisons per
-level.
+`MAX_TIER_AUTHORS = 2` is the load-bearing limit.
+Rebuilding the shared o5 composite grows dearer with every policy author and
+every policy change, and must stay inside the 60s `COMM_TIMEOUT`, past which the
+watchdog SIGKILLs. Raising the cap needs a fresh measurement.
 
 Width is not a lever **at apply**, where `tau_shrink` interns pubkey literals to
 `bv[8]`. It very much is a lever **at admission**, which does not shrink at all
