@@ -32,14 +32,8 @@ from dataclasses import dataclass, field, asdict, replace
 REVISION = "revision"
 STEP = "step"
 #: Re-initialize the evaluator from the program baseline, then apply `units`.
-#:
-#: What a governance activation does to the evaluator. Every activated revision
-#: goes through i0 and would otherwise LAYER on the previous consensus rules,
-#: while the chain's hashed consensus state says "the last activation only" --
-#: which is why the in-process path collapsed its interpreter after every
-#: activation. Recording the collapse as an entry makes a running evaluator and
-#: a reconstructed one collapse at the same point, and it bounds replay: nothing
-#: before the last RESET can affect the evaluator.
+#: Recorded after a governance activation and after a block that revised a policy
+#: composite, since both layer through i0; nothing before the last RESET matters.
 RESET = "reset"
 
 # Why an entry is authoritative -- or why it is not.

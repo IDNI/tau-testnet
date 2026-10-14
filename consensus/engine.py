@@ -64,6 +64,7 @@ from consensus.tx_signing import verify_tx_signature
 import tau_native
 import tau_advisory
 import tau_guard
+import tau_journal
 import tau_session
 import tau_shrink
 
@@ -255,6 +256,24 @@ def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict,
         return False, str(output)
     return True, ""
 
+
+
+def _revised_policy_composite(proposal) -> bool:
+    # Only composites and activations are fed with accumulate=False; op-0 rules accumulate.
+    return any(
+        entry.kind == tau_journal.REVISION and not entry.accumulate
+        for entry in proposal.journal.entries()
+    )
+
+
+TEMPORAL_REFERENCE_REASON = "temporal_reference"
+
+
+def _offered_rule_temporal_error(rule_text: str) -> Optional[str]:
+    # Lazy: consensus.admission imports chain_state, which imports this module.
+    from consensus.admission import screen_temporal_rule
+
+    return screen_temporal_rule(clause_body_v1(rule_text))
 
 
 def _refuse_in_process_authority(entry: str) -> None:
@@ -915,29 +934,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             next_cons_rules = "\n".join(last_update.rule_revisions)
             next_active_consensus_id = last_update.update_id_hex[:16]
 
-            if proposal is not None:
-                # Collapse the proposal's evaluator to "the last activation
-                # only", the state the hash above declares. Fed through i0 the
-                # activated revisions LAYER on the previous consensus rules; the
-                # in-process path therefore rebuilt its interpreter after every
-                # activation, and a running node and a restarted one disagreed
-                # on o6/o7 until it did. Here the collapse happens before
-                # anything is durable, is recorded as a RESET, and the worker
-                # that gets promoted is the collapsed one.
-                import chain_state as _chain_state
-                units = _chain_state.restore_plan_for(
-                    next_cons_rules, next_app_rules, lifecycle=lm,
+        if proposal is not None and (newly_active or _revised_policy_composite(proposal)):
+            # Activations and composites fed through i0 layer instead of replacing;
+            # collapsing to the hashed state matches a restart and bounds apply cost.
+            units = chain_state.restore_plan_for(
+                next_cons_rules, next_app_rules, lifecycle=lm,
+            )
+            try:
+                proposal.reset(units)
+            except Exception as exc:
+                # Deterministic: every node composes the same plan from the same hashed state.
+                cause = "governance activation" if newly_active else "policy revision"
+                raise FeeRuleError(
+                    f"Block #{block.header.block_number} ({cause}) "
+                    f"could not collapse the evaluator: {exc}"
                 )
-                try:
-                    proposal.reset(units)
-                except Exception as exc:
-                    # Deterministic: every node composes the same plan from the
-                    # same hashed state. Existing block-failure semantics.
-                    raise FeeRuleError(
-                        f"Governance activation at height {block.header.block_number} "
-                        f"could not collapse the evaluator: {exc}"
-                    )
-        
+
         # Finalize Hashes
         acc_hash = compute_accounts_hash(t_bals, t_seqs)
         meta_hash = lm.consensus_meta_hash()
@@ -1553,15 +1565,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # clause bodies. Imported lazily: consensus.admission pulls in
                 # the facade and chain_state, and chain_state imports this
                 # module, so a module-level import would be a cycle.
-                from consensus.admission import _screen_clause_domains, _width_mismatch_details
+                from consensus.admission import (
+                    _screen_clause_domains,
+                    _width_mismatch_details,
+                    is_temporal_reference_error,
+                )
 
                 domain_error = _screen_clause_domains(body)
                 if domain_error:
-                    reason = (
-                        "width_mismatch"
-                        if _width_mismatch_details(domain_error)
-                        else "rule_not_applied"
-                    )
+                    if is_temporal_reference_error(domain_error):
+                        reason = TEMPORAL_REFERENCE_REASON
+                    elif _width_mismatch_details(domain_error):
+                        reason = "width_mismatch"
+                    else:
+                        reason = "rule_not_applied"
                     _did_not_land(f"o5 clause ignored ({domain_error})", reason=reason)
                     return True
 
@@ -1885,10 +1902,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         block_height + len(lifecycle_mgr.active_validators)
                         if block_height is not None else None
                     )
+                    # Lazy: consensus.admission imports chain_state, which imports this module.
+                    from consensus.admission import _temporal_backreference
+
+                    temporal_ref = _temporal_backreference(update.rule_revisions)
                     if min_activation is not None and update.activate_at_height < min_activation:
                         tx_receipt["logs"].append(
                             "Update ignored (activation delay breached): "
                             f"{update.activate_at_height} < {min_activation}"
+                        )
+                    elif temporal_ref:
+                        # Activation would reset into a spec with lookback.
+                        tx_receipt["logs"].append(
+                            "Update ignored (consensus rule revision reads a "
+                            f"previous step): {temporal_ref}"
                         )
                     elif lifecycle_mgr.can_admit_update(update, is_mempool=False):
                         if lifecycle_mgr.submit_update(update):
@@ -1931,8 +1958,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             offer,
                             next_height=block_height if block_height is not None else 0,
                         )
+                        temporal_error = (
+                            _offered_rule_temporal_error(offer.rule_text) if ok else None
+                        )
                         if not ok:
                             tx_receipt["logs"].append(f"Offer ignored ({reason})")
+                        elif temporal_error:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = TEMPORAL_REFERENCE_REASON
+                            tx_receipt["logs"].append(f"Error: {temporal_error}")
                         elif offers.submit_offer(offer):
                             tx_receipt["logs"].append("Offer submitted: " + offer.offer_id_hex)
                         else:
@@ -1966,10 +2002,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         accepted_in_block = False
                     else:
                         ok, reason = offers.can_admit_decision(decision)
+                        temporal_error = (
+                            _offered_rule_temporal_error(decision.rule_text)
+                            if ok and accept else None
+                        )
                         if not ok:
                             tx_receipt["logs"].append(
                                 f"Offer decision ignored ({reason})"
                             )
+                        elif temporal_error:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = TEMPORAL_REFERENCE_REASON
+                            tx_receipt["logs"].append(f"Error: {temporal_error}")
                         else:
                             target_stream = offers.submit_decision(
                                 decision, approval_slots_active=approval_slots_on
@@ -2345,7 +2391,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 f"Error: {width_error or conj_error}"
                             )
                         # Lazy: consensus.admission imports chain_state, which imports this module.
-                        from consensus.admission import screen_reserved_rule_outputs
+                        from consensus.admission import (
+                            screen_reserved_rule_outputs,
+                            screen_temporal_rule,
+                        )
                         output_error = (
                             None if replay_mode
                             else screen_reserved_rule_outputs(rule_text)
@@ -2356,6 +2405,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             execution_success = False
                             tx_receipt["reason"] = "reserved_output_stream"
                             tx_receipt["logs"].append(f"Error: {output_error}")
+                        temporal_error = screen_temporal_rule(rule_text)
+                        if temporal_error and not hard_reject:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = TEMPORAL_REFERENCE_REASON
+                            tx_receipt["logs"].append(f"Error: {temporal_error}")
                         if execution_success and accepted_in_block and not hard_reject:
                           try:
                             # The rule goes through the evaluator SESSION rather

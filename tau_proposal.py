@@ -346,13 +346,11 @@ class ProposalContext:
     def reset(self, units) -> None:
         """Collapse the evaluator to the program baseline plus `units`, recorded.
 
-        What a governance activation does. The activated revisions layer on the
-        previous consensus rules when fed through i0, while the chain's hashed
-        consensus state says "the last activation only" -- so the in-process
-        path rebuilt its interpreter after every activation. Here the collapse
-        happens inside the proposal, before anything is durable, and is recorded
-        as a RESET so a reconstruction collapses at exactly the same point. The
-        worker that gets promoted is the collapsed one.
+        Done for a governance activation and for a block whose accepted execution
+        revised a policy composite: both layer through i0 on what the hashed
+        state replaces. The collapse happens inside the proposal, before anything
+        is durable, and is recorded as a RESET so a reconstruction collapses at
+        the same point. The worker that gets promoted is the collapsed one.
         """
         import tau_journal as _tau_journal
 

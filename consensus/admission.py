@@ -132,6 +132,27 @@ def screen_reserved_rule_outputs(rule_text: str) -> Optional[str]:
     return None
 
 
+# Lookback is global to the evaluator's spec: one unit reading another step
+# leaves every output at 0 for the steps after each later revision or rebuild.
+TEMPORAL_REFERENCE_CODE = "TEMPORAL_REFERENCE"
+_TEMPORAL_REFERENCE_PHRASE = "reads a step other than the current one"
+
+
+def screen_temporal_rule(rule_text: str) -> Optional[str]:
+    """Error text when a user rule references any step other than `[t]`."""
+    ref = _temporal_backreference([rule_text])
+    if ref is None:
+        return None
+    return (
+        f"rule {_TEMPORAL_REFERENCE_PHRASE} ({ref}); user rules may reference "
+        f"[t] only."
+    )
+
+
+def is_temporal_reference_error(error_text: Optional[str]) -> bool:
+    return bool(error_text) and _TEMPORAL_REFERENCE_PHRASE in error_text
+
+
 class AdmissionResult:
     def __init__(self, is_valid: bool, error: Optional[str] = None, data: Optional[Dict] = None,
                  code: Optional[str] = None, details: Optional[Dict] = None):
@@ -174,6 +195,8 @@ def _width_mismatch_details(reason: str) -> Optional[Dict]:
 
 def _admission_from_domain_error(domain_error: str, prefix: str = "") -> AdmissionResult:
     msg = f"{prefix}{domain_error}" if prefix else domain_error
+    if is_temporal_reference_error(domain_error):
+        return format_error(msg, code=TEMPORAL_REFERENCE_CODE)
     mismatch = _width_mismatch_details(domain_error)
     if mismatch:
         return format_error(msg, code="WIDTH_MISMATCH", **mismatch)
@@ -292,6 +315,10 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         reserved_error = screen_reserved_rule_outputs(rule_text)
         if reserved_error:
             return format_error(reserved_error)
+
+        temporal_error = screen_temporal_rule(rule_text)
+        if temporal_error:
+            return format_error(temporal_error, code=TEMPORAL_REFERENCE_CODE)
         # i2 (balance) is now fed from the parent-block snapshot at apply, frozen
         # for the whole block, so proposer and verifier agree and a POLICY rule
         # reading it is deterministic (issue #20). What remains is
@@ -935,8 +962,12 @@ def _screen_clause_domains(body: str) -> Optional[str]:
 
     Same screens as a user_tx rule op: a clause must not write the
     consensus-owned verdict/fee streams, must not read an input the apply path
-    mocks, and must not type a reserved input stream.
+    mocks, must not type a reserved input stream, and may reference [t] only.
     """
+    temporal_error = screen_temporal_rule(body)
+    if temporal_error:
+        return temporal_error
+
     writes = _streams_referenced(body, CONSENSUS_OWNED_OUTPUT_STREAMS)
     if writes:
         return (

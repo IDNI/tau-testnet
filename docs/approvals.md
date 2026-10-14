@@ -277,6 +277,7 @@ reserves, and the margin does not survive a slower host.
 |---|---|
 | `FEATURE_INACTIVE` | The chain does not have approval slots activated. |
 | `CLAUSE_SHAPE` | The clause body references `i12`, writes more than one output stream, nests a temporal operator, or is not one `always` unit. |
+| `TEMPORAL_REFERENCE` | The rule or clause body reads a step other than the current one (`i1[t-1]`, `i1[0]`). User rules reference `[t]` only. |
 | `UNSCOPED_USER_RULE` | An unguarded `o5` rule on a chain without activation, where the guarded form is still expected. |
 | `MIXED_OUTPUT_RULE` | The rule writes `o5` and something else. |
 | `RULE_WITH_TRANSFERS` | A routed `o5` rule shares a `user_tx` with transfers. Admission would judge those transfers against the policy being replaced. |
