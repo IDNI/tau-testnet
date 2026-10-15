@@ -120,6 +120,26 @@ class _Capture:
         return False
 
 
+def _unwrap(res):
+    return (res.value if res else None), res.report
+
+
+def _report_summary(*reports) -> dict:
+    reports = [r for r in reports if r is not None]
+    return {
+        "errors": [str(e) for r in reports for e in r.errors],
+        "warnings": [str(w) for r in reports for w in r.warnings],
+        "codes": [int(c) for r in reports for c in r.codes],
+        "has_error": any(bool(r.has_error) for r in reports),
+        "awaiting_input": any(bool(r.awaiting_input) for r in reports),
+    }
+
+
+def _diag(cap_text: str, *reports) -> str:
+    extra = [t for t in (str(r).strip() for r in reports if r is not None) if t]
+    return "\n".join([t for t in [cap_text] if t] + extra)
+
+
 class _Session:
     def __init__(self, tau_module, binding_id: str):
         self.tau = tau_module
@@ -139,27 +159,37 @@ class _Session:
 
     def init(self, spec_text: str) -> dict:
         with _Capture() as cap:
-            self.itp = self.tau.get_interpreter(spec_text)
+            res = self.tau.get_interpreter(spec_text)
         self._bump()
+        self.itp = res.value if res else None
+        diag = _diag(cap.text, res.report)
+        summary = _report_summary(res.report)
         if self.itp is None:
             self.healthy = False
             return {"ok": False, "phase": "interpreter_construction",
-                    "diagnostics": cap.text, "capture_complete": cap.complete}
+                    "diagnostics": diag, "report": summary,
+                    "capture_complete": cap.complete}
         return {"ok": True, "phase": "interpreter_construction",
-                "diagnostics": cap.text, "capture_complete": cap.complete,
-                **self.observe()}
+                "diagnostics": diag, "report": summary,
+                "capture_complete": cap.complete, **self.observe()}
 
     def _one_step(self, assignments: dict):
         """One prompt+step, both boundaries captured together."""
+        asked = outs = None
+        reports = []
         with _Capture() as cap:
-            asked = self.tau.get_inputs_for_step(self.itp)
-            vals = {}
-            for slot in asked or []:
-                vals[slot] = assignments.get(slot.name, "F" if slot.name == "i0" else "0")
-            outs = self.tau.step(self.itp, vals) if asked is not None else None
+            pres = self.tau.get_inputs_for_step(self.itp)
+            asked, prep = _unwrap(pres)
+            reports.append(prep)
+            if asked is not None:
+                vals = {}
+                for slot in asked:
+                    vals[slot] = assignments.get(slot.name, "F" if slot.name == "i0" else "0")
+                outs, srep = _unwrap(self.tau.step(self.itp, vals))
+                reports.append(srep)
         self._bump()
-        named = {k.name: str(v) for k, v in (outs or {}).items()} if outs else None
-        return named, [s.name for s in (asked or [])], cap
+        named = {k.name: str(v) for k, v in outs.items()} if outs is not None else None
+        return named, [s.name for s in (asked or [])], cap, reports
 
     def revise(self, candidate: str, candidate_id: str, max_offers: int = 16) -> dict:
         """Offer a candidate until the engine actually asks for i0.
@@ -177,23 +207,24 @@ class _Session:
         filler = []
         for _ in range(max_offers):
             with _Capture() as peek:
-                asked = self.tau.get_inputs_for_step(self.itp)
+                asked, _ = _unwrap(self.tau.get_inputs_for_step(self.itp))
             names = [s.name for s in (asked or [])]
             if "i0" in names:
                 break
             # Not offered i0 yet: advance with fallbacks and try again.
-            named, step_asked, cap = self._one_step({})
+            named, step_asked, cap, reps = self._one_step({})
             filler.append({"asked": step_asked, "outputs": named})
             if named is None:
                 return {
                     "ok": False, "outcome": INCOMPLETE, "candidate_id": candidate_id,
                     "consumed": False, "asked": step_asked, "outputs": None,
-                    "filler_steps": filler, "diagnostics": cap.text,
+                    "filler_steps": filler, "diagnostics": _diag(cap.text, *reps),
+                    "report": _report_summary(*reps),
                     "deferred_diagnostics": "", "capture_complete": cap.complete,
                     "binding_id": self.binding_id, **self.observe(),
                 }
 
-        named, asked, cap = self._one_step({"i0": candidate})
+        named, asked, cap, reps = self._one_step({"i0": candidate})
         delivered = "i0" in asked
         if not delivered:
             outcome = INCOMPLETE
@@ -220,7 +251,8 @@ class _Session:
             "asked": asked,
             "outputs": named,
             "filler_steps": filler,
-            "diagnostics": cap.text,
+            "diagnostics": _diag(cap.text, *reps),
+            "report": _report_summary(*reps),
             "deferred_diagnostics": drain.text,
             "capture_complete": bool(cap.complete and drain.complete),
             "binding_id": self.binding_id,
@@ -228,9 +260,11 @@ class _Session:
         }
 
     def step(self, assignments: dict) -> dict:
-        named, asked, cap = self._one_step(assignments or {})
+        named, asked, cap, reps = self._one_step(assignments or {})
         return {"ok": named is not None, "outputs": named, "asked": asked,
-                "diagnostics": cap.text, "capture_complete": cap.complete,
+                "diagnostics": _diag(cap.text, *reps),
+                "report": _report_summary(*reps),
+                "capture_complete": cap.complete,
                 **self.observe()}
 
 

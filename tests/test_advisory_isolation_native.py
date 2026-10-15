@@ -324,9 +324,9 @@ def cap(fn):
 router = "always ( " + open(os.path.join(os.environ["REPO_ROOT"], "genesis.tau")).read().strip() + " )."
 consensus = chain_state._preprocess_tau_spec_text(
     open(os.path.join(os.environ["REPO_ROOT"], "genesis_consensus.tau")).read())
-itp = cap(lambda: tau.get_interpreter(router))
+itp = cap(lambda: tau.get_interpreter(router)).value
 def step(i0=None):
-    ins = cap(lambda: tau.get_inputs_for_step(itp))
+    ins = cap(lambda: tau.get_inputs_for_step(itp)).value
     vals = {s: (i0 if (s.name == "i0" and i0) else ("F" if s.name == "i0" else "0")) for s in ins}
     return cap(lambda: tau.step(itp, vals))
 step(consensus)

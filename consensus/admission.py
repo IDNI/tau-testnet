@@ -1007,8 +1007,8 @@ def _screen_clause_domains(body: str) -> Optional[str]:
 
     # Approval slots may be read, but every occurrence must be typed bv[384].
     # Per-stream bitvector typing is process-global and sticky, so one clause
-    # typing i18 at bv[384] and another at bv[24] leaves get_interpreter
-    # returning None for everyone. Reject-unless-annotated, because an
+    # typing i18 at bv[384] and another at bv[24] makes get_interpreter
+    # fail for everyone. Reject-unless-annotated, because an
     # unannotated mention is exactly what lets the engine infer another width.
     slot_error = screen_slot_widths(body)
     if slot_error:

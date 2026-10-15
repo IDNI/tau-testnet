@@ -135,7 +135,7 @@ class TestGhostTxIntegration(unittest.TestCase):
     def test_rule_change_and_rejection(self, mock_sig, mock_tau):
         # Mock Tau Manager
         mock_tau.tau_ready.is_set.return_value = True
-        # Side effect to simulate Tau returning the "Updated specification" or createblock capturing it
+        # Side effect to simulate Tau returning a spec update or createblock capturing it
         def tau_side_effect(**kwargs):
             if kwargs.get('rule_text'):
                 # Simulate Tau accepting the rule

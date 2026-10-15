@@ -46,7 +46,7 @@ MAX_TRANSFER_VALUE = (1 << TRANSFER_VALUE_BV_WIDTH) - 1
 # o5 (user policy) and o8 (user custom fee) are the same width as the transfer
 # value streams. Per-stream bitvector typing is process-global and sticky: the
 # first unit that types o5 pins the interpreter, so a later bv[16] clause
-# leaves get_interpreter returning None for everyone. Reject-unless-annotated
+# leaves get_interpreter failing for everyone. Reject-unless-annotated
 # at admission and apply (consensus/approvals.py::screen_policy_widths).
 # o9 is pinned by the shipped genesis consensus rules; advertised here so
 # wallets stop scraping rule text for widths.
@@ -279,7 +279,7 @@ TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS = (13,)
 #
 # Width is FROZEN at bv[384] (a full pubkey; 0 = no vote). Per-stream bitvector
 # typing is process-global and sticky, so one rule typing i18 at bv[384] and
-# another at bv[24] leaves get_interpreter returning None for everyone --
+# another at bv[24] leaves get_interpreter failing for everyone --
 # measured, and it fails closed. The clause screen therefore rejects any slot
 # occurrence not annotated at exactly bv[384], unannotated ones included.
 APPROVAL_SLOT_BASE = 18

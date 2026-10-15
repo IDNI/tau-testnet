@@ -874,9 +874,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         next_active_consensus_id = parent_snapshot.metadata.get("active_consensus_id", "")
         if newly_active:
             # Route every activated revision through `i0` in declaration order.
-            # The genesis `i0 -> u` routing emits an `Updated specification:`
-            # marker on stdout and tau_native rebuilds the interpreter from
-            # that output, so the live spec advances exactly the same way it
+            # The genesis `i0 -> u` routing advances the interpreter's
+            # spec revision, so the live spec advances exactly the same way it
             # does for user_tx ops['0'] application-rule changes.
             #
             # Activation revisions intentionally do NOT trigger the
@@ -2564,10 +2563,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             # Live apply: a rule that did not land must not sit
                             # in the block and pay a fee. Replay keeps the
                             # historical inclusion (only a deterministic Tau
-                            # parse error still hard-rejects). The marker is
-                            # ANSI-wrapped by the engine, so match it with the
-                            # ANSI-aware helper, never a literal substring.
-                            if not replay_mode or tau_native.tau_reports_error(str(e)):
+                            # rule refusal still hard-rejects).
+                            if not replay_mode or isinstance(e, TauSpecRejected):
                                 accepted_in_block = False
                                 hard_reject = True
                                 tx_receipt["reason"] = "rule_not_applied"
