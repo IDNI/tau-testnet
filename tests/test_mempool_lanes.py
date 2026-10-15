@@ -216,6 +216,64 @@ def test_reserved_rows_are_not_reselected(temp_database):
     assert db.reserve_mempool_txs(limit=10) == []
 
 
+def _held(*hashes):
+    """The status of each named row."""
+    with db.get_db_connection() as conn:
+        return {h: conn.execute(
+            "SELECT status FROM mempool WHERE tx_hash = ?", (h,)).fetchone()[0]
+            for h in hashes}
+
+
+def test_excluded_hashes_are_skipped_and_the_batch_is_filled_from_the_rest(temp_database):
+    for i in range(5):
+        _add(_coin(sender=format(i, "096x")), f"coin-{i}", 1000 + i)
+
+    rows = db.reserve_mempool_txs(limit=3, exclude_hashes={"coin-0", "coin-2"})
+
+    assert [r["tx_hash"] for r in rows] == ["coin-1", "coin-3", "coin-4"]
+    assert _held("coin-0", "coin-2") == {"coin-0": "pending", "coin-2": "pending"}
+
+
+def test_an_excluded_row_takes_no_slot_in_the_slow_lane(temp_database):
+    _add(_rule(sender=format(1, "096x")), "rule-rich", 1000, estimated_fee=500)
+    _add(_rule(sender=format(2, "096x")), "rule-mid", 1001, estimated_fee=50)
+    _add(_rule(sender=format(3, "096x")), "rule-poor", 1002, estimated_fee=1)
+
+    rows = db.reserve_mempool_txs(limit=10, slow_limit=2, exclude_hashes=["rule-rich"])
+
+    assert [r["tx_hash"] for r in rows] == ["rule-mid", "rule-poor"]
+    assert _held("rule-rich") == {"rule-rich": "pending"}
+
+
+def test_an_excluded_fast_row_leaves_its_room_to_the_lanes_after_it(temp_database):
+    _add(_coin(sender=format(1, "096x")), "coin-0", 1000, estimated_fee=9)
+    _add(_coin(sender=format(2, "096x")), "coin-1", 1001, estimated_fee=1)
+    for i in range(3):
+        _add(_rule(sender=format(10 + i, "096x")), f"rule-{i}", 2000 + i)
+
+    rows = db.reserve_mempool_txs(limit=3, exclude_hashes={"coin-0"})
+
+    assert [r["tx_hash"] for r in rows] == ["coin-1", "rule-0", "rule-1"]
+
+
+def test_excluding_nothing_changes_nothing(temp_database):
+    for i in range(3):
+        _add(_coin(sender=format(i, "096x")), f"coin-{i}", 1000 + i)
+    for excluded in (None, (), set(), {"never-queued"}):
+        got = [r["tx_hash"] for r in db.reserve_mempool_txs(limit=10, exclude_hashes=excluded)]
+        assert got == ["coin-0", "coin-1", "coin-2"], excluded
+        db.reset_mempool_reservations()
+
+
+def test_the_exclusion_list_is_not_bound_by_the_sql_variable_limit(temp_database):
+    _add(_coin(), "coin-1", 1000)
+    crowd = {f"gone-{i}" for i in range(60_000)}
+    assert [r["tx_hash"] for r in db.reserve_mempool_txs(
+        limit=10, exclude_hashes=crowd | {"coin-1"})] == []
+    assert [r["tx_hash"] for r in db.reserve_mempool_txs(
+        limit=10, exclude_hashes=crowd)] == ["coin-1"]
+
+
 # --- eviction ---------------------------------------------------------------
 
 def test_slow_lane_eviction_spares_the_fast_lane(temp_database, monkeypatch):

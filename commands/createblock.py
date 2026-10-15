@@ -392,9 +392,9 @@ def _speculative_proposal(candidate_rules=()):
     )
 
 
-#: A transaction whose evaluation outran the mining budget sits out a backoff
-#: that doubles with every further overrun, so one slow transaction cannot stall
-#: every round the miner retries.
+#: A transaction held when the evaluator was lost, or whose evaluation outran the
+#: mining budget, sits out a backoff that doubles with every further strike, so
+#: one transaction that breaks or stalls the worker cannot stall every round.
 DEFER_BASE_SECONDS = 60
 DEFER_CAP_SECONDS = 3600
 
@@ -422,37 +422,35 @@ def _defer(tx_hash: str) -> tuple:
     return strikes, delay
 
 
-def _skip_deferred(reserved_txs: List[Dict]) -> List[Dict]:
-    if not _deferred:
-        return reserved_txs
+def _backing_off() -> set:
     now = _now()
     _prune_deferred(now)
-    held = [rtx for rtx in reserved_txs
-            if _deferred.get(rtx.get("tx_hash"), (0, 0.0))[1] > now]
-    if not held:
-        return reserved_txs
-    db.unreserve_mempool_txs([rtx["id"] for rtx in held])
-    held_ids = {rtx["id"] for rtx in held}
-    return [rtx for rtx in reserved_txs if rtx["id"] not in held_ids]
+    return {tx_hash for tx_hash, (_, eligible_at) in _deferred.items()
+            if eligible_at > now}
 
 
-def _defer_overrun(exc, execution_transactions, row_ids, reserved_txs) -> None:
-    """The transaction stays pending: a timeout is never a verdict about it."""
-    if not (isinstance(exc, EvaluatorLost) and exc.timed_out):
+def _defer_lost(exc, execution_transactions, row_ids, reserved_txs) -> None:
+    """The transaction stays pending: a lost evaluator is never a verdict about
+    it, and retrying it at once would lose the evaluator again."""
+    if not isinstance(exc, EvaluatorLost) or (exc.tx_id is None and not exc.timed_out):
         return
     hashes = {rtx["id"]: rtx.get("tx_hash") for rtx in reserved_txs}
     owners = [hashes.get(row_ids[i]) for i, tx in enumerate(execution_transactions)
               if isinstance(tx, dict) and tau_proposal.branch_id(tx, i) == exc.tx_id]
     owners = [tx_hash for tx_hash in owners if tx_hash]
+    if exc.timed_out:
+        what = f"a request outran the {config.MINING_BUDGET}s mining budget"
+        cause = f"outran the {config.MINING_BUDGET}s mining budget"
+    else:
+        what = "the evaluator was lost"
+        cause = f"was being evaluated when the evaluator was lost ({exc})"
     if not owners:
-        logger.warning("createblock: a request outran the %ss mining budget but no "
-                       "queued transaction owns %r; nothing deferred",
-                       config.MINING_BUDGET, exc.tx_id)
+        logger.warning("createblock: %s but no queued transaction owns %r; "
+                       "nothing deferred", what, exc.tx_id)
     for tx_hash in owners:
         strikes, delay = _defer(tx_hash)
-        logger.warning("createblock: transaction %s outran the %ss mining budget; "
-                       "deferred for %ss (strike %d)",
-                       tx_hash, config.MINING_BUDGET, delay, strikes)
+        logger.warning("createblock: transaction %s %s; deferred for %ss (strike %d)",
+                       tx_hash, cause, delay, strikes)
 
 
 def create_block_from_mempool(allow_empty: bool = False) -> Dict:
@@ -558,8 +556,8 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
             consensus_rule_budget if slow_limit is None
             else min(slow_limit, consensus_rule_budget)
         )
-    reserved_txs = _skip_deferred(
-        db.reserve_mempool_txs(limit=1000, slow_limit=slow_limit)
+    reserved_txs = db.reserve_mempool_txs(
+        limit=1000, slow_limit=slow_limit, exclude_hashes=_backing_off()
     )
     print(f"[INFO][createblock] Reserved {len(reserved_txs)} entries from mempool")
 
@@ -984,7 +982,7 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
             _db.unreserve_mempool_txs(reserved_ids)
             if sim_proposal is not None:
                 sim_proposal.dispose()
-            _defer_overrun(e, execution_transactions, filtered_reserved_ids, reserved_txs)
+            _defer_lost(e, execution_transactions, filtered_reserved_ids, reserved_txs)
         msg = str(e)
         return {"error": msg, "message": msg}
         

@@ -207,10 +207,10 @@ def test_unavailable_native_is_operational_not_a_verdict(tmp_path):
         write({"ok": False, "unavailable": True, "error": "native tau unavailable",
                "request_id": req["request_id"], "state_revision": 1})
     ''')
-    with pytest.raises(spec.SpeculationError) as exc:
+    with pytest.raises(spec.WorkerLost) as exc:
         s.state()
     assert "unavailable" in str(exc.value)
-    s.kill()
+    _assert_lost_and_reaped(s)
 
 
 def test_a_receipt_naming_another_candidate_is_rejected(tmp_path):

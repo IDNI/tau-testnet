@@ -370,46 +370,61 @@ def test_strikes_start_over_after_a_deferral_has_been_forgotten(clock):
     assert createblock._defer("h") == (1, 60)
 
 
-def test_only_rows_still_backing_off_are_given_back(clock):
-    rows = [{"id": 1, "tx_hash": "a"}, {"id": 2, "tx_hash": "b"}, {"id": 3, "tx_hash": "c"}]
+def test_only_hashes_still_backing_off_are_excluded_from_the_selection(clock):
     createblock._defer("b")
-    with patch.object(createblock.db, "unreserve_mempool_txs") as unreserve:
-        assert createblock._skip_deferred(rows) == [rows[0], rows[2]]
-        unreserve.assert_called_once_with([2])
-        clock.now += 61
-        unreserve.reset_mock()
-        assert createblock._skip_deferred(rows) == rows
-        unreserve.assert_not_called()
+    createblock._defer("c")
+    assert createblock._backing_off() == {"b", "c"}
+    clock.now += 61
+    assert createblock._backing_off() == set()
+    assert createblock._backing_off() == set(), "an elapsed deferral came back"
+
+
+def test_a_deferral_that_was_never_registered_excludes_nothing(clock):
+    assert createblock._backing_off() == set()
 
 
 def test_an_overrun_is_attributed_through_the_id_the_engine_opened():
     rows = [{"id": 10, "tx_hash": "h0"}, {"id": 11, "tx_hash": "h1"}, {"id": 12, "tx_hash": "h2"}]
     batch = [{"tx_id": "own-id"}, {"tx_id": "h1"}, {}]
     lost = EvaluatorLost("evaluator lost", tx_id="own-id", timed_out=True)
-    createblock._defer_overrun(lost, batch, [10, 11, 12], rows)
+    createblock._defer_lost(lost, batch, [10, 11, 12], rows)
     assert set(createblock._deferred) == {"h0"}
     createblock._deferred.clear()
-    createblock._defer_overrun(EvaluatorLost("x", tx_id="tx2", timed_out=True),
-                               batch, [10, 11, 12], rows)
+    createblock._defer_lost(EvaluatorLost("x", tx_id="tx2", timed_out=True),
+                            batch, [10, 11, 12], rows)
     assert set(createblock._deferred) == {"h2"}
 
 
 def test_an_overrun_nobody_owns_defers_nothing(caplog):
     rows = [{"id": 10, "tx_hash": "h0"}]
     with caplog.at_level(logging.WARNING, logger=createblock.logger.name):
-        createblock._defer_overrun(EvaluatorLost("x", tx_id="ghost", timed_out=True),
-                                   [{"tx_id": "h0"}], [10], rows)
-        createblock._defer_overrun(EvaluatorLost("x", tx_id=None, timed_out=True),
-                                   [{"tx_id": "h0"}], [10], rows)
+        createblock._defer_lost(EvaluatorLost("x", tx_id="ghost", timed_out=True),
+                                [{"tx_id": "h0"}], [10], rows)
+        createblock._defer_lost(EvaluatorLost("x", tx_id=None, timed_out=True),
+                                [{"tx_id": "h0"}], [10], rows)
     assert createblock._deferred == {}
     assert "nothing deferred" in caplog.text
 
 
-def test_only_a_timeout_is_deferred():
+def test_only_an_evaluator_lost_naming_a_transaction_is_deferred():
     rows = [{"id": 10, "tx_hash": "h0"}]
-    for failure in (EvaluatorLost("x", tx_id="h0", timed_out=False), RuntimeError("x")):
-        createblock._defer_overrun(failure, [{"tx_id": "h0"}], [10], rows)
+    for failure in (RuntimeError("x"), EvaluatorLost("x", tx_id=None),
+                    EvaluatorLost("x", tx_id=None, timed_out=False)):
+        createblock._defer_lost(failure, [{"tx_id": "h0"}], [10], rows)
     assert createblock._deferred == {}
+    createblock._defer_lost(EvaluatorLost("x", tx_id="h0", timed_out=False),
+                            [{"tx_id": "h0"}], [10], rows)
+    assert set(createblock._deferred) == {"h0"}
+
+
+def test_a_loss_nobody_owns_defers_nothing_and_says_so(caplog):
+    rows = [{"id": 10, "tx_hash": "h0"}]
+    with caplog.at_level(logging.WARNING, logger=createblock.logger.name):
+        createblock._defer_lost(EvaluatorLost("x", tx_id="ghost", timed_out=False),
+                                [{"tx_id": "h0"}], [10], rows)
+    assert createblock._deferred == {}
+    assert "evaluator was lost" in caplog.text and "nothing deferred" in caplog.text
+    assert "mining budget" not in caplog.text
 
 
 def test_the_branch_ids_the_owners_derive_are_the_ones_the_engine_opens(temp_database):
@@ -574,9 +589,34 @@ def test_a_second_timeout_doubles_the_backoff(node_state, clock):
     assert "error" not in out and out["message"].startswith("Mempool is empty"), out
 
 
-def test_a_plain_loss_aborts_the_round_without_deferring(node_state, clock):
-    tx_hash = wl._queued_transfer("plain")
-    out = wl._mine_with(_slow_on(tx_hash, failure=lambda: spec.WorkerLost(wl.LOST)))
+def test_a_plain_loss_naming_a_transaction_defers_it_like_a_timeout(
+        node_state, clock, caplog):
+    """A transaction that kills the worker every time would otherwise stall every
+    round the miner retries."""
+    slow = wl._queued_transfer("plain")
+    fast = wl._queued_transfer("fast")
+    with caplog.at_level(logging.WARNING, logger=createblock.logger.name):
+        out = wl._mine_with(_slow_on(slow, failure=lambda: spec.WorkerLost(wl.LOST)))
+    assert "evaluator lost" in out["error"], out
+    assert createblock._deferred == {slow: (1, clock.now + createblock.DEFER_BASE_SECONDS)}
+    _queued(slow)
+    _queued(fast)
+
+    lines = [r.getMessage() for r in caplog.records if "deferred for" in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert slow in lines[0] and "evaluator was lost" in lines[0] and wl.LOST in lines[0]
+    assert "mining budget" not in lines[0], "a plain loss was reported as a timeout"
+
+    mined = wl._mine_with(_healthy)
+
+    assert "block_hash" in mined, mined
+    assert _mined() == [fast]
+    _queued(slow)
+
+
+def test_a_loss_with_no_transaction_in_evaluation_defers_nothing(node_state, clock):
+    tx_hash = wl._queued_transfer("between")
+    out = wl._mine_with(wl._lose)
     assert "evaluator lost" in out["error"], out
     assert createblock._deferred == {}
     _queued(tx_hash)
@@ -585,6 +625,80 @@ def test_a_plain_loss_aborts_the_round_without_deferring(node_state, clock):
 
     assert "block_hash" in mined, mined
     assert _mined() == [tx_hash]
+
+
+@pytest.fixture
+def reservations(monkeypatch):
+    """What each reservation was told to leave out, what it took, and the
+    status the deferred rows held at that moment."""
+    real = db.reserve_mempool_txs
+    seen = []
+
+    def spy(*args, **kwargs):
+        rows = real(*args, **kwargs)
+        excluded = set(kwargs.get("exclude_hashes") or ())
+        seen.append({
+            "exclude": excluded,
+            "taken": [row["tx_hash"] for row in rows],
+            "status": {h: (db.get_mempool_entry(h) or {}).get("status") for h in excluded},
+        })
+        return rows
+
+    monkeypatch.setattr(db, "reserve_mempool_txs", spy)
+    return seen
+
+
+def test_the_reservation_is_told_which_transactions_are_backing_off(
+        node_state, clock, reservations):
+    slow = wl._queued_transfer("slow")
+    fast = wl._queued_transfer("fast")
+    wl._mine_with(_slow_on(slow))
+    wl._mine_with(_healthy)
+
+    first, second = reservations
+    assert first["exclude"] == set() and set(first["taken"]) == {slow, fast}
+    assert second["exclude"] == {slow}
+    assert second["taken"] == [fast], "a deferred transaction was reserved"
+    assert second["status"] == {slow: "pending"}, "a deferred transaction was held"
+
+
+def test_a_transaction_is_reserved_again_once_its_backoff_has_elapsed(
+        node_state, clock, reservations):
+    slow = wl._queued_transfer("slow")
+    wl._mine_with(_slow_on(slow))
+    clock.now += createblock.DEFER_BASE_SECONDS + 1
+    wl._mine_with(_healthy)
+
+    assert reservations[-1]["exclude"] == set()
+    assert reservations[-1]["taken"] == [slow]
+
+
+def test_a_deferred_transaction_is_never_reserved_while_it_backs_off(
+        node_state, clock, reservations):
+    slow = wl._queued_transfer("slow")
+    wl._mine_with(_slow_on(slow))
+    with patch.object(createblock.db, "unreserve_mempool_txs") as unreserve:
+        for _ in range(3):
+            out = wl._mine_with(_healthy)
+            assert out["message"].startswith("Mempool is empty"), out
+    assert all(slow not in seen["taken"] for seen in reservations[1:])
+    unreserve.assert_not_called()
+
+
+def test_a_deferred_rule_transaction_does_not_hold_the_slow_lane_slot(
+        node_state, clock, reservations, monkeypatch):
+    from test_mempool_lanes import _add, _rule
+
+    monkeypatch.setattr(config, "BLOCK_MAX_RULE_TXS", 1)
+    _add(_rule(sender="aa" * 48), "rule-rich", 1000, estimated_fee=500)
+    _add(_rule(sender="bb" * 48), "rule-poor", 1001, estimated_fee=1)
+    createblock._defer("rule-rich")
+
+    wl._mine_with(_healthy)
+
+    assert reservations[0]["exclude"] == {"rule-rich"}
+    assert reservations[0]["taken"] == ["rule-poor"], (
+        "the deferred rule transaction took the only slow-lane slot")
 
 
 def test_a_deferred_transaction_is_never_dropped_or_reported_rejected(node_state, clock):

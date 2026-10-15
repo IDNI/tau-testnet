@@ -375,7 +375,7 @@ Operational extras: `TAU_MAX_MEMPOOL_TXS` (5000), `TAU_MEMPOOL_RULE_LANE_MAX_FRA
 
 Real Tau evaluation is **enabled by default**. Setting `TAU_FORCE_TEST=1` bypasses the real engine and uses a deterministic mock validator path — for development/CI only (the test suite sets it automatically). Booting with `TAU_FORCE_TEST=1` **and** `TAU_ENV=production` is refused.
 
-When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker), the node holds a single `tau::interpreter` instance and reads state updates from its output streams. The interpreter is process-global and Tau calls are serialized; a watchdog (`TAU_COMM_TIMEOUT`) kills a stalled in-process evaluation, while block evaluation runs in worker processes bounded per request by `TAU_MINING_BUDGET` and `TAU_VALIDATION_CEILING`. A native segfault under sustained use is a known alpha risk and is **not** isolated — it can stop the node process (see [Security & risk model](#security--risk-model)).
+When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker), the node holds a single `tau::interpreter` instance and reads state updates from its output streams. The interpreter is process-global and Tau calls are serialized; a watchdog (`TAU_COMM_TIMEOUT`) kills a stalled in-process evaluation, while block evaluation runs in worker processes bounded per request by `TAU_MINING_BUDGET` and `TAU_VALIDATION_CEILING`. A native segfault inside a block-evaluation worker is contained: the worker is lost and the attempt is operational, never a verdict on a transaction or a block. The in-process interpreter, which holds the consensus rules and answers the header and eligibility fallbacks, can still take the node process down (see [Security & risk model](#security--risk-model)).
 
 ---
 
@@ -726,13 +726,13 @@ This is **alpha, non-finalized PoA**. Tokens have no value; the cryptography and
 - **Authentication** — transport is libp2p (Ed25519 peer identity). The application handshake gates peers on matching `network_id` **and** `genesis_hash`; a peer presenting an empty/missing or mismatching genesis is rejected once this node has a genesis (fork protection).
 - **Block/tx relay** — gossiped transactions pass through the same admission path as RPC submissions; blocks are fully validated (proposer signature, validator-set membership, `state_hash`, fees) before they can affect the canonical head. Invalid blocks are rejected and never committed, but there is **no peer scoring/banning yet** — a peer can keep re-sending junk (throttled only at the libp2p connection level, `TAU_RATE_LIMIT_PER_PEER`).
 - **DHT records are discovery hints, not trusted consensus data** — advertised state is re-validated against the local chain before use; provider/peer records are capped and truncated on intake to bound poisoning.
-- **Not yet addressed** — eclipse/Sybil resistance (bootstrap peers are trusted for discovery), per-peer block/header quarantine, and a per-object Tau-evaluation budget beyond the global watchdog.
+- **Not yet addressed** — eclipse/Sybil resistance (bootstrap peers are trusted for discovery) and per-peer block/header quarantine.
 
 ### RPC / WebSocket exposure
 
 RPC (TCP, default `127.0.0.1:65432`) and WebSocket (`+1` → `65433`) bind to `TAU_HOST`. There is **no per-call authentication**; the only network gate is that `createblock` is refused from non-loopback clients (and always over WS) unless `TAU_ALLOW_REMOTE_CREATEBLOCK=true`, decided from the real socket peer address (not header-spoofable). The web wallet keeps private keys client-side and signs locally — keys are never sent to the node. Treat RPC/WS as a loopback / trusted-LAN surface; front it with TLS and an origin allowlist if you must expose it.
 
-**Known alpha risks:** no economic finality; no slashing; possible deep reorgs; unaudited cryptography and consensus; **no cross-network signature domain separation** (do not reuse keys across networks); a sustained Tau run can hit a **native segfault that stops the node process** (no process isolation yet); and a voted-in consensus rule that emits an invalid `o9` (or otherwise fails at runtime) can **halt progress at a height** until governance corrects it.
+**Known alpha risks:** no economic finality; no slashing; possible deep reorgs; unaudited cryptography and consensus; **no cross-network signature domain separation** (do not reuse keys across networks); a native segfault in the in-process consensus interpreter **stops the node process** (block evaluation runs in isolated workers); and a voted-in consensus rule that emits an invalid `o9` (or otherwise fails at runtime) can **halt progress at a height** until governance corrects it.
 
 ---
 
