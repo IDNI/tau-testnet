@@ -305,8 +305,10 @@ def test_a_failing_history_write_never_raises(temp_database, monkeypatch):
 
 
 class _Result:
+    """The snapshot a block's evaluation produced; events ride in its metadata."""
+
     def __init__(self, events):
-        self.governance_changes = {"retractable_events": events}
+        self.metadata = {"retractable_events": events}
 
 
 class _Block:
@@ -329,3 +331,10 @@ def test_chain_state_hook_records_the_apply_events(temp_database):
         _Block(), _Result([(rid, "parked"), ("34" * 32, "released")]))
     _head("a2", 2)
     assert [e["outcome"] for e in db.get_canonical_retractable_events(rid)] == ["parked"]
+
+
+def test_a_snapshot_without_events_records_nothing(monkeypatch):
+    seen = []
+    monkeypatch.setattr(db, "record_retractable_events", lambda *a: seen.append(a))
+    chain_state._record_retractable_events(_Block(), TauStateSnapshot(state_hash="s", tau_bytes=b"", metadata={}))
+    assert seen == []

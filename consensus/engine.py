@@ -1036,7 +1036,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "last_transfer_ts": t_lts,
                 "lifecycle_manager": lm,
                 "consensus_rules_state": next_cons_rules,
-                "active_consensus_id": next_active_consensus_id
+                "active_consensus_id": next_active_consensus_id,
+                "retractable_events": retractable_events,
             }
         )
         

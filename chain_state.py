@@ -546,12 +546,14 @@ def _retractable_state(lm) -> dict:
     }
 
 
-def _record_retractable_events(block, apply_result) -> None:
-    """Best-effort history write; the apply verdict is already final."""
+def _record_retractable_events(block, next_snapshot) -> None:
+    """Best-effort history write; the apply verdict is already final.
+
+    Read from the snapshot, not the apply result: a block that reuses its own
+    evaluation has no apply result.
+    """
     try:
-        events = (getattr(apply_result, "governance_changes", None) or {}).get(
-            "retractable_events"
-        )
+        events = (getattr(next_snapshot, "metadata", None) or {}).get("retractable_events")
         if events:
             db.record_retractable_events(
                 block.block_hash, block.header.block_number, list(events)
@@ -1070,7 +1072,7 @@ def _process_new_block_locked(block: Block) -> bool:
                 _swap_in_memory_state(next_snapshot, block)
                 db.save_canonical_state_atomically(**_canonical_rows)
 
-            _record_retractable_events(block, apply_result)
+            _record_retractable_events(block, next_snapshot)
 
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
@@ -1346,7 +1348,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                                       stored_hash=block.header.state_hash,
                                       reason="state_hash invariant mismatch")
 
-            _record_retractable_events(block, apply_result)
+            _record_retractable_events(block, next_snapshot)
 
             if _enabled:
                 # The block's evaluator history becomes durable exactly as a live
