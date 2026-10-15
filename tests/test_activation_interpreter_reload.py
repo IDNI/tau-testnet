@@ -90,3 +90,55 @@ def test_reload_failure_does_not_break_block_processing():
         if not was_set:
             tau_manager.tau_ready.clear()
         os.remove(path)
+
+
+# --- worker-backed authority: the in-process interpreter is consensus-only ----
+
+class _Owner:
+    enabled = True
+
+
+def _authority_reload(plan, *, held, consensus="C"):
+    path = _with_program_file()
+    was_set = tau_manager.tau_ready.is_set()
+    tau_manager.tau_ready.set()
+    original = (config.TAU_PROGRAM_FILE, chain_state._inprocess_consensus_text,
+                chain_state._consensus_rules_state)
+    config.TAU_PROGRAM_FILE = path
+    chain_state._inprocess_consensus_text = held
+    chain_state._consensus_rules_state = consensus
+    try:
+        with patch.object(chain_state.tau_authority, "owner", return_value=_Owner()), \
+             patch.object(tau_manager, "restore_full_tau_spec") as restore, \
+             patch.object(chain_state, "get_tau_restore_plan", return_value=plan), \
+             patch.object(chain_state, "replay_tau_restore_plan") as replay, \
+             patch.object(chain_state, "_preprocess_tau_spec_text", side_effect=lambda t: t):
+            chain_state.reload_consensus_interpreter_from_state()
+        return restore, replay
+    finally:
+        (config.TAU_PROGRAM_FILE, chain_state._inprocess_consensus_text,
+         chain_state._consensus_rules_state) = original
+        if not was_set:
+            tau_manager.tau_ready.clear()
+        os.remove(path)
+
+
+MIXED_PLAN = [
+    {"label": "consensus_rules", "text": "C", "persist": False},
+    {"label": "application_rule_1", "text": "A", "persist": False},
+    {"label": "builtin_rule_1", "text": "B", "persist": False},
+    {"label": "rule_composite_o5", "text": "X", "persist": False},
+]
+
+
+def test_reload_under_authority_replays_the_consensus_unit_only():
+    restore, replay = _authority_reload(MIXED_PLAN, held="old")
+    restore.assert_called_once()
+    replay.assert_called_once()
+    assert [e["label"] for e in replay.call_args.args[0]] == ["consensus_rules"]
+
+
+def test_reload_under_authority_is_idempotent_for_unchanged_consensus():
+    restore, replay = _authority_reload(MIXED_PLAN, held="C")
+    restore.assert_not_called()
+    replay.assert_not_called()

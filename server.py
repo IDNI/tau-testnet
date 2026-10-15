@@ -841,20 +841,29 @@ def _run_server(container: ServiceContainer):
 
         try:
             if use_persisted_state:
-                if persisted_full_spec:
+                if persisted_full_spec and not authority_enabled:
                     logger.info("Restoring Tau spec from chain state (len=%s)...", len(persisted_full_spec))
                     tau_module.restore_full_tau_spec(persisted_full_spec)
                     logger.info("Tau restore completed via chain state snapshot.")
                     return
 
-            restore_plan = chain_state_module.get_tau_restore_plan(use_persisted_state=use_persisted_state)
+            if authority_enabled:
+                restore_plan = chain_state_module.advisory_restore_plan(
+                    use_persisted_state=use_persisted_state)
+            else:
+                restore_plan = chain_state_module.get_tau_restore_plan(use_persisted_state=use_persisted_state)
             if restore_plan:
                 logger.info("Replaying %s Tau rule update(s) via i0 after bootstrap from %s...", len(restore_plan), config.TAU_PROGRAM_FILE)
                 # Shared with the rebuild-from-genesis path so both reconstruct
                 # an identical interpreter (consensus o6/o7 + application + builtin).
-                persist_needed = chain_state_module.replay_tau_restore_plan(
-                    restore_plan, source_prefix="startup"
-                )
+                if authority_enabled:
+                    persist_needed = chain_state_module.replay_advisory_restore_plan(
+                        restore_plan, source_prefix="startup"
+                    )
+                else:
+                    persist_needed = chain_state_module.replay_tau_restore_plan(
+                        restore_plan, source_prefix="startup"
+                    )
 
                 if persist_needed and not authority_enabled:
                     # With worker-backed authority the in-process interpreter is

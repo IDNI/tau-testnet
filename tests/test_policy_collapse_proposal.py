@@ -370,7 +370,7 @@ def _sync(entries, mirror):
                       side_effect=mirror.restore_full_tau_spec), \
          patch.object(chain_state.tau_manager, "communicate_with_tau",
                       side_effect=mirror.communicate_with_tau):
-        chain_state._sync_advisory_mirror(prepared)
+        chain_state._sync_inprocess_consensus(prepared)
 
 
 def test_the_mirror_restarts_from_the_last_reset_and_skips_what_came_before(tmp_path):
@@ -439,6 +439,6 @@ def test_the_mirror_is_left_alone_in_test_mode():
     with patch.object(chain_state.tau_manager, "tau_test_mode", True), \
          patch.object(chain_state.tau_manager, "restore_full_tau_spec") as restore, \
          patch.object(chain_state.tau_manager, "communicate_with_tau") as feed:
-        chain_state._sync_advisory_mirror(prepared)
+        chain_state._sync_inprocess_consensus(prepared)
 
     assert restore.call_count == 0 and feed.call_count == 0
