@@ -941,7 +941,10 @@ class TauInterface:
             if not isinstance(rev, str) or not rev.strip():
                 continue
 
-            prepared_rev = cls._normalize_assignment_value(rev, allow_hex_literal=False)
+            # Same normalization the live apply path gives a revision.
+            prepared_rev = cls._normalize_assignment_value(
+                cls.preprocess_spec_text(rev), allow_hex_literal=False
+            )
             rev_consumed = False
 
             # Bounded lazy-prompt loop matching _run_step's shape: keep feeding
