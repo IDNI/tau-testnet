@@ -138,10 +138,10 @@ def test_a_worker_session_writes_only_to_its_proposal_journal():
     import tau_session as ts
 
     class _FakeSpec:
-        def revise(self, text, cid):
+        def revise(self, text, cid, **kwargs):
             return {"outcome": "ACCEPTED_CHANGED", "ok": True}
 
-        def step(self, inputs):
+        def step(self, inputs, **kwargs):
             return {"outputs": {"o5": "1"}}
 
         def kill(self):

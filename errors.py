@@ -63,7 +63,15 @@ class EvaluatorLost(TauTestnetError):
 
     The typed, catchable form of `tau_speculation.WorkerLost`, raised at the
     boundary that owns the proposal. Operational and node-local, never a verdict.
+
+    `timed_out` says the worker was killed for outrunning its budget, and
+    `tx_id` names the transaction that held the evaluator when it went.
     """
+
+    def __init__(self, *args, tx_id=None, timed_out=False):
+        super().__init__(*args)
+        self.tx_id = tx_id
+        self.timed_out = timed_out
 
 
 class BlockchainBug(TauTestnetError):

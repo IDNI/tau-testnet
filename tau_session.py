@@ -20,6 +20,7 @@ engine did before, with the calls named and recorded.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 
 import tau_journal
@@ -40,6 +41,10 @@ def _shrink_width():
 
 #: Revision outcomes that mean the engine took the candidate.
 _ACCEPTED = ("ACCEPTED_CHANGED", "ACCEPTED_NOOP")
+
+#: A replay entry this slow is logged: replay time is what a restart, a
+#: proposal and an admission context each pay, and it has no deadline.
+SLOW_REPLAY_SECONDS = 10.0
 
 
 class StepRefused(RuntimeError):
@@ -235,6 +240,10 @@ class WorkerSession(EvaluatorSession):
     """
 
     is_speculative = True
+
+    #: Per-request deadline in seconds, set by the transaction branch that holds
+    #: this session. None is no deadline, which is how every replay runs.
+    request_budget = None
 
     def __init__(self, spec_session, log=None, normalize=None, journal=None,
                  allocation=None, plan=None):
@@ -437,7 +446,8 @@ class WorkerSession(EvaluatorSession):
                     plan=self.plan,
                 )
             runtime_text = prepared.runtime_text
-            receipt = self._spec.revise(runtime_text, "apply")
+            receipt = self._spec.revise(runtime_text, "apply",
+                                        timeout=self.request_budget)
         self.last_outcome = receipt
         identity = tau_journal.candidate_identity(
             rule_text, mapping_epoch=self.allocation.epoch,
@@ -488,7 +498,8 @@ class WorkerSession(EvaluatorSession):
     def evaluate(self, inputs, *, target=None, source="unknown", multi=False,
                  apply_rules_update=False, record=True):
         with self._allocating():
-            result = self._spec.step(self._named_inputs(inputs))
+            result = self._spec.step(self._named_inputs(inputs),
+                                     timeout=self.request_budget)
         self.last_step = result
         if not result.get("ok", True):
             # The engine REFUSED the step: nothing advanced, nothing was
@@ -571,6 +582,7 @@ def replay_entries(session, entries, *, respawn, expected=None,
 
 
 def _replay(session, entries, *, respawn, expected, start_at_last_reset):
+    began = time.monotonic()
     begin = 0
     if start_at_last_reset:
         last = tau_journal.last_reset_index(entries)
@@ -580,6 +592,7 @@ def _replay(session, entries, *, respawn, expected, start_at_last_reset):
         session = respawn()
     for index in range(begin, len(entries)):
         entry = entries[index]
+        entry_began = time.monotonic()
         if entry.kind == tau_journal.RESET:
             fresh = respawn()
             for text, persist in entry.units:
@@ -603,11 +616,17 @@ def _replay(session, entries, *, respawn, expected, start_at_last_reset):
         else:
             observed = session.evaluate(entry.inputs, multi=True, record=False)
             outcome = None
+        took = time.monotonic() - entry_began
+        if took >= SLOW_REPLAY_SECONDS:
+            logger.warning("replay: entry %s (%s) took %.1fs", entry.seq, entry.kind, took)
         if expected is not None:
             seq, fingerprint = expected[index]
             tau_journal.compare(fingerprint, observed, seq=seq, outcome=outcome)
     if session is None:
         session = respawn()
+    total = time.monotonic() - began
+    if total >= SLOW_REPLAY_SECONDS:
+        logger.info("replay: %d entries took %.1fs", len(entries) - begin, total)
     return session
 
 

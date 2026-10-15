@@ -54,6 +54,10 @@ from tau_session import StepRefused  # noqa: E402 - re-exported: the engine refu
 from tau_speculation import WorkerLost  # noqa: E402
 
 
+#: A standby replays the history since the last reset, which no request is asked
+#: to wait for, so its build gets this many request budgets.
+STANDBY_BUDGET_FACTOR = 3
+
 #: Contexts evaluating at once. Each is a process holding a native interpreter,
 #: so a burst of submissions must queue for a slot rather than fork without bound.
 MAX_CONCURRENT = 4
@@ -403,13 +407,25 @@ class _Standby:
             self._building = True
 
         def _run():
+            deadline = _Deadline(STANDBY_BUDGET_FACTOR * default_budget())
             try:
-                session, anchor, plan = _build(
-                    candidate_rules=(), label="admission-standby", deadline=None,
-                    cwd=cwd, env=env, store=store,
-                )
+                try:
+                    session, anchor, plan = _build(
+                        candidate_rules=(), label="admission-standby",
+                        deadline=deadline, cwd=cwd, env=env, store=store,
+                    )
+                finally:
+                    # Before the context is stored: a live timer would later
+                    # kill the standby that is waiting for a request.
+                    deadline.cancel()
+                if deadline.expired:
+                    session.dispose()
+                    raise AdmissionTimeout("the standby budget ran out as the build finished")
             except (Exception, WorkerLost) as exc:
-                logger.info("admission standby not built: %s", exc)
+                if deadline.expired:
+                    logger.warning("admission standby build ran out of time: %s", exc)
+                else:
+                    logger.info("admission standby not built: %s", exc)
                 with self._lock:
                     self._building = False
                 return

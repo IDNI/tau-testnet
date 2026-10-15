@@ -73,19 +73,26 @@ class TimeoutSettings:
     comm_timeout: int = 60
     client_wait_timeout: int = 10
     shutdown_timeout: int = 1
-    # Ceiling for a single isolated rule/revision compile on the ADMISSION path.
-    # Must stay below the shipped client's own socket timeout
-    # (tau_testnet_cli.rpc.DEFAULT_TIMEOUT = 75s), or the client gives up first
-    # and never sees the structured ADMISSION_TIMEOUT (issue #23). It is also
-    # capped at comm_timeout by tau_native.admission_compile_timeout(). Block
-    # apply is not bounded by this — the activation-height compile there must
-    # run to completion.
+    # Below the shipped client's socket timeout (tau_testnet_cli.rpc.DEFAULT_TIMEOUT = 75s),
+    # or the client gives up before the structured ADMISSION_TIMEOUT arrives.
+    # tau_native.admission_compile_timeout also caps it at comm_timeout.
     admission_budget: int = 60
+    # Per Tau request while this node builds a block, so one slow transaction is
+    # deferred instead of stalling the miner. Block-level work and replays have no deadline.
+    mining_budget: int = 60
+    # Per Tau request while applying a received block; below mining_budget it
+    # would refuse an honest miner's block.
+    validation_ceiling: int = 600
 
     def validate(self) -> None:
         for name, value in asdict(self).items():
             if value <= 0:
                 raise ConfigurationError(f"Timeout '{name}' must be greater than zero (got {value}).")
+        if self.validation_ceiling < self.mining_budget:
+            raise ConfigurationError(
+                f"Timeout 'validation_ceiling' ({self.validation_ceiling}) must not be "
+                f"below 'mining_budget' ({self.mining_budget})."
+            )
 
 
 @dataclass
@@ -354,6 +361,8 @@ _ENV_VALUE_CASTERS: Dict[str, Any] = {
     "TAU_PROCESS_TIMEOUT": ("timeouts", "process_timeout", int),
     "TAU_COMM_TIMEOUT": ("timeouts", "comm_timeout", int),
     "TAU_ADMISSION_BUDGET": ("timeouts", "admission_budget", int),
+    "TAU_MINING_BUDGET": ("timeouts", "mining_budget", int),
+    "TAU_VALIDATION_CEILING": ("timeouts", "validation_ceiling", int),
     "TAU_CLIENT_WAIT_TIMEOUT": ("timeouts", "client_wait_timeout", int),
     "TAU_SHUTDOWN_TIMEOUT": ("timeouts", "shutdown_timeout", int),
     "TAU_DB_PATH": ("database", "path", str),
@@ -571,6 +580,7 @@ def _sync_legacy_exports(current: Settings) -> None:
     global HOST, PORT, BUFFER_SIZE, MAX_RPC_COMMAND_BYTES
     global TAU_PROGRAM_FILE, TAU_READY_SIGNAL, COMM_DEBUG_PATH, TAU_SHRINK_ENABLED, TAU_SHRINK_STREAM_EXCLUDE
     global PROCESS_TIMEOUT, COMM_TIMEOUT, CLIENT_WAIT_TIMEOUT, SHUTDOWN_TIMEOUT, ADMISSION_BUDGET
+    global MINING_BUDGET, VALIDATION_CEILING
     global STRING_DB_PATH
     global BOOTSTRAP_PEERS, NETWORK_ID, NETWORK_LISTEN, PEERSTORE_PATH, peerstore_path
     global DHT_RECORD_TTL, DHT_VALIDATOR_NAMESPACES, DHT_BOOTSTRAP_PEERS
@@ -597,6 +607,8 @@ def _sync_legacy_exports(current: Settings) -> None:
     CLIENT_WAIT_TIMEOUT = current.timeouts.client_wait_timeout
     SHUTDOWN_TIMEOUT = current.timeouts.shutdown_timeout
     ADMISSION_BUDGET = current.timeouts.admission_budget
+    MINING_BUDGET = current.timeouts.mining_budget
+    VALIDATION_CEILING = current.timeouts.validation_ceiling
 
     STRING_DB_PATH = current.database.path
 
@@ -672,6 +684,8 @@ __all__ = [
     "CLIENT_WAIT_TIMEOUT",
     "SHUTDOWN_TIMEOUT",
     "ADMISSION_BUDGET",
+    "MINING_BUDGET",
+    "VALIDATION_CEILING",
     "STRING_DB_PATH",
     "BOOTSTRAP_PEERS",
     "NETWORK_ID",
