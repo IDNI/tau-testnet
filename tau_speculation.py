@@ -17,12 +17,16 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import struct
 import subprocess
 import sys
 import threading
 
 _HDR = struct.Struct("!I")
+
+# A per-call `timeout=None` means no deadline, so "unset" needs its own marker.
+_SESSION_DEFAULT = object()
 
 ACCEPTED_CHANGED = "ACCEPTED_CHANGED"
 ACCEPTED_NOOP = "ACCEPTED_NOOP"
@@ -40,6 +44,11 @@ class SpeculationProtocolError(SpeculationError):
 class WorkerLost(BaseException):
     """The worker is gone. A BaseException so that no broad `except Exception`
     can report this node-local loss as a verdict on a rule or a transaction."""
+
+
+class WorkerTimeout(WorkerLost):
+    """A request outlived its deadline and the worker was killed. The answer is
+    unknown, so it is as operational as any other lost worker."""
 
 
 class RevisionReceipt(dict):
@@ -62,7 +71,7 @@ class RevisionReceipt(dict):
 class SpeculationSession:
     """A persistent worker owning exactly one native execution history."""
 
-    def __init__(self, *, python=None, cwd=None, env=None, timeout=120.0,
+    def __init__(self, *, python=None, cwd=None, env=None, timeout=None,
                  stderr=None, worker=None):
         self._timeout = timeout
         self._next_id = 0
@@ -100,6 +109,21 @@ class SpeculationSession:
         except (OSError, ValueError) as exc:
             raise WorkerLost(f"worker closed its request channel: {exc}") from exc
 
+    def _await_frame(self, limit) -> None:
+        """Block until a response starts or the deadline passes. Only before the
+        header: past it the buffered reader may hold bytes poll cannot see. poll,
+        not select, which rejects fd numbers past FD_SETSIZE."""
+        if limit is None:
+            return
+        try:
+            poller = select.poll()
+            poller.register(self._result.fileno(), select.POLLIN)
+            ready = poller.poll(max(limit, 0.0) * 1000)
+        except (OSError, ValueError) as exc:
+            raise WorkerLost(f"result channel unreadable: {exc}") from exc
+        if not ready:
+            raise WorkerTimeout(f"worker gave no answer within {limit:g}s")
+
     def _recv(self) -> dict:
         try:
             head = self._result.read(_HDR.size)
@@ -113,21 +137,27 @@ class SpeculationSession:
             raise WorkerLost("truncated result frame")
         return json.loads(body.decode("utf-8"))
 
-    def _request(self, payload: dict) -> dict:
-        with self._lock:
+    def _request(self, payload: dict, *, timeout=_SESSION_DEFAULT) -> dict:
+        limit = self._timeout if timeout is _SESSION_DEFAULT else timeout
+        try:
+            with self._lock:
+                if self._closed:
+                    raise WorkerLost("session is closed")
+                self._next_id += 1
+                rid = self._next_id
+                payload["request_id"] = rid
+                try:
+                    self._send(payload)
+                    self._await_frame(limit)
+                    resp = self._recv()
+                except WorkerLost:
+                    # Closes the session too, so a later request fails at once
+                    # instead of waiting on a channel nobody will write to.
+                    self.kill()
+                    raise
+        finally:
             if self._closed:
-                raise WorkerLost("session is closed")
-            self._next_id += 1
-            rid = self._next_id
-            payload["request_id"] = rid
-            try:
-                self._send(payload)
-                resp = self._recv()
-            except WorkerLost:
-                # Closes the session too, so a later request fails at once
-                # instead of waiting on a channel nobody will write to.
-                self.kill()
-                raise
+                self._release_result()
         if resp.get("request_id") != rid:
             raise SpeculationProtocolError(
                 f"response is for request {resp.get('request_id')!r}, expected {rid}"
@@ -144,17 +174,19 @@ class SpeculationSession:
 
     # --- operations -----------------------------------------------------------
 
-    def init(self, spec_text: str) -> dict:
-        resp = self._request({"op": "init", "spec": spec_text})
+    def init(self, spec_text: str, *, timeout=_SESSION_DEFAULT) -> dict:
+        resp = self._request({"op": "init", "spec": spec_text}, timeout=timeout)
         if not resp.get("ok"):
             raise SpeculationError(
                 f"interpreter construction failed: {resp.get('diagnostics', '')[:200]}"
             )
         return resp
 
-    def revise(self, candidate: str, candidate_id: str = "") -> RevisionReceipt:
+    def revise(self, candidate: str, candidate_id: str = "", *,
+               timeout=_SESSION_DEFAULT) -> RevisionReceipt:
         resp = self._request(
-            {"op": "revise", "candidate": candidate, "candidate_id": candidate_id}
+            {"op": "revise", "candidate": candidate, "candidate_id": candidate_id},
+            timeout=timeout,
         )
         if resp.get("candidate_id") != candidate_id:
             raise SpeculationProtocolError("receipt names a different candidate")
@@ -162,11 +194,11 @@ class SpeculationSession:
             raise SpeculationError("session became unusable during the revision")
         return RevisionReceipt(resp)
 
-    def step(self, inputs: dict) -> dict:
-        return self._request({"op": "step", "inputs": inputs or {}})
+    def step(self, inputs: dict, *, timeout=_SESSION_DEFAULT) -> dict:
+        return self._request({"op": "step", "inputs": inputs or {}}, timeout=timeout)
 
-    def state(self) -> dict:
-        return self._request({"op": "state"})
+    def state(self, *, timeout=_SESSION_DEFAULT) -> dict:
+        return self._request({"op": "state"}, timeout=timeout)
 
     # --- disposal -------------------------------------------------------------
 
@@ -185,10 +217,7 @@ class SpeculationSession:
         except subprocess.TimeoutExpired:
             return self.kill()
         finally:
-            try:
-                self._result.close()
-            except Exception:
-                pass
+            self._release_result()
 
     def kill(self) -> int | None:
         """Disposal for a rejected speculative attempt: there is no rollback, so
@@ -203,10 +232,20 @@ class SpeculationSession:
         except Exception:
             return None
         finally:
-            try:
-                self._result.close()
-            except Exception:
-                pass
+            self._release_result()
+
+    def _release_result(self) -> None:
+        """Close the result channel unless a request is in flight. Its reader may
+        be parked in poll on the fd number, which a close would free for reuse;
+        the request thread closes on its way out instead."""
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            self._result.close()
+        except Exception:
+            pass
+        finally:
+            self._lock.release()
 
     def __enter__(self):
         return self
