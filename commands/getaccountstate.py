@@ -57,6 +57,15 @@ def execute(raw_command: str, container):
             "getaccountstate", f"Failed to build account state: {exc}", "INTERNAL_ERROR"
         )
 
+    try:
+        from consensus.facade import TipAdmissionView
+
+        tip = TipAdmissionView()
+        escrowed_out = tip.escrowed_out(address)
+        escrowed_in = tip.escrowed_in(address)
+    except Exception:
+        escrowed_out = escrowed_in = 0
+
     pending_outgoing = 0
     pending_incoming = 0
     pending_fees = 0
@@ -104,5 +113,7 @@ def execute(raw_command: str, container):
         "pending_incoming": str(pending_incoming),
         "pending_fees": str(pending_fees),
         "available_balance": str(available_balance),
+        "escrowed_out": str(escrowed_out),
+        "escrowed_in": str(escrowed_in),
         "pending_txs": pending_txs,
     })

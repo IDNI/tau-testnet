@@ -143,7 +143,7 @@ arguments keep their case except where a handler lowercases a hex id. Payload
 commands take the rest of the line verbatim as one JSON argument, and tolerate
 it being wrapped in matching single or double quotes.
 
-The full registry (25 names, `app/container.py`):
+The full registry (28 names, `app/container.py`):
 
 | Command | Grammar |
 |---|---|
@@ -172,6 +172,9 @@ The full registry (25 names, `app/container.py`):
 | `getrequestid` | `getrequestid <json_payload>` |
 | `getapprovalslots` | `getapprovalslots <address>` — advisory, node-local |
 | `getapprovalpreview` | `getapprovalpreview <json_draft>` — advisory, node-local |
+| `getretractable` | `getretractable <retractable_id>` — 64 hex chars |
+| `getretractables` | `getretractables <address> [in\|out\|all]` (default `all`) |
+| `getretractableid` | `getretractableid <json_payload>` |
 
 `gettimestamp` and `getcurrenttimestamp` share one handler, and it hardcodes
 its own name: a `getcurrenttimestamp` request comes back with
@@ -416,6 +419,48 @@ transaction. It does not check satisfiability — tau-lang exposes
 bindings — so a clean result means no conflict was *observed*. See the
 [Rule sharing](../README.md#rule-sharing) section for the composite-rule model
 and why an accepted rule is composed rather than appended.
+
+## Retractable transfers
+
+Escrow a transfer until a block height or Unix time; the sender can take it back
+before then. Semantics and timing caveats are in the
+[README](../README.md#retractable-transfers).
+
+```bash
+tau-testnet retractable send --key alice --to <pk> --amount 10 --release-in 20
+tau-testnet retractable send --key alice --to <pk> --amount 10 --release-at-height 5000
+tau-testnet retractable send --key alice --to <pk> --amount 10 --release-at-time 1790000000
+tau-testnet retractable send --key alice --to <pk> --amount 10 --release-after 3600
+tau-testnet retractable list --key alice --role out
+tau-testnet retractable show <retractable_id>
+tau-testnet retractable retract --key alice <retractable_id>
+tau-testnet retractable id --from-pubkey <pk> --to <pk> --amount 10 --sequence 7 --release-at-height 5000
+```
+
+Exactly one release flag. `--release-in N` counts from the next block, like
+`--expire-in`. The CLI clamps `expire_at_height` to the release height, or
+`expiration_time` below the release time, because admission refuses a park that
+could be mined at or after its own release. `send` prints the retractable id.
+
+Raw transactions (root fields only; a nested `payload` is ignored):
+
+| `tx_type` | Signed fields beyond the envelope |
+|---|---|
+| `retractable_transfer` | `recipient_pubkey`, `amount`, exactly one of `release_at_height` / `release_at_time` |
+| `retract_transfer` | `retractable_id` (feeless) |
+
+RPC replies:
+
+- `getretractable` returns the open entry with `status: "open"`, or
+  `{retractable_id, status: "released"|"retracted", resolved_at_height}` once
+  resolved on the canonical chain, or `RETRACTABLE_UNKNOWN`.
+- `getretractables` returns `retractables` (open entries for the address) and
+  `mempool` (queued parks and retracts naming it).
+- `getretractableid '{"sender_pubkey":..,"recipient_pubkey":..,"amount":..,"sequence_number":..,"release_at_height":..}'`
+  returns the id, with `shape_error` when the park would be refused as it stands.
+- `gettxstatus` adds `retractable: {id, status}` to a confirmed park and
+  `retracts` to a confirmed retract. `getaccountstate` adds `escrowed_out` and
+  `escrowed_in`, and a queued park counts as `pending_outgoing`.
 
 ## Governance
 

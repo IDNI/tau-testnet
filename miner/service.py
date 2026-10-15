@@ -12,6 +12,8 @@ from network import bus as network_bus
 
 logger = logging.getLogger(__name__)
 
+_DUE_WAKE_INTERVAL = 2.0
+
 
 class SoleMiner:
     """
@@ -32,19 +34,32 @@ class SoleMiner:
         self._max_block_interval = max(1.0, float(max_block_interval))
         self._lock = threading.Lock()
         self._last_mine_time = time.time()  # Initialize to avoid immediate mine on startup
+        self._last_due_attempt = 0.0
+        self._wake_for_due = False
+
+    def _due_wake_allowed(self) -> bool:
+        """Empty mempool, but a retractable release is due and the throttle is open."""
+        if time.time() - self._last_due_attempt < _DUE_WAKE_INTERVAL:
+            return False
+        head = db.get_canonical_head_block()
+        next_height = head['header']['block_number'] + 1 if head else 0
+        return db.has_due_retractables(next_height, int(time.time()))
 
     def _should_mine(self) -> bool:
         # 1. Cheap local gates first to avoid driving the Tau engine on every tick.
         #    On an idle node these short-circuits keep us from running a full
         #    tau.step (and its DEBUG log spam) once per second.
+        self._wake_for_due = False
         pending = db.count_mempool_txs()
         if pending == 0:
-            return False
-
-        threshold_met = pending >= self._threshold
-        interval_met = (time.time() - self._last_mine_time) >= self._max_block_interval
-        if not (threshold_met or interval_met):
-            return False
+            if not self._due_wake_allowed():
+                return False
+            self._wake_for_due = True
+        else:
+            threshold_met = pending >= self._threshold
+            interval_met = (time.time() - self._last_mine_time) >= self._max_block_interval
+            if not (threshold_met or interval_met):
+                return False
 
         # 2. Only now consult Tau for proposer eligibility. create_block_from_mempool
         #    re-checks this immediately before producing the block, so we don't lose
@@ -80,10 +95,14 @@ class SoleMiner:
             if not self._should_mine():
                 return
 
+            wake = self._wake_for_due
+            if wake:
+                self._last_due_attempt = time.time()
+
             try:
                 # Delegate to createblock logic
                 # This handles validation, execution, state locking, DB commit, and DHT publishing
-                block_data = createblock.create_block_from_mempool()
+                block_data = createblock.create_block_from_mempool(wake_if_due=True) if wake else createblock.create_block_from_mempool()
                 
                 # Check if a block was actually created (createblock returns dict with block_hash on success)
                 if isinstance(block_data, dict) and "block_hash" in block_data:

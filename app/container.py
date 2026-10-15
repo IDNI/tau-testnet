@@ -22,6 +22,9 @@ from commands import (
     getapprovalrequests,
     getapprovalslots,
     getrequestid,
+    getretractable,
+    getretractableid,
+    getretractables,
 )
 from errors import DependencyError
 from network import BootstrapPeer, NetworkConfig
@@ -80,6 +83,9 @@ class ServiceContainer:
         "getapprovalrequests": getapprovalrequests,
         "getapprovalrequest": getapprovalrequest,
         "getrequestid": getrequestid,
+        "getretractable": getretractable,
+        "getretractables": getretractables,
+        "getretractableid": getretractableid,
         # Advisory, node-local, and engine-driving -- rate-limited accordingly
         # in server.py.
         "getapprovalslots": getapprovalslots,

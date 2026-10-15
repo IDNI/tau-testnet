@@ -659,12 +659,13 @@ def _read_rule_text(args: argparse.Namespace) -> str:
         raise _PayloadError(f"cannot read {path}: {exc}") from exc
 
 
-def _submit_rule_tx(args: argparse.Namespace, build) -> int:
+def _submit_rule_tx(args: argparse.Namespace, build, *, pass_tip: bool = False) -> int:
     """Shared build -> sign -> submit path for the three rule-sharing types.
 
     `build` is called with (pubkey, sequence, expire_at_height): the height is
     resolved once here, from the tip that came back with the sequence, so no
-    builder has to ask for it again.
+    builder has to ask for it again. `pass_tip` appends that tip as a fourth
+    argument for builders that count a release point from it.
     """
     try:
         sk_int, sender_pubkey = _resolve_signing_key(args)
@@ -681,8 +682,9 @@ def _submit_rule_tx(args: argparse.Namespace, build) -> int:
         return EXIT_APP_ERROR
 
     try:
-        payload = build(sender_pubkey, sequence_number,
-                        _resolve_expire_at_height(args, tip=tip))
+        height = _resolve_expire_at_height(args, tip=tip)
+        payload = (build(sender_pubkey, sequence_number, height, tip) if pass_tip
+                   else build(sender_pubkey, sequence_number, height))
     except (_PayloadError, ValueError) as exc:
         print_error(str(exc))
         return EXIT_LOCAL
@@ -1178,6 +1180,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_gov_subparsers(sub)
     _add_rule_subparsers(sub)
     _add_approval_subparsers(sub)
+    _add_retractable_subparsers(sub)
     _add_node_subparsers(sub)
 
     return parser
@@ -1861,6 +1864,195 @@ def _add_approval_subparsers(sub) -> None:
     p_rid.add_argument("--expire-at-height", required=True, type=int)
     p_rid.add_argument("--approver", action="append", metavar="SLOT=PUBKEY")
     p_rid.set_defaults(func=cmd_approval_request_id)
+
+
+# --- Retractable transfers --------------------------------------------------
+
+
+def _release_point(args, tip: int, now: int) -> dict:
+    """The release kwargs for the builder from whichever --release-* flag is set."""
+    if getattr(args, "release_at_height", None) is not None:
+        height = int(args.release_at_height)
+    elif getattr(args, "release_in", None) is not None:
+        if not tip:
+            tip = _tip_height(args)
+        height = tip + 1 + int(args.release_in)
+    else:
+        height = None
+    if height is not None:
+        if not tip:
+            tip = _tip_height(args)
+        if height <= tip + 1:
+            raise _PayloadError(
+                f"release height {height} is not after the next block ({tip + 1}); "
+                "the park would be mined at or past its release."
+            )
+        return {"release_at_height": height}
+
+    if getattr(args, "release_at_time", None) is not None:
+        when = int(args.release_at_time)
+    else:
+        when = now + int(args.release_after)
+    if when <= now + 1:
+        raise _PayloadError(f"release time {when} is already (almost) past.")
+    return {"release_at_time": when}
+
+
+def cmd_retractable_send(args: argparse.Namespace) -> int:
+    from consensus.retractable import RetractableShapeError, parse_retractable_transfer
+
+    created = {}
+
+    def _build(sender_pubkey, sequence_number, expire_at_height, tip):
+        now = int(_now())
+        payload = tx_mod.build_retractable_transfer_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=now + args.expiry,
+            expire_at_height=expire_at_height,
+            recipient_pubkey=args.to,
+            amount=int(args.amount),
+            fee_limit=args.fee,
+            **_release_point(args, tip, now),
+        )
+        try:
+            created["id"] = parse_retractable_transfer(payload).retractable_id.hex()
+        except RetractableShapeError as exc:
+            raise _PayloadError(str(exc))
+        return payload
+
+    status = _submit_rule_tx(args, _build, pass_tip=True)
+    if status == EXIT_OK and created.get("id"):
+        print(f"retractable id: {created['id']}", file=sys.stderr if args.json else sys.stdout)
+    return status
+
+
+def cmd_retractable_retract(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_retract_transfer_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            retractable_id=args.retractable_id,
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_retractable_list(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getretractables {address} {getattr(args, 'role', 'all')}")
+
+
+def cmd_retractable_show(args: argparse.Namespace) -> int:
+    return _simple_query(args, f"getretractable {args.retractable_id}")
+
+
+def cmd_retractable_id(args: argparse.Namespace) -> int:
+    from consensus.retractable import RetractableShapeError, parse_retractable_transfer
+
+    fields = {
+        "sender_pubkey": args.from_pubkey.strip().lower(),
+        "recipient_pubkey": args.to.strip().lower(),
+        "amount": int(args.amount),
+        "sequence_number": int(args.sequence),
+    }
+    if args.release_at_height is not None:
+        fields["release_at_height"] = int(args.release_at_height)
+    else:
+        fields["release_at_time"] = int(args.release_at_time)
+    try:
+        rid = parse_retractable_transfer(fields).retractable_id.hex()
+    except RetractableShapeError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    if args.json:
+        print_result({"retractable_id": rid, "input_echo": fields}, json_mode=True)
+    else:
+        print(rid)
+    return EXIT_OK
+
+
+def _add_retractable_subparsers(sub) -> None:
+    """`tau-testnet retractable ...` -- park a transfer until a release point."""
+    p_ret = sub.add_parser(
+        "retractable",
+        parents=[_GLOBAL_PARENT],
+        help="Retractable transfers (send, retract, inspect)",
+    )
+    rsub = p_ret.add_subparsers(dest="retractable_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser):
+        parser.add_argument("--fee", default="0", help="Fee limit (default '0')")
+        parser.add_argument(
+            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+        parser.add_argument("--expire-in", type=_block_count, default=1000,
+                            help="Blocks the transaction may land in, from the next one")
+        parser.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+
+    p_send = rsub.add_parser(
+        "send", parents=common,
+        help="Escrow a transfer until a release point; retract it before then",
+    )
+    _key_group(p_send)
+    p_send.add_argument("--to", required=True, help="Recipient public key (96 hex)")
+    p_send.add_argument("--amount", required=True, type=int, help="Amount to transfer")
+    release = p_send.add_mutually_exclusive_group(required=True)
+    release.add_argument("--release-in", type=_block_count, metavar="BLOCKS",
+                         help="Release this many blocks after the next one")
+    release.add_argument("--release-at-height", type=int, metavar="HEIGHT",
+                         help="Release in the first block at or past this height")
+    release.add_argument("--release-at-time", type=int, metavar="UNIX",
+                         help="Release in the first block stamped at or past this time")
+    release.add_argument("--release-after", type=_block_count, metavar="SECONDS",
+                         help="Release this many seconds from now")
+    _tx_flags(p_send)
+    p_send.set_defaults(func=cmd_retractable_send)
+
+    p_back = rsub.add_parser(
+        "retract", parents=common,
+        help="Take an escrowed transfer back before its release point",
+    )
+    _key_group(p_back)
+    p_back.add_argument("retractable_id", help="Retractable id (64 hex)")
+    _tx_flags(p_back)
+    p_back.set_defaults(func=cmd_retractable_retract)
+
+    p_list = rsub.add_parser("list", parents=common,
+                             help="Open retractable transfers for an address")
+    p_list.add_argument("--address", help="Address (default: your key's)")
+    _key_group(p_list, required=False)
+    p_list.add_argument("--role", choices=["in", "out", "all"], default="all")
+    p_list.set_defaults(func=cmd_retractable_list)
+
+    p_show = rsub.add_parser("show", parents=common, help="One retractable transfer")
+    p_show.add_argument("retractable_id", help="Retractable id (64 hex)")
+    p_show.set_defaults(func=cmd_retractable_show)
+
+    p_rid = rsub.add_parser("id", parents=common,
+                            help="Derive a retractable id without submitting")
+    p_rid.add_argument("--from-pubkey", required=True, help="Sender public key")
+    p_rid.add_argument("--to", required=True, help="Recipient public key")
+    p_rid.add_argument("--amount", required=True, type=int)
+    p_rid.add_argument("--sequence", required=True, type=int)
+    rid_release = p_rid.add_mutually_exclusive_group(required=True)
+    rid_release.add_argument("--release-at-height", type=int)
+    rid_release.add_argument("--release-at-time", type=int)
+    p_rid.set_defaults(func=cmd_retractable_id)
 
 
 def _add_rule_subparsers(sub) -> None:

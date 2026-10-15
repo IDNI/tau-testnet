@@ -40,6 +40,36 @@ def _iso_from_seconds(secs) -> str:
         return ""
 
 
+def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
+    """`retractable` for a confirmed park, `retracts` for a confirmed retract."""
+    try:
+        block = db.get_block_by_hash(block_hash) or {}
+        txs = block.get("transactions") or []
+        ids = block.get("tx_ids") or []
+        if tx_hash not in ids or len(ids) != len(txs):
+            return {}
+        tx = txs[ids.index(tx_hash)]
+        tx_type = tx.get("tx_type") if isinstance(tx, dict) else None
+        if tx_type == "retract_transfer":
+            return {"retracts": tx.get("retractable_id")}
+        if tx_type != "retractable_transfer":
+            return {}
+        from commands.getretractable import resolution
+        from consensus.facade import TipAdmissionView
+        from consensus.retractable import parse_retractable_transfer
+
+        rid = parse_retractable_transfer(tx).retractable_id
+        if TipAdmissionView().get_retractable(rid) is not None:
+            status = "open"
+        else:
+            resolved = resolution(rid.hex())
+            status = resolved[0] if resolved else "not_recorded"
+        return {"retractable": {"id": rid.hex(), "status": status}}
+    except Exception:
+        logger.exception("Failed to resolve retractable detail for %s", tx_hash)
+        return {}
+
+
 def execute(raw_command: str, container):
     parts = raw_command.split()
     if len(parts) != 2:
@@ -87,13 +117,15 @@ def execute(raw_command: str, container):
             )
             if is_canonical:
                 confirmations = head_number - loc["block_number"] + 1
-                return api_response.success_response("gettxstatus", {
+                data = {
                     "tx_hash": tx_hash,
                     "status": "confirmed",
                     "block_hash": loc["block_hash"],
                     "block_number": loc["block_number"],
                     "confirmations": max(1, confirmations),
-                })
+                }
+                data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
+                return api_response.success_response("gettxstatus", data)
 
         # 3. Dropped without being mined?
         dropped = db.get_dropped_tx(tx_hash)

@@ -451,7 +451,7 @@ def init_db():
                     block_hash     TEXT NOT NULL,
                     block_number   INTEGER NOT NULL,
                     outcome        TEXT NOT NULL,
-                    PRIMARY KEY (retractable_id, block_hash)
+                    PRIMARY KEY (retractable_id, block_hash, outcome)
                 );
             ''')
             conn.execute('''
@@ -1663,6 +1663,15 @@ def get_mempool_txs_for_address(address: str) -> List[Dict]:
         amount_out = 0
         amount_in = 0
         touches = (sender == address)
+        if data.get("tx_type") == "retractable_transfer":
+            # A queued park debits its sender when mined; the recipient gets
+            # nothing until release, so it never counts as incoming.
+            try:
+                park_amount = int(data.get("amount"))
+            except (ValueError, TypeError):
+                park_amount = 0
+            if sender == address and park_amount > 0:
+                amount_out += park_amount
         if isinstance(transfers, list):
             for tr in transfers:
                 if not (isinstance(tr, (list, tuple)) and len(tr) == 3):
@@ -2513,6 +2522,34 @@ def load_retractable_state() -> tuple[List[tuple], int, bytes]:
     )
 
 
+def get_open_retractables(address: str, role: str = "all") -> List[Dict]:
+    """Open retractable transfers sent by (`out`), addressed to (`in`) or either
+    side of (`all`) this address, oldest release first."""
+    if _db_conn is None:
+        init_db()
+    if role == "out":
+        where, params = "sender_pubkey = ?", (address,)
+    elif role == "in":
+        where, params = "recipient_pubkey = ?", (address,)
+    else:
+        where, params = "sender_pubkey = ? OR recipient_pubkey = ?", (address, address)
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT retractable_id, sender_pubkey, recipient_pubkey, amount, '
+            'sequence_number, release_kind, release_at FROM retractable_transfers_v1 '
+            f'WHERE {where} ORDER BY release_kind, release_at, retractable_id',
+            params,
+        ).fetchall()
+    return [
+        {
+            "retractable_id": r[0], "sender_pubkey": r[1], "recipient_pubkey": r[2],
+            "amount": int(r[3]), "sequence_number": int(r[4]),
+            "release_kind": int(r[5]), "release_at": int(r[6]),
+        }
+        for r in rows
+    ]
+
+
 def record_retractable_events(block_hash: str, block_number: int, events) -> None:
     """Node-local history of what a block did to retractable transfers.
 
@@ -2552,6 +2589,27 @@ def get_canonical_retractable_events(retractable_id: str) -> List[Dict]:
                 {"block_hash": block_hash, "block_number": int(block_number), "outcome": outcome}
             )
     return out
+
+
+def has_due_retractables(next_height: int, now: int) -> bool:
+    """True if an open retractable transfer is releasable at this height or time.
+
+    A hint for the miner thread: reads persisted rows only, never the in-memory
+    manager, and the block builder re-checks under the chain lock.
+    """
+    if _db_conn is None:
+        init_db()
+    try:
+        with _db_lock:
+            row = _db_conn.execute(
+                'SELECT 1 FROM retractable_transfers_v1 WHERE '
+                '(release_kind = 0 AND release_at <= ?) OR '
+                '(release_kind = 1 AND release_at <= ?) LIMIT 1',
+                (int(next_height), int(now)),
+            ).fetchone()
+    except Exception:
+        return False
+    return row is not None
 
 
 def load_approval_requests() -> List[Dict]:

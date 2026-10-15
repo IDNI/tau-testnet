@@ -453,7 +453,7 @@ def _defer_lost(exc, execution_transactions, row_ids, reserved_txs) -> None:
                        tx_hash, cause, delay, strikes)
 
 
-def create_block_from_mempool(allow_empty: bool = False) -> Dict:
+def create_block_from_mempool(allow_empty: bool = False, wake_if_due: bool = False) -> Dict:
     """
     Creates a new block from all transactions currently in the mempool,
     saves it to the database, and clears the mempool.
@@ -471,6 +471,10 @@ def create_block_from_mempool(allow_empty: bool = False) -> Dict:
     callers advance height to a governance activation boundary. It is off by
     default: a caller polling `createblock` would otherwise mint an unbounded
     run of empty blocks.
+
+    `wake_if_due` permits an empty block only when a retractable transfer is due
+    at this candidate's own height and header timestamp, judged under the lock;
+    the miner's pre-check is a hint and may be stale.
     """
     print(f"[INFO][createblock] Starting block creation process...")
 
@@ -491,10 +495,10 @@ def create_block_from_mempool(allow_empty: bool = False) -> Dict:
             msg = f"{_BUSY_PREFIX}; skipping this round."
             print(f"[INFO][createblock] {msg}")
             return {"message": msg}
-        return _create_block_locked(allow_empty=allow_empty)
+        return _create_block_locked(allow_empty=allow_empty, wake_if_due=wake_if_due)
 
 
-def _create_block_locked(allow_empty: bool = False) -> Dict:
+def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -> Dict:
     """`create_block_from_mempool` body. Callers must hold the chain-write lock."""
     # Ensure early turn-check and block number logic happens BEFORE reserving mempool
     latest_block = db.get_canonical_head_block()
@@ -532,6 +536,15 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
         print(f"[INFO][createblock] {msg}")
         return {"message": msg}
 
+    # The header carries this timestamp, so the due decision and the sealed block
+    # agree on it.
+    block_timestamp = int(time.time())
+    empty_ok = allow_empty
+    if wake_if_due and not empty_ok:
+        book = getattr(lm, "retractable_transfers", None)
+        has_due = getattr(book, "has_due", None)
+        empty_ok = bool(has_due is not None and has_due(block_number, block_timestamp) is True)
+
     # Get batch of reserved transactions from mempool. The chain-write lock is
     # already held for the whole round, so no second producer can sweep or
     # re-reserve this batch while we build on it.
@@ -561,7 +574,7 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
     )
     print(f"[INFO][createblock] Reserved {len(reserved_txs)} entries from mempool")
 
-    if not reserved_txs and not allow_empty:
+    if not reserved_txs and not empty_ok:
         msg = "Mempool is empty (no pending txs); no block produced."
         print(f"[INFO][createblock] {msg}")
         return {"message": msg}
@@ -622,7 +635,7 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
         db.remove_transactions(malformed_ids)
         reserved_ids = [i for i in reserved_ids if i not in _malformed]
 
-    if not transactions and not allow_empty:
+    if not transactions and not empty_ok:
         msg = "Mempool is empty (no valid pending txs); no block produced."
         print(f"[INFO][createblock] {msg}")
         return {"message": msg}
@@ -640,7 +653,7 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
     # predecessor instead.
     _drop_sequence_gap_orphans(transactions, execution_transactions, filtered_reserved_ids)
 
-    if not transactions and not allow_empty:
+    if not transactions and not empty_ok:
         msg = "Mempool has no contiguous-sequence txs; no block produced."
         print(f"[INFO][createblock] {msg}")
         db.unreserve_mempool_txs(reserved_ids)
@@ -660,7 +673,6 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
         return {"error": msg, "message": msg}
 
     print(f"[INFO][createblock] Validating and Executing Batch Natively...")
-    block_timestamp = int(time.time())
 
     # Flips once the candidate is canonical; gates the reclaim in `except`.
     persisted = False

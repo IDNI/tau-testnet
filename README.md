@@ -276,6 +276,12 @@ tau-testnet rule check <offer_id>
 tau-testnet rule accept --key bob <offer_id>
 tau-testnet rule reject --key bob <offer_id>
 
+# retractable transfers (escrowed until a release point; the sender can take it back first)
+tau-testnet retractable send --key alice --to <recipient_pubkey> --amount 10 --release-in 20
+tau-testnet retractable list --key alice --role out
+tau-testnet retractable show <retractable_id>
+tau-testnet retractable retract --key alice <retractable_id>
+
 # target a remote node
 tau-testnet --host testnet.tau.net --port 65432 status
 ```
@@ -563,6 +569,38 @@ Because each acceptor gets its own guarded branch of one composite, cross-user c
 The offer book and clause registry are folded into `consensus_meta.mechanism_specific_metadata` as `rule_offers_root` and `rule_clauses_root`, emitted **only while the book is non-empty** — the same hash-compat gate `eligibility_mode` uses. So genesis stays byte-identical and **no regenesis is required**; the first offer makes an un-upgraded node diverge loudly (state-hash mismatch, block rejected) rather than silently. The only coordination requirement is that nodes upgrade before the first offer lands. `rule_text` and an offer's terminal status are node-local durability for the read RPCs and are deliberately **not** hashed.
 
 Bounds and cap breaches at block apply are **soft no-ops** with a receipt log, so block validity stays a function of the block alone; only a Tau failure on the composed rule hard-rejects the transaction.
+
+## Retractable transfers
+
+A `retractable_transfer` parks funds in escrow until a **release point**, either a block height (`release_at_height`) or a Unix time (`release_at_time`). Until then the sender can `retract_transfer` and the escrow comes back. At the release point the funds go to the recipient without anyone sending another transaction.
+
+```bash
+tau-testnet retractable send --key alice --to <recipient_pubkey> --amount 10 --release-in 20      # 20 blocks after the next one
+tau-testnet retractable send --key alice --to <recipient_pubkey> --amount 10 --release-at-height 5000
+tau-testnet retractable send --key alice --to <recipient_pubkey> --amount 10 --release-after 3600   # seconds from now
+tau-testnet retractable list --key alice --role out        # open entries (and queued parks/retracts)
+tau-testnet retractable show <retractable_id>              # open, released or retracted
+tau-testnet retractable retract --key alice <retractable_id>
+tau-testnet retractable id --from-pubkey <alice_pubkey> --to <recipient_pubkey> --amount 10 \
+    --sequence 7 --release-at-height 5000
+```
+
+Semantics:
+
+- **Park.** The amount leaves the sender's balance when the park is mined and sits in escrow. The park passes the same gates as an ordinary transfer (the sender's `o5` policy with empty approval slots, the fee step, the balance), so scheduling cannot bypass a co-sign policy. The fee is charged once at park time and never refunded. Escrowed funds are not balance, so they do not count as stake.
+- **Retract.** Only the sender, feeless, valid while the block is strictly before the release point. The escrow returns to the sender.
+- **Release.** The first block with `height >= release_at_height`, or whose header timestamp is `>= release_at_time`, pays the recipient in an end-of-block sweep. Retract (`<`) and release (`>=`) cannot both happen in one block.
+- **Id.** Content-derived from sender, recipient, amount, sequence number and release point, so `retractable id` and `getretractableid` can compute it before the park is signed. The id is printed by `retractable send`.
+- **Caps.** 16 open entries per sender, 4096 in total, and a release point at most 100 000 blocks or 90 days ahead. A park's own deadline is capped at its release point (the CLI clamps it), so a park is never mined at or after its release.
+- **Reads.** `getretractable`, `getretractables`, `getretractableid`; `gettxstatus` reports a confirmed park's id and state; `getaccountstate` reports `escrowed_out` and `escrowed_in`.
+
+Timing caveats:
+
+- A block timestamp is chosen by its proposer, within the parent's timestamp and local clock + 120 s. A time-based release can land up to about two minutes early, and a retract near a time deadline is judged by the block's timestamp. Height-based release points are exact.
+- Height does not advance on an idle chain. The miner wakes to seal the one block that crosses a due release point; it does not fast-forward height. For an idle chain, prefer a time-based release.
+- A retract must be **included in a block** before the release point, not merely sent. A feeless retract sorts last in the mempool under backlog, so retract with margin.
+
+**Upgrade.** This adds a field to the consensus metadata hash with no activation flag, so it needs a regenesis and every node on the same build. An older binary forks at the first park block.
 
 ## Mempool policy
 

@@ -537,3 +537,81 @@ def build_transfer_vote_tx(
     if reason:
         tx["reason"] = reason
     return tx
+
+
+def build_retractable_transfer_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    recipient_pubkey: str,
+    amount: int,
+    release_at_height: int | None = None,
+    release_at_time: int | None = None,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='retractable_transfer'`` payload (without signature).
+
+    Exactly one release point. Admission refuses a park that could be mined at or
+    after its own release, so the deadline is clamped to it: ``expire_at_height``
+    to ``release_at_height``, or ``expiration_time`` below ``release_at_time``.
+    """
+    if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
+        raise ValueError("recipient_pubkey must be a 96-character hex public key")
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount < 1:
+        raise ValueError("amount must be a positive integer")
+    if (release_at_height is None) == (release_at_time is None):
+        raise ValueError("give exactly one of release_at_height and release_at_time")
+    expire_at_height = _check_expire_at_height(expire_at_height)
+
+    tx = {
+        "tx_type": "retractable_transfer",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "fee_limit": str(fee_limit),
+        "recipient_pubkey": recipient_pubkey.lower(),
+        "amount": amount,
+    }
+    if release_at_height is not None:
+        if not isinstance(release_at_height, int) or isinstance(release_at_height, bool) \
+                or release_at_height < 1:
+            raise ValueError("release_at_height must be a positive block height")
+        tx["release_at_height"] = release_at_height
+        expire_at_height = min(expire_at_height, release_at_height)
+    else:
+        if not isinstance(release_at_time, int) or isinstance(release_at_time, bool) \
+                or release_at_time < 1:
+            raise ValueError("release_at_time must be a positive unix timestamp")
+        tx["release_at_time"] = release_at_time
+        expiration_time = min(expiration_time, release_at_time - 1)
+    tx["expiration_time"] = expiration_time
+    tx["expire_at_height"] = expire_at_height
+    return tx
+
+
+def build_retract_transfer_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    retractable_id: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='retract_transfer'`` payload (without signature).
+
+    Feeless. It must be INCLUDED in a block before the release point, so send it
+    with margin: a feeless transaction sorts last when the mempool is backed up.
+    """
+    if not isinstance(retractable_id, str) or len(retractable_id) != 64:
+        raise ValueError("retractable_id must be a 64-character hex string")
+    return {
+        "tx_type": "retract_transfer",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "retractable_id": retractable_id.lower(),
+    }
