@@ -69,7 +69,7 @@ parallel jobs run after checkout:
 
 | Job | What it does |
 |---|---|
-| `python-build` | Sets up Python 3.10, installs deps, runs the CLI test suite (six `tests/test_cli_*.py` files), runs `python -m build`, uploads `dist/*` as workflow artifacts, and attaches them to the GitHub Release. |
+| `python-build` | Sets up Python 3.14, installs deps, runs the CLI test suite (six `tests/test_cli_*.py` files), runs `python -m build`, uploads `dist/*` as workflow artifacts, and attaches them to the GitHub Release. |
 | `docker-build` | Logs into GHCR with `GITHUB_TOKEN`, computes image tags, and pushes via `docker/build-push-action`. |
 
 ### Tag conventions
