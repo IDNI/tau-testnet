@@ -29,6 +29,14 @@ from .approvals import (
     screen_policy_widths,
     screen_unsatisfiable_sender_conjunction,
 )
+from .retractable import (
+    RETRACTABLE_TX_TYPES,
+    RetractableBook,
+    TX_TYPE_RETRACTABLE_TRANSFER,
+    RetractableShapeError,
+    parse_retract_transfer,
+    parse_retractable_transfer,
+)
 from .rule_offers import (
     NEUTRAL_O5_CLAUSE_BODY,
     RULE_OFFER_TX_TYPES,
@@ -58,7 +66,8 @@ from .rule_offers import (
 # an engine import, and a divergence charges a different fee at admission than
 # at inclusion.
 FEE_BEARING_TX_TYPES = frozenset(
-    {"user_tx", TX_TYPE_APPROVAL_REQUEST} | set(RULE_OFFER_TX_TYPES)
+    {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER}
+    | set(RULE_OFFER_TX_TYPES)
 )
 from consensus.tx_signing import verify_tx_signature
 import tau_native
@@ -256,6 +265,29 @@ def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict,
         return False, str(output)
     return True, ""
 
+
+
+def _retractable_book(lm) -> Optional[RetractableBook]:
+    book = getattr(lm, "retractable_transfers", None)
+    return book if isinstance(book, RetractableBook) else None
+
+
+def _escrow_total(lm) -> int:
+    book = _retractable_book(lm)
+    return book.escrow_total() if book is not None else 0
+
+
+def _release_due_retractables(lm, balances, height, timestamp) -> List[str]:
+    """Pay every matured entry to its recipient; returns the released ids."""
+    book = _retractable_book(lm)
+    if book is None:
+        return []
+    released = book.release_due(int(height), int(timestamp))
+    for entry in released:
+        balances[entry.recipient_pubkey] = (
+            int(balances.get(entry.recipient_pubkey, 0)) + entry.amount
+        )
+    return [entry.retractable_id.hex() for entry in released]
 
 
 def _revised_policy_composite(proposal) -> bool:
@@ -777,7 +809,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # adopt their clones into this object, and the activation below
             # mutates it directly because it is block-level, not per-transaction.
             proposal.lifecycle = lm
-        
+        parent_total += _escrow_total(lm)
+
         # 2. Pure Transaction Simulation (Internal Layer)
         # We pass target_balances and target_sequences to self.apply which mutates them internally.
         # This acts as our pure executor since t_bals/t_seqs are local copies.
@@ -806,7 +839,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # credits the proposer through the same staged_writes pass, so total
         # supply is preserved across a block (no mint, no burn). A mismatch is
         # a consensus bug, not a recoverable error.
-        post_total = sum(int(v) for v in t_bals.values())
+        # The sweep runs after the transaction loop, so a retract (strictly
+        # before release) and a release can never both fire in one block.
+        released_retractables = _release_due_retractables(
+            lm, t_bals, block.header.block_number, block.header.timestamp
+        )
+
+        post_total = sum(int(v) for v in t_bals.values()) + _escrow_total(lm)
         if post_total != parent_total and not getattr(config, "TESTNET_AUTO_FAUCET", False):
             raise BlockchainBug(
                 f"Supply not conserved applying block #{block.header.block_number}: "
@@ -1000,7 +1039,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             accepted_tx_ids=accepted_ids,
             skipped_tx_ids=skipped_ids,
             invalid_tx_ids=[tx.get('tx_id') for tx in exec_result.rejected_transactions],
-            governance_changes={"activated_updates": [u.update_id_hex for u in newly_active]},
+            governance_changes={
+                "activated_updates": [u.update_id_hex for u in newly_active],
+                "released_retractables": released_retractables,
+            },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
 
@@ -1503,6 +1545,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # withdrawn after settlement. Deterministic: every node measures the
             # same fee against the same signed fee_limit and balance.
             parked_request_id: Optional[bytes] = None
+            pending_retractable_park = None
+            pending_retract_id: Optional[bytes] = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -1726,7 +1770,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 return allows, fee
 
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
-                                          slot_values=None, overrides=None):
+                                          slot_values=None, overrides=None,
+                                          escrow=False):
                 """Execute ONE transfer under the fee model. True to continue.
 
                 Extracted verbatim from the user_tx transfer loop so the
@@ -1745,6 +1790,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 (i18..i25). The ordinary path passes the all-zero map, so no
                 approver pubkey ever matches and a policy clause keeps blocking;
                 the vote path passes the pubkeys of approvers who actually voted.
+
+                `escrow` stages only the debit: the credit belongs to the
+                retractable book until it releases.
                 """
                 nonlocal accepted_in_block, hard_reject, execution_success
                 try:
@@ -1839,7 +1887,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         tx_receipt["logs"].append("Transfer balance state failed (insufficient)")
                         return False
                     staged_writes[from_addr] = current_from - amount
-                    staged_writes[to_addr] = _read_bal(to_addr) + amount
+                    if not escrow:
+                        staged_writes[to_addr] = _read_bal(to_addr) + amount
                 except FeeRuleError:
                     raise
                 except Exception as e:
@@ -2263,6 +2312,84 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         "still blocks; request marked failed: "
                                         + vote.request_id_hex
                                     )
+
+            elif tx_type in RETRACTABLE_TX_TYPES:
+                # Nothing here reads nested `payload` or `operations`: only root
+                # fields are signed, so anything else is unsigned data.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    sig_ok, sig_reason = verify_tx_signature(tx)
+                    if not sig_ok:
+                        logger.error(
+                            "Retractable tx %s signature rejected at apply: %s",
+                            tx_id, sig_reason,
+                        )
+                        tx_receipt["logs"].append(
+                            f"Retractable transaction signature invalid: {sig_reason}"
+                        )
+                        accepted_in_block = False
+                        hard_reject = True
+                        execution_success = False
+                        tx_receipt["reason"] = "invalid_signature"
+                    elif tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+                        try:
+                            park = parse_retractable_transfer(tx)
+                        except RetractableShapeError as exc:
+                            park = None
+                            reason = f"invalid retractable transfer ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != park.sender_pubkey:
+                                reason = "sender is not the signer"
+                            elif target_balances is None:
+                                reason = "no balance overlay to escrow from"
+                            else:
+                                _, reason = lifecycle_mgr.retractable_transfers.can_admit_park(
+                                    park, int(block_height or 0), int(block_timestamp or 0)
+                                )
+                        if park is None or reason:
+                            tx_receipt["logs"].append(f"Retractable transfer ignored: {reason}")
+                            tx_receipt["reason"] = "retractable_not_parked"
+                            accepted_in_block = False
+                        else:
+                            escrowed = _execute_fee_era_transfer(
+                                park.sender_pubkey, park.recipient_pubkey, park.amount,
+                                slot_values=_approval_slot_values(),
+                                overrides={},
+                                escrow=True,
+                            )
+                            fee_already_measured = True
+                            if escrowed and accepted_in_block and not hard_reject:
+                                pending_retractable_park = park
+                                tx_receipt["logs"].append(
+                                    "Retractable transfer parked: " + park.retractable_id.hex()
+                                )
+                    else:  # TX_TYPE_RETRACT_TRANSFER
+                        try:
+                            request = parse_retract_transfer(tx)
+                        except RetractableShapeError as exc:
+                            request = None
+                            reason = f"invalid retract ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != request.sender_pubkey:
+                                reason = "sender is not the signer"
+                            elif target_balances is None:
+                                reason = "no balance overlay to refund into"
+                            else:
+                                _, reason = lifecycle_mgr.retractable_transfers.can_admit_retract(
+                                    request.retractable_id, request.sender_pubkey,
+                                    int(block_height or 0), int(block_timestamp or 0),
+                                )
+                        if request is None or reason:
+                            tx_receipt["logs"].append(f"Retract ignored: {reason}")
+                            tx_receipt["reason"] = "retract_not_applied"
+                            accepted_in_block = False
+                        else:
+                            entry = lifecycle_mgr.retractable_transfers.get(request.retractable_id)
+                            staged_writes[sender] = _read_bal(sender) + entry.amount
+                            pending_retract_id = request.retractable_id
+                            tx_receipt["logs"].append(
+                                "Retractable transfer retracted: " + request.retractable_id.hex()
+                            )
 
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
@@ -2827,6 +2954,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         "Approval request un-parked (its fee was not paid)"
                     )
 
+            stamp_retractable_park = False
+            if accepted_in_block and not hard_reject:
+                book = lifecycle_mgr.retractable_transfers
+                if pending_retractable_park is not None:
+                    book.submit(pending_retractable_park)
+                    stamp_retractable_park = True
+                elif pending_retract_id is not None:
+                    book.retract(pending_retract_id)
+
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same
             # observable behavior as the legacy immediate-write loop.)
@@ -2880,7 +3016,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # (issue #21). Only transfers count -- a rule-only user_tx is not
                 # a send -- and only for txs that stay accepted, mirroring the
                 # staged-balance commit rule.
-                if sender and transfers_op_data and target_last_transfer_ts is not None:
+                if (sender and (transfers_op_data or stamp_retractable_park)
+                        and target_last_transfer_ts is not None):
                     target_last_transfer_ts[sender] = int(block_timestamp or 0)
 
                 if should_increment_seq and sender:

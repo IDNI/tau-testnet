@@ -24,6 +24,7 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_REJECT,
     RULE_OFFER_TX_TYPES,
 )
+from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -45,7 +46,8 @@ KNOWN_TX_TYPES = frozenset(
 # and a fee strategy, and the vote is bounded by the request's declared approver
 # set instead.
 FEE_BEARING_TX_TYPES = frozenset(
-    {"user_tx", TX_TYPE_APPROVAL_REQUEST} | set(RULE_OFFER_TX_TYPES)
+    {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER}
+    | set(RULE_OFFER_TX_TYPES)
 )
 from db import add_mempool_tx
 from network import bus as network_bus
