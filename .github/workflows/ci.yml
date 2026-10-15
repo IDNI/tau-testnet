@@ -17,6 +17,12 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Cache coincurve wheel
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/coincurve-wheels
+          key: coincurve-${{ runner.os }}-${{ runner.arch }}-py3.14-${{ hashFiles('scripts/install_coincurve.sh') }}
+
       - name: Install native build dependencies
         run: |
           sudo apt-get update
