@@ -133,8 +133,8 @@ def test_an_empty_transfer_list_is_not_treated_as_transfers(tip_view):
 
 
 def test_a_mistyped_slot_is_refused(tip_view):
-    """One clause typing i18 bv[384] and another bv[24] leaves get_interpreter
-    returning None for everyone -- process-global and sticky."""
+    """One clause typing i18 bv[384] and another bv[24] makes get_interpreter
+    fail for everyone -- process-global and sticky."""
     result = _route(_tx(TIER_RULE.replace("i18[t]:bv[384]", "i18[t]:bv[24]")), tip_view)
     assert result.is_valid is False
     assert "bv[384]" in result.error

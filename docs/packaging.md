@@ -40,7 +40,7 @@ Build args:
 | Arg | Default | Purpose |
 |---|---|---|
 | `TAU_LANG_REPO` | `https://github.com/IDNI/tau-lang.git` | tau-lang git remote |
-| `TAU_LANG_REF`  | `main` | tau-lang git ref to check out |
+| `TAU_LANG_REF`  | `c3ea334cd1e6612930ea9f404933211858f0009f` | tau-lang git ref to check out |
 | `TAU_BUILD_JOBS`| `4` | parallel make/cmake jobs for cvc5/boost/tau-lang |
 
 The image carries OCI labels (`org.opencontainers.image.title`,
@@ -69,7 +69,7 @@ parallel jobs run after checkout:
 
 | Job | What it does |
 |---|---|
-| `python-build` | Sets up Python 3.10, installs deps, runs the CLI test suite (six `tests/test_cli_*.py` files), runs `python -m build`, uploads `dist/*` as workflow artifacts, and attaches them to the GitHub Release. |
+| `python-build` | Sets up Python 3.14, installs deps, runs the CLI test suite (six `tests/test_cli_*.py` files), runs `python -m build`, uploads `dist/*` as workflow artifacts, and attaches them to the GitHub Release. |
 | `docker-build` | Logs into GHCR with `GITHUB_TOKEN`, computes image tags, and pushes via `docker/build-push-action`. |
 
 ### Tag conventions

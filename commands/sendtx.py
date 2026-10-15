@@ -551,7 +551,12 @@ def _revision_refusal(receipt: dict):
     except Exception:  # pragma: no cover - the binding's helpers are optional here
         def strip_ansi(text):
             return text
+    report_errors = (receipt.get("report") or {}).get("errors") or []
+    if report_errors:
+        detail = strip_ansi(str(report_errors[0])).strip()
     for key in ("diagnostics", "deferred_diagnostics"):
+        if detail:
+            break
         for line in str(receipt.get(key) or "").splitlines():
             if "rror" in line:
                 # the engine colours its diagnostics; a client gets plain text

@@ -20,7 +20,7 @@ first one is a live latent bug in the `o5` user-policy convention documented in
    everyone else: a network-wide transfer block.
 
 3. TWO TOTAL-FORM RULES ON ONE STREAM DO NOT COMPOSE. Conjoined, the spec is
-   unsatisfiable and `get_interpreter` returns None. Fed sequentially through
+   unsatisfiable and `get_interpreter` fails. Fed sequentially through
    `i0`, the later rule silently SUPERSEDES the earlier one. Either way,
    "append one rule unit per user" cannot work for a shared stream.
 
@@ -195,14 +195,9 @@ emit(res)
     assert parsed["valid"] is None, f"valid rule wrongly rejected: {parsed['valid']}"
 
 
-def test_error_marker_regex_tolerates_ansi():
-    """Pure unit check on the marker screen -- no engine needed."""
+def test_strip_ansi_removes_colour_codes():
     import tau_native
     coloured = "(\x1b[31;1mError\x1b[0m) [tau] Syntax Error: boom"
-    assert tau_native.tau_reports_error(coloured)
-    assert tau_native.tau_reports_error("(Error) plain")
-    assert not tau_native.tau_reports_error("Temporal normalization reached fixpoint")
-    assert not tau_native.tau_reports_error("")
     assert tau_native.strip_ansi(coloured).startswith("(Error)")
 
 
@@ -267,10 +262,9 @@ def total(pk, val):
 tau_mod = tau_native.load_tau_module()
 spec = ("always ( (" + BASE + ") && " + total(A, "000000")
         + " && " + total(B, "000000") + " ).")
-with tau_native.StdOutCapture() as cap:
-    built = tau_mod.get_interpreter(tau_native.TauInterface.preprocess_spec_text(spec))
-res["conjoined_built"] = built is not None
-res["conjoined_err"] = tau_native.strip_ansi(cap.output)[:400]
+built = tau_mod.get_interpreter(tau_native.TauInterface.preprocess_spec_text(spec))
+res["conjoined_built"] = bool(built)
+res["conjoined_err"] = tau_native.report_errors(built.report)[:400]
 
 # (b) Applied sequentially through i0: does A's own clause survive B's?
 iface = new_iface()
@@ -319,10 +313,9 @@ composite = ("(" + guard(A) + " ? " + o5("000000")
 # (a) Conjoined build.
 tau_mod = tau_native.load_tau_module()
 spec = "always ( (" + BASE + ") && " + composite + " )."
-with tau_native.StdOutCapture() as cap:
-    built = tau_mod.get_interpreter(tau_native.TauInterface.preprocess_spec_text(spec))
-res["conjoined_built"] = built is not None
-res["conjoined_err"] = tau_native.strip_ansi(cap.output)[:300]
+built = tau_mod.get_interpreter(tau_native.TauInterface.preprocess_spec_text(spec))
+res["conjoined_built"] = bool(built)
+res["conjoined_err"] = tau_native.report_errors(built.report)[:300]
 
 # (b) Sequential i0 application -- the path a live node and a replaying node
 #     both take.
@@ -442,9 +435,8 @@ tau_mod = tau_native.load_tau_module()
 GENESIS = open(os.path.join(os.environ["REPO_ROOT"], "genesis.tau")).read().strip()
 
 def build(spec):
-    with tau_native.StdOutCapture() as cap:
-        itp = tau_mod.get_interpreter(tau_native.TauInterface.preprocess_spec_text(spec))
-    return itp is not None, tau_native.strip_ansi(cap.output)[:200]
+    itp = tau_mod.get_interpreter(tau_native.TauInterface.preprocess_spec_text(spec))
+    return bool(itp), tau_native.report_errors(itp.report)[:200]
 
 def user_unit(width, val):
     return ("(" + guard(A) + " -> (o5[t]:bv[" + str(width) + "] = { #x" + val
@@ -492,7 +484,7 @@ emit(res)
     assert parsed["genesis_user16"] is False, (
         f"a bv[16] o5 unit still compiles against genesis; #41 is re-opened: {parsed}"
     )
-    assert "o5" in parsed["genesis_user16_err"], parsed["genesis_user16_err"]
+    assert parsed["genesis_user16_err"], "the refusal carries no engine error text"
 
     # Why it must stay a tautology.
     assert parsed["constraining_vs_user"] is False, (

@@ -238,7 +238,7 @@ differ:
 
 **Slot width is pinned at `bv[384]` by a strict reject-unless-annotated screen.**
 Per-stream bitvector typing is process-global and sticky: if one rule types
-`i18` as `bv[384]` and another as `bv[24]`, `get_interpreter` returns `None` for
+`i18` as `bv[384]` and another as `bv[24]`, `get_interpreter` fails for
 everyone until the process restarts. An unannotated slot mention is therefore
 rejected outright, admission compiles offered rule text in an isolated
 subprocess before it can reach the live interpreter, and the engine fails closed
@@ -248,7 +248,7 @@ if one ever got through.
 
 | Constant | Value | Notes |
 |---|---|---|
-| `MAX_TIER_AUTHORS` | `2` | Policy authors on `o5`, **network-wide**. A measured ceiling, not a quota — see below. |
+| `MAX_TIER_AUTHORS` | `2` | Policy authors on `o5`, **network-wide**, counting clauses from both doors (self-service rules and accepted offers) once approval slots are active. A measured ceiling, not a quota — see below. |
 | `MAX_APPROVERS_PER_REQUEST` | `8` | Tiers use three; the rest are spare. |
 | `MAX_PENDING_REQUESTS_PER_SENDER` | `8` | |
 | `MAX_APPROVAL_WINDOW_BLOCKS` | `10_000` | CLI `--expire-in` defaults to `1000`. |
@@ -257,12 +257,10 @@ if one ever got through.
 | `MAX_VOTE_REASON_BYTES` | `256` | Signed and merkle-covered, but excluded from the approval-state root. |
 | `MAX_PREVIEW_SLOTS` | `6` | Above this, `getapprovalpreview` returns `unavailable`. |
 
-`MAX_TIER_AUTHORS = 2` is the load-bearing limit and is measured, not guessed.
-Interpreter rebuild time grows roughly eightfold per additional policy author —
-about 2.5s at one, 13–22s at two, 110s at four — against a 60s `COMM_TIMEOUT`
-with a watchdog SIGKILL past it. Any design carrying per-user policy as rule
-text dies at four authors. The driver is conditional depth times comparisons per
-level.
+`MAX_TIER_AUTHORS = 2` is the load-bearing limit.
+Rebuilding the shared o5 composite grows dearer with every policy author and
+every policy change, and must stay inside the 60s `COMM_TIMEOUT`, past which the
+watchdog SIGKILLs. Raising the cap needs a fresh measurement.
 
 Width is not a lever **at apply**, where `tau_shrink` interns pubkey literals to
 `bv[8]`. It very much is a lever **at admission**, which does not shrink at all
@@ -279,10 +277,11 @@ reserves, and the margin does not survive a slower host.
 |---|---|
 | `FEATURE_INACTIVE` | The chain does not have approval slots activated. |
 | `CLAUSE_SHAPE` | The clause body references `i12`, writes more than one output stream, nests a temporal operator, or is not one `always` unit. |
+| `TEMPORAL_REFERENCE` | The rule or clause body reads a step other than the current one (`i1[t-1]`, `i1[0]`). User rules reference `[t]` only. |
 | `UNSCOPED_USER_RULE` | An unguarded `o5` rule on a chain without activation, where the guarded form is still expected. |
 | `MIXED_OUTPUT_RULE` | The rule writes `o5` and something else. |
 | `RULE_WITH_TRANSFERS` | A routed `o5` rule shares a `user_tx` with transfers. Admission would judge those transfers against the policy being replaced. |
-| `CLAUSE_REGISTRY_FULL` | `MAX_TIER_AUTHORS` author slots are taken. An existing author frees one with the neutral clause. |
+| `CLAUSE_REGISTRY_FULL` | `MAX_TIER_AUTHORS` author slots are taken, counting clauses from both doors (self-service rules and accepted offers) once approval slots are active. Refused for a new author's rule, an offer to a recipient who holds no clause, and an accept by a new acceptor. An existing author frees one with the neutral clause. |
 | `TOO_MANY_REQUESTS` | `MAX_PENDING_REQUESTS_PER_SENDER` reached. |
 | `DUPLICATE_REQUEST` | A request with this id already exists. |
 | `NOT_AN_APPROVER` | The voter is not one of the request's declared approvers. |

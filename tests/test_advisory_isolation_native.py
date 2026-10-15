@@ -192,15 +192,16 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
     Under worker-backed authority the in-process interpreter is an ADVISORY
     mirror. Every place that still steps it has to be one of:
 
-      advisory      previews, keeping the mirror current, and the
-                    header/eligibility fallbacks after the isolated evaluator --
-                    none of them decide committed state or an admission verdict;
+      advisory      keeping the mirror current, and the header/eligibility
+                    fallbacks after the isolated evaluator -- none of them decide
+                    committed state or an admission verdict;
       legacy        the path that exists for the mock/test configuration, and
                     which refuses to run -- or is routed around -- once the
                     owner is enabled. Admission is here since Step 5F: with the
                     owner enabled every request runs in its own context
                     (tau_admission), and the in-process calls are the
-                    not-isolated branch only;
+                    not-isolated branch only. The approval preview is the same:
+                    under authority it probes in a context of its own;
 
     and anything else is a new authoritative use of an interpreter that is not
     the authority. Moving startup and block application alone would not stop
@@ -210,9 +211,8 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
 
     classified = {
         # advisory: the mirror, never consulted by consensus or admission
-        ("chain_state.py", "_sync_advisory_mirror"),
+        ("chain_state.py", "_sync_inprocess_consensus"),
         ("chain_state.py", "replay_tau_restore_plan"),
-        ("commands/getapprovalpreview.py", "_step"),
         ("consensus/engine.py", "query_eligibility"),
         ("consensus/engine.py", "verify_block_header"),
         # legacy: refuses to run, or is routed around, under worker-backed
@@ -222,6 +222,7 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
         ("commands/createblock.py", "execute_batch"),
         ("commands/sendtx.py", "queue_transaction"),
         ("commands/sendtx.py", "step_multi"),
+        ("commands/getapprovalpreview.py", "_step"),
         # the in-process session the not-enabled engine path uses
         ("tau_session.py", "apply_rule"),
         ("tau_session.py", "evaluate"),
@@ -234,6 +235,7 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
         ("consensus/engine.py", "_apply_block"): "proposal",
         ("commands/sendtx.py", "queue_transaction"): "admission_tau.isolated",
         ("commands/sendtx.py", "step_multi"): "if not self.isolated",
+        ("commands/getapprovalpreview.py", "_step"): "tau_admission.enabled()",
     }
 
     class _Sites(ast.NodeVisitor):
@@ -324,9 +326,9 @@ def cap(fn):
 router = "always ( " + open(os.path.join(os.environ["REPO_ROOT"], "genesis.tau")).read().strip() + " )."
 consensus = chain_state._preprocess_tau_spec_text(
     open(os.path.join(os.environ["REPO_ROOT"], "genesis_consensus.tau")).read())
-itp = cap(lambda: tau.get_interpreter(router))
+itp = cap(lambda: tau.get_interpreter(router)).value
 def step(i0=None):
-    ins = cap(lambda: tau.get_inputs_for_step(itp))
+    ins = cap(lambda: tau.get_inputs_for_step(itp)).value
     vals = {s: (i0 if (s.name == "i0" and i0) else ("F" if s.name == "i0" else "0")) for s in ins}
     return cap(lambda: tau.step(itp, vals))
 step(consensus)

@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import api_response
 import db
+import tau_admission
 import tau_defs
 from commands import (
     getapprovalpreview,
@@ -335,6 +336,131 @@ def test_the_preview_needs_the_engine(temp_database):
         assert _err(getapprovalpreview.execute(
             "getapprovalpreview " + _draft(5000, {18: AUTH}), None))["code"] \
             == "TAU_UNAVAILABLE"
+
+
+# --- the preview under worker-backed authority ------------------------------
+
+class _FakeContext:
+    """Stands in for an admission context: records steps, answers o5 from a policy."""
+
+    def __init__(self, policy=_fake_policy, fail=None):
+        self.steps = []
+        self.disposed = False
+        self._policy = policy
+        self._fail = fail
+
+    def step(self, inputs):
+        self.steps.append(dict(inputs))
+        if self._fail is not None:
+            raise self._fail
+        return self._policy(input_stream_values=inputs)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.disposed = True
+        return False
+
+
+def _preview_under_authority(draft, *, context=None, open_error=None):
+    ctx = context or _FakeContext()
+
+    def _open(**kwargs):
+        assert kwargs.get("label") == "approval_preview"
+        if open_error is not None:
+            raise open_error
+        return ctx
+
+    with patch("tau_admission.enabled", return_value=True), \
+         patch("tau_admission.open_context", side_effect=_open), \
+         patch("tau_manager.communicate_with_tau_multi",
+               side_effect=AssertionError("in-process interpreter stepped")), \
+         patch("tau_manager.tau_ready") as ready:
+        ready.is_set.return_value = True
+        resp = getapprovalpreview.execute("getapprovalpreview " + draft, None)
+    return resp, ctx
+
+
+def test_the_preview_steps_a_context_under_authority(temp_database):
+    _activate()
+    _persist()
+    resp, ctx = _preview_under_authority(_draft(5000, {18: AUTH, 19: SCAN}))
+    data = _data(resp)
+    assert data["required_slots"] == [18], data
+    assert data["required_approvers"] == {"18": AUTH}
+    assert data["probes"] == len(ctx.steps) == 3
+    assert ctx.disposed
+
+
+def test_the_preview_under_authority_matches_the_in_process_answer(temp_database):
+    _activate()
+    _persist()
+    for amount, approvers in ((5000, {18: AUTH, 19: SCAN}), (500, {18: AUTH}),
+                              (5000, {18: AUTH})):
+        draft = _draft(amount, approvers)
+        authority, _ctx = _preview_under_authority(draft)
+        with patch("tau_manager.communicate_with_tau_multi", side_effect=_fake_policy), \
+             patch("tau_manager.tau_ready") as ready:
+            ready.is_set.return_value = True
+            in_process = getapprovalpreview.execute("getapprovalpreview " + draft, None)
+        assert _data(authority) == _data(in_process)
+
+
+def test_the_context_is_fed_the_inputs_an_admission_step_is(temp_database):
+    _activate()
+    _persist()
+    _resp, ctx = _preview_under_authority(_draft(5000, {18: AUTH}))
+    first, last = ctx.steps[0], ctx.steps[-1]
+    assert first[3] == "{ #x" + A + " }:bv[384]"
+    assert first[4] == "{ #x" + B + " }:bv[384]"
+    assert first[12] == first[3]
+    assert 5 in first
+    for slot in tau_defs.approval_slot_indices():
+        assert first[slot] == "0"
+    assert last[18] == "{ #x" + AUTH + " }:bv[%d]" % tau_defs.APPROVAL_SLOT_BV_WIDTH
+
+
+def test_the_preview_under_authority_reports_a_blocking_policy(temp_database):
+    _activate()
+    _persist()
+    ctx = _FakeContext(policy=lambda **k: {5: "0"})
+    data = _data(_preview_under_authority(_draft(5000, {18: AUTH}), context=ctx)[0])
+    assert data["satisfiable"] is False and data["required_slots"] is None
+
+
+@pytest.mark.parametrize("make_exc", [
+    lambda: tau_admission.AdmissionUnavailable("every context is busy"),
+    lambda: tau_admission.AdmissionTimeout("budget ran out"),
+])
+def test_an_unavailable_context_is_no_answer_not_a_wrong_one(temp_database, make_exc):
+    _activate()
+    _persist()
+    resp, _ctx = _preview_under_authority(
+        _draft(5000, {18: AUTH}), open_error=make_exc())
+    data = _data(resp)
+    assert data["advisory"] is True and data["available"] is False
+    assert "reason" in data and "required_slots" not in data
+
+
+@pytest.mark.parametrize("make_exc", [
+    lambda: tau_admission.AdmissionTimeout("budget ran out"),
+    lambda: tau_admission.StepRefused("inputs refused"),
+])
+def test_a_step_failure_in_the_context_is_no_answer(temp_database, make_exc):
+    _activate()
+    _persist()
+    ctx = _FakeContext(fail=make_exc())
+    resp, ctx = _preview_under_authority(_draft(5000, {18: AUTH}), context=ctx)
+    data = _data(resp)
+    assert data["advisory"] is True and data["available"] is False
+    assert ctx.disposed
+
+
+def test_the_in_process_step_refuses_under_authority():
+    with patch("tau_admission.enabled", return_value=True):
+        with pytest.raises(RuntimeError):
+            getapprovalpreview._step({1: "1"})
 
 
 # --- gossip routing ---------------------------------------------------------

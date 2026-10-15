@@ -326,18 +326,18 @@ def cap(fn):
     return r
 
 router = open(os.path.join(os.environ["REPO_ROOT"], "genesis.tau")).read().strip()
-itp = cap(lambda: tau.get_interpreter("always ( " + router + " )."))
+itp = cap(lambda: tau.get_interpreter("always ( " + router + " ).")).value
 
 def send(rule=None, i12=None):
-    ins = cap(lambda: tau.get_inputs_for_step(itp))
+    ins = cap(lambda: tau.get_inputs_for_step(itp)).value
     vals = {}
     for s in ins:
         if s.name == "i0": vals[s] = rule if rule is not None else "F"
         elif s.name == "i12" and i12 is not None: vals[s] = i12
         else: vals[s] = "0"
     before = itp.spec_revision
-    outs = cap(lambda: tau.step(itp, vals))
-    o = {k.name: v for k, v in outs.items()} if outs else {}
+    outs = cap(lambda: tau.step(itp, vals)).value
+    o = {k.name: v for k, v in outs.items()} if outs is not None else {}
     return (itp.spec_revision > before), o.get("o5")
 
 comp = ("always ( (i12[t]:bv[384] = { #x" + A + " }:bv[384]) ? "

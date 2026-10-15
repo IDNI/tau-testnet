@@ -43,8 +43,10 @@ def _native_available():
         return False
 
 
-pytestmark = pytest.mark.skipif(not _native_available(),
-                                reason="native tau module not built")
+pytestmark = [
+    pytest.mark.skipif(not _native_available(), reason="native tau module not built"),
+    pytest.mark.usefixtures("allow_history_rules"),
+]
 
 HISTORY_RULE = "always ( o12[t]:bv[24] = i1[t-1]:bv[24] )."
 CONTINUATION = ("#x000011", "#x000022", "#x000033")

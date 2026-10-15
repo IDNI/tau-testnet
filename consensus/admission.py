@@ -19,6 +19,7 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_REJECT,
     NEUTRAL_O5_CLAUSE_BODY,
     RuleOfferShapeError,
+    clause_author_cap,
     clause_body_v1,
     clause_output_streams,
     compose_stream_rule,
@@ -131,6 +132,27 @@ def screen_reserved_rule_outputs(rule_text: str) -> Optional[str]:
     return None
 
 
+# Lookback is global to the evaluator's spec: one unit reading another step
+# leaves every output at 0 for the steps after each later revision or rebuild.
+TEMPORAL_REFERENCE_CODE = "TEMPORAL_REFERENCE"
+_TEMPORAL_REFERENCE_PHRASE = "reads a step other than the current one"
+
+
+def screen_temporal_rule(rule_text: str) -> Optional[str]:
+    """Error text when a user rule references any step other than `[t]`."""
+    ref = _temporal_backreference([rule_text])
+    if ref is None:
+        return None
+    return (
+        f"rule {_TEMPORAL_REFERENCE_PHRASE} ({ref}); user rules may reference "
+        f"[t] only."
+    )
+
+
+def is_temporal_reference_error(error_text: Optional[str]) -> bool:
+    return bool(error_text) and _TEMPORAL_REFERENCE_PHRASE in error_text
+
+
 class AdmissionResult:
     def __init__(self, is_valid: bool, error: Optional[str] = None, data: Optional[Dict] = None,
                  code: Optional[str] = None, details: Optional[Dict] = None):
@@ -173,6 +195,8 @@ def _width_mismatch_details(reason: str) -> Optional[Dict]:
 
 def _admission_from_domain_error(domain_error: str, prefix: str = "") -> AdmissionResult:
     msg = f"{prefix}{domain_error}" if prefix else domain_error
+    if is_temporal_reference_error(domain_error):
+        return format_error(msg, code=TEMPORAL_REFERENCE_CODE)
     mismatch = _width_mismatch_details(domain_error)
     if mismatch:
         return format_error(msg, code="WIDTH_MISMATCH", **mismatch)
@@ -291,6 +315,10 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         reserved_error = screen_reserved_rule_outputs(rule_text)
         if reserved_error:
             return format_error(reserved_error)
+
+        temporal_error = screen_temporal_rule(rule_text)
+        if temporal_error:
+            return format_error(temporal_error, code=TEMPORAL_REFERENCE_CODE)
         # i2 (balance) is now fed from the parent-block snapshot at apply, frozen
         # for the whole block, so proposer and verifier agree and a POLICY rule
         # reading it is deterministic (issue #20). What remains is
@@ -880,7 +908,7 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
         tip_view, target_stream, offer.recipient_pubkey, body
     )
     if compose_error:
-        return format_error(compose_error)
+        return compose_error
 
     return success({
         "offer_id": offer_id_hex,
@@ -893,13 +921,17 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
 def _compose_with_clause(tip_view, target_stream: int, acceptor: str, body: str):
     """Composite for `target_stream` with `acceptor`'s clause set to `body`.
 
-    Returns (composite_text, error). An acceptor REPLACING their own clause
-    does not grow the composite, so the acceptor cap only applies to a
-    genuinely new one.
+    Returns (composite_text, error), where error is a ready AdmissionResult. An
+    acceptor REPLACING their own clause does not grow the composite, so the
+    acceptor cap only applies to a genuinely new one.
     """
     clauses = dict(tip_view.clauses_for_stream(target_stream))
-    if acceptor not in clauses and len(clauses) >= MAX_ACCEPTORS_PER_STREAM:
-        return None, (
+    cap = clause_author_cap(target_stream, approval_slots_active(tip_view))
+    if acceptor not in clauses and len(clauses) >= cap:
+        if cap == MAX_TIER_AUTHORS:
+            # The measured tier cap bound this stream, not the frozen ceiling.
+            return None, _registry_full_error(len(clauses))
+        return None, format_error(
             f"o{target_stream} already has the maximum "
             f"{MAX_ACCEPTORS_PER_STREAM} accepted clauses."
         )
@@ -907,7 +939,22 @@ def _compose_with_clause(tip_view, target_stream: int, acceptor: str, body: str)
     try:
         return compose_stream_rule(target_stream, clauses), None
     except RuleOfferShapeError as exc:
-        return None, f"Composed rule for o{target_stream} is invalid: {exc}"
+        return None, format_error(
+            f"Composed rule for o{target_stream} is invalid: {exc}"
+        )
+
+
+def _registry_full_error(authors: int) -> AdmissionResult:
+    return format_error(
+        f"The o5 policy registry is full: {authors} of "
+        f"{MAX_TIER_AUTHORS} author slots are taken. This is a MEASURED "
+        f"ceiling, not a quota: every author and every policy change makes "
+        f"the shared o5 rule dearer to rebuild, and a rebuild must finish "
+        f"inside the 60s COMM_TIMEOUT. An existing author can free a slot "
+        f"by submitting the neutral clause "
+        f"`always ( {NEUTRAL_O5_CLAUSE_BODY} ).`",
+        code="CLAUSE_REGISTRY_FULL",
+    )
 
 
 def _screen_clause_domains(body: str) -> Optional[str]:
@@ -915,8 +962,12 @@ def _screen_clause_domains(body: str) -> Optional[str]:
 
     Same screens as a user_tx rule op: a clause must not write the
     consensus-owned verdict/fee streams, must not read an input the apply path
-    mocks, and must not type a reserved input stream.
+    mocks, must not type a reserved input stream, and may reference [t] only.
     """
+    temporal_error = screen_temporal_rule(body)
+    if temporal_error:
+        return temporal_error
+
     writes = _streams_referenced(body, CONSENSUS_OWNED_OUTPUT_STREAMS)
     if writes:
         return (
@@ -956,8 +1007,8 @@ def _screen_clause_domains(body: str) -> Optional[str]:
 
     # Approval slots may be read, but every occurrence must be typed bv[384].
     # Per-stream bitvector typing is process-global and sticky, so one clause
-    # typing i18 at bv[384] and another at bv[24] leaves get_interpreter
-    # returning None for everyone. Reject-unless-annotated, because an
+    # typing i18 at bv[384] and another at bv[24] makes get_interpreter
+    # fail for everyone. Reject-unless-annotated, because an
     # unannotated mention is exactly what lets the engine infer another width.
     slot_error = screen_slot_widths(body)
     if slot_error:
@@ -1034,7 +1085,7 @@ def validate_rule_offer_decision_payload(
         tip_view, target_stream, decision.actor_pubkey, body
     )
     if compose_error:
-        return format_error(compose_error)
+        return compose_error
 
     return success({
         "offer_id": offer_id_hex,
@@ -1133,18 +1184,8 @@ def validate_o5_clause_routing(
     existing = tip_view.clause_for(sender_n, tau_defs.USER_POLICY_STREAM_INDEX)
     if existing is None:
         authors = tip_view.clause_author_count(tau_defs.USER_POLICY_STREAM_INDEX)
-        if authors >= MAX_TIER_AUTHORS:
-            return format_error(
-                f"The o5 policy registry is full: {authors} of "
-                f"{MAX_TIER_AUTHORS} author slots are taken. This is a MEASURED "
-                f"ceiling, not a quota — interpreter rebuild time grows about "
-                f"eightfold per additional author (about 2.5s at one, 13-22s at "
-                f"two, 110s at four) against a 60s COMM_TIMEOUT with a watchdog "
-                f"kill past it. An existing author can free a slot by submitting "
-                f"the neutral clause "
-                f"`always ( {NEUTRAL_O5_CLAUSE_BODY} ).`",
-                code="CLAUSE_REGISTRY_FULL",
-            )
+        if authors >= clause_author_cap(tau_defs.USER_POLICY_STREAM_INDEX, True):
+            return _registry_full_error(authors)
 
     return success({
         "o5_clause_action": "declare",

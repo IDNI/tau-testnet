@@ -26,7 +26,6 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +36,7 @@ NATIVE = os.environ.get(
     "/Users/ak/idni/tau-lang/build-Release/bindings/python/nanobind")
 PYTHON = os.environ.get("TAU_E2E_PYTHON", sys.executable)
 NETWORK_ID = "tau-e2e-authority"
+BASE_FEE = 10
 ACTORS = ("minerA", "minerB", "alice", "bob", "carol", "dave", "erin", "inf")
 
 RESULTS = []
@@ -96,14 +96,19 @@ def history_policy_total(pk, previous="00005a"):
             ": (o5[t]:bv[24] = { #x000001 }:bv[24]) )." % (pk, previous))
 
 
-def history_fee(dave, carol):
-    """dave pays the previous step's amount as a custom fee; carol pays its low
-    six bits; nobody else pays one. o8 is on no other rule, so this composes
-    with the incident's o5 rules (checked by replay before it was used here)."""
-    return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) ? (o8[t]:bv[24] = i1[t-1]:bv[24]) : "
+def sender_fee(dave, carol):
+    """dave pays his own amount as a custom fee; carol pays its low six bits;
+    nobody else pays one. o8 is on no other rule, so this composes with the
+    incident's o5 rules."""
+    return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) ? (o8[t]:bv[24] = i1[t]:bv[24]) : "
             "((i12[t]:bv[384] = { #x%s }:bv[384]) ? "
-            "(o8[t]:bv[24] = (i1[t-1]:bv[24] & { #x00003f }:bv[24])) : "
+            "(o8[t]:bv[24] = (i1[t]:bv[24] & { #x00003f }:bv[24])) : "
             "(o8[t]:bv[24] = { #x000000 }:bv[24])) )." % (dave, carol))
+
+
+def fee_for(who, amount):
+    """What the base fee and `sender_fee` charge `who` for a transfer."""
+    return BASE_FEE + {"dave": amount, "carol": amount & 0x3f}.get(who, 0)
 
 
 def fresh_address(tag):
@@ -132,7 +137,7 @@ def export_ref(ref, dst):
 
 
 def make_genesis(tree, keys, *, validators, accounts):
-    cmd = [PYTHON, "scripts/gen_genesis.py", "--base-fee", "10",
+    cmd = [PYTHON, "scripts/gen_genesis.py", "--base-fee", str(BASE_FEE),
            "--network-id", NETWORK_ID, "--out", "data/genesis.json"]
     for name in validators:
         cmd += ["--validator-privkey", format(keys[name]["sk"], "064x")]
@@ -442,11 +447,29 @@ def relay(src, dst):
     return dst.probe("ingest", blocks=missing, peer=f"relay-{src.name}", timeout=600)
 
 
-def fee_probe(chain, node, who, to_pk):
-    """The fee admission quotes `who` for a 1-unit transfer: FEE_LIMIT_TOO_LOW
-    carries it. With dave's history fee this reads the committed history."""
-    res = chain.transfer(node, who, to_pk, 1, fee_limit="1")
+def fee_probe(chain, node, who, to_pk, amount=1):
+    """The fee admission quotes `who` for a transfer of `amount`:
+    FEE_LIMIT_TOO_LOW carries it."""
+    res = chain.transfer(node, who, to_pk, amount, fee_limit="1")
     return int((err(res).get("details") or {}).get("required_fee", -1))
+
+
+QUOTE_AMOUNTS = {"dave": 7, "carol": 90, "alice": 1}
+EXPECTED_QUOTES = {who: fee_for(who, amount) for who, amount in QUOTE_AMOUNTS.items()}
+
+
+def quotes(chain, node, to_pk):
+    return {who: fee_probe(chain, node, who, to_pk, amount)
+            for who, amount in QUOTE_AMOUNTS.items()}
+
+
+def step_amounts(rows):
+    """The i1 of every committed evaluator step, in journal order."""
+    out = []
+    for (_seq, kind, _rule, inputs, _target, _outcome, _fp, _link) in rows:
+        if kind == "step":
+            out.append(str((json.loads(inputs or "{}")).get("i1")))
+    return out
 
 
 # --- the run ------------------------------------------------------------------------
@@ -569,32 +592,48 @@ def _run(root, keys, chain, nodes, args):
 
     # ---------------------------------------------------------------- 5, 6, 7
     say("== 5-7: A/B/C/D -- B steps the evaluator and allocates, then is rejected ==")
-    r = chain.send(a, "carol", {"0": history_fee(pk["dave"], pk["carol"])})
-    check(5, "history fee rule admitted", ok(r), r)
+    r = chain.send(a, "carol", {"0": sender_fee(pk["dave"], pk["carol"])})
+    check(5, "sender fee rule admitted", ok(r), r)
     _mine(chain, a)
     check(5, "and included", tx_hash(r) in block_txs(a))
     new_addr, x_addr = fresh_address("abcd-new"), fresh_address("abcd-x")
-    carol0, dave0 = a.balance("carol"), a.balance("dave")
-    ta = chain.transfer(a, "alice", x_addr, 90, fee_limit="60")
-    tb = chain.transfer(a, "dave", new_addr, 5, fee_limit="60")
-    tc_ = chain.transfer(a, "carol", new_addr, 3, fee_limit="60")
+    carol0, dave0, erin0 = a.balance("carol"), a.balance("dave"), a.balance("erin")
+    journal0 = a.journal()
+    # B is affordable at the head and not after A: carol's two transfers share a block.
+    ta = chain.transfer(a, "carol", x_addr, 60000, fee_limit="100")
+    # getsequence already counts the mempool, so the tracked pending count is not added.
+    tb = chain.transfer(a, "carol", new_addr, 50000, fee_limit="100",
+                        seq=int(a.rpc(f"getsequence {pk['carol']}")["data"]["sequence_number"]))
+    tc_ = chain.transfer(a, "dave", new_addr, 90, fee_limit="200")
     td = chain.transfer(a, "erin", pk["alice"], 1, fee_limit="60")
     check(5, "A, B, C, D all admitted at the committed head",
           all(ok(x) for x in (ta, tb, tc_, td)), [ta, tb, tc_, td])
     _mine(chain, a)
     txs = block_txs(a)
     check(5, "the block carries A, C, D -- and not B",
-          txs == [tx_hash(ta), tx_hash(tc_), tx_hash(td)],
+          sorted(txs) == sorted([tx_hash(ta), tx_hash(tc_), tx_hash(td)]),
           {"block": txs, "A": tx_hash(ta), "B": tx_hash(tb), "C": tx_hash(tc_), "D": tx_hash(td)})
     status_b = a.rpc(f"gettxstatus {tx_hash(tb)}")["data"]
-    check(5, "B was rejected at apply (its fee after A is 10 + 90 > 60)",
-          status_b.get("status") == "rejected", status_b)
-    check(6, "B left nothing: dave paid no fee and moved nothing", a.balance("dave") == dave0)
+    check(5, "B was rejected at apply, for want of funds once A had landed",
+          status_b.get("status") == "rejected"
+          and "insufficient" in str(status_b.get("detail")), status_b)
     paid = carol0 - a.balance("carol")
-    check(6, "C saw A and not B: carol's fee reads A's 90 (26), not B's 5",
-          paid == 3 + 10 + (90 & 63), {"paid": paid, "if_B_leaked": 3 + 10 + 5})
-    check(6, "the new address holds C's transfer only", a.balance_of(new_addr) == 3,
+    check(6, "B left nothing: carol paid A's amount and fee, and B moved nothing",
+          paid == 60000 + fee_for("carol", 60000),
+          {"paid": paid, "A_only": 60000 + fee_for("carol", 60000)})
+    check(6, "each fee matches its own transaction's amount: dave 90 + 10 + 90",
+          dave0 - a.balance("dave") == 90 + fee_for("dave", 90),
+          dave0 - a.balance("dave"))
+    check(6, "and nobody else pays a custom fee: erin 1 + 10",
+          erin0 - a.balance("erin") == 1 + BASE_FEE, erin0 - a.balance("erin"))
+    check(6, "the new address holds C's transfer only", a.balance_of(new_addr) == 90,
           a.balance_of(new_addr))
+    check(6, "and A's went where it was sent", a.balance_of(x_addr) == 60000,
+          a.balance_of(x_addr))
+    amounts = step_amounts(a.journal()[len(journal0):])
+    EVIDENCE["committed_step_amounts"] = amounts
+    check(6, "the committed journal holds the steps of A, C and D and none of B's",
+          "50000" not in amounts and {"60000", "90", "1"} <= set(amounts), amounts)
     with a.db() as c:
         bound = [k for (k,) in c.execute("SELECT key FROM tau_shrink_ids").fetchall()
                  if new_addr in k]
@@ -613,21 +652,28 @@ def _run(root, keys, chain, nodes, args):
 
     # ---------------------------------------------------------------- 8
     say("== 8: restart; the evaluator continues where it was ==")
-    before = fee_probe(chain, a, "dave", pk["alice"])
-    check(8, "admission reads the committed history: dave's quote is 10 + D's 1",
-          before == 11, before)
+    before = quotes(chain, a, pk["bob"])
+    check(8, "admission quotes each sender from its own amount: dave 10 + 7, carol 10 + 26, alice 10",
+          before == EXPECTED_QUOTES, before)
+    journal_before = a.journal()
     a.stop()
     a.start()
     check(8, "A restarts", a.wait_ready())
     check(8, "the authority was rebuilt from the committed journal",
           "authoritative evaluator reconstructed from" in a.log().split("===== start")[-1])
-    check(8, "the same quote after restart", fee_probe(chain, a, "dave", pk["alice"]) == before)
-    dave0 = a.balance("dave")
+    check(8, "the restart left the committed journal as it was",
+          a.journal()[:len(journal_before)] == journal_before)
+    check(8, "the same quotes after restart: the fee rule came back with the journal",
+          quotes(chain, a, pk["bob"]) == before)
+    dave0, carol0 = a.balance("dave"), a.balance("carol")
     chain.transfer(a, "dave", pk["alice"], 2)
+    chain.transfer(a, "carol", pk["alice"], 70)
     mark = a.log_mark()
     _mine(chain, a)
-    check(8, "the reconstructed authority continues the history: dave pays 10 + 1",
-          dave0 - a.balance("dave") == 2 + 11, dave0 - a.balance("dave"))
+    check(8, "the reconstructed authority charges by each tx's own amount: dave 2 + 10 + 2",
+          dave0 - a.balance("dave") == 2 + fee_for("dave", 2), dave0 - a.balance("dave"))
+    check(8, "and carol 70 + 10 + 6",
+          carol0 - a.balance("carol") == 70 + fee_for("carol", 70), carol0 - a.balance("carol"))
     r_bob = chain.transfer(a, "bob", pk["alice"], 5)
     check(8, "the incident policy survives restart: bob still blocked",
           not ok(r_bob) and "user policy" in err(r_bob).get("message", ""), r_bob)
@@ -662,8 +708,8 @@ def _run(root, keys, chain, nodes, args):
           "injected promotion failure" in a.log_since(mark))
     snap = a.probe("snapshot")
     check(10, "and nothing is served", snap["state"] == "UNAVAILABLE", snap["state"])
-    check(10, "admission still answers from the committed journal: 10 + 7",
-          fee_probe(chain, a, "dave", pk["alice"]) == 17)
+    check(10, "admission still answers from the committed journal: the same quotes",
+          quotes(chain, a, pk["bob"]) == EXPECTED_QUOTES)
     dave0 = a.balance("dave")
     chain.transfer(a, "dave", pk["alice"], 1)
     mark = a.log_mark()
@@ -671,13 +717,16 @@ def _run(root, keys, chain, nodes, args):
     since = a.log_since(mark)
     check(10, "the next block is built from the journal, not the lost worker",
           "runs on the authoritative worker (lent)" not in since and a.height() == height0 + 2)
-    check(10, "and continues the same history: dave pays 10 + 7",
-          dave0 - a.balance("dave") == 1 + 17, dave0 - a.balance("dave"))
+    check(10, "and charges by the tx's own amount: dave pays 1 + 10 + 1",
+          dave0 - a.balance("dave") == 1 + fee_for("dave", 1), dave0 - a.balance("dave"))
+    journal_before = a.journal()
     a.stop()
     a.start()
     check(10, "restart after the failure", a.wait_ready())
-    check(10, "the same continuation after restart: quote 10 + 1",
-          fee_probe(chain, a, "dave", pk["alice"]) == 11)
+    check(10, "the restart left the committed journal as it was",
+          a.journal()[:len(journal_before)] == journal_before)
+    check(10, "the same quotes after restart",
+          quotes(chain, a, pk["bob"]) == EXPECTED_QUOTES)
     plan = json.loads(a.commits()[-1][3] or "{}")
     EVIDENCE["plan_after_recovery"] = plan
     rule2 = incident_rule(pk["erin"])
@@ -747,7 +796,7 @@ def _run(root, keys, chain, nodes, args):
     say("== 14: rebuild the journal explicitly from the stored blocks ==")
     b.stop()
     head_a, journal_a = a.head(), a.journal()
-    quote_a = fee_probe(chain, a, "dave", pk["alice"])
+    quote_a = quotes(chain, a, pk["bob"])
     tree_r = os.path.join(root, "nodeR")
     shutil.copytree(tree_b, tree_r, ignore=shutil.ignore_patterns("e2e-control", "node.log", "logs"))
     db_r = os.path.join(tree_r, "data", "node.db")
@@ -774,8 +823,8 @@ def _run(root, keys, chain, nodes, args):
           semantic_journal(journal_r) == semantic_journal(journal_a),
           {"A": len(journal_a), "rebuilt": len(journal_r)})
     EVIDENCE["rebuild_links_identical"] = [x[7] for x in journal_r] == [x[7] for x in journal_a]
-    check(14, "the rebuilt evaluator continues identically (dave's quote)",
-          fee_probe(chain, rn, "dave", pk["alice"]) == quote_a, quote_a)
+    check(14, "the rebuilt evaluator quotes every sender identically",
+          quote_a == EXPECTED_QUOTES and quotes(chain, rn, pk["bob"]) == quote_a, quote_a)
     rn.stop()
     before = rn.journal()
     rn.start(TAU_REBUILD_JOURNAL="1")
@@ -808,9 +857,11 @@ def _run(root, keys, chain, nodes, args):
 
 
 def step15(root, keys, chain, nodes, *, patched):
-    """Repeated admission requests around a `[t-1]` o5 policy, on a chain of its
-    own: the policy is the only o5 rule there, so nothing else composes with it."""
-    say("== 15: admission requests cannot influence one another ==")
+    """A `[t-1]` o5 policy on a chain of its own. A patched tree refuses it at
+    admission; an unpatched one admits it, and then the admission requests of
+    unrelated senders become the policy's history."""
+    say("== 15: a rule reading another step is refused ==" if patched
+        else "== 15: admission requests cannot influence one another ==")
     pk = {n: keys[n]["pk"] for n in keys}
     tag = "15" if patched else "15-unpatched"
     tree = os.path.join(root, "nodeC" if patched else "nodeC-unpatched")
@@ -826,6 +877,17 @@ def step15(root, keys, chain, nodes, *, patched):
     check(tag, "a fresh node for the policy", node.wait_ready())
     chain.pending.clear()
     r = chain.send(node, "dave", {"0": history_policy_total(pk["dave"])})
+    if patched:
+        check(tag, "dave's [t-1] policy is refused at admission, with its reason",
+              not ok(r) and err(r).get("code") == "TEMPORAL_REFERENCE", r)
+        rt = chain.transfer(node, "erin", pk["alice"], 1)
+        check(tag, "a transfer is still admitted", ok(rt), rt)
+        _mine(chain, node)
+        check(tag, "and included: the refused rule left nothing behind",
+              tx_hash(rt) in block_txs(node))
+        check(tag, "no crash artifact", not node.crash_dumps())
+        node.stop()
+        return
     check(tag, "dave's [t-1] policy admitted", ok(r), r)
     _mine(chain, node)
     check(tag, "and included", tx_hash(r) in block_txs(node))
@@ -836,45 +898,9 @@ def step15(root, keys, chain, nodes, *, patched):
     check(tag, "influencers reach the Tau step (amount 90) and are refused after it",
           err(rinf).get("code") == "INSUFFICIENT_FUNDS", rinf)
     rd = chain.transfer(node, "dave", fresh_address("dave-target"), 5)
-    if patched:
-        check(tag, "dave is admitted: committed history ends at 1, not the influencers' 90",
-              ok(rd), rd)
-        _mine(chain, node)
-        check(tag, "and included: admission and inclusion agree", tx_hash(rd) in block_txs(node))
-        chain.transfer(node, "alice", fresh_address("x90"), 90)
-        _mine(chain, node)                              # history now ends at 90
-        for _ in range(3):
-            chain.transfer(node, "inf", fresh_address("elsewhere"), 5)
-        rd = chain.transfer(node, "dave", fresh_address("dave-target"), 5)
-        check(tag, "the other direction: history ends at 90, influencers feed 5 -- dave refused",
-              not ok(rd) and "user policy" in err(rd).get("message", ""), rd)
-        verdicts, threads, lock = [], [], threading.Lock()
-
-        def _one(who, amount):
-            out = chain.transfer(node, who, fresh_address(f"c-{who}"), amount)
-            with lock:
-                verdicts.append((who, "admitted" if ok(out) else err(out).get("code"),
-                                 err(out).get("message", "")[:60]))
-
-        for i in range(8):
-            threads.append(threading.Thread(
-                target=_one, args=(("dave", 5) if i % 2 else ("inf", 5))))
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(180)
-        EVIDENCE["concurrent_admission"] = verdicts
-        daves = [v for v in verdicts if v[0] == "dave"]
-        answered = [v for v in daves if v[1] not in ("ADMISSION_UNAVAILABLE", "ADMISSION_TIMEOUT")]
-        check(tag, "eight concurrent requests: no dave request got a verdict from anyone "
-                   "else's history", answered and all(v[1] == "TX_REJECTED" and
-                                                      "user policy" in v[2] for v in answered),
-              verdicts)
-        check(tag, "no crash artifact", not node.crash_dumps())
-    else:
-        EVIDENCE["unpatched_step15"] = rd
-        check(tag, "UNPATCHED: dave is falsely refused -- the influencers' 90 became his [t-1]",
-              not ok(rd) and "user policy" in err(rd).get("message", ""), rd)
+    EVIDENCE["unpatched_step15"] = rd
+    check(tag, "UNPATCHED: dave is falsely refused -- the influencers' 90 became his [t-1]",
+          not ok(rd) and "user policy" in err(rd).get("message", ""), rd)
     node.stop()
 
 

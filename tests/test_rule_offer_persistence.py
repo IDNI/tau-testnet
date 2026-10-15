@@ -11,6 +11,7 @@ durability for the RPC surface and must NOT affect the hash, exactly as
 governance update payloads do not.
 """
 import chain_state
+import pytest
 from consensus.governance import ConsensusLifecycleManager, DEFAULT_MAX_RULE_TXS_PER_BLOCK
 from consensus.rule_offers import (
     STATUS_ACCEPTED,
@@ -21,6 +22,8 @@ from consensus.rule_offers import (
     RuleOfferDecision,
     clause_body_v1,
 )
+
+pytestmark = pytest.mark.usefixtures("isolated_chain_state")
 
 A = "aa" * 48
 B = "bb" * 48

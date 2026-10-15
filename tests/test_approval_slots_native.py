@@ -14,7 +14,7 @@ schema was frozen, and two of them contradicted the first draft of the plan.
    at both sides of every boundary.
 
 3. A bv-WIDTH CLASH FAILS CLOSED. One clause typing i18 at bv[384] and another
-   at bv[24] leaves `get_interpreter` returning None -- for everyone, until the
+   at bv[24] leaves `get_interpreter` failing -- for everyone, until the
    process restarts. This is why the clause screen is reject-unless-annotated
    rather than reject-on-mismatch.
 
@@ -148,7 +148,7 @@ def iface_from(*bodies):
     """Build directly from a boot file holding ONE conjoined always() unit.
 
     A spec is one `always ( ... ).`; multiple always() sentences joined by
-    newlines or spaces make get_interpreter return None, even for the four
+    newlines or spaces make get_interpreter fail, even for the four
     shipped rules/*.tau.
     """
     spec = "always ( " + " && ".join("(" + b + ")" for b in bodies) + " )."
@@ -357,11 +357,10 @@ narrow = ("(" + guard(BOB) + " ? ((i18[t]:bv[24] = { #x000001 }:bv[24])"
 for label, bodies in (("consistent", [BASE, good]),
                       ("clashing", [BASE, good, narrow])):
     spec = "always ( " + " && ".join("(" + b + ")" for b in bodies) + " )."
-    with tau_native.StdOutCapture() as cap:
-        built = tau_mod.get_interpreter(
-            tau_native.TauInterface.preprocess_spec_text(spec))
-    res[label] = built is not None
-    res[label + "_err"] = tau_native.strip_ansi(cap.output)[-300:]
+    built = tau_mod.get_interpreter(
+        tau_native.TauInterface.preprocess_spec_text(spec))
+    res[label] = bool(built)
+    res[label + "_err"] = tau_native.report_errors(built.report)[-300:]
 emit(res)
 ''')
     _assert_ok(proc, parsed)

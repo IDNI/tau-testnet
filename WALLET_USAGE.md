@@ -172,7 +172,10 @@ execution); a malformed `o5` fails closed (treated as block).
 
 Rules scope on the sender (`i12` pubkey, or `i3`) and may read the recipient
 (`i4`), block time (`i5`), and amount (`i1`) — all real at both admission and
-apply. Examples expressible today:
+apply. Rules must reference `[t]` only: `i1[t-1]` or `i1[0]` is refused with
+`TEMPORAL_REFERENCE`, because one unit that reads another step zeroes every
+output for the steps after each later revision, for all accounts. Examples
+expressible today:
 
 - **Recipient whitelist:** `always ( (i4[t] = {#x…}:bv[384]) ? o5[t]:bv[24] = { #x000001 }:bv[24] : o5[t]:bv[24] = { #x000000 }:bv[24] ).`
 - **Time-lock:** block transfers while `i5[t] < {unlock_ts}:bv[64]`.
