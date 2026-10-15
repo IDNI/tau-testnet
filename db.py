@@ -1677,7 +1677,8 @@ def get_mempool_entries() -> List[Dict]:
         ]
 
 def reserve_mempool_txs(limit: int = 1000, max_age_seconds: int = 60,
-                        slow_limit: int | None = None) -> List[Dict]:
+                        slow_limit: int | None = None,
+                        exclude_hashes=None) -> List[Dict]:
     """
     Selects pending transactions from the mempool AND releases stale
     reservations (older than max_age_seconds).
@@ -1692,6 +1693,9 @@ def reserve_mempool_txs(limit: int = 1000, max_age_seconds: int = 60,
 
     `slow_limit=None` means no cap, preserving the pre-lane behaviour for
     callers that have no per-block budget of their own.
+
+    `exclude_hashes` are never selected and take no slot in either lane, so a
+    row the caller will not build on cannot crowd out one it can.
 
     Returns a list of dicts: {'id': int, 'tx_hash': str, 'payload': str},
     fast-lane rows first, at most `limit` in total.
@@ -1729,14 +1733,21 @@ def reserve_mempool_txs(limit: int = 1000, max_age_seconds: int = 60,
             "ORDER BY estimated_fee DESC, fee_limit DESC, received_at ASC, id ASC"
         )
 
+        excluded = frozenset(exclude_hashes or ())
+
         def _select(lane: int, count: int):
             if count <= 0:
                 return []
-            return cur.execute(
+            # Over-fetch and filter, rather than NOT IN, so the exclusion list
+            # is not bound by SQLite's limit on bound variables.
+            rows = cur.execute(
                 "SELECT id, tx_hash, payload FROM mempool "
                 "WHERE status = 'pending' AND lane = ? " + _LANE_ORDER + " LIMIT ?",
-                (lane, count),
+                (lane, count + len(excluded)),
             ).fetchall()
+            if excluded:
+                rows = [row for row in rows if row[1] not in excluded]
+            return rows[:count]
 
         fast_rows = _select(LANE_FAST, limit)
         slow_budget = limit - len(fast_rows)

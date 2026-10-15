@@ -273,7 +273,13 @@ class PreparedBlockCommit:
                 )
 
         if self.worker is not None:
-            state = _worker_state(self.worker)
+            try:
+                # Strict: a worker that died after freezing reads as an empty
+                # state, which would compare equal to anything and be promoted.
+                state = _worker_state(self.worker, strict=True)
+            except WorkerUnavailable as exc:
+                problems.append(str(exc))
+                state = {}
             for name, mine in (("spec_revision", self.proposal_spec_revision),
                                ("time_point", self.proposal_time_point)):
                 theirs = state.get(name)

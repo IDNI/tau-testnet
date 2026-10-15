@@ -68,6 +68,13 @@ def authority(node_state):
 
 
 @pytest.fixture(autouse=True)
+def _no_deferrals():
+    createblock._deferred.clear()
+    yield
+    createblock._deferred.clear()
+
+
+@pytest.fixture(autouse=True)
 def _mining_allowed():
     with patch.object(TauConsensusEngine, "query_eligibility", lambda *a, **k: True), \
          patch.object(TauConsensusEngine, "verify_block_header", lambda *a, **k: True):
@@ -199,13 +206,49 @@ def test_a_killed_worker_aborts_the_round_and_the_batch_stays_pending(authority,
     assert "evaluator lost" in out["error"], out
     assert _head() == head, "a block landed although its evaluation was lost"
     _queued(tx_hash)
+    assert set(createblock._deferred) == {tx_hash}, (
+        "the transaction in evaluation when the worker died was not deferred")
     _assert_serves_no_dead_worker(authority)
 
     killer.disarm()
-    mined = createblock.create_block_from_mempool()
+    backed_off = createblock.create_block_from_mempool()
+    assert "error" not in backed_off and "block_hash" not in backed_off, backed_off
+    _queued(tx_hash)
+
+    later = time.monotonic() + createblock.DEFER_BASE_SECONDS + 1
+    with patch.object(createblock, "_now", lambda: later):
+        mined = createblock.create_block_from_mempool()
     assert "error" not in mined, mined
     assert _included(tx_hash), "the transaction was not included once a worker lived"
     assert authority.state == auth.ACTIVE and authority.active
+
+
+# --- the commit gate ------------------------------------------------------------
+
+def test_a_worker_killed_between_freezing_and_the_gate_costs_the_artifact_only(
+        authority):
+    """A dead worker reads as an empty state, which agrees with every counter, so
+    without a strict gate the artifact would be promoted."""
+    tx_hash = _queue_a_rule("lost_gate")
+    victims = []
+    real_offer = tc.registry().offer
+
+    def _offer_then_kill(execution_id, prepared, proposal):
+        real_offer(execution_id, prepared, proposal)
+        victim = proposal.session._spec
+        victim._proc.kill()
+        victim._proc.wait(timeout=10)
+        victims.append(victim)
+
+    with patch.object(tc.registry(), "offer", _offer_then_kill):
+        out = createblock.create_block_from_mempool()
+
+    assert victims, "no artifact was offered: the test reached nothing"
+    assert "error" not in out and "block_hash" in out, out
+    assert _included(tx_hash)
+    assert authority.state == auth.ACTIVE and authority.active
+    _assert_serves_no_dead_worker(authority)
+    assert authority._session._spec is not victims[0], "the killed worker was promoted"
 
 
 # --- ingestion ------------------------------------------------------------------

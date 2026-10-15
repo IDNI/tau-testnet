@@ -42,13 +42,19 @@ class SpeculationProtocolError(SpeculationError):
 
 
 class WorkerLost(BaseException):
-    """The worker is gone. A BaseException so that no broad `except Exception`
-    can report this node-local loss as a verdict on a rule or a transaction."""
+    """The worker is gone or can no longer serve. A BaseException so that no broad
+    `except Exception` can report this node-local loss as a verdict on a rule or
+    a transaction."""
 
 
 class WorkerTimeout(WorkerLost):
     """A request outlived its deadline and the worker was killed. The answer is
     unknown, so it is as operational as any other lost worker."""
+
+
+def _why_unusable(resp: dict) -> str:
+    detail = resp.get("error") or str(resp.get("diagnostics") or "")[:200]
+    return detail or str(resp.get("phase") or "no detail given")
 
 
 class RevisionReceipt(dict):
@@ -150,6 +156,10 @@ class SpeculationSession:
                     self._send(payload)
                     self._await_frame(limit)
                     resp = self._recv()
+                    # Before the identity checks: a worker that cannot serve may
+                    # not even echo the request id (the startup refusal does not).
+                    if resp.get("unavailable") or not resp.get("session_healthy", True):
+                        raise WorkerLost(f"worker cannot serve: {_why_unusable(resp)}")
                 except WorkerLost:
                     # Closes the session too, so a later request fails at once
                     # instead of waiting on a channel nobody will write to.
@@ -168,8 +178,6 @@ class SpeculationSession:
                 f"state revision went backwards: {state} < {self._last_state_revision}"
             )
         self._last_state_revision = state
-        if resp.get("unavailable"):
-            raise SpeculationError(resp.get("error", "native tau unavailable"))
         return resp
 
     # --- operations -----------------------------------------------------------
@@ -190,8 +198,6 @@ class SpeculationSession:
         )
         if resp.get("candidate_id") != candidate_id:
             raise SpeculationProtocolError("receipt names a different candidate")
-        if not resp.get("session_healthy", True):
-            raise SpeculationError("session became unusable during the revision")
         return RevisionReceipt(resp)
 
     def step(self, inputs: dict, *, timeout=_SESSION_DEFAULT) -> dict:
