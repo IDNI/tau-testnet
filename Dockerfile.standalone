@@ -78,8 +78,9 @@ WORKDIR /app/tau-testnet
 COPY requirements.txt /app/tau-testnet/requirements.txt
 COPY scripts/install_coincurve.sh /tmp/install_coincurve.sh
 
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    sh /tmp/install_coincurve.sh && rm /tmp/install_coincurve.sh && \
+RUN --mount=type=cache,target=/root/.cache/coincurve-wheels \
+    pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    COINCURVE_WHEEL_DIR=/root/.cache/coincurve-wheels sh /tmp/install_coincurve.sh && rm /tmp/install_coincurve.sh && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir nanobind
 
