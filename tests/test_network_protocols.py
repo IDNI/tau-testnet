@@ -852,9 +852,6 @@ async def test_peer_advertisement_gossip(monkeypatch):
         
         svc_a._dht.provider_store.add_provider(provider_key_bytes, peer_info_c)
 
-        svc_b.host.get_peerstore().add_addrs(svc_a.host.get_id(), addrs_a, 60)
-        await svc_b.host.connect(PeerInfo(svc_a.host.get_id(), addrs_a))
-
         original_find = svc_b._dht.peer_routing.find_peer
         lookup_ids: List[ID] = []
 
@@ -863,6 +860,9 @@ async def test_peer_advertisement_gossip(monkeypatch):
             return await original_find(peer_id)
 
         monkeypatch.setattr(svc_b._dht.peer_routing, "find_peer", instrumented_find)
+
+        svc_b.host.get_peerstore().add_addrs(svc_a.host.get_id(), addrs_a, 60)
+        await svc_b.host.connect(PeerInfo(svc_a.host.get_id(), addrs_a))
 
         advertisement_seen = trio.Event()
 
