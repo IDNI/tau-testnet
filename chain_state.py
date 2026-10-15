@@ -525,6 +525,16 @@ def _dispose_quietly(proposal) -> None:
         logger.warning("could not dispose a block proposal", exc_info=True)
 
 
+def _overrun_tx(block, opened_as) -> str:
+    """A block body carries no `tx_id`, so the engine names its transactions by
+    position; this maps that name back to the hash the block lists."""
+    for index, tx in enumerate(block.transactions or []):
+        if isinstance(tx, dict) and tau_proposal.branch_id(tx, index) == opened_as:
+            ids = getattr(block, "tx_ids", None) or []
+            return ids[index] if index < len(ids) else opened_as
+    return opened_as or "?"
+
+
 def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
     """The canonical rows for a block, computed from its SNAPSHOT.
 
@@ -660,7 +670,7 @@ def process_new_block(block: Block) -> bool:
 def _process_new_block_locked(block: Block) -> bool:
     """`process_new_block` body. Callers must hold `_chain_lock`."""
     global _lifecycle_manager, _application_rules_state, _consensus_rules_state, _tau_engine_state_hash, _canonical_head_hash, _active_consensus_id
-    from errors import TauTestnetError, BlockchainBug
+    from errors import TauTestnetError, BlockchainBug, EvaluatorLost
     import db
     
     try:
@@ -830,6 +840,7 @@ def _process_new_block_locked(block: Block) -> bool:
                         _proposal = _owner.build_proposal(
                             candidate_rules=_candidates, label=_label,
                         )
+                        _proposal.budget = config.VALIDATION_CEILING
                 except Exception as exc:
                     logger.error(
                         "[BLOCKCHAIN] cannot evaluate block #%s: the authoritative "
@@ -872,10 +883,18 @@ def _process_new_block_locked(block: Block) -> bool:
                     # Operational: the proposal could not be evaluated or frozen.
                     # Nothing is durable yet, so the block is simply not accepted
                     # now; it is not judged invalid.
-                    logger.error(
-                        "[BLOCKCHAIN] could not evaluate block #%s: %s",
-                        block.header.block_number, exc,
-                    )
+                    if isinstance(exc, EvaluatorLost) and exc.timed_out:
+                        logger.error(
+                            "[BLOCKCHAIN] block #%s: transaction %s exceeded the %ss "
+                            "validation ceiling; not accepted now",
+                            block.header.block_number, _overrun_tx(block, exc.tx_id),
+                            config.VALIDATION_CEILING,
+                        )
+                    else:
+                        logger.error(
+                            "[BLOCKCHAIN] could not evaluate block #%s: %s",
+                            block.header.block_number, exc,
+                        )
                     _dispose_quietly(_proposal)
                     return False
             elif _prepared is None:

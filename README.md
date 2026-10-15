@@ -367,7 +367,7 @@ Defaults shown; set via environment or `tau-testnet node run` flags. **Bold** va
 | **`TAU_BLOCK_SIGNATURE_SCHEME`** | `bls_g2` | Block signature algorithm. |
 | `TAU_GOVERNANCE_OPEN_ADMISSION` | `false` | Allow non-validators into governance (keep off in public). |
 
-Operational extras: `TAU_MAX_MEMPOOL_TXS` (5000), `TAU_MEMPOOL_RULE_LANE_MAX_FRACTION` (0.1; slow-lane share of the mempool), `TAU_BLOCK_MAX_RULE_TXS` (8; proposer-side rule budget, never above the consensus ceiling), `TAU_MAX_CONNECTIONS` (200), `TAU_RATE_LIMIT_PER_PEER` (2.0/s), `TAU_COMM_TIMEOUT` (60s; watchdog kills a stalled Tau), `TAU_WS_ALLOWED_ORIGINS`, `TAU_WS_CERT_PATH`/`TAU_WS_KEY_PATH` (WSS), `TAU_FORCE_FRESH_START` (crash recovery). See `config.py` for the full list.
+Operational extras: `TAU_MAX_MEMPOOL_TXS` (5000), `TAU_MEMPOOL_RULE_LANE_MAX_FRACTION` (0.1; slow-lane share of the mempool), `TAU_BLOCK_MAX_RULE_TXS` (8; proposer-side rule budget, never above the consensus ceiling), `TAU_MAX_CONNECTIONS` (200), `TAU_RATE_LIMIT_PER_PEER` (2.0/s), `TAU_COMM_TIMEOUT` (60s; watchdog kills a stalled in-process interpreter; also the limit on each advisory worker request), `TAU_MINING_BUDGET` (60s; per Tau request while this node builds a block; an overrun defers that transaction), `TAU_VALIDATION_CEILING` (600s; per Tau request while applying a received block; an overrun leaves the block for a later retry), `TAU_WS_ALLOWED_ORIGINS`, `TAU_WS_CERT_PATH`/`TAU_WS_KEY_PATH` (WSS), `TAU_FORCE_FRESH_START` (crash recovery). See `config.py` for the full list.
 
 ---
 
@@ -375,7 +375,7 @@ Operational extras: `TAU_MAX_MEMPOOL_TXS` (5000), `TAU_MEMPOOL_RULE_LANE_MAX_FRA
 
 Real Tau evaluation is **enabled by default**. Setting `TAU_FORCE_TEST=1` bypasses the real engine and uses a deterministic mock validator path — for development/CI only (the test suite sets it automatically). Booting with `TAU_FORCE_TEST=1` **and** `TAU_ENV=production` is refused.
 
-When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker), the node holds a single `tau::interpreter` instance and reads state updates from its output streams. The interpreter is process-global and Tau calls are serialized; a watchdog (`TAU_COMM_TIMEOUT`) kills a stalled evaluation. A native segfault under sustained use is a known alpha risk and is **not** isolated — it can stop the node process (see [Security & risk model](#security--risk-model)).
+When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker), the node holds a single `tau::interpreter` instance and reads state updates from its output streams. The interpreter is process-global and Tau calls are serialized; a watchdog (`TAU_COMM_TIMEOUT`) kills a stalled in-process evaluation, while block evaluation runs in worker processes bounded per request by `TAU_MINING_BUDGET` and `TAU_VALIDATION_CEILING`. A native segfault under sustained use is a known alpha risk and is **not** isolated — it can stop the node process (see [Security & risk model](#security--risk-model)).
 
 ---
 

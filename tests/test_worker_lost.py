@@ -793,7 +793,7 @@ def test_a_lost_worker_while_freezing_the_artifact_costs_the_artifact_only(node_
 _SESSION_APIS = re.compile(
     r"SpeculationSession|WorkerSession|validate_once|build_proposal\(|"
     r"replay_entries\(|\.reconstruct\(|\bproposal\.(?:reset|replan)\(|"
-    r"\.replan\(")
+    r"\.replan\(|open_context\(")
 
 #: Modules that define the loss, or carry it without catching it.
 _DEFINES = {"tau_speculation.py", "tau_session.py", "tau_proposal.py"}
@@ -807,6 +807,10 @@ _OWNERS = {
     "tau_advisory.py": "WorkerLost",
     "tau_authority.py": "WorkerLost",
     "tau_preflight.py": "WorkerLost",
+    # These go through an AdmissionContext, which turns the loss into
+    # AdmissionUnavailable at its own edge.
+    os.path.join("commands", "getapprovalpreview.py"): "AdmissionUnavailable",
+    os.path.join("commands", "sendtx.py"): "AdmissionUnavailable",
 }
 
 _SKIP_DIRS = {".git", ".claude", ".local", "venv", ".venv", "data", "tests",
@@ -853,7 +857,7 @@ def test_every_user_of_a_session_is_accounted_for():
 @pytest.mark.parametrize("relative,how", sorted(_OWNERS.items()))
 def test_every_owner_translates_the_loss(relative, how):
     code = _code_without_docs(os.path.join(REPO, relative))
-    needle = "boundary(" if how == "boundary" else "WorkerLost"
+    needle = "boundary(" if how == "boundary" else how
     assert needle in code, f"{relative} owns a session and never translates WorkerLost"
 
 

@@ -258,11 +258,11 @@ def test_a_speculative_session_cannot_intern_into_the_live_table(temp_database, 
     import tau_session
 
     class _FakeSpec:
-        def revise(self, text, cid):
+        def revise(self, text, cid, **kwargs):
             ts.intern_value(ADDR, 384)          # the encoder runs here
             return {"outcome": "ACCEPTED_CHANGED"}
 
-        def step(self, inputs):
+        def step(self, inputs, **kwargs):
             ts.intern_value(OTHER, 384)
             return {"outputs": {}}
 

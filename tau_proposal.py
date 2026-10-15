@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 MAX_REPRESENTATION_RETRIES = 3
 
 
+def branch_id(tx, index: int) -> str:
+    """The id a transaction's branch is opened under. consensus/engine.py spells
+    the same expression; the tests pin the two together."""
+    return str(tx.get("tx_id") or tx.get("tx_hash") or f"tx{index}")
+
+
 @contextlib.contextmanager
 def boundary(proposal=None, *, label="proposal"):
     """The ONE deliberate terminal catch for an isolation breach.
@@ -68,7 +74,12 @@ def boundary(proposal=None, *, label="proposal"):
         if proposal is not None and not getattr(proposal, "poisoned", None):
             proposal.poison(f"evaluator lost: {lost}")
         logger.error("%s: evaluator lost, abandoning the proposal: %s", label, lost)
-        raise EvaluatorLost(f"evaluator lost: {lost}") from None
+        # The owner of a timed-out round needs the transaction that held the worker.
+        raise EvaluatorLost(
+            f"evaluator lost: {lost}",
+            tx_id=getattr(proposal, "open_tx", None),
+            timed_out=isinstance(lost, tau_speculation.WorkerTimeout),
+        ) from None
 
 
 class ProposalPoisoned(RuntimeError):
@@ -160,12 +171,18 @@ class TxBranch:
         if session is not None:
             session.allocation = self.allocation
             session.journal = self.journal
+            if hasattr(session, "request_budget"):
+                session.request_budget = self.proposal.budget
+        self.proposal.open_tx = self.tx_id
 
     def _unbind(self) -> None:
         session = getattr(self.proposal, "session", None)
         if session is not None:
             session.allocation = self.proposal.allocator
             session.journal = self.proposal.journal
+            if hasattr(session, "request_budget"):
+                session.request_budget = None
+        self.proposal.open_tx = None
 
     # --- evaluator effects ----------------------------------------------------
 
@@ -270,6 +287,12 @@ class ProposalContext:
         #: stepped with a block that will never commit, so the owner must stop
         #: claiming to serve committed state.
         self.on_abandon = None
+        #: Per-request deadline in seconds, set by the owner and applied only while
+        #: a transaction branch is open: block-level work and replays never carry
+        #: one. None means no deadline.
+        self.budget = None
+        #: The transaction whose branch is open, to name it if the worker is lost.
+        self.open_tx = None
 
     def _bind_session(self) -> None:
         if self.session is None:

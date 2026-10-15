@@ -47,6 +47,7 @@ class AdvisoryEvaluator:
     # --- lifecycle ------------------------------------------------------------
 
     def _ensure(self, canonical_spec: str):
+        import config
         import tau_speculation
 
         fingerprint = _spec_fingerprint(canonical_spec)
@@ -57,7 +58,8 @@ class AdvisoryEvaluator:
         env.setdefault("PYTHONPATH", "")
         if self._cwd not in env["PYTHONPATH"].split(os.pathsep):
             env["PYTHONPATH"] = self._cwd + os.pathsep + env["PYTHONPATH"]
-        session = tau_speculation.SpeculationSession(cwd=self._cwd, env=env)
+        session = tau_speculation.SpeculationSession(
+            cwd=self._cwd, env=env, timeout=config.COMM_TIMEOUT)
         session.init(canonical_spec)
         self._session = session
         self._fingerprint = fingerprint
@@ -75,6 +77,7 @@ class AdvisoryEvaluator:
         consensus rules alone (user rules may not write them), so nothing else
         belongs in this session.
         """
+        import config
         import tau_speculation
 
         unit = _normalize_consensus(consensus_rules)
@@ -90,7 +93,8 @@ class AdvisoryEvaluator:
         env.setdefault("PYTHONPATH", "")
         if self._cwd not in env["PYTHONPATH"].split(os.pathsep):
             env["PYTHONPATH"] = self._cwd + os.pathsep + env["PYTHONPATH"]
-        session = tau_speculation.SpeculationSession(cwd=self._cwd, env=env)
+        session = tau_speculation.SpeculationSession(
+            cwd=self._cwd, env=env, timeout=config.COMM_TIMEOUT)
         try:
             session.init(baseline)
             receipt = session.revise(unit, "consensus")

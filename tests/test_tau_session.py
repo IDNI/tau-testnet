@@ -182,12 +182,12 @@ def test_a_worker_receipt_exposes_accepted_as_a_key():
     rejected -- which is exactly what happened when apply first ran in proposal
     mode."""
     class _Spec:
-        def revise(self, text, cid):
+        def revise(self, text, cid, **kwargs):
             import tau_speculation
             return tau_speculation.RevisionReceipt(
                 {"outcome": "ACCEPTED_CHANGED", "ok": True})
 
-        def step(self, inputs):
+        def step(self, inputs, **kwargs):
             return {"outputs": {}}
 
         def kill(self):

@@ -11,6 +11,7 @@ import db
 import block
 import chain_state
 import config
+from errors import EvaluatorLost
 from consensus.state import compute_state_hash
 from consensus.lanes import TAU_EVALUATING_TX_TYPES
 
@@ -391,6 +392,69 @@ def _speculative_proposal(candidate_rules=()):
     )
 
 
+#: A transaction whose evaluation outran the mining budget sits out a backoff
+#: that doubles with every further overrun, so one slow transaction cannot stall
+#: every round the miner retries.
+DEFER_BASE_SECONDS = 60
+DEFER_CAP_SECONDS = 3600
+
+# tx_hash -> (strikes, eligible_at on the monotonic clock). Only touched while
+# the chain-write lock is held.
+_deferred: Dict[str, tuple] = {}
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+def _prune_deferred(now: float) -> None:
+    for tx_hash in [h for h, (_, eligible_at) in _deferred.items()
+                    if now - eligible_at > DEFER_CAP_SECONDS]:
+        del _deferred[tx_hash]
+
+
+def _defer(tx_hash: str) -> tuple:
+    now = _now()
+    _prune_deferred(now)
+    strikes = _deferred.get(tx_hash, (0, 0.0))[0] + 1
+    delay = min(DEFER_BASE_SECONDS * 2 ** (strikes - 1), DEFER_CAP_SECONDS)
+    _deferred[tx_hash] = (strikes, now + delay)
+    return strikes, delay
+
+
+def _skip_deferred(reserved_txs: List[Dict]) -> List[Dict]:
+    if not _deferred:
+        return reserved_txs
+    now = _now()
+    _prune_deferred(now)
+    held = [rtx for rtx in reserved_txs
+            if _deferred.get(rtx.get("tx_hash"), (0, 0.0))[1] > now]
+    if not held:
+        return reserved_txs
+    db.unreserve_mempool_txs([rtx["id"] for rtx in held])
+    held_ids = {rtx["id"] for rtx in held}
+    return [rtx for rtx in reserved_txs if rtx["id"] not in held_ids]
+
+
+def _defer_overrun(exc, execution_transactions, row_ids, reserved_txs) -> None:
+    """The transaction stays pending: a timeout is never a verdict about it."""
+    if not (isinstance(exc, EvaluatorLost) and exc.timed_out):
+        return
+    hashes = {rtx["id"]: rtx.get("tx_hash") for rtx in reserved_txs}
+    owners = [hashes.get(row_ids[i]) for i, tx in enumerate(execution_transactions)
+              if isinstance(tx, dict) and tau_proposal.branch_id(tx, i) == exc.tx_id]
+    owners = [tx_hash for tx_hash in owners if tx_hash]
+    if not owners:
+        logger.warning("createblock: a request outran the %ss mining budget but no "
+                       "queued transaction owns %r; nothing deferred",
+                       config.MINING_BUDGET, exc.tx_id)
+    for tx_hash in owners:
+        strikes, delay = _defer(tx_hash)
+        logger.warning("createblock: transaction %s outran the %ss mining budget; "
+                       "deferred for %ss (strike %d)",
+                       tx_hash, config.MINING_BUDGET, delay, strikes)
+
+
 def create_block_from_mempool(allow_empty: bool = False) -> Dict:
     """
     Creates a new block from all transactions currently in the mempool,
@@ -494,7 +558,9 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
             consensus_rule_budget if slow_limit is None
             else min(slow_limit, consensus_rule_budget)
         )
-    reserved_txs = db.reserve_mempool_txs(limit=1000, slow_limit=slow_limit)
+    reserved_txs = _skip_deferred(
+        db.reserve_mempool_txs(limit=1000, slow_limit=slow_limit)
+    )
     print(f"[INFO][createblock] Reserved {len(reserved_txs)} entries from mempool")
 
     if not reserved_txs and not allow_empty:
@@ -701,6 +767,8 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
         ]
         with tau_proposal.boundary(label="createblock"):
             sim_proposal = _speculative_proposal(candidate_rules=candidate_rules)
+        if sim_proposal is not None:
+            sim_proposal.budget = config.MINING_BUDGET
         sim_session = sim_proposal.session if sim_proposal is not None else None
         # The terminal catch for an isolation breach. Inside apply the leak is a
         # BaseException precisely so no broad handler can turn it into a rejected
@@ -916,6 +984,7 @@ def _create_block_locked(allow_empty: bool = False) -> Dict:
             _db.unreserve_mempool_txs(reserved_ids)
             if sim_proposal is not None:
                 sim_proposal.dispose()
+            _defer_overrun(e, execution_transactions, filtered_reserved_ids, reserved_txs)
         msg = str(e)
         return {"error": msg, "message": msg}
         
