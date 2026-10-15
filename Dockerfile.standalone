@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM ubuntu:24.04 AS tau-builder
+FROM python:3.14-trixie AS tau-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TAU_LANG_REPO=https://github.com/IDNI/tau-lang.git
@@ -18,10 +18,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libboost-all-dev \
     ninja-build \
     pkg-config \
-    python3 \
-    python3-dev \
-    python3-pip \
-    python3-venv \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
@@ -60,7 +56,7 @@ RUN set -eux; \
       -DTAU_BUILD_TESTS=OFF
 
 
-FROM ubuntu:24.04 AS runtime
+FROM python:3.14-slim-trixie AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -73,10 +69,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgmp-dev \
     libsodium-dev \
     pkg-config \
-    python3 \
-    python3-dev \
-    python3-pip \
-    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /opt/venv
@@ -84,8 +76,10 @@ ENV PATH=/opt/venv/bin:$PATH
 
 WORKDIR /app/tau-testnet
 COPY requirements.txt /app/tau-testnet/requirements.txt
+COPY scripts/install_coincurve.sh /tmp/install_coincurve.sh
 
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    sh /tmp/install_coincurve.sh && rm /tmp/install_coincurve.sh && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir nanobind
 

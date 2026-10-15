@@ -92,7 +92,7 @@ The `tau-testnet` CLI is pure Python and runs under native Windows Python to que
 
 > On Windows, run these inside **WSL2** (see [Windows](#windows)). On Linux/macOS, run them directly.
 
-**Prerequisites:** Python **3.10+** (3.10 / 3.11 / 3.12).
+**Prerequisites:** Python **3.14+**.
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
@@ -112,8 +112,8 @@ tau-testnet node run --test
 git clone https://github.com/IDNI/tau-lang.git ../tau-lang
 git -C ../tau-lang checkout c3ea334cd1e6612930ea9f404933211858f0009f   # pinned; matches Dockerfile.standalone
 ( cd ../tau-lang && ./dev dep-cvc5 && ./dev dep-boost \
-  && TAU_PYTHON=/path/to/venv/bin/python ./dev build Release -DTAU_BUILD_BINDING_PYTHON_NANOBIND=ON -DTAU_PYTHON_VERSION=3.12 )   # → build-Release/bindings/python/nanobind/tau*.so
-# set -DTAU_PYTHON_VERSION to the major.minor of that python (default 3.12, as in the Docker image)
+  && TAU_PYTHON=/path/to/venv/bin/python ./dev build Release -DTAU_BUILD_BINDING_PYTHON_NANOBIND=ON -DTAU_PYTHON_VERSION=3.14 )   # → build-Release/bindings/python/nanobind/tau*.so
+# set -DTAU_PYTHON_VERSION to the major.minor of that python (default 3.14, as in the Docker image)
 
 # only needed if auto-discovery of ../tau-lang fails:
 export PYTHONPATH=../tau-lang/build-Release/bindings/python/nanobind
@@ -161,7 +161,7 @@ RPC is exposed on `localhost:65432`, WebSocket on `65433`.
 For development, or to run without Docker. **On Windows, run these inside [WSL2](#windows)** — the node is Unix-only.
 
 ```bash
-# 1. clone + install the CLI (Python 3.10+)
+# 1. clone + install the CLI (Python 3.14+)
 git clone https://github.com/IDNI/tau-testnet.git && cd tau-testnet
 python3 -m venv venv && source venv/bin/activate
 pip install -e .
@@ -170,7 +170,7 @@ pip install -e .
 git clone https://github.com/IDNI/tau-lang.git ../tau-lang
 git -C ../tau-lang checkout c3ea334cd1e6612930ea9f404933211858f0009f   # pinned; matches Dockerfile.standalone
 ( cd ../tau-lang && ./dev dep-cvc5 && ./dev dep-boost \
-  && TAU_PYTHON=/path/to/venv/bin/python ./dev build Release -DTAU_BUILD_BINDING_PYTHON_NANOBIND=ON -DTAU_PYTHON_VERSION=3.12 )
+  && TAU_PYTHON=/path/to/venv/bin/python ./dev build Release -DTAU_BUILD_BINDING_PYTHON_NANOBIND=ON -DTAU_PYTHON_VERSION=3.14 )
 # only if auto-discovery of ../tau-lang fails:
 # export PYTHONPATH=../tau-lang/build-Release/bindings/python/nanobind
 
