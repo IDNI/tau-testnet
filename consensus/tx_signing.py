@@ -38,6 +38,10 @@ from consensus.approvals import (
     TX_TYPE_APPROVAL_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
+from consensus.retractable import (
+    TX_TYPE_RETRACT_TRANSFER,
+    TX_TYPE_RETRACTABLE_TRANSFER,
+)
 from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
     TX_TYPE_RULE_OFFER_ACCEPT,
@@ -121,6 +125,15 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         # block merkle root via block.compute_tx_hash either way, so leaving it
         # unsigned would let a proposer put words in an approver's mouth.
         signing_dict["reason"] = payload.get("reason", "")
+    elif tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+        # Every field that fixes where the escrowed funds go and when is signed;
+        # the release is applied later by a sweep no signature covers.
+        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
+        signing_dict["amount"] = payload.get("amount")
+        signing_dict["release_at_height"] = payload.get("release_at_height")
+        signing_dict["release_at_time"] = payload.get("release_at_time")
+    elif tx_type == TX_TYPE_RETRACT_TRANSFER:
+        signing_dict["retractable_id"] = payload.get("retractable_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
+from consensus.retractable import RetractableBook
 
 logger = logging.getLogger(__name__)
 from consensus.approvals import (
@@ -195,6 +196,7 @@ def build_mechanism_metadata(
     max_rule_txs_per_block: int = DEFAULT_MAX_RULE_TXS_PER_BLOCK,
     approval_requests_root: str = "",
     approval_slots_active: bool = False,
+    retractable_transfers_root: Optional[str] = None,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -233,6 +235,11 @@ def build_mechanism_metadata(
         mech["approval_slots_active"] = True
     if approval_requests_root:
         mech["approval_requests_root"] = approval_requests_root
+    # Always present, unlike the keys above: the feature has no activation gate,
+    # so the empty-book root is part of every chain's genesis hash.
+    if retractable_transfers_root is None:
+        retractable_transfers_root = RetractableBook().root().hex()
+    mech["retractable_transfers_root"] = retractable_transfers_root
     return mech
 
 
@@ -469,6 +476,7 @@ class ConsensusLifecycleManager:
 
         # Co-signature approvals. A FIELD for the same reason rule_offers is.
         self.approval_requests = ApprovalRequestLifecycleManager()
+        self.retractable_transfers = RetractableBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
@@ -548,6 +556,7 @@ class ConsensusLifecycleManager:
                 else self.approval_requests.requests_root().hex()
             ),
             approval_slots_active=self.approval_slots_active,
+            retractable_transfers_root=self.retractable_transfers.root().hex(),
         )
         return compute_consensus_meta_hash(
             host_contract={},

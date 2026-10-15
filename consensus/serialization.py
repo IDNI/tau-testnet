@@ -575,3 +575,83 @@ def encode_approval_request_book(open_entries: list, resolved: list) -> bytes:
 def compute_approval_request_book_root(open_entries: list, resolved: list) -> bytes:
     """BLAKE3 of the canonical request book. Returns 32 bytes."""
     return blake3(encode_approval_request_book(open_entries, resolved)).digest()
+
+
+# --- Retractable transfers ---------------------------------------------------
+
+DOMAIN_RETRACTABLE_TRANSFER_V1 = b"tau.retractable.transfer.v1"
+DOMAIN_RETRACTABLE_RESOLVED_V1 = b"tau.retractable.resolved.v1"
+DOMAIN_RETRACTABLE_BOOK_V1 = b"tau.retractable.book.v1"
+
+
+def compute_retractable_id(
+    sender_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    sequence_number: int,
+    kind: int,
+    release_at: int,
+) -> bytes:
+    """BLAKE3 of the canonical parked transfer. Returns 32 bytes.
+
+    Content-derived because the apply-time tx_id differs between proposer and
+    validators; sequence_number keeps identical transfers from colliding.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RETRACTABLE_TRANSFER_V1.decode()))
+    out.extend(encode_pubkey48(sender_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(bytes([int(kind) & 0xFF]))
+    out.extend(encode_uint64(int(release_at)))
+    return blake3(bytes(out)).digest()
+
+
+def compute_retractable_resolved_acc(acc: Any, retractable_id: Any, outcome: int) -> bytes:
+    """Fold one resolution into the running commitment. Order-dependent by design."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RETRACTABLE_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(retractable_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    return blake3(bytes(out)).digest()
+
+
+def encode_retractable_entry(
+    retractable_id: Any,
+    sender_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    sequence_number: int,
+    kind: int,
+    release_at: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_hash32(retractable_id))
+    out.extend(encode_pubkey48(sender_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(bytes([int(kind) & 0xFF]))
+    out.extend(encode_uint64(int(release_at)))
+    return bytes(out)
+
+
+def compute_retractable_book_root(
+    open_entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    """BLAKE3 of the book: sorted open entries, then the resolved commitment.
+
+    `open_entries` are tuples in encode_retractable_entry argument order. Open
+    and resolved are separate count-prefixed sections, so no status byte.
+    """
+    encoded = sorted(encode_retractable_entry(*e) for e in (open_entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RETRACTABLE_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()

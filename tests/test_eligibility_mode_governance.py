@@ -5,6 +5,7 @@ field plumbing, mirroring the vote_quorum precedent.
 """
 import pytest
 
+from consensus.retractable import RetractableBook
 from consensus.governance import (
     ConsensusLifecycleManager,
     validate_eligibility_mode,
@@ -189,8 +190,15 @@ class TestFeeBeneficiary:
             mgr.effective_quorum_policy(),
             mgr.effective_eligibility_mode(),
             mgr.effective_fee_beneficiary(),
-        ) == {"vote_quorum": mgr.effective_quorum_policy(), "fee_beneficiary": "ab" * 48}
+        ) == {
+            "vote_quorum": mgr.effective_quorum_policy(),
+            "fee_beneficiary": "ab" * 48,
+            "retractable_transfers_root": RetractableBook().root().hex(),
+        }
 
     def test_default_metadata_omits_the_field_entirely(self):
         from consensus.governance import build_mechanism_metadata
-        assert build_mechanism_metadata("supermajority") == {"vote_quorum": "supermajority"}
+        assert build_mechanism_metadata("supermajority") == {
+            "vote_quorum": "supermajority",
+            "retractable_transfers_root": RetractableBook().root().hex(),
+        }

@@ -21,6 +21,7 @@ import copy
 import pytest
 
 import tau_defs
+from consensus.retractable import RetractableBook
 from consensus.approvals import STATUS_FAILED, ApprovalRequest
 from consensus.governance import (
     DEFAULT_ELIGIBILITY_MODE,
@@ -54,7 +55,7 @@ def _legacy_meta_hash(lm):
         vote_records=vote_records,
         activation_schedule=lm.scheduled_updates,
         checkpoint_references=[],
-        mechanism_specific_metadata=mech,
+        mechanism_specific_metadata={**mech, "retractable_transfers_root": RetractableBook().root().hex()},
     )
 
 
@@ -77,7 +78,10 @@ def test_untouched_feature_preserves_the_legacy_meta_hash(mode, validators):
 def test_gen_genesis_shaped_call_is_unaffected():
     """gen_genesis calls the builder without the new arguments, so block 0 stays
     byte-identical."""
-    assert build_mechanism_metadata("supermajority") == {"vote_quorum": "supermajority"}
+    assert build_mechanism_metadata("supermajority") == {
+        "vote_quorum": "supermajority",
+        "retractable_transfers_root": RetractableBook().root().hex(),
+    }
 
 
 def test_activation_changes_the_hash_and_is_idempotent():

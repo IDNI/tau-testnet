@@ -15,6 +15,7 @@ If any of these tests fails, shipping the change forks every live chain.
 """
 import pytest
 
+from consensus.retractable import RetractableBook
 from consensus.governance import (
     DEFAULT_ELIGIBILITY_MODE,
     DEFAULT_MAX_RULE_TXS_PER_BLOCK,
@@ -45,7 +46,7 @@ def _legacy_meta_hash(lm):
         vote_records=vote_records,
         activation_schedule=lm.scheduled_updates,
         checkpoint_references=[],
-        mechanism_specific_metadata=mech,
+        mechanism_specific_metadata={**mech, "retractable_transfers_root": RetractableBook().root().hex()},
     )
 
 

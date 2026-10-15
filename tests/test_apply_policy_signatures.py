@@ -204,8 +204,8 @@ def _post_activation_block():
     return txs, lm, request
 
 
-PRE_ACTIVATION_HASH = "a1ddb5917868512919d39b6348be77b8b07556f67cd68703aa89ee0760a692a3"
-POST_ACTIVATION_HASH = "983bfaf7d92c1b571cf03c06adf9a2441b65f2d20d854dd25a09cd7e1ce3d44c"
+PRE_ACTIVATION_HASH = "000c1b2c23129dc94c3f0b613f0aa996adef74521c491ad30f50bd055d8fb4c9"
+POST_ACTIVATION_HASH = "bc78eeac874ebed98fbed788a27a680f054205b1b7202dd67d2e3e080e7b6c89"
 
 
 def test_pre_activation_forged_policy_txs_are_accepted_live_and_on_replay():

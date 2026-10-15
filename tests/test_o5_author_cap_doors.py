@@ -184,8 +184,8 @@ def _accepts_block(acceptors):
     return txs
 
 
-PRE_ACTIVATION_THREE_ACCEPTS_HASH = "a35cd7390ddbc34864a1a72a0238b99ee3546405c9ee8835084c2070b74bc6a5"
-ACTIVATED_WITHIN_CAP_HASH = "aad2264f90e6db370e9ffdb9e96db87be9633ac4c3d6889f538068a507ad8f55"
+PRE_ACTIVATION_THREE_ACCEPTS_HASH = "b71f5a29200b68343cec4d2ac42d632a36349b65f912bf73109867d51d0912f2"
+ACTIVATED_WITHIN_CAP_HASH = "85e7a9fe945caa82d0b36cafe15875b8e7db5b8bc7c35d2f9bbfb3facfe33118"
 
 
 def test_pre_activation_block_registers_three_new_acceptors():
