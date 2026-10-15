@@ -37,6 +37,8 @@ SLOW_TX_TYPES = frozenset({
     "consensus_rule_update",
 })
 
+# `retractable_transfer` and `retract_transfer` are absent too, i.e. FAST: a park
+# costs one transfer step and a retract needs no Tau evaluation at all.
 # `approval_request` and `transfer_vote` are deliberately absent, i.e. FAST.
 # Neither routes text through i0, so neither rebuilds the interpreter: a request
 # costs one cheap Tau step like a transfer, and a vote costs one more only when
@@ -59,6 +61,7 @@ TAU_EVALUATING_TX_TYPES = frozenset({
     "user_tx",
     "approval_request",
     "transfer_vote",
+    "retractable_transfer",
 })
 
 

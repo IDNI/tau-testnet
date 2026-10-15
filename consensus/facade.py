@@ -328,6 +328,75 @@ class TipAdmissionView:
                     out.append(row)
         return out
 
+    # --- Retractable transfers ---------------------------------------------
+    #
+    # Persisted rows, not the in-memory manager, for the same reason as the
+    # approval accessors. Absent tables read as an empty book.
+
+    @property
+    def tip_timestamp(self) -> int:
+        """Header timestamp of the canonical tip; 0 when there is none."""
+        try:
+            head = db.get_canonical_head_block()
+            return int(head["header"]["timestamp"]) if head else 0
+        except Exception:
+            return 0
+
+    def _retractable_scalar(self, sql: str, params: tuple = ()) -> int:
+        try:
+            with db._db_lock:
+                row = db._db_conn.execute(sql, params).fetchone()
+        except Exception:
+            return 0
+        return int(row[0] or 0) if row else 0
+
+    def get_retractable(self, retractable_id: bytes) -> Optional[dict]:
+        """The open entry with this id, or None (unknown or already resolved)."""
+        try:
+            with db._db_lock:
+                row = db._db_conn.execute(
+                    "SELECT sender_pubkey, recipient_pubkey, amount, sequence_number, "
+                    "release_kind, release_at FROM retractable_transfers_v1 "
+                    "WHERE retractable_id = ?",
+                    (bytes(retractable_id).hex(),),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        return {
+            "retractable_id": bytes(retractable_id).hex(),
+            "sender_pubkey": row[0],
+            "recipient_pubkey": row[1],
+            "amount": int(row[2]),
+            "sequence_number": int(row[3]),
+            "release_kind": int(row[4]),
+            "release_at": int(row[5]),
+        }
+
+    def open_retractable_count_for_sender(self, sender_pubkey: str) -> int:
+        return self._retractable_scalar(
+            "SELECT COUNT(*) FROM retractable_transfers_v1 WHERE sender_pubkey = ?",
+            (sender_pubkey,),
+        )
+
+    def open_retractable_count(self) -> int:
+        return self._retractable_scalar("SELECT COUNT(*) FROM retractable_transfers_v1")
+
+    def escrowed_out(self, pubkey: str) -> int:
+        return self._retractable_scalar(
+            "SELECT COALESCE(SUM(amount), 0) FROM retractable_transfers_v1 "
+            "WHERE sender_pubkey = ?",
+            (pubkey,),
+        )
+
+    def escrowed_in(self, pubkey: str) -> int:
+        return self._retractable_scalar(
+            "SELECT COALESCE(SUM(amount), 0) FROM retractable_transfers_v1 "
+            "WHERE recipient_pubkey = ?",
+            (pubkey,),
+        )
+
     def clause_author_count(self, target_stream: int) -> int:
         """How many principals hold a registered clause on this stream.
 

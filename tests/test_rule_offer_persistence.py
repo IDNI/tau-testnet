@@ -246,6 +246,9 @@ def test_every_commit_site_persists_rule_offers():
         # approvers have voted) is bound into consensus_meta_hash, so a path
         # that omits it rehydrates a stale book after a restart.
         "approval_requests", "approval_slots_active",
+        # Escrowed retractable transfers: the open book and resolved commitment
+        # are bound into consensus_meta_hash.
+        "retractable_transfers",
     }
 
     # Names bound from the audited builder, anywhere in the module.

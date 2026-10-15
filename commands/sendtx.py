@@ -24,7 +24,7 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_REJECT,
     RULE_OFFER_TX_TYPES,
 )
-from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
+from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -39,6 +39,7 @@ KNOWN_TX_TYPES = frozenset(
     {"user_tx", "consensus_rule_update", "consensus_rule_vote"}
     | set(RULE_OFFER_TX_TYPES)
     | set(APPROVAL_TX_TYPES)
+    | set(RETRACTABLE_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
 # execution later is free and there is no second fee to drift. `transfer_vote` is
@@ -855,10 +856,36 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
             **admission_eval.details,
         )
 
+    if tx_type == TX_TYPE_RETRACT_TRANSFER:
+        # One pending retract per entry. Kept out of validate_mempool_admission:
+        # readmission and checktx share it and must not see the mempool.
+        own_hash, _ = _compute_transaction_message_id(payload)
+        rivals = [
+            h for h in db.pending_retract_tx_hashes(sender_pubkey, payload["retractable_id"])
+            if h != own_hash
+        ]
+        if rivals:
+            return _qt_err(
+                "DUPLICATE_RETRACT",
+                "A retract for this retractable transfer is already pending.",
+                pending_tx_hash=rivals[0],
+            )
+
     if tx_type == "user_tx":
         operations = payload.get("operations", {})
         has_transfers = "1" in operations
         has_rules = "0" in operations
+    elif tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+        # A park is judged as the one transfer leg it will become at apply; its
+        # (unsigned) operations are never read.
+        operations = {}
+        has_transfers = True
+        has_rules = False
+        operations["1"] = [[
+            sender_pubkey,
+            admission_eval.data["recipient_pubkey"],
+            str(admission_eval.data["amount"]),
+        ]]
     else:
         has_transfers = False
         has_rules = False
@@ -1028,7 +1055,7 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                         (admission_eval.data or {}).get("target_stream"),
                     )
 
-        elif tx_type == "user_tx":
+        elif tx_type in ("user_tx", TX_TYPE_RETRACTABLE_TRANSFER):
             # --- Tau Validation (Deterministic Two-Step) ---
 
             # Step 1: Rule Validation (if present)
@@ -1420,7 +1447,7 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                 "tx_type": tx_type,
                 "tau_evaluated": not skip_tau_eval,
             }
-            if not skip_tau_eval and tx_type == "user_tx":
+            if not skip_tau_eval and tx_type in ("user_tx", TX_TYPE_RETRACTABLE_TRANSFER):
                 verdict["estimated_fee"] = str(estimated_fee_total)
             update_id = admission_eval.data.get("update_id")
             if update_id:

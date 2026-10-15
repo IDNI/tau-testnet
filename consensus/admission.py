@@ -47,6 +47,17 @@ from consensus.approvals import (
     screen_unsatisfiable_sender_conjunction,
     validate_request_shape,
 )
+from consensus.retractable import (
+    KIND_HEIGHT,
+    MAX_OPEN_RETRACTABLE_PER_SENDER,
+    MAX_OPEN_RETRACTABLE_TOTAL,
+    TX_TYPE_RETRACT_TRANSFER,
+    TX_TYPE_RETRACTABLE_TRANSFER,
+    RetractableShapeError,
+    parse_retract_transfer,
+    parse_retractable_transfer,
+    validate_park_shape,
+)
 from consensus.governance import (
     normalize_validator_delta,
     normalize_validator_set,
@@ -1329,6 +1340,108 @@ def validate_transfer_vote_payload(
     })
 
 
+# --- Retractable transfers ---------------------------------------------------
+
+def validate_retractable_transfer_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for parking a transfer until a release point.
+
+    The o5 verdict, fee and funds checks run on the sendtx path. Shape and the
+    release window are shared with block apply through `validate_park_shape`;
+    the deadline coupling is advisory and keeps a park from being mined at or
+    after its own release.
+    """
+    try:
+        park = parse_retractable_transfer(tx)
+    except RetractableShapeError as exc:
+        return format_error(f"Malformed retractable_transfer: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != park.sender_pubkey:
+        return format_error("retractable_transfer sender_pubkey must match the signer.")
+
+    shape_error = validate_park_shape(park, tip_view.next_block_height, tip_view.tip_timestamp)
+    if shape_error:
+        return format_error(f"retractable_transfer rejected: {shape_error}")
+
+    retractable_id = park.retractable_id
+    if tip_view.get_retractable(retractable_id) is not None:
+        return format_error(
+            "Duplicate retractable_transfer (same sender, recipient, amount, "
+            "sequence and release point).",
+            code="DUPLICATE_RETRACTABLE",
+        )
+    if tip_view.open_retractable_count_for_sender(park.sender_pubkey) >= MAX_OPEN_RETRACTABLE_PER_SENDER:
+        return format_error(
+            f"Sender already has {MAX_OPEN_RETRACTABLE_PER_SENDER} open retractable transfers.",
+            code="TOO_MANY_RETRACTABLES",
+        )
+    if tip_view.open_retractable_count() >= MAX_OPEN_RETRACTABLE_TOTAL:
+        return format_error(
+            "The retractable transfer book is full.", code="RETRACTABLE_BOOK_FULL"
+        )
+
+    if park.kind == KIND_HEIGHT:
+        expire_at_height = tx.get("expire_at_height")
+        if isinstance(expire_at_height, int) and expire_at_height > park.release_at:
+            return format_error(
+                "expire_at_height must not be after release_at_height.",
+                code="DEADLINE_AFTER_RELEASE",
+            )
+    else:
+        expiration_time = tx.get("expiration_time")
+        if isinstance(expiration_time, int) and expiration_time >= park.release_at:
+            return format_error(
+                "expiration_time must be before release_at_time.",
+                code="DEADLINE_AFTER_RELEASE",
+            )
+
+    return success({
+        "retractable_id": retractable_id.hex(),
+        "amount": park.amount,
+        "recipient_pubkey": park.recipient_pubkey,
+        "release_kind": park.kind,
+        "release_at": park.release_at,
+    })
+
+
+def validate_retract_transfer_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for taking an escrowed transfer back before its release point."""
+    try:
+        request = parse_retract_transfer(tx)
+    except RetractableShapeError as exc:
+        return format_error(f"Malformed retract_transfer: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != request.sender_pubkey:
+        return format_error("retract_transfer sender_pubkey must match the signer.")
+
+    row = tip_view.get_retractable(request.retractable_id)
+    if row is None:
+        return format_error(
+            "Unknown or already resolved retractable transfer.",
+            code="UNKNOWN_RETRACTABLE",
+        )
+    if row["sender_pubkey"] != request.sender_pubkey:
+        return format_error(
+            "Only the sender may retract.", code="NOT_RETRACTABLE_SENDER"
+        )
+
+    if int(row["release_kind"]) == KIND_HEIGHT:
+        too_late = tip_view.next_block_height >= int(row["release_at"])
+    else:
+        too_late = tip_view.tip_timestamp >= int(row["release_at"])
+    if too_late:
+        return format_error(
+            "Release point reached; too late to retract.", code="RETRACT_TOO_LATE"
+        )
+
+    return success({"retractable_id": request.retractable_id.hex()})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -1426,6 +1539,12 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_TRANSFER_VOTE:
          return validate_transfer_vote_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+         return validate_retractable_transfer_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_RETRACT_TRANSFER:
+         return validate_retract_transfer_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

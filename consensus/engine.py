@@ -877,6 +877,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 receipt = exec_result.receipts.get(tx_id, {})
                 outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, reason=receipt.get("reason"), receipt_logs=receipt.get("logs", [])))
 
+        retractable_events = []
+        for i, tx in enumerate(block.transactions):
+            event = (exec_result.receipts.get(tx.get('tx_id', str(i))) or {}).get("retractable_event")
+            if event and tx in exec_result.accepted_transactions:
+                retractable_events.append(event)
+        retractable_events.extend((rid, "released") for rid in released_retractables)
+
         # 3. Post-State Materialization Layer
         
         # The rules are updated by self.apply (it returns a generic snapshot with tau_bytes).
@@ -1042,6 +1049,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             governance_changes={
                 "activated_updates": [u.update_id_hex for u in newly_active],
                 "released_retractables": released_retractables,
+                "retractable_events": retractable_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -2958,9 +2966,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if accepted_in_block and not hard_reject:
                 book = lifecycle_mgr.retractable_transfers
                 if pending_retractable_park is not None:
+                    tx_receipt["retractable_event"] = (
+                        pending_retractable_park.retractable_id.hex(), "parked"
+                    )
                     book.submit(pending_retractable_park)
                     stamp_retractable_park = True
                 elif pending_retract_id is not None:
+                    tx_receipt["retractable_event"] = (pending_retract_id.hex(), "retracted")
                     book.retract(pending_retract_id)
 
             # Commit staged balance writes only for txs that stay accepted.

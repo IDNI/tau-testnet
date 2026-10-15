@@ -19,6 +19,9 @@ TAU_GOSSIP_TOPIC_RULES = "tau/rules/2.0.0"
 # does: a burst of parked requests must not crowd out coin-transfer gossip, and
 # a vote is time-sensitive -- it is what releases someone's funds.
 TAU_GOSSIP_TOPIC_APPROVALS = "tau/approvals/1.0.0"
+# Retractable transfers get their own topic: parks are floods, while a retract
+# is deadline-sensitive and must not queue behind them.
+TAU_GOSSIP_TOPIC_RETRACTABLE = "tau/retractable/1.0.0"
 TAU_GOSSIP_TOPIC_PEERS = "tau/peers/2.0.0"
 
 # Mempool & Edge Ingestion Limits
@@ -44,3 +47,7 @@ TAU_MAX_TRANSFER_VOTE_BYTES = 4096
 # Same reasoning as the rule sub-quota: a backlog of parked requests must not
 # become the entire snapshot a peer receives on connect.
 TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS = 32
+# A park and a retract each carry a few pubkeys, an amount and a signature.
+TAU_MAX_RETRACTABLE_TRANSFER_BYTES = 4096
+TAU_MAX_RETRACT_TRANSFER_BYTES = 4096
+TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS = 32

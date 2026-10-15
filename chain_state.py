@@ -14,6 +14,7 @@ import tau_native
 from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
 from consensus.lanes import TAU_EVALUATING_TX_TYPES
 from consensus.fees import FeeRuleError
+from errors import DatabaseError
 from block import Block
 import hashlib
 from consensus.state import compute_state_hash as compute_rules_hash, compute_consensus_state_hash
@@ -535,6 +536,30 @@ def _overrun_tx(block, opened_as) -> str:
     return opened_as or "?"
 
 
+def _retractable_state(lm) -> dict:
+    book = lm.retractable_transfers
+    count, acc = book.resolved_state()
+    return {
+        "rows": book.snapshot_rows(),
+        "resolved_count": count,
+        "resolved_acc": acc.hex(),
+    }
+
+
+def _record_retractable_events(block, apply_result) -> None:
+    """Best-effort history write; the apply verdict is already final."""
+    try:
+        events = (getattr(apply_result, "governance_changes", None) or {}).get(
+            "retractable_events"
+        )
+        if events:
+            db.record_retractable_events(
+                block.block_hash, block.header.block_number, list(events)
+            )
+    except Exception:
+        logger.exception("could not record retractable events")
+
+
 def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
     """The canonical rows for a block, computed from its SNAPSHOT.
 
@@ -575,6 +600,7 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         max_rule_txs_per_block=lm.max_rule_txs_per_block,
         approval_requests=lm.approval_requests.snapshot_requests(),
         approval_slots_active=lm.approval_slots_active,
+        retractable_transfers=_retractable_state(lm),
         eligibility_mode=lm.eligibility_mode,
         fee_beneficiary=lm.fee_beneficiary,
         last_transfer_ts=merged_ts,
@@ -1044,6 +1070,8 @@ def _process_new_block_locked(block: Block) -> bool:
                 _swap_in_memory_state(next_snapshot, block)
                 db.save_canonical_state_atomically(**_canonical_rows)
 
+            _record_retractable_events(block, apply_result)
+
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
             # instead of leaving the i0-accumulated conjunction in place. Done
@@ -1317,6 +1345,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                                       computed_hash=next_snapshot.state_hash,
                                       stored_hash=block.header.state_hash,
                                       reason="state_hash invariant mismatch")
+
+            _record_retractable_events(block, apply_result)
 
             if _enabled:
                 # The block's evaluator history becomes durable exactly as a live
@@ -2132,6 +2162,18 @@ def _restore_approvals(lm) -> None:
     lm.approval_requests.resolved_details = details
 
 
+def _restore_retractables(lm) -> None:
+    """Rehydrate the escrow book; a stored row that does not recompute its id is
+    corruption and refuses to load rather than silently dropping escrowed funds."""
+    from consensus.retractable import RetractableBook
+
+    rows, resolved_count, resolved_acc = db.load_retractable_state()
+    try:
+        lm.retractable_transfers = RetractableBook.restore(rows, resolved_count, resolved_acc)
+    except ValueError as exc:
+        raise DatabaseError(f"corrupt retractable transfer state: {exc}") from exc
+
+
 def save_effective_tau_spec(canonical_rule_text: str):
     """
     Append ONE canonical (full-width, pre-shrink) application rule to the raw
@@ -2260,6 +2302,7 @@ def load_state_from_db() -> bool:
         # on the first block after a restart.
         _restore_rule_offers(_lifecycle_manager)
         _restore_approvals(_lifecycle_manager)
+        _restore_retractables(_lifecycle_manager)
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
         persisted_slots = db.get_chain_state_value("approval_slots_active", _MISSING)
@@ -2313,6 +2356,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         max_rule_txs_snapshot = _lifecycle_manager.max_rule_txs_per_block
         approval_requests_list = _lifecycle_manager.approval_requests.snapshot_requests()
         approval_slots_active_snapshot = _lifecycle_manager.approval_slots_active
+        retractable_snapshot = _retractable_state(_lifecycle_manager)
 
     db.save_canonical_state_atomically(
         block_hash, block_number,
@@ -2329,6 +2373,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         max_rule_txs_per_block=max_rule_txs_snapshot,
         approval_requests=approval_requests_list,
         approval_slots_active=approval_slots_active_snapshot,
+        retractable_transfers=retractable_snapshot,
     )
 
 def tick_governance(height: int):
@@ -2802,6 +2847,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
             max_rule_txs_per_block=_lifecycle_manager.max_rule_txs_per_block,
             approval_requests=_lifecycle_manager.approval_requests.snapshot_requests(),
             approval_slots_active=_lifecycle_manager.approval_slots_active,
+            retractable_transfers=_retractable_state(_lifecycle_manager),
         )
 
     # Phase 5: Mempool Restore

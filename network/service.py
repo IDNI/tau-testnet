@@ -38,6 +38,8 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "rule_offer_reject",
     "approval_request",
     "transfer_vote",
+    "retractable_transfer",
+    "retract_transfer",
 })
 
 
@@ -470,6 +472,7 @@ class NetworkService:
             TAU_MEMPOOL_SNAPSHOT_MAX_VOTES,
             TAU_MEMPOOL_SNAPSHOT_MAX_RULE_TXS,
             TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS,
+            TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS,
             TAU_GOSSIP_MAX_RAW_TX_BYTES
         )
         try:
@@ -481,6 +484,7 @@ class NetworkService:
             total_count = 0
             rule_txs_count = 0
             approval_txs_count = 0
+            retractable_txs_count = 0
 
             for tx in txs:
                 if total_count >= TAU_MEMPOOL_SNAPSHOT_MAX_TOTAL:
@@ -524,6 +528,10 @@ class NetworkService:
                     if approval_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS:
                         continue
                     approval_txs_count += 1
+                elif tx_type in ("retractable_transfer", "retract_transfer"):
+                    if retractable_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS:
+                        continue
+                    retractable_txs_count += 1
                 topic = self.topic_for_tx_type(tx_type)
                     
                 # 4. Optional partial decode
@@ -550,6 +558,7 @@ class NetworkService:
             TAU_GOSSIP_TOPIC_GOVERNANCE,
             TAU_GOSSIP_TOPIC_RULES,
             TAU_GOSSIP_TOPIC_APPROVALS,
+            TAU_GOSSIP_TOPIC_RETRACTABLE,
             TAU_GOSSIP_TOPIC_BLOCKS,
             TAU_GOSSIP_TOPIC_PEERS,
         )
@@ -558,6 +567,7 @@ class NetworkService:
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_GOVERNANCE, self._on_governance_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_RULES, self._on_rule_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_APPROVALS, self._on_approval_gossip)
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_RETRACTABLE, self._on_retractable_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PEERS, self._on_peer_advertisement)
 
@@ -751,6 +761,20 @@ class NetworkService:
             },
         )
 
+    async def _on_retractable_gossip(self, envelope: Dict[str, Any]) -> None:
+        from .protocols import (
+            TAU_MAX_RETRACT_TRANSFER_BYTES,
+            TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
+        )
+        await self._process_gossip_payload(
+            envelope,
+            allowed_types={"retractable_transfer", "retract_transfer"},
+            type_limits={
+                "retractable_transfer": TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
+                "retract_transfer": TAU_MAX_RETRACT_TRANSFER_BYTES,
+            },
+        )
+
     async def _process_gossip_payload(self, envelope: Dict[str, Any], allowed_types: set, type_limits: dict) -> None:
         import json
         from .protocols import TAU_GOSSIP_MAX_RAW_TX_BYTES
@@ -838,6 +862,17 @@ class NetworkService:
         elif tx_type == "transfer_vote":
             if "request_id" not in p_dict:
                 logger.debug("Gossip rejected: transfer_vote missing request_id")
+                return
+        elif tx_type == "retractable_transfer":
+            if "recipient_pubkey" not in p_dict or "amount" not in p_dict:
+                logger.debug("Gossip rejected: retractable_transfer missing required structural fields")
+                return
+            if (p_dict.get("release_at_height") is None) == (p_dict.get("release_at_time") is None):
+                logger.debug("Gossip rejected: retractable_transfer needs exactly one release point")
+                return
+        elif tx_type == "retract_transfer":
+            if "retractable_id" not in p_dict:
+                logger.debug("Gossip rejected: retract_transfer missing retractable_id")
                 return
 
         try:
@@ -1397,6 +1432,7 @@ class NetworkService:
         from .protocols import (
             TAU_GOSSIP_TOPIC_APPROVALS,
             TAU_GOSSIP_TOPIC_GOVERNANCE,
+            TAU_GOSSIP_TOPIC_RETRACTABLE,
             TAU_GOSSIP_TOPIC_RULES,
             TAU_GOSSIP_TOPIC_TRANSACTIONS,
         )
@@ -1406,6 +1442,8 @@ class NetworkService:
             return TAU_GOSSIP_TOPIC_RULES
         if tx_type in ("approval_request", "transfer_vote"):
             return TAU_GOSSIP_TOPIC_APPROVALS
+        if tx_type in ("retractable_transfer", "retract_transfer"):
+            return TAU_GOSSIP_TOPIC_RETRACTABLE
         return TAU_GOSSIP_TOPIC_TRANSACTIONS
 
     def broadcast_transaction(self, payload: str, message_id: str) -> None:

@@ -418,6 +418,42 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_approval_requests_expiry "
                 "ON approval_requests_v1(expire_at_height);"
             )
+            # Retractable transfers: the open escrow book. Bound into
+            # consensus_meta_hash, so written in the same transaction as accounts.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS retractable_transfers_v1 (
+                    retractable_id   TEXT PRIMARY KEY,
+                    sender_pubkey    TEXT NOT NULL,
+                    recipient_pubkey TEXT NOT NULL,
+                    amount           INTEGER NOT NULL,
+                    sequence_number  INTEGER NOT NULL,
+                    release_kind     INTEGER NOT NULL,
+                    release_at       INTEGER NOT NULL
+                );
+            ''')
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_retractable_sender "
+                "ON retractable_transfers_v1(sender_pubkey);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_retractable_recipient "
+                "ON retractable_transfers_v1(recipient_pubkey);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_retractable_release "
+                "ON retractable_transfers_v1(release_kind, release_at);"
+            )
+            # Node-local diagnostics, keyed per block so a reorg needs no cleanup;
+            # canonicality is resolved at query time like tx_index.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS retractable_events (
+                    retractable_id TEXT NOT NULL,
+                    block_hash     TEXT NOT NULL,
+                    block_number   INTEGER NOT NULL,
+                    outcome        TEXT NOT NULL,
+                    PRIMARY KEY (retractable_id, block_hash)
+                );
+            ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -1347,6 +1383,28 @@ def get_pending_sequence(sender_pubkey: str) -> Optional[int]:
     return max_seq
 
 
+def pending_retract_tx_hashes(sender_pubkey: str, retractable_id: str) -> List[str]:
+    """Mempool hashes of retract_transfer txs by this sender for this id, any status."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT tx_hash, payload FROM mempool WHERE sender_pubkey = ? OR sender_pubkey IS NULL',
+            (sender_pubkey,),
+        ).fetchall()
+    found = []
+    for tx_hash, payload in rows:
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        if (data.get('tx_type') == 'retract_transfer'
+                and data.get('sender_pubkey') == sender_pubkey
+                and data.get('retractable_id') == retractable_id):
+            found.append(tx_hash)
+    return found
+
+
 def get_pending_sequences(sender_pubkey: str) -> set:
     """Every sequence number this sender holds in the mempool, any status."""
     if _db_conn is None:
@@ -2153,7 +2211,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2190,10 +2248,11 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 max_rule_txs_per_block=max_rule_txs_per_block,
                 approval_requests=approval_requests,
                 approval_slots_active=approval_slots_active,
+                retractable_transfers=retractable_transfers,
             )
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2384,6 +2443,9 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
             ('approval_slots_active', '1' if approval_slots_active else '0')
         )
 
+    if retractable_transfers is not None:
+        _write_retractable_rows(retractable_transfers)
+
     if max_rule_txs_per_block is not None:
         # Governance-activated value; persisted verbatim so a reload
         # reproduces the same per-block budget as a from-genesis replay.
@@ -2391,6 +2453,105 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
             'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
             ('max_rule_txs_per_block', str(int(max_rule_txs_per_block)))
         )
+
+
+def _write_retractable_rows(state: Dict) -> None:
+    """Full replace of the open escrow rows plus the resolved commitment."""
+    _db_conn.execute('DELETE FROM retractable_transfers_v1')
+    for row in state['rows']:
+        _db_conn.execute(
+            'INSERT INTO retractable_transfers_v1 '
+            '(retractable_id, sender_pubkey, recipient_pubkey, amount, '
+            'sequence_number, release_kind, release_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (
+                row['retractable_id'],
+                row['sender_pubkey'],
+                row['recipient_pubkey'],
+                int(row['amount']),
+                int(row['sequence_number']),
+                int(row['release_kind']),
+                int(row['release_at']),
+            )
+        )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        (
+            'retractable_resolved',
+            json.dumps({'count': int(state['resolved_count']), 'acc': state['resolved_acc']}),
+        )
+    )
+
+
+def load_retractable_state() -> tuple[List[tuple], int, bytes]:
+    """(open rows, resolved_count, resolved_acc) exactly as stored.
+
+    Rows are (id_bytes, sender, recipient, amount, sequence, kind, release_at),
+    ordered by id. Absent rows mean an empty book and a zero commitment.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT retractable_id, sender_pubkey, recipient_pubkey, amount, '
+            'sequence_number, release_kind, release_at '
+            'FROM retractable_transfers_v1 ORDER BY retractable_id'
+        ).fetchall()
+        raw = _db_conn.execute(
+            "SELECT value FROM chain_state WHERE key = 'retractable_resolved'"
+        ).fetchone()
+    count, acc = 0, bytes(32)
+    if raw and raw[0]:
+        parsed = json.loads(raw[0])
+        count, acc = int(parsed['count']), bytes.fromhex(parsed['acc'])
+    return (
+        [
+            (bytes.fromhex(r[0]), r[1], r[2], int(r[3]), int(r[4]), int(r[5]), int(r[6]))
+            for r in rows
+        ],
+        count,
+        acc,
+    )
+
+
+def record_retractable_events(block_hash: str, block_number: int, events) -> None:
+    """Node-local history of what a block did to retractable transfers.
+
+    Diagnostic only: a failure is logged and never reaches block commit.
+    """
+    if not events:
+        return
+    try:
+        if _db_conn is None:
+            init_db()
+        with _db_lock:
+            with _db_conn:
+                _db_conn.executemany(
+                    'INSERT OR IGNORE INTO retractable_events '
+                    '(retractable_id, block_hash, block_number, outcome) VALUES (?, ?, ?, ?)',
+                    [(rid, block_hash, int(block_number), outcome) for rid, outcome in events],
+                )
+    except Exception:
+        logger.exception("could not record retractable events")
+
+
+def get_canonical_retractable_events(retractable_id: str) -> List[Dict]:
+    """Events for this id recorded by blocks on the canonical chain, oldest first."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT block_hash, block_number, outcome FROM retractable_events '
+            'WHERE retractable_id = ? ORDER BY block_number ASC',
+            (retractable_id,),
+        ).fetchall()
+    out = []
+    for block_hash, block_number, outcome in rows:
+        canonical, _ = get_canonical_confirmation(block_hash, int(block_number))
+        if canonical:
+            out.append(
+                {"block_hash": block_hash, "block_number": int(block_number), "outcome": outcome}
+            )
+    return out
 
 
 def load_approval_requests() -> List[Dict]:
