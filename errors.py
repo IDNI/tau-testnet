@@ -19,14 +19,14 @@ class TauEngineCrash(TauTestnetError):
 
 
 class TauEngineBug(TauTestnetError):
-    """Raised for errors reported by the Tau interpreter (e.g. `(Error)` output, evaluation failures)."""
+    """Raised for errors reported by the Tau interpreter (e.g. an engine-reported error, evaluation failures)."""
 
 
 class TauSpecRejected(TauTestnetError):
     """The engine refused the TEXT OR VALUE it was given; the input is at fault.
 
     Deliberately NOT a TauEngineBug: W0 measured that a parse/type rejection is a
-    clean no-op -- `step` returns None, neither `spec_revision` nor `time_point`
+    clean no-op -- `step` reports a failure, neither `spec_revision` nor `time_point`
     advances, no type is established, and the interpreter keeps accepting later
     revisions. Treating it as an engine crash (dumping a crash log) is what made a
     malformed user rule indistinguishable from a node failure to an external

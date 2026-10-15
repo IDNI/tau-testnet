@@ -2297,8 +2297,8 @@ def tick_governance(height: int):
         return
 
     # Route every activated revision through `i0` in declaration order. The
-    # genesis routing emits `Updated specification:` and tau_native rebuilds
-    # the interpreter, so the live spec advances exactly like user_tx ops['0']
+    # genesis routing advances the interpreter's spec revision, so the live
+    # spec advances exactly like user_tx ops['0']
     # application-rule changes.
     #
     # Activation revisions intentionally do NOT trigger the rules-handler

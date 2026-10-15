@@ -40,7 +40,7 @@ def test_web_wallet_example_syntax(rule_idx, rule_text):
     
     try:
         # If the syntax is invalid, TauInterface will raise TauEngineCrash
-        # because tau.get_interpreter() will return None
+        # because tau.get_interpreter() will fail
         iface = TauInterface(temp_name)
         assert iface.interpreter is not None
     except TauEngineCrash as e:

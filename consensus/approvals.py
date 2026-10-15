@@ -118,7 +118,7 @@ def approval_slots_active(tip_view) -> bool:
 # --- Slot width screening ---------------------------------------------------
 #
 # Per-stream bitvector typing is process-global and sticky: one rule typing i18
-# at bv[384] and another at bv[24] leaves get_interpreter returning None for
+# at bv[384] and another at bv[24] makes get_interpreter fail for
 # everyone. Measured, and it fails closed rather than silently.
 #
 # So the screen is REJECT-UNLESS-ANNOTATED: every occurrence of a slot stream
@@ -311,7 +311,7 @@ def audit_stream_collisions(spec_texts) -> List[str]:
     1. **A slot already typed somewhere in the effective spec.** Per-stream
        bitvector typing is process-global and sticky, so a deployed rule typing
        i18 at, say, bv[24] means the first co-signature clause typing it bv[384]
-       leaves `get_interpreter` returning None -- for everyone, until restart.
+       makes `get_interpreter` fail -- for everyone, until restart.
 
     2. **A legacy raw o5 writer.** The first derived composite becomes a second
        total-form unit on o5 beside it, and two of those either fail to conjoin

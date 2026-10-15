@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile.standalone
       args:
-        TAU_LANG_REF: 3badb21a7c3ba258a43593dcf71c56d6966d29ba
+        TAU_LANG_REF: c3ea334cd1e6612930ea9f404933211858f0009f
         TAU_BUILD_JOBS: 4
     image: tau-testnet-standalone:latest
     container_name: tau-testnet-standalone

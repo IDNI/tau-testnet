@@ -310,7 +310,7 @@ def test_a_rule_is_judged_against_the_committed_type_history(authority):
                side_effect=AssertionError("fresh-process compile used")):
         refused = _submit(sk, pk, {"0": "always ( o13[t]:bv[8] = i13[t]:bv[8] )."})
     assert not refused.get("ok") and refused.get("code") == "TX_REJECTED", refused
-    assert "i13" in refused.get("message", ""), refused
+    assert refused["details"]["outcome"] == "REJECTED_RULE", refused
 
 
 # --- custom inputs reach the evaluator as values --------------------------------

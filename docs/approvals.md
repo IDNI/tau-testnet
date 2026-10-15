@@ -238,7 +238,7 @@ differ:
 
 **Slot width is pinned at `bv[384]` by a strict reject-unless-annotated screen.**
 Per-stream bitvector typing is process-global and sticky: if one rule types
-`i18` as `bv[384]` and another as `bv[24]`, `get_interpreter` returns `None` for
+`i18` as `bv[384]` and another as `bv[24]`, `get_interpreter` fails for
 everyone until the process restarts. An unannotated slot mention is therefore
 rejected outright, admission compiles offered rule text in an isolated
 subprocess before it can reach the live interpreter, and the engine fails closed
