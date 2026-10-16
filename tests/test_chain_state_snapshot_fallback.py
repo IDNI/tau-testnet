@@ -45,7 +45,7 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
             nonlocal block_added
             block_added = True
 
-        def mock_commit(_block, _canonical=None):
+        def mock_commit(_block, canonical=None):
             nonlocal block_added
             block_added = True
 
