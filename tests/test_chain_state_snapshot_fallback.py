@@ -45,10 +45,17 @@ def test_process_new_block_falls_back_to_replay_when_dht_snapshot_missing(monkey
             nonlocal block_added
             block_added = True
 
+        def mock_commit(_block, _canonical=None):
+            nonlocal block_added
+            block_added = True
+
         monkeypatch.setattr(chain_state.db, "get_block_by_hash", lambda h: block_dict if h == block.block_hash and block_added else None)
         monkeypatch.setattr(chain_state.db, "get_candidate_heads", lambda: [(block.block_hash, block.header.block_number)] if block_added else [])
         monkeypatch.setattr(chain_state.db, "get_chain_path", lambda *args: [block.block_hash])
         monkeypatch.setattr(chain_state.db, "get_canonical_blocks_at_or_after_height", lambda *args: [block_dict] if block_added else [])
+        # The extending path commits the block and the canonical rows together.
+        # Ingest and a reorg's Phase 4 still call the two older functions.
+        monkeypatch.setattr(chain_state.db, "commit_block_and_canonical_state", mock_commit)
         monkeypatch.setattr(chain_state.db, "add_block", mock_add_block)
         monkeypatch.setattr(chain_state.db, "save_canonical_state_atomically", lambda *args, **kwargs: None)
         monkeypatch.setattr(chain_state.db, "remove_mempool_by_hashes", lambda _tx_hashes: 0)
