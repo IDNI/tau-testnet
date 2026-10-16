@@ -357,22 +357,6 @@ def audit_stream_collisions(spec_texts) -> List[str]:
 
 # --- Payload parsing --------------------------------------------------------
 
-def _payload_of(tx: Dict[str, Any]) -> Dict[str, Any]:
-    """Accept fields at the tx root or nested under "payload", matching the
-    tolerance of the governance and rule-offer parsers."""
-    root_val = tx.get("payload")
-    if isinstance(root_val, dict):
-        return root_val
-    if isinstance(root_val, str):
-        try:
-            parsed = json.loads(root_val)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-    return tx
-
-
 def _normalize_pubkey(value: Any) -> str:
     from consensus.rule_offers import normalize_acceptor_pubkey, RuleOfferShapeError
 
@@ -447,20 +431,15 @@ class TransferVote:
 
 
 def parse_approval_request(tx: Dict[str, Any]) -> Optional[ApprovalRequest]:
+    """Read every field from ROOT fields only; a nested `payload` is unsigned data."""
     if tx.get("tx_type") != TX_TYPE_APPROVAL_REQUEST:
         return None
-    payload = _payload_of(tx)
 
     sender = tx.get("sender_pubkey")
-    if not isinstance(sender, str):
-        sender = payload.get("sender_pubkey")
     seq = tx.get("sequence_number")
-    if seq is None:
-        seq = payload.get("sequence_number")
-
-    recipient = payload.get("recipient_pubkey")
-    amount = payload.get("amount")
-    expire_at = payload.get("expire_at_height")
+    recipient = tx.get("recipient_pubkey")
+    amount = tx.get("amount")
+    expire_at = tx.get("expire_at_height")
 
     if isinstance(amount, str):
         try:
@@ -474,8 +453,8 @@ def parse_approval_request(tx: Dict[str, Any]) -> Optional[ApprovalRequest]:
     try:
         sender_n = _normalize_pubkey(sender)
         recipient_n = _normalize_pubkey(recipient)
-        approvers_raw = _normalize_index_map(payload.get("approvers"), "approvers")
-        customs_raw = _normalize_index_map(payload.get("custom_inputs"), "custom_inputs")
+        approvers_raw = _normalize_index_map(tx.get("approvers"), "approvers")
+        customs_raw = _normalize_index_map(tx.get("custom_inputs"), "custom_inputs")
         approvers = {idx: _normalize_pubkey(pk) for idx, pk in approvers_raw.items()}
     except ApprovalShapeError:
         return None
@@ -498,16 +477,14 @@ def parse_approval_request(tx: Dict[str, Any]) -> Optional[ApprovalRequest]:
 
 
 def parse_transfer_vote(tx: Dict[str, Any]) -> Optional[TransferVote]:
+    """Read every field from ROOT fields only; a nested `payload` is unsigned data."""
     if tx.get("tx_type") != TX_TYPE_TRANSFER_VOTE:
         return None
-    payload = _payload_of(tx)
 
     voter = tx.get("sender_pubkey")
-    if not isinstance(voter, str):
-        voter = payload.get("sender_pubkey")
-    request_id_hex = payload.get("request_id")
-    approve = payload.get("approve", True)
-    reason = payload.get("reason", "")
+    request_id_hex = tx.get("request_id")
+    approve = tx.get("approve", True)
+    reason = tx.get("reason", "")
 
     if not isinstance(request_id_hex, str):
         return None

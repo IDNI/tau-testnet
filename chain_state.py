@@ -685,11 +685,11 @@ def process_new_block(block: Block) -> bool:
     Standard network/import block ingestion path.
     Enforces strict derivation, verification, and pure simulation before persistence.
 
-    Holds `_chain_lock` for the whole attempt: the head read, `db.add_block`, the
-    in-memory state swap and the canonical-state write must be one critical
-    section, or a second writer slips in between them and both blocks claim the
-    same height. Reentrant, so the local producer (which already holds it for the
-    whole round) passes straight through.
+    Holds `_chain_lock` for the whole attempt: the head read, the durable commit
+    and the in-memory state swap must be one critical section, or a second
+    writer slips in between them and both blocks claim the same height.
+    Reentrant, so the local producer (which already holds it for the whole
+    round) passes straight through.
     """
     with _chain_lock:
         return _process_new_block_locked(block)
@@ -1066,11 +1066,21 @@ def _process_new_block_locked(block: Block) -> bool:
             else:
                 # Not enabled. An artifact reused here has no promotion to go to --
                 # the authority is the in-process interpreter -- so its worker is
-                # disposed rather than leaked.
+                # disposed rather than leaked. Durable FIRST, as one transaction:
+                # the block row and the canonical snapshot. Memory second.
+                # Publishing memory before the durable write succeeds is how a
+                # node ends up serving a state its own disk does not have.
                 _dispose_quietly(_proposal)
-                db.add_block(block)
+                try:
+                    db.commit_block_and_canonical_state(block, canonical=_canonical_rows)
+                except Exception as exc:
+                    # One transaction: nothing durable happened. Discard.
+                    logger.error(
+                        "[BLOCKCHAIN] commit of block #%s failed; nothing was "
+                        "persisted: %s", block.header.block_number, exc,
+                    )
+                    return False
                 _swap_in_memory_state(next_snapshot, block)
-                db.save_canonical_state_atomically(**_canonical_rows)
 
             _record_retractable_events(block, next_snapshot)
 
@@ -1127,6 +1137,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
         with _balance_lock, _sequence_lock, _rules_lock:
             _balances.clear()
             _sequence_numbers.clear()
+            _last_transfer_ts.clear()
             # Re-seed genesis rule text (the reorg path replays only the new
             # suffix, not the genesis block, so these would otherwise be lost
             # and the replayed state hash would diverge from the mined chain).
@@ -2694,6 +2705,24 @@ def _extend_through_commit_protocol(new_suffix, new_head_hash: str) -> bool:
     return len(applied) == len(new_suffix)
 
 
+def _restore_prior_head(old_path, old_head_hash) -> None:
+    """Replay `old_path` back into memory after a reorg abort.
+
+    `old_path == []` (the prior head was genesis, or its own ancestry was
+    broken) resets to the genesis baseline; a non-empty path replays the
+    known-good canonical chain. The canonical rows are left alone: they still
+    name the prior head.
+    """
+    restore = _rebuild_state_from_blockchain_internal(0, path_hashes=old_path)
+    if restore is None or not restore.ok:
+        logger.error(
+            "[chain_state] Reorg abort recovery FAILED to restore prior head "
+            "%s... (reason=%s). In-memory state may be inconsistent.",
+            (old_head_hash or '')[:16],
+            getattr(restore, 'reason', 'no result') if restore else 'no result',
+        )
+
+
 def reorg_to(new_head_hash: str) -> Optional[bool]:
     """Reorg the canonical head to `new_head_hash`.
 
@@ -2701,10 +2730,10 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
     deliberately not asserted: tests drive `reorg_to` directly.
 
     Returns True if the head advanced (state rebuilt + committed), False if the
-    reorg was ABORTED because the rebuild replay failed (canonical head left
-    unchanged; in-memory state restored to the prior head), or None for a no-op
-    (already at target, or the target's ancestry cannot be resolved -- logged
-    at ERROR).
+    reorg was ABORTED (the rebuild replay failed, or the canonical save failed;
+    the canonical head is left unchanged and in-memory state is restored to the
+    prior head), or None for a no-op (already at target, or the target's
+    ancestry cannot be resolved -- logged at ERROR).
     """
     import db, config
 
@@ -2799,58 +2828,61 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
             new_head_hash[:16], stopped, reason, computed[:16], stored[:16],
             (old_head_hash or '')[:16],
         )
-        # Restore consistent state at the prior head. old_path==[] (prior head
-        # was genesis, or its own ancestry was broken) resets to the genesis
-        # baseline; a non-empty old_path replays the known-good canonical chain.
-        restore = _rebuild_state_from_blockchain_internal(0, path_hashes=old_path)
-        if restore is None or not restore.ok:
-            logger.error(
-                "[chain_state] Reorg abort recovery FAILED to restore prior head "
-                "%s... (reason=%s). In-memory state may be inconsistent.",
-                (old_head_hash or '')[:16],
-                getattr(restore, 'reason', 'no result') if restore else 'no result',
-            )
+        _restore_prior_head(old_path, old_head_hash)
         return False
 
-    # Phase 4: Atomic Commit of Rebuilt State
-    with _balance_lock, _sequence_lock, _rules_lock:
-        b = dict(_balances)
-        s = dict(_sequence_numbers)
-        app_r = _application_rules_state
-        cons_r = _consensus_rules_state
-        cons_id = _active_consensus_id
-        pending_updates_list = _persistable_update_payloads(_lifecycle_manager)
-        votes_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "voter_pubkey": pub.hex() if isinstance(pub, bytes) else pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
-        scheduled_list = [(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates]
-        archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
-        active_validators_list = sorted(normalize_validator_set(_lifecycle_manager.active_validators))
-        rule_offers_list = _lifecycle_manager.rule_offers.snapshot_offers()
-        rule_clauses_list = _lifecycle_manager.rule_offers.snapshot_clauses()
-        head_num = db.get_block_by_hash(new_head_hash)['header']['block_number']
-        db.save_canonical_state_atomically(
-            new_head_hash,
-            head_num,
-            b,
-            s,
-            app_r,
-            cons_r,
-            cons_id,
-            pending_updates_list,
-            votes_list,
-            scheduled_list,
-            archival_list,
-            active_validators=active_validators_list,
-            quorum_policy=_lifecycle_manager.quorum_policy,
-            eligibility_mode=_lifecycle_manager.eligibility_mode,
-            fee_beneficiary=_lifecycle_manager.fee_beneficiary,
-            last_transfer_ts=dict(_last_transfer_ts),
-            rule_offers=rule_offers_list,
-            rule_clauses=rule_clauses_list,
-            max_rule_txs_per_block=_lifecycle_manager.max_rule_txs_per_block,
-            approval_requests=_lifecycle_manager.approval_requests.snapshot_requests(),
-            approval_slots_active=_lifecycle_manager.approval_slots_active,
-            retractable_transfers=_retractable_state(_lifecycle_manager),
+    # Phase 4: Atomic Commit of Rebuilt State.
+    # The replay above has already published the new head into memory. If this
+    # save fails, disk is still the prior head, so memory has to go back there
+    # before the error is reported. The locks must be released first: the
+    # restore replays through the same locks, and they are not reentrant.
+    try:
+        with _balance_lock, _sequence_lock, _rules_lock:
+            b = dict(_balances)
+            s = dict(_sequence_numbers)
+            app_r = _application_rules_state
+            cons_r = _consensus_rules_state
+            cons_id = _active_consensus_id
+            pending_updates_list = _persistable_update_payloads(_lifecycle_manager)
+            votes_list = [{"update_id": k.hex() if isinstance(k, bytes) else k, "voter_pubkey": pub.hex() if isinstance(pub, bytes) else pub} for k, v in _lifecycle_manager.votes.items() for pub in v]
+            scheduled_list = [(h, uid.hex() if isinstance(uid, bytes) else uid) for h, uid in _lifecycle_manager.scheduled_updates]
+            archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
+            active_validators_list = sorted(normalize_validator_set(_lifecycle_manager.active_validators))
+            rule_offers_list = _lifecycle_manager.rule_offers.snapshot_offers()
+            rule_clauses_list = _lifecycle_manager.rule_offers.snapshot_clauses()
+            head_num = db.get_block_by_hash(new_head_hash)['header']['block_number']
+            db.save_canonical_state_atomically(
+                new_head_hash,
+                head_num,
+                b,
+                s,
+                app_r,
+                cons_r,
+                cons_id,
+                pending_updates_list,
+                votes_list,
+                scheduled_list,
+                archival_list,
+                active_validators=active_validators_list,
+                quorum_policy=_lifecycle_manager.quorum_policy,
+                eligibility_mode=_lifecycle_manager.eligibility_mode,
+                fee_beneficiary=_lifecycle_manager.fee_beneficiary,
+                last_transfer_ts=dict(_last_transfer_ts),
+                rule_offers=rule_offers_list,
+                rule_clauses=rule_clauses_list,
+                max_rule_txs_per_block=_lifecycle_manager.max_rule_txs_per_block,
+                approval_requests=_lifecycle_manager.approval_requests.snapshot_requests(),
+                approval_slots_active=_lifecycle_manager.approval_slots_active,
+                retractable_transfers=_retractable_state(_lifecycle_manager),
+            )
+    except Exception as exc:
+        logger.error(
+            "[chain_state] Reorg to %s... ABORTED: canonical state save failed "
+            "(%s). Canonical head NOT advanced; restoring prior head %s...",
+            new_head_hash[:16], exc, (old_head_hash or '')[:16],
         )
+        _restore_prior_head(old_path, old_head_hash)
+        return False
 
     # Phase 5: Mempool Restore
     if new_txs:

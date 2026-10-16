@@ -230,10 +230,11 @@ def test_every_commit_site_persists_rule_offers():
 
     A commit site may pass the arguments explicitly, or delegate to
     `_canonical_state_kwargs` -- in which case the BUILDER is audited instead,
-    so centralising the arguments cannot quietly drop one. Both the two-step
-    `save_canonical_state_atomically` sites and the one-transaction
-    `commit_prepared_block` site are covered; a naive audit of the former alone
-    would never see the latter.
+    so centralising the arguments cannot quietly drop one. The two-step
+    `save_canonical_state_atomically` sites, the one-transaction
+    `commit_prepared_block` site, and the non-authority
+    `commit_block_and_canonical_state` site are covered; a naive audit of the
+    first alone would never see the other two.
     """
     import ast
     import inspect
@@ -269,7 +270,7 @@ def test_every_commit_site_persists_rule_offers():
                     return True
         return False
 
-    saves, commits = [], []
+    saves, commits, block_commits = [], [], []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
@@ -277,14 +278,21 @@ def test_every_commit_site_persists_rule_offers():
             saves.append(node)
         elif node.func.attr == "commit_prepared_block":
             commits.append(node)
+        elif node.func.attr == "commit_block_and_canonical_state":
+            block_commits.append(node)
 
-    assert len(saves) == 3, (
-        f"expected 3 save_canonical_state_atomically sites in chain_state, found "
-        f"{len(saves)}; a new one must also pass every hash-bound argument"
+    assert len(saves) == 2, (
+        f"expected 2 save_canonical_state_atomically sites in chain_state "
+        f"(startup snapshot, reorg), found {len(saves)}; a new one must also "
+        "pass every hash-bound argument"
     )
     assert len(commits) == 2, (
         f"expected 2 commit_prepared_block sites in chain_state (block apply, "
         f"journal rebuild), found {len(commits)}"
+    )
+    assert len(block_commits) == 1, (
+        "expected 1 commit_block_and_canonical_state site (non-authority block "
+        f"apply), found {len(block_commits)}"
     )
     delegated = False
     for call in saves:
@@ -313,6 +321,12 @@ def test_every_commit_site_persists_rule_offers():
             "rows from _canonical_state_kwargs or declare canonical=None explicitly"
         )
         journal_only += 1
+    for call in block_commits:
+        assert _delegates(call, via="canonical"), (
+            f"chain_state.py:{call.lineno}: commit_block_and_canonical_state "
+            "must take its canonical rows from _canonical_state_kwargs"
+        )
+        delegated = True
     assert journal_only <= 1, "more than one journal-only commit site"
 
     if delegated:

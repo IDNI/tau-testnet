@@ -280,9 +280,9 @@ def test_root_is_insertion_order_independent():
 
 def test_request_parser_normalizes_numeric_keys_and_string_amount():
     tx = {"tx_type": "approval_request", "sender_pubkey": A, "sequence_number": 4,
-          "payload": {"recipient_pubkey": B, "amount": "50000", "expire_at_height": 900,
-                      "approvers": {"19": SCAN, "18": AUTH},
-                      "custom_inputs": {"26": "hi"}}}
+          "recipient_pubkey": B, "amount": "50000", "expire_at_height": 900,
+          "approvers": {"19": SCAN, "18": AUTH},
+          "custom_inputs": {"26": "hi"}}
     r = parse_approval_request(tx)
     assert r is not None
     assert list(r.approvers) == [18, 19], "ascending NUMERIC order, not string order"
@@ -292,24 +292,88 @@ def test_request_parser_normalizes_numeric_keys_and_string_amount():
 def test_vote_parser_requires_a_real_bool():
     """Accepting 1/0 would let a wallet bug turn a decline into an approval."""
     base = {"tx_type": "transfer_vote", "sender_pubkey": AUTH,
-            "payload": {"request_id": "ab" * 32}}
+            "request_id": "ab" * 32}
     assert parse_transfer_vote(base).approve is True
-    base["payload"]["approve"] = False
+    base["approve"] = False
     assert parse_transfer_vote(base).approve is False
-    base["payload"]["approve"] = 1
+    base["approve"] = 1
     assert parse_transfer_vote(base) is None
 
 
 def test_vote_parser_rejects_a_malformed_request_id():
     for bad in ("nothex", "ab", "ab" * 31):
         tx = {"tx_type": "transfer_vote", "sender_pubkey": AUTH,
-              "payload": {"request_id": bad}}
+              "request_id": bad}
         assert parse_transfer_vote(tx) is None
 
 
 def test_parsers_ignore_other_tx_types():
     assert parse_approval_request({"tx_type": "user_tx"}) is None
     assert parse_transfer_vote({"tx_type": "rule_offer"}) is None
+
+
+def test_parsers_read_root_fields_and_ignore_a_nested_payload():
+    """A nested payload is unsigned. Root fields win; nested-only is not a tx."""
+    tx = {
+        "tx_type": "approval_request",
+        "sender_pubkey": A,
+        "sequence_number": 4,
+        "recipient_pubkey": B,
+        "amount": 50000,
+        "expire_at_height": 900,
+        "approvers": {"18": AUTH},
+        "custom_inputs": {"26": "hi"},
+        "payload": {
+            "sender_pubkey": STRANGER,
+            "sequence_number": 99,
+            "recipient_pubkey": SCAN,
+            "amount": 1,
+            "expire_at_height": 1,
+            "approvers": {"19": SCAN},
+            "custom_inputs": {"27": "no"},
+        },
+    }
+    r = parse_approval_request(tx)
+    assert r is not None
+    assert r.sender_pubkey == A and r.sequence_number == 4
+    assert r.recipient_pubkey == B and r.amount == 50000
+    assert r.expire_at_height == 900
+    assert r.approvers == {18: AUTH}
+    assert r.custom_inputs == {26: "hi"}
+
+    assert parse_approval_request({
+        "tx_type": "approval_request",
+        "payload": {
+            "sender_pubkey": A, "sequence_number": 4, "recipient_pubkey": B,
+            "amount": 50000, "expire_at_height": 900, "approvers": {"18": AUTH},
+        },
+    }) is None
+
+    vote = {
+        "tx_type": "transfer_vote",
+        "sender_pubkey": AUTH,
+        "request_id": "ab" * 32,
+        "approve": False,
+        "reason": "no",
+        "payload": {
+            "sender_pubkey": SCAN,
+            "request_id": "cd" * 32,
+            "approve": True,
+            "reason": "yes",
+        },
+    }
+    parsed = parse_transfer_vote(vote)
+    assert parsed is not None
+    assert parsed.approve is False
+    assert parsed.request_id.hex() == "ab" * 32
+    assert parsed.reason == "no" and parsed.voter_pubkey == AUTH
+
+    assert parse_transfer_vote({
+        "tx_type": "transfer_vote",
+        "payload": {
+            "sender_pubkey": AUTH, "request_id": "ab" * 32, "approve": False,
+        },
+    }) is None
 
 
 # --- slot width screen -------------------------------------------------------

@@ -1,5 +1,4 @@
 from typing import Any, Dict, List, Optional, Iterable, Union
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -324,50 +323,31 @@ class ConsensusRuleVote:
 def parse_consensus_rule_update(tx: Dict[str, Any]) -> Optional[ConsensusRuleUpdate]:
     """
     Parse a transaction dictionary into a ConsensusRuleUpdate if it matches the schema.
-    Normally we check tx_type == "consensus_rule_update".
+    Read rule_revisions, activate_at_height and host_contract_patch from ROOT
+    fields only; a nested `payload` is unsigned data.
     """
     if tx.get("tx_type") != "consensus_rule_update":
         return None
-        
-    # Fields like rule_revisions could be in a nested "payload" dict, or at the root of `tx`.
-    root_val = tx.get("payload")
-    if isinstance(root_val, dict):
-        payload = root_val
-    elif isinstance(root_val, str):
-        try:
-            payload = json.loads(root_val)
-        except Exception:
-            payload = tx
-    else:
-        payload = tx
 
-    revisions = payload.get("rule_revisions")
+    revisions = tx.get("rule_revisions")
     if not isinstance(revisions, list):
-         # Legacy fallback to single tau_source
-         tau_source = payload.get("tau_source")
-         if isinstance(tau_source, str):
-             revisions = [tau_source]
-         else:
-             return None
-             
-    activate_at = payload.get("activate_at_height")
-    if not isinstance(activate_at, int):
-         # Try convert
-         try:
-             activate_at = int(activate_at)
-         except Exception:
-             return None
+        return None
 
-    patch = payload.get("host_contract_patch")
+    activate_at = tx.get("activate_at_height")
+    if not isinstance(activate_at, int):
+        try:
+            activate_at = int(activate_at)
+        except Exception:
+            return None
+
+    patch = tx.get("host_contract_patch")
     if patch is not None and not isinstance(patch, dict):
         return None
 
     proposer_pubkey = tx.get("sender_pubkey")
     if not isinstance(proposer_pubkey, str):
-        proposer_pubkey = payload.get("sender_pubkey")
-    if not isinstance(proposer_pubkey, str):
         proposer_pubkey = None
-        
+
     return ConsensusRuleUpdate(
         rule_revisions=revisions,
         activate_at_height=activate_at,
@@ -378,38 +358,28 @@ def parse_consensus_rule_update(tx: Dict[str, Any]) -> Optional[ConsensusRuleUpd
 def parse_consensus_rule_vote(tx: Dict[str, Any]) -> Optional[ConsensusRuleVote]:
     """
     Parse a transaction dictionary into a ConsensusRuleVote if it matches the schema.
+    Read update_id and approve from ROOT fields only; a nested `payload` is unsigned data.
     """
     if tx.get("tx_type") != "consensus_rule_vote":
         return None
-        
-    root_val = tx.get("payload")
-    if isinstance(root_val, dict):
-        payload = root_val
-    elif isinstance(root_val, str):
-        try:
-            payload = json.loads(root_val)
-        except Exception:
-            payload = tx
-    else:
-        payload = tx
 
-    update_id_str = payload.get("update_id")
+    update_id_str = tx.get("update_id")
     if not isinstance(update_id_str, str):
-         return None
-         
+        return None
+
     try:
         update_id = bytes.fromhex(update_id_str)
         if len(update_id) != 32:
             return None
     except ValueError:
         return None
-        
-    approve = payload.get("approve", True) # Default to true for approvals
+
+    approve = tx.get("approve", True)  # Default to true for approvals
     if not isinstance(approve, bool):
-         if str(approve).lower() == "false" or approve == 0:
-             approve = False
-         else:
-             approve = True
+        if str(approve).lower() == "false" or approve == 0:
+            approve = False
+        else:
+            approve = True
 
     return ConsensusRuleVote(
         update_id=update_id,

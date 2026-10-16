@@ -19,11 +19,9 @@ class TestGovernance(unittest.TestCase):
         tx = {
             "tx_type": "consensus_rule_update",
             "sender_pubkey": f"{1:096x}",
-            "payload": {
-                "rule_revisions": ["always o5 = 1"],
-                "activate_at_height": 100,
-                "host_contract_patch": {"fee": 10}
-            }
+            "rule_revisions": ["always o5 = 1"],
+            "activate_at_height": 100,
+            "host_contract_patch": {"fee": 10},
         }
         update = parse_consensus_rule_update(tx)
         self.assertIsNotNone(update)
@@ -37,15 +35,60 @@ class TestGovernance(unittest.TestCase):
         update = ConsensusRuleUpdate(["test"], 10)
         tx = {
             "tx_type": "consensus_rule_vote",
-            "payload": {
-                "update_id": update.update_id.hex(),
-                "approve": True
-            }
+            "update_id": update.update_id.hex(),
+            "approve": True,
         }
         vote = parse_consensus_rule_vote(tx)
         self.assertIsNotNone(vote)
         self.assertEqual(vote.update_id, update.update_id)
         self.assertTrue(vote.approve)
+
+    def test_parsers_read_root_fields_and_ignore_a_nested_payload(self):
+        """A nested payload is unsigned. Root fields win; nested-only is not a tx."""
+        sender = f"{1:096x}"
+        tx = {
+            "tx_type": "consensus_rule_update",
+            "sender_pubkey": sender,
+            "rule_revisions": ["always o5 = 1"],
+            "activate_at_height": 100,
+            "host_contract_patch": {"fee": 10},
+            "payload": {
+                "sender_pubkey": f"{2:096x}",
+                "rule_revisions": ["always o5 = 0"],
+                "activate_at_height": 1,
+                "host_contract_patch": {"fee": 99},
+            },
+        }
+        update = parse_consensus_rule_update(tx)
+        self.assertIsNotNone(update)
+        self.assertEqual(update.rule_revisions, ["always o5 = 1"])
+        self.assertEqual(update.activate_at_height, 100)
+        self.assertEqual(update.host_contract_patch, {"fee": 10})
+        self.assertEqual(update.proposer_pubkey, sender)
+
+        self.assertIsNone(parse_consensus_rule_update({
+            "tx_type": "consensus_rule_update",
+            "payload": {
+                "rule_revisions": ["always o5 = 1"],
+                "activate_at_height": 100,
+            },
+        }))
+
+        vote_tx = {
+            "tx_type": "consensus_rule_vote",
+            "update_id": update.update_id.hex(),
+            "approve": False,
+            "payload": {"update_id": "ab" * 32, "approve": True},
+        }
+        vote = parse_consensus_rule_vote(vote_tx)
+        self.assertIsNotNone(vote)
+        self.assertEqual(vote.update_id, update.update_id)
+        self.assertFalse(vote.approve)
+
+        self.assertIsNone(parse_consensus_rule_vote({
+            "tx_type": "consensus_rule_vote",
+            "payload": {"update_id": update.update_id.hex(), "approve": False},
+        }))
         
     def test_lifecycle_promotion(self):
         manager = ConsensusLifecycleManager(active_validators=self.active_validators)

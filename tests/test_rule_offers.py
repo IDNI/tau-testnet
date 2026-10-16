@@ -220,11 +220,52 @@ def test_parse_offer_roundtrip():
     assert offer.offer_id_hex == offer.offer_id.hex()
 
 
-def test_parse_offer_accepts_nested_payload():
-    tx = {"tx_type": "rule_offer", "sender_pubkey": A, "payload": {
-        "recipient_pubkey": B, "rule_text": BLOCK_RULE, "expire_at_height": 7}}
+def test_parsers_read_root_fields_and_ignore_a_nested_payload():
+    """A nested payload is unsigned. Root fields win; nested-only is not a tx."""
+    tx = _offer_tx(payload={
+        "sender_pubkey": C,
+        "recipient_pubkey": C,
+        "rule_text": ALLOW_RULE,
+        "expire_at_height": 7,
+    })
     offer = parse_rule_offer(tx)
-    assert offer is not None and offer.expire_at_height == 7
+    assert offer is not None
+    assert offer.offerer_pubkey == A and offer.recipient_pubkey == B
+    assert offer.rule_text == BLOCK_RULE and offer.expire_at_height == 500
+
+    assert parse_rule_offer({
+        "tx_type": "rule_offer", "sender_pubkey": A,
+        "payload": {"recipient_pubkey": B, "rule_text": BLOCK_RULE,
+                    "expire_at_height": 7},
+    }) is None
+
+    offer_id = offer.offer_id.hex()
+    accept = parse_rule_offer_accept({
+        "tx_type": "rule_offer_accept", "sender_pubkey": B,
+        "offer_id": offer_id, "rule_text": BLOCK_RULE,
+        "payload": {"offer_id": "ab" * 32, "rule_text": ALLOW_RULE,
+                    "sender_pubkey": C},
+    })
+    assert accept is not None
+    assert accept.offer_id == offer.offer_id
+    assert accept.rule_text == BLOCK_RULE and accept.actor_pubkey == B
+
+    assert parse_rule_offer_accept({
+        "tx_type": "rule_offer_accept",
+        "payload": {"sender_pubkey": B, "offer_id": offer_id, "rule_text": BLOCK_RULE},
+    }) is None
+
+    reject = parse_rule_offer_reject({
+        "tx_type": "rule_offer_reject", "sender_pubkey": B, "offer_id": offer_id,
+        "payload": {"offer_id": "cd" * 32, "sender_pubkey": C},
+    })
+    assert reject is not None and reject.offer_id == offer.offer_id
+    assert reject.accept is False
+
+    assert parse_rule_offer_reject({
+        "tx_type": "rule_offer_reject",
+        "payload": {"sender_pubkey": B, "offer_id": offer_id},
+    }) is None
 
 
 def test_offer_id_depends_on_every_bound_field():

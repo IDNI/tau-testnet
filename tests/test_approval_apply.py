@@ -620,3 +620,83 @@ def test_unvoted_slots_are_fed_as_plain_zero():
         if isinstance(k, int) and 18 <= k <= 25 and str(v) == "0"
     ]
     assert zeros, "unvoted slots should be fed 0"
+
+
+# --- unsigned fields a proposer can add after the signature -----------------
+
+def _no_stream(calls, idx):
+    return all(idx not in (c.get("input_stream_values") or {}) for c in calls)
+
+
+def test_a_nested_approve_cannot_flip_a_signed_decline():
+    """The approver signed approve:false. A proposer-added payload must not
+    turn that into a release."""
+    req = _request()
+    decline = vote_tx(req, voter=AUTH, sk=SK_AUTH, approve=False)
+    decline["payload"] = {"request_id": req.request_id_hex, "approve": True}
+    result, lm, _ = _apply([request_tx(req), decline])
+    entry = lm.approval_requests.get_request(req.request_id)
+    assert entry is not None, "a signed decline must not release the request"
+    assert 18 in entry.declined
+    assert _balances(result)[BOB] == 0
+
+
+def test_a_nested_recipient_cannot_rewrite_a_parked_request():
+    """The parked request_id is the one the sender signed, not the nested one."""
+    req = _request()
+    tx = request_tx(req)
+    tx["payload"] = {
+        "recipient_pubkey": STRANGER,
+        "amount": 1,
+        "expire_at_height": req.expire_at_height,
+        "approvers": {"18": AUTH},
+        "custom_inputs": {"30": "7"},
+    }
+    result, lm, _ = _apply([tx])
+    entry = lm.approval_requests.get_request(req.request_id)
+    assert entry is not None
+    assert entry.recipient_pubkey == BOB and entry.amount == req.amount
+    assert f"Approval request parked: {req.request_id_hex}" in _logs(result)
+
+
+def test_unsigned_operations_on_an_approval_request_are_ignored():
+    req = _request()
+    reserved = request_tx(req)
+    reserved["operations"] = {"12": "1", "14": "1"}
+    result, lm, _ = _apply([reserved], fee=7)
+    assert result.outcomes[0].status == "applied"
+    assert "Operation key" not in _logs(result)
+    assert lm.approval_requests.get_request(req.request_id) is not None
+    assert "Fee charged: 7" in _logs(result)
+
+    custom = request_tx(req)
+    custom["operations"] = {"30": "7"}
+    result, lm, calls = _apply([custom], fee=7)
+    assert lm.approval_requests.get_request(req.request_id) is not None
+    assert "Tau(custom_unified)" not in _logs(result)
+    assert "Fee charged: 7" in _logs(result)
+    assert _no_stream(calls, 30)
+    assert _no_stream(_apply.single_calls, 30)
+
+
+def test_unsigned_operations_on_a_transfer_vote_are_ignored():
+    req = _request()
+    reserved = vote_tx(req, approve=False)
+    reserved["operations"] = {"12": "1", "14": "1"}
+    result, lm, _ = _apply([reserved], lm=_seeded(req))
+    assert result.outcomes[0].status == "applied"
+    assert "Operation key" not in _logs(result)
+    entry = lm.approval_requests.get_request(req.request_id)
+    assert entry is not None and 18 in entry.declined
+    assert "Fee charged" not in _logs(result)
+
+    custom = vote_tx(req, approve=False)
+    custom["operations"] = {"30": "7"}
+    result, lm, calls = _apply([custom], lm=_seeded(req))
+    assert "Tau(custom_unified)" not in _logs(result)
+    assert "Fee charged" not in _logs(result)
+    entry = lm.approval_requests.get_request(req.request_id)
+    assert entry is not None and 18 in entry.declined
+    assert _balances(result)[ALICE] == 100000
+    assert _no_stream(calls, 30)
+    assert _no_stream(_apply.single_calls, 30)

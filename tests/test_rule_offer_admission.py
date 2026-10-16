@@ -137,22 +137,32 @@ def test_offer_with_a_non_integer_height_rejected(tip_view):
     assert not res.is_valid and "expire_at_height" in res.error
 
 
-def test_offer_offerer_must_be_the_sender(tip_view):
-    """Only reachable when the envelope sender is unusable and a nested payload
-    supplies a different one."""
-    tx = {
+def test_a_nested_payload_is_not_the_offer(tip_view):
+    """Fields under payload are unsigned. The admitted offer is the root one,
+    and an offer whose body exists only under payload is malformed."""
+    tx = offer_tx()
+    tx["payload"] = {
+        "sender_pubkey": C,
+        "recipient_pubkey": C,
+        "rule_text": ALLOW_RULE,
+        "expire_at_height": NEXT_HEIGHT,
+    }
+    res = validate_mempool_admission(tx, tip_view)
+    assert res.is_valid, res.error
+
+    nested_only = {
         "tx_type": "rule_offer",
-        "sender_pubkey": None,
+        "sender_pubkey": A,
+        "expire_at_height": EXPIRE,
         "payload": {
             "sender_pubkey": C,
             "recipient_pubkey": B,
             "rule_text": BLOCK_RULE,
             "expire_at_height": EXPIRE,
         },
-        "expire_at_height": EXPIRE,
     }
-    res = validate_mempool_admission(tx, tip_view)
-    assert not res.is_valid and "sender" in res.error
+    res = validate_mempool_admission(nested_only, tip_view)
+    assert not res.is_valid and "Malformed" in res.error
 
 
 def test_offer_oversized_rejected(tip_view):

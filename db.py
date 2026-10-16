@@ -989,6 +989,24 @@ def commit_prepared_block(*, execution_id, tip, parent, journal_entries,
             "journal_head": journal_head, "allocator_digest": allocator_digest}
 
 
+def commit_block_and_canonical_state(block, canonical: dict) -> None:
+    """Persist a block and its canonical snapshot in ONE transaction.
+
+    The same composition `commit_prepared_block` uses for its block row and
+    canonical rows, without the journal and the commit record. The
+    non-authority path has no worker to promote, and it has the same
+    requirement: the block and the canonical head become durable together.
+    Memory moves only after this returns.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        with _db_conn:
+            _write_block_rows(_db_conn.cursor(), block)
+            _write_canonical_state_rows(**canonical)
+
+
 def publish_shrink_ids(delta: dict, expected_epoch: str) -> None:
     """Insert an exact set of (key -> id) bindings in ONE transaction.
 
@@ -1922,10 +1940,12 @@ def clear_mempool():
 def _write_block_rows(cur, new_block) -> None:
     """The block row and its tx index, WITHOUT a transaction of its own.
 
-    Callers own the transaction. `add_block` gives it one; the block commit puts
-    these rows in the same transaction as the canonical snapshot, the journal
-    delta, the allocator delta and the commit record -- so a crash cannot leave a
-    block whose evaluator history was never recorded, or the reverse.
+    Callers own the transaction. `add_block` gives it one;
+    `commit_block_and_canonical_state` puts these rows in the same transaction
+    as the canonical snapshot; the prepared block commit puts them with the
+    journal delta, the allocator delta and the commit record -- so a crash
+    cannot leave a block whose canonical head, or whose evaluator history, was
+    never recorded.
     """
     block_data_json = json.dumps(new_block.to_dict())
     # OR IGNORE: a block received from a peer is STORED by ingestion before fork
@@ -1953,40 +1973,18 @@ def _write_block_rows(cur, new_block) -> None:
 
 
 def add_block(new_block: block_module.Block):
-    """Adds a new block to the database."""
+    """Adds a new block to the database.
+
+    A duplicate block hash is ignored. Ingestion stores a block before fork
+    choice decides to commit it, and a block's hash is its content, so the row
+    already there is this block.
+    """
     if _db_conn is None:
         init_db()
-    
-    block_dict = new_block.to_dict()
-    block_data_json = json.dumps(block_dict)
 
     with _db_lock:
-        cur = _db_conn.cursor()
-        cur.execute(
-            'INSERT INTO blocks (block_hash, block_number, previous_hash, timestamp, block_data) VALUES (?, ?, ?, ?, ?)',
-            (
-                new_block.block_hash,
-                new_block.header.block_number,
-                new_block.header.previous_hash,
-                new_block.header.timestamp,
-                block_data_json,
-            )
-        )
-        # Index every tx hash in this block (same transaction as the block row)
-        # so gettxstatus can resolve "confirmed". tx_ids is authoritative;
-        # fall back to computing from the transaction bodies if it is absent.
-        # Defensive getattr: some callers/tests pass block-like objects without
-        # these attributes.
-        tx_hashes = getattr(new_block, "tx_ids", None) or [
-            block_module.compute_tx_hash(tx)
-            for tx in (getattr(new_block, "transactions", None) or [])
-        ]
-        for th in tx_hashes:
-            cur.execute(
-                'INSERT OR IGNORE INTO tx_index (tx_hash, block_hash, block_number) VALUES (?, ?, ?)',
-                (th, new_block.block_hash, new_block.header.block_number),
-            )
-        _db_conn.commit()
+        with _db_conn:
+            _write_block_rows(_db_conn.cursor(), new_block)
         logger.info("Added block #%s to database", new_block.header.block_number)
 
 def get_canonical_head_block() -> Optional[Dict]:
