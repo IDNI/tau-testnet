@@ -1107,6 +1107,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
         with _balance_lock, _sequence_lock, _rules_lock:
             _balances.clear()
             _sequence_numbers.clear()
+            _last_transfer_ts.clear()
             # Re-seed genesis rule text (the reorg path replays only the new
             # suffix, not the genesis block, so these would otherwise be lost
             # and the replayed state hash would diverge from the mined chain).
