@@ -1403,7 +1403,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # clone, and the proposal adopts it only on acceptance.
                 lifecycle_mgr = _branch.lifecycle
             tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
-            operations = tx.get('operations', {})
+            # operations is signed only for user_tx.
+            operations = tx.get('operations', {}) if tx.get('tx_type', 'user_tx') == 'user_tx' else {}
             sender = tx.get('sender_pubkey')
             
             # By default, we consider the transaction valid for inclusion unless strictly malformed

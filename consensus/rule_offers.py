@@ -51,7 +51,6 @@ hash to it would let a tau-lang upgrade silently invalidate history.
 """
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -357,22 +356,6 @@ def compose_stream_rule(stream_index: int, clauses: Dict[str, str]) -> Optional[
 
 # --- Transaction payloads ---------------------------------------------------
 
-def _payload_of(tx: Dict[str, Any]) -> Dict[str, Any]:
-    """Accept fields at the tx root or nested under "payload", matching the
-    tolerance of the governance parsers."""
-    root_val = tx.get("payload")
-    if isinstance(root_val, dict):
-        return root_val
-    if isinstance(root_val, str):
-        try:
-            parsed = json.loads(root_val)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-    return tx
-
-
 @dataclass
 class RuleOffer:
     offerer_pubkey: str
@@ -410,16 +393,14 @@ class RuleOfferDecision:
 
 
 def parse_rule_offer(tx: Dict[str, Any]) -> Optional[RuleOffer]:
+    """Read every field from ROOT fields only; a nested `payload` is unsigned data."""
     if tx.get("tx_type") != TX_TYPE_RULE_OFFER:
         return None
-    payload = _payload_of(tx)
 
     offerer = tx.get("sender_pubkey")
-    if not isinstance(offerer, str):
-        offerer = payload.get("sender_pubkey")
-    recipient = payload.get("recipient_pubkey")
-    rule_text = payload.get("rule_text")
-    expire_at = payload.get("expire_at_height")
+    recipient = tx.get("recipient_pubkey")
+    rule_text = tx.get("rule_text")
+    expire_at = tx.get("expire_at_height")
 
     if not isinstance(offerer, str) or not isinstance(recipient, str):
         return None
@@ -442,14 +423,12 @@ def parse_rule_offer(tx: Dict[str, Any]) -> Optional[RuleOffer]:
 
 
 def _parse_decision(tx: Dict[str, Any], tx_type: str, accept: bool) -> Optional[RuleOfferDecision]:
+    """Read every field from ROOT fields only; a nested `payload` is unsigned data."""
     if tx.get("tx_type") != tx_type:
         return None
-    payload = _payload_of(tx)
 
     actor = tx.get("sender_pubkey")
-    if not isinstance(actor, str):
-        actor = payload.get("sender_pubkey")
-    offer_id_hex = payload.get("offer_id")
+    offer_id_hex = tx.get("offer_id")
     if not isinstance(actor, str) or not isinstance(offer_id_hex, str):
         return None
     try:
@@ -463,7 +442,7 @@ def _parse_decision(tx: Dict[str, Any], tx_type: str, accept: bool) -> Optional[
     except RuleOfferShapeError:
         return None
 
-    rule_text = payload.get("rule_text")
+    rule_text = tx.get("rule_text")
     if accept:
         if not isinstance(rule_text, str):
             return None

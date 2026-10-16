@@ -192,26 +192,23 @@ def test_offer_with_a_bad_shape_is_a_soft_no_op():
     assert "Offer ignored" in _logs(result)
 
 
-def test_offer_from_a_different_sender_is_rejected():
-    """Only reachable via a nested payload: the parser otherwise derives the
-    offerer FROM the envelope sender, so the two cannot disagree."""
+def test_a_nested_payload_cannot_retarget_an_offer():
+    """A nested payload is unsigned. The offer that is recorded is the root one."""
     offer = _offer()
-    tx = {
-        "tx_id": "offer-nested",
-        "tx_type": "rule_offer",
-        "sender_pubkey": None,
-        "sequence_number": 0,
-        "fee_limit": "0",
-        "payload": {
-            "sender_pubkey": C,
-            "recipient_pubkey": B,
-            "rule_text": BLOCK_RULE,
-            "expire_at_height": EXPIRE,
-        },
+    tx = offer_tx(offer)
+    tx["payload"] = {
+        "sender_pubkey": C,
+        "recipient_pubkey": C,
+        "rule_text": ALLOW_RULE,
+        "expire_at_height": HEIGHT + 1,
     }
     result, lm, _ = _apply([tx])
-    assert lm.rule_offers.get_offer(offer.offer_id) is None
-    assert "not the sender" in _logs(result)
+    recorded = lm.rule_offers.get_offer(offer.offer_id)
+    assert recorded is not None
+    assert recorded.offerer_pubkey == A and recorded.recipient_pubkey == B
+    forged = _offer(offerer=C, recipient=C, text=ALLOW_RULE, expire=HEIGHT + 1)
+    assert lm.rule_offers.get_offer(forged.offer_id) is None
+    assert "not the sender" not in _logs(result)
 
 
 def test_duplicate_offer_in_the_same_block_is_ignored_once():
@@ -443,3 +440,28 @@ def test_another_principals_requests_survive_an_acceptance():
 
     assert post.rule_offers.clause_for(REAL_B, TARGET) is not None, "the accept landed"
     assert post.approval_requests.get_request(theirs.request_id) is not None
+
+
+def test_unsigned_operations_on_a_rule_offer_are_ignored():
+    """operations is signed only for user_tx. Injected keys must not reject the
+    offer, reach the unified custom step, or change the fee."""
+    offer = _offer()
+    reserved = offer_tx(offer)
+    reserved["operations"] = {"12": "1", "14": "1"}
+    result, lm, _ = _apply([reserved])
+    assert result.outcomes[0].status == "applied"
+    assert "Operation key" not in _logs(result)
+    assert lm.rule_offers.get_offer(offer.offer_id) is not None
+
+    clean_offer = _offer(expire=EXPIRE + 1)
+    clean, _, _ = _apply([offer_tx(clean_offer)])
+
+    custom_offer = _offer(expire=EXPIRE + 2)
+    custom = offer_tx(custom_offer)
+    custom["operations"] = {"30": "7"}
+    result, lm, calls = _apply([custom])
+    assert lm.rule_offers.get_offer(custom_offer.offer_id) is not None
+    assert "Tau(custom_unified)" not in _logs(result)
+    assert "Fee charged" not in _logs(result)
+    assert result.next_snapshot.metadata["balances"] == clean.next_snapshot.metadata["balances"]
+    assert all(30 not in (c.get("input_stream_values") or {}) for c in calls)

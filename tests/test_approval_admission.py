@@ -152,12 +152,24 @@ def test_malformed_request_is_refused(tip_view):
     assert result.is_valid is False and "Malformed approval_request" in result.error
 
 
-def test_a_request_without_a_root_sender_is_refused(tip_view):
-    """The signer is the ROOT sender_pubkey; the parser tolerates a nested
-    payload for the other fields but the signature covers the root. A request
-    that only declares its sender inside the payload has nobody accountable for
-    it, so the signer check refuses it rather than trusting the nested value."""
-    tx = {
+def test_a_nested_payload_is_not_the_request(tip_view):
+    """Fields under payload are unsigned. The admitted request is the root one,
+    and a request whose fields exist only under payload is malformed."""
+    tx = request_tx()
+    tx["payload"] = {
+        "sender_pubkey": STRANGER,
+        "recipient_pubkey": STRANGER,
+        "amount": 1,
+        "expire_at_height": EXPIRE,
+        "approvers": {"18": SCAN},
+    }
+    result = validate_approval_request_payload(tx, tip_view)
+    assert result.is_valid is True, result.error
+    assert result.data["recipient_pubkey"] == B
+    assert result.data["amount"] == 200000
+    assert result.data["approvers"] == {18: AUTH, 19: SCAN, 20: PARTNER}
+
+    nested_only = {
         "tx_type": "approval_request",
         "sequence_number": 1,
         "payload": {
@@ -168,18 +180,30 @@ def test_a_request_without_a_root_sender_is_refused(tip_view):
             "approvers": {"18": AUTH},
         },
     }
-    result = validate_approval_request_payload(tx, tip_view)
+    result = validate_approval_request_payload(nested_only, tip_view)
     assert result.is_valid is False
-    assert "must match the signer" in result.error
+    assert "Malformed approval_request" in result.error
 
 
-def test_a_vote_without_a_root_sender_is_refused(tip_view):
+def test_a_nested_payload_is_not_the_vote(tip_view):
     tip_view.get_approval_request.return_value = _open_row()
-    tx = {"tx_type": "transfer_vote",
-          "payload": {"sender_pubkey": AUTH, "request_id": _request().request_id_hex}}
+    tx = vote_tx(approve=False)
+    tx["payload"] = {
+        "sender_pubkey": STRANGER,
+        "request_id": "ab" * 32,
+        "approve": True,
+    }
     result = validate_transfer_vote_payload(tx, tip_view)
+    assert result.is_valid is True, result.error
+
+    nested_only = {
+        "tx_type": "transfer_vote",
+        "payload": {"sender_pubkey": AUTH, "request_id": _request().request_id_hex,
+                    "approve": True},
+    }
+    result = validate_transfer_vote_payload(nested_only, tip_view)
     assert result.is_valid is False
-    assert "must match the signer" in result.error
+    assert "Malformed transfer_vote" in result.error
 
 
 def test_duplicate_request_is_refused(tip_view):
