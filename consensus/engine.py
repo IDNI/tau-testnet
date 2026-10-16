@@ -60,6 +60,16 @@ from .rule_offers import (
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST} | set(RULE_OFFER_TX_TYPES)
 )
+
+# Branches that mutate the lifecycle manager in place. Once the envelope
+# checks have already rejected the transaction, entering them records a
+# governance update, offer, accept or vote that only proposal mode discards.
+# `withdraw_request` still covers a request rejected later, at fee settlement.
+_LIFECYCLE_TX_TYPES = frozenset(
+    {"consensus_rule_update", "consensus_rule_vote"}
+    | set(RULE_OFFER_TX_TYPES)
+    | set(APPROVAL_TX_TYPES)
+)
 from consensus.tx_signing import verify_tx_signature
 import tau_native
 import tau_advisory
@@ -1883,8 +1893,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             reserved_error = None
 
             from consensus.governance import parse_consensus_rule_update, parse_consensus_rule_vote
-            
-            if tx_type == 'consensus_rule_update':
+
+            if tx_type in _LIFECYCLE_TX_TYPES and not (accepted_in_block and not hard_reject):
+                # Already rejected: lifecycle mutations are only rolled back in proposal mode.
+                tx_receipt["logs"].append(
+                    "Lifecycle action skipped: transaction already rejected"
+                )
+            elif tx_type == 'consensus_rule_update':
                 update = parse_consensus_rule_update(tx)
                 if update:
                     # Consensus-enforced activation delay. Mirrors the mempool

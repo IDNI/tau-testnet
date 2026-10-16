@@ -56,12 +56,12 @@ def _offer(offerer=A, recipient=B, text=BLOCK_RULE, expire=EXPIRE):
 _TX_SEQ = itertools.count()
 
 
-def offer_tx(offer, sender=None):
+def offer_tx(offer, sender=None, seq=0):
     return {
         "tx_id": f"offer-{next(_TX_SEQ)}",
         "tx_type": "rule_offer",
         "sender_pubkey": sender or offer.offerer_pubkey,
-        "sequence_number": 0,
+        "sequence_number": seq,
         "recipient_pubkey": offer.recipient_pubkey,
         "rule_text": offer.rule_text,
         "expire_at_height": offer.expire_at_height,
@@ -69,12 +69,12 @@ def offer_tx(offer, sender=None):
     }
 
 
-def decision_tx(offer, *, accept, sender=None, rule_text=None):
+def decision_tx(offer, *, accept, sender=None, rule_text=None, seq=0):
     tx = {
         "tx_id": f"decision-{next(_TX_SEQ)}",
         "tx_type": "rule_offer_accept" if accept else "rule_offer_reject",
         "sender_pubkey": sender or offer.recipient_pubkey,
-        "sequence_number": 0,
+        "sequence_number": seq,
         "offer_id": offer.offer_id_hex,
         "fee_limit": "0",
     }
@@ -169,12 +169,16 @@ def test_offer_is_recorded():
 
 
 def test_offer_beyond_its_window_is_a_soft_no_op():
-    """The block stays valid; the offer simply is not recorded."""
+    """The block stays valid; the offer simply is not recorded.
+
+    That height is also the transaction envelope, so the pre-dispatch expiry
+    check rejects it before the offer book is consulted.
+    """
     offer = _offer(expire=HEIGHT)   # expires at the inclusion height
     result, lm, _ = _apply([offer_tx(offer)])
 
     assert lm.rule_offers.get_offer(offer.offer_id) is None
-    assert "Offer ignored" in _logs(result)
+    assert "expired at height" in _logs(result)
     assert result.next_snapshot is not None
 
 
@@ -213,7 +217,7 @@ def test_a_nested_payload_cannot_retarget_an_offer():
 
 def test_duplicate_offer_in_the_same_block_is_ignored_once():
     offer = _offer()
-    result, lm, _ = _apply([offer_tx(offer), offer_tx(offer)])
+    result, lm, _ = _apply([offer_tx(offer), offer_tx(offer, seq=1)])
     assert lm.rule_offers.get_offer(offer.offer_id) is not None
     logs = _logs(result)
     assert "Offer submitted" in logs
@@ -275,7 +279,7 @@ def test_second_acceptor_does_not_disable_the_first():
     second = _offer(recipient=C, expire=EXPIRE + 1)
     result, lm, calls = _apply([
         offer_tx(first), decision_tx(first, accept=True),
-        offer_tx(second), decision_tx(second, accept=True),
+        offer_tx(second, seq=1), decision_tx(second, accept=True),
     ])
 
     assert lm.rule_offers.clause_for(B, TARGET) is not None, "first acceptor's clause lost"
@@ -294,7 +298,7 @@ def test_accepting_again_replaces_the_acceptors_own_clause():
     second = _offer(text=ALLOW_RULE, expire=EXPIRE + 1)
     _, lm, calls = _apply([
         offer_tx(first), decision_tx(first, accept=True),
-        offer_tx(second), decision_tx(second, accept=True),
+        offer_tx(second, seq=1), decision_tx(second, accept=True, seq=1),
     ])
 
     assert lm.rule_offers.clause_for(B, TARGET) == clause_body_v1(ALLOW_RULE)
