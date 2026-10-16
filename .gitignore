@@ -43,6 +43,7 @@ MagicMock
 !docs/CONSENSUS_ARCHITECTURE.md
 !docs/developer_cli.md
 !docs/approvals.md
+!docs/retractable.md
 !docs/packaging.md
 
 # Python

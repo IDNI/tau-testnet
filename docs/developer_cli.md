@@ -425,6 +425,7 @@ and why an accepted rule is composed rather than appended.
 Escrow a transfer until a block height or Unix time; the sender can take it back
 before then. Semantics and timing caveats are in the
 [README](../README.md#retractable-transfers).
+Long-form guide: [retractable.md](retractable.md).
 
 ```bash
 tau-testnet retractable send --key alice --to <pk> --amount 10 --release-in 20

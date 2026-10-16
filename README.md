@@ -572,6 +572,8 @@ Bounds and cap breaches at block apply are **soft no-ops** with a receipt log, s
 
 ## Retractable transfers
 
+Long-form guide: [docs/retractable.md](docs/retractable.md).
+
 A `retractable_transfer` parks funds in escrow until a **release point**, either a block height (`release_at_height`) or a Unix time (`release_at_time`). Until then the sender can `retract_transfer` and the escrow comes back. At the release point the funds go to the recipient without anyone sending another transaction.
 
 ```bash
