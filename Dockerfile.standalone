@@ -25,7 +25,7 @@ RUN python3 -m venv /opt/tau-build-venv
 ENV PATH=/opt/tau-build-venv/bin:$PATH
 
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir nanobind
+    pip install --no-cache-dir nanobind auditwheel
 
 WORKDIR /app
 RUN set -eux; \
@@ -40,18 +40,11 @@ WORKDIR /app/tau-lang
 RUN set -eux; \
     TAU_JOBS="${TAU_BUILD_JOBS}"; \
     if [ "${TAU_JOBS}" -le 0 ]; then TAU_JOBS=4; fi; \
-    ./dev dep-cvc5 -DTAU_BUILD_JOBS="${TAU_JOBS}"
-RUN set -eux; \
-    TAU_JOBS="${TAU_BUILD_JOBS}"; \
-    if [ "${TAU_JOBS}" -le 0 ]; then TAU_JOBS=4; fi; \
-    ./dev dep-boost -DTAU_BUILD_JOBS="${TAU_JOBS}"
-RUN set -eux; \
-    TAU_JOBS="${TAU_BUILD_JOBS}"; \
-    if [ "${TAU_JOBS}" -le 0 ]; then TAU_JOBS=4; fi; \
     TAU_PYTHON=/opt/tau-build-venv/bin/python ./dev build Release \
       -DTAU_BUILD_JOBS="${TAU_JOBS}" \
       -DTAU_BUILD_EXECUTABLE=ON \
       -DTAU_BUILD_BINDING_PYTHON_NANOBIND=ON \
+      -DTAU_PYTHON_VERSION=3.14 \
       -DPython_EXECUTABLE=/opt/tau-build-venv/bin/python \
       -DTAU_BUILD_TESTS=OFF
 
@@ -64,6 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     build-essential \
     ca-certificates \
+    libcurl4t64 \
     libffi-dev \
     libboost-all-dev \
     libgmp-dev \
