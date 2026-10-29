@@ -18,7 +18,7 @@ API surface lands incrementally per the unification plan
         attach_resource_manager, collect_listen_addrs, wait_for_listening,
         split_listen_outcome, describe_bind_failure)
 - A4 — discovery (ensure_peer_id, seed_peerstore)
-- A5 — stream primitives (bounded_stream_read, close_stream_safely)
+- A5 — stream primitives (bounded_stream_read, read_until_eof, close_stream_safely)
 - A6 — DHT validator wrap (install_validating_dht)
 - A7 — trio↔async bridge (run_trio_from_thread)
 - A9 — QUIC shim (apply_quic_cleanup_shim)
@@ -469,6 +469,33 @@ async def bounded_stream_read(
     return data
 
 
+class StreamTooLarge(ValueError):
+    """A peer's response exceeded the caller's byte cap."""
+
+
+async def read_until_eof(stream, max_bytes: int) -> bytes:
+    """Read `stream` until the peer closes it, returning every byte received.
+
+    A single `stream.read(n)` yields only what is buffered (one muxer frame),
+    so a multi-frame response needs this loop. Raises `StreamTooLarge` instead
+    of returning a truncated payload. Stream resets and other errors propagate.
+    """
+    chunks: List[bytes] = []
+    total = 0
+    while True:
+        try:
+            chunk = await stream.read(max_bytes + 1 - total)
+        except EOFError:
+            break
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise StreamTooLarge(f"stream response exceeds {max_bytes} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def close_stream_safely(stream) -> None:
     """`await stream.close()` wrapped so close errors do not mask handler errors.
 
@@ -692,6 +719,8 @@ __all__ = [
     "seed_peerstore",
     # Stream primitives (A5)
     "bounded_stream_read",
+    "read_until_eof",
+    "StreamTooLarge",
     "close_stream_safely",
     # DHT validator wrap (A6)
     "install_validating_dht",

@@ -182,12 +182,13 @@ class NetworkService:
 
     async def _handshake_once(self, peer_id: Any) -> None:
         from .protocols import TAU_PROTOCOL_HANDSHAKE
+        from .libp2p_compat import read_until_eof
         import json
         try:
             stream = await self.host.new_stream(peer_id, [TAU_PROTOCOL_HANDSHAKE])
             payload = self._build_handshake_payload()
             await stream.write(json.dumps(payload).encode())
-            data = await stream.read(65535)
+            data = await read_until_eof(stream, 65535)
             await stream.close()
             
             # Process response
@@ -1775,6 +1776,7 @@ class NetworkService:
         Returns number of newly ingested blocks.
         """
         from .protocols import TAU_PROTOCOL_SYNC, TAU_PROTOCOL_BLOCKS
+        from .libp2p_compat import read_until_eof
         import json
         import db
 
@@ -1806,7 +1808,7 @@ class NetworkService:
             req = {"type": "get_headers", "locator": list(locator), "stop": stop, "limit": limit}
             stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_SYNC])
             await stream.write(json.dumps(req).encode())
-            resp_raw = await stream.read(2 * 1024 * 1024)
+            resp_raw = await read_until_eof(stream, 2 * 1024 * 1024)
             await stream.close()
             resp = json.loads((resp_raw or b"{}").decode())
             headers = resp.get("headers") or []
@@ -1849,7 +1851,7 @@ class NetworkService:
                 req = {"type": "get_blocks", "hashes": chunk}
                 stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_BLOCKS])
                 await stream.write(json.dumps(req).encode())
-                resp_raw = await stream.read(20 * 1024 * 1024)
+                resp_raw = await read_until_eof(stream, 20 * 1024 * 1024)
                 await stream.close()
                 resp = json.loads((resp_raw or b"{}").decode())
                 blocks.extend(resp.get("blocks") or [])
