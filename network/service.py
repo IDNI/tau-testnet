@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+from collections import OrderedDict
 import logging
 import sys
 import trio
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 MAX_HANDSHAKE_PROVIDERS = 50
+# Hard bound on header pages pulled in one sync call.
+MAX_SYNC_PAGES = 50
+# Bound on remembered peers that failed the genesis gate.
+MAX_GENESIS_REJECTED_PEERS = 1024
 
 # Install the libp2p shims (QUIC cleanup race, AutoConnector backoff overflow) at
 # module load. Their bodies live in `network/libp2p_compat.py`; calling them here
@@ -83,6 +88,10 @@ class NetworkService:
         # duplicate handshakes/subscription spam when libp2p emits multiple
         # connected notifications for the same peer.
         self._connected_peer_ids: Set[str] = set()
+        # Peers whose handshake failed the genesis gate. Survives disconnects so a
+        # rejected peer that reconnects cannot trigger syncs through gossip.
+        self._genesis_rejected_peers: "OrderedDict[str, None]" = OrderedDict()
+        self._syncing_peers: Set[str] = set()
 
     async def _on_host_event(self, event: str, conn: Any) -> None:
         logger.debug("Host event: %s", event)
@@ -181,14 +190,25 @@ class NetworkService:
                 await trio.sleep(delay + random.uniform(0, 1))
                 delay = min(delay * 2, 15.0)
 
+    def _mark_genesis_rejected(self, peer_id: Any) -> None:
+        key = str(peer_id)
+        self._genesis_rejected_peers.pop(key, None)
+        self._genesis_rejected_peers[key] = None
+        while len(self._genesis_rejected_peers) > MAX_GENESIS_REJECTED_PEERS:
+            self._genesis_rejected_peers.popitem(last=False)
+
+    def _clear_genesis_rejected(self, peer_id: Any) -> None:
+        self._genesis_rejected_peers.pop(str(peer_id), None)
+
     async def _handshake_once(self, peer_id: Any) -> None:
         from .protocols import TAU_PROTOCOL_HANDSHAKE
+        from .libp2p_compat import read_until_eof
         import json
         try:
             stream = await self.host.new_stream(peer_id, [TAU_PROTOCOL_HANDSHAKE])
             payload = self._build_handshake_payload()
             await stream.write(json.dumps(payload).encode())
-            data = await stream.read(65535)
+            data = await read_until_eof(stream, 65535)
             await stream.close()
             
             # Process response
@@ -214,11 +234,14 @@ class NetworkService:
                 local_gh = self._genesis_hash
                 if local_gh and str(peer_gh or "") != str(local_gh):
                     logger.warning("Disconnecting %s: incompatible genesis_hash %r", peer_id, peer_gh)
+                    self._mark_genesis_rejected(peer_id)
                     try:
                         await self.host.disconnect(peer_id)
                     except Exception:
                         pass
                     return
+
+                self._clear_genesis_rejected(peer_id)
 
                 # Persist basic peer metadata so later routing/sync has context.
                 try:
@@ -959,12 +982,17 @@ class NetworkService:
                     # the check. Only skipped while we ourselves have no genesis.
                     peer_gh = payload.get("genesis_hash")
                     local_gh = self._genesis_hash
+                    remote_pid = getattr(getattr(stream, "muxed_conn", None), "peer_id", None)
                     if local_gh and str(peer_gh or "") != str(local_gh):
                         logger.warning(
                             "Rejecting handshake from %s: incompatible genesis_hash %r",
                             getattr(stream.muxed_conn, "peer_id", "Unknown"), peer_gh,
                         )
+                        if remote_pid:
+                            self._mark_genesis_rejected(remote_pid)
                         return
+                    if remote_pid:
+                        self._clear_genesis_rejected(remote_pid)
 
                     remote_pubkey = payload.get("peer_pubkey", "")
                     if remote_pubkey:
@@ -1773,11 +1801,16 @@ class NetworkService:
     async def _sync_and_ingest_from_peer(self, peer_id: Any, locator: List[str], stop: Optional[str] = None, limit: int = 2000) -> int:
         """
         Header sync (locator/stop/limit) + fetch missing block bodies + ingest into local DB/state.
-        Returns number of newly ingested blocks.
+        Pages until the peer has nothing further for us, the local head stops
+        advancing, or MAX_SYNC_PAGES is reached. Returns number of newly ingested blocks.
         """
-        from .protocols import TAU_PROTOCOL_SYNC, TAU_PROTOCOL_BLOCKS
-        import json
-        import db
+        peer_key = str(peer_id)
+        if peer_key in self._genesis_rejected_peers:
+            logger.debug("Skipping sync from %s: failed the genesis gate", peer_id)
+            return 0
+        if peer_key in self._syncing_peers:
+            logger.debug("Skipping sync from %s: one already in flight", peer_id)
+            return 0
 
         try:
             limit = int(limit or 2000)
@@ -1794,12 +1827,37 @@ class NetworkService:
         except Exception:
             pass
 
-        # Ensure we have at least some route information before opening streams.
+        self._syncing_peers.add(peer_key)
         try:
-            if hasattr(self, "_ensure_peer_route"):
-                await self._ensure_peer_route(pid_obj)
-        except Exception:
-            pass
+            # Ensure we have at least some route information before opening streams.
+            try:
+                if hasattr(self, "_ensure_peer_route"):
+                    await self._ensure_peer_route(pid_obj)
+            except Exception:
+                pass
+
+            total = 0
+            for _page in range(MAX_SYNC_PAGES):
+                tip_before = self._build_block_locator()[0]
+                ingested, more = await self._sync_header_page(pid_obj, peer_id, locator, stop, limit)
+                total += ingested
+                if not (ingested and more):
+                    break
+                locator = self._build_block_locator()
+                if locator[0] == tip_before:
+                    break
+            return total
+        finally:
+            self._syncing_peers.discard(peer_key)
+
+    async def _sync_header_page(
+        self, pid_obj: Any, peer_id: Any, locator: List[str], stop: Optional[str], limit: int
+    ) -> "tuple[int, bool]":
+        """Fetch and ingest one header page. Returns (ingested, peer_may_have_more)."""
+        from .protocols import TAU_PROTOCOL_SYNC, TAU_PROTOCOL_BLOCKS
+        from .libp2p_compat import read_until_eof
+        import json
+        import db
 
         # 1) Request headers
         headers: List[Dict[str, Any]] = []
@@ -1807,19 +1865,20 @@ class NetworkService:
             req = {"type": "get_headers", "locator": list(locator), "stop": stop, "limit": limit}
             stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_SYNC])
             await stream.write(json.dumps(req).encode())
-            resp_raw = await stream.read(2 * 1024 * 1024)
+            resp_raw = await read_until_eof(stream, 2 * 1024 * 1024)
             await stream.close()
             resp = json.loads((resp_raw or b"{}").decode())
             headers = resp.get("headers") or []
         except Exception:
             logger.warning("Failed to sync headers from %s", peer_id, exc_info=True)
-            return 0
+            return 0, False
 
         if not headers:
             logger.debug("No headers received from %s during sync", peer_id)
-            return 0
+            return 0, False
 
         # 2) Determine which blocks we are missing locally
+        page_hashes: List[str] = []
         missing_hashes: List[str] = []
         for h in headers:
             if not isinstance(h, dict):
@@ -1827,12 +1886,13 @@ class NetworkService:
             bh = h.get("block_hash")
             if not bh:
                 continue
+            page_hashes.append(str(bh))
             if not db.get_block_by_hash(str(bh)):
                 missing_hashes.append(str(bh))
 
         if not missing_hashes:
             logger.debug("Header sync from %s: nothing missing (headers=%d)", peer_id, len(headers))
-            return 0
+            return 0, False
         logger.info(
             "Header sync from %s: headers=%d missing=%d stop=%s",
             peer_id,
@@ -1840,6 +1900,7 @@ class NetworkService:
             len(missing_hashes),
             stop,
         )
+        more = len(headers) >= limit and not (stop and str(stop) in page_hashes)
 
         # 3) Fetch missing blocks by hash
         blocks: List[Dict[str, Any]] = []
@@ -1850,7 +1911,7 @@ class NetworkService:
                 req = {"type": "get_blocks", "hashes": chunk}
                 stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_BLOCKS])
                 await stream.write(json.dumps(req).encode())
-                resp_raw = await stream.read(20 * 1024 * 1024)
+                resp_raw = await read_until_eof(stream, 20 * 1024 * 1024)
                 await stream.close()
                 resp = json.loads((resp_raw or b"{}").decode())
                 blocks.extend(resp.get("blocks") or [])
@@ -1860,7 +1921,7 @@ class NetworkService:
 
         if not blocks:
             logger.debug("No block bodies received from %s during sync", peer_id)
-            return 0
+            return 0, False
 
         # 4) Ingest blocks in order (avoid blocking Trio with Tau/DB work)
         try:
@@ -1877,10 +1938,10 @@ class NetworkService:
             )
             if ingested:
                 logger.info("Ingested %d blocks from %s", ingested, peer_id)
-            return ingested
+            return ingested, more
         except Exception:
             logger.warning("Failed to ingest blocks from %s", peer_id, exc_info=True)
-            return 0
+            return 0, False
 
     @staticmethod
     def _ingest_blocks(sorted_blocks: List[Dict[str, Any]], peer_id: Any) -> int:

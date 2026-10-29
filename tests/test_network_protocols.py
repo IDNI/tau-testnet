@@ -508,6 +508,47 @@ async def test_transaction_gossip_triggers_queue(two_nodes, monkeypatch):
     assert propagate_flag is False
 
 
+async def test_large_header_response_read_until_eof(two_nodes, monkeypatch):
+    from network.libp2p_compat import read_until_eof
+    from network.protocols import TAU_PROTOCOL_SYNC
+    import db
+
+    svc1, svc2, _ = two_nodes
+
+    addrs2 = await _wait_for_addrs(svc2.host)
+    peer_info = PeerInfo(svc2.host.get_id(), addrs2)
+    svc1.host.get_peerstore().add_addrs(peer_info.peer_id, peer_info.addrs, 60)
+    await svc1.host.connect(peer_info)
+
+    def synthetic_blocks(start):
+        return [
+            {
+                "block_hash": f"{i:064x}",
+                "header": {
+                    "block_number": i,
+                    "previous_hash": f"{i - 1:064x}",
+                    "timestamp": 1_700_000_000 + i,
+                    "merkle_root": "f" * 64,
+                    "state_hash": "e" * 64,
+                    "state_locator": "d" * 64,
+                },
+            }
+            for i in range(start, 2000)
+        ]
+
+    monkeypatch.setattr(db, "get_canonical_blocks_at_or_after_height", synthetic_blocks)
+
+    req = {"type": "get_headers", "locator": ["unknown"], "stop": None, "limit": 2000}
+    stream = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_SYNC])
+    await stream.write(json.dumps(req).encode())
+    raw = await read_until_eof(stream, 2 * 1024 * 1024)
+    await stream.close()
+
+    assert len(raw) > 64 * 1024
+    resp = json.loads(raw.decode())
+    assert len(resp["headers"]) == 2000
+
+
 async def test_block_gossip_triggers_sync(two_nodes, monkeypatch):
     from network.protocols import TAU_GOSSIP_TOPIC_BLOCKS
     from network.service import NetworkService
