@@ -624,6 +624,47 @@ class NetworkService:
         if self._nursery:
             self._nursery.start_soon(self._head_reannounce_loop)
 
+        # Bootstrap re-dial while peerless (see _bootstrap_redial_loop)
+        if self._nursery:
+            self._nursery.start_soon(self._bootstrap_redial_loop)
+
+    async def _bootstrap_redial_loop(self) -> None:
+        """Dial the configured bootstrap peers again while we have no peer.
+
+        _connect_to_bootstrap_peer runs once per peer at start (5 attempts),
+        so a node that later loses every connection, e.g. because the
+        bootnode stops accepting peers for a while, stays at 0 peers with a
+        stale head until it is restarted. Every interval this checks the
+        connected peers and, only when there are none, runs the normal
+        bootstrap dial again. Interval via TAU_BOOTSTRAP_REDIAL_INTERVAL
+        seconds (default 60; <= 0 disables)."""
+        import os
+
+        try:
+            interval = float(os.environ.get("TAU_BOOTSTRAP_REDIAL_INTERVAL", "60"))
+        except ValueError:
+            interval = 60.0
+        if interval <= 0:
+            return
+        while not self._runner_stop.is_set():
+            await trio.sleep(interval)
+            try:
+                await self._bootstrap_redial_once()
+            except Exception:
+                logger.debug("Bootstrap re-dial failed", exc_info=True)
+
+    async def _bootstrap_redial_once(self) -> bool:
+        """One re-dial pass. Returns True when bootstrap peers were dialed."""
+        if self.get_connected_peers():
+            return False
+        bootstraps = list(self._config.bootstrap_peers or []) + list(getattr(self._config, "dht_bootstrap_peers", []) or [])
+        if not bootstraps:
+            return False
+        logger.info("No connected peer; dialing %d bootstrap peer(s) again", len(bootstraps))
+        for peer_cfg in bootstraps:
+            await self._connect_to_bootstrap_peer(peer_cfg)
+        return True
+
     async def _head_reannounce_loop(self) -> None:
         """Periodically re-announce our canonical head over block gossip.
 

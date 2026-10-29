@@ -149,3 +149,63 @@ async def test_bootstrap_retry_until_success():
         await NetworkService._connect_to_bootstrap_peer(svc, peer_cfg)
 
     assert attempts["n"] == 3
+
+
+def _redial_service(connected, bootstraps):
+    import trio
+    from network.service import NetworkService
+
+    svc = object.__new__(NetworkService)
+    svc._config = MagicMock()
+    svc._config.bootstrap_peers = bootstraps
+    svc._config.dht_bootstrap_peers = []
+    svc._runner_stop = trio.Event()
+    svc.get_connected_peers = lambda: list(connected)
+    dialed = []
+
+    async def dial(peer_cfg):
+        dialed.append(peer_cfg)
+
+    svc._connect_to_bootstrap_peer = dial
+    return svc, dialed
+
+
+@pytest.mark.trio
+async def test_bootstrap_redial_when_peerless():
+    from network.service import NetworkService
+
+    peer_cfg = {"peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC",
+                "addrs": ["/ip4/127.0.0.1/tcp/4001"]}
+    svc, dialed = _redial_service(connected=[], bootstraps=[peer_cfg])
+    assert await NetworkService._bootstrap_redial_once(svc) is True
+    assert dialed == [peer_cfg]
+
+
+@pytest.mark.trio
+async def test_bootstrap_redial_skipped_with_a_peer():
+    from network.service import NetworkService
+
+    peer_cfg = {"peer_id": "12D3KooWDpWEYxBy8y84AssrPSLaq9DxC7Lncmn5wERJnAWZFnYC",
+                "addrs": ["/ip4/127.0.0.1/tcp/4001"]}
+    svc, dialed = _redial_service(connected=["some-peer"], bootstraps=[peer_cfg])
+    assert await NetworkService._bootstrap_redial_once(svc) is False
+    assert dialed == []
+
+
+@pytest.mark.trio
+async def test_bootstrap_redial_without_bootstrap_peers():
+    from network.service import NetworkService
+
+    svc, dialed = _redial_service(connected=[], bootstraps=[])
+    assert await NetworkService._bootstrap_redial_once(svc) is False
+    assert dialed == []
+
+
+@pytest.mark.trio
+async def test_bootstrap_redial_loop_disabled(monkeypatch):
+    from network.service import NetworkService
+
+    monkeypatch.setenv("TAU_BOOTSTRAP_REDIAL_INTERVAL", "0")
+    svc, dialed = _redial_service(connected=[], bootstraps=[{"peer_id": "x", "addrs": ["y"]}])
+    await NetworkService._bootstrap_redial_loop(svc)
+    assert dialed == []
