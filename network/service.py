@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 
 MAX_HANDSHAKE_PROVIDERS = 50
+# Hard bound on header pages pulled in one sync call.
+MAX_SYNC_PAGES = 50
 
 # Apply the libp2p 0.5.x QUIC cleanup-race shim at module load. The shim body
 # lives in `network/libp2p_compat.py`; this call site keeps the side effect
@@ -82,6 +84,7 @@ class NetworkService:
         # duplicate handshakes/subscription spam when libp2p emits multiple
         # connected notifications for the same peer.
         self._connected_peer_ids: Set[str] = set()
+        self._syncing_peers: Set[str] = set()
 
     async def _on_host_event(self, event: str, conn: Any) -> None:
         logger.debug("Host event: %s", event)
@@ -1773,12 +1776,13 @@ class NetworkService:
     async def _sync_and_ingest_from_peer(self, peer_id: Any, locator: List[str], stop: Optional[str] = None, limit: int = 2000) -> int:
         """
         Header sync (locator/stop/limit) + fetch missing block bodies + ingest into local DB/state.
-        Returns number of newly ingested blocks.
+        Pages until the peer has nothing further for us, the local head stops
+        advancing, or MAX_SYNC_PAGES is reached. Returns number of newly ingested blocks.
         """
-        from .protocols import TAU_PROTOCOL_SYNC, TAU_PROTOCOL_BLOCKS
-        from .libp2p_compat import read_until_eof
-        import json
-        import db
+        peer_key = str(peer_id)
+        if peer_key in self._syncing_peers:
+            logger.debug("Skipping sync from %s: one already in flight", peer_id)
+            return 0
 
         try:
             limit = int(limit or 2000)
@@ -1795,12 +1799,37 @@ class NetworkService:
         except Exception:
             pass
 
-        # Ensure we have at least some route information before opening streams.
+        self._syncing_peers.add(peer_key)
         try:
-            if hasattr(self, "_ensure_peer_route"):
-                await self._ensure_peer_route(pid_obj)
-        except Exception:
-            pass
+            # Ensure we have at least some route information before opening streams.
+            try:
+                if hasattr(self, "_ensure_peer_route"):
+                    await self._ensure_peer_route(pid_obj)
+            except Exception:
+                pass
+
+            total = 0
+            for _page in range(MAX_SYNC_PAGES):
+                tip_before = self._build_block_locator()[0]
+                ingested, more = await self._sync_header_page(pid_obj, peer_id, locator, stop, limit)
+                total += ingested
+                if not (ingested and more):
+                    break
+                locator = self._build_block_locator()
+                if locator[0] == tip_before:
+                    break
+            return total
+        finally:
+            self._syncing_peers.discard(peer_key)
+
+    async def _sync_header_page(
+        self, pid_obj: Any, peer_id: Any, locator: List[str], stop: Optional[str], limit: int
+    ) -> "tuple[int, bool]":
+        """Fetch and ingest one header page. Returns (ingested, peer_may_have_more)."""
+        from .protocols import TAU_PROTOCOL_SYNC, TAU_PROTOCOL_BLOCKS
+        from .libp2p_compat import read_until_eof
+        import json
+        import db
 
         # 1) Request headers
         headers: List[Dict[str, Any]] = []
@@ -1814,13 +1843,14 @@ class NetworkService:
             headers = resp.get("headers") or []
         except Exception:
             logger.warning("Failed to sync headers from %s", peer_id, exc_info=True)
-            return 0
+            return 0, False
 
         if not headers:
             logger.debug("No headers received from %s during sync", peer_id)
-            return 0
+            return 0, False
 
         # 2) Determine which blocks we are missing locally
+        page_hashes: List[str] = []
         missing_hashes: List[str] = []
         for h in headers:
             if not isinstance(h, dict):
@@ -1828,12 +1858,13 @@ class NetworkService:
             bh = h.get("block_hash")
             if not bh:
                 continue
+            page_hashes.append(str(bh))
             if not db.get_block_by_hash(str(bh)):
                 missing_hashes.append(str(bh))
 
         if not missing_hashes:
             logger.debug("Header sync from %s: nothing missing (headers=%d)", peer_id, len(headers))
-            return 0
+            return 0, False
         logger.info(
             "Header sync from %s: headers=%d missing=%d stop=%s",
             peer_id,
@@ -1841,6 +1872,7 @@ class NetworkService:
             len(missing_hashes),
             stop,
         )
+        more = len(headers) >= limit and not (stop and str(stop) in page_hashes)
 
         # 3) Fetch missing blocks by hash
         blocks: List[Dict[str, Any]] = []
@@ -1861,7 +1893,7 @@ class NetworkService:
 
         if not blocks:
             logger.debug("No block bodies received from %s during sync", peer_id)
-            return 0
+            return 0, False
 
         # 4) Ingest blocks in order (avoid blocking Trio with Tau/DB work)
         try:
@@ -1878,10 +1910,10 @@ class NetworkService:
             )
             if ingested:
                 logger.info("Ingested %d blocks from %s", ingested, peer_id)
-            return ingested
+            return ingested, more
         except Exception:
             logger.warning("Failed to ingest blocks from %s", peer_id, exc_info=True)
-            return 0
+            return 0, False
 
     @staticmethod
     def _ingest_blocks(sorted_blocks: List[Dict[str, Any]], peer_id: Any) -> int:

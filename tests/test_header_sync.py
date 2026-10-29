@@ -1,11 +1,17 @@
-"""Header-sync transport: read-to-EOF."""
+"""Header-sync transport and policy: read-to-EOF, paging, in-flight guard."""
 from __future__ import annotations
 
-from typing import List, Optional
+import json
+from typing import Any, Dict, List, Optional
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import trio
 
+from network import service as service_mod
+from network.config import NetworkConfig
 from network.libp2p_compat import StreamTooLarge, read_until_eof
+from network.service import NetworkService
 
 pytestmark = pytest.mark.trio
 
@@ -68,3 +74,183 @@ async def test_read_until_eof_propagates_other_errors():
 
     with pytest.raises(ConnectionResetError):
         await read_until_eof(Resetting(), 1024)
+
+
+# --------------------------------------------------------------------------
+# Service fixture
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def service():
+    cfg = MagicMock(spec=NetworkConfig)
+    cfg.network_id = "test-net"
+    cfg.agent = "test-agent"
+    cfg.genesis_hash = "genesis_local"
+    cfg.bootstrap_peers = []
+    cfg.dht_bootstrap_peers = []
+    cfg.peer_advertisement_interval = 0
+    cfg.MINER_PUBKEY = ""
+    with patch("network.service.HostManager") as MockHostManager, \
+         patch("network.service.DHTManager"), \
+         patch("network.service.DiscoveryManager"), \
+         patch("network.service.GossipManager"):
+        host = MagicMock()
+        host.get_id.return_value = "local_peer"
+        host.disconnect = AsyncMock()
+        MockHostManager.return_value.host = host
+        svc = NetworkService(cfg)
+        svc.get_id = MagicMock(return_value="local_peer")
+        svc._ensure_peer_route = AsyncMock()
+        svc._ensure_peer_id = lambda p: p
+        return svc
+
+
+# --------------------------------------------------------------------------
+# Paging
+# --------------------------------------------------------------------------
+
+
+class FakeChain:
+    """Remote chain of `total` blocks h0..h{total-1} plus the local view of it."""
+
+    def __init__(self, total: int, *, advance: bool = True):
+        self.total = total
+        self.advance = advance
+        self.local: Dict[str, int] = {}
+        self.head = -1
+        self.header_requests: List[Dict[str, Any]] = []
+        self.block_requests = 0
+        self.gate: Optional[trio.Event] = None
+        self.entered = trio.Event()
+
+    def locator(self) -> List[str]:
+        return [f"h{self.head}" if self.head >= 0 else "genesis_local"]
+
+    def get_block_by_hash(self, h: str):
+        return {"block_hash": h} if h in self.local else None
+
+    def ingest(self, blocks, peer_id) -> int:
+        for b in blocks:
+            self.local[b["block_hash"]] = b["header"]["block_number"]
+        if self.advance and blocks:
+            self.head = max(self.head, max(b["header"]["block_number"] for b in blocks))
+        return len(blocks)
+
+    def _respond(self, req: Dict[str, Any]) -> bytes:
+        if req["type"] == "get_headers":
+            self.header_requests.append(req)
+            first = req["locator"][0]
+            start = int(first[1:]) + 1 if first.startswith("h") else 0
+            out = []
+            for i in range(start, self.total):
+                out.append({"block_number": i, "block_hash": f"h{i}"})
+                if req.get("stop") == f"h{i}" or len(out) >= req["limit"]:
+                    break
+            return json.dumps({"headers": out}).encode()
+        self.block_requests += 1
+        blocks = [
+            {"block_hash": h, "header": {"block_number": int(h[1:])}} for h in req["hashes"]
+        ]
+        return json.dumps({"blocks": blocks}).encode()
+
+    async def new_stream(self, peer_id, protocols):
+        if self.gate is not None:
+            self.entered.set()
+            await self.gate.wait()
+        chain = self
+
+        class _S:
+            payload = b""
+
+            async def write(self, data):
+                self.payload = chain._respond(json.loads(data.decode()))
+
+            async def read(self, n=None):
+                take = min(FRAME, n or FRAME)
+                out, self.payload = self.payload[:take], self.payload[take:]
+                if not out:
+                    raise EOFError()
+                return out
+
+            async def close(self):
+                pass
+
+        return _S()
+
+
+def _wire(service, chain: FakeChain, monkeypatch):
+    import db
+
+    service.host.new_stream = chain.new_stream
+    service._build_block_locator = chain.locator
+    service._ingest_blocks = chain.ingest
+    monkeypatch.setattr(db, "get_block_by_hash", chain.get_block_by_hash)
+
+
+async def test_sync_pages_until_caught_up(service, monkeypatch):
+    chain = FakeChain(5000)
+    _wire(service, chain, monkeypatch)
+    total = await service._sync_and_ingest_from_peer("peerA", chain.locator())
+    assert total == 5000
+    assert len(chain.header_requests) == 3
+    assert [r["locator"][0] for r in chain.header_requests] == ["genesis_local", "h1999", "h3999"]
+    assert chain.head == 4999
+    assert not service._syncing_peers
+
+
+async def test_sync_stops_when_head_does_not_advance(service, monkeypatch):
+    chain = FakeChain(5000, advance=False)
+    _wire(service, chain, monkeypatch)
+    total = await service._sync_and_ingest_from_peer("peerA", chain.locator())
+    assert total == 2000
+    assert len(chain.header_requests) == 1
+
+
+async def test_sync_stops_when_stop_hash_in_page(service, monkeypatch):
+    chain = FakeChain(5000)
+    _wire(service, chain, monkeypatch)
+    total = await service._sync_and_ingest_from_peer("peerA", chain.locator(), stop="h1999")
+    assert total == 2000
+    assert len(chain.header_requests) == 1
+
+
+async def test_sync_respects_page_cap(service, monkeypatch):
+    chain = FakeChain(service_mod.MAX_SYNC_PAGES + 10)
+    _wire(service, chain, monkeypatch)
+    total = await service._sync_and_ingest_from_peer("peerA", chain.locator(), limit=1)
+    assert len(chain.header_requests) == service_mod.MAX_SYNC_PAGES
+    assert total == service_mod.MAX_SYNC_PAGES
+
+
+async def test_sync_for_same_peer_is_not_reentrant(service, monkeypatch):
+    chain = FakeChain(10)
+    chain.gate = trio.Event()
+    _wire(service, chain, monkeypatch)
+    results: Dict[str, int] = {}
+
+    async def first():
+        results["first"] = await service._sync_and_ingest_from_peer("peerA", chain.locator())
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(first)
+        await chain.entered.wait()
+        results["second"] = await service._sync_and_ingest_from_peer("peerA", chain.locator())
+        assert chain.header_requests == []
+        chain.gate.set()
+
+    assert results["second"] == 0
+    assert results["first"] == 10
+    assert not service._syncing_peers
+
+
+async def test_sync_guard_released_after_failure(service, monkeypatch):
+    chain = FakeChain(10)
+    _wire(service, chain, monkeypatch)
+
+    async def boom(*a, **k):
+        raise RuntimeError("dial failed")
+
+    service.host.new_stream = boom
+    assert await service._sync_and_ingest_from_peer("peerA", chain.locator()) == 0
+    assert not service._syncing_peers
