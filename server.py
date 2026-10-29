@@ -1,5 +1,6 @@
 import logging
 import os
+import signal
 import socket
 import ssl
 import sys
@@ -28,6 +29,9 @@ logger = logging.getLogger("tau.server")
 # --- NetworkService globals ---
 NETWORK_THREAD = None
 NETWORK_STOP_FLAG = threading.Event()
+# Set when the network thread dies after a successful start; main() turns it into a failing exit.
+_NETWORK_FATAL: "BaseException | None" = None
+_NETWORK_FATAL_EXIT_CODE = 70
 # --- Command Dispatch Table ---
 
 
@@ -291,6 +295,39 @@ class _NetworkStartup:
     def wait(self, timeout: float) -> bool:
         return self._done.wait(timeout)
 
+    @property
+    def succeeded(self) -> bool:
+        return self._done.is_set() and self.error is None
+
+
+def _deliver_sigint() -> None:
+    # A real signal interrupts the blocking accept() in the main thread; flag-polling cannot.
+    os.kill(os.getpid(), signal.SIGINT)
+
+
+def _hard_exit(code: int) -> None:
+    os._exit(code)
+
+
+def _arm_hard_exit_timer(grace: float) -> None:
+    timer = threading.Timer(grace, lambda: _hard_exit(_NETWORK_FATAL_EXIT_CODE))
+    timer.daemon = True
+    timer.start()
+
+
+def _on_network_thread_crash(exc: BaseException) -> None:
+    """Turn a dead network thread into a process exit instead of a node that mines but never gossips."""
+    global _NETWORK_FATAL
+    _NETWORK_FATAL = exc
+    logger.critical("NetworkService thread crashed; shutting the node down: %r", exc)
+    # Covers the miner stop plus both thread joins in the _run_server cleanup.
+    _arm_hard_exit_timer(2 * config.SHUTDOWN_TIMEOUT + 5.0)
+    try:
+        _deliver_sigint()
+    except OSError:
+        logger.critical("Could not signal the main thread; exiting immediately.", exc_info=True)
+        _hard_exit(_NETWORK_FATAL_EXIT_CODE)
+
 
 def _start_network_background(container: ServiceContainer) -> _NetworkStartup:
     """
@@ -334,7 +371,13 @@ def _start_network_background(container: ServiceContainer) -> _NetworkStartup:
                     await trio.sleep(0.25)
             finally:
                 await service.stop()
-        trio.run(main)
+        try:
+            trio.run(main)
+        except BaseException as exc:
+            if startup.succeeded and not NETWORK_STOP_FLAG.is_set():
+                _on_network_thread_crash(exc)
+            # Propagates so threading.excepthook prints the traceback to stderr even if the logger is silenced.
+            raise
 
     t = threading.Thread(target=_runner, name="NetworkServiceThread", daemon=True)
     t.start()
@@ -1070,6 +1113,10 @@ def main():
     try:
         _run_server(container)
     except KeyboardInterrupt:
+        if _NETWORK_FATAL is not None:
+            logger.critical("Exiting after NetworkService thread failure: %r", _NETWORK_FATAL)
+            tau_module.request_shutdown()
+            sys.exit(1)
         logger.info("KeyboardInterrupt received, shutting down server...")
         tau_module.request_shutdown()
     except ConfigurationError as exc:
