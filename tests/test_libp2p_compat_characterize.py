@@ -480,3 +480,140 @@ def test_dht_validator_shape_missing_attrs_raises():
             record_validator=lambda k, v: True,
             key_validator=lambda k: True,
         )
+
+
+# --------------------------------------------------------------------------
+# AutoConnector backoff shim
+# --------------------------------------------------------------------------
+
+
+def _make_connector(*, connections: int = 5, min_connections: int = 3):
+    from types import SimpleNamespace
+
+    from libp2p.network.auto_connector import AutoConnector
+
+    swarm = SimpleNamespace(
+        get_total_connections=lambda: connections,
+        connection_config=SimpleNamespace(min_connections=min_connections),
+    )
+    return AutoConnector(swarm)
+
+
+def _peer(name: bytes = b"backoff-shim-peer"):
+    from libp2p.peer.id import ID
+
+    return ID(name)
+
+
+@pytest.fixture
+def unshimmed_connector_class(monkeypatch):
+    """AutoConnector with the upstream `_get_cooldown`, restored on teardown."""
+    from libp2p.network.auto_connector import AutoConnector
+
+    from network.libp2p_compat import apply_auto_connector_backoff_shim
+
+    # Importing network.service already applied the shim; make sure the
+    # __wrapped__ lookup below is well defined regardless of import order.
+    apply_auto_connector_backoff_shim()
+    current = AutoConnector._get_cooldown
+    monkeypatch.setattr(AutoConnector, "_get_cooldown", getattr(current, "__wrapped__", current))
+    return AutoConnector
+
+
+def test_upstream_get_cooldown_overflows_on_huge_failure_count(unshimmed_connector_class):
+    """Documents the upstream bug the shim works around: 2 ** 1024 does not fit a float."""
+    connector = _make_connector()
+    peer = _peer()
+    connector._failure_counts[peer] = 1024
+    assert connector._get_cooldown(peer) == connector._max_cooldown
+    connector._failure_counts[peer] = 1025
+    with pytest.raises(OverflowError):
+        connector._get_cooldown(peer)
+
+
+def test_backoff_shim_applies_and_reports_true(unshimmed_connector_class):
+    from network.libp2p_compat import apply_auto_connector_backoff_shim
+
+    original = unshimmed_connector_class._get_cooldown
+    assert apply_auto_connector_backoff_shim() is True
+    assert unshimmed_connector_class._get_cooldown is not original
+    assert unshimmed_connector_class._get_cooldown.__wrapped__ is original
+
+
+def test_backoff_shim_applied_twice_wraps_once(unshimmed_connector_class):
+    from network.libp2p_compat import apply_auto_connector_backoff_shim
+
+    original = unshimmed_connector_class._get_cooldown
+    assert apply_auto_connector_backoff_shim() is True
+    first = unshimmed_connector_class._get_cooldown
+    assert apply_auto_connector_backoff_shim() is True
+    assert unshimmed_connector_class._get_cooldown is first
+    assert first.__wrapped__ is original
+
+
+def test_backoff_shim_is_noop_when_auto_connector_unavailable():
+    from network.libp2p_compat import apply_auto_connector_backoff_shim
+
+    with patch.dict(sys.modules, {"libp2p.network.auto_connector": None}):
+        assert apply_auto_connector_backoff_shim() is False
+
+
+def test_backoff_shim_handles_huge_failure_count(unshimmed_connector_class):
+    from network.libp2p_compat import apply_auto_connector_backoff_shim
+
+    apply_auto_connector_backoff_shim()
+    connector = _make_connector()
+    peer = _peer()
+    connector._failure_counts[peer] = 5000
+    assert connector._get_cooldown(peer) == 300.0
+
+
+def test_backoff_shim_caps_huge_count_at_sixty_seconds_below_min_connections(unshimmed_connector_class):
+    from network.libp2p_compat import apply_auto_connector_backoff_shim
+
+    apply_auto_connector_backoff_shim()
+    connector = _make_connector(connections=0, min_connections=3)
+    assert connector._below_min_connections() is True
+    peer = _peer()
+    connector._failure_counts[peer] = 5000
+    assert connector._get_cooldown(peer) == 60.0
+
+
+def test_backoff_shim_keeps_small_counts_unchanged(unshimmed_connector_class):
+    from network.libp2p_compat import apply_auto_connector_backoff_shim
+
+    apply_auto_connector_backoff_shim()
+    connector = _make_connector()
+    peer = _peer()
+    got = []
+    for n in (1, 2, 3, 4):
+        connector._failure_counts[peer] = n
+        got.append(connector._get_cooldown(peer))
+    assert got == [5.0, 15.0, 20.0, 40.0]
+    assert connector._failure_counts[peer] == 4
+
+
+def test_backoff_shim_clamps_stored_count_and_ignores_unknown_peers(unshimmed_connector_class):
+    from network.libp2p_compat import apply_auto_connector_backoff_shim
+
+    apply_auto_connector_backoff_shim()
+    connector = _make_connector()
+    known, unknown = _peer(), _peer(b"other-peer")
+    connector._failure_counts[known] = 5000
+    connector._get_cooldown(known)
+    assert connector._failure_counts[known] == 16
+    assert connector._get_cooldown(unknown) == 0.0
+    assert unknown not in connector._failure_counts
+
+
+def test_backoff_shim_should_skip_peer_survives_huge_failure_count(unshimmed_connector_class):
+    import time
+
+    from network.libp2p_compat import apply_auto_connector_backoff_shim
+
+    apply_auto_connector_backoff_shim()
+    connector = _make_connector()
+    peer = _peer()
+    connector._failure_counts[peer] = 5000
+    connector._last_connect_attempt[peer] = time.time()
+    assert connector._should_skip_peer(peer) is True

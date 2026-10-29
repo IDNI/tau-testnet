@@ -21,12 +21,13 @@ logger = logging.getLogger(__name__)
 
 MAX_HANDSHAKE_PROVIDERS = 50
 
-# Apply the libp2p 0.5.x QUIC cleanup-race shim at module load. The shim body
-# lives in `network/libp2p_compat.py`; this call site keeps the side effect
-# explicit (no module-load magic in compat). No-op on libp2p >= 0.6.0.
-from .libp2p_compat import apply_quic_cleanup_shim  # noqa: E402
+# Install the libp2p shims (QUIC cleanup race, AutoConnector backoff overflow) at
+# module load. Their bodies live in `network/libp2p_compat.py`; calling them here
+# keeps the side effect explicit (no module-load magic in compat).
+from .libp2p_compat import apply_auto_connector_backoff_shim, apply_quic_cleanup_shim  # noqa: E402
 
 apply_quic_cleanup_shim()
+apply_auto_connector_backoff_shim()
 
 # Transaction types a mempool snapshot will replay to a newly connected peer.
 _SNAPSHOT_TX_TYPES = frozenset({

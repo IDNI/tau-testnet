@@ -22,9 +22,11 @@ API surface lands incrementally per the unification plan
 - A6 — DHT validator wrap (install_validating_dht)
 - A7 — trio↔async bridge (run_trio_from_thread)
 - A9 — QUIC shim (apply_quic_cleanup_shim)
+- AutoConnector backoff shim (apply_auto_connector_backoff_shim)
 """
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -670,6 +672,55 @@ def apply_quic_cleanup_shim() -> bool:
     return True
 
 
+# --------------------------------------------------------------------------
+# AutoConnector backoff shim — bounds the per-peer failure counter that
+# upstream `AutoConnector._get_cooldown` feeds into `2 ** (n - 1)`.
+#
+# Like the QUIC shim, this is an explicit call from `network/service.py`.
+# --------------------------------------------------------------------------
+
+# Counts of 8 and above already saturate the 300 s maximum cooldown, so
+# clamping to this ceiling never changes a returned cooldown.
+_AUTO_CONNECTOR_FAILURE_CEILING = 16
+
+
+def apply_auto_connector_backoff_shim() -> bool:
+    """Clamp `AutoConnector._failure_counts[peer]` before `_get_cooldown` runs.
+
+    Source bug: the per-peer failure counter grows on every failed dial and is
+    never bounded, so past 1024 failures `2 ** (n - 1)` no longer converts to
+    float and `_get_cooldown` raises `OverflowError`. The periodic task catches
+    it, but the disconnect-triggered `maybe_connect` path does not, and the
+    exception ends the trio run that hosts the network service.
+    TODO: drop this shim when upstream bounds the backoff exponent.
+
+    Returns:
+        True if the shim is in place (including an earlier application).
+        False if the libp2p AutoConnector is unavailable (no-op).
+    """
+    try:
+        from libp2p.network.auto_connector import AutoConnector
+    except Exception:
+        logger.debug("libp2p AutoConnector unavailable; backoff shim is a no-op", exc_info=True)
+        return False
+
+    orig_get_cooldown = AutoConnector._get_cooldown
+    if getattr(orig_get_cooldown, "_tau_backoff_shim", False):
+        return True
+
+    @functools.wraps(orig_get_cooldown)
+    def _bounded_get_cooldown(self, peer_id):
+        counts = self._failure_counts
+        if counts.get(peer_id, 0) > _AUTO_CONNECTOR_FAILURE_CEILING:
+            counts[peer_id] = _AUTO_CONNECTOR_FAILURE_CEILING
+        return orig_get_cooldown(self, peer_id)
+
+    _bounded_get_cooldown._tau_backoff_shim = True
+    AutoConnector._get_cooldown = _bounded_get_cooldown
+    logger.info("Applied libp2p AutoConnector backoff shim")
+    return True
+
+
 __all__ = [
     # Identity (A2)
     "IDENTITY_SEED_SIZE",
@@ -699,4 +750,5 @@ __all__ = [
     "run_trio_from_thread",
     # QUIC shim (A9)
     "apply_quic_cleanup_shim",
+    "apply_auto_connector_backoff_shim",
 ]
