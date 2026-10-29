@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+from collections import OrderedDict
 import logging
 import sys
 import trio
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 MAX_HANDSHAKE_PROVIDERS = 50
 # Hard bound on header pages pulled in one sync call.
 MAX_SYNC_PAGES = 50
+# Bound on remembered peers that failed the genesis gate.
+MAX_GENESIS_REJECTED_PEERS = 1024
 
 # Apply the libp2p 0.5.x QUIC cleanup-race shim at module load. The shim body
 # lives in `network/libp2p_compat.py`; this call site keeps the side effect
@@ -84,6 +87,9 @@ class NetworkService:
         # duplicate handshakes/subscription spam when libp2p emits multiple
         # connected notifications for the same peer.
         self._connected_peer_ids: Set[str] = set()
+        # Peers whose handshake failed the genesis gate. Survives disconnects so a
+        # rejected peer that reconnects cannot trigger syncs through gossip.
+        self._genesis_rejected_peers: "OrderedDict[str, None]" = OrderedDict()
         self._syncing_peers: Set[str] = set()
 
     async def _on_host_event(self, event: str, conn: Any) -> None:
@@ -183,6 +189,16 @@ class NetworkService:
                 await trio.sleep(delay + random.uniform(0, 1))
                 delay = min(delay * 2, 15.0)
 
+    def _mark_genesis_rejected(self, peer_id: Any) -> None:
+        key = str(peer_id)
+        self._genesis_rejected_peers.pop(key, None)
+        self._genesis_rejected_peers[key] = None
+        while len(self._genesis_rejected_peers) > MAX_GENESIS_REJECTED_PEERS:
+            self._genesis_rejected_peers.popitem(last=False)
+
+    def _clear_genesis_rejected(self, peer_id: Any) -> None:
+        self._genesis_rejected_peers.pop(str(peer_id), None)
+
     async def _handshake_once(self, peer_id: Any) -> None:
         from .protocols import TAU_PROTOCOL_HANDSHAKE
         from .libp2p_compat import read_until_eof
@@ -217,11 +233,14 @@ class NetworkService:
                 local_gh = self._genesis_hash
                 if local_gh and str(peer_gh or "") != str(local_gh):
                     logger.warning("Disconnecting %s: incompatible genesis_hash %r", peer_id, peer_gh)
+                    self._mark_genesis_rejected(peer_id)
                     try:
                         await self.host.disconnect(peer_id)
                     except Exception:
                         pass
                     return
+
+                self._clear_genesis_rejected(peer_id)
 
                 # Persist basic peer metadata so later routing/sync has context.
                 try:
@@ -962,12 +981,17 @@ class NetworkService:
                     # the check. Only skipped while we ourselves have no genesis.
                     peer_gh = payload.get("genesis_hash")
                     local_gh = self._genesis_hash
+                    remote_pid = getattr(getattr(stream, "muxed_conn", None), "peer_id", None)
                     if local_gh and str(peer_gh or "") != str(local_gh):
                         logger.warning(
                             "Rejecting handshake from %s: incompatible genesis_hash %r",
                             getattr(stream.muxed_conn, "peer_id", "Unknown"), peer_gh,
                         )
+                        if remote_pid:
+                            self._mark_genesis_rejected(remote_pid)
                         return
+                    if remote_pid:
+                        self._clear_genesis_rejected(remote_pid)
 
                     remote_pubkey = payload.get("peer_pubkey", "")
                     if remote_pubkey:
@@ -1780,6 +1804,9 @@ class NetworkService:
         advancing, or MAX_SYNC_PAGES is reached. Returns number of newly ingested blocks.
         """
         peer_key = str(peer_id)
+        if peer_key in self._genesis_rejected_peers:
+            logger.debug("Skipping sync from %s: failed the genesis gate", peer_id)
+            return 0
         if peer_key in self._syncing_peers:
             logger.debug("Skipping sync from %s: one already in flight", peer_id)
             return 0

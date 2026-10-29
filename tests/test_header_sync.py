@@ -1,7 +1,8 @@
-"""Header-sync transport and policy: read-to-EOF, paging, in-flight guard."""
+"""Header-sync transport and policy: read-to-EOF, paging, in-flight guard, genesis denylist."""
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -254,3 +255,93 @@ async def test_sync_guard_released_after_failure(service, monkeypatch):
     service.host.new_stream = boom
     assert await service._sync_and_ingest_from_peer("peerA", chain.locator()) == 0
     assert not service._syncing_peers
+
+
+# --------------------------------------------------------------------------
+# Genesis denylist
+# --------------------------------------------------------------------------
+
+
+_HS_MODULES = {
+    "db": MagicMock(),
+    "multiaddr": MagicMock(),
+    "libp2p.peer.id": MagicMock(),
+    "libp2p.peer.peerinfo": MagicMock(),
+}
+
+
+def _wire_outbound(service, resp: Dict[str, Any]):
+    stream = ChunkedStream(json.dumps(resp).encode(), eof="raise")
+    stream.write = AsyncMock()
+    stream.close = AsyncMock()
+    service.host.new_stream = AsyncMock(return_value=stream)
+    service._build_handshake_payload = lambda: {"network_id": "test-net"}
+
+
+def _inbound_stream(payload: Dict[str, Any], peer: str):
+    stream = MagicMock()
+    stream.read = AsyncMock(return_value=json.dumps(payload).encode())
+    stream.write = AsyncMock()
+    stream.close = AsyncMock()
+    stream.muxed_conn.peer_id = peer
+    return stream
+
+
+async def test_outbound_genesis_mismatch_denylists_peer(service):
+    _wire_outbound(service, {"network_id": "test-net", "genesis_hash": "other"})
+    await service._handshake_once("peerA")
+    assert "peerA" in service._genesis_rejected_peers
+    service.host.disconnect.assert_awaited_once()
+
+
+async def test_inbound_genesis_mismatch_denylists_peer(service):
+    stream = _inbound_stream({"network_id": "test-net", "genesis_hash": ""}, "peerB")
+    with patch.dict(sys.modules, _HS_MODULES):
+        await service._handle_handshake(stream)
+    assert "peerB" in service._genesis_rejected_peers
+    stream.write.assert_not_called()
+
+
+async def test_passing_handshake_clears_denylist_both_directions(service):
+    service._mark_genesis_rejected("peerA")
+    service._mark_genesis_rejected("peerB")
+
+    _wire_outbound(service, {"network_id": "test-net", "genesis_hash": "genesis_local"})
+    await service._handshake_once("peerA")
+    assert "peerA" not in service._genesis_rejected_peers
+
+    stream = _inbound_stream({"network_id": "test-net", "genesis_hash": "genesis_local"}, "peerB")
+    with patch.dict(sys.modules, _HS_MODULES):
+        await service._handle_handshake(stream)
+    assert "peerB" not in service._genesis_rejected_peers
+
+
+async def test_denylisted_peer_gossip_opens_no_sync_stream(service, monkeypatch):
+    import db
+
+    monkeypatch.setattr(db, "get_block_by_hash", lambda h: None)
+    service._build_block_locator = lambda: ["genesis_local"]
+    service.host.new_stream = AsyncMock()
+    service._mark_genesis_rejected("peerA")
+
+    await service._handle_block_gossip(
+        {"via": "peerA", "payload": {"tip_hash": "a" * 64, "headers": []}}
+    )
+    service.host.new_stream.assert_not_called()
+
+
+async def test_denylist_survives_disconnect(service):
+    service._mark_genesis_rejected("peerA")
+    conn = MagicMock()
+    conn.muxed_conn.peer_id = "peerA"
+    await service._on_peer_disconnected(conn)
+    assert "peerA" in service._genesis_rejected_peers
+
+
+async def test_denylist_is_bounded_and_evicts_oldest(service):
+    cap = service_mod.MAX_GENESIS_REJECTED_PEERS
+    for i in range(cap + 5):
+        service._mark_genesis_rejected(f"p{i}")
+    assert len(service._genesis_rejected_peers) == cap
+    assert "p0" not in service._genesis_rejected_peers
+    assert f"p{cap + 4}" in service._genesis_rejected_peers
