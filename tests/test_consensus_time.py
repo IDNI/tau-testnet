@@ -11,6 +11,18 @@ from commands import sendtx, createblock
 from consensus.engine import TauConsensusEngine
 import chain_state, db, block, tau_defs
 
+
+def _native_available():
+    try:
+        import tau_native
+        tau_native.load_tau_module()
+        return True
+    except Exception:
+        return False
+
+
+_needs_native = unittest.skipUnless(_native_available(), "native tau module not built")
+
 class TestConsensusTime(unittest.TestCase):
     def setUp(self):
         self.test_db = "test_consensus_time_db.sqlite"
@@ -186,6 +198,7 @@ class TestConsensusTime(unittest.TestCase):
         self.assertIn(5, input_args)
         self.assertEqual(input_args[5], str(timestamp))
 
+    @_needs_native
     def test_complex_rule_temporary_spending_limit(self):
         """Test the 'Temporary Spending Limit' example from app.js."""
         import tempfile
@@ -237,6 +250,7 @@ class TestConsensusTime(unittest.TestCase):
         finally:
             os.remove(path)
 
+    @_needs_native
     def test_complex_rule_time_decaying_multisig(self):
         """Test the 'Time-Decaying Multi-Signature Vault' example from app.js."""
         import tempfile
