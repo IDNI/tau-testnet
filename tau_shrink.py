@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import db
 
@@ -520,37 +520,17 @@ def _classify(text: str, exclude_streams=frozenset()):
     return plan.shrunk, plan.lit_edits, _tokenize(text)
 
 
-def _plan(text: str, exclude_streams=frozenset()) -> _Plan:
-    toks = _tokenize(text)
+_VALUEISH = {"bvlit", "streamref", "num", "hexnum", "ident"}
+
+
+def _equality_edges(toks: list) -> list:
+    """(left_pos, right_pos, op_text) for each supported equality edge.
+
+    Both operands are single tokens directly adjacent to the operator, and each
+    is a COMPLETE operand. This rejects juxtaposition-AND (`= A B`) and a postfix
+    complement (`= A'`), which no operator scan can enumerate.
+    """
     n = len(toks)
-
-    refs: list = []
-    occurrences: dict = {}
-    unknown: set = set()
-    for pos, t in enumerate(toks):
-        if t.kind == "streamref":
-            ref = _ref_of(t, pos)
-            if ref is None:
-                # a streamref-shaped token we cannot parse: disqualify loudly
-                m = re.match(r"([io])(\d+)", t.text)
-                if m and m.group(1) == "i":
-                    unknown.add(int(m.group(2)))
-                continue
-            refs.append(ref)
-            if ref.io == "i":
-                occurrences.setdefault(ref.index, []).append(ref)
-        elif t.kind == "ident":
-            m = _BARE_STREAM_IDENT_RE.match(t.text)
-            if m and m.group(1) == "i":
-                unknown.add(int(m.group(2)))  # `i12` with no `[...]` -> not understood
-
-    # Supported equality edges: both operands are single tokens directly adjacent
-    # to the operator, and each is a COMPLETE operand -- nothing value-ish or
-    # disqualifying immediately outside it. This is what rejects juxtaposition-AND
-    # (`= A B`, where the right operand is really a compound) and a postfix
-    # complement (`= A'`), neither of which involves an operator the scanner could
-    # have enumerated.
-    _VALUEISH = {"bvlit", "streamref", "num", "hexnum", "ident"}
 
     def _operand_complete(pos: int, outward: int) -> bool:
         j = pos + outward
@@ -571,7 +551,77 @@ def _plan(text: str, exclude_streams=frozenset()) -> _Plan:
             if not _operand_complete(pos - 1, -1) or not _operand_complete(pos + 1, +1):
                 continue          # compound operand -> outside the supported fragment
             edges.append((pos - 1, pos + 1, t.text))
+    return edges
 
+
+def _bare_ref_widths(toks: list, edges: list) -> dict:
+    """Width of each unannotated stream reference.
+
+    The engine types a bare `i4[t]` from its context, so the planner must give
+    it a width too: the canonical width of the stream, else the one declared
+    width all its equality partners agree on. Anything else stays unknown.
+    """
+    partners: dict = {}
+    for lpos, rpos, _op in edges:
+        partners.setdefault(lpos, []).append(rpos)
+        partners.setdefault(rpos, []).append(lpos)
+    widths = {}
+    for pos, t in enumerate(toks):
+        if t.kind != "streamref":
+            continue
+        ref = _ref_of(t, pos)
+        if ref is None or ref.width >= 0:
+            continue
+        canonical = _canonical_width_for(ref.index) if ref.io == "i" else None
+        if canonical is not None:
+            widths[pos] = canonical
+            continue
+        found = set()
+        for other in partners.get(pos, ()):
+            ot = toks[other]
+            if ot.kind == "bvlit":
+                info = _lit_of(ot)
+                if info is not None:
+                    found.add(info["width"])
+            elif ot.kind == "streamref":
+                oref = _ref_of(ot, other)
+                if oref is not None and oref.width >= 0:
+                    found.add(oref.width)
+        if len(found) == 1:
+            widths[pos] = found.pop()
+    return widths
+
+
+def _plan(text: str, exclude_streams=frozenset()) -> _Plan:
+    toks = _tokenize(text)
+    edges = _equality_edges(toks)
+    bare_widths = _bare_ref_widths(toks, edges)
+
+    refs: list = []
+    occurrences: dict = {}
+    unknown: set = set()
+    for pos, t in enumerate(toks):
+        if t.kind == "streamref":
+            ref = _ref_of(t, pos)
+            if ref is not None and pos in bare_widths:
+                # The rewrite inserts the annotation right after the `]`.
+                at = t.start + _STREAMREF_RE.match(t.text).end()
+                ref = replace(ref, width=bare_widths[pos], ann_start=at, ann_end=at)
+            if ref is None:
+                # a streamref-shaped token we cannot parse: disqualify loudly
+                m = re.match(r"([io])(\d+)", t.text)
+                if m and m.group(1) == "i":
+                    unknown.add(int(m.group(2)))
+                continue
+            refs.append(ref)
+            if ref.io == "i":
+                occurrences.setdefault(ref.index, []).append(ref)
+        elif t.kind == "ident":
+            m = _BARE_STREAM_IDENT_RE.match(t.text)
+            if m and m.group(1) == "i":
+                unknown.add(int(m.group(2)))  # `i12` with no `[...]` -> not understood
+
+    ref_at = {r.pos: r for r in refs}
     edge_of: dict = {}
     for lpos, rpos, op in edges:
         edge_of.setdefault(lpos, []).append((rpos, op))
@@ -581,7 +631,7 @@ def _plan(text: str, exclude_streams=frozenset()) -> _Plan:
         """Declared canonical width of a single-token operand, or None."""
         t = toks[pos]
         if t.kind == "streamref":
-            ref = _ref_of(t, pos)
+            ref = ref_at.get(pos)
             return None if ref is None or ref.width < 0 else ref.width
         if t.kind == "bvlit":
             info = _lit_of(t)
@@ -604,7 +654,7 @@ def _plan(text: str, exclude_streams=frozenset()) -> _Plan:
     for sidx, occ in occurrences.items():
         widths = {r.width for r in occ}
         if -1 in widths or len(widths) != 1:
-            unresolved.add(sidx)          # unannotated or inconsistent -> never invent one
+            unresolved.add(sidx)          # no width source or inconsistent -> never invent one
     candidates = set()
     for sidx, occ in occurrences.items():
         if sidx in unresolved or sidx in exclude_streams:
@@ -683,11 +733,16 @@ def wide_input_streams(text: str) -> frozenset:
     """
     out = set()
     try:
-        for t in _tokenize(text or ""):
+        toks = _tokenize(text or "")
+        bare_widths = _bare_ref_widths(toks, _equality_edges(toks))
+        for pos, t in enumerate(toks):
             if t.kind != "streamref":
                 continue
-            ref = _ref_of(t, -1)
-            if ref is not None and ref.io == "i" and ref.width >= MIN_SHRINK_WIDTH:
+            ref = _ref_of(t, pos)
+            if ref is None or ref.io != "i":
+                continue
+            width = bare_widths.get(pos, ref.width)
+            if width >= MIN_SHRINK_WIDTH:
                 out.add(ref.index)
     except Exception:  # a scan must never break the eval path
         pass
@@ -843,8 +898,8 @@ def prepare_rule(full_width_text: str, exclude_streams=frozenset()) -> PreparedT
         if ref.io != "i" or ref.index not in plan.shrunk:
             continue
         if ref.ann_start < 0:
-            # unannotated occurrences never reach here (they are unresolved), but
-            # fail closed rather than synthesize a type.
+            # an occurrence with no width source never reaches here (it is
+            # unresolved), but fail closed rather than synthesize a type.
             logger.error("tau_shrink: unannotated occurrence of shrunk i%s", ref.index)
             return PreparedTauSpec(
                 canonical, canonical, False, frozenset(), wide_input_streams(canonical)
