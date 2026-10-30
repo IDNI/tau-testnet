@@ -128,7 +128,8 @@ tau-testnet approval decline <request_id> --key bot --reason "not this quarter"
 ```
 
 `transfer_vote` is **feeless** — it is absent from `FEE_BEARING_TX_TYPES` — so an
-approver bot needs no funded account and no fee strategy. It is bounded instead
+approver bot needs no funded account and no fee strategy. `approve` and
+`decline` therefore have no `--fee` flag. It is bounded instead
 by referencing an open request, being one of that request's declared approvers,
 and one vote per approver.
 

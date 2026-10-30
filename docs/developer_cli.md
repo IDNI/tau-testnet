@@ -374,6 +374,20 @@ envelope (any `error.code`, e.g. `INVALID_SIGNATURE`, `INVALID_SEQUENCE`,
 `TX_REJECTED`), `4` for bad amounts/empty operations/missing inputs, `3` on
 connection/timeout errors.
 
+### Fee limit
+
+`--fee <n>` sets `fee_limit`. Without `--fee`, a fee-bearing command (`tx send`,
+`rule offer|accept|reject`, `approval request`, `retractable send`) signs a
+draft with `fee_limit` 0, asks the node with `checktx estimate`, and signs the
+transaction again with the estimate as `fee_limit`. The estimate does not
+depend on the draft's `fee_limit`. When the node gives no estimate
+(`ESTIMATE_BUSY`, `ADMISSION_UNAVAILABLE`, or any rejection), the CLI stops
+before the final signature, prints the node error, and exits `1`. Give `--fee`
+in that case.
+
+The fee-exempt commands have no `--fee`: `approval approve`, `approval decline`,
+`retractable retract`, `gov propose` and `gov vote`. They sign `fee_limit` 0.
+
 ## Rule sharing
 
 Send a Tau rule to another user; they check its conflict status and then accept

@@ -260,11 +260,14 @@ tau-testnet blocks --limit 10
 tau-testnet mempool
 tau-testnet governance
 
-# send a transfer (default fee 10, expiry 600s)
+# send a transfer (expiry 600s). Without --fee the CLI signs a draft, asks the
+# node with `checktx estimate`, and signs again with the estimate as fee_limit.
+# This applies to every fee-bearing command (tx, rule, approval request,
+# retractable send). With no estimate the CLI stops and asks for --fee.
 tau-testnet tx send --key alice --to <recipient_pubkey> --amount 10
 tau-testnet tx send --key alice --transfer <pk1>:5 --transfer <pk2>:3 --fee 10
 
-# governance (sender must be an active validator; default fee 0)
+# governance (sender must be an active validator; fee-exempt, no --fee)
 tau-testnet gov propose --key alice --file consensus_update.json
 tau-testnet gov vote --key alice --update-id <update_id_hex>
 

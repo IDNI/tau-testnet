@@ -397,6 +397,37 @@ def cmd_keys_delete(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 
 
+FEE_HELP = (
+    "Fee limit (string-encoded integer). Default: the node's fee estimate "
+    "from 'checktx estimate'"
+)
+
+
+def _sign_with_fee(args: argparse.Namespace, payload: dict, sk_int) -> dict:
+    """Sign with --fee, or with the node's fee estimate when --fee is absent.
+
+    The estimate does not depend on fee_limit, so a draft signed with 0 gets
+    the fee of the final transaction. A command with no --fee keeps its 0.
+    """
+    fee = getattr(args, "fee", None)
+    if fee is None and hasattr(args, "fee"):
+        payload["fee_limit"] = "0"
+        tx_mod.sign_tx(payload, sk_int)
+        fee = tx_mod.estimate_fee(
+            payload, host=args.host, port=args.port, timeout=args.timeout
+        )
+    if fee is not None:
+        payload["fee_limit"] = str(fee)
+    return tx_mod.sign_tx(payload, sk_int)
+
+
+def _no_fee_estimate(exc: RuntimeError) -> int:
+    print_error(
+        f"the node gave no fee estimate ({exc}); give the fee limit with --fee"
+    )
+    return EXIT_APP_ERROR
+
+
 def cmd_tx_send(args: argparse.Namespace) -> int:
     try:
         sk_int, sender_pubkey = _resolve_signing_key(args)
@@ -428,15 +459,17 @@ def cmd_tx_send(args: argparse.Namespace) -> int:
         print_error(str(exc))
         return EXIT_APP_ERROR
 
-    payload = tx_mod.build_and_sign_user_tx(
-        private_key=sk_int,
+    payload = tx_mod.build_user_tx(
         sender_pubkey=sender_pubkey,
         sequence_number=sequence_number,
-        operations=operations,
+        expiration_time=int(_now()) + int(args.expiry),
         expire_at_height=_resolve_expire_at_height(args, tip=tip),
-        fee_limit=args.fee,
-        expiry_seconds=args.expiry,
+        operations=operations,
     )
+    try:
+        _sign_with_fee(args, payload, sk_int)
+    except RuntimeError as exc:
+        return _no_fee_estimate(exc)
 
     response = tx_mod.submit_tx(
         payload, host=args.host, port=args.port, timeout=args.timeout
@@ -570,7 +603,6 @@ def cmd_gov_propose(args: argparse.Namespace) -> int:
             rule_revisions=rule_revisions or [],
             activate_at_height=activate_at_height or 0,
             host_contract_patch=host_contract_patch,
-            fee_limit=args.fee,
         )
     except (ValueError, TypeError) as exc:
         print_error(str(exc))
@@ -616,7 +648,6 @@ def cmd_gov_vote(args: argparse.Namespace) -> int:
         expire_at_height=_resolve_expire_at_height(args, tip=tip),
         update_id=args.update_id,
         approve=True,
-        fee_limit=args.fee,
     )
     tx_mod.sign_tx(payload, sk_int)
     response = tx_mod.submit_tx(
@@ -689,7 +720,10 @@ def _submit_rule_tx(args: argparse.Namespace, build, *, pass_tip: bool = False) 
         print_error(str(exc))
         return EXIT_LOCAL
 
-    tx_mod.sign_tx(payload, sk_int)
+    try:
+        _sign_with_fee(args, payload, sk_int)
+    except RuntimeError as exc:
+        return _no_fee_estimate(exc)
     response = tx_mod.submit_tx(
         payload, host=args.host, port=args.port, timeout=args.timeout
     )
@@ -719,7 +753,6 @@ def cmd_rule_offer(args: argparse.Namespace) -> int:
             recipient_pubkey=args.to,
             rule_text=rule_text,
             expire_at_height=height,
-            fee_limit=args.fee,
         ),
     )
 
@@ -806,7 +839,6 @@ def cmd_rule_accept(args: argparse.Namespace) -> int:
             expire_at_height=height,
             offer_id=args.offer_id,
             rule_text=rule_text,
-            fee_limit=args.fee,
         ),
     )
 
@@ -820,7 +852,6 @@ def cmd_rule_reject(args: argparse.Namespace) -> int:
             expiration_time=int(_now()) + args.expiry,
             expire_at_height=height,
             offer_id=args.offer_id,
-            fee_limit=args.fee,
         ),
     )
 
@@ -1433,11 +1464,7 @@ def _add_tx_subparsers(sub) -> None:
         default=None,
         help="Path to a JSON file whose object overrides the operations dict",
     )
-    p_send.add_argument(
-        # Default matches the genesis consensus fee rule (o9); keep in sync
-        # with the network's active fee rule.
-        "--fee", default="10", help="Fee limit (string-encoded integer; default '10')"
-    )
+    p_send.add_argument("--fee", default=None, help=FEE_HELP)
     p_send.add_argument(
         "--expiry",
         type=int,
@@ -1648,7 +1675,6 @@ def cmd_approval_request(args: argparse.Namespace) -> int:
             expire_at_height=expire_at_height,
             approvers=approvers,
             custom_inputs=customs,
-            fee_limit=args.fee,
         )
 
     return _submit_rule_tx(args, _build)
@@ -1763,8 +1789,9 @@ def _add_approval_subparsers(sub) -> None:
         src.add_argument("--key", help="Logical name of a saved key")
         src.add_argument("--privkey", help="Private key (hex or decimal)")
 
-    def _tx_flags(parser):
-        parser.add_argument("--fee", default="0", help="Fee limit (default '0')")
+    def _tx_flags(parser, fee=True):
+        if fee:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
         parser.add_argument(
             "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
             help="Seconds until expiration_time (default: %(default)s)",
@@ -1812,7 +1839,8 @@ def _add_approval_subparsers(sub) -> None:
     _key_group(p_ok)
     p_ok.add_argument("request_id", help="Request id (64 hex)")
     p_ok.add_argument("--code", help="TOTP code -- goes to the BOT, never on chain")
-    _tx_flags(p_ok)
+    # Votes are fee-exempt: an approver needs no funds and no fee strategy.
+    _tx_flags(p_ok, fee=False)
     p_ok.set_defaults(func=lambda a: cmd_approval_vote(a, approve=True))
 
     p_no = asub.add_parser(
@@ -1822,7 +1850,7 @@ def _add_approval_subparsers(sub) -> None:
     _key_group(p_no)
     p_no.add_argument("request_id", help="Request id (64 hex)")
     p_no.add_argument("--reason", default="", help="Note for the sender (<=256 bytes)")
-    _tx_flags(p_no)
+    _tx_flags(p_no, fee=False)
     p_no.set_defaults(func=lambda a: cmd_approval_vote(a, approve=False))
 
     # --- reads ---
@@ -1912,7 +1940,6 @@ def cmd_retractable_send(args: argparse.Namespace) -> int:
             expire_at_height=expire_at_height,
             recipient_pubkey=args.to,
             amount=int(args.amount),
-            fee_limit=args.fee,
             **_release_point(args, tip, now),
         )
         try:
@@ -1993,8 +2020,9 @@ def _add_retractable_subparsers(sub) -> None:
         src.add_argument("--key", help="Logical name of a saved key")
         src.add_argument("--privkey", help="Private key (hex or decimal)")
 
-    def _tx_flags(parser):
-        parser.add_argument("--fee", default="0", help="Fee limit (default '0')")
+    def _tx_flags(parser, fee=True):
+        if fee:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
         parser.add_argument(
             "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
             help="Seconds until expiration_time (default: %(default)s)",
@@ -2029,7 +2057,8 @@ def _add_retractable_subparsers(sub) -> None:
     )
     _key_group(p_back)
     p_back.add_argument("retractable_id", help="Retractable id (64 hex)")
-    _tx_flags(p_back)
+    # A retract is fee-exempt, so a fee limit changes nothing.
+    _tx_flags(p_back, fee=False)
     p_back.set_defaults(func=cmd_retractable_retract)
 
     p_list = rsub.add_parser("list", parents=common,
@@ -2076,7 +2105,7 @@ def _add_rule_subparsers(sub) -> None:
         src.add_argument("--rule-file", help="File containing the Tau rule text")
 
     def _tx_flags(parser):
-        parser.add_argument("--fee", default="0", help="Fee limit (default '0')")
+        parser.add_argument("--fee", default=None, help=FEE_HELP)
         parser.add_argument(
             "--expiry",
             type=int,
@@ -2210,7 +2239,6 @@ def _add_gov_subparsers(sub) -> None:
         required=True,
         help="JSON file with rule_revisions / activate_at_height / host_contract_patch",
     )
-    p_propose.add_argument("--fee", default="0", help="Fee limit (default '0')")
     p_propose.add_argument(
         "--expiry",
         type=int,
@@ -2228,7 +2256,6 @@ def _add_gov_subparsers(sub) -> None:
     vsrc.add_argument("--key", help="Logical name of a saved key")
     vsrc.add_argument("--privkey", help="Private key (hex or decimal)")
     p_vote.add_argument("--update-id", required=True, help="Update id to vote on")
-    p_vote.add_argument("--fee", default="0", help="Fee limit (default '0')")
     p_vote.add_argument(
         "--expiry",
         type=int,
