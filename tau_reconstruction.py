@@ -130,19 +130,26 @@ def plan_representation(*, history_rules=(), candidate_rules=(), width=None):
     # is about to be anchored to.
     scratch = tau_allocator.Allocator(tau_allocator.DbMappingSnapshot(),
                                       width=width, label="planner")
-    for text in list(history_rules) + list(candidate_rules):
-        if not text or not str(text).strip():
-            continue
-        try:
-            with tau_shrink.speculative_allocation(allocator=scratch):
-                prepared = tau_shrink.prepare_rule(str(text))
-        except Exception:
-            # An unanalyzable rule cannot be shown to be shrinkable: everything it
-            # touches stays plain.
-            plain |= tau_shrink.wide_input_streams(str(text))
-            continue
-        interned |= set(prepared.shrunk_streams)
-        plain |= set(prepared.wide_streams_unshrunk)
+    texts = [str(t) for t in list(history_rules) + list(candidate_rules)
+             if t and str(t).strip()]
+    # A plain stream also makes its equality partners plain, in every rule, so
+    # repeat with the plain set excluded until it stops growing.
+    while True:
+        interned, grown = set(), set(plain)
+        for text in texts:
+            try:
+                with tau_shrink.speculative_allocation(allocator=scratch):
+                    prepared = tau_shrink.prepare_rule(text, exclude_streams=frozenset(plain))
+            except Exception:
+                # An unanalyzable rule cannot be shown to be shrinkable: everything it
+                # touches stays plain.
+                grown |= tau_shrink.wide_input_streams(text)
+                continue
+            interned |= set(prepared.shrunk_streams)
+            grown |= set(prepared.wide_streams_unshrunk)
+        if grown == plain:
+            break
+        plain = grown
     # A stream that must be plain anywhere is plain everywhere.
     interned -= plain
     return RepresentationPlan(width=width, interned=frozenset(interned),
