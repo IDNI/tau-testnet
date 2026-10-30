@@ -80,9 +80,8 @@ _PREAMBLE = r'''
 import json, os, sys, tempfile, time
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "false"
-# Deliberately no config/db import: with shrink off these cases exercise
-# TauInterface at the raw layer, which never reaches the intern table, so the
+# Deliberately no config/db import: these cases exercise TauInterface at the
+# raw layer, which never shrinks and never reaches the intern table, so the
 # child needs only the nanobind module on PYTHONPATH.
 import tau_native
 
@@ -386,8 +385,8 @@ def test_two_policy_authors_stay_isolated_and_the_build_cost_stays_bounded(tmp_p
     force. A composite that loses one author is the exact regression it exists to
     prevent, and it is what a second appended rule unit would cause.
 
-    COST is asserted loosely, and deliberately so. These children run with
-    `TAU_SHRINK_ENABLED=false`, which makes the build roughly SIX TIMES dearer
+    COST is asserted loosely, and deliberately so. These children run the raw
+    engine without shrink, which makes the build roughly SIX TIMES dearer
     than production: tau_shrink interns the bv[384] pubkey literals down to
     bv[8], and two authors measured 13-22s with shrink on versus ~122s with it
     off. So the production headroom against the 60s COMM_TIMEOUT cannot be

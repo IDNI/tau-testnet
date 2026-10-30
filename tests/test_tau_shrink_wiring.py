@@ -61,12 +61,7 @@ class FakeIface:
 
 @pytest.fixture()
 def direct_mode(temp_database, monkeypatch):
-    """Direct mode with a FakeIface, shrink explicitly ENABLED."""
-    import config
-    # Set it on the settings object too: set_database_path() re-runs
-    # _sync_legacy_exports, which would otherwise reset the module global.
-    monkeypatch.setattr(config.settings.tau, "shrink_enabled", True)
-    monkeypatch.setattr("config.TAU_SHRINK_ENABLED", True)
+    """Direct mode with a FakeIface."""
     # Pin the process shrink width (tiny table -> bv[8]) for deterministic asserts.
     import tau_shrink
     monkeypatch.setattr(tau_shrink, "_current_shrink_width", 8)
@@ -159,29 +154,21 @@ def test_db_error_during_stream_shrink_aborts(direct_mode, monkeypatch):
         )
 
 
-def test_shrink_disabled_passes_full_width(direct_mode, monkeypatch):
-    monkeypatch.setattr("config.TAU_SHRINK_ENABLED", False)
-    tau_manager.communicate_with_tau(rule_text=EQ_RULE, target_output_stream_index=0)
-    assert "bv[384]" in direct_mode.received_rules[-1]
-    assert tau_manager._runtime_shrunk_streams == frozenset()
-
-
 def test_application_rules_state_canonical_and_width_independent(temp_database, monkeypatch):
     """CONSENSUS CORE: the hashed application-rules state is canonical full-width
-    and byte-identical whether shrink is ON or OFF -- the interpreter gets the
-    shrunk form, but the state (and thus the consensus hash) never does."""
+    and byte-identical at every shrink width -- the interpreter gets the shrunk
+    form, but the state (and thus the consensus hash) never does."""
     import chain_state
-    import config
     import tau_shrink
 
-    monkeypatch.setattr(config.settings.tau, "shrink_enabled", True)
     monkeypatch.setattr(tau_manager, "tau_test_mode", False)
     tau_manager.tau_ready.set()
     tau_manager.set_rules_handler(chain_state.save_effective_tau_spec)
     try:
-        def _apply(enabled):
-            monkeypatch.setattr("config.TAU_SHRINK_ENABLED", enabled)
-            monkeypatch.setattr(tau_shrink, "_current_shrink_width", 8)
+        def _apply(width):
+            # Each width stands for a fresh process: no type commitments yet.
+            tau_manager.reset_evaluator_state()
+            monkeypatch.setattr(tau_shrink, "_current_shrink_width", width)
             chain_state._application_rules_state = ""
             chain_state._consensus_rules_state = ""
             iface = FakeIface()
@@ -192,14 +179,16 @@ def test_application_rules_state_canonical_and_width_independent(temp_database, 
             )
             return chain_state.get_application_rules_state(), iface
 
-        on_state, on_iface = _apply(True)
-        off_state, _ = _apply(False)
+        narrow_state, narrow_iface = _apply(8)
+        wide_state, wide_iface = _apply(16)
     finally:
         tau_manager.set_rules_handler(None)
+        tau_manager.reset_evaluator_state()
 
-    assert on_state == off_state                      # width-independent
-    assert f"#x{HEX96}" in on_state and "bv[384]" in on_state   # canonical full-width
-    assert "{ 1 }:bv[8]" in on_iface.received_rules[-1]  # interpreter got the shrunk form
+    assert narrow_state == wide_state                 # width-independent
+    assert f"#x{HEX96}" in narrow_state and "bv[384]" in narrow_state   # canonical full-width
+    assert "{ 1 }:bv[8]" in narrow_iface.received_rules[-1]  # interpreter got the shrunk form
+    assert "{ 1 }:bv[16]" in wide_iface.received_rules[-1]
 
 
 def test_restore_never_repicks_the_process_shrink_width(direct_mode, monkeypatch):

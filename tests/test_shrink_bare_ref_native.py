@@ -25,7 +25,6 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CHILD = r'''
 import os, sys
 os.environ["TAU_ENV"] = "test"; os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = os.environ["PROBE_SHRINK"]
 import config
 config.set_database_path(os.environ["PROBE_DB"])
 import db; db.init_db()
@@ -46,8 +45,7 @@ iface = tau_native.TauInterface(os.path.join(os.environ["REPO_ROOT"], "genesis.t
 tau_manager.tau_direct_interface = iface
 tau_manager.tau_test_mode = False
 tau_manager.tau_ready.set()
-if config.TAU_SHRINK_ENABLED:
-    tau_shrink.set_shrink_width_from_db()
+tau_shrink.set_shrink_width_from_db()
 
 
 def apply(label, text):
@@ -63,9 +61,6 @@ def apply(label, text):
 
 
 def addr(hex_digits):
-    # With shrink off, the engine takes the bare value, not the wrapped form.
-    if not config.TAU_SHRINK_ENABLED:
-        return "#x" + hex_digits
     return "{ #x" + hex_digits + " }:bv[384]"
 
 
@@ -90,10 +85,10 @@ sys.stdout.flush(); os._exit(0)
 '''
 
 
-def _run(tmp_path, clause, shrink):
+def _run(tmp_path, clause):
     script = tmp_path / "child_bare_ref.py"
     script.write_text(_CHILD)
-    env = dict(os.environ, PROBE_CLAUSE=clause, PROBE_SHRINK=shrink,
+    env = dict(os.environ, PROBE_CLAUSE=clause,
                PROBE_DB=str(tmp_path / "probe.db"), REPO_ROOT=REPO)
     env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
     out = subprocess.run(
@@ -105,9 +100,8 @@ def _run(tmp_path, clause, shrink):
     return out.returncode, lines
 
 
-@pytest.mark.parametrize("shrink", ["true", "false"])
-def test_bare_clause_is_admitted_and_judged_the_same(tmp_path, shrink):
-    rc, lines = _run(tmp_path, "bare", shrink)
+def test_bare_clause_is_admitted_and_judged_the_same(tmp_path):
+    rc, lines = _run(tmp_path, "bare")
     assert rc == 0, lines
     assert "PREFLIGHT bare: ADMIT" in lines
     assert any(line.startswith("APPLY bare: o0='F' outcome=ACCEPTED_CHANGED") for line in lines)
@@ -116,7 +110,7 @@ def test_bare_clause_is_admitted_and_judged_the_same(tmp_path, shrink):
 
 
 def test_a_plain_bare_ref_of_a_shrunk_stream_is_node_local(tmp_path):
-    rc, lines = _run(tmp_path, "paren", "true")
+    rc, lines = _run(tmp_path, "paren")
     assert rc == 0, lines
     preflight = next(line for line in lines if line.startswith("PREFLIGHT "))
     assert "ADMISSION_UNAVAILABLE" in preflight
