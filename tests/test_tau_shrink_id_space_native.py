@@ -55,7 +55,6 @@ _CHILD = r'''
 import json, os, sys, tempfile
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "true"
 os.environ["TAU_NO_WIDTH_REEXEC"] = "1"   # observe the overflow, never os.execv
 
 import config

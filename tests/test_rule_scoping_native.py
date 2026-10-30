@@ -82,9 +82,8 @@ _PREAMBLE = r'''
 import json, os, sys, tempfile
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "false"
-# Deliberately no config/db import: with shrink disabled these cases exercise
-# TauInterface at the raw layer, which never reaches the intern table. That
+# Deliberately no config/db import: these cases exercise TauInterface at the
+# raw layer, which never shrinks and never reaches the intern table. That
 # keeps the child runnable under a bare interpreter that only has the built
 # nanobind module on PYTHONPATH.
 import tau_native

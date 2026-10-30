@@ -83,8 +83,6 @@ _PREAMBLE = r'''
 import json, os, sys, tempfile
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-# Raw engine for the characterization; the apply child runs as a node does.
-os.environ["TAU_SHRINK_ENABLED"] = os.environ.get("CHILD_SHRINK", "false")
 
 SENTINEL = %(sentinel)r
 A = "aa" * 48
@@ -275,7 +273,7 @@ def _apply(tmp_path, rule, replay):
     return _run_child(
         tmp_path, "apply", _APPLY_BODY,
         {"HOSTILE_RULE": rule, "REPLAY_MODE": "1" if replay else "0",
-         "CHILD_SHRINK": "true", "AMOUNT": str(AMOUNT)},
+         "AMOUNT": str(AMOUNT)},
     )
 
 
