@@ -1361,7 +1361,7 @@ def validate_retractable_transfer_payload(
     if not isinstance(sender, str) or sender != park.sender_pubkey:
         return format_error("retractable_transfer sender_pubkey must match the signer.")
 
-    shape_error = validate_park_shape(park, tip_view.next_block_height, tip_view.tip_timestamp)
+    shape_error = validate_park_shape(park, tip_view.next_block_height, tip_view.next_block_timestamp)
     if shape_error:
         return format_error(f"retractable_transfer rejected: {shape_error}")
 
@@ -1433,7 +1433,7 @@ def validate_retract_transfer_payload(
     if int(row["release_kind"]) == KIND_HEIGHT:
         too_late = tip_view.next_block_height >= int(row["release_at"])
     else:
-        too_late = tip_view.tip_timestamp >= int(row["release_at"])
+        too_late = tip_view.next_block_timestamp >= int(row["release_at"])
     if too_late:
         return format_error(
             "Release point reached; too late to retract.", code="RETRACT_TOO_LATE"
