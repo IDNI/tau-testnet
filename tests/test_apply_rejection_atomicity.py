@@ -15,6 +15,7 @@ from py_ecc.bls import G2Basic
 
 import tau_defs
 from consensus.engine import TauConsensusEngine
+from consensus.governance import ConsensusLifecycleManager
 from consensus.state import TauStateSnapshot
 from consensus.tx_signing import signing_message_bytes
 
@@ -46,8 +47,14 @@ class _Approvals:
         return []
 
 
+class _LifecycleMock(MagicMock):
+    # Each transaction forks the lifecycle, so the double must fork for real.
+    fork = ConsensusLifecycleManager.fork
+    adopt = ConsensusLifecycleManager.adopt
+
+
 def _lifecycle():
-    mgr = MagicMock()
+    mgr = _LifecycleMock()
     mgr.approval_slots_active = True
     mgr.rule_offers = _Offers()
     mgr.approval_requests = _Approvals()

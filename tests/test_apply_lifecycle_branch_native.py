@@ -28,6 +28,7 @@ import tau_reconstruction as tr
 import tau_session as ts
 from consensus.approvals import ApprovalRequestEntry, ApprovalRequestLifecycleManager
 from consensus.engine import TauConsensusEngine
+from consensus.governance import ConsensusLifecycleManager
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.state import TauStateSnapshot
 
@@ -110,6 +111,9 @@ class _Lifecycle:
 
     def effective_eligibility_mode(self):
         return ""
+
+    fork = ConsensusLifecycleManager.fork
+    adopt = ConsensusLifecycleManager.adopt
 
 
 def _proposal(lifecycle):
