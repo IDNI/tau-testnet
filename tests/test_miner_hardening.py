@@ -71,9 +71,6 @@ class TestMinerHardening(unittest.TestCase):
         from consensus.governance import ConsensusLifecycleManager
         chain_state._lifecycle_manager = ConsensusLifecycleManager()
 
-        # Disable auto-faucet for strict balance testing
-        self.original_faucet = config.TESTNET_AUTO_FAUCET
-        config.TESTNET_AUTO_FAUCET = False
         
         # Pre-seed UserOverspend balance
         chain_state._balances["UserOverspend"] = 100
@@ -83,7 +80,6 @@ class TestMinerHardening(unittest.TestCase):
         config.MINER_PRIVKEY = "0" * 63 + "1"
 
     def tearDown(self):
-        config.TESTNET_AUTO_FAUCET = self.original_faucet
         config.MINER_PRIVKEY = self.original_miner_key
         
         if db._db_conn:

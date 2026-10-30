@@ -45,8 +45,6 @@ class _TauDeterminismBase(unittest.TestCase):
 
         self.sender = chain_state.GENESIS_ADDRESS
         chain_state._balances[self.sender] = 100000
-        self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
 
         # Live interpreter from the real genesis program
         tau_manager.tau_direct_interface = tau_native.TauInterface(GENESIS_TAU)
@@ -68,7 +66,6 @@ class _TauDeterminismBase(unittest.TestCase):
         patch.stopall()
         tau_manager.tau_ready.clear()
         tau_manager.tau_direct_interface = None
-        config.TESTNET_AUTO_FAUCET = self.original_faucet
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None

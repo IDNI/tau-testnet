@@ -15,7 +15,7 @@ from .governance import (
     normalize_validator_set,
     is_tau_authoritative_eligibility_mode,
 )
-from . import fees
+from . import faucet, fees
 from .fees import FeeRuleError
 from .approvals import (
     APPROVAL_TX_TYPES,
@@ -856,7 +856,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         )
 
         post_total = sum(int(v) for v in t_bals.values()) + _escrow_total(lm)
-        if post_total != parent_total and not getattr(config, "TESTNET_AUTO_FAUCET", False):
+        if post_total != parent_total and not faucet.amount(lm):
             raise BlockchainBug(
                 f"Supply not conserved applying block #{block.header.block_number}: "
                 f"parent_total={parent_total} post_total={post_total}"
@@ -1350,6 +1350,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # governs H+1 onward and never retroactively redirects H's own fees.
         # "" means credit the proposer.
         fee_beneficiary = getattr(lifecycle_mgr, "effective_fee_beneficiary", lambda: "")()
+        faucet_grant = faucet.amount(lifecycle_mgr)
 
         # i2 (sender balance) source for this block: the PARENT snapshot, frozen
         # for the whole block (issue #20). Shallow-copied because the caller's
@@ -1370,20 +1371,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         def _parent_bal(addr: Optional[str]) -> str:
             """i2 for `addr`, clamped to the width the rules declare for it.
 
-            Applies the same TESTNET_AUTO_FAUCET substitution the debit path uses
-            further down. Without it Tau would see 0 for a faucet-funded account
-            while the transfer succeeded against a synthetic 100000, so a
-            min-balance rule would reject a send that then went through. This does
-            make i2 depend on a per-node flag — but that flag already has to match
-            network-wide (it also exempts the supply-conservation invariant), and
-            being inconsistent *within* one node is the worse, silent failure.
+            Applies the same faucet substitution the debit path uses further
+            down, so a min-balance rule judges the balance the transfer spends.
             """
             try:
                 value = int(parent_bals.get(addr, 0)) if addr else 0
             except (TypeError, ValueError):
                 value = 0
-            if value == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                value = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+            if value == 0 and faucet_grant:
+                value = faucet_grant
             return str(max(0, min(value, tau_defs.MAX_TRANSFER_VALUE)))
 
         # i16: seconds since this sender's previous transfer, read from the
@@ -1893,8 +1889,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             return False
 
                     current_from = _read_bal(from_addr)
-                    if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                        current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+                    if current_from == 0 and faucet_grant:
+                        current_from = faucet_grant
                     if current_from < amount:
                         logger.error(
                             "Insufficient funds for %s to send %s. Has: %s.",
@@ -2792,8 +2788,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         else:
                                             current_from = _balance_of(from_addr)
 
-                                        if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                                            current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+                                        if current_from == 0 and faucet_grant:
+                                            current_from = faucet_grant
 
                                         if current_from < amount:
                                             logger.error("Insufficient funds for %s to send %s. Has: %s.", from_addr[:10], amount, current_from)
@@ -2928,8 +2924,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     # materializes the faucet balance before the fee, a rule
                     # alone never did.
                     sender_bal = _read_bal(sender) if sender else 0
-                    if sender and sender_bal == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                        sender_bal = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+                    if sender and sender_bal == 0 and faucet_grant:
+                        sender_bal = faucet_grant
                     if sender is None or sender_bal < total_fee:
                         if replay_mode:
                             logger.error(

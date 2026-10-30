@@ -81,9 +81,6 @@ class TestStateReconstruction(unittest.TestCase):
         self.addr2 = "893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2"
         self.addr3 = "aabbccddee1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678"
         
-        # Disable auto-faucet for these tests to ensure strict balance checks
-        self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
         
         from unittest.mock import patch
         self.verify_patch = patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
@@ -91,8 +88,6 @@ class TestStateReconstruction(unittest.TestCase):
     
     def tearDown(self):
         """Clean up the temporary database."""
-        # Restore auto-faucet setting
-        config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
         self.verify_patch.stop()
 
         # Ensure Tau process is stopped between tests

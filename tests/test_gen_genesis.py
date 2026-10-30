@@ -376,3 +376,68 @@ def test_malformed_fee_beneficiary_fails_loudly():
         result, _ = _run_gen_genesis(["--fee-beneficiary", "not-a-pubkey"], tmpdir)
         assert result.returncode != 0
         assert "fee-beneficiary" in (result.stderr + result.stdout)
+
+
+def test_faucet_amount_is_pinned_and_bound_into_the_state_hash():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result, path = _run_gen_genesis(["--faucet-amount", "100000"], tmpdir)
+        assert result.returncode == 0, f"gen_genesis failed: {result.stderr}"
+        with open(path) as f:
+            data = json.load(f)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _, path_default = _run_gen_genesis([], tmpdir)
+        with open(path_default) as f:
+            default_data = json.load(f)
+
+    assert data["consensus_meta"]["mechanism_specific_metadata"]["faucet_amount"] == 100000
+    # No faucet keeps the key out, so a genesis without it hashes as before.
+    assert "faucet_amount" not in default_data["consensus_meta"]["mechanism_specific_metadata"]
+    assert (data["block_0"]["header"]["state_hash"]
+            != default_data["block_0"]["header"]["state_hash"])
+
+
+def test_runtime_manager_reproduces_a_faucet_genesis():
+    from chain_state import compute_accounts_hash
+    from consensus.governance import ConsensusLifecycleManager, normalize_validator_set
+    from consensus.state import compute_consensus_state_hash
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result, path = _run_gen_genesis(["--faucet-amount", "100000"], tmpdir)
+        assert result.returncode == 0, f"gen_genesis failed: {result.stderr}"
+        with open(path) as f:
+            g = json.load(f)
+
+    def state_hash(faucet_amount):
+        mgr = ConsensusLifecycleManager()
+        mgr.active_validators = normalize_validator_set(g["consensus_meta"]["active_validators"])
+        mgr.quorum_policy = g["consensus_meta"]["mechanism_specific_metadata"]["vote_quorum"]
+        mgr.faucet_amount = faucet_amount
+        accts = g["accounts_state"]
+        return compute_consensus_state_hash(
+            g["consensus_rules"].encode("utf-8"), g["application_rules"].encode("utf-8"),
+            compute_accounts_hash(accts, {a: 0 for a in accts}), mgr.consensus_meta_hash(),
+        )
+
+    assert state_hash(100000) == g["block_0"]["header"]["state_hash"]
+    assert state_hash(0) != g["block_0"]["header"]["state_hash"]
+
+
+@pytest.mark.parametrize("value", ["-1", "16777216"])
+def test_out_of_range_faucet_amount_fails_loudly(value):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result, _ = _run_gen_genesis(["--faucet-amount", value], tmpdir)
+        assert result.returncode != 0
+        assert "faucet-amount" in (result.stderr + result.stdout)
+
+
+def test_load_genesis_takes_the_faucet_amount_from_the_genesis(temp_database, monkeypatch):
+    import chain_state
+    for name in ("_genesis_faucet_amount", "_lifecycle_manager"):
+        monkeypatch.setattr(chain_state, name, getattr(chain_state, name))
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result, path = _run_gen_genesis(["--faucet-amount", "250"], tmpdir)
+        assert result.returncode == 0, f"gen_genesis failed: {result.stderr}"
+        chain_state.load_genesis(path)
+    assert chain_state._lifecycle_manager.faucet_amount == 250
+    chain_state.load_state_from_db()
+    assert chain_state._lifecycle_manager.faucet_amount == 250

@@ -108,8 +108,6 @@ class ReorgRestoreTestCase(unittest.TestCase):
         chain_state._genesis_accounts_state = {GENESIS_ADDRESS: chain_state.GENESIS_BALANCE}
         chain_state._balances[GENESIS_ADDRESS] = chain_state.GENESIS_BALANCE
 
-        self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
         self.original_miner = config.MINER_PRIVKEY
         config.MINER_PRIVKEY = "11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09"
 
@@ -133,7 +131,6 @@ class ReorgRestoreTestCase(unittest.TestCase):
         for p in reversed(self.patches):
             p.stop()
         config.MINER_PRIVKEY = self.original_miner
-        config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
         config.set_database_path(self.original_db_path)
         if getattr(db, '_db_conn', None) is not None:
             db._db_conn.close()

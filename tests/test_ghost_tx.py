@@ -97,7 +97,6 @@ class TestGhostTxIntegration(unittest.TestCase):
         self.test_db = "test_ghost_integration.db"
         config.DB_PATH = self.test_db
         config.STRING_DB_PATH = self.test_db # Ensure db.py uses this
-        config.TESTNET_AUTO_FAUCET = True # Allow funding
         
         # Reset DB connection
         db._db_conn = None
