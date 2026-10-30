@@ -606,7 +606,7 @@ def test_a_release_that_skips_its_credit_breaks_conservation():
     oracle = Oracle(_balances())
     _parked(ch, oracle, at_height=HEIGHT + 2)
 
-    def lossy(lm, balances, height, timestamp):
+    def lossy(lm, balances, sequences, height, timestamp):
         lm.retractable_transfers.release_due(int(height), int(timestamp))
         return []
 

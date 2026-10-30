@@ -1660,11 +1660,12 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
                 commit_state_to_db(_canonical_head_hash, good_num)
         
 def get_balance(address_hex: str) -> int:
-    """Returns the balance of the given address. Returns 0 if address not found."""
-    with _balance_lock:
-        if address_hex not in _balances and faucet.amount(_lifecycle_manager):
-            return faucet.amount(_lifecycle_manager)
-        return _balances.get(address_hex, 0)
+    """The spendable balance: the stored balance, or the pending faucet grant
+    of an address with no account record."""
+    with _balance_lock, _sequence_lock:
+        return faucet.spendable(
+            _balances, _sequence_numbers, address_hex, faucet.amount(_lifecycle_manager)
+        )
 
 def get_committed_balance(address: str) -> int:
     """Raw committed balance lookup (no auto-faucet shim). Used for advisory
@@ -1683,18 +1684,18 @@ def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, a
         print(f"[WARN][chain_state] Attempted to update balance with non-positive amount: {amount}")
         return False # Should have been caught by Tau
 
-    with _balance_lock:
-        current_from_balance = _balances.get(from_address_hex, 0)
-
-        if from_address_hex not in _balances and faucet.amount(_lifecycle_manager):
-            current_from_balance = faucet.amount(_lifecycle_manager)
+    grant = faucet.amount(_lifecycle_manager)
+    with _balance_lock, _sequence_lock:
+        current_from_balance = faucet.spendable(
+            _balances, _sequence_numbers, from_address_hex, grant)
 
         # Enforce sufficient funds during balance updates to avoid negative balances
         if current_from_balance < amount:
             print(f"[ERROR][chain_state] Insufficient funds for {from_address_hex[:10]}... to send {amount}. Has: {current_from_balance}.")
             return False
 
-        current_to_balance = _balances.get(to_address_hex, 0)
+        current_to_balance = faucet.spendable(
+            _balances, _sequence_numbers, to_address_hex, grant)
         
         _balances[from_address_hex] = current_from_balance - amount
         _balances[to_address_hex] = current_to_balance + amount
@@ -1723,7 +1724,11 @@ def get_sequence_number(address_hex: str) -> int:
 
 def increment_sequence_number(address_hex: str):
     """Increments the sequence number for the given address."""
-    with _sequence_lock:
+    grant = faucet.amount(_lifecycle_manager)
+    with _balance_lock, _sequence_lock:
+        # A record made by the nonce alone still gets the grant.
+        if grant and not faucet.has_account(_balances, _sequence_numbers, address_hex):
+            _balances[address_hex] = grant
         _sequence_numbers[address_hex] = _sequence_numbers.get(address_hex, 0) + 1
 
 
