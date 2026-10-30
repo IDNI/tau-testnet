@@ -121,3 +121,57 @@ def test_a_plain_bare_ref_of_a_shrunk_stream_is_node_local(tmp_path):
     preflight = next(line for line in lines if line.startswith("PREFLIGHT "))
     assert "ADMISSION_UNAVAILABLE" in preflight
     assert any(line.startswith("APPLY paren: ShrinkTypeConflict") for line in lines)
+
+
+CUSTOM_KEY = "a1" * 48
+SHRINKS_I13 = ("always ( i13[t]:bv[384] = { #x" + CUSTOM_KEY + " }:bv[384]"
+               " -> o5[t]:bv[24] = { #x000001 }:bv[24] ).")
+
+
+def _worker_after_shrinking_i13(candidate):
+    import tau_reconstruction
+    import tau_session
+
+    with open(os.path.join(REPO, "genesis.tau")) as fh:
+        router = f"always ( {fh.read().strip()} )."
+    plan = tau_reconstruction.plan_representation(history_rules=[SHRINKS_I13],
+                                                  candidate_rules=[candidate])
+    assert 13 in plan.interned
+    env = dict(os.environ)
+    env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+    session = tau_session.WorkerSession.spawn(router, cwd=REPO, env=env, plan=plan)
+    session.apply_rule(SHRINKS_I13, record=False)
+    assert session.last_receipt()["accepted"]
+    return session
+
+
+def test_a_bare_ref_of_a_shrunk_custom_stream_gets_a_clear_error(temp_database):
+    import commands.sendtx as sendtx
+
+    candidate = ("always ( i13[t] = ({ #x" + CUSTOM_KEY + " }:bv[384])"
+                 " -> o6[t]:bv[24] = { #x000001 }:bv[24] ).")
+    session = _worker_after_shrinking_i13(candidate)
+    try:
+        session.apply_rule(candidate, record=False)
+        receipt = session.last_receipt()
+    finally:
+        session.dispose()
+    assert not receipt["accepted"]
+    assert receipt["outcome"] == "REJECTED_RULE"
+    refusal = sendtx._revision_refusal(receipt)
+    assert refusal["code"] == "TX_REJECTED"
+    assert "Write i13[t]:bv[384]" in refusal["message"]
+    assert "type inference produced no tree" not in refusal["message"]
+
+
+def test_the_error_never_turns_an_accepted_bare_ref_into_a_refusal(temp_database):
+    # The engine types this bare i13 from the shrunk width it already holds.
+    candidate = "always ( i13[t] = i14[t] -> o6[t]:bv[24] = { #x000001 }:bv[24] )."
+    session = _worker_after_shrinking_i13(candidate)
+    try:
+        session.apply_rule(candidate, record=False)
+        receipt = session.last_receipt()
+    finally:
+        session.dispose()
+    assert receipt["accepted"]
+    assert not (receipt.get("report") or {}).get("errors")
