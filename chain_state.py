@@ -1667,6 +1667,15 @@ def get_balance(address_hex: str) -> int:
             _balances, _sequence_numbers, address_hex, faucet.amount(_lifecycle_manager)
         )
 
+def get_balance_view(address_hex: str) -> tuple:
+    """(spendable balance, faucet_pending), read under one lock."""
+    with _balance_lock, _sequence_lock:
+        grant = faucet.amount(_lifecycle_manager)
+        return (
+            faucet.spendable(_balances, _sequence_numbers, address_hex, grant),
+            faucet.faucet_pending(_balances, _sequence_numbers, address_hex, grant),
+        )
+
 def get_committed_balance(address: str) -> int:
     """Raw committed balance lookup (no auto-faucet shim). Used for advisory
     eligibility dry-runs; consensus verification reads parent-snapshot balances

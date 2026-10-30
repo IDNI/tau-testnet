@@ -54,6 +54,11 @@ def spendable(balances, sequences, address, grant: int) -> int:
     return grant
 
 
+def faucet_pending(balances, sequences, address, grant: int) -> bool:
+    """Whether the next touch of `address` makes its record with the grant."""
+    return bool(grant) and not has_account(balances, sequences, address)
+
+
 def granted(parent_balances, parent_sequences, balances, sequences, grant: int) -> int:
     """The coins that the grants of one block add to the supply."""
     if not grant:

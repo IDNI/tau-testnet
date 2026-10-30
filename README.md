@@ -651,7 +651,7 @@ The libp2p DHT layer exposes runtime knobs through `NetworkConfig`:
 Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSocket emits it raw):
 
 ```json
-{"status":"ok","command":"getbalance","data":{"address":"a63b...ea73","balance":"1000"}}
+{"status":"ok","command":"getbalance","data":{"address":"a63b...ea73","balance":"1000","faucet_pending":false}}
 {"status":"error","command":"sendtx","error":{"code":"INVALID_SEQUENCE","message":"Invalid sequence number: expected 5, got 4.","details":{"expected":5,"received":4}}}
 ```
 
@@ -674,14 +674,19 @@ governance activation boundary. Tune the waits with `TAU_BLOCK_PRODUCTION_LOCK_T
 
 ### Pending-aware wallet queries
 
-`getbalance <address>` returns only the confirmed chain balance. For a wallet
-view that accounts for queued sends, use the additive commands (both read-only):
+`getbalance <address>` returns only the confirmed chain balance. `balance` is
+what the account can spend. For an account with no record on the chain yet, it
+includes the faucet grant of the genesis, and `faucet_pending` is `true`. The
+first transaction that touches the account writes the grant into the chain.
+For a wallet view that accounts for queued sends, use the additive commands
+(both read-only):
 
 - **`getaccountstate <address>`** — confirmed balance plus the mempool view:
 
   ```json
   {"status":"ok","command":"getaccountstate","data":{
-    "address":"a63b...ea73","chain_balance":"1000","pending_outgoing":"101",
+    "address":"a63b...ea73","chain_balance":"1000","faucet_pending":false,
+    "pending_outgoing":"101",
     "pending_incoming":"0","pending_fees":"2","available_balance":"897",
     "pending_txs":[{"hash":"…","direction":"outgoing","amount":"101","fee":"2",
                     "status":"queued","sequence_number":3,"tx_type":"user_tx",
