@@ -491,6 +491,14 @@ def _admission_timestamp() -> int:
     return int(time.time())
 
 
+class _TauFacts:
+    """What one request really ran, as opposed to what its mode allowed."""
+
+    def __init__(self):
+        self.tau_steps = 0
+        self.fee_estimated = False
+
+
 class _AdmissionTau:
     """Where ONE request's Tau steps run.
 
@@ -506,31 +514,46 @@ class _AdmissionTau:
     pays for a replay.
     """
 
-    def __init__(self, *, candidate_rules=()):
+    def __init__(self, *, candidate_rules=(), estimate=False, facts=None):
         import tau_admission
         self.isolated = tau_admission.enabled()
         self.budget = tau_admission.default_budget()
         self._candidates = tuple(c for c in candidate_rules if c)
+        self._estimate = estimate
         self._context = None
+        self.facts = facts if facts is not None else _TauFacts()
 
     def _ctx(self):
         if self._context is None:
             import tau_admission
             self._context = tau_admission.open_context(
                 candidate_rules=self._candidates, budget=self.budget,
-                label="admission",
+                label="estimate" if self._estimate else "admission",
+                estimate=self._estimate,
             )
         return self._context
 
     def revise(self, rule_text: str) -> dict:
-        return self._ctx().revise(rule_text)
+        receipt = self._ctx().revise(rule_text)
+        self.facts.tau_steps += 1
+        return receipt
 
     def step_multi(self, inputs: dict, *, source: str) -> dict:
         if not self.isolated:
-            return tau_manager.communicate_with_tau_multi(
+            outputs = tau_manager.communicate_with_tau_multi(
                 input_stream_values=inputs, source=source, apply_rules_update=False,
             )
-        return self._ctx().step(inputs)
+            self.facts.tau_steps += 1
+            return outputs
+        import tau_admission
+        try:
+            outputs = self._ctx().step(inputs)
+        except tau_admission.StepRefused:
+            # The engine evaluated the step and refused it: Tau did run.
+            self.facts.tau_steps += 1
+            raise
+        self.facts.tau_steps += 1
+        return outputs
 
     def close(self) -> None:
         context, self._context = self._context, None
@@ -802,7 +825,8 @@ def readmit_orphaned_transactions(txs: list) -> dict:
 
 
 def queue_transaction(json_blob: str, propagate: bool = True, *,
-                      dry_run: bool = False, skip_tau_eval: bool = False) -> dict:
+                      dry_run: bool = False, skip_tau_eval: bool = False,
+                      estimate: bool = False) -> dict:
     """Validate a transaction and (unless dry_run) queue it in the mempool.
 
     `dry_run` returns the verdict just before the two mutations
@@ -820,7 +844,32 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
     overflow re-exec the process. An unauthenticated, fee-free RPC must not
     reach them. The rule-compile step is unaffected: it already runs in a
     SIGKILL-able subprocess and is genuinely pure.
+
+    `estimate` is a dry run that does run steps 2/3/3b, in an isolated admission
+    context on the estimate slot (tau_admission.open_context). It answers with
+    the fee whatever fee_limit the draft carries, so the fee-limit check is off.
+    Without an isolated context it refuses: the in-process steps have the side
+    effects above.
+
+    A dry-run verdict, admitted or refused, also says what really ran:
+    `tau_evaluated` (a Tau step ran) and `fee_checked` (the fee of a
+    fee-bearing type was estimated).
     """
+    facts = _TauFacts()
+    verdict = _queue_transaction(
+        json_blob, propagate, dry_run=dry_run, skip_tau_eval=skip_tau_eval,
+        estimate=estimate, facts=facts,
+    )
+    if dry_run:
+        verdict["tau_evaluated"] = facts.tau_steps > 0
+        verdict["fee_checked"] = facts.fee_estimated
+    return verdict
+
+
+def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
+                       skip_tau_eval: bool, estimate: bool, facts: _TauFacts) -> dict:
+    if estimate and (not dry_run or skip_tau_eval):
+        raise ValueError("estimate is a dry run that evaluates Tau")
     blob = json_blob.strip()
     if len(blob) >= 2 and ((blob[0] == '"' and blob[-1] == '"') or (blob[0] == "'" and blob[-1] == "'")):
         blob = blob[1:-1]
@@ -1004,8 +1053,14 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
     except Exception as e:
         logger.exception("Could not derive the admission candidate: %s", e)
         return _qt_err("INTERNAL_ERROR", "An unexpected server error occurred.")
+    if estimate and not tau_admission.enabled():
+        return _qt_err(
+            "ADMISSION_UNAVAILABLE",
+            "This node has no isolated admission context, so it cannot estimate a fee.",
+        )
     admission_tau = _AdmissionTau(
-        candidate_rules=(admission_candidate,) if admission_candidate else ()
+        candidate_rules=(admission_candidate,) if admission_candidate else (),
+        estimate=estimate, facts=facts,
     )
 
     # Advisory block timestamp for i5 at admission (see _admission_timestamp).
@@ -1356,6 +1411,7 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                                 f"Consensus fee rule failure: {fee_exc}",
                             )
                     logger.info("All Tau transfer validations successful.")
+                    facts.fee_estimated = tx_type in FEE_BEARING_TX_TYPES
 
         # Step 3b: Fee estimate for any fee-bearing tx with no transfers, for
         # every type, as apply charges it. An approval_request is priced on its
@@ -1404,6 +1460,7 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                             "Send it as an ordinary transfer.",
                             request_id=admission_eval.data["request_id"],
                         )
+                facts.fee_estimated = True
             except FeeRuleError as fee_exc:
                 return _qt_err(
                     "FEE_RULE_ERROR",
@@ -1447,7 +1504,7 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
         # diverge only for fee rules that violate the documented
         # determinism constraint (i2/i3/i4 are mocked at apply time).
         if tx_type in FEE_BEARING_TX_TYPES:
-            if estimated_fee_total > fee_limit_int:
+            if estimated_fee_total > fee_limit_int and not estimate:
                 return _qt_err(
                     "FEE_LIMIT_TOO_LOW",
                     f"required estimated fee {estimated_fee_total}, fee_limit {fee_limit_int}",
@@ -1480,10 +1537,10 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                 "message": "Transaction would be admitted.",
                 "admissible": True,
                 "tx_type": tx_type,
-                "tau_evaluated": not skip_tau_eval,
             }
-            if not skip_tau_eval and tx_type in ("user_tx", TX_TYPE_RETRACTABLE_TRANSFER):
+            if facts.fee_estimated:
                 verdict["estimated_fee"] = str(estimated_fee_total)
+                verdict["fee_limit"] = str(fee_limit_int)
             update_id = admission_eval.data.get("update_id")
             if update_id:
                 verdict["update_id"] = update_id
@@ -1535,6 +1592,12 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
         # The engine refused this request's own inputs, against committed state:
         # the same refusal wherever they run.
         return _qt_err("TX_REJECTED", f"Transaction rejected by Tau. {e}")
+    except tau_admission.EstimateBusy as e:
+        logger.info("Fee estimate refused: %s", e)
+        return _qt_err(
+            "ESTIMATE_BUSY",
+            "Another fee estimate is running on this node; please retry.",
+        )
     except tau_admission.AdmissionTimeout as e:
         logger.warning("Admission evaluation timed out: %s", e)
         return _qt_err(
