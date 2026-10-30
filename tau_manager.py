@@ -227,10 +227,6 @@ def _preprocess_rule_for_tau(rule_text: str | None) -> str | None:
     return text
 
 
-def _shrink_exclude() -> frozenset:
-    return frozenset(getattr(config, "TAU_SHRINK_STREAM_EXCLUDE", frozenset()))
-
-
 def _assert_representation_compatible(prepared) -> None:
     """Refuse any representation this process cannot type.
 
@@ -269,7 +265,7 @@ def _prepare_rule_for_tau(rule_text: str | None) -> "tau_shrink.PreparedTauSpec 
     canonical = _preprocess_rule_for_tau(rule_text)
     if canonical is None:
         return None
-    prepared = tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
+    prepared = tau_shrink.prepare_rule(canonical)
     _assert_representation_compatible(prepared)
     return prepared
 
@@ -904,7 +900,7 @@ def restore_full_tau_spec(spec_text: str, *, runtime_shrunk_streams: "frozenset 
         # Do NOT re-pick the shrink width here: restores run mid-process while the
         # intern table grows, and the engine never re-types a stream it typed.
         # Widening is only safe via re-exec.
-        prepared = tau_shrink.prepare_rule(canonical, exclude_streams=_shrink_exclude())
+        prepared = tau_shrink.prepare_rule(canonical)
         # The restore path builds its own preparation, so it needs the same
         # gate: the engine's type commitments are process-global and survive
         # the interpreter rebuild this function performs.
