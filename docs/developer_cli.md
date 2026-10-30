@@ -64,7 +64,7 @@ Error codes emitted by the node, by origin:
 | Server dispatch (`server.py`) | `UNKNOWN_COMMAND`, `RATE_LIMITED`, `FORBIDDEN`, `TIMEOUT`, `INTERNAL_ERROR` |
 | Argument / payload parsing (every command) | `INVALID_PARAMS`, `PARSE_ERROR` |
 | `sendtx` / `checktx` structural | `TX_INVALID`, `TX_EXPIRED`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `BLS_UNAVAILABLE`, `TX_REJECTED` |
-| `sendtx` fees & capacity | `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `MEMPOOL_FULL` |
+| `sendtx` fees & capacity | `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `MEMPOOL_FULL`, `ESTIMATE_BUSY` (`checktx estimate` only) |
 | Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `CLAUSE_REGISTRY_FULL`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED` |
 | `createblock` | `MEMPOOL_EMPTY`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED` |
 | Governance / rule / approval reads | `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `REQUEST_UNKNOWN`, `FEATURE_INACTIVE`, `TAU_UNAVAILABLE`, `TAU_ERROR` |
@@ -148,7 +148,7 @@ The full registry (28 names, `app/container.py`):
 | Command | Grammar |
 |---|---|
 | `sendtx` | `sendtx <json_payload>` |
-| `checktx` | `checktx <json_payload>` — admission dry-run, no mempool write |
+| `checktx` | `checktx [estimate] <json_payload>` — admission dry-run, no mempool write. The plain form answers `admissible: null`, `fee_checked: false`; `estimate` also runs the Tau steps and answers `estimated_fee`, `fee_limit`, `admissible: true\|false`. `tau_evaluated` and `fee_checked` are true only when a Tau step ran and a fee was estimated; a fee-exempt type answers `fee_checked: false` and a `fee_exempt` note |
 | `createblock` | `createblock [allow-empty]` — **local-only**, see below |
 | `getmempool` | `getmempool` |
 | `gettimestamp` | `gettimestamp` |
