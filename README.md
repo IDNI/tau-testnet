@@ -199,7 +199,7 @@ tau-testnet --host localhost status      # node started via Docker (CLI installe
 
 > The Docker image ships only the node, not the `tau-testnet` CLI. To query a Docker node, install the client on the host with `pip install -e .` (no `tau-lang` build needed — the CLI is a thin RPC client), or just read the container's foreground logs.
 
-A rising `head_number` means you are syncing. If it stays at 0, the handshake was rejected — confirm `TAU_NETWORK_ID=tau-testnet-v2` and that `data/genesis.json` matches the committed profile (`block_0.hash` = `35faee3b…f1a7`). The node logs the exact reason for any mismatch.
+A rising `head_number` means you are syncing. If it stays at 0, the handshake was rejected — confirm `TAU_NETWORK_ID=tau-testnet-v2` and that `data/genesis.json` matches the committed profile (`block_0.hash` = `359fa1bd…0891`). The node logs the exact reason for any mismatch.
 
 ### Run as a validator
 
@@ -323,7 +323,7 @@ python scripts/gen_genesis.py \
 ```
 
 - Validator and account addresses are **96 lowercase hex chars** (48-byte BLS pubkeys, no `0x`). Private keys are 64 hex chars (32 bytes). Use `--validator-privkey` to derive the pubkey automatically.
-- **No auto-faucet** — unknown accounts have balance 0. Fund accounts at genesis with repeatable `--account ADDR:BALANCE`, or by transfer afterward.
+- **Faucet** — `--faucet-amount N` puts the faucet amount into the genesis. Each new account gets N one time, at the first applied transaction that touches it, as sender or as recipient. An account that spends down to 0 gets nothing more. The amount is fixed for the life of the network. No node setting and no vote changes it. The default 0 turns the faucet off. `tau-testnet-v2` uses 100000. You can also fund accounts at genesis with repeatable `--account ADDR:BALANCE`, or by transfer afterward.
 - Transfer amounts are `bv[24]` → capped at **16,777,215** per step; `--base-fee` likewise (0–16777215).
 - **Adding a validator after launch:** an existing validator proposes a `consensus_rule_update` with `host_contract_patch.validator_additions`; once it reaches the vote quorum (`supermajority` = ⌈2N/3⌉ by default, or `majority`) it activates. Removal works symmetrically.
 
