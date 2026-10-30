@@ -290,3 +290,26 @@ def test_a_restart_gives_the_same_balances(temp_database, monkeypatch):
 def test_granted_counts_each_new_record_once():
     assert faucet.granted({ALICE: 1}, {BOB: 2}, {ALICE: 1, CAROL: 5}, {BOB: 3, CAROL: 1}, 10) == 10
     assert faucet.granted({ALICE: 1}, {}, {ALICE: 1, CAROL: 5}, {}, 0) == 0
+
+
+def test_admission_judges_the_same_spendable_balance(temp_database, monkeypatch):
+    """A new sender is funded by its pending grant; a recorded 0 is not."""
+    import importlib
+    import json
+    from commands import checktx, sendtx
+    import test_checktx as tc
+    importlib.reload(sendtx)
+    monkeypatch.setattr(chain_state, "_balances", {})
+    monkeypatch.setattr(chain_state, "_sequence_numbers", {})
+    chain_state.load_genesis("data/genesis.json")
+    monkeypatch.setattr(chain_state._lifecycle_manager, "faucet_amount", GRANT)
+    monkeypatch.setattr(sendtx, "_validate_bls12_381_pubkey", lambda *_: (True, None))
+    monkeypatch.setattr(sendtx.tau_manager, "communicate_with_tau_multi", tc._mock_tau_multi_ok)
+    case = tc.TestChecktx()
+    chain_state._balances.pop(tc.SENDER, None)
+    chain_state._sequence_numbers.pop(tc.SENDER, None)
+    fresh = json.loads(checktx.execute(f"checktx {json.dumps(case._tx())}", None))
+    chain_state._balances[tc.SENDER] = 0
+    zero = json.loads(checktx.execute(f"checktx {json.dumps(case._tx())}", None))
+    assert fresh["status"] == "ok" and fresh["data"]["admissible"] is True, fresh
+    assert zero["status"] != "ok", zero
