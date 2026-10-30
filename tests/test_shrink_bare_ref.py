@@ -92,3 +92,37 @@ def test_a_plain_stream_makes_its_equality_partners_plain(temp_database):
     assert not ({3, 4} & set(plan.interned))
     plan = tau_reconstruction.plan_representation(history_rules=[rule02])
     assert plan.interned == frozenset({3, 4})
+
+
+def test_untyped_streams_are_the_bare_refs_with_no_width_source():
+    assert ts.untyped_input_streams(_rule(f"i13[t] = ({{ #x{HEX96} }}:bv[384])")) == {13}
+    assert ts.untyped_input_streams(_rule("i13[t] = i14[t]")) == {13, 14}
+    assert ts.untyped_input_streams(_rule(f"i13[t] = {{ #x{HEX96} }}:bv[384]")) == frozenset()
+    assert ts.untyped_input_streams(_rule(f"i13[t]:bv[384] = ({{ #x{HEX96} }}:bv[384])")) == frozenset()
+    assert ts.untyped_input_streams(_rule(f"i4[t] = ({{ #x{HEX96} }}:bv[384])")) == frozenset()
+
+
+def test_the_untyped_shrunk_stream_error_names_the_annotated_form():
+    message = ts.untyped_shrunk_stream_error({13})
+    assert "i13 without a width" in message
+    assert "Write i13[t]:bv[384]" in message
+
+
+def test_the_clear_error_does_not_parse_engine_diagnostics(temp_database):
+    """The engine may refuse with no stable log line naming the stream."""
+    from unittest.mock import MagicMock
+
+    import tau_reconstruction
+    import tau_session
+
+    shrinks = _rule(f"i13[t]:bv[384] = {{ #x{HEX96} }}:bv[384]")
+    candidate = _rule(f"i13[t] = ({{ #x{HEX96} }}:bv[384])")
+    plan = tau_reconstruction.plan_representation(history_rules=[shrinks],
+                                                  candidate_rules=[candidate])
+    session = tau_session.WorkerSession(MagicMock())
+    session.plan = plan
+    receipt = {"outcome": "REJECTED_RULE", "accepted": False,
+               "diagnostics": "(Error) type inference produced no tree",
+               "report": {}}
+    session._explain_untyped_shrunk(candidate, receipt)
+    assert receipt["report"]["errors"][0].startswith("The rule references i13")

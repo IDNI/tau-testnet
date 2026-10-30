@@ -749,6 +749,39 @@ def wide_input_streams(text: str) -> frozenset:
     return frozenset(out)
 
 
+def untyped_input_streams(text: str) -> frozenset:
+    """Input streams with a bare reference that has no width source.
+
+    The engine infers the width of such a reference from its context, so it
+    cannot follow a stream that another rule made shrunk.
+    """
+    out = set()
+    try:
+        toks = _tokenize(text or "")
+        bare_widths = _bare_ref_widths(toks, _equality_edges(toks))
+        for pos, t in enumerate(toks):
+            if t.kind != "streamref" or pos in bare_widths:
+                continue
+            ref = _ref_of(t, pos)
+            if ref is not None and ref.io == "i" and ref.width < 0:
+                out.add(ref.index)
+    except Exception:  # a scan must never break the eval path
+        pass
+    return frozenset(out)
+
+
+def untyped_shrunk_stream_error(streams) -> str:
+    """The author-facing reason for a rule the engine refused because a bare
+    reference met a stream this node runs shrunk."""
+    names = ", ".join(f"i{i}" for i in sorted(streams))
+    forms = ", ".join(f"i{i}[t]:bv[384]" for i in sorted(streams))
+    return (
+        f"The rule references {names} without a width, and another rule makes "
+        f"this node run {names} shrunk, so the engine cannot infer the width. "
+        f"Write {forms} (or the width of the stream values) at every reference."
+    )
+
+
 # --- Rewrite ------------------------------------------------------------------
 
 def _shrunk_streamref_text(tok: _Tok, width: int) -> str:
