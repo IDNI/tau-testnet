@@ -261,6 +261,28 @@ def _approval_slot_feed(tip_view) -> tuple:
     return tau_defs.approval_slot_indices()
 
 
+def _parked_transfer_inputs(sender_pubkey: str, request: dict, tip_view,
+                            admission_ts: int) -> dict:
+    """Tau inputs of the step that prices an approval_request.
+
+    Apply prices a parked transfer with its real transfer inputs, so admission
+    feeds the same keys in the same order as the per-transfer step.
+    """
+    values = {
+        1: str(request["amount"]),
+        2: _admission_i2(sender_pubkey),
+        3: "{ #x" + sender_pubkey + " }:bv[384]",
+        4: "{ #x" + request["recipient_pubkey"] + " }:bv[384]",
+        12: "{ #x" + sender_pubkey + " }:bv[384]",
+    }
+    for k, v in (request.get("custom_inputs") or {}).items():
+        values[int(k)] = str(v)
+    for slot in _approval_slot_feed(tip_view):
+        values[slot] = "0"
+    values[5] = str(admission_ts)
+    return values
+
+
 def _get_signing_message_bytes(payload: dict) -> bytes:
     """Canonical signing preimage. Kept as a module-level name because wallets,
     the CLI and a dozen tests import it from here; the implementation is
@@ -986,6 +1008,10 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
         candidate_rules=(admission_candidate,) if admission_candidate else ()
     )
 
+    # Advisory block timestamp for i5 at admission (see _admission_timestamp).
+    # Read once: every step of one request is judged at the same moment.
+    admission_ts = _admission_timestamp()
+
     try:
         if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RULE_OFFER_ACCEPT):
             # Compile the COMPOSED rule, not the offered clause on its own.
@@ -1177,11 +1203,6 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                             if preflight_err is not None:
                                 return preflight_err
 
-            # Advisory block timestamp for i5 at admission (see
-            # _admission_timestamp). Read once: every step of one request is
-            # judged at the same moment.
-            admission_ts = _admission_timestamp()
-
             # Step 2: Custom Input Validation (transfer-less user_tx only).
             # For txs WITH transfers the custom streams are merged into the
             # per-transfer step below (mirrors apply, where the custom-only
@@ -1336,19 +1357,22 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                             )
                     logger.info("All Tau transfer validations successful.")
 
-            # Step 3b: Fee estimate for any fee-bearing tx with no transfers —
-            # one fee-query step with the canonical mocked transfer inputs
-            # (mirrors the engine's apply-time convention). Covers the
-            # rule-sharing types, which are user-initiated and expensive and so
-            # pay like a user_tx, unlike the fee-exempt governance types.
-            if (
-                tx_type in FEE_BEARING_TX_TYPES
-                and not all_validated_transfers
-                and not tau_force_test
-                and not skip_tau_eval
-                and (admission_tau.isolated or tau_manager.tau_ready.is_set())
-            ):
-                try:
+        # Step 3b: Fee estimate for any fee-bearing tx with no transfers, for
+        # every type, as apply charges it. An approval_request is priced on its
+        # parked transfer. The rest get the canonical mocked fee-query step.
+        if (
+            tx_type in FEE_BEARING_TX_TYPES
+            and not all_validated_transfers
+            and not tau_force_test
+            and not skip_tau_eval
+            and (admission_tau.isolated or tau_manager.tau_ready.is_set())
+        ):
+            try:
+                if tx_type == TX_TYPE_APPROVAL_REQUEST:
+                    fee_query_inputs = _parked_transfer_inputs(
+                        sender_pubkey, admission_eval.data, tip_view, admission_ts,
+                    )
+                else:
                     # i2 is the sender's head balance here too, matching the
                     # engine's transfer-less fee-query step (issue #20).
                     fee_query_inputs = {1: "0", 2: _admission_i2(sender_pubkey),
@@ -1359,31 +1383,42 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                     # fee-query overlay order in consensus/engine.py.
                     for k, v in custom_tau_inputs.items():
                         fee_query_inputs[k] = v
-                    fee_outputs = admission_tau.step_multi(
-                        fee_query_inputs, source=sender_pubkey,
-                    )
-                    estimated_fee_total += fees.parse_consensus_fee(
-                        fee_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
-                        context="queue fee-query",
-                    ) + fees.parse_custom_fee(
-                        fee_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
-                        context="queue fee-query",
-                    )
-                except FeeRuleError as fee_exc:
-                    return _qt_err(
-                        "FEE_RULE_ERROR",
-                        f"Consensus fee rule failure: {fee_exc}",
-                    )
-                except Exception:
-                    if admission_tau.isolated:
-                        # A context that could not answer is not an estimate of
-                        # zero: admitting on it would quote a fee the block then
-                        # charges differently. Reported by the handlers below.
-                        raise
-                    logger.warning(
-                        "Fee-query estimation failed; estimate stays %s (engine is authoritative).",
-                        estimated_fee_total, exc_info=True,
-                    )
+                fee_outputs = admission_tau.step_multi(
+                    fee_query_inputs, source=sender_pubkey,
+                )
+                estimated_fee_total += fees.parse_consensus_fee(
+                    fee_outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
+                    context="queue fee-query",
+                ) + fees.parse_custom_fee(
+                    fee_outputs.get(tau_defs.CUSTOM_FEE_STREAM_INDEX),
+                    context="queue fee-query",
+                )
+                if tx_type == TX_TYPE_APPROVAL_REQUEST:
+                    from commands.getapprovalpreview import _o5_allows
+
+                    # Apply drops a request whose transfer the policy already allows.
+                    if _o5_allows(fee_outputs):
+                        return _qt_err(
+                            "APPROVAL_NOT_NEEDED",
+                            "The sender's policy allows this transfer with no votes. "
+                            "Send it as an ordinary transfer.",
+                            request_id=admission_eval.data["request_id"],
+                        )
+            except FeeRuleError as fee_exc:
+                return _qt_err(
+                    "FEE_RULE_ERROR",
+                    f"Consensus fee rule failure: {fee_exc}",
+                )
+            except Exception:
+                if admission_tau.isolated:
+                    # A context that could not answer is not an estimate of
+                    # zero: admitting on it would quote a fee the block then
+                    # charges differently. Reported by the handlers below.
+                    raise
+                logger.warning(
+                    "Fee-query estimation failed; estimate stays %s (engine is authoritative).",
+                    estimated_fee_total, exc_info=True,
+                )
 
         # Evaluation is over; the context goes before anything is queued.
         admission_tau.close()
