@@ -13,6 +13,7 @@ import config
 import tau_native
 from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
 from consensus.lanes import TAU_EVALUATING_TX_TYPES
+from consensus import faucet
 from consensus.fees import FeeRuleError
 from errors import DatabaseError
 from block import Block
@@ -492,6 +493,7 @@ _genesis_active_validators: list = []
 _genesis_vote_quorum: str = ""
 _genesis_eligibility_mode: str = ""
 _genesis_fee_beneficiary: str = ""
+_genesis_faucet_amount: int = 0
 # Genesis rule text, re-seeded on full rebuild so the replayed state hash
 # matches the mined chain (the reorg path replays only the new suffix, not
 # the genesis block, so its rules would otherwise be lost).
@@ -1153,6 +1155,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             _lifecycle_manager.quorum_policy = _genesis_vote_quorum
             _lifecycle_manager.eligibility_mode = _genesis_eligibility_mode
             _lifecycle_manager.fee_beneficiary = _genesis_fee_beneficiary
+            _lifecycle_manager.faucet_amount = _genesis_faucet_amount
             _lifecycle_manager.recompute_approval_threshold()
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
@@ -1494,7 +1497,7 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     # Remember the artifact's pre-funded accounts for rebuild/reorg seeding,
     # regardless of whether the DB is fresh or already provisioned.
     global _genesis_accounts_state, _genesis_active_validators, _genesis_vote_quorum
-    global _genesis_eligibility_mode, _genesis_fee_beneficiary
+    global _genesis_eligibility_mode, _genesis_fee_beneficiary, _genesis_faucet_amount
     global _genesis_application_rules, _genesis_consensus_rules
     _genesis_accounts_state = {
         k: int(v) for k, v in genesis_data.get("accounts_state", {}).items()
@@ -1504,6 +1507,13 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     _genesis_vote_quorum = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("vote_quorum", "")
     _genesis_eligibility_mode = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("eligibility_mode", "")
     _genesis_fee_beneficiary = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("fee_beneficiary", "")
+    from consensus.faucet import DEFAULT_FAUCET_AMOUNT, validate_faucet_amount
+    _faucet = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get(
+        "faucet_amount", DEFAULT_FAUCET_AMOUNT)
+    _faucet_err = validate_faucet_amount(_faucet)
+    if _faucet_err:
+        raise ValueError(f"FATAL: genesis faucet_amount {_faucet_err}: {_faucet!r}")
+    _genesis_faucet_amount = _faucet
     _genesis_application_rules = genesis_data.get("application_rules", "")
     _genesis_consensus_rules = genesis_data.get("consensus_rules", "")
 
@@ -1552,6 +1562,7 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
             _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
             _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
             _lifecycle_manager.fee_beneficiary = meta.get("mechanism_specific_metadata", {}).get("fee_beneficiary", "")
+            _lifecycle_manager.faucet_amount = _genesis_faucet_amount
             # A fresh chain may ship with co-signature approval slots already
             # reserved (scripts/gen_genesis.py --approval-slots). One-way, so
             # this only ever turns it on.
@@ -1651,8 +1662,8 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
 def get_balance(address_hex: str) -> int:
     """Returns the balance of the given address. Returns 0 if address not found."""
     with _balance_lock:
-        if address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-            return int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+        if address_hex not in _balances and faucet.amount(_lifecycle_manager):
+            return faucet.amount(_lifecycle_manager)
         return _balances.get(address_hex, 0)
 
 def get_committed_balance(address: str) -> int:
@@ -1675,8 +1686,8 @@ def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, a
     with _balance_lock:
         current_from_balance = _balances.get(from_address_hex, 0)
 
-        if from_address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-            current_from_balance = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+        if from_address_hex not in _balances and faucet.amount(_lifecycle_manager):
+            current_from_balance = faucet.amount(_lifecycle_manager)
 
         # Enforce sufficient funds during balance updates to avoid negative balances
         if current_from_balance < amount:
@@ -2299,6 +2310,8 @@ def load_state_from_db() -> bool:
         _lifecycle_manager.fee_beneficiary = (
             _genesis_fee_beneficiary if persisted_beneficiary == _MISSING else persisted_beneficiary
         )
+        # Never persisted: the genesis is the only source, on every load.
+        _lifecycle_manager.faucet_amount = _genesis_faucet_amount
         persisted_budget = db.get_chain_state_value("max_rule_txs_per_block", _MISSING)
         if persisted_budget != _MISSING:
             try:

@@ -105,11 +105,6 @@ class EngineFeeBase(unittest.TestCase):
         self.mock_comm = self.comm_patcher.start()
         self.addCleanup(self.comm_patcher.stop)
 
-        # Fee settlement reads plain balances; the faucet shim would mask
-        # insufficiency cases.
-        self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
-        self.addCleanup(lambda: setattr(config, "TESTNET_AUTO_FAUCET", self.original_faucet))
 
         mock_store = MagicMock()
         mock_store.commit.side_effect = lambda snap: snap
@@ -307,13 +302,12 @@ class TestEngineFeeCharging(EngineFeeBase):
         rule-only tx from it is queued. Proposal-mode apply (the production
         path) reads plain target_balances, and refused the same tx as
         insufficient_funds_for_fee: "need 10, have 0"."""
-        config.TESTNET_AUTO_FAUCET = True
-        amount = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+        amount = 100000
         session = MagicMock(is_speculative=True)
         session.ready.return_value = True
         session.evaluate.return_value = {9: "10"}
         proposal = MagicMock(session=session, label="test")
-        proposal.lifecycle = MagicMock(approval_slots_active=False)
+        proposal.lifecycle = MagicMock(approval_slots_active=False, faucet_amount=amount)
         balances = {}
         tx = sign_tx({
             "tx_id": "tx_fresh",
@@ -697,9 +691,6 @@ class TestApplyBlockFeeE2E(unittest.TestCase):
         self.comm_patcher.start()
         self.addCleanup(self.comm_patcher.stop)
 
-        self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
-        self.addCleanup(lambda: setattr(config, "TESTNET_AUTO_FAUCET", self.original_faucet))
 
     def _parent_snapshot(self, balances):
         from consensus.governance import ConsensusLifecycleManager

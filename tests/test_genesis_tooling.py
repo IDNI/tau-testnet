@@ -151,6 +151,7 @@ class TestGoldenVectors(unittest.TestCase):
         )
         mgr.active_validators = normalize_validator_set(meta["active_validators"])
         mgr.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
+        mgr.faucet_amount = meta.get("mechanism_specific_metadata", {}).get("faucet_amount", 0)
         if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
             mgr.activate_approval_slots()
         mgr.recompute_approval_threshold()
