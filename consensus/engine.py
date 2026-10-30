@@ -1473,6 +1473,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # transaction mutates a clone, derives its composite from THAT
                 # clone, and the proposal adopts it only on acceptance.
                 lifecycle_mgr = _branch.lifecycle
+            elif _block_lifecycle is not None:
+                # Same discipline without a proposal: a rejected transaction must
+                # leave no lifecycle write, or the re-apply without it hashes apart.
+                lifecycle_mgr = _block_lifecycle.fork()
             tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
             # operations is signed only for user_tx.
             operations = tx.get('operations', {}) if tx.get('tx_type', 'user_tx') == 'user_tx' else {}
@@ -3024,6 +3028,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     if _rule_touched_canonical:
                         _set_rules_state(_rule_prior_rules_state or "")
                         current_tau_bytes = _rule_prior_tau_bytes
+            elif (lifecycle_mgr is not _block_lifecycle
+                    and accepted_in_block and not hard_reject):
+                _block_lifecycle.adopt(lifecycle_mgr)
 
             if accepted_in_block and not hard_reject:
                 accepted_txs.append(tx)
