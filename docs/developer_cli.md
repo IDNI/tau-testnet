@@ -102,11 +102,14 @@ The WebSocket listener scans `65433`–`65442` for the first free port, so on a
 host already running a node the browser wallet may need a port other than the
 default. The node binds its libp2p listener first, and both scans (the TCP
 one from `65432`) skip its ports: a p2p port inside either range moves the
-WebSocket or TCP listener, never the p2p one. It also enforces an `Origin` allowlist: missing/`null` origins and
-anything containing `localhost` or `127.0.0.1` pass, otherwise the origin must
+WebSocket or TCP listener, never the p2p one. It also enforces an `Origin` allowlist: a missing origin and
+the hosts `localhost`, `127.0.0.1` and `::1` pass, otherwise the origin must
 match an entry in the comma-separated `TAU_WS_ALLOWED_ORIGINS` (`*` allows
-all). A rejected connection gets the plain-text `error disallowed_origin` and
-is then closed.
+all). An entry with a scheme must match scheme, host and port. A bare entry
+is a host only (no port or path in the entry) and must match the host exactly.
+`Origin: null` (a sandboxed frame or a `file:` page) is refused unless
+`TAU_WS_ALLOWED_ORIGINS` contains `null`. A rejected connection gets HTTP 403
+with the body `error disallowed_origin`.
 
 ### Connection lifecycle
 
