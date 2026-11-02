@@ -139,8 +139,6 @@ class DurableFirstTestBase(unittest.TestCase):
         tau_manager.tau_test_mode = True
         tau_manager.tau_ready.set()
 
-        self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
         self.original_miner_privkey = config.MINER_PRIVKEY
         self.original_miner_pubkey = config.MINER_PUBKEY
         config.MINER_PRIVKEY = TEST_MINER_PRIVKEY
@@ -170,7 +168,6 @@ class DurableFirstTestBase(unittest.TestCase):
     def tearDown(self):
         self.verify_patch.stop()
         self.os_env_patch.stop()
-        config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
         config.MINER_PRIVKEY = self.original_miner_privkey
         config.MINER_PUBKEY = self.original_miner_pubkey
         tau_manager.tau_test_mode = self._tau_test_mode

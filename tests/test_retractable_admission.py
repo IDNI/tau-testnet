@@ -14,7 +14,6 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 import chain_state
-import config
 import db
 import tau_defs
 import consensus.retractable as retractable
@@ -299,7 +298,6 @@ def node(temp_database, monkeypatch):
     mocks = [p.start() for p in patches]
     mocks[0].is_set.return_value = True
     mocks[3].Verify.return_value = True
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False)
     monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
     height = patch.object(TipAdmissionView, "next_block_height",
                           new_callable=PropertyMock, return_value=NEXT_HEIGHT)

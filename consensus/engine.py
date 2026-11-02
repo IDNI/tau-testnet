@@ -15,7 +15,7 @@ from .governance import (
     normalize_validator_set,
     is_tau_authoritative_eligibility_mode,
 )
-from . import fees
+from . import faucet, fees
 from .fees import FeeRuleError
 from .approvals import (
     APPROVAL_TX_TYPES,
@@ -287,16 +287,17 @@ def _escrow_total(lm) -> int:
     return book.escrow_total() if book is not None else 0
 
 
-def _release_due_retractables(lm, balances, height, timestamp) -> List[str]:
+def _release_due_retractables(lm, balances, sequences, height, timestamp) -> List[str]:
     """Pay every matured entry to its recipient; returns the released ids."""
     book = _retractable_book(lm)
     if book is None:
         return []
     released = book.release_due(int(height), int(timestamp))
+    grant = faucet.amount(lm)
     for entry in released:
-        balances[entry.recipient_pubkey] = (
-            int(balances.get(entry.recipient_pubkey, 0)) + entry.amount
-        )
+        balances[entry.recipient_pubkey] = faucet.spendable(
+            balances, sequences, entry.recipient_pubkey, grant
+        ) + entry.amount
     return [entry.retractable_id.hex() for entry in released]
 
 
@@ -839,6 +840,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # metadata['balances'] is the pre-block state; t_bals above is the
             # mutable copy apply() debits, and must NOT be used for i2.
             parent_balances=metadata.get('balances'),
+            parent_sequences=metadata.get('sequence_numbers'),
             parent_last_transfer_ts=metadata.get('last_transfer_ts'),
             session=session,
             target_last_transfer_ts=t_lts,
@@ -847,19 +849,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
         # Conservation invariant: the native fee model debits the sender and
         # credits the proposer through the same staged_writes pass, so total
-        # supply is preserved across a block (no mint, no burn). A mismatch is
-        # a consensus bug, not a recoverable error.
+        # supply moves only by the faucet grants of the block (no other mint, no
+        # burn). A mismatch is a consensus bug, not a recoverable error.
         # The sweep runs after the transaction loop, so a retract (strictly
         # before release) and a release can never both fire in one block.
         released_retractables = _release_due_retractables(
-            lm, t_bals, block.header.block_number, block.header.timestamp
+            lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
         )
 
+        minted = faucet.granted(
+            metadata.get('balances'), metadata.get('sequence_numbers'),
+            t_bals, t_seqs, faucet.amount(lm),
+        )
         post_total = sum(int(v) for v in t_bals.values()) + _escrow_total(lm)
-        if post_total != parent_total and not getattr(config, "TESTNET_AUTO_FAUCET", False):
+        if post_total != parent_total + minted:
             raise BlockchainBug(
                 f"Supply not conserved applying block #{block.header.block_number}: "
-                f"parent_total={parent_total} post_total={post_total}"
+                f"parent_total={parent_total} minted={minted} post_total={post_total}"
             )
 
         # Convert internal apply result into structural outcomes
@@ -1150,6 +1156,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         proposer_pubkey: Optional[str] = None,
         block_height: Optional[int] = None,
         parent_balances: Optional[Dict[str, int]] = None,
+        parent_sequences: Optional[Dict[str, int]] = None,
         parent_last_transfer_ts: Optional[Dict[str, int]] = None,
         target_last_transfer_ts: Optional[Dict[str, int]] = None,
         session=None,
@@ -1176,6 +1183,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             proposer_pubkey=proposer_pubkey,
             block_height=block_height,
             parent_balances=parent_balances,
+            parent_sequences=parent_sequences,
             parent_last_transfer_ts=parent_last_transfer_ts,
             target_last_transfer_ts=target_last_transfer_ts,
             session=session,
@@ -1210,6 +1218,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         proposer_pubkey: Optional[str] = None,
         block_height: Optional[int] = None,
         parent_balances: Optional[Dict[str, int]] = None,
+        parent_sequences: Optional[Dict[str, int]] = None,
         parent_last_transfer_ts: Optional[Dict[str, int]] = None,
         target_last_transfer_ts: Optional[Dict[str, int]] = None,
         session=None,
@@ -1294,11 +1303,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 return int(target_sequences[address])
             return chain_state.get_sequence_number(address)
 
+        faucet_grant = faucet.amount(lifecycle_mgr)
+
         def _balance_of(address) -> int:
-            if proposal is not None:
-                return int(target_balances.get(address, 0))
-            if target_balances is not None and address in target_balances:
-                return target_balances[address]
+            # The overlay already holds the parent state: reading chain_state
+            # here would judge a block against the node's live head instead.
+            if target_balances is not None:
+                return faucet.spendable(
+                    target_balances, target_sequences, address, faucet_grant
+                )
             return chain_state.get_balance(address)
 
         def _commit_snapshot(snap):
@@ -1361,6 +1374,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # both see the same pre-block balance, so a min-balance floor does not
         # compound within a block. The block-build re-check remains the backstop.
         parent_bals = dict(parent_balances or {})
+        parent_seqs = dict(parent_sequences or {})
         if parent_balances is None and target_balances is not None:
             # Legacy direct-apply callers (tests) that never pass a parent map.
             # Feed 0 rather than guessing from the mutable overlay, which would
@@ -1370,20 +1384,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         def _parent_bal(addr: Optional[str]) -> str:
             """i2 for `addr`, clamped to the width the rules declare for it.
 
-            Applies the same TESTNET_AUTO_FAUCET substitution the debit path uses
-            further down. Without it Tau would see 0 for a faucet-funded account
-            while the transfer succeeded against a synthetic 100000, so a
-            min-balance rule would reject a send that then went through. This does
-            make i2 depend on a per-node flag — but that flag already has to match
-            network-wide (it also exempts the supply-conservation invariant), and
-            being inconsistent *within* one node is the worse, silent failure.
+            The parent's spendable balance, with the pending grant of an
+            account that has no record yet: the value the debit path spends, so
+            a min-balance rule judges the balance the transfer spends.
             """
+            if not addr or parent_balances is None:
+                return "0"
             try:
-                value = int(parent_bals.get(addr, 0)) if addr else 0
+                value = faucet.spendable(parent_bals, parent_seqs, addr, faucet_grant)
             except (TypeError, ValueError):
                 value = 0
-            if value == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                value = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
             return str(max(0, min(value, tau_defs.MAX_TRANSFER_VALUE)))
 
         # i16: seconds since this sender's previous transfer, read from the
@@ -1893,8 +1903,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             return False
 
                     current_from = _read_bal(from_addr)
-                    if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                        current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
                     if current_from < amount:
                         logger.error(
                             "Insufficient funds for %s to send %s. Has: %s.",
@@ -2787,13 +2795,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     
                                     if target_balances is not None:
                                         # Use isolated balance tracking
-                                        if from_addr in target_balances:
-                                            current_from = target_balances[from_addr]
-                                        else:
-                                            current_from = _balance_of(from_addr)
-
-                                        if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                                            current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+                                        current_from = _balance_of(from_addr)
 
                                         if current_from < amount:
                                             logger.error("Insufficient funds for %s to send %s. Has: %s.", from_addr[:10], amount, current_from)
@@ -2921,15 +2923,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             f"Fee {total_fee} exceeds fee_limit {fee_limit_int}"
                         )
                 else:
-                    # Same faucet shim as the transfer debit and admission's
-                    # get_balance. Without it admission accepted a rule-only tx
-                    # from a fresh account (faucet-funded there) that apply
-                    # then refused as insufficient_funds_for_fee: a transfer
-                    # materializes the faucet balance before the fee, a rule
-                    # alone never did.
+                    # _read_bal gives a new sender its pending grant, as
+                    # admission's get_balance does, so a rule-only tx from a new
+                    # account pays its fee from the grant.
                     sender_bal = _read_bal(sender) if sender else 0
-                    if sender and sender_bal == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                        sender_bal = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
                     if sender is None or sender_bal < total_fee:
                         if replay_mode:
                             logger.error(
@@ -3052,6 +3049,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if should_increment_seq and sender:
                     try:
                         if target_sequences is not None:
+                            # A record made by the nonce alone still gets the grant.
+                            if (faucet_grant and target_balances is not None
+                                    and not faucet.has_account(
+                                        target_balances, target_sequences, sender)):
+                                target_balances[sender] = faucet_grant
                             target_sequences[sender] = target_sequences.get(sender, 0) + 1
                         else:
                             if proposal is not None:

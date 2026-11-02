@@ -31,10 +31,10 @@ from consensus.governance import ConsensusLifecycleManager, normalize_validator_
 GENESIS_PATH = os.path.join(project_root, "networks", "tau-testnet-v2", "genesis.json")
 
 # ─── Golden Vectors (computed deterministically from data/genesis.json) ───
-EXPECTED_BLOCK_HASH = "35faee3b5652e30c9b5a9adb89bdf3c2312ff0cef833adf57ebd9566ceeaf1a7"
-EXPECTED_STATE_HASH = "aebbc5045c868c8a8aac7a2ab8765c2541a31edc25509efeaa0376810bcee105"
+EXPECTED_BLOCK_HASH = "359fa1bd64b60e32021a97ee7d654b14fef952c9bb653dfa2583999dfeb70891"
+EXPECTED_STATE_HASH = "7b826c2efe619d9ac7fd680b88609bef29c0cd253be7e224a2827346ffde3f25"
 EXPECTED_ACCOUNTS_HASH = "fa0b485d4a4cfd4a845226cd965cb996b9d0994764b64daca30459b99dd2b323"
-EXPECTED_META_HASH = "6e2c9124c55841f0bd61af7396fd627ecd296eb802ea10bd228b5def80fe9a77"
+EXPECTED_META_HASH = "9ea0065022e631e19a746095d1ab61c97561418607abf4370bde2733dbbce6fe"
 
 
 def _load_genesis():
@@ -149,6 +149,7 @@ class TestGoldenVectors(unittest.TestCase):
         )
         mgr.active_validators = normalize_validator_set(meta["active_validators"])
         mgr.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
+        mgr.faucet_amount = meta.get("mechanism_specific_metadata", {}).get("faucet_amount", 0)
         if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
             mgr.activate_approval_slots()
         mgr.recompute_approval_threshold()
