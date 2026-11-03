@@ -10,6 +10,9 @@ import config
 from commands import sendtx, createblock
 from consensus.engine import TauConsensusEngine
 import chain_state, db, block, tau_defs
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload, sign_tx
+
+SENDER = pubkey_hex(SK_ALICE)
 
 class TestConsensusTime(unittest.TestCase):
     def setUp(self):
@@ -29,9 +32,6 @@ class TestConsensusTime(unittest.TestCase):
         db.init_db()
         chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
-        # Crypto is mandatory now: mock signature verification instead of disabling it.
-        mock_bls = patch('commands.sendtx.G2Basic').start()
-        mock_bls.Verify.return_value = True
         patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
         patch('commands.createblock._BLS_AVAILABLE', True).start()
         patch('commands.createblock._validate_signature', return_value=True).start()
@@ -49,7 +49,7 @@ class TestConsensusTime(unittest.TestCase):
     def test_mempool_rejects_reserved_streams(self):
         """Test that sendtx rejects transactions attempting to use reserved stream 5."""
         tx = {
-            "sender_pubkey": chain_state.GENESIS_ADDRESS,
+            "sender_pubkey": SENDER,
             "sequence_number": 0,
             "expiration_time": int(time.time()) + 1000,
             "expire_at_height": 5000,
@@ -57,9 +57,8 @@ class TestConsensusTime(unittest.TestCase):
                 "5": "1234567890"  # Attempting to inject consensus time!
             },
             "fee_limit": "0",
-            "signature": "00" * 48
         }
-        res = sendtx.queue_transaction(json.dumps(tx))
+        res = sendtx.queue_transaction(json.dumps(sign_payload(tx, SK_ALICE)))
         self.assertFalse(res["ok"], f"Got: {res}")
         self.assertEqual(res["code"], "TX_INVALID")
         self.assertIn("operation key '5'", res["message"])
@@ -73,20 +72,19 @@ class TestConsensusTime(unittest.TestCase):
         so time-lock o5 rules can pre-check at admission (apply is authoritative)."""
         mock_ready.is_set.return_value = True
         mock_multi.return_value = {1: "1", 5: "1"}  # o1 success flag, o5 allow
-        chain_state._balances[chain_state.GENESIS_ADDRESS] = 100000
+        chain_state._balances[SENDER] = 100000
 
         tip = db.get_canonical_head_block()["header"]["timestamp"]
         recipient = "ab" * 48
         tx = {
-            "sender_pubkey": chain_state.GENESIS_ADDRESS,
-            "sequence_number": chain_state.get_sequence_number(chain_state.GENESIS_ADDRESS),
+            "sender_pubkey": SENDER,
+            "sequence_number": chain_state.get_sequence_number(SENDER),
             "expiration_time": int(time.time()) + 1000,
             "expire_at_height": 5000,
-            "operations": {"1": [[chain_state.GENESIS_ADDRESS, recipient, "1"]]},
+            "operations": {"1": [[SENDER, recipient, "1"]]},
             "fee_limit": "1000",
-            "signature": "00" * 48,
         }
-        res = sendtx.queue_transaction(json.dumps(tx))
+        res = sendtx.queue_transaction(json.dumps(sign_payload(tx, SK_ALICE)))
         self.assertTrue(res["ok"], f"queue failed: {res}")
 
         transfer_inputs = [
@@ -108,21 +106,21 @@ class TestConsensusTime(unittest.TestCase):
         mock_tau.return_value = "1" # Success output for transfers
         mock_tau_multi.return_value = {1: "1"} # Success output for transfers multi
         
-        tx = {
-            "sender_pubkey": chain_state.GENESIS_ADDRESS,
-            "sequence_number": chain_state.get_sequence_number(chain_state.GENESIS_ADDRESS),
+        sender = pubkey_hex(SK_ALICE)
+        tx = sign_payload({
+            "sender_pubkey": sender,
+            "sequence_number": chain_state.get_sequence_number(sender),
             "expiration_time": int(time.time()) + 1000,
             "expire_at_height": 5000,
             "operations": {
-                "1": [[chain_state.GENESIS_ADDRESS, "some_addr", "1"]],
+                "1": [[sender, "some_addr", "1"]],
                 "20": "custom_data"
             },
             "fee_limit": "0",
-            "signature": "00" * 48
-        }
+        }, SK_ALICE)
         
-        # Give Genesis some funds
-        chain_state._balances[chain_state.GENESIS_ADDRESS] = 100
+        # Give the sender some funds
+        chain_state._balances[sender] = 100
         
         block_timestamp = int(time.time())
         final_txs, final_reserved_ids, final_rules, final_balances, final_sequences = createblock.execute_batch([tx], [1], block_timestamp)
@@ -152,15 +150,15 @@ class TestConsensusTime(unittest.TestCase):
         engine = TauConsensusEngine()
         timestamp = 1700000000
         
-        tx = {
-            "sender_pubkey": chain_state.GENESIS_ADDRESS,
-            "sequence_number": chain_state.get_sequence_number(chain_state.GENESIS_ADDRESS),
+        sender = pubkey_hex(SK_ALICE)
+        tx = sign_tx({
+            "sender_pubkey": sender,
+            "sequence_number": chain_state.get_sequence_number(sender),
             "operations": {
-                "1": [[chain_state.GENESIS_ADDRESS, "some_addr", "1"]],
+                "1": [[sender, "some_addr", "1"]],
                 "20": "custom_data"
             },
-            "signature": "00" * 48
-        }
+        }, SK_ALICE)
         
         snap = chain_state.TauStateSnapshot(
             state_hash="0"*64,
@@ -168,8 +166,8 @@ class TestConsensusTime(unittest.TestCase):
             metadata={}
         )
         
-        chain_state._balances[chain_state.GENESIS_ADDRESS] = 100
-        chain_state._sequence_numbers[chain_state.GENESIS_ADDRESS] = 0
+        chain_state._balances[sender] = 100
+        chain_state._sequence_numbers[sender] = 0
         
         # Apply replay transaction
         engine.apply(snap, [tx], timestamp)

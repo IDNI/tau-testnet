@@ -21,9 +21,10 @@ import tau_authority
 import tau_manager
 from chain_state import GENESIS_ADDRESS, GENESIS_BALANCE
 from block import Block, BlockHeader, compute_merkle_root, compute_tx_hash, sha256_hex
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload, sign_tx
 from consensus.engine import TauConsensusEngine
 
-SENDER = "a" * 96
+SENDER = pubkey_hex(SK_ALICE)
 RECIPIENT = "b" * 96
 PROPOSER = "c" * 96
 BASE_TS = 1_700_000_000
@@ -33,15 +34,14 @@ NODE_GENESIS_PATH = os.path.join(project_root, "data", "genesis.json")
 
 
 def _tx(seq, amount=1):
-    return {
+    return sign_payload({
         "sender_pubkey": SENDER,
         "sequence_number": seq,
         "expiration_time": 9999999999,
         "expire_at_height": 5000,
         "operations": {"1": [[SENDER, RECIPIENT, str(amount)]]},
         "fee_limit": "0",
-        "signature": "dummy_signature_for_testing",
-    }
+    }, SK_ALICE)
 
 
 def _txs(count):
@@ -602,9 +602,9 @@ class TestMinedBlocksReverify(ChainTestCase):
         from commands import createblock
 
         sent = [
-            {"sender_pubkey": sender * 96, "recipient": "b", "amount": 10,
-             "operations": {"1": []}, "sequence_number": 0, "fee_limit": "0", "signature": "sig"}
-            for sender in "acd"
+            sign_tx({"sender_pubkey": pubkey_hex(sk), "recipient": "b", "amount": 10,
+                     "operations": {"1": []}, "sequence_number": 0, "fee_limit": "0"}, sk)
+            for sk in (SK_ALICE, SK_BOB, SK_CAROL)
         ]
         for n, tx in enumerate(sent):
             db.add_mempool_tx(json.dumps(tx), compute_tx_hash(tx), 1000 + n)

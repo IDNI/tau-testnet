@@ -11,6 +11,7 @@ import pytest
 
 import config
 import db
+from bls_keys import SK_ALICE, pubkey_hex, sign_tx
 from errors import DatabaseError
 
 
@@ -791,7 +792,7 @@ class TestApplyRuleHonesty:
     or charge a fee. A bv[16] unit is hard-rejected before Tau sees it.
     """
 
-    SENDER = "aa" * 48
+    SENDER = pubkey_hex(SK_ALICE)
     PROPOSER = "bb" * 48
 
     def _apply(self, rule, comm_return="ok", app_rules="", fee_limit="100",
@@ -802,14 +803,14 @@ class TestApplyRuleHonesty:
 
         engine = TauConsensusEngine(state_store=MagicMock())
         engine._state_store.commit.side_effect = lambda snap: snap
-        tx = {
+        tx = sign_tx({
             "tx_id": "r1",
             "tx_type": "user_tx",
             "sender_pubkey": self.SENDER,
             "sequence_number": 0,
             "fee_limit": fee_limit,
             "operations": {"0": rule},
-        }
+        })
         with patch("tau_manager.tau_ready") as ready, \
              patch("tau_manager.communicate_with_tau", return_value=comm_return) as comm, \
              patch("tau_manager.communicate_with_tau_multi", return_value={9: "7"}), \

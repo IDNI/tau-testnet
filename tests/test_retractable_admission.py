@@ -18,6 +18,7 @@ import config
 import db
 import tau_defs
 import consensus.retractable as retractable
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload
 from consensus.admission import (
     TipAdmissionView,
     validate_mempool_admission,
@@ -266,13 +267,13 @@ def test_a_malformed_retractable_id_is_refused(tip_view, rid):
 
 # --- queue_transaction flows -------------------------------------------------
 
-SENDER = "a" * 96
+SENDER = pubkey_hex(SK_ALICE)
 RECIPIENT = "c" * 96
 
 
 @pytest.fixture
 def node(temp_database, monkeypatch):
-    """A real database, a mocked signature check, and a scriptable Tau."""
+    """A real database, real signatures, and a scriptable Tau."""
     from commands import sendtx
 
     script = {"fee": 0, "custom": 0, "block_o5": False, "calls": []}
@@ -291,14 +292,12 @@ def node(temp_database, monkeypatch):
         patch("tau_manager.tau_ready"),
         patch("tau_manager.communicate_with_tau", return_value="x1001"),
         patch("tau_manager.communicate_with_tau_multi", side_effect=multi),
-        patch("commands.sendtx.G2Basic"),
         patch("commands.sendtx.chain_state.get_sequence_number", return_value=1),
         patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)),
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}),
     ]
     mocks = [p.start() for p in patches]
     mocks[0].is_set.return_value = True
-    mocks[3].Verify.return_value = True
     monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False)
     monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
     height = patch.object(TipAdmissionView, "next_block_height",
@@ -314,8 +313,8 @@ def node(temp_database, monkeypatch):
 
 def _park_payload(**over):
     over.setdefault("fee_limit", "100")
-    return park(sender_pubkey=SENDER, recipient_pubkey=RECIPIENT,
-                signature="00" * 48, **over)
+    return sign_payload(
+        park(sender_pubkey=SENDER, recipient_pubkey=RECIPIENT, **over), SK_ALICE)
 
 
 def _queue(sendtx, payload, **kw):
@@ -412,7 +411,7 @@ def _seed_open_entry(tx):
 
 
 def _retract_payload(rid, **over):
-    return retract(rid, sender=SENDER, signature="00" * 48, **over)
+    return sign_payload(retract(rid, sender=SENDER, **over), SK_ALICE)
 
 
 def test_a_retract_is_queued_without_a_tau_step(node):

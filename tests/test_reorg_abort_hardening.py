@@ -24,24 +24,28 @@ if project_root not in sys.path:
 import config
 import db
 import chain_state
-from chain_state import GENESIS_ADDRESS, GENESIS_BALANCE
+from chain_state import GENESIS_BALANCE
 from block import Block
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload
 
 ADDR2 = "893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2"
 ADDR3 = "aabbccddee1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678"
 BAD_HASH = "f" * 64
 
 
+FUNDED_ACCOUNT = pubkey_hex(SK_ALICE)
+
+
 def _tx(sender, seq, transfers):
-    return {
+    assert sender == FUNDED_ACCOUNT
+    return sign_payload({
         "sender_pubkey": sender,
         "sequence_number": seq,
         "expiration_time": 9999999999,
         "expire_at_height": 5000,
         "operations": {"1": transfers},
         "fee_limit": "0",
-        "signature": "dummy_signature_for_testing",
-    }
+    }, SK_ALICE)
 
 
 class TestReorgAbortHardening(unittest.TestCase):
@@ -60,8 +64,8 @@ class TestReorgAbortHardening(unittest.TestCase):
         chain_state.load_genesis("data/genesis.json")
         # Pin the rebuild seed to the legacy single-account baseline these
         # synthetic histories are built on.
-        chain_state._genesis_accounts_state = {GENESIS_ADDRESS: GENESIS_BALANCE}
-        chain_state._balances[GENESIS_ADDRESS] = GENESIS_BALANCE
+        chain_state._genesis_accounts_state = {FUNDED_ACCOUNT: GENESIS_BALANCE}
+        chain_state._balances[FUNDED_ACCOUNT] = GENESIS_BALANCE
 
         self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
         config.TESTNET_AUTO_FAUCET = False
@@ -82,10 +86,10 @@ class TestReorgAbortHardening(unittest.TestCase):
         # shape (miner's stored hash != replay-computed hash), forcing the abort.
         genesis_hash = db.get_genesis_hash()
         self.a1 = Block.create(block_number=1, previous_hash=genesis_hash,
-                               transactions=[_tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, ADDR2, "5"]])],
+                               transactions=[_tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, ADDR2, "5"]])],
                                proposer_pubkey="a" * 96)
         self.b1 = Block.create(block_number=1, previous_hash=genesis_hash,
-                               transactions=[_tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, ADDR3, "7"]])],
+                               transactions=[_tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, ADDR3, "7"]])],
                                proposer_pubkey="b" * 96)
         self.b2 = Block.create(block_number=2, previous_hash=self.b1.block_hash,
                                transactions=[], proposer_pubkey="b" * 96,
@@ -132,7 +136,7 @@ class TestReorgAbortHardening(unittest.TestCase):
         self.assertEqual(chain_state._canonical_head_hash, self.a1.block_hash)
         # A1 applied: addr1 -5, addr2 +5.
         self.assertEqual(chain_state.get_balance(ADDR2), 5)
-        self.assertEqual(chain_state.get_balance(GENESIS_ADDRESS), GENESIS_BALANCE - 5)
+        self.assertEqual(chain_state.get_balance(FUNDED_ACCOUNT), GENESIS_BALANCE - 5)
 
     # --- reorg_to abort is loud and non-destructive -----------------------
 
@@ -140,7 +144,7 @@ class TestReorgAbortHardening(unittest.TestCase):
         # Establish A1 as the clean canonical head first.
         self.assertTrue(chain_state.reorg_to(self.a1.block_hash))
         head_before = db.get_canonical_head()['block_hash']
-        bal_a1 = {a: chain_state.get_balance(a) for a in (GENESIS_ADDRESS, ADDR2, ADDR3)}
+        bal_a1 = {a: chain_state.get_balance(a) for a in (FUNDED_ACCOUNT, ADDR2, ADDR3)}
 
         # Reorg to the diverging B2 chain: must abort.
         advanced = chain_state.reorg_to(self.b2.block_hash)
@@ -154,7 +158,7 @@ class TestReorgAbortHardening(unittest.TestCase):
         # Balances restored to A1's state (not B1's addr3=7 partial replay).
         self.assertEqual(chain_state.get_balance(ADDR2), bal_a1[ADDR2])
         self.assertEqual(chain_state.get_balance(ADDR3), 0)
-        self.assertEqual(chain_state.get_balance(GENESIS_ADDRESS), bal_a1[GENESIS_ADDRESS])
+        self.assertEqual(chain_state.get_balance(FUNDED_ACCOUNT), bal_a1[FUNDED_ACCOUNT])
 
     def test_maybe_update_canonical_head_tolerates_failed_reorg(self):
         # A1 canonical; a failed reorg attempt must leave the head intact and

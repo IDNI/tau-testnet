@@ -7,19 +7,17 @@ guarded only by the reserved-stream error, so a transaction already rejected by
 the sequence check still had its policy replaced and its pending approvals
 cancelled -- a "rejected" transaction with visible side effects.
 """
-import hashlib
 from unittest.mock import MagicMock, patch
 
 import pytest
-from py_ecc.bls import G2Basic
 
 import tau_defs
+from bls_keys import pubkey_hex, sign_payload
 from consensus.engine import TauConsensusEngine
 from consensus.state import TauStateSnapshot
-from consensus.tx_signing import signing_message_bytes
 
 SK_SENDER = 33333
-SENDER = G2Basic.SkToPk(SK_SENDER).hex()
+SENDER = pubkey_hex(SK_SENDER)
 PROPOSER = "bb" * 48
 STREAM = tau_defs.USER_POLICY_STREAM_INDEX
 # A registered clause carries NO i12 guard -- the composer supplies the scope.
@@ -58,7 +56,7 @@ def _apply(*, sequence_number, seq_state=None):
     engine = TauConsensusEngine(state_store=MagicMock())
     engine._state_store.commit.side_effect = lambda snap: snap
     lifecycle = _lifecycle()
-    tx = {
+    tx = sign_payload({
         "tx_id": "r1",
         "tx_type": "user_tx",
         "sender_pubkey": SENDER,
@@ -66,10 +64,7 @@ def _apply(*, sequence_number, seq_state=None):
         "expiration_time": 9999999999,
         "fee_limit": "100",
         "operations": {"0": CLAUSE},
-    }
-    tx["signature"] = G2Basic.Sign(
-        SK_SENDER, hashlib.sha256(signing_message_bytes(tx)).digest()
-    ).hex()
+    }, SK_SENDER)
     with patch("tau_manager.tau_ready") as ready, \
          patch("tau_manager.communicate_with_tau", return_value="ok"), \
          patch("tau_manager.communicate_with_tau_multi", return_value={9: "7"}), \
@@ -117,14 +112,15 @@ def _apply_rule_with_fee(*, fee_limit, saves, states):
     """
     engine = TauConsensusEngine(state_store=MagicMock())
     engine._state_store.commit.side_effect = lambda snap: snap
-    tx = {
+    tx = sign_payload({
         "tx_id": "r1",
         "tx_type": "user_tx",
         "sender_pubkey": SENDER,
         "sequence_number": 0,
+        "expiration_time": 9999999999,
         "fee_limit": fee_limit,
         "operations": {"0": RULE},
-    }
+    }, SK_SENDER)
 
     def _get_state():
         return states.pop(0) if len(states) > 1 else states[0]

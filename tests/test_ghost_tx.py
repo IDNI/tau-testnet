@@ -9,6 +9,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 import db
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_tx
 
 # Mock blake3 if missing (for test environment)
 # try:
@@ -171,13 +172,13 @@ class TestGhostTxIntegration(unittest.TestCase):
             
              # 1. Test Rule Application
              # Insert TX with Rule
-             payload_rule = json.dumps({
-                 "sender_pubkey": "UserRule",
+             payload_rule = json.dumps(sign_tx({
+                 "sender_pubkey": pubkey_hex(SK_ALICE),
                  "sequence_number": 0,
                  "expiration_time": int(time.time() + 3600),
                  "expire_at_height": 5000,
                  "operations": {"0": "rule X"}
-             })
+             }, SK_ALICE))
              db.add_mempool_tx(payload_rule, "hash_rule", 1000)
              
              # Run Mining
@@ -195,13 +196,14 @@ class TestGhostTxIntegration(unittest.TestCase):
         
         # 2. Test Rejection (Bad Sequence)
         # Insert TX with bad sequence (100 vs expected 0 for new user)
-        payload_bad = json.dumps({
-            "sender_pubkey": "UserBad",
+        bad_sender = pubkey_hex(SK_BOB)
+        payload_bad = json.dumps(sign_tx({
+            "sender_pubkey": bad_sender,
             "sequence_number": 100,
             "expiration_time": int(time.time() + 3600),
             "expire_at_height": 5000,
-            "operations": {"1": [["UserBad", "UserX", "10"]]}
-        })
+            "operations": {"1": [[bad_sender, "UserX", "10"]]}
+        }, SK_BOB))
         db.add_mempool_tx(payload_bad, "hash_bad", 2000)
 
         # Run Mining. This must stay inside the patch context: a tx rejected at

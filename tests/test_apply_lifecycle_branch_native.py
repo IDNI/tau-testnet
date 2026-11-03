@@ -18,7 +18,7 @@ import copy
 import os
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import tau_allocator as alloc
 import tau_defs
@@ -26,6 +26,7 @@ import tau_journal as tj
 import tau_proposal as tp
 import tau_reconstruction as tr
 import tau_session as ts
+from bls_keys import SK_BOB, SK_CAROL, pubkey_hex, sign_tx
 from consensus.approvals import ApprovalRequestEntry, ApprovalRequestLifecycleManager
 from consensus.engine import TauConsensusEngine
 from consensus.rule_offers import RuleOfferLifecycleManager
@@ -45,16 +46,10 @@ pytestmark = pytest.mark.skipif(not _native_available(),
                                 reason="native tau module not built")
 
 
-@pytest.fixture(autouse=True)
-def _signatures_not_under_test():
-    # These tests exercise evaluator and lifecycle mechanics, not signatures.
-    with patch("consensus.engine.verify_tx_signature", return_value=(True, "")):
-        yield
-
-
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SENDER_B = "b2" * 48
-SENDER_C = "c3" * 48
+SENDER_B = pubkey_hex(SK_BOB)
+SENDER_C = pubkey_hex(SK_CAROL)
+_SK = {SENDER_B: SK_BOB, SENDER_C: SK_CAROL}
 PROPOSER = "d4" * 48
 STREAM = tau_defs.USER_POLICY_STREAM_INDEX
 
@@ -144,7 +139,7 @@ def _tx(tx_id, sender, rule=None, transfer=None, sequence_number=0, fee_limit="1
         tx["operations"]["0"] = rule
     if transfer:
         tx["operations"]["1"] = [transfer]
-    return tx
+    return sign_tx(tx, _SK[sender])
 
 
 def _run(transactions):

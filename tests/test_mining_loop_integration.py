@@ -8,6 +8,7 @@ import json
 import config
 import db
 import chain_state
+from bls_keys import SK_ALICE, SK_CAROL, pubkey_hex, sign_payload
 from miner.service import SoleMiner
 from consensus.mempool import load_transactions
 
@@ -97,17 +98,16 @@ class TestMiningLoopIntegration(unittest.TestCase):
         self.assertEqual(initial['header']['block_number'], 0)
         
         # Add a valid-looking transaction
-        sender_pubkey = "a" * 96
+        sender_pubkey = pubkey_hex(SK_ALICE)
         # Valid structure for sendtx/createblock validation
-        tx = {
+        tx = sign_payload({
             "sender_pubkey": sender_pubkey,
             "sequence_number": 0,
             "expiration_time": int(time.time()) + 3600,
             "expire_at_height": 5000,
             "operations": {"1": []}, # Empty transfer list is valid
             "fee_limit": 1000,
-            "signature": "b" * 192, # Dummy signature
-        }
+        }, SK_ALICE)
         # In test env, BLS might not be available or mocked, but structure is checked.
         # queue_transaction in sendtx.py validates BLS if available. 
         # But we are injecting directly into DB mempool, bypassing queue_transaction logic?
@@ -156,16 +156,15 @@ class TestMiningLoopIntegration(unittest.TestCase):
         self.assertEqual(initial['header']['block_number'], 0)
         
         # Add just 1 transaction (valid structure)
-        sender_pubkey = "c" * 96
-        tx = {
+        sender_pubkey = pubkey_hex(SK_CAROL)
+        tx = sign_payload({
             "sender_pubkey": sender_pubkey,
             "sequence_number": 0,
             "expiration_time": int(time.time()) + 3600,
             "expire_at_height": 5000,
             "operations": {}, 
             "fee_limit": 1000,
-            "signature": "d" * 192,
-        }
+        }, SK_CAROL)
         tx_blob = json.dumps(tx)
         db.add_mempool_tx(tx_blob, "msg_id_time", int(time.time()*1000))
         

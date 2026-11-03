@@ -14,6 +14,14 @@ from consensus.engine import TauConsensusEngine
 from consensus.state import TauStateSnapshot
 import chain_state
 import tau_manager
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload, sign_tx
+
+SENDER = pubkey_hex(SK_ALICE)
+
+
+def _signed(payload):
+    return json.dumps(sign_payload(payload, SK_ALICE))
+
 
 class TestCustomInputs(unittest.TestCase):
 
@@ -50,11 +58,6 @@ class TestCustomInputs(unittest.TestCase):
         self.addCleanup(self.test_mode_patcher.stop)
         self.addCleanup(self.isolated_patcher.stop)
 
-        # Crypto is mandatory now: mock signature verification instead of disabling it.
-        self.crypto_patcher = patch('commands.sendtx.G2Basic')
-        mock_bls = self.crypto_patcher.start()
-        mock_bls.Verify.return_value = True
-        self.addCleanup(self.crypto_patcher.stop)
         self.seq_patcher = patch('commands.sendtx.chain_state.get_sequence_number', return_value=1)
         self.seq_patcher.start()
         self.addCleanup(self.seq_patcher.stop)
@@ -68,15 +71,14 @@ class TestCustomInputs(unittest.TestCase):
         # rejected by the sendtx custom-input parse.
         for key in ["2", "3", "4"]:
             payload = {
-                "sender_pubkey": "a" * 96,
+                "sender_pubkey": SENDER,
                 "sequence_number": 1,
                 "expiration_time": 9999999999,
                 "expire_at_height": 5000,
                 "operations": {key: "val"},
                 "fee_limit": 100,
-                "signature": "00" * 48
             }
-            json_blob = json.dumps(payload)
+            json_blob = _signed(payload)
             with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
                 with patch('commands.sendtx.db.add_mempool_tx'):
                     result = sendtx.queue_transaction(json_blob, propagate=False)
@@ -88,17 +90,16 @@ class TestCustomInputs(unittest.TestCase):
         """operations["12"] (sender-pubkey stream) is rejected at the authoritative
         admission gate before it can reach the custom-input merge and spoof i12."""
         payload = {
-            "sender_pubkey": "a" * 96,
+            "sender_pubkey": SENDER,
             "sequence_number": 1,
             "expiration_time": 9999999999,
             "expire_at_height": 5000,
             "operations": {"12": "deadbeef"},
             "fee_limit": 100,
-            "signature": "00" * 48,
         }
         with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
             with patch('commands.sendtx.db.add_mempool_tx'):
-                result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
+                result = sendtx.queue_transaction(_signed(payload), propagate=False)
         self.assertFalse(result["ok"])
         self.assertIn("12", result["message"])
 
@@ -107,17 +108,16 @@ class TestCustomInputs(unittest.TestCase):
         admission before they can pin a conflicting bv width process-wide."""
         for key in ("14", "15"):
             payload = {
-                "sender_pubkey": "a" * 96,
+                "sender_pubkey": SENDER,
                 "sequence_number": 1,
                 "expiration_time": 9999999999,
                 "expire_at_height": 5000,
                 "operations": {key: "5"},
                 "fee_limit": 100,
-                "signature": "00" * 48,
             }
             with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
                 with patch('commands.sendtx.db.add_mempool_tx'):
-                    result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
+                    result = sendtx.queue_transaction(_signed(payload), propagate=False)
             self.assertFalse(result["ok"], msg=f"key {key} accepted")
             self.assertIn(key, result["message"])
 
@@ -129,8 +129,9 @@ class TestCustomInputs(unittest.TestCase):
             mock_store.commit.return_value = TauStateSnapshot(b"", b"", {})
             engine = TauConsensusEngine(state_store=mock_store)
             snapshot = TauStateSnapshot(b"hash", b"rules", {})
-            tx = {"tx_id": f"tx_{key}", "operations": {key: "5"}}
-            result = engine.apply(snapshot, [tx], 1700000000)
+            tx = sign_tx({"tx_id": f"tx_{key}", "sender_pubkey": SENDER,
+                          "operations": {key: "5"}})
+            result = engine.apply(snapshot, [tx], 1700000000, target_sequences={})
             self.assertEqual(len(result.rejected_transactions), 1, msg=f"key {key} not rejected")
             receipt = result.receipts[f"tx_{key}"]
             self.assertEqual(receipt["status"], "failed")
@@ -140,7 +141,7 @@ class TestCustomInputs(unittest.TestCase):
         """Test that sendtx accepts keys >= 5 and normalizes values."""
         
         payload = {
-            "sender_pubkey": "A" * 96,
+            "sender_pubkey": SENDER,
             "sequence_number": 1,
             "expiration_time": 9999999999,
             "expire_at_height": 5000,
@@ -149,14 +150,12 @@ class TestCustomInputs(unittest.TestCase):
                 "200": ["a", 1]
             },
             "fee_limit": 100,
-            "signature": "00" * 48,
-            "sender_pubkey": "a" * 96 # Valid-ish hex
         }
         
         # Mock validators to pass structure checks
         with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
              with patch('commands.sendtx.db.add_mempool_tx'):
-                result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
+                result = sendtx.queue_transaction(_signed(payload), propagate=False)
         
         self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
         
@@ -181,7 +180,7 @@ class TestCustomInputs(unittest.TestCase):
         path. The rule no longer goes through communicate_with_tau, and the live
         validate-then-restore is skipped entirely on the isolated path."""
         payload = {
-            "sender_pubkey": "a" * 96,
+            "sender_pubkey": SENDER,
             "sequence_number": 1,
             "expiration_time": 9999999999,
             "expire_at_height": 5000,
@@ -190,13 +189,12 @@ class TestCustomInputs(unittest.TestCase):
                 "100": "42"
             },
             "fee_limit": 100,
-            "signature": "00" * 48
         }
 
         with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
              with patch('commands.sendtx.db.add_mempool_tx'):
                  with patch('tau_manager.reset_tau_state') as mock_reset:
-                    result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
+                    result = sendtx.queue_transaction(_signed(payload), propagate=False)
 
         self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
 
@@ -223,13 +221,14 @@ class TestCustomInputs(unittest.TestCase):
         engine = TauConsensusEngine(state_store=mock_store)
         
         snapshot = TauStateSnapshot(b"hash", b"rules", {})
-        tx = {
+        tx = sign_tx({
             "tx_id": "tx1",
+            "sender_pubkey": SENDER,
             "operations": {
                 "0": "new rule",
                 "100": "99"
             }
-        }
+        })
         
         # Mock communicate_with_tau to return distinct outputs
         self.mock_communicate.side_effect = ["output_rule", "output_custom"]
@@ -238,7 +237,7 @@ class TestCustomInputs(unittest.TestCase):
             "chain_state.get_application_rules_state",
             return_value="new rule",
         ):
-            result = engine.apply(snapshot, [tx], 1700000000)
+            result = engine.apply(snapshot, [tx], 1700000000, target_sequences={})
 
         receipt = result.receipts["tx1"]
         logs = receipt["logs"]
@@ -268,17 +267,18 @@ class TestCustomInputs(unittest.TestCase):
         engine = TauConsensusEngine(state_store=mock_store)
         
         snapshot = TauStateSnapshot(b"hash", b"rules", {})
-        tx = {
+        tx = sign_tx({
             "tx_id": "tx_fail",
+            "sender_pubkey": SENDER,
             "operations": {
                 "100": "bad_input"
             }
-        }
+        })
         
         # Mock communicate_with_tau to return Error
         self.mock_communicate.return_value = "(Error) Invalid input"
         
-        result = engine.apply(snapshot, [tx], 1700000000)
+        result = engine.apply(snapshot, [tx], 1700000000, target_sequences={})
         
         # New behavior: Tx execution fails on Tau Error, but is accepted into block (nonce consumed)
         self.assertEqual(len(result.accepted_transactions), 1)
@@ -453,8 +453,9 @@ class TestKey12Rejection(unittest.TestCase):
         mock_store.commit.return_value = TauStateSnapshot(b"", b"", {})
         engine = TauConsensusEngine(state_store=mock_store)
         snapshot = TauStateSnapshot(b"hash", b"rules", {})
-        tx = {"tx_id": "tx_spoof", "operations": {"12": "deadbeef"}}
-        result = engine.apply(snapshot, [tx], 1700000000)
+        tx = sign_tx({"tx_id": "tx_spoof", "sender_pubkey": SENDER,
+                      "operations": {"12": "deadbeef"}})
+        result = engine.apply(snapshot, [tx], 1700000000, target_sequences={})
         receipt = result.receipts["tx_spoof"]
         self.assertIn("Error", " ".join(receipt["logs"]))
         # Hard-rejected: lands in rejected_transactions, not accepted.

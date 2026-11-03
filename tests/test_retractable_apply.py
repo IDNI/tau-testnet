@@ -98,7 +98,7 @@ def retract_tx(rid_hex, sk=SK_ALICE, sender=ALICE, seq=1, signer_sk=None):
 
 
 def spend_tx(sender, to, amount, seq, fee_limit="100"):
-    return {
+    return _sign({
         "tx_id": f"spend-{next(_TX_SEQ)}",
         "tx_type": "user_tx",
         "sender_pubkey": sender,
@@ -107,7 +107,7 @@ def spend_tx(sender, to, amount, seq, fee_limit="100"):
         "expire_at_height": 1000,
         "fee_limit": str(fee_limit),
         "operations": {"1": [[sender, to, amount]]},
-    }
+    }, {ALICE: SK_ALICE, BOB: SK_BOB, CAROL: SK_CAROL, MALLORY: SK_MALLORY}[sender])
 
 
 def rid_of(tx) -> str:

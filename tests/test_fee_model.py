@@ -18,12 +18,13 @@ import config
 import chain_state
 import db
 import tau_defs
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload, sign_tx
 from consensus import fees
 from consensus.engine import TauConsensusEngine
 from consensus.fees import FeeRuleError
 from consensus.state import TauStateSnapshot
 
-SENDER = "a" * 96
+SENDER = pubkey_hex(SK_ALICE)
 RECIPIENT = "c" * 96
 PROPOSER = "b" * 96
 
@@ -115,7 +116,7 @@ class EngineFeeBase(unittest.TestCase):
 
     def transfer_tx(self, amount=100, fee_limit="50", seq=0, sender=SENDER,
                     recipient=RECIPIENT, tx_id="tx1", transfers=None):
-        return {
+        return sign_tx({
             "tx_id": tx_id,
             "tx_type": "user_tx",
             "sender_pubkey": sender,
@@ -123,7 +124,7 @@ class EngineFeeBase(unittest.TestCase):
             "fee_limit": fee_limit,
             "operations": {"1": transfers if transfers is not None
                            else [[sender, recipient, amount]]},
-        }
+        })
 
     def apply(self, txs, balances, seqs=None, proposer=PROPOSER, height=1,
               replay_mode=False):
@@ -247,14 +248,14 @@ class TestEngineFeeCharging(EngineFeeBase):
         lifecycle.can_admit_vote.return_value = True
         lifecycle.submit_vote.return_value = True
         balances = {}  # zero-balance validator
-        tx = {
+        tx = sign_tx({
             "tx_id": "gov1",
             "tx_type": "consensus_rule_vote",
             "sender_pubkey": SENDER,
             "fee_limit": "0",
             "update_id": "ab" * 32,
             "approve": True,
-        }
+        })
         result = self.engine.apply(
             self.snapshot, [tx], 1700000000,
             target_balances=balances,
@@ -279,14 +280,14 @@ class TestEngineFeeCharging(EngineFeeBase):
     def test_transfer_less_tx_charged_via_fee_query(self):
         self.mock_multi.return_value = {9: "7"}
         balances = {SENDER: 1000}
-        tx = {
+        tx = sign_tx({
             "tx_id": "tx_norule",
             "tx_type": "user_tx",
             "sender_pubkey": SENDER,
             "sequence_number": 0,
             "fee_limit": "10",
             "operations": {"100": "42"},
-        }
+        })
         result = self.apply([tx], balances)
         self.assertEqual(len(result.accepted_transactions), 1)
         self.assertEqual(balances[SENDER], 993)
@@ -312,14 +313,14 @@ class TestEngineFeeCharging(EngineFeeBase):
         proposal = MagicMock(session=session, label="test")
         proposal.lifecycle = MagicMock(approval_slots_active=False)
         balances = {}
-        tx = {
+        tx = sign_tx({
             "tx_id": "tx_fresh",
             "tx_type": "user_tx",
             "sender_pubkey": SENDER,
             "sequence_number": 0,
             "fee_limit": "10",
             "operations": {"100": "42"},
-        }
+        })
         result = self.engine.apply(
             self.snapshot, [tx], 1700000000,
             target_balances=balances, target_sequences={},
@@ -412,12 +413,6 @@ class TestAdmissionFees(unittest.TestCase):
         self.iso_patcher.start()
         self.addCleanup(self.iso_patcher.stop)
 
-        # Crypto is mandatory now: mock signature verification instead of disabling it.
-        self.crypto_patcher = patch("commands.sendtx.G2Basic")
-        mock_bls = self.crypto_patcher.start()
-        mock_bls.Verify.return_value = True
-        self.addCleanup(self.crypto_patcher.stop)
-
         # Sequence enforcement is on; pin the sender's expected sequence to match
         # the payload (sequence_number=1) and fund the sender (no auto-faucet).
         self.seq_patcher = patch(
@@ -457,13 +452,12 @@ class TestAdmissionFees(unittest.TestCase):
             "expire_at_height": 5000,
             "operations": operations if operations is not None else {"100": "42"},
             "fee_limit": fee_limit,
-            "signature": "00" * 48,
         }
         if tx_type != "user_tx":
             p["tx_type"] = tx_type
             p.pop("operations")
         p.update(extra)
-        return p
+        return sign_payload(p, SK_ALICE)
 
     def test_missing_fee_limit_rejected(self):
         p = self.payload()
@@ -743,14 +737,14 @@ class TestApplyBlockFeeE2E(unittest.TestCase):
 
     def test_state_hash_stable_across_normal_and_replay(self):
         engine = TauConsensusEngine()
-        tx = {
+        tx = sign_tx({
             "tx_id": "tx1",
             "tx_type": "user_tx",
             "sender_pubkey": SENDER,
             "sequence_number": 0,
             "fee_limit": "50",
             "operations": {"1": [[SENDER, RECIPIENT, 100]]},
-        }
+        })
         parent = self._parent_snapshot({SENDER: 1000})
         active_view = engine.derive_active_consensus(parent, 1)
         blk = self._block([tx])
@@ -775,14 +769,14 @@ class TestApplyBlockFeeE2E(unittest.TestCase):
         engine = TauConsensusEngine()
 
         def make_tx(seq, tx_id):
-            return {
+            return sign_tx({
                 "tx_id": tx_id,
                 "tx_type": "user_tx",
                 "sender_pubkey": SENDER,
                 "sequence_number": seq,
                 "fee_limit": "50",
                 "operations": {"1": [[SENDER, RECIPIENT, 100]]},
-            }
+            })
 
         parent = self._parent_snapshot({SENDER: 1000})
         active_view = engine.derive_active_consensus(parent, 1)
@@ -802,14 +796,14 @@ class TestApplyBlockFeeE2E(unittest.TestCase):
 
     def test_o9_garbage_propagates_out_of_apply_block(self):
         engine = TauConsensusEngine()
-        tx = {
+        tx = sign_tx({
             "tx_id": "tx1",
             "tx_type": "user_tx",
             "sender_pubkey": SENDER,
             "sequence_number": 0,
             "fee_limit": "50",
             "operations": {"1": [[SENDER, RECIPIENT, 100]]},
-        }
+        })
         self.mock_multi.return_value = {1: "1", 9: "garbage"}
         parent = self._parent_snapshot({SENDER: 1000})
         active_view = engine.derive_active_consensus(parent, 1)
@@ -1107,9 +1101,9 @@ class TestCooldownStream(EngineFeeBase):
         target = {}
         self.engine.apply(
             self.snapshot,
-            [{"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
-              "sequence_number": 0, "fee_limit": "0",
-              "operations": {"0": "always (o13[t]:bv[16] = { #x0001 }:bv[16])."}}],
+            [sign_tx({"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
+                      "sequence_number": 0, "fee_limit": "0",
+                      "operations": {"0": "always (o13[t]:bv[16] = { #x0001 }:bv[16])."}})],
             1700000000,
             target_balances={SENDER: 1000}, target_sequences={},
             proposer_pubkey=PROPOSER, block_height=1,

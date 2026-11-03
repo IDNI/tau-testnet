@@ -687,11 +687,15 @@ def test_a_deferred_transaction_is_never_reserved_while_it_backs_off(
 
 def test_a_deferred_rule_transaction_does_not_hold_the_slow_lane_slot(
         node_state, clock, reservations, monkeypatch):
+    from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_payload
     from test_mempool_lanes import _add, _rule
 
+    def signed_rule(sk):
+        return json.dumps(sign_payload(json.loads(_rule(sender=pubkey_hex(sk))), sk))
+
     monkeypatch.setattr(config, "BLOCK_MAX_RULE_TXS", 1)
-    _add(_rule(sender="aa" * 48), "rule-rich", 1000, estimated_fee=500)
-    _add(_rule(sender="bb" * 48), "rule-poor", 1001, estimated_fee=1)
+    _add(signed_rule(SK_ALICE), "rule-rich", 1000, estimated_fee=500)
+    _add(signed_rule(SK_BOB), "rule-poor", 1001, estimated_fee=1)
     createblock._defer("rule-rich")
 
     wl._mine_with(_healthy)

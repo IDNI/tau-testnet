@@ -29,18 +29,18 @@ import chain_state
 import tau_manager
 from py_ecc.bls import G2Basic
 from block import Block, compute_tx_hash
-from chain_state import GENESIS_ADDRESS
 from commands import gettxstatus, sendtx
 from consensus.lanes import LANE_FAST, LANE_SLOW
 from consensus.tx_signing import signing_message_bytes
 
 BASE_TS = 1_700_000_000
 
-SK_ALICE, SK_BOB, SK_STRANGER = 11111, 22222, 55555
+SK_ALICE, SK_BOB, SK_STRANGER, SK_FUNDER = 11111, 22222, 55555, 77777
 ALICE = G2Basic.SkToPk(SK_ALICE).hex()
 BOB = G2Basic.SkToPk(SK_BOB).hex()
 CAROL = G2Basic.SkToPk(33333).hex()
 MALLORY = G2Basic.SkToPk(66666).hex()
+FUNDER = G2Basic.SkToPk(SK_FUNDER).hex()
 FUNDING = 3000
 
 
@@ -105,8 +105,8 @@ class ReorgRestoreTestCase(unittest.TestCase):
         db.init_db()
         db.clear_mempool()
         chain_state.load_genesis("data/genesis.json")
-        chain_state._genesis_accounts_state = {GENESIS_ADDRESS: chain_state.GENESIS_BALANCE}
-        chain_state._balances[GENESIS_ADDRESS] = chain_state.GENESIS_BALANCE
+        chain_state._genesis_accounts_state = {FUNDER: chain_state.GENESIS_BALANCE}
+        chain_state._balances[FUNDER] = chain_state.GENESIS_BALANCE
 
         self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
         config.TESTNET_AUTO_FAUCET = False
@@ -124,8 +124,8 @@ class ReorgRestoreTestCase(unittest.TestCase):
         self.container = types.SimpleNamespace(db=db)
 
         self.prefix = self.block(1, self.genesis_hash, [
-            dummy_signed(GENESIS_ADDRESS, 0, ALICE, FUNDING),
-            dummy_signed(GENESIS_ADDRESS, 1, BOB, FUNDING),
+            transfer(SK_FUNDER, ALICE, FUNDING, 0),
+            transfer(SK_FUNDER, BOB, FUNDING, 1),
         ], "a" * 96)
         self.ingest([self.prefix])
 

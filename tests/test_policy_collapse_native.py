@@ -5,10 +5,11 @@ rebuilt from the restore plan. The collapse is only sound if the rebuilt evaluat
 answers every transfer like the layered one it replaces, if the journal's RESET is
 what a replay starts from, and if an emptied registry still lets a transfer through.
 """
+import functools
 import json
 import os
 from collections import namedtuple
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -21,6 +22,7 @@ import tau_proposal as tp
 import tau_reconstruction as tr
 import tau_session as ts
 from block import Block
+from bls_keys import pubkey_hex, sign_tx
 from consensus import admission
 from consensus import rule_offers as ro
 from consensus.engine import ActiveConsensusView, TauConsensusEngine, _apply_composite_rule
@@ -39,12 +41,6 @@ def _native_available():
 
 pytestmark = pytest.mark.skipif(not _native_available(),
                                 reason="native tau module not built")
-
-
-@pytest.fixture(autouse=True)
-def _signatures_not_under_test():
-    with patch("consensus.engine.verify_tx_signature", return_value=(True, "")):
-        yield
 
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -80,8 +76,13 @@ def _o5(v):
     return "(o5[t]:bv[24] = " + _bv24(v) + ")"
 
 
+def author_sk(i):
+    return 0xAB0000 + i
+
+
+@functools.lru_cache(maxsize=None)
 def author_key(i):
-    return ("ab" + f"{i:04x}") * 16
+    return pubkey_hex(author_sk(i))
 
 
 def approver_keys(i):
@@ -239,9 +240,9 @@ Applied = namedtuple("Applied", "proposal result lifecycle plan units")
 
 
 def _clause_tx(tx_id, author, rule_text, seq):
-    return {"tx_id": tx_id, "tx_type": "user_tx", "sender_pubkey": author_key(author),
-            "sequence_number": seq, "fee_limit": "10000",
-            "operations": {"0": rule_text}}
+    return sign_tx({"tx_id": tx_id, "tx_type": "user_tx", "sender_pubkey": author_key(author),
+                    "sequence_number": seq, "fee_limit": "10000",
+                    "operations": {"0": rule_text}}, author_sk(author))
 
 
 def _apply_block(steps):

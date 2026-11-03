@@ -873,20 +873,22 @@ def test_forged_vote_in_block_is_noop():
     block and must not advance the tally."""
     from consensus.governance import ConsensusRuleUpdate
 
+    from bls_keys import SK_BOB, pubkey_hex, sign_tx
+
     validator_hex = "a" * 96
-    outsider_hex = "b" * 96
+    outsider_hex = pubkey_hex(SK_BOB)
     engine, lm, parent_snapshot, active_view, _ = _w1_fixture([validator_hex], validator_hex)
 
     update = ConsensusRuleUpdate(["always ( o6[t]:bv[16] = { 0 }:bv[16] )."], 100)
     assert lm.submit_update(update)
 
     from block import Block
-    vote_tx = {
+    vote_tx = sign_tx({
         "tx_type": "consensus_rule_vote",
         "sender_pubkey": outsider_hex,
         "update_id": update.update_id.hex(),
         "approve": True,
-    }
+    }, SK_BOB)
     block_obj = Block.create(
         block_number=5,
         previous_hash="00" * 32,

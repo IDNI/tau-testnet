@@ -52,6 +52,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 import db
 import chain_state
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_tx
 from commands import createblock
 
 class TestMinerHardening(unittest.TestCase):
@@ -75,8 +76,9 @@ class TestMinerHardening(unittest.TestCase):
         self.original_faucet = config.TESTNET_AUTO_FAUCET
         config.TESTNET_AUTO_FAUCET = False
         
-        # Pre-seed UserOverspend balance
-        chain_state._balances["UserOverspend"] = 100
+        # Pre-seed the overspender's balance
+        self.overspender = pubkey_hex(SK_BOB)
+        chain_state._balances[self.overspender] = 100
 
         # Fix: Helper MINER_PRIVKEY for PoA mining (must be non-zero for BLS)
         self.original_miner_key = config.MINER_PRIVKEY
@@ -142,26 +144,25 @@ class TestMinerHardening(unittest.TestCase):
         
         mock_sig.return_value = True
         
-        with patch('py_ecc.bls.G2Basic.Verify', return_value=True):
-            # Setup: Account with 100 coins (done in setUp)
-            
-            # Create TX with 2 transfers: 60 + 50 = 110 (> 100)
-            payload = json.dumps({
-                "sender_pubkey": "UserOverspend",
-                "sequence_number": 0,
-                "expiration_time": int(time.time() + 3600),
-                "expire_at_height": 5000,
-                "operations": {
-                    "1": [
-                        ["UserOverspend", "Alice", "60"],
-                        ["UserOverspend", "Bob", "50"]
-                    ]
-                }
-            })
-            db.add_mempool_tx(payload, "hash_overspend", 1000)
-            
-            # Run CreateBlock
-            res = createblock.create_block_from_mempool()
+        # Setup: Account with 100 coins (done in setUp)
+        
+        # Create TX with 2 transfers: 60 + 50 = 110 (> 100)
+        payload = json.dumps(sign_tx({
+            "sender_pubkey": self.overspender,
+            "sequence_number": 0,
+            "expiration_time": int(time.time() + 3600),
+            "expire_at_height": 5000,
+            "operations": {
+                "1": [
+                    [self.overspender, "Alice", "60"],
+                    [self.overspender, "Bob", "50"]
+                ]
+            }
+        }, SK_BOB))
+        db.add_mempool_tx(payload, "hash_overspend", 1000)
+        
+        # Run CreateBlock
+        res = createblock.create_block_from_mempool()
         
         # Verify Rejection
         if "transactions" in res:
@@ -170,7 +171,7 @@ class TestMinerHardening(unittest.TestCase):
              self.assertIn("message", res)
              
         # Balances should remain 100
-        self.assertEqual(chain_state._balances.get("UserOverspend"), 100)
+        self.assertEqual(chain_state._balances.get(self.overspender), 100)
         
         print("[TEST] Intra-TX overspend rejected.")
 
@@ -226,7 +227,7 @@ class TestMinerHardening(unittest.TestCase):
         mock_sig.return_value = True
         
         # Seed the user explicitly — there is no auto-faucet anymore.
-        user_addr = "UserNew"
+        user_addr = pubkey_hex(SK_ALICE)
         chain_state._balances[user_addr] = 1000
 
         # This test verifies "no negative balance" and correct debit.
@@ -234,7 +235,7 @@ class TestMinerHardening(unittest.TestCase):
         transfer_amount = max(1, faucet_start // 2)
             
         # Send a valid amount within faucet balance.
-        payload = json.dumps({
+        payload = json.dumps(sign_tx({
             "sender_pubkey": user_addr,
             "sequence_number": 0,
             "expiration_time": int(time.time() + 3600),
@@ -242,14 +243,13 @@ class TestMinerHardening(unittest.TestCase):
             "operations": {
                 "1": [[user_addr, "Bob", str(transfer_amount)]]
             }
-        })
+        }, SK_ALICE))
         db.add_mempool_tx(payload, "hash_faucet", 1000)
         
         # Run Mining (the createblock/chain_state fee guards consult their
         # own tau_manager references; share the mock)
         try:
-            with patch('py_ecc.bls.G2Basic.Verify', return_value=True), \
-                 patch('commands.createblock.tau_manager', mock_tau), \
+            with patch('commands.createblock.tau_manager', mock_tau), \
                  patch('chain_state.tau_manager', mock_tau):
                 res = createblock.create_block_from_mempool()
         except Exception as e:
