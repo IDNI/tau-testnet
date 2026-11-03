@@ -107,7 +107,7 @@ def test_the_default_session_is_replaceable():
 
 # --- the engine drives the session it is given --------------------------------
 
-def _apply_with(session, rule="always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."):
+def _apply_with(session, rule="always ( o13[t]:bv[24] = { #x000001 }:bv[24] )."):
     from unittest.mock import patch
     from consensus.engine import TauConsensusEngine
     from consensus.state import TauStateSnapshot
@@ -151,7 +151,7 @@ def test_apply_records_the_rule_in_the_step_log():
     engine applied has to be in it."""
     m = _Manager(receipt={"outcome": "ACCEPTED_CHANGED", "accepted": True})
     session = ts.InProcessSession(manager=m)
-    rule = "always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."
+    rule = "always ( o13[t]:bv[24] = { #x000001 }:bv[24] )."
     _apply_with(session, rule=rule)
     rules = [e for e in session.log.entries() if e.kind == ts.RULE]
     assert rules, "the applied rule is missing from the step log"

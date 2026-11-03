@@ -26,8 +26,6 @@ from .approvals import (
     TX_TYPE_TRANSFER_VOTE,
     parse_approval_request,
     parse_transfer_vote,
-    screen_policy_widths,
-    screen_unsatisfiable_sender_conjunction,
 )
 from .retractable import (
     RETRACTABLE_TX_TYPES,
@@ -1607,6 +1605,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
                     return True
 
+                # Lazy: consensus.admission imports chain_state, which imports this module.
+                from consensus.admission import routed_rule_conflict
+                conflict = routed_rule_conflict(rule_text, operations)
+                if conflict:
+                    _did_not_land(
+                        f"o5 clause ignored ({conflict.error})", reason=conflict.reason
+                    )
+                    return True
+
                 if not isinstance(sender, str):
                     _did_not_land("o5 clause ignored (no sender)")
                     return True
@@ -1949,6 +1956,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             transfers_op_data = None
             custom_tau_inputs: dict[int, list[str]] = {}
             reserved_error = None
+            reserved_reason = None
 
             from consensus.governance import parse_consensus_rule_update, parse_consensus_rule_vote
 
@@ -2455,8 +2463,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     # consensus-shared constant) so apply agrees with the
                     # sendtx/admission gate. Consensus change.
                     if idx in tau_defs.RESERVED_STREAMS or idx in tau_defs.reserved_operation_keys(
-                            getattr(lifecycle_mgr, "effective_eligibility_mode", lambda: "")()):
+                            getattr(lifecycle_mgr, "effective_eligibility_mode", lambda: "")(),
+                            approval_slots_active=approval_slots_on):
                          reserved_error = f"Operation key '{k}' matches reserved stream {idx}."
+                         reserved_reason = "reserved_operation_key"
                          break
                     
                     # Normalize value
@@ -2503,6 +2513,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 accepted_in_block = False
                 hard_reject = True
                 execution_success = False
+                if reserved_reason:
+                    tx_receipt["reason"] = reserved_reason
                 tx_receipt["logs"].append(f"Error: {reserved_error}")
             else:
                 # --- Step 1: Rule Execution ---
@@ -2525,44 +2537,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         pass
                      elif isinstance(rule_op_data, str) and rule_op_data.strip():
                         rule_text = rule_op_data.strip()
-                        width_error = screen_policy_widths(rule_text)
-                        conj_error = (
-                            None if approval_slots_on
-                            else screen_unsatisfiable_sender_conjunction(rule_text)
-                        )
-                        if (width_error or conj_error) and not replay_mode:
-                            accepted_in_block = False
-                            hard_reject = True
-                            execution_success = False
-                            tx_receipt["reason"] = (
-                                "width_mismatch" if width_error
-                                else "unsatisfiable_sender_conjunction"
-                            )
-                            tx_receipt["logs"].append(
-                                f"Error: {width_error or conj_error}"
-                            )
                         # Lazy: consensus.admission imports chain_state, which imports this module.
-                        from consensus.admission import (
-                            screen_reserved_rule_outputs,
-                            screen_temporal_rule,
+                        from consensus.admission import screen_user_rule_text
+                        rejection = screen_user_rule_text(
+                            rule_text,
+                            getattr(lifecycle_mgr, "effective_eligibility_mode", lambda: "")(),
+                            approval_slots_on,
                         )
-                        output_error = (
-                            None if replay_mode
-                            else screen_reserved_rule_outputs(rule_text)
-                        )
-                        if output_error and not hard_reject:
+                        if rejection and not hard_reject:
                             accepted_in_block = False
                             hard_reject = True
                             execution_success = False
-                            tx_receipt["reason"] = "reserved_output_stream"
-                            tx_receipt["logs"].append(f"Error: {output_error}")
-                        temporal_error = screen_temporal_rule(rule_text)
-                        if temporal_error and not hard_reject:
-                            accepted_in_block = False
-                            hard_reject = True
-                            execution_success = False
-                            tx_receipt["reason"] = TEMPORAL_REFERENCE_REASON
-                            tx_receipt["logs"].append(f"Error: {temporal_error}")
+                            tx_receipt["reason"] = rejection.reason
+                            tx_receipt["logs"].append(f"Error: {rejection.error}")
                         if execution_success and accepted_in_block and not hard_reject:
                           try:
                             # The rule goes through the evaluator SESSION rather

@@ -918,18 +918,21 @@ class TestApplyRuleHonesty:
         comm.assert_not_called()
 
     def test_apply_keeps_user_fee_and_free_output_rules(self):
-        for stream in ("o8", "o12"):
-            rule = self._reserved_rule(stream)
+        guarded_o8 = (
+            f"always ((i12[t]:bv[384] = {{ #x{self.SENDER} }}:bv[384]) -> "
+            f"(o8[t]:bv[24] = {{ #x000001 }}:bv[24]))."
+        )
+        for rule in (guarded_o8, self._reserved_rule("o12")):
             result, _ = self._apply(rule, app_rules=rule)
             assert result.receipts["r1"].get("reason") != "reserved_output_stream"
             assert result.accepted_transactions
 
-    def test_replay_keeps_rule_writing_consensus_output(self):
+    def test_replay_rejects_rule_writing_consensus_output(self):
         rule = self._reserved_rule("o9")
         result, comm = self._apply(rule, app_rules=rule, replay_mode=True)
-        comm.assert_called()
-        assert result.accepted_transactions
-        assert result.receipts["r1"].get("reason") != "reserved_output_stream"
+        assert result.accepted_transactions == []
+        assert result.receipts["r1"].get("reason") == "reserved_output_stream"
+        comm.assert_not_called()
 
     def test_word_boundary_does_not_match_custom_streams(self):
         for stream in ("o90", "o60", "o10", "o12", "o41"):

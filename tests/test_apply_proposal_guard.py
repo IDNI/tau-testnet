@@ -21,7 +21,7 @@ from consensus.state import TauStateSnapshot
 
 SENDER = "aa" * 48
 PROPOSER = "bb" * 48
-RULE = "always ( o5[t]:bv[24] = { #x000002 }:bv[24] )."
+RULE = "always ( o13[t]:bv[24] = { #x000002 }:bv[24] )."
 
 
 def _proposal(session):

@@ -215,7 +215,7 @@ class TestStateReconstruction(unittest.TestCase):
             # Simple helper to build a unique rule for index i
             def rule_for(i: int) -> str:
                 pat = random_pattern()
-                return f"always ((i1[t]:bv[24] = {pat})? o1[t]:bv[24] = {{ 0 }}:bv[24] : o1[t]:bv[24] = i1[t]:bv[24])."
+                return f"always ((i1[t]:bv[24] = {pat})? o12[t]:bv[24] = {{ 0 }}:bv[24] : o12[t]:bv[24] = i1[t]:bv[24])."
 
             # -------- Block 0  (sender = addr1) --------
             tx1 = self.create_test_transaction(
@@ -423,7 +423,7 @@ class TestStateReconstruction(unittest.TestCase):
         # --- Start Tau ---
         self.start_tau()
         try:
-            rule_text = "o1[t] = i1[t]."
+            rule_text = "o12[t] = i1[t]."
 
             # Create a transaction containing both the rule and a transfer
             tx1 = self.create_test_transaction(

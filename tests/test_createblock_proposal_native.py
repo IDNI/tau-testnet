@@ -32,7 +32,7 @@ def _native_available():
 pytestmark = pytest.mark.skipif(not _native_available(),
                                 reason="native tau module not built")
 
-RULE = 'always ( o5[t]:bv[24] = { #x000000 }:bv[24] ).'
+RULE = 'always ( o12[t]:bv[24] = { #x000000 }:bv[24] ).'
 
 _CHILD = r'''
 import os, sys, tempfile, json

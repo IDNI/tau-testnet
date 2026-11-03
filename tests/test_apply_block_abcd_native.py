@@ -13,7 +13,7 @@ journal head, the allocator delta, and the evaluator's own counters.
 
 B is a genuine contaminant rather than a no-op. It registers a clause (lifecycle
 + registry), interns its own pubkey (allocator), installs a recomposed composite
-(evaluator), and only then fails on an unaffordable transfer.
+(evaluator), and only then fails fee settlement.
 """
 import os
 
@@ -77,7 +77,7 @@ def _env():
 
 def _router():
     with open(os.path.join(REPO, "genesis.tau")) as fh:
-        return f"always ( {fh.read().strip()} )."
+        return f"always ( {fh.read().strip()} && (o9[t]:bv[24] = {{ #x000007 }}:bv[24]) )."
 
 
 def _lifecycle():
@@ -133,8 +133,9 @@ OFFER = RuleOffer(offerer_pubkey=D_KEY, recipient_pubkey=A_KEY,
                   rule_text=OFFER_RULE, expire_at_height=500)
 
 TX_A = _rule_tx("A", A_KEY, _clause("000002"))
-TX_B = _rule_tx("B", B_KEY, _clause("000003"),
-                transfer=[B_KEY, C_KEY, "999999"])
+# An unmeetable fee (the router sets o9 = 7) is the rejection left once a routed
+# clause lands, since a rule sharing a tx with transfers is refused up front.
+TX_B = _rule_tx("B", B_KEY, _clause("000003"), fee_limit="1")
 TX_C = _rule_tx("C", C_KEY, _clause("000004"))
 TX_D = _offer_tx("D", OFFER)
 

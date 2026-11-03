@@ -77,7 +77,7 @@ def _env():
 
 def _router():
     with open(os.path.join(REPO, "genesis.tau")) as fh:
-        return f"always ( {fh.read().strip()} )."
+        return f"always ( {fh.read().strip()} && (o9[t]:bv[24] = {{ #x000007 }}:bv[24]) )."
 
 
 class _Lifecycle:
@@ -136,9 +136,9 @@ def _proposal(lifecycle):
     )
 
 
-def _tx(tx_id, sender, rule=None, transfer=None, sequence_number=0):
+def _tx(tx_id, sender, rule=None, transfer=None, sequence_number=0, fee_limit="1000"):
     tx = {"tx_id": tx_id, "tx_type": "user_tx", "sender_pubkey": sender,
-          "sequence_number": sequence_number, "fee_limit": "1000",
+          "sequence_number": sequence_number, "fee_limit": fee_limit,
           "operations": {}}
     if rule:
         tx["operations"]["0"] = rule
@@ -173,18 +173,17 @@ def _run(transactions):
 
 def test_a_routed_clause_rejected_at_a_later_stage_leaves_the_registry_alone(
         temp_database):
-    """B registers a clause, then cannot afford its transfer.
+    """B registers a clause, then cannot meet its fee.
 
     The registration, the approval resolution and the composite application all
     happened while B was still live. Only ownership can take them back.
     """
     ctx, result, lifecycle = _run([
-        _tx("B", SENDER_B, rule=NEW_CLAUSE,
-            transfer=[SENDER_B, SENDER_C, "999999"]),
+        _tx("B", SENDER_B, rule=NEW_CLAUSE, fee_limit="1"),
     ])
     try:
         assert "B" in [t.get("tx_id") for t in result.rejected_transactions], \
-            "B was supposed to be rejected at the transfer stage"
+            "B was supposed to be rejected at fee settlement"
 
         assert lifecycle.rule_offers.accepted_clauses == {
             (SENDER_B.lower(), STREAM): PREVIOUS_BODY
@@ -246,8 +245,7 @@ def test_the_rejected_clause_is_gone_from_the_evaluator_too(temp_database):
     rebuild on its way in, and the contract would look satisfied by accident.
     """
     ctx, result, lifecycle = _run([
-        _tx("B", SENDER_B, rule=NEW_CLAUSE,
-            transfer=[SENDER_B, SENDER_C, "999999"]),
+        _tx("B", SENDER_B, rule=NEW_CLAUSE, fee_limit="1"),
     ])
     try:
         # The proposal journal is what defines the evaluator after resolution,
