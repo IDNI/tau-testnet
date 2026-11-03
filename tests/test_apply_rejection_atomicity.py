@@ -105,7 +105,7 @@ def test_a_live_transaction_still_registers_its_clause():
 
 # --- the rule must not survive a later rejection ------------------------------
 
-RULE = "always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."
+RULE = "always ( o13[t]:bv[24] = { #x000001 }:bv[24] )."
 
 
 def _apply_rule_with_fee(*, fee_limit, saves, states):

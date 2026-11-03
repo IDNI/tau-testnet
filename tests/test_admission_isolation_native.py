@@ -476,6 +476,7 @@ def test_the_approval_preview_sees_the_authoritys_policy(authority):
     sk, pk = _sender("preview_owner")
     approver = "ab" * 48
     db.set_chain_state_value("approval_slots_active", "1")
+    chain_state._lifecycle_manager.activate_approval_slots()
     assert _submit(sk, pk, {"0": _tiered_policy(approver)}).get("ok")
     _mine()
     # the mined block rewrites the flag from the in-memory lifecycle

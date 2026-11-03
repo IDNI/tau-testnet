@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 import os
 import re
 import json
@@ -236,6 +236,102 @@ def _open_governance_admission() -> bool:
     return bool(getattr(config.settings.authority, "open_governance_admission", False))
 
 
+class UserRuleRejection(NamedTuple):
+    error: str
+    reason: str
+    code: str
+    details: Optional[Dict] = None
+
+
+def screen_user_rule_text(
+    rule_text: str, eligibility_mode: str, slots_active: bool
+) -> Optional[UserRuleRejection]:
+    """Screens for an accumulated op-0 rule, run by admission and by block apply.
+
+    A proposer can include a tx that never passed admission, so apply must refuse
+    exactly what admission refuses.
+    """
+    # A user rule on a consensus-owned output forges verdicts or fees, or makes the spec unsat.
+    # Governance revisions are exempt because writing those streams is their job.
+    reserved_error = screen_reserved_rule_outputs(rule_text)
+    if reserved_error:
+        return UserRuleRejection(reserved_error, "reserved_output_stream", "TX_REJECTED")
+
+    temporal_error = screen_temporal_rule(rule_text)
+    if temporal_error:
+        return UserRuleRejection(temporal_error, "temporal_reference", TEMPORAL_REFERENCE_CODE)
+
+    # A balance-reading fee rule is quoted against the current head but charged
+    # against the parent block, so the sender pays a different fee than quoted.
+    mocked_in = _streams_referenced(rule_text, APPLY_MOCKED_INPUT_STREAMS)
+    if mocked_in and _streams_referenced(rule_text, ("o8",)):
+        return UserRuleRejection(
+            f"user_tx FEE rule (o8) references input stream '{mocked_in[0]}' "
+            f"(balance): admission estimates it against the current head while "
+            f"apply uses the parent block, so the fee charged could differ from "
+            f"the estimate quoted to the sender. Balance-reading POLICY rules "
+            f"(o5) are permitted; for fees, tier on i1 instead.",
+            "fee_reads_balance",
+            "TX_REJECTED",
+        )
+
+    # i12 stays readable, since that is how a rule scopes itself. A plain rule is
+    # not a registered clause, so typing a reserved input pins its width process-wide.
+    typed_reserved = tau_defs.rule_text_forbidden_input_streams(
+        tau_defs.RULE_TEXT_CONTEXT_USER,
+        eligibility_mode,
+        approval_slots_active=slots_active,
+    )
+    typed_reserved_in = _streams_referenced(rule_text, typed_reserved)
+    if typed_reserved_in:
+        return UserRuleRejection(
+            f"user_tx rule text references reserved consensus input stream "
+            f"'{typed_reserved_in[0]}' (proposer pubkey / stake / eligibility mode): these are "
+            f"only fed at consensus evaluation steps, and typing them from a user rule can pin a "
+            f"conflicting bitvector width process-wide (e.g. i13 is bv[384]).",
+            "reserved_input_stream",
+            "TX_REJECTED",
+        )
+
+    # o5/o8 are shared across senders, so an unscoped write freezes transfers or taxes fees for all.
+    # A reference is not proof of gating; this catches the accidental global rule only.
+    policy_out = _streams_referenced(rule_text, ("o5", "o8"))
+    if policy_out and not _streams_referenced(rule_text, ("i12", "i3")):
+        return UserRuleRejection(
+            f"user_tx rule text writes shared policy stream '{policy_out[0]}' "
+            f"without a sender scope: it would apply to every account on the "
+            f"network. Guard the rule on your own identity — reference i12 "
+            f"(sender pubkey) or i3 (from address), e.g. "
+            f"always ((i12[t]:bv[384] = {{ #x<your pubkey> }}:bv[384]) -> "
+            f"{policy_out[0]}[t]:bv[24] = {{ #x000000 }}:bv[24]).",
+            "unscoped_user_rule",
+            "UNSCOPED_USER_RULE",
+            {"stream": policy_out[0]},
+        )
+
+    # Per-stream typing is process-global and sticky, so a bv[16] or untyped
+    # o5/o8 write pins the interpreter for everyone, even from a scoped rule.
+    width_error = screen_policy_widths(rule_text)
+    if width_error:
+        return UserRuleRejection(
+            width_error,
+            "width_mismatch",
+            "WIDTH_MISMATCH",
+            _width_mismatch_details(width_error) or {},
+        )
+
+    # While o5 accumulates, a top-level i12 conjunction is unsatisfiable for every
+    # other sender; a registered clause must not carry i12 at all.
+    if not slots_active:
+        conj_error = screen_unsatisfiable_sender_conjunction(rule_text)
+        if conj_error:
+            return UserRuleRejection(
+                conj_error, "unsatisfiable_sender_conjunction", "TX_REJECTED"
+            )
+
+    return None
+
+
 def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """
     Ensure user_tx does not interact with governance fields or reserved domains.
@@ -295,129 +391,20 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
                 f"write)."
             )
 
-    # Screen user rule TEXT for reserved streams. Comment-stripped and
-    # word-boundary matched (so custom streams like i23/o90 are not mistaken
-    # for i2/o9, and a stream named only in a comment is ignored).
-    #
-    #  (a) A user rule writing o6/o7 (block validity / eligibility) or o9
-    #      (consensus fee) would conflict with the voted consensus rules in the
-    #      composed spec (unsat -> DoS) or forge consensus verdicts/fees.
-    #  (b) A user rule reading i2 (balance — mocked to "0" at block apply) emits a
-    #      different o8 fee at admission than at inclusion -> admitted then
-    #      rejected at block build. i3/i4/i5 are real at both points and allowed.
-    #
-    # HARD for user txs; governance revisions stay exempt for (a) because
-    # writing those output streams is their legitimate job (see the consensus
-    # revision screen, which still hard-rejects (b)).
     rule_text = operations.get("0")
     if isinstance(rule_text, str) and rule_text:
-        # DECIDED FIRST, before any user-rule screen. Once approval slots are
-        # active an o5 rule is a registered clause, not accumulated text, and the
-        # two are screened by OPPOSITE rules: the user context forbids reading
-        # the approval slots that a clause exists to read, and requires an i12
-        # guard that a clause must not carry. Running the user screens first
-        # rejected every co-signature policy with "references reserved consensus
-        # input stream 'i18'" -- found by the live-node e2e, invisible to a unit
-        # test that called the routing validator directly.
+        # DECIDED FIRST, before any user-rule screen: once approval slots are
+        # active an o5 rule is a registered clause, and the user and clause
+        # contexts screen it by opposite rules (slot reads, i12 guard).
         routing = validate_o5_clause_routing(tx, tip_view, rule_text)
         if routing is not None:
             return routing
 
-        reserved_error = screen_reserved_rule_outputs(rule_text)
-        if reserved_error:
-            return format_error(reserved_error)
-
-        temporal_error = screen_temporal_rule(rule_text)
-        if temporal_error:
-            return format_error(temporal_error, code=TEMPORAL_REFERENCE_CODE)
-        # i2 (balance) is now fed from the parent-block snapshot at apply, frozen
-        # for the whole block, so proposer and verifier agree and a POLICY rule
-        # reading it is deterministic (issue #20). What remains is
-        # admission-estimate drift: admission evaluates against the current head,
-        # and the tx may land several blocks later.
-        #
-        # That drift only has teeth on the FEE streams. A wrong fee estimate is
-        # shown to the user as required_fee and then re-charged differently at
-        # inclusion, so the tx is dropped at block build after the wallet
-        # promised a number. A flipped o5 verdict just rejects the transfer,
-        # which is what a policy rule is for. So the screen now applies only to
-        # rules that write o8.
-        mocked_in = _streams_referenced(rule_text, APPLY_MOCKED_INPUT_STREAMS)
-        if mocked_in and _streams_referenced(rule_text, ("o8",)):
+        rejection = screen_user_rule_text(rule_text, tip_view.eligibility_mode, slots_active)
+        if rejection:
             return format_error(
-                f"user_tx FEE rule (o8) references input stream '{mocked_in[0]}' "
-                f"(balance): admission estimates it against the current head while "
-                f"apply uses the parent block, so the fee charged could differ from "
-                f"the estimate quoted to the sender. Balance-reading POLICY rules "
-                f"(o5) are permitted; for fees, tier on i1 instead."
+                rejection.error, code=rejection.code, **(rejection.details or {})
             )
-        # Same reserved set as the operations screen above, minus i12: READING the
-        # sender pubkey is how a policy rule scopes itself, only WRITING it as an
-        # operation is forbidden. Approval slots stay forbidden here -- a plain
-        # user_tx rule is not a registered o5 clause, and letting one type a slot
-        # would pin a width process-wide outside the clause screen's control.
-        typed_reserved = tau_defs.rule_text_forbidden_input_streams(
-            tau_defs.RULE_TEXT_CONTEXT_USER,
-            tip_view.eligibility_mode,
-            approval_slots_active=slots_active,
-        )
-        typed_reserved_in = _streams_referenced(rule_text, typed_reserved)
-        if typed_reserved_in:
-            return format_error(
-                f"user_tx rule text references reserved consensus input stream "
-                f"'{typed_reserved_in[0]}' (proposer pubkey / stake / eligibility mode): these are "
-                f"only fed at consensus evaluation steps, and typing them from a user rule can pin a "
-                f"conflicting bitvector width process-wide (e.g. i13 is bv[384])."
-            )
-
-        #  (c) o5/o8 are SHARED streams: Tau composes every deployed user rule
-        #      into one constraint, so a rule that writes them without gating on
-        #      its author's identity applies to EVERY sender. `always (o5[t] = 0)`
-        #      from any account is then a one-transaction network freeze, and
-        #      `always (o8[t] = 3)` taxes every user_tx on the network — both for
-        #      the price of a single deploy (issue #24, observation 1).
-        #
-        #      Sender-scoping was already the documented contract (tau_defs.py,
-        #      README) and every shipped wallet template already complies; this
-        #      only makes it enforced. i12 (sender pubkey) or i3 (from address)
-        #      both count as a scope.
-        #
-        #      Admission-only, so it is NOT retroactive: rules already accumulated
-        #      on chain keep evaluating, and apply never re-runs this screen.
-        #      Deliberate limit: a reference is not proof the rule is really gated
-        #      by it — `always (o5[t] = 1 || i12[t] != i12[t])` passes. Catching
-        #      that needs formula analysis, not text screening. The target here is
-        #      the accidental global rule, not a determined attacker (who can only
-        #      author a rule that also blocks their own transfers).
-        policy_out = _streams_referenced(rule_text, ("o5", "o8"))
-        if policy_out and not _streams_referenced(rule_text, ("i12", "i3")):
-            return format_error(
-                f"user_tx rule text writes shared policy stream '{policy_out[0]}' "
-                f"without a sender scope: it would apply to every account on the "
-                f"network. Guard the rule on your own identity — reference i12 "
-                f"(sender pubkey) or i3 (from address), e.g. "
-                f"always ((i12[t]:bv[384] = {{ #x<your pubkey> }}:bv[384]) -> "
-                f"{policy_out[0]}[t]:bv[24] = {{ #x000000 }}:bv[24]).",
-                code="UNSCOPED_USER_RULE",
-                stream=policy_out[0],
-            )
-
-        # Reject-unless-annotated bv[24] on o5/o8. Per-stream typing is
-        # process-global and sticky; a bv[16] or untyped `o5[t] = 0` pins the
-        # interpreter for everyone. Runs even when the rule is sender-scoped.
-        width_error = screen_policy_widths(rule_text)
-        if width_error:
-            mismatch = _width_mismatch_details(width_error) or {}
-            return format_error(width_error, code="WIDTH_MISMATCH", **mismatch)
-
-        # While o5 still accumulates (approval slots off), a top-level
-        # `i12 = me && …` total-form unit is unsatisfiable for every other
-        # sender. Implication / ternary are the documented guards. Goes away
-        # once routing is on — a registered clause must not carry i12 at all.
-        if not slots_active:
-            conj_error = screen_unsatisfiable_sender_conjunction(rule_text)
-            if conj_error:
-                return format_error(conj_error)
 
     return success()
 
@@ -1110,6 +1097,33 @@ def validate_rule_offer_decision_payload(
 
 # --- Routing an o5 policy rule into the clause registry ----------------------
 
+def routed_rule_conflict(rule_text: str, operations: Dict) -> Optional[UserRuleRejection]:
+    """Why a rule writing o5 cannot be registered as a policy clause, if it cannot."""
+    streams = clause_output_streams(rule_text)
+    if len(streams) > 1:
+        others = ", ".join(f"o{s}" for s in streams if s != tau_defs.USER_POLICY_STREAM_INDEX)
+        return UserRuleRejection(
+            f"A rule writing o5 is registered as your policy clause and may write "
+            f"o5 only; this one also writes {others}. Split it into separate "
+            f"transactions.",
+            "mixed_output_rule",
+            "MIXED_OUTPUT_RULE",
+        )
+
+    # The rule replaces the policy that judges transfers, and transfers in the
+    # same tx would be judged by the very clause being replaced.
+    transfers = operations.get("1")
+    if isinstance(transfers, (list, tuple)) and len(transfers) > 0:
+        return UserRuleRejection(
+            "A policy rule (o5) and transfers cannot share one transaction: the "
+            "transfers would be judged by the policy this rule replaces. Send the "
+            "rule first, then the transfers.",
+            "rule_with_transfers",
+            "RULE_WITH_TRANSFERS",
+        )
+    return None
+
+
 def validate_o5_clause_routing(
     tx: Dict, tip_view: TipAdmissionView, rule_text: str
 ) -> Optional[AdmissionResult]:
@@ -1138,28 +1152,9 @@ def validate_o5_clause_routing(
     if tau_defs.USER_POLICY_STREAM_INDEX not in streams:
         return None
 
-    if len(streams) > 1:
-        others = ", ".join(f"o{s}" for s in streams if s != tau_defs.USER_POLICY_STREAM_INDEX)
-        return format_error(
-            f"A rule writing o5 is registered as your policy clause and may write "
-            f"o5 only; this one also writes {others}. Split it into separate "
-            f"transactions.",
-            code="MIXED_OUTPUT_RULE",
-        )
-
-    # A routed rule replaces the policy that would judge the transfers, so the
-    # two cannot share a transaction: admission compiles the rule separately and
-    # evaluates transfers against the EXISTING live policy, which would judge
-    # them by the very clause being replaced.
-    operations = tx.get("operations") or {}
-    transfers = operations.get("1")
-    if isinstance(transfers, (list, tuple)) and len(transfers) > 0:
-        return format_error(
-            "A policy rule (o5) and transfers cannot share one transaction: the "
-            "transfers would be judged by the policy this rule replaces. Send the "
-            "rule first, then the transfers.",
-            code="RULE_WITH_TRANSFERS",
-        )
+    conflict = routed_rule_conflict(rule_text, tx.get("operations") or {})
+    if conflict:
+        return format_error(conflict.error, code=conflict.code)
 
     try:
         body = clause_body_v1(rule_text)

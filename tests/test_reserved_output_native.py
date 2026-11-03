@@ -16,8 +16,8 @@ live apply path has to refuse it too:
    the accumulated application rules, and the transfer is still charged the
    consensus fee.
 
-3. REPLAY. Stored blocks are canonical, so the same block under
-   `replay_mode=True` keeps the old behaviour: the rule is applied.
+3. REPLAY. The same block under `replay_mode=True` is refused the same way,
+   so a node rebuilding from stored blocks agrees with live apply.
 
 Each case runs in a child process: the engine types streams process-wide, and
 the native library segfaults on interpreter teardown, so the child prints a
@@ -301,13 +301,11 @@ def test_live_apply_rejects_the_hostile_rule_and_keeps_the_builtin_values(tmp_pa
 
 
 @requires_native
-def test_replay_applies_the_rule_a_stored_block_already_carried(tmp_path):
-    """Replay never re-litigates a stored block: the screen is live-only, so the
-    rule is applied and, being the later unit, zeroes the fee."""
+def test_replay_rejects_the_rule_like_live_apply(tmp_path):
     out = _apply(tmp_path, HOSTILE_O9, replay=True)
 
-    assert out["rule_reason"] != "reserved_output_stream", out
-    assert "rule-tx" in out["accepted"], out
-    assert out["rules_changed"], out
-    assert out["rule_in_saved_state"], out
-    assert out["proposer_balance"] == 0, out
+    assert out["invalid"] == ["rule-tx"], out
+    assert out["rule_reason"] == "reserved_output_stream", out
+    assert not out["rules_changed"], out
+    assert not out["rule_in_saved_state"], out
+    assert out["proposer_balance"] == FEE, out

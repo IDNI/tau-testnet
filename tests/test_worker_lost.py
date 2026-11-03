@@ -32,7 +32,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SENDER = "aa" * 48
 RECIPIENT = "cc" * 48
 PROPOSER = "bb" * 48
-RULE = "always ( o5[t]:bv[24] = { #x000002 }:bv[24] )."
+RULE = "always ( o13[t]:bv[24] = { #x000002 }:bv[24] )."
 LOST = "worker closed the result channel"
 
 
