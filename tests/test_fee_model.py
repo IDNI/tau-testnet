@@ -18,12 +18,13 @@ import config
 import chain_state
 import db
 import tau_defs
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload
 from consensus import fees
 from consensus.engine import TauConsensusEngine
 from consensus.fees import FeeRuleError
 from consensus.state import TauStateSnapshot
 
-SENDER = "a" * 96
+SENDER = pubkey_hex(SK_ALICE)
 RECIPIENT = "c" * 96
 PROPOSER = "b" * 96
 
@@ -412,12 +413,6 @@ class TestAdmissionFees(unittest.TestCase):
         self.iso_patcher.start()
         self.addCleanup(self.iso_patcher.stop)
 
-        # Crypto is mandatory now: mock signature verification instead of disabling it.
-        self.crypto_patcher = patch("commands.sendtx.G2Basic")
-        mock_bls = self.crypto_patcher.start()
-        mock_bls.Verify.return_value = True
-        self.addCleanup(self.crypto_patcher.stop)
-
         # Sequence enforcement is on; pin the sender's expected sequence to match
         # the payload (sequence_number=1) and fund the sender (no auto-faucet).
         self.seq_patcher = patch(
@@ -457,13 +452,12 @@ class TestAdmissionFees(unittest.TestCase):
             "expire_at_height": 5000,
             "operations": operations if operations is not None else {"100": "42"},
             "fee_limit": fee_limit,
-            "signature": "00" * 48,
         }
         if tx_type != "user_tx":
             p["tx_type"] = tx_type
             p.pop("operations")
         p.update(extra)
-        return p
+        return sign_payload(p, SK_ALICE)
 
     def test_missing_fee_limit_rejected(self):
         p = self.payload()

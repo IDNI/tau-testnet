@@ -14,6 +14,14 @@ from consensus.engine import TauConsensusEngine
 from consensus.state import TauStateSnapshot
 import chain_state
 import tau_manager
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload
+
+SENDER = pubkey_hex(SK_ALICE)
+
+
+def _signed(payload):
+    return json.dumps(sign_payload(payload, SK_ALICE))
+
 
 class TestCustomInputs(unittest.TestCase):
 
@@ -50,11 +58,6 @@ class TestCustomInputs(unittest.TestCase):
         self.addCleanup(self.test_mode_patcher.stop)
         self.addCleanup(self.isolated_patcher.stop)
 
-        # Crypto is mandatory now: mock signature verification instead of disabling it.
-        self.crypto_patcher = patch('commands.sendtx.G2Basic')
-        mock_bls = self.crypto_patcher.start()
-        mock_bls.Verify.return_value = True
-        self.addCleanup(self.crypto_patcher.stop)
         self.seq_patcher = patch('commands.sendtx.chain_state.get_sequence_number', return_value=1)
         self.seq_patcher.start()
         self.addCleanup(self.seq_patcher.stop)
@@ -68,15 +71,14 @@ class TestCustomInputs(unittest.TestCase):
         # rejected by the sendtx custom-input parse.
         for key in ["2", "3", "4"]:
             payload = {
-                "sender_pubkey": "a" * 96,
+                "sender_pubkey": SENDER,
                 "sequence_number": 1,
                 "expiration_time": 9999999999,
                 "expire_at_height": 5000,
                 "operations": {key: "val"},
                 "fee_limit": 100,
-                "signature": "00" * 48
             }
-            json_blob = json.dumps(payload)
+            json_blob = _signed(payload)
             with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
                 with patch('commands.sendtx.db.add_mempool_tx'):
                     result = sendtx.queue_transaction(json_blob, propagate=False)
@@ -88,17 +90,16 @@ class TestCustomInputs(unittest.TestCase):
         """operations["12"] (sender-pubkey stream) is rejected at the authoritative
         admission gate before it can reach the custom-input merge and spoof i12."""
         payload = {
-            "sender_pubkey": "a" * 96,
+            "sender_pubkey": SENDER,
             "sequence_number": 1,
             "expiration_time": 9999999999,
             "expire_at_height": 5000,
             "operations": {"12": "deadbeef"},
             "fee_limit": 100,
-            "signature": "00" * 48,
         }
         with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
             with patch('commands.sendtx.db.add_mempool_tx'):
-                result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
+                result = sendtx.queue_transaction(_signed(payload), propagate=False)
         self.assertFalse(result["ok"])
         self.assertIn("12", result["message"])
 
@@ -107,17 +108,16 @@ class TestCustomInputs(unittest.TestCase):
         admission before they can pin a conflicting bv width process-wide."""
         for key in ("14", "15"):
             payload = {
-                "sender_pubkey": "a" * 96,
+                "sender_pubkey": SENDER,
                 "sequence_number": 1,
                 "expiration_time": 9999999999,
                 "expire_at_height": 5000,
                 "operations": {key: "5"},
                 "fee_limit": 100,
-                "signature": "00" * 48,
             }
             with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
                 with patch('commands.sendtx.db.add_mempool_tx'):
-                    result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
+                    result = sendtx.queue_transaction(_signed(payload), propagate=False)
             self.assertFalse(result["ok"], msg=f"key {key} accepted")
             self.assertIn(key, result["message"])
 
@@ -140,7 +140,7 @@ class TestCustomInputs(unittest.TestCase):
         """Test that sendtx accepts keys >= 5 and normalizes values."""
         
         payload = {
-            "sender_pubkey": "A" * 96,
+            "sender_pubkey": SENDER,
             "sequence_number": 1,
             "expiration_time": 9999999999,
             "expire_at_height": 5000,
@@ -149,14 +149,12 @@ class TestCustomInputs(unittest.TestCase):
                 "200": ["a", 1]
             },
             "fee_limit": 100,
-            "signature": "00" * 48,
-            "sender_pubkey": "a" * 96 # Valid-ish hex
         }
         
         # Mock validators to pass structure checks
         with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
              with patch('commands.sendtx.db.add_mempool_tx'):
-                result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
+                result = sendtx.queue_transaction(_signed(payload), propagate=False)
         
         self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
         
@@ -181,7 +179,7 @@ class TestCustomInputs(unittest.TestCase):
         path. The rule no longer goes through communicate_with_tau, and the live
         validate-then-restore is skipped entirely on the isolated path."""
         payload = {
-            "sender_pubkey": "a" * 96,
+            "sender_pubkey": SENDER,
             "sequence_number": 1,
             "expiration_time": 9999999999,
             "expire_at_height": 5000,
@@ -190,13 +188,12 @@ class TestCustomInputs(unittest.TestCase):
                 "100": "42"
             },
             "fee_limit": 100,
-            "signature": "00" * 48
         }
 
         with patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)):
              with patch('commands.sendtx.db.add_mempool_tx'):
                  with patch('tau_manager.reset_tau_state') as mock_reset:
-                    result = sendtx.queue_transaction(json.dumps(payload), propagate=False)
+                    result = sendtx.queue_transaction(_signed(payload), propagate=False)
 
         self.assertTrue(result["ok"], msg=f"queue_transaction failed: {result}")
 

@@ -2,6 +2,7 @@ import json
 import time
 
 import config
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload
 from commands import sendtx
 import tau_manager
 
@@ -24,16 +25,14 @@ def test_sendtx_ignores_force_test_outside_test_env(monkeypatch):
     config.reload_settings(env="development")
 
     try:
-        sender = "a" * 96
-        payload = {
-            "sender_pubkey": sender,
+        payload = sign_payload({
+            "sender_pubkey": pubkey_hex(SK_ALICE),
             "sequence_number": 0,
             "expiration_time": int(time.time()) + 1000,
             "expire_at_height": 5000,
             "operations": {"0": "always o12[t] := i9[t]."},
             "fee_limit": "0",
-            "signature": "00" * 48,
-        }
+        }, SK_ALICE)
 
         compile_calls = []
 
@@ -41,8 +40,6 @@ def test_sendtx_ignores_force_test_outside_test_env(monkeypatch):
             compile_calls.append((prior_spec, revisions, timeout))
             return "syntax error in rule"  # non-None -> rejection
 
-        # Crypto is mandatory now: mock signature verification instead of disabling it.
-        monkeypatch.setattr(sendtx.G2Basic, "Verify", lambda *args, **kwargs: True)
         monkeypatch.setattr(sendtx, "_validate_bls12_381_pubkey", lambda *args, **kwargs: (True, None))
         monkeypatch.setattr(sendtx.chain_state, "get_sequence_number", lambda *_args, **_kwargs: 0)
         monkeypatch.setattr(sendtx.chain_state, "get_rules_state", lambda: None)

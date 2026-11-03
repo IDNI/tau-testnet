@@ -95,9 +95,8 @@ class _NativeFeeE2EBase(unittest.TestCase):
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}).start()
 
         # Signature plumbing is out of scope here (covered elsewhere);
-        # everything Tau/fee related runs for real. BLS is mandatory now, so
-        # mock the verifier instead of disabling it.
-        patch("commands.sendtx.G2Basic.Verify", return_value=True).start()
+        # everything Tau/fee related runs for real, so only the verdict is forced.
+        patch("consensus.tx_signing._bls_verify", return_value=True).start()
         patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
         patch("commands.createblock._BLS_AVAILABLE", True).start()
         patch("commands.createblock._validate_signature", return_value=True).start()

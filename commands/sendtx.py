@@ -650,10 +650,8 @@ def _check_tx_envelope(payload: dict) -> dict | None:
     if not (_PY_ECC_AVAILABLE and _PY_ECC_BLS):
         return _qt_err("BLS_UNAVAILABLE", "BLS signatures are required but py_ecc is missing.")
 
-    # One verifier, shared with block apply (consensus/tx_signing.py). G2Basic is
-    # read from this module's globals at call time so the many tests that
-    # patch("commands.sendtx.G2Basic") keep working.
-    sig_ok, sig_reason = verify_tx_signature(payload, g2=globals().get("G2Basic"))
+    # One verifier, shared with block apply (consensus/tx_signing.py).
+    sig_ok, sig_reason = verify_tx_signature(payload)
     if not sig_ok:
         return _qt_err("INVALID_SIGNATURE", f"Invalid signature: {sig_reason}")
     return None
