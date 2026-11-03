@@ -23,12 +23,13 @@ if tests_dir not in sys.path:
 import config
 import db
 import chain_state
-from chain_state import GENESIS_ADDRESS, GENESIS_BALANCE
+from bls_keys import SK_BOB, pubkey_hex
+from chain_state import GENESIS_BALANCE
 from consensus.engine import TauConsensusEngine
 from consensus.fees import FeeRuleError
-from test_reorg_deep_chain import ADDR2, ADDR3, BASE_TS, DeepChainTestCase, _tx, quiet
+from test_reorg_deep_chain import ADDR2, ADDR3, BASE_TS, FUNDED_ACCOUNT, DeepChainTestCase, _tx, quiet
 
-KEYED = "cc" * 48
+KEYED = pubkey_hex(SK_BOB)
 STRAY = "dd" * 48
 
 
@@ -79,8 +80,8 @@ class TransferTsReorgTests(DeepChainTestCase):
         chain_state._last_transfer_ts.clear()
         with quiet():
             chain_state.load_genesis("data/genesis.json")
-        chain_state._genesis_accounts_state = {GENESIS_ADDRESS: GENESIS_BALANCE}
-        chain_state._balances[GENESIS_ADDRESS] = GENESIS_BALANCE
+        chain_state._genesis_accounts_state = {FUNDED_ACCOUNT: GENESIS_BALANCE}
+        chain_state._balances[FUNDED_ACCOUNT] = GENESIS_BALANCE
 
     def _account_row(self, address):
         with db._db_lock:
@@ -106,16 +107,16 @@ class TransferTsReorgTests(DeepChainTestCase):
     def test_losing_fork_stamp_is_dropped(self):
         """A transfer that exists only on the losing suffix does not keep its stamp."""
         prefix = self.extend(self.genesis_hash, 0, 6)
-        losing_tx = _tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, ADDR2, "5"]])
+        losing_tx = _tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, ADDR2, "5"]])
         losing = self.extend(prefix[-1].block_hash, 6, 3, proposer="b" * 96,
                              txs={8: [losing_tx]})
         winning = self.extend(prefix[-1].block_hash, 6, 5, proposer="c" * 96)
         self.adopt(prefix + losing)
         self.assertEqual(
-            chain_state._last_transfer_ts.get(GENESIS_ADDRESS), BASE_TS + 8)
+            chain_state._last_transfer_ts.get(FUNDED_ACCOUNT), BASE_TS + 8)
 
         self.adopt(winning)
-        self.assertNotIn(GENESIS_ADDRESS, chain_state._last_transfer_ts)
+        self.assertNotIn(FUNDED_ACCOUNT, chain_state._last_transfer_ts)
         self._assert_matches_follower(prefix + winning)
 
     def test_stamp_follows_winner_when_both_forks_send(self):
@@ -123,23 +124,23 @@ class TransferTsReorgTests(DeepChainTestCase):
         prefix = self.extend(self.genesis_hash, 0, 6)
         losing = self.extend(
             prefix[-1].block_hash, 6, 3, proposer="b" * 96,
-            txs={8: [_tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, ADDR2, "5"]])]})
+            txs={8: [_tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, ADDR2, "5"]])]})
         winning = self.extend(
             prefix[-1].block_hash, 6, 5, proposer="c" * 96,
-            txs={9: [_tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, ADDR3, "7"]])]})
+            txs={9: [_tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, ADDR3, "7"]])]})
         self.adopt(prefix + losing)
         self.adopt(winning)
 
         self.assertEqual(
-            chain_state._last_transfer_ts.get(GENESIS_ADDRESS), BASE_TS + 9)
+            chain_state._last_transfer_ts.get(FUNDED_ACCOUNT), BASE_TS + 9)
         node = self._assert_matches_follower(prefix + winning)
-        self.assertEqual(node[0].get(GENESIS_ADDRESS), BASE_TS + 9)
+        self.assertEqual(node[0].get(FUNDED_ACCOUNT), BASE_TS + 9)
 
     def test_losing_fork_only_sender_leaves_no_account_row(self):
         """A sender funded only on the losing fork must not survive as a 0/0 row."""
         prefix = self.extend(self.genesis_hash, 0, 6)
-        fund = _tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, KEYED, "100"]])
-        send = _tx(KEYED, 0, [[KEYED, ADDR2, "5"]])
+        fund = _tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, KEYED, "100"]])
+        send = _tx(KEYED, 0, [[KEYED, ADDR2, "5"]], sk=SK_BOB)
         losing = self.extend(prefix[-1].block_hash, 6, 3, proposer="b" * 96,
                              txs={7: [fund], 8: [send]})
         winning = self.extend(prefix[-1].block_hash, 6, 5, proposer="c" * 96)
@@ -154,18 +155,18 @@ class TransferTsReorgTests(DeepChainTestCase):
         """A replay that dies mid-winner must not leave the winner's stamps behind."""
         shared = self.extend(
             self.genesis_hash, 0, 4,
-            txs={2: [_tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, ADDR3, "4"]])]})
+            txs={2: [_tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, ADDR3, "4"]])]})
         canonical = self.extend(shared[-1].block_hash, 4, 4)
         self.adopt(shared + canonical)
         prior = dict(chain_state._last_transfer_ts)
-        self.assertEqual(prior.get(GENESIS_ADDRESS), BASE_TS + 2)
+        self.assertEqual(prior.get(FUNDED_ACCOUNT), BASE_TS + 2)
         self.assertNotIn(KEYED, prior)
 
         winner = self.extend(
             shared[-1].block_hash, 4, 3, proposer="b" * 96,
             txs={
-                5: [_tx(GENESIS_ADDRESS, 1, [[GENESIS_ADDRESS, KEYED, "100"]])],
-                6: [_tx(KEYED, 0, [[KEYED, ADDR2, "5"]])],
+                5: [_tx(FUNDED_ACCOUNT, 1, [[FUNDED_ACCOUNT, KEYED, "100"]])],
+                6: [_tx(KEYED, 0, [[KEYED, ADDR2, "5"]], sk=SK_BOB)],
             })
         self.ingest(winner)
         fail_hash = winner[-1].block_hash
@@ -189,10 +190,10 @@ class TransferTsReorgTests(DeepChainTestCase):
         """A stamp loaded from disk is discarded; replay is the source of truth."""
         chain = self.extend(
             self.genesis_hash, 0, 6,
-            txs={3: [_tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, ADDR2, "5"]])]})
+            txs={3: [_tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, ADDR2, "5"]])]})
         self.adopt(chain)
         expected = dict(chain_state._last_transfer_ts)
-        self.assertEqual(expected.get(GENESIS_ADDRESS), BASE_TS + 3)
+        self.assertEqual(expected.get(FUNDED_ACCOUNT), BASE_TS + 3)
 
         with db._db_lock:
             db._db_conn.execute(

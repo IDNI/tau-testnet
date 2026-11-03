@@ -57,7 +57,8 @@ def _native_python():
 
 def _child_env():
     env = dict(os.environ)
-    env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [REPO_ROOT, os.path.join(REPO_ROOT, "tests"), env.get("PYTHONPATH", "")])
     env["REPO_ROOT"] = REPO_ROOT
     return env
 
@@ -164,7 +165,7 @@ emit({"before": {"o1": stream(before, 1), "o9": stream(before, 9)},
 
 _APPLY_BODY = r'''
 import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import config
 config.set_database_path(os.path.join(tempfile.mkdtemp(), "reserved.sqlite"))
@@ -174,10 +175,13 @@ import tau_manager
 import tau_shrink
 import chain_state
 from block import Block
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_tx
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager
 from consensus.state import TauStateSnapshot
 
+A = pubkey_hex(SK_ALICE)
+B = pubkey_hex(SK_BOB)
 tau_shrink.set_shrink_width_from_db()
 iface, revise = boot_interface(through_manager=True)
 # As a node wires it: an accepted rule lands in the hashed accumulation.
@@ -187,12 +191,12 @@ HOSTILE = os.environ["HOSTILE_RULE"]
 REPLAY = os.environ["REPLAY_MODE"] == "1"
 AMOUNT = int(os.environ["AMOUNT"])
 
-tx_rule = {"tx_id": "rule-tx", "tx_type": "user_tx", "sender_pubkey": A,
-           "sequence_number": 0, "fee_limit": "1000",
-           "operations": {"0": HOSTILE}}
-tx_transfer = {"tx_id": "transfer-tx", "tx_type": "user_tx", "sender_pubkey": B,
-               "sequence_number": 0, "fee_limit": "1000",
-               "operations": {"1": [[B, A, str(AMOUNT)]]}}
+tx_rule = sign_tx({"tx_id": "rule-tx", "tx_type": "user_tx", "sender_pubkey": A,
+                   "sequence_number": 0, "fee_limit": "1000",
+                   "operations": {"0": HOSTILE}}, SK_ALICE)
+tx_transfer = sign_tx({"tx_id": "transfer-tx", "tx_type": "user_tx", "sender_pubkey": B,
+                       "sequence_number": 0, "fee_limit": "1000",
+                       "operations": {"1": [[B, A, str(AMOUNT)]]}}, SK_BOB)
 
 lifecycle = ConsensusLifecycleManager(active_validators=[PROPOSER])
 parent_app_rules = GENESIS["application_rules"]
@@ -211,8 +215,7 @@ view = ActiveConsensusView(target_height=1,
 
 engine = TauConsensusEngine(state_store=MagicMock())
 engine._state_store.commit.side_effect = lambda snap: snap
-with patch("consensus.engine.verify_tx_signature", return_value=(True, "")):
-    result = engine.apply_block(view, block, parent, replay_mode=REPLAY)
+result = engine.apply_block(view, block, parent, replay_mode=REPLAY)
 
 outcomes = {o.tx_id: o for o in result.outcomes}
 balances = result.next_snapshot.metadata["balances"]

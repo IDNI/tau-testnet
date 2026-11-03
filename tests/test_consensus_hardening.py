@@ -14,12 +14,13 @@ boundary" and "State hash"):
     the validator set can react — in the limit, reaching quorum and activating
     in the same block.
 """
+from bls_keys import SK_ALICE, pubkey_hex, sign_tx
 from consensus.governance import ConsensusLifecycleManager, DEFAULT_QUORUM_POLICY
 from consensus.engine import TauConsensusEngine
 from consensus.state import TauStateSnapshot
 
-# Distinct 96-hex (48-byte) validator pubkeys.
-V1, V2, V3, V4, V5 = ("11" * 48, "22" * 48, "33" * 48, "44" * 48, "55" * 48)
+# Distinct 96-hex (48-byte) validator pubkeys; V1 holds a real key and signs the updates.
+V1, V2, V3, V4, V5 = (pubkey_hex(SK_ALICE), "22" * 48, "33" * 48, "44" * 48, "55" * 48)
 
 
 def _make_lm(validators, quorum_policy=""):
@@ -77,15 +78,15 @@ def test_genesis_pinned_majority_threshold():
 # Fix 2: activation delay enforced in the engine block path
 # --------------------------------------------------------------------------- #
 
-def _update_tx(activate_at_height, salt="a", sender=V1):
-    return {
+def _update_tx(activate_at_height, salt="a"):
+    return sign_tx({
         "tx_type": "consensus_rule_update",
         "tx_id": f"u_{activate_at_height}_{salt}",
-        "sender_pubkey": sender,
+        "sender_pubkey": V1,
         "rule_revisions": [f"always (o6[t]:bv[16] = {{ 1 }}:bv[16]). % {salt}"],
         "activate_at_height": activate_at_height,
         "operations": {},
-    }
+    }, SK_ALICE)
 
 
 def _apply_update(lm, tx, block_height):

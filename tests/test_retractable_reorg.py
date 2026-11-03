@@ -10,7 +10,6 @@ memory.
 Mock engine, replayed without Tau (see test_reorg_deep_chain.py): what is under
 test is the book across the rebuild, not the transfer verdict.
 """
-import hashlib
 import os
 import tempfile
 
@@ -18,13 +17,11 @@ import config
 import chain_state
 import db
 from block import Block, compute_tx_hash
-from py_ecc.bls import G2Basic
-
-from consensus.tx_signing import signing_message_bytes
-from test_reorg_deep_chain import ADDR2, BASE_TS, GENESIS_ADDRESS, DeepChainTestCase, quiet
+from bls_keys import sign_payload, pubkey_hex
+from test_reorg_deep_chain import ADDR2, BASE_TS, FUNDED_ACCOUNT, DeepChainTestCase, _tx, quiet
 
 SK = 4242
-SENDER = G2Basic.SkToPk(SK).hex()
+SENDER = pubkey_hex(SK)
 FUNDED = 1000
 AMOUNT = 40
 RELEASE_TIME = BASE_TS + 1000
@@ -32,18 +29,11 @@ PROPOSER = "a" * 96
 
 
 def _sign(tx):
-    digest = hashlib.sha256(signing_message_bytes(tx)).digest()
-    tx["signature"] = G2Basic.Sign(SK, digest).hex()
-    return tx
+    return sign_payload(tx, SK)
 
 
 def funding():
-    return {
-        "sender_pubkey": GENESIS_ADDRESS, "sequence_number": 0,
-        "expiration_time": 9999999999, "expire_at_height": 5000,
-        "operations": {"1": [[GENESIS_ADDRESS, SENDER, str(FUNDED)]]},
-        "fee_limit": "0", "signature": "dummy_signature_for_testing",
-    }
+    return _tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, SENDER, str(FUNDED)]])
 
 
 def park(seq=0, *, at_height=None, at_time=None, amount=AMOUNT, expire_at_height=40,
@@ -144,8 +134,8 @@ class RetractableReorgTestCase(DeepChainTestCase):
         db.init_db()
         db.clear_mempool()
         chain_state.load_genesis("data/genesis.json")
-        chain_state._genesis_accounts_state = {GENESIS_ADDRESS: chain_state.GENESIS_BALANCE}
-        chain_state._balances[GENESIS_ADDRESS] = chain_state.GENESIS_BALANCE
+        chain_state._genesis_accounts_state = {FUNDED_ACCOUNT: chain_state.GENESIS_BALANCE}
+        chain_state._balances[FUNDED_ACCOUNT] = chain_state.GENESIS_BALANCE
         self.genesis_hash = db.get_genesis_hash()
 
     def assertState(self, got, **expected):

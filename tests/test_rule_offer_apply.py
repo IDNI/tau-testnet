@@ -15,14 +15,13 @@ Design constraints these tests encode:
 - Only a Tau failure on the composed rule hard-rejects, because that means the
   text could not have entered the specification at all.
 """
-import hashlib
 import itertools
 
 import pytest
-from py_ecc.bls import G2Basic
 from unittest.mock import patch
 
 from block import Block
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager
 from consensus.rule_offers import (
@@ -33,11 +32,11 @@ from consensus.rule_offers import (
     clause_body_v1,
 )
 from consensus.state import TauStateSnapshot
-from consensus.tx_signing import signing_message_bytes
 
-A = "aa" * 48   # offerer
-B = "bb" * 48   # recipient / acceptor
-C = "cc" * 48   # second acceptor
+A = pubkey_hex(SK_ALICE)   # offerer
+B = pubkey_hex(SK_BOB)     # recipient / acceptor
+C = pubkey_hex(SK_CAROL)   # second acceptor
+_SK = {A: SK_ALICE, B: SK_BOB, C: SK_CAROL}
 BLOCK_RULE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
 ALLOW_RULE = "always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."
 TARGET = 5
@@ -57,44 +56,34 @@ _TX_SEQ = itertools.count()
 
 
 def offer_tx(offer, sender=None, seq=0):
-    return {
+    sender = sender or offer.offerer_pubkey
+    return sign_payload({
         "tx_id": f"offer-{next(_TX_SEQ)}",
         "tx_type": "rule_offer",
-        "sender_pubkey": sender or offer.offerer_pubkey,
+        "sender_pubkey": sender,
         "sequence_number": seq,
+        "expiration_time": 9999999999,
         "recipient_pubkey": offer.recipient_pubkey,
         "rule_text": offer.rule_text,
         "expire_at_height": offer.expire_at_height,
         "fee_limit": "0",
-    }
+    }, _SK[sender])
 
 
 def decision_tx(offer, *, accept, sender=None, rule_text=None, seq=0):
+    sender = sender or offer.recipient_pubkey
     tx = {
         "tx_id": f"decision-{next(_TX_SEQ)}",
         "tx_type": "rule_offer_accept" if accept else "rule_offer_reject",
-        "sender_pubkey": sender or offer.recipient_pubkey,
+        "sender_pubkey": sender,
         "sequence_number": seq,
+        "expiration_time": 9999999999,
         "offer_id": offer.offer_id_hex,
         "fee_limit": "0",
     }
     if accept:
         tx["rule_text"] = rule_text if rule_text is not None else offer.rule_text
-    return tx
-
-
-SK_REAL_B = 44444
-REAL_B = G2Basic.SkToPk(SK_REAL_B).hex()
-
-
-def signed_accept(offer):
-    """An accept the apply-time signature check lets through."""
-    tx = decision_tx(offer, accept=True)
-    tx["expiration_time"] = 9999999999
-    tx["signature"] = G2Basic.Sign(
-        SK_REAL_B, hashlib.sha256(signing_message_bytes(tx)).digest()
-    ).hex()
-    return tx
+    return sign_payload(tx, _SK[sender])
 
 
 def _apply(txs, lm=None, height=HEIGHT, tau_output="T"):
@@ -394,16 +383,16 @@ def test_accepting_an_offered_o5_clause_fails_the_acceptors_open_requests():
     lm = ConsensusLifecycleManager(active_validators=[A])
     lm.activate_approval_slots()
     req = ApprovalRequest(
-        sender_pubkey=REAL_B, recipient_pubkey=C, amount=5000,
+        sender_pubkey=B, recipient_pubkey=C, amount=5000,
         sequence_number=0, expire_at_height=EXPIRE,
         approvers={18: A}, custom_inputs={},
     )
     lm.approval_requests.submit_request(req)
 
-    offer = _offer(recipient=REAL_B, text=ALLOW_RULE)
-    _, post, _ = _apply([offer_tx(offer), signed_accept(offer)], lm=lm)
+    offer = _offer(text=ALLOW_RULE)
+    _, post, _ = _apply([offer_tx(offer), decision_tx(offer, accept=True)], lm=lm)
 
-    assert post.rule_offers.clause_for(REAL_B, TARGET) is not None, "the policy did change"
+    assert post.rule_offers.clause_for(B, TARGET) is not None, "the policy did change"
     assert post.approval_requests.get_request(req.request_id) is None
     assert post.approval_requests.terminal_status[req.request_id] == STATUS_FAILED
 
@@ -439,10 +428,10 @@ def test_another_principals_requests_survive_an_acceptance():
     )
     lm.approval_requests.submit_request(theirs)
 
-    offer = _offer(recipient=REAL_B, text=ALLOW_RULE)
-    _, post, _ = _apply([offer_tx(offer), signed_accept(offer)], lm=lm)
+    offer = _offer(text=ALLOW_RULE)
+    _, post, _ = _apply([offer_tx(offer), decision_tx(offer, accept=True)], lm=lm)
 
-    assert post.rule_offers.clause_for(REAL_B, TARGET) is not None, "the accept landed"
+    assert post.rule_offers.clause_for(B, TARGET) is not None, "the accept landed"
     assert post.approval_requests.get_request(theirs.request_id) is not None
 
 

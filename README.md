@@ -399,7 +399,7 @@ When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker)
   **User rules reference `[t]` only** (`TEMPORAL_REFERENCE`): `i1[t-1]` or `i1[0]` is refused at admission and again at block apply, on every stream and for rules offered, accepted or routed as clauses. One unit that reads another step gives the whole evaluator a lookback, and every output is then 0 for the steps after each later revision or rebuild, for every account.
 
 **Python host enforces _before_ Tau** (the inputs Tau trusts):
-- Transaction BLS signature verification + canonical decoding (`commands/sendtx.py`).
+- Transaction BLS signature verification + canonical decoding (`commands/sendtx.py` at admission, and again for every transaction at block apply).
 - **Block proposer signature** — `Block.verify_consensus_proof()` verifies the proposer's BLS signature over the canonical header and feeds the result to Tau as `i10`; the `o6 = i10` rule then rejects an unsigned/forged block. Validator-set membership alone proves only that the named proposer is _listed_, not that the sender holds its key — the signature check is what binds them.
 - Proposer ∈ active validator set (`consensus/engine.py`).
 - Per-account sequence, expiration, `fee_limit` admission estimate, and DoS size bounds (`consensus/admission.py`).
@@ -461,8 +461,9 @@ state_hash = BLAKE3(
 
 ## Cryptography & signatures
 
-- **Scheme:** BLS12-381 via `py_ecc` **`G2Basic`** (IETF basic scheme, DST `…G2_XMD:SHA-256_SSWU_RO_NUL_`). Public keys are **G1, 48 bytes / 96 lowercase hex**; signatures are **G2, 96 bytes**; private keys are 32 bytes / 64 hex. `TAU_BLOCK_SIGNATURE_SCHEME=bls_g2` is descriptive metadata — the scheme is fixed in code.
-- **Validation:** `Verify` runs public-key and signature **subgroup checks** and rejects the **point at infinity**; transaction ingest additionally runs `KeyValidate` on `sender_pubkey` and both transfer addresses. Malformed keys/signatures fail closed (`INVALID_SIGNATURE`); if `py_ecc` is unavailable, ingest is **refused** (`BLS_UNAVAILABLE`), never skipped.
+- **Scheme:** BLS12-381 **`G2Basic`** (IETF basic scheme, DST `…G2_XMD:SHA-256_SSWU_RO_NUL_`). Public keys are **G1, 48 bytes / 96 lowercase hex**; signatures are **G2, 96 bytes**; private keys are 32 bytes / 64 hex. `TAU_BLOCK_SIGNATURE_SCHEME=bls_g2` is descriptive metadata — the scheme is fixed in code.
+- **Validation:** transaction signatures are verified by `consensus/tx_signing.py` on `py_arkworks_bls12381`, which rejects non-canonical point encodings and the **point at infinity** and runs public-key and signature **subgroup checks**; block header proofs use `py_ecc`. Transaction ingest additionally runs `KeyValidate` (`py_ecc`) on `sender_pubkey` and both transfer addresses. Malformed keys/signatures fail closed (`INVALID_SIGNATURE`); if `py_ecc` is unavailable, ingest is **refused** (`BLS_UNAVAILABLE`), never skipped.
+- **Verified twice:** every transaction signature is checked at admission and again at block apply, for every transaction type. At apply a bad signature rejects only that transaction (receipt reason `invalid_signature`) and the block stays valid.
 - **Signed payloads:**
   - Transaction → `SHA-256` of canonical JSON of `{sender_pubkey, sequence_number, expiration_time, expire_at_height, fee_limit, tx_type, …type-specific}`. `tx_type` **is** signed, so a `user_tx` signature cannot be replayed as a governance vote. `expire_at_height` is signed whenever present, and required on anything new: the wall-clock `expiration_time` is rechecked at apply against the block **timestamp**, which the proposer picks, so the height is the deadline a proposer cannot move.
   - Block header → `SHA-256` of `BlockHeader.canonical_bytes()`, verified by `Block.verify_consensus_proof()`.
@@ -498,7 +499,7 @@ submitted ──(quorum reached)──> scheduled ──(height ≥ activate_at_
     └──(activate_at_height passes while still pending)──> expired (archived)
 ```
 
-- **Quorum** — promotion to `scheduled` needs votes ≥ `approval_threshold` = ⌈2N/3⌉ (`supermajority`) or N/2+1 (`majority`), where N is the **current** active validator set and the policy comes from genesis (bound into the state hash). A validator cannot vote twice (votes are a set); only active validators count — a forged or non-validator vote inside a block is a deterministic no-op.
+- **Quorum** — promotion to `scheduled` needs votes ≥ `approval_threshold` = ⌈2N/3⌉ (`supermajority`) or N/2+1 (`majority`), where N is the **current** active validator set and the policy comes from genesis (bound into the state hash). A validator cannot vote twice (votes are a set); only active validators count — a non-validator vote inside a block is a deterministic no-op, and a forged one is rejected at apply.
 - **Activation delay** — enforced at admission **and** at block application: `activate_at_height ≥ inclusion_height + N`. A crafted block cannot reach quorum and activate in the same block.
 - **Expiry** — a pending update whose `activate_at_height` arrives before quorum is archived, not activated.
 - **Safety** — a revision that fails to compile is rejected at admission (isolated staging compile) and again at activation; an activated rule emitting an invalid `o9` halts progress until further governance (see [Security & risk model](#security--risk-model)). Governance txs still require a valid signature, sequence, and expiration; they carry fee 0 and therefore sort **below** any paid user tx.

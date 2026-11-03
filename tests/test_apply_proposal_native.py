@@ -18,6 +18,7 @@ import tau_proposal as tp
 import tau_reconstruction as tr
 import tau_session as ts
 import tau_shrink as tshrink
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_tx
 from consensus.engine import TauConsensusEngine
 from consensus.state import TauStateSnapshot
 
@@ -34,9 +35,10 @@ def _native_available():
 pytestmark = pytest.mark.skipif(not _native_available(), reason="native tau module not built")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SENDER_A = "a1" * 48
-SENDER_B = "b2" * 48
-SENDER_C = "c3" * 48
+SENDER_A = pubkey_hex(SK_ALICE)
+SENDER_B = pubkey_hex(SK_BOB)
+SENDER_C = pubkey_hex(SK_CAROL)
+_SK = {SENDER_A: SK_ALICE, SENDER_B: SK_BOB, SENDER_C: SK_CAROL}
 PROPOSER = "d4" * 48
 
 
@@ -63,7 +65,7 @@ def _tx(tx_id, sender, rule=None, fee_limit="1000", transfer=None):
         tx["operations"]["0"] = rule
     if transfer:
         tx["operations"]["1"] = [transfer]
-    return tx
+    return sign_tx(tx, _SK[sender])
 
 
 def _proposal():

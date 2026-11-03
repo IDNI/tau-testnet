@@ -152,16 +152,17 @@ def _offer(recipient=BOB, offerer=ALICE):
 
 
 def _offer_tx(offer, seq=0):
-    return {
+    return _sign({
         "tx_id": f"offer-{next(_TX_SEQ)}",
         "tx_type": "rule_offer",
         "sender_pubkey": offer.offerer_pubkey,
         "sequence_number": seq,
+        "expiration_time": 9999999999,
         "recipient_pubkey": offer.recipient_pubkey,
         "rule_text": offer.rule_text,
         "expire_at_height": offer.expire_at_height,
         "fee_limit": "10000",
-    }
+    }, SK_ALICE)
 
 
 def _accept_tx(offer, sk):
@@ -195,25 +196,27 @@ def _routed_o5_tx(sk=SK_ALICE, sender=ALICE, rule=OFFER_RULE):
 
 
 def _rule_tx(seq=0):
-    return {
+    return _sign({
         "tx_id": f"rule-{next(_TX_SEQ)}",
         "tx_type": "user_tx",
         "sender_pubkey": ALICE,
         "sequence_number": seq,
+        "expiration_time": 9999999999,
         "fee_limit": "100",
         "operations": {"0": NON_POLICY_RULE},
-    }
+    }, SK_ALICE)
 
 
 def _transfer_tx(seq=0):
-    return {
+    return _sign({
         "tx_id": f"transfer-{next(_TX_SEQ)}",
         "tx_type": "user_tx",
         "sender_pubkey": ALICE,
         "sequence_number": seq,
+        "expiration_time": 9999999999,
         "fee_limit": "100",
         "operations": {"1": [[ALICE, BOB, 5]]},
-    }
+    }, SK_ALICE)
 
 
 def _resets(proposal):

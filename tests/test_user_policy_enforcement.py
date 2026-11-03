@@ -25,6 +25,7 @@ import pytest
 
 import chain_state
 import tau_defs
+from bls_keys import SK_ALICE, pubkey_hex, sign_tx
 from consensus.engine import TauConsensusEngine
 
 
@@ -37,7 +38,7 @@ def _native_available():
         return False
 
 
-SENDER = "11" * 48      # 96 hex chars == bv[384]
+SENDER = pubkey_hex(SK_ALICE)      # 96 hex chars == bv[384]
 RECIPIENT = "22" * 48
 PROPOSER = "33" * 48
 
@@ -47,15 +48,14 @@ def _snap():
 
 
 def _transfer_tx(transfers):
-    return {
+    return sign_tx({
         "tx_id": "tx_test",
         "sender_pubkey": SENDER,
         "sequence_number": 0,
         "tx_type": "user_tx",
         "operations": {"1": transfers},
         "fee_limit": "1000",
-        "signature": "00" * 48,
-    }
+    })
 
 
 class TestUserPolicyApplyEnforcement(unittest.TestCase):

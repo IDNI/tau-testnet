@@ -13,7 +13,7 @@ durable commit and promotion and had to rebuild from the committed anchors.
 import os
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import db
 import tau_allocator as alloc
@@ -23,6 +23,7 @@ import tau_journal as tj
 import tau_proposal as tp
 import tau_reconstruction as tr
 import tau_session as ts
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, SK_MALLORY, pubkey_hex, sign_tx
 from consensus.engine import TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager
 from consensus.rule_offers import RuleOffer
@@ -42,15 +43,10 @@ pytestmark = pytest.mark.skipif(not _native_available(),
                                 reason="native tau module not built")
 
 
-@pytest.fixture(autouse=True)
-def _signatures_not_under_test():
-    # These tests exercise evaluator and lifecycle mechanics, not signatures.
-    with patch("consensus.engine.verify_tx_signature", return_value=(True, "")):
-        yield
-
-
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-A_KEY, B_KEY, C_KEY, D_KEY = "a1" * 48, "b2" * 48, "c3" * 48, "e5" * 48
+A_KEY, B_KEY, C_KEY, D_KEY = (
+    pubkey_hex(SK_ALICE), pubkey_hex(SK_BOB), pubkey_hex(SK_CAROL), pubkey_hex(SK_MALLORY))
+_SK = {A_KEY: SK_ALICE, B_KEY: SK_BOB, C_KEY: SK_CAROL, D_KEY: SK_MALLORY}
 PROPOSER = "d4" * 48
 STREAM = tau_defs.USER_POLICY_STREAM_INDEX
 OFFER_RULE = f"always ( o{STREAM}[t]:bv[24] = {{ #x000000 }}:bv[24] )."
@@ -127,7 +123,7 @@ def _rule_tx(tx_id, sender, rule, transfer=None):
           "sequence_number": 0, "fee_limit": "10000", "operations": {"0": rule}}
     if transfer:
         tx["operations"]["1"] = [transfer]
-    return tx
+    return sign_tx(tx, _SK[sender])
 
 
 OFFER = RuleOffer(offerer_pubkey=D_KEY, recipient_pubkey=A_KEY,
@@ -135,10 +131,10 @@ OFFER = RuleOffer(offerer_pubkey=D_KEY, recipient_pubkey=A_KEY,
 TX_A = _rule_tx("A", A_KEY, _clause("000002"))
 TX_B = _rule_tx("B", B_KEY, _clause("000003"), transfer=[B_KEY, C_KEY, "999999"])
 TX_C = _rule_tx("C", C_KEY, _clause("000004"))
-TX_D = {"tx_id": "D", "tx_type": "rule_offer", "sender_pubkey": D_KEY,
-        "sequence_number": 0, "recipient_pubkey": OFFER.recipient_pubkey,
-        "rule_text": OFFER.rule_text, "expire_at_height": OFFER.expire_at_height,
-        "fee_limit": "10000"}
+TX_D = sign_tx({"tx_id": "D", "tx_type": "rule_offer", "sender_pubkey": D_KEY,
+                "sequence_number": 0, "recipient_pubkey": OFFER.recipient_pubkey,
+                "rule_text": OFFER.rule_text, "expire_at_height": OFFER.expire_at_height,
+                "fee_limit": "10000"}, SK_MALLORY)
 BALANCES = {A_KEY: 5000, B_KEY: 5000, C_KEY: 5000, D_KEY: 5000}
 
 

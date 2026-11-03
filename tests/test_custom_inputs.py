@@ -14,7 +14,7 @@ from consensus.engine import TauConsensusEngine
 from consensus.state import TauStateSnapshot
 import chain_state
 import tau_manager
-from bls_keys import SK_ALICE, pubkey_hex, sign_payload
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload, sign_tx
 
 SENDER = pubkey_hex(SK_ALICE)
 
@@ -129,8 +129,9 @@ class TestCustomInputs(unittest.TestCase):
             mock_store.commit.return_value = TauStateSnapshot(b"", b"", {})
             engine = TauConsensusEngine(state_store=mock_store)
             snapshot = TauStateSnapshot(b"hash", b"rules", {})
-            tx = {"tx_id": f"tx_{key}", "operations": {key: "5"}}
-            result = engine.apply(snapshot, [tx], 1700000000)
+            tx = sign_tx({"tx_id": f"tx_{key}", "sender_pubkey": SENDER,
+                          "operations": {key: "5"}})
+            result = engine.apply(snapshot, [tx], 1700000000, target_sequences={})
             self.assertEqual(len(result.rejected_transactions), 1, msg=f"key {key} not rejected")
             receipt = result.receipts[f"tx_{key}"]
             self.assertEqual(receipt["status"], "failed")
@@ -220,13 +221,14 @@ class TestCustomInputs(unittest.TestCase):
         engine = TauConsensusEngine(state_store=mock_store)
         
         snapshot = TauStateSnapshot(b"hash", b"rules", {})
-        tx = {
+        tx = sign_tx({
             "tx_id": "tx1",
+            "sender_pubkey": SENDER,
             "operations": {
                 "0": "new rule",
                 "100": "99"
             }
-        }
+        })
         
         # Mock communicate_with_tau to return distinct outputs
         self.mock_communicate.side_effect = ["output_rule", "output_custom"]
@@ -235,7 +237,7 @@ class TestCustomInputs(unittest.TestCase):
             "chain_state.get_application_rules_state",
             return_value="new rule",
         ):
-            result = engine.apply(snapshot, [tx], 1700000000)
+            result = engine.apply(snapshot, [tx], 1700000000, target_sequences={})
 
         receipt = result.receipts["tx1"]
         logs = receipt["logs"]
@@ -265,17 +267,18 @@ class TestCustomInputs(unittest.TestCase):
         engine = TauConsensusEngine(state_store=mock_store)
         
         snapshot = TauStateSnapshot(b"hash", b"rules", {})
-        tx = {
+        tx = sign_tx({
             "tx_id": "tx_fail",
+            "sender_pubkey": SENDER,
             "operations": {
                 "100": "bad_input"
             }
-        }
+        })
         
         # Mock communicate_with_tau to return Error
         self.mock_communicate.return_value = "(Error) Invalid input"
         
-        result = engine.apply(snapshot, [tx], 1700000000)
+        result = engine.apply(snapshot, [tx], 1700000000, target_sequences={})
         
         # New behavior: Tx execution fails on Tau Error, but is accepted into block (nonce consumed)
         self.assertEqual(len(result.accepted_transactions), 1)
@@ -450,8 +453,9 @@ class TestKey12Rejection(unittest.TestCase):
         mock_store.commit.return_value = TauStateSnapshot(b"", b"", {})
         engine = TauConsensusEngine(state_store=mock_store)
         snapshot = TauStateSnapshot(b"hash", b"rules", {})
-        tx = {"tx_id": "tx_spoof", "operations": {"12": "deadbeef"}}
-        result = engine.apply(snapshot, [tx], 1700000000)
+        tx = sign_tx({"tx_id": "tx_spoof", "sender_pubkey": SENDER,
+                      "operations": {"12": "deadbeef"}})
+        result = engine.apply(snapshot, [tx], 1700000000, target_sequences={})
         receipt = result.receipts["tx_spoof"]
         self.assertIn("Error", " ".join(receipt["logs"]))
         # Hard-rejected: lands in rejected_transactions, not accepted.

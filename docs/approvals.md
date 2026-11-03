@@ -330,31 +330,25 @@ on `o5` beside them, which either fails to conjoin or silently supersedes.
 
 ## Signature verification
 
-Per-transaction signatures were historically verified only at mempool admission;
-`_process_new_block_locked` checks the header proof, `verify_block_header` and
-the timestamp, and `engine.apply` did not check signatures at all. Verifying
-only the two new transaction types would be insufficient — after activation a
-malicious proposer could forge a transaction that *sets policy* (a `user_tx`
-carrying the victim's `o5` rule, or a `rule_offer_accept` from the victim),
-replace their clause, and then let a legitimate vote execute under an
-attacker-chosen policy.
+Every transaction signature is verified twice: at mempool admission, and again at
+block apply. Without the apply check a malicious proposer could include a
+transfer from any account, or a `user_tx` carrying a victim's `o5` rule, a
+`rule_offer_accept` from the victim, or a vote in an approver's name, and then let
+a legitimate vote execute under an attacker-chosen policy. Splitting one theft
+into many small forged transfers in one block would also dodge per-transaction
+tier policies, which read balances and history frozen at the parent block.
 
 `consensus/tx_signing.py` holds the canonical `signing_message_bytes` and
 `verify_tx_signature`, imported by both `commands/sendtx.py` and `engine.apply`.
-`apply` verifies, before any state mutation and **height-gated on activation** so
-historical replay is untouched:
-
-- `approval_request` and `transfer_vote`;
-- post-activation `user_tx` routed into the `o5` registry;
-- post-activation `rule_offer_accept`.
+`apply` verifies **every** transaction of **every** type at one site, at the top of
+the per-transaction loop, before the fee preamble, any Tau step or any state
+mutation. The check is not gated on approval-slot activation and it runs in replay
+too, because the state hash binds a transaction as rejected.
 
 A failure sets `hard_reject`: the transaction lands in `rejected_transactions`
-with the receipt reason `invalid_signature`, its effects are discarded, and the
-**block stays valid**. Every node reaches that verdict from the block bytes alone.
-
-Ordinary transfers are still verified at admission only. A malicious proposer can
-forge any transfer a victim's policy allows with no votes in: the policy bounds
-what a forgery can move; it does not stop forgery.
+with the receipt reason `invalid_signature`, its effects are discarded (no fee, no
+sequence bump, no lifecycle change) and the **block stays valid**. Every node
+reaches that verdict from the block bytes alone.
 
 ## Not in this release
 

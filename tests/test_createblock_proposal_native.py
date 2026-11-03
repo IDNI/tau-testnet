@@ -47,9 +47,10 @@ from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager
 from consensus.state import TauStateSnapshot
 from block import Block
+from bls_keys import SK_ALICE, pubkey_hex, sign_tx
 
 RULE = os.environ["PROBE_RULE"]
-SENDER = "a1" * 48
+SENDER = pubkey_hex(SK_ALICE)
 PROPOSER = "d4" * 48
 
 boot = tempfile.NamedTemporaryFile("w", suffix=".tau", delete=False)
@@ -64,8 +65,9 @@ spec_before = db.get_chain_state_value("full_tau_spec", "")
 epoch_before = db.shrink_mapping_epoch()
 time_before = iface.interpreter.time_point
 
-tx = {"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
-      "sequence_number": 0, "fee_limit": "10000", "operations": {"0": RULE}}
+tx = sign_tx({"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
+              "sequence_number": 0, "fee_limit": "10000", "operations": {"0": RULE}},
+             SK_ALICE)
 
 proposal = _speculative_proposal(candidate_rules=[RULE])
 kind = type(proposal).__name__ if proposal is not None else "None"
@@ -113,7 +115,8 @@ def _run(tmp_path):
     env["PROBE_DB"] = str(tmp_path / "cb.db")
     env["REPO_ROOT"] = REPO
     env["PROBE_RULE"] = RULE
-    env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [REPO, os.path.join(REPO, "tests"), env.get("PYTHONPATH", "")])
     proc = subprocess.run([sys.executable, str(script)], capture_output=True,
                           text=True, env=env, timeout=180)
     line = next((l for l in proc.stdout.splitlines() if l.startswith("CB_RESULT")), None)

@@ -1466,13 +1466,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             operations = tx.get('operations', {}) if tx.get('tx_type', 'user_tx') == 'user_tx' else {}
             sender = tx.get('sender_pubkey')
             
-            # By default, we consider the transaction valid for inclusion unless strictly malformed
-            # (e.g. signature issues are handled in verify_block, here we might assume validity).
-            # However, historically we used tx_success to mean "execution successful".
-            # We now split this:
-            # - accepted_in_block: True (unless we decide it's total garbage)
-            # - execution_success: True/False
-            
             accepted_in_block = True
             hard_reject = False
             execution_success = True
@@ -1511,7 +1504,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # Sequence number handling: only increment if the tx is included/accepted.
             sequence_number = tx.get('sequence_number')
             should_increment_seq = False
-            if sequence_number is not None and sender:
+            if sequence_number is not None and isinstance(sender, str) and sender:
                 if target_sequences is not None:
                     current_seq = target_sequences.get(sender, 0)
                 else:
@@ -1533,6 +1526,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         f"Invalid sequence number: expected {current_seq}, got {sequence_number}"
                     )
 
+            # Every branch and every account-scoped policy below trusts sender_pubkey.
+            # Replay rejects too: the state hash binds the tx as rejected.
+            signature_rejected = False
+            if not hard_reject:
+                sig_ok, sig_reason = verify_tx_signature(tx)
+                if not sig_ok:
+                    logger.error("Tx %s signature rejected at apply: %s", tx_id, sig_reason)
+                    accepted_in_block = False
+                    hard_reject = True
+                    execution_success = False
+                    signature_rejected = True
+                    operations = {}
+                    tx_receipt["reason"] = "invalid_signature"
+                    tx_receipt["logs"].append(f"Transaction signature invalid: {sig_reason}")
+
             # Process operations
             # Parse operations first to establish deterministic order:
             # 1. Rule update (key "0")
@@ -1547,7 +1555,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # user-initiated and expensive, and exempting them would make rule
             # spam free. They carry no transfers, so the transfer-less
             # fee-query step below covers them.
-            charge_fee = fees_enabled and tx_type in FEE_BEARING_TX_TYPES
+            charge_fee = (
+                fees_enabled and tx_type in FEE_BEARING_TX_TYPES
+                and not signature_rejected
+            )
             fee_limit_int: Optional[int] = None
             fee_components: List[int] = []
             staged_writes: Dict[str, int] = {}
@@ -1596,14 +1607,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return False
                 if tau_defs.USER_POLICY_STREAM_INDEX not in clause_output_streams(rule_text):
                     return False
-
-                sig_ok, sig_reason = verify_tx_signature(tx)
-                if not sig_ok:
-                    _did_not_land(
-                        f"o5 clause signature invalid: {sig_reason}",
-                        reason="invalid_signature",
-                    )
-                    return True
 
                 # Lazy: consensus.admission imports chain_state, which imports this module.
                 from consensus.admission import routed_rule_conflict
@@ -2058,24 +2061,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                 else:
                     accept = tx_type == TX_TYPE_RULE_OFFER_ACCEPT
-                    sig_ok, sig_reason = (
-                        verify_tx_signature(tx) if accept and approval_slots_on
-                        else (True, "")
-                    )
                     decision = (
-                        None if not sig_ok
-                        else parse_rule_offer_accept(tx) if accept
+                        parse_rule_offer_accept(tx) if accept
                         else parse_rule_offer_reject(tx)
                     )
-                    if not sig_ok:
-                        tx_receipt["logs"].append(
-                            f"Rule offer accept signature invalid: {sig_reason}"
-                        )
-                        accepted_in_block = False
-                        hard_reject = True
-                        execution_success = False
-                        tx_receipt["reason"] = "invalid_signature"
-                    elif decision is None:
+                    if decision is None:
                         tx_receipt["logs"].append("Invalid rule offer decision format")
                         accepted_in_block = False
                     elif not isinstance(sender, str) or sender.lower() != decision.actor_pubkey:
@@ -2159,8 +2149,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # Bounds and state disagreements are SOFT no-ops with a receipt
                 # log, matching the rule-offer branch: the block stays valid and
                 # the action simply is not recorded, so replay is deterministic
-                # regardless of tip state. Only a forged signature or a Tau
-                # failure hard-rejects.
+                # regardless of tip state. Only a Tau failure hard-rejects.
                 approvals = lifecycle_mgr.approval_requests
 
                 if not approval_slots_on:
@@ -2169,24 +2158,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
                     accepted_in_block = False
                 else:
-                    # Apart from the policy-setting paths, signatures are checked
-                    # only at admission; a forged vote would release parked funds
-                    # with no approver involved.
-                    sig_ok, sig_reason = verify_tx_signature(tx)
-                    if not sig_ok:
-                        logger.error(
-                            "Approval tx %s signature rejected at apply: %s",
-                            tx_id, sig_reason,
-                        )
-                        tx_receipt["logs"].append(
-                            f"Approval transaction signature invalid: {sig_reason}"
-                        )
-                        accepted_in_block = False
-                        hard_reject = True
-                        execution_success = False
-                        tx_receipt["reason"] = "invalid_signature"
-
-                    elif tx_type == TX_TYPE_APPROVAL_REQUEST:
+                    if tx_type == TX_TYPE_APPROVAL_REQUEST:
                         request = parse_approval_request(tx)
                         if request is None:
                             tx_receipt["logs"].append("Invalid approval request format")
@@ -2351,20 +2323,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # fields are signed, so anything else is unsigned data.
                 operations = {}
                 if accepted_in_block and not hard_reject:
-                    sig_ok, sig_reason = verify_tx_signature(tx)
-                    if not sig_ok:
-                        logger.error(
-                            "Retractable tx %s signature rejected at apply: %s",
-                            tx_id, sig_reason,
-                        )
-                        tx_receipt["logs"].append(
-                            f"Retractable transaction signature invalid: {sig_reason}"
-                        )
-                        accepted_in_block = False
-                        hard_reject = True
-                        execution_success = False
-                        tx_receipt["reason"] = "invalid_signature"
-                    elif tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+                    if tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
                         try:
                             park = parse_retractable_transfer(tx)
                         except RetractableShapeError as exc:

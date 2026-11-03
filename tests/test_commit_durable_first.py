@@ -29,6 +29,7 @@ import chain_state
 import tau_authority
 import tau_manager
 from block import Block, compute_tx_hash
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload
 
 ADDR2 = "893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2"
 ADDR3 = "aabbccddee1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678"
@@ -36,16 +37,20 @@ TEST_MINER_PRIVKEY = "11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebe
 BLOCK_TS = 1_700_000_100
 
 
+SENDER = pubkey_hex(SK_ALICE)
+SENDER_FUNDING = 1000
+
+
 def _tx(sender, seq, transfers):
-    return {
+    assert sender == SENDER
+    return sign_payload({
         "sender_pubkey": sender,
         "sequence_number": seq,
         "expiration_time": 9999999999,
         "expire_at_height": 5000,
         "operations": {"1": transfers},
         "fee_limit": "0",
-        "signature": "dummy_signature_for_testing",
-    }
+    }, SK_ALICE)
 
 
 def _memory():
@@ -157,9 +162,18 @@ class DurableFirstTestBase(unittest.TestCase):
         self.os_env_patch = patch.dict("os.environ", {"TAU_FORCE_TEST": "1", "TAU_ENV": "test"})
         self.os_env_patch.start()
 
-        funded = max(chain_state._balances.items(), key=lambda kv: int(kv[1]))
-        self.sender = funded[0]
-        self.funded = int(funded[1])
+        # The genesis-funded account has no known key, so fund one that does.
+        self.sender = SENDER
+        self.funded = SENDER_FUNDING
+        chain_state._balances[self.sender] = self.funded
+        chain_state._sequence_numbers[self.sender] = 0
+        chain_state._genesis_accounts_state = {
+            **chain_state._genesis_accounts_state, self.sender: self.funded}
+        with db._db_lock:
+            db._db_conn.execute(
+                "INSERT INTO accounts (address, balance, sequence_number, last_transfer_ts) "
+                "VALUES (?, ?, 0, 0)", (self.sender, self.funded))
+            db._db_conn.commit()
         self.genesis_hash = db.get_canonical_head()['block_hash']
         # createblock refuses to propose unless the configured key is in the
         # active set. Header proofs are patched, so any genesis validator works.

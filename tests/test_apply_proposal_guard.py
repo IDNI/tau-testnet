@@ -16,10 +16,11 @@ import tau_proposal
 import tau_proposal as tp
 import tau_reconstruction as tr
 import tau_session as ts
+from bls_keys import SK_ALICE, pubkey_hex, sign_tx
 from consensus.engine import TauConsensusEngine
 from consensus.state import TauStateSnapshot
 
-SENDER = "aa" * 48
+SENDER = pubkey_hex(SK_ALICE)
 PROPOSER = "bb" * 48
 RULE = "always ( o13[t]:bv[24] = { #x000002 }:bv[24] )."
 
@@ -37,9 +38,9 @@ def _proposal(session):
 
 
 def _tx():
-    return {"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
-            "sequence_number": 0, "fee_limit": "100",
-            "operations": {"0": RULE}}
+    return sign_tx({"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
+                    "sequence_number": 0, "fee_limit": "100",
+                    "operations": {"0": RULE}})
 
 
 def _apply(session, proposal):

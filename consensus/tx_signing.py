@@ -2,23 +2,16 @@
 
 WHY THIS EXISTS
 ---------------
-Transaction signatures used to be verified in exactly one place: mempool
-admission (`commands/sendtx.py`). Block application never re-checked them --
-`chain_state._process_new_block_locked` verifies the header proof, the engine's
-`verify_block_header` and the timestamp, and `TauConsensusEngine.apply` reads
-`sender_pubkey` as fact. `commands/createblock._validate_signature` exists but is
-referenced only by tests.
+`sender_pubkey` is only a claim until its signature is checked, and every
+account-scoped rule (balance, sequence, policy clause, approvals) trusts it.
+Signatures are verified at mempool admission (`commands/sendtx.py`) and again for
+every transaction at block apply, at one site at the top of the apply loop in
+`TauConsensusEngine.apply`. Without the apply check a proposer could include a
+transfer from any account, or a rule offer or a vote in anyone's name.
 
-For ordinary transfers that is tolerable: forging one forges a transfer the
-sender could have made anyway, and the balance and sequence checks still bind.
-It is NOT tolerable for a feature whose whole promise is independent
-co-signatures -- a malicious proposer could otherwise mint a co-signature
-bearing an approver's `sender_pubkey` and release parked funds with no approver
-involved.
-
-So the preimage and the verify live here, once, and both the admission path and
-the apply path call them. Keeping them in one module is the point: two
-implementations of a signing preimage is a consensus split waiting to happen.
+The preimage and the verify live here, once, and both paths call them. Two
+implementations of a signing preimage would be a consensus split waiting to
+happen.
 
 INJECTION POINT
 ---------------

@@ -18,7 +18,6 @@ patched the way test_state_reconstruction.py does it): what is under test is the
 ancestry walk and the head it picks, not Tau.
 """
 import contextlib
-import hashlib
 import io
 import logging
 import os
@@ -36,10 +35,9 @@ import db
 import chain_state
 import tau_manager
 import tau_authority
-from py_ecc.bls import G2Basic
-from chain_state import GENESIS_ADDRESS, GENESIS_BALANCE
+from chain_state import GENESIS_BALANCE
 from block import Block, compute_tx_hash
-from consensus.tx_signing import signing_message_bytes
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload
 
 ADDR2 = "893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2"
 ADDR3 = "aabbccddee1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678"
@@ -49,25 +47,28 @@ DEEP = LEGACY_MAX_DEPTH + 100
 SYNC_BATCH = 700
 BASE_TS = 1_700_000_000
 
+# The account these histories fund and spend from.
+FUNDED_ACCOUNT = pubkey_hex(SK_ALICE)
 
-def _tx(sender, seq, transfers):
-    return {
+
+def _tx(sender, seq, transfers, sk=None):
+    """A signed transfer from `sender`; the funded account signs unless `sk` is given."""
+    if sk is None:
+        assert sender == FUNDED_ACCOUNT, "name the key of any other sender"
+        sk = SK_ALICE
+    return sign_payload({
         "sender_pubkey": sender,
         "sequence_number": seq,
         "expiration_time": 9999999999,
         "expire_at_height": 5000,
         "operations": {"1": transfers},
         "fee_limit": "0",
-        "signature": "dummy_signature_for_testing",
-    }
+    }, sk)
 
 
 def _signed_tx(sk, seq, transfers):
-    """A transaction whose signature verifies, from the account of key `sk`."""
-    tx = _tx(G2Basic.SkToPk(sk).hex(), seq, transfers)
-    digest = hashlib.sha256(signing_message_bytes(tx)).digest()
-    tx["signature"] = G2Basic.Sign(sk, digest).hex()
-    return tx
+    """A transfer from the account of key `sk`."""
+    return _tx(pubkey_hex(sk), seq, transfers, sk=sk)
 
 
 @contextlib.contextmanager
@@ -91,8 +92,8 @@ class DeepChainTestCase(unittest.TestCase):
         db.init_db()
         db.clear_mempool()
         chain_state.load_genesis("data/genesis.json")
-        chain_state._genesis_accounts_state = {GENESIS_ADDRESS: GENESIS_BALANCE}
-        chain_state._balances[GENESIS_ADDRESS] = GENESIS_BALANCE
+        chain_state._genesis_accounts_state = {FUNDED_ACCOUNT: GENESIS_BALANCE}
+        chain_state._balances[FUNDED_ACCOUNT] = GENESIS_BALANCE
 
         self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
         config.TESTNET_AUTO_FAUCET = False
@@ -191,10 +192,10 @@ class TestDeepReorg(DeepChainTestCase):
     def test_real_fork_deep_in_the_chain_still_rebuilds_from_genesis(self):
         fork_at = DEEP - 10
         sk = 4242
-        keyed = G2Basic.SkToPk(sk).hex()
-        funding = _tx(GENESIS_ADDRESS, 0, [[GENESIS_ADDRESS, keyed, "100"]])
+        keyed = pubkey_hex(sk)
+        funding = _tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, keyed, "100"]])
         lost_tx = _signed_tx(sk, 0, [[keyed, ADDR2, "5"]])
-        won_tx = _tx(GENESIS_ADDRESS, 1, [[GENESIS_ADDRESS, ADDR3, "7"]])
+        won_tx = _tx(FUNDED_ACCOUNT, 1, [[FUNDED_ACCOUNT, ADDR3, "7"]])
         main = self.extend(self.genesis_hash, 0, DEEP, txs={1: [funding], DEEP - 5: [lost_tx]})
         self.adopt(main)
         self.assertEqual(chain_state.get_balance(ADDR2), 5)

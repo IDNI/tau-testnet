@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import tau_defs
+from bls_keys import SK_ALICE, pubkey_hex, sign_payload
 from consensus.admission import (
     AdmissionResult,
     TipAdmissionView,
@@ -194,7 +195,7 @@ class TestApplyRejectsAnExpiredHeight:
     """`expiration_time` is rechecked at apply against the block TIMESTAMP,
     which the proposer sets. The height gate is the one it cannot move."""
 
-    SENDER = "a" * 96
+    SENDER = pubkey_hex(SK_ALICE)
     RECIPIENT = "b" * 96
 
     @pytest.fixture(autouse=True)
@@ -233,7 +234,7 @@ class TestApplyRejectsAnExpiredHeight:
             "operations": {"1": [[self.SENDER, self.RECIPIENT, 100]]},
         }
         tx.update(extra)
-        return tx
+        return sign_payload(tx, SK_ALICE)
 
     def _apply(self, tx, height, replay_mode=False):
         balances = {self.SENDER: 1000}

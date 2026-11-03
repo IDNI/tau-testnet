@@ -20,6 +20,7 @@ from block import (
 from commands import createblock
 from db import init_db, add_mempool_tx, get_canonical_head_block, clear_mempool
 import config
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_tx
 
 TEST_MINER_PRIVKEY = "11cebd90117355080b392cb7ef2fbdeff1150a124d29058ae48b19bebecd4f09"
 
@@ -95,24 +96,22 @@ class TestBlockCreation(unittest.TestCase):
         chain_state._balances.clear()
         chain_state._sequence_numbers.clear()
         
-        self.tx1_json = json.dumps({
-            "sender_pubkey": "a"*96, 
+        self.tx1_json = json.dumps(sign_tx({
+            "sender_pubkey": pubkey_hex(SK_ALICE),
             "recipient": "b", 
             "amount": 10, 
             "operations": {"1": []},
             "sequence_number": 0,
             "fee_limit": "0",
-            "signature": "sig"
-        })
-        self.tx2_json = json.dumps({
-            "sender_pubkey": "c"*96, 
+        }, SK_ALICE))
+        self.tx2_json = json.dumps(sign_tx({
+            "sender_pubkey": pubkey_hex(SK_BOB),
             "recipient": "d", 
             "amount": 20, 
             "operations": {"1": []},
             "sequence_number": 0,
             "fee_limit": "0",
-            "signature": "sig"
-        })
+        }, SK_BOB))
 
         # Mock Tau Manager for createblock
         self.tau_patcher = unittest.mock.patch('commands.createblock.tau_manager')

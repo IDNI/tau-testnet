@@ -19,6 +19,8 @@ SK_BOB = 0xB0B
 SK_CAROL = 0xCA401
 SK_MALLORY = 0xBAD
 
+FAR_FUTURE = 9999999999
+
 
 def check_sk(sk: int) -> int:
     # Scalar() silently reduces mod r, which would alias distinct keys.
@@ -40,3 +42,11 @@ def sign_payload(payload: Dict[str, Any], sk: int) -> Dict[str, Any]:
     digest = hashlib.sha256(signing_message_bytes(payload)).digest()
     payload["signature"] = sign_message(sk, digest).hex()
     return payload
+
+
+def sign_tx(tx: Dict[str, Any], sk: int = SK_ALICE) -> Dict[str, Any]:
+    """sign_payload for a test transaction that leaves out envelope fields the preimage needs."""
+    tx.setdefault("sequence_number", 0)
+    tx.setdefault("expiration_time", FAR_FUTURE)
+    tx.setdefault("fee_limit", "0")
+    return sign_payload(tx, sk)

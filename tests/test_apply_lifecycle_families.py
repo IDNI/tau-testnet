@@ -215,16 +215,17 @@ def _offer():
 
 
 def _offer_tx(offer, fee_limit="100"):
-    return {
+    return _sign({
         "tx_id": f"offer-{next(_TX_SEQ)}",
         "tx_type": "rule_offer",
         "sender_pubkey": offer.offerer_pubkey,
         "sequence_number": 0,
+        "expiration_time": 9999999999,
         "recipient_pubkey": offer.recipient_pubkey,
         "rule_text": offer.rule_text,
         "expire_at_height": offer.expire_at_height,
         "fee_limit": str(fee_limit),
-    }
+    }, SK_ALICE)
 
 
 def test_a_submitted_offer_does_not_survive_its_fee_rejection(temp_database):

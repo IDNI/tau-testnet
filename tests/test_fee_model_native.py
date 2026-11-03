@@ -34,6 +34,7 @@ import config
 import chain_state
 import db
 import tau_manager
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_payload
 from commands import sendtx, createblock
 
 GENESIS_TAU = os.path.join(project_root, "genesis.tau")
@@ -74,7 +75,7 @@ class _NativeFeeE2EBase(unittest.TestCase):
         chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
 
-        self.sender = chain_state.GENESIS_ADDRESS
+        self.sender = pubkey_hex(SK_ALICE)
         chain_state._balances[self.sender] = 100000
         self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
         config.TESTNET_AUTO_FAUCET = False
@@ -94,9 +95,6 @@ class _NativeFeeE2EBase(unittest.TestCase):
         # is real (conftest defaults it to "1" for the legacy suite).
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}).start()
 
-        # Signature plumbing is out of scope here (covered elsewhere);
-        # everything Tau/fee related runs for real, so only the verdict is forced.
-        patch("consensus.tx_signing._bls_verify", return_value=True).start()
         patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
         patch("commands.createblock._BLS_AVAILABLE", True).start()
         patch("commands.createblock._validate_signature", return_value=True).start()
@@ -126,7 +124,7 @@ class _NativeFeeE2EBase(unittest.TestCase):
         self.assertNotIn("error", str(out).lower(), f"seeding {label} failed: {out}")
 
     def _tx(self, amount, fee_limit, seq=None):
-        return json.dumps({
+        return json.dumps(sign_payload({
             "sender_pubkey": self.sender,
             "sequence_number": seq if seq is not None
             else chain_state.get_sequence_number(self.sender),
@@ -134,8 +132,7 @@ class _NativeFeeE2EBase(unittest.TestCase):
             "expire_at_height": 5000,
             "operations": {"1": [[self.sender, RECIPIENT, str(amount)]]},
             "fee_limit": str(fee_limit),
-            "signature": "00" * 48,
-        })
+        }, SK_ALICE))
 
 @pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
 class TestFeeModelNativeE2E(_NativeFeeE2EBase):
@@ -222,17 +219,16 @@ class TestFeeModelNativeE2E(_NativeFeeE2EBase):
     def test_insufficient_for_amount_plus_fee_real_tau(self):
         """Balance covers the amount but not amount+fee -> rejected, state intact."""
         self._seed_rule(FEE_RULE_10, "fee-10")
-        poor = "d" * 96
+        poor = pubkey_hex(SK_BOB)
         chain_state._balances[poor] = 100
-        tx = json.dumps({
+        tx = json.dumps(sign_payload({
             "sender_pubkey": poor,
             "sequence_number": 0,
             "expiration_time": int(time.time()) + 3600,
             "expire_at_height": 5000,
             "operations": {"1": [[poor, RECIPIENT, "100"]]},
             "fee_limit": "50",
-            "signature": "00" * 48,
-        })
+        }, SK_BOB))
         res = sendtx.queue_transaction(tx, propagate=False)
         self.assertFalse(res["ok"])
         self.assertEqual(res["code"], "INSUFFICIENT_FUNDS")
@@ -283,7 +279,7 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
         new_spec = genesis_consensus.replace("#x00000a", "#x000014")
         self.assertNotEqual(new_spec, genesis_consensus)
         activate_at = 4
-        update_tx = json.dumps({
+        update_tx = json.dumps(sign_payload({
             "tx_type": "consensus_rule_update",
             "sender_pubkey": validator,
             "sequence_number": chain_state.get_sequence_number(validator),
@@ -293,8 +289,7 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
             "activate_at_height": activate_at,
             "host_contract_patch": {},
             "fee_limit": "0",
-            "signature": "00" * 48,
-        })
+        }, int(config.MINER_PRIVKEY, 16)))
         res = sendtx.queue_transaction(update_tx, propagate=False)
         self.assertTrue(res["ok"], f"proposal rejected: {res}")
         self._mine(expect_txs=1)
@@ -305,7 +300,7 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
         )
 
         # Block 3: validator vote reaches threshold (1 of 1) -> scheduled.
-        vote_tx = json.dumps({
+        vote_tx = json.dumps(sign_payload({
             "tx_type": "consensus_rule_vote",
             "sender_pubkey": validator,
             "sequence_number": chain_state.get_sequence_number(validator),
@@ -314,8 +309,7 @@ class TestGovernanceFeeChangeE2E(_NativeFeeE2EBase):
             "update_id": update_id_hex,
             "approve": True,
             "fee_limit": "0",
-            "signature": "00" * 48,
-        })
+        }, int(config.MINER_PRIVKEY, 16)))
         res = sendtx.queue_transaction(vote_tx, propagate=False)
         self.assertTrue(res["ok"], f"vote rejected: {res}")
         self._mine(expect_txs=1)

@@ -109,16 +109,17 @@ def test_the_default_session_is_replaceable():
 
 def _apply_with(session, rule="always ( o13[t]:bv[24] = { #x000001 }:bv[24] )."):
     from unittest.mock import patch
+    from bls_keys import SK_ALICE, pubkey_hex, sign_tx
     from consensus.engine import TauConsensusEngine
     from consensus.state import TauStateSnapshot
 
     engine = TauConsensusEngine(state_store=MagicMock())
     engine._state_store.commit.side_effect = lambda snap: snap
-    sender = "aa" * 48
-    tx = {
+    sender = pubkey_hex(SK_ALICE)
+    tx = sign_tx({
         "tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": sender,
         "sequence_number": 0, "fee_limit": "1000", "operations": {"0": rule},
-    }
+    })
     # The session's own dispatches go through its injected manager; the engine's
     # OTHER evaluator calls (fees, transfers) still go to tau_manager directly --
     # they are not on the session yet, which is exactly what this stage is.

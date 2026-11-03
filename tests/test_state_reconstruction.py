@@ -15,8 +15,9 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from chain_state import rebuild_state_from_blockchain, get_balance, get_sequence_number, GENESIS_ADDRESS, GENESIS_BALANCE
+from chain_state import rebuild_state_from_blockchain, get_balance, get_sequence_number, GENESIS_BALANCE
 from block import Block
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
 from db import init_db, add_block, clear_mempool
 import config
 import chain_state
@@ -70,16 +71,18 @@ class TestStateReconstruction(unittest.TestCase):
         init_db()
         clear_mempool()
         chain_state.load_genesis("data/genesis.json")
-        # These tests build synthetic histories on the legacy GENESIS_ADDRESS
-        # baseline; pin the rebuild seed accordingly (rebuild now seeds from
-        # the loaded genesis artifact by default).
-        chain_state._genesis_accounts_state = {GENESIS_ADDRESS: GENESIS_BALANCE}
-        chain_state._balances[GENESIS_ADDRESS] = GENESIS_BALANCE
 
-        # Sample addresses for testing
-        self.addr1 = GENESIS_ADDRESS
-        self.addr2 = "893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2"
-        self.addr3 = "aabbccddee1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678"
+        # Sample accounts for testing; every sender signs its transactions for real.
+        self.addr1 = pubkey_hex(SK_ALICE)
+        self.addr2 = pubkey_hex(SK_BOB)
+        self.addr3 = pubkey_hex(SK_CAROL)
+        self._sk = {self.addr1: SK_ALICE, self.addr2: SK_BOB, self.addr3: SK_CAROL}
+
+        # These tests build synthetic histories on a single funded baseline
+        # account; pin the rebuild seed accordingly (rebuild seeds from the
+        # loaded genesis artifact by default).
+        chain_state._genesis_accounts_state = {self.addr1: GENESIS_BALANCE}
+        chain_state._balances[self.addr1] = GENESIS_BALANCE
         
         # Disable auto-faucet for these tests to ensure strict balance checks
         self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
@@ -133,14 +136,13 @@ class TestStateReconstruction(unittest.TestCase):
         if transfers:
             operations["1"] = transfers
         
-        return {
+        return sign_payload({
             "sender_pubkey": sender_pubkey,
             "sequence_number": sequence_number,
             "expiration_time": 9999999999,  # Far in the future
             "operations": operations,
             "fee_limit": "0",
-            "signature": "dummy_signature_for_testing"
-        }
+        }, self._sk[sender_pubkey])
     
     def test_reconstruction_empty_blockchain(self):
         """Test state reconstruction when no blocks exist."""
@@ -150,8 +152,8 @@ class TestStateReconstruction(unittest.TestCase):
         rebuild_state_from_blockchain()
         
         # Verify genesis state
-        self.assertEqual(get_balance(GENESIS_ADDRESS), GENESIS_BALANCE)
-        self.assertEqual(get_sequence_number(GENESIS_ADDRESS), 0)
+        self.assertEqual(get_balance(self.addr1), GENESIS_BALANCE)
+        self.assertEqual(get_sequence_number(self.addr1), 0)
         
         # Verify no other balances
         self.assertEqual(get_balance(self.addr2), 0)
@@ -510,6 +512,7 @@ class TestStateReconstruction(unittest.TestCase):
             # Add unknown operations manually
             tx1["operations"]["99"] = "123" # Must be valid Tau syntax or entire tx is rejected
             tx1["operations"]["custom"] = {"some": "data"}
+            sign_payload(tx1, SK_ALICE)
             
             block_1 = Block.create(
                 block_number=1,

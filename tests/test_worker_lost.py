@@ -24,12 +24,13 @@ import tau_proposal as tp
 import tau_reconstruction as tr
 import tau_session
 import tau_speculation as spec
+from bls_keys import SK_ALICE, pubkey_hex, sign_tx
 from consensus.engine import TauConsensusEngine, _apply_composite_rule
 from consensus.state import TauStateSnapshot
 from errors import EvaluatorLost, TauTestnetError
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SENDER = "aa" * 48
+SENDER = pubkey_hex(SK_ALICE)
 RECIPIENT = "cc" * 48
 PROPOSER = "bb" * 48
 RULE = "always ( o13[t]:bv[24] = { #x000002 }:bv[24] )."
@@ -85,14 +86,14 @@ def _proposal(session, label="proposal"):
 
 
 def _rule_tx():
-    return {"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
-            "sequence_number": 0, "fee_limit": "100", "operations": {"0": RULE}}
+    return sign_tx({"tx_id": "r1", "tx_type": "user_tx", "sender_pubkey": SENDER,
+                    "sequence_number": 0, "fee_limit": "100", "operations": {"0": RULE}})
 
 
 def _transfer_tx():
-    return {"tx_id": "t1", "tx_type": "user_tx", "sender_pubkey": SENDER,
-            "sequence_number": 0, "fee_limit": "100",
-            "operations": {"1": [[SENDER, RECIPIENT, "5"]]}}
+    return sign_tx({"tx_id": "t1", "tx_type": "user_tx", "sender_pubkey": SENDER,
+                    "sequence_number": 0, "fee_limit": "100",
+                    "operations": {"1": [[SENDER, RECIPIENT, "5"]]}})
 
 
 def _apply(session, proposal, tx):
