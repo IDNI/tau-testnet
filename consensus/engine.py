@@ -309,11 +309,23 @@ def _revised_policy_composite(proposal) -> bool:
 TEMPORAL_REFERENCE_REASON = "temporal_reference"
 
 
-def _offered_rule_temporal_error(rule_text: str) -> Optional[str]:
+def _clause_domain_rejection(body: str) -> Optional[Tuple[str, str]]:
+    """(error, receipt reason) when admission would refuse this clause body."""
     # Lazy: consensus.admission imports chain_state, which imports this module.
-    from consensus.admission import screen_temporal_rule
+    from consensus.admission import (
+        _screen_clause_domains,
+        _width_mismatch_details,
+        is_temporal_reference_error,
+    )
 
-    return screen_temporal_rule(clause_body_v1(rule_text))
+    error = _screen_clause_domains(body)
+    if error is None:
+        return None
+    if is_temporal_reference_error(error):
+        return error, TEMPORAL_REFERENCE_REASON
+    if _width_mismatch_details(error):
+        return error, "width_mismatch"
+    return error, "rule_not_applied"
 
 
 def _refuse_in_process_authority(entry: str) -> None:
@@ -1635,23 +1647,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return True
 
                 # Same screen admission runs, so the two paths reject the same
-                # clause bodies. Imported lazily: consensus.admission pulls in
-                # the facade and chain_state, and chain_state imports this
-                # module, so a module-level import would be a cycle.
-                from consensus.admission import (
-                    _screen_clause_domains,
-                    _width_mismatch_details,
-                    is_temporal_reference_error,
-                )
-
-                domain_error = _screen_clause_domains(body)
-                if domain_error:
-                    if is_temporal_reference_error(domain_error):
-                        reason = TEMPORAL_REFERENCE_REASON
-                    elif _width_mismatch_details(domain_error):
-                        reason = "width_mismatch"
-                    else:
-                        reason = "rule_not_applied"
+                # clause bodies.
+                rejection = _clause_domain_rejection(body)
+                if rejection:
+                    domain_error, reason = rejection
                     _did_not_land(f"o5 clause ignored ({domain_error})", reason=reason)
                     return True
 
@@ -2042,17 +2041,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             offer,
                             next_height=block_height if block_height is not None else 0,
                         )
-                        temporal_error = (
-                            _offered_rule_temporal_error(offer.rule_text) if ok else None
+                        rejection = (
+                            _clause_domain_rejection(clause_body_v1(offer.rule_text))
+                            if ok else None
                         )
                         if not ok:
                             tx_receipt["logs"].append(f"Offer ignored ({reason})")
-                        elif temporal_error:
+                        elif rejection:
+                            domain_error, domain_reason = rejection
                             accepted_in_block = False
                             hard_reject = True
                             execution_success = False
-                            tx_receipt["reason"] = TEMPORAL_REFERENCE_REASON
-                            tx_receipt["logs"].append(f"Error: {temporal_error}")
+                            tx_receipt["reason"] = domain_reason
+                            tx_receipt["logs"].append(f"Error: {domain_error}")
                         elif offers.submit_offer(offer):
                             tx_receipt["logs"].append("Offer submitted: " + offer.offer_id_hex)
                         else:
@@ -2073,20 +2074,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         accepted_in_block = False
                     else:
                         ok, reason = offers.can_admit_decision(decision)
-                        temporal_error = (
-                            _offered_rule_temporal_error(decision.rule_text)
+                        rejection = (
+                            _clause_domain_rejection(clause_body_v1(decision.rule_text))
                             if ok and accept else None
                         )
                         if not ok:
                             tx_receipt["logs"].append(
                                 f"Offer decision ignored ({reason})"
                             )
-                        elif temporal_error:
+                        elif rejection:
+                            domain_error, domain_reason = rejection
                             accepted_in_block = False
                             hard_reject = True
                             execution_success = False
-                            tx_receipt["reason"] = TEMPORAL_REFERENCE_REASON
-                            tx_receipt["logs"].append(f"Error: {temporal_error}")
+                            tx_receipt["reason"] = domain_reason
+                            tx_receipt["logs"].append(f"Error: {domain_error}")
                         else:
                             target_stream = offers.submit_decision(
                                 decision, approval_slots_active=approval_slots_on
