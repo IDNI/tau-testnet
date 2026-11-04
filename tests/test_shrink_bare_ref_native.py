@@ -123,14 +123,17 @@ SHRINKS_I13 = ("always ( i13[t]:bv[384] = { #x" + CUSTOM_KEY + " }:bv[384]"
 
 
 def _worker_after_shrinking_i13(candidate):
+    """A worker whose plan interns i13 before the candidate arrives. A plan over
+    the candidate makes i13 plain, so only such a worker meets the hint."""
     import tau_reconstruction
     import tau_session
 
     with open(os.path.join(REPO, "genesis.tau")) as fh:
         router = f"always ( {fh.read().strip()} )."
-    plan = tau_reconstruction.plan_representation(history_rules=[SHRINKS_I13],
-                                                  candidate_rules=[candidate])
+    plan = tau_reconstruction.plan_representation(history_rules=[SHRINKS_I13])
     assert 13 in plan.interned
+    assert 13 in tau_reconstruction.plan_representation(
+        history_rules=[SHRINKS_I13], candidate_rules=[candidate]).plain
     env = dict(os.environ)
     env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
     session = tau_session.WorkerSession.spawn(router, cwd=REPO, env=env, plan=plan)
@@ -205,6 +208,12 @@ def _router():
         return f"always ( {fh.read().strip()} )."
 
 
+def _width():
+    import tau_shrink
+
+    return tau_shrink.current_shrink_width()
+
+
 def _no_shrink_plan(width):
     import tau_reconstruction
 
@@ -214,6 +223,18 @@ def _no_shrink_plan(width):
 
 def _addr(hex_digits):
     return "{ #x" + hex_digits + " }:bv[384]"
+
+
+def _outputs(session, inputs):
+    import tau_session
+
+    outputs = []
+    for step in inputs:
+        try:
+            outputs.append(session.evaluate(step, multi=True, record=False))
+        except tau_session.StepRefused:
+            outputs.append("refused")
+    return outputs
 
 
 def _run_rules(plan, rules, inputs):
@@ -226,10 +247,38 @@ def _run_rules(plan, rules, inputs):
         for rule in rules:
             session.apply_rule(rule, record=False)
             accepted.append(session.last_receipt()["accepted"])
-        outputs = [session.evaluate(step, multi=True, record=False) for step in inputs]
+        outputs = _outputs(session, inputs)
     finally:
         session.dispose()
     return accepted, outputs
+
+
+def _run_live(rules, inputs):
+    """Each rule as a node meets it: a worker planned over the accepted history
+    and this rule, which replays the history and then offers the rule."""
+    import tau_reconstruction
+    import tau_session
+
+    history, accepted, session = [], [], None
+    try:
+        for rule in rules:
+            plan = tau_reconstruction.plan_representation(history_rules=history,
+                                                          candidate_rules=[rule])
+            if session is not None:
+                session.dispose()
+            session = tau_session.WorkerSession.spawn(_router(), cwd=REPO, env=_env(),
+                                                      plan=plan)
+            for old in history:
+                session.apply_rule(old, record=False)
+            session.apply_rule(rule, record=False)
+            ok = session.last_receipt()["accepted"]
+            accepted.append(ok)
+            if ok:
+                history.append(rule)
+        return accepted, _outputs(session, inputs)
+    finally:
+        if session is not None:
+            session.dispose()
 
 
 VERDICT_RULES = {
@@ -251,3 +300,50 @@ def test_a_rule_gives_the_same_verdict_with_and_without_shrink(temp_database, na
     canonical = _run_rules(_no_shrink_plan(plan.width), [rule], inputs)
     assert shrunk[0] == [True]
     assert shrunk == canonical
+
+
+BARE_I13 = "always ( i13[t] = i14[t] -> o6[t]:bv[24] = { #x000001 }:bv[24] )."
+PAIR_STEPS = [{13: _addr(CUSTOM_KEY), 14: _addr(CUSTOM_KEY)},
+              {13: _addr(CUSTOM_KEY), 14: _addr(OTHER_KEY)},
+              {13: _addr(OTHER_KEY), 14: _addr(OTHER_KEY)}]
+
+
+def test_a_bare_ref_makes_its_stream_and_partners_plain(temp_database):
+    import tau_reconstruction
+
+    for rules in ([BARE_I13, SHRINKS_I13], [SHRINKS_I13, BARE_I13]):
+        plan = tau_reconstruction.plan_representation(history_rules=rules)
+        assert {13, 14} <= set(plan.plain)
+        assert not ({13, 14} & set(plan.interned))
+
+
+def test_annotated_then_bare_gives_the_no_shrink_verdict(temp_database):
+    """B then A: the bare i14 takes its width from i13, so a shrunk i13 typed i14
+    shrunk while its input stayed full width."""
+    live = _run_live([SHRINKS_I13, BARE_I13], PAIR_STEPS)
+    canonical = _run_rules(_no_shrink_plan(_width()), [SHRINKS_I13, BARE_I13], PAIR_STEPS)
+    assert live[0] == [True, True]
+    assert live == canonical
+    assert [(out.get(5), out.get(6)) for out in canonical[1]] == [
+        ("1", "1"), ("1", "0"), ("0", "1")]
+
+
+def test_bare_then_annotated_gives_the_no_shrink_verdict(temp_database):
+    """A then B: the engine refuses B also with no shrink."""
+    live = _run_live([BARE_I13, SHRINKS_I13], PAIR_STEPS)
+    canonical = _run_rules(_no_shrink_plan(_width()), [BARE_I13, SHRINKS_I13], PAIR_STEPS)
+    assert live[0] == [True, False]
+    assert live == canonical
+
+
+def test_replay_of_a_bare_ref_rule_before_its_stream_is_annotated(temp_database):
+    """A plan over a history with A and B, as a proposal plans over every candidate.
+    Its replay gives the verdicts and the outputs of the live node and of no shrink."""
+    import tau_reconstruction
+
+    rules = [BARE_I13, SHRINKS_I13]
+    plan = tau_reconstruction.plan_representation(history_rules=rules)
+    assert {13, 14} <= set(plan.plain)
+    replayed = _run_rules(plan, rules, PAIR_STEPS)
+    assert replayed == _run_live(rules, PAIR_STEPS)
+    assert replayed == _run_rules(_no_shrink_plan(plan.width), rules, PAIR_STEPS)

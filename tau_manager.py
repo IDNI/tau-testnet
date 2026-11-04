@@ -238,6 +238,9 @@ def _assert_representation_compatible(prepared) -> None:
     fallback would let the others through.
     """
     wide = frozenset(getattr(prepared, "wide_streams_unshrunk", ()) or ())
+    # The engine types a bare reference with no width source from the shrunk
+    # width, while the inputs of its equality partners stay full width.
+    wide |= tau_shrink.untyped_input_streams(getattr(prepared, "canonical_text", "") or "")
     conflict = wide & frozenset(_runtime_shrunk_streams)
     conflict |= _evaluator_state.conflicts(
         prepared, width=tau_shrink.current_shrink_width()

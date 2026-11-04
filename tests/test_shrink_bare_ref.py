@@ -117,8 +117,8 @@ def test_the_clear_error_does_not_parse_engine_diagnostics(temp_database):
 
     shrinks = _rule(f"i13[t]:bv[384] = {{ #x{HEX96} }}:bv[384]")
     candidate = _rule(f"i13[t] = ({{ #x{HEX96} }}:bv[384])")
-    plan = tau_reconstruction.plan_representation(history_rules=[shrinks],
-                                                  candidate_rules=[candidate])
+    # A plan over the candidate makes i13 plain: only an older plan interns it.
+    plan = tau_reconstruction.plan_representation(history_rules=[shrinks])
     session = tau_session.WorkerSession(MagicMock())
     session.plan = plan
     receipt = {"outcome": "REJECTED_RULE", "accepted": False,
@@ -137,8 +137,8 @@ def test_the_clear_error_is_only_for_a_type_inference_failure(temp_database):
 
     shrinks = _rule(f"i13[t]:bv[384] = {{ #x{HEX96} }}:bv[384]")
     candidate = _rule(f"i13[t] = ({{ #x{HEX96} }}:bv[384])")
-    plan = tau_reconstruction.plan_representation(history_rules=[shrinks],
-                                                  candidate_rules=[candidate])
+    # A plan over the candidate makes i13 plain: only an older plan interns it.
+    plan = tau_reconstruction.plan_representation(history_rules=[shrinks])
     session = tau_session.WorkerSession(MagicMock())
     session.plan = plan
     receipt = {"outcome": "REJECTED_RULE", "accepted": False,
@@ -148,6 +148,36 @@ def test_the_clear_error_is_only_for_a_type_inference_failure(temp_database):
     receipt = {"outcome": "REJECTED_NOT_ROUTED", "accepted": False, "report": {}}
     session._explain_untyped_shrunk(candidate, receipt)
     assert not receipt["report"].get("errors")
+
+
+def test_a_bare_ref_with_no_width_source_is_plain_in_the_plan(temp_database):
+    import tau_reconstruction
+
+    shrinks = _rule(f"i13[t]:bv[384] = {{ #x{HEX96} }}:bv[384]")
+    candidate = _rule("i13[t] = i14[t]")
+    plan = tau_reconstruction.plan_representation(history_rules=[shrinks],
+                                                  candidate_rules=[candidate])
+    assert {13, 14} <= set(plan.plain)
+    assert not ({13, 14} & set(plan.interned))
+    assert 13 in tau_reconstruction.plan_representation(history_rules=[shrinks]).interned
+
+
+def test_the_guard_refuses_a_bare_ref_with_no_width_of_a_shrunk_stream(temp_database,
+                                                                     monkeypatch):
+    p = ts.prepare_rule(_rule("i13[t] = i14[t]"))
+    monkeypatch.setattr(tau_manager, "_runtime_shrunk_streams", frozenset({13}))
+    with pytest.raises(ts.ShrinkTypeConflict, match="i13"):
+        tau_manager._assert_representation_compatible(p)
+
+
+def test_the_guard_admits_a_bare_ref_of_a_stream_that_is_not_shrunk(temp_database,
+                                                                   monkeypatch):
+    p = ts.prepare_rule(_rule("i13[t] = i14[t]"))
+    monkeypatch.setattr(tau_manager, "_runtime_shrunk_streams", frozenset({3, 4}))
+    tau_manager._assert_representation_compatible(p)
+    annotated = ts.prepare_rule(_rule(f"i13[t]:bv[384] = {{ #x{HEX96} }}:bv[384]"))
+    monkeypatch.setattr(tau_manager, "_runtime_shrunk_streams", frozenset({13}))
+    tau_manager._assert_representation_compatible(annotated)
 
 
 def _counted_plan(monkeypatch, **rules):

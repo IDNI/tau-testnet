@@ -1,7 +1,8 @@
-"""The in-process paths give the same clear error as the worker path.
+"""The in-process paths and a bare reference with no width source.
 
-The hint comes only for a type-inference failure at a bare reference to a
-stream that this process runs shrunk.
+The process cannot plan again, so a bare reference to a stream that it runs
+shrunk stops at the guard as a node-local conflict. Other refusals keep the
+engine text.
 """
 import threading
 from unittest.mock import MagicMock, patch
@@ -22,10 +23,12 @@ class _Interface:
 
     def __init__(self, codes):
         self.codes = codes
+        self.rules = []
         self.last_revision_receipt = None
 
     def communicate(self, *, rule_text=None, **_kwargs):
         if rule_text is not None:
+            self.rules.append(rule_text)
             raise TauSpecRejected(ENGINE_TEXT, codes=self.codes)
         return "1"
 
@@ -42,6 +45,7 @@ def in_process(temp_database, monkeypatch):
         monkeypatch.setattr(tau_manager, "tau_test_mode", False)
         monkeypatch.setattr(tau_manager, "tau_direct_interface", _Interface(codes))
         monkeypatch.setattr(tau_manager, "_runtime_shrunk_streams", frozenset(shrunk))
+        return tau_manager.tau_direct_interface
     return _install
 
 
@@ -51,17 +55,17 @@ def _refusal(rule_text):
     return info.value
 
 
-def test_in_process_type_inference_failure_gets_the_hint(in_process):
-    in_process(codes=(4, 15))
-    exc = _refusal(BARE_I13)
-    assert str(exc).startswith("The rule references i13 without a width")
-    assert "Write i13[t]:bv[384]" in str(exc)
-    assert ENGINE_TEXT in str(exc)
-    assert exc.codes == (4, 15)
+def test_in_process_bare_ref_of_a_shrunk_stream_stops_at_the_guard(in_process):
+    import tau_shrink
+
+    engine = in_process(codes=(4, 15))
+    with pytest.raises(tau_shrink.ShrinkTypeConflict, match="i13"):
+        tau_manager.communicate_with_tau(rule_text=BARE_I13, apply_rules_update=False)
+    assert engine.rules == []
 
 
 def test_in_process_other_refusal_keeps_its_cause(in_process):
-    in_process(codes=(13,))
+    in_process(codes=(13,), shrunk=frozenset())
     assert str(_refusal(BARE_I13)) == ENGINE_TEXT
 
 
@@ -100,18 +104,18 @@ def _apply_block(rule_text):
         )
 
 
-def test_block_apply_rejection_shows_the_hint(in_process):
-    in_process(codes=(4,))
+def test_block_apply_bare_ref_of_a_shrunk_stream_is_node_local(in_process):
+    engine = in_process(codes=(4,))
     result = _apply_block(BARE_I13)
     assert "r1" in [t.get("tx_id") for t in result.rejected_transactions]
     receipt = result.receipts["r1"]
-    assert receipt["reason"] == "rule_rejected"
-    logs = "\n".join(receipt["logs"])
-    assert "Error: rule rejected by Tau: The rule references i13 without a width" in logs
+    assert receipt["reason"] == "rule_type_conflict"
+    assert "Error: runtime type conflict: rule references i13" in "\n".join(receipt["logs"])
+    assert engine.rules == []
 
 
 def test_block_apply_other_rejection_keeps_its_cause(in_process):
-    in_process(codes=(13,))
+    in_process(codes=(13,), shrunk=frozenset())
     result = _apply_block(BARE_I13)
     logs = "\n".join(result.receipts["r1"]["logs"])
     assert f"Error: rule rejected by Tau: {ENGINE_TEXT}" in logs

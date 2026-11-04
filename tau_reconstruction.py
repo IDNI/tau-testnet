@@ -132,6 +132,10 @@ def plan_representation(*, history_rules=(), candidate_rules=(), width=None):
                                       width=width, label="planner")
     texts = [str(t) for t in list(history_rules) + list(candidate_rules)
              if t and str(t).strip()]
+    # The engine types a bare reference with no width source by itself, so a
+    # shrunk feed of that stream, or of its equality partners, cannot match it.
+    for text in texts:
+        plain |= tau_shrink.untyped_input_streams(text)
     # A plain stream also makes its equality partners plain, in every rule, so
     # repeat with the plain set excluded until it stops growing.
     while True:
