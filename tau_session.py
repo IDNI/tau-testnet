@@ -42,6 +42,10 @@ def _shrink_width():
 #: Revision outcomes that mean the engine took the candidate.
 _ACCEPTED = ("ACCEPTED_CHANGED", "ACCEPTED_NOOP")
 
+#: Engine report codes of a type-inference failure: type_error and
+#: missing_type_information in the diagnostics of the parser library.
+_TYPE_INFERENCE_CODES = frozenset({4, 8})
+
 #: A replay entry this slow is logged: replay time is what a restart, a
 #: proposal and an admission context each pay, and it has no deadline.
 SLOW_REPLAY_SECONDS = 10.0
@@ -482,15 +486,16 @@ class WorkerSession(EvaluatorSession):
         a stream this plan interns. Only the message changes, never the verdict."""
         if self.plan is None or getattr(receipt, "accepted", False):
             return
+        report = receipt.get("report")
+        codes = report.get("codes") if isinstance(report, dict) else None
+        if not _TYPE_INFERENCE_CODES.intersection(codes or ()):
+            return
         import tau_shrink
         # The plan and the rule text already say which bare refs meet a shrunk feed.
         streams = (set(self.plan.interned)
                    & tau_shrink.untyped_input_streams(rule_text))
         if not streams:
             return
-        report = receipt.get("report")
-        if not isinstance(report, dict):
-            report = receipt["report"] = {}
         report["errors"] = ([tau_shrink.untyped_shrunk_stream_error(streams)]
                             + list(report.get("errors") or []))
 

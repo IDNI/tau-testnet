@@ -123,6 +123,28 @@ def test_the_clear_error_does_not_parse_engine_diagnostics(temp_database):
     session.plan = plan
     receipt = {"outcome": "REJECTED_RULE", "accepted": False,
                "diagnostics": "(Error) type inference produced no tree",
-               "report": {}}
+               "report": {"codes": [4]}}
     session._explain_untyped_shrunk(candidate, receipt)
     assert receipt["report"]["errors"][0].startswith("The rule references i13")
+
+
+def test_the_clear_error_is_only_for_a_type_inference_failure(temp_database):
+    """A bare ref rule that the engine refuses for another reason keeps its cause."""
+    from unittest.mock import MagicMock
+
+    import tau_reconstruction
+    import tau_session
+
+    shrinks = _rule(f"i13[t]:bv[384] = {{ #x{HEX96} }}:bv[384]")
+    candidate = _rule(f"i13[t] = ({{ #x{HEX96} }}:bv[384])")
+    plan = tau_reconstruction.plan_representation(history_rules=[shrinks],
+                                                  candidate_rules=[candidate])
+    session = tau_session.WorkerSession(MagicMock())
+    session.plan = plan
+    receipt = {"outcome": "REJECTED_RULE", "accepted": False,
+               "report": {"errors": ["unsat"], "codes": [13]}}
+    session._explain_untyped_shrunk(candidate, receipt)
+    assert receipt["report"]["errors"] == ["unsat"]
+    receipt = {"outcome": "REJECTED_NOT_ROUTED", "accepted": False, "report": {}}
+    session._explain_untyped_shrunk(candidate, receipt)
+    assert not receipt["report"].get("errors")

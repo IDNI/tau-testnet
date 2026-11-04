@@ -171,6 +171,26 @@ def test_the_error_never_turns_an_accepted_bare_ref_into_a_refusal(temp_database
     assert not (receipt.get("report") or {}).get("errors")
 
 
+def test_a_bare_ref_rule_refused_for_another_reason_keeps_its_cause(temp_database):
+    import commands.sendtx as sendtx
+
+    # The bare i13 types, but o6 cannot be 1 and 2 at once.
+    candidate = ("always ( i13[t] = i14[t]"
+                 " && o6[t]:bv[24] = { #x000001 }:bv[24]"
+                 " && o6[t]:bv[24] = { #x000002 }:bv[24] ).")
+    session = _worker_after_shrinking_i13(candidate)
+    try:
+        session.apply_rule(candidate, record=False)
+        receipt = session.last_receipt()
+    finally:
+        session.dispose()
+    assert not receipt["accepted"]
+    refusal = sendtx._revision_refusal(receipt)
+    assert "Write i13[t]:bv[384]" not in refusal["message"]
+    errors = (receipt.get("report") or {}).get("errors") or []
+    assert not any("without a width" in str(e) for e in errors)
+
+
 OTHER_KEY = "cd" * 48
 
 
