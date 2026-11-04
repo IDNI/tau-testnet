@@ -317,8 +317,28 @@ python scripts/gen_genesis.py \
   --account <addr1>:1000000 --account <addr2>:500000 \
   --network-id tau-testnet-v2 \
   --base-fee 10 \
+  --faucet-amount 100000 \
   --genesis-rules-path genesis.tau \
   --genesis-consensus-path genesis_consensus.tau \
+  --out data/genesis.json
+```
+
+The command below builds `networks/tau-testnet-v2/genesis.json` again, byte for byte:
+
+```bash
+python scripts/gen_genesis.py \
+  --validator-key a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b \
+  --account 838d089401687e4ba5fe844f1241b2f6cf63cf73a7f8fb6aa0e45b3c6b85454f4e7ca19960b71d847655486495b64cb4:100000 \
+  --account 93da919aed3b83e517190b8362528b35cbd51beb754289c5d99db12a306ac7f4980fbb96108a9cb812a46aede0c5f9ca:100000 \
+  --account 8a39b9d9498535492290c52b44959b5a6e9177dc85ae6a1d97f54462f03c15a38052a85c7ace5cd81858e343a3b789d0:100000 \
+  --account b1337fcdf8d713a53518f0d6289c70bec2a09a7d6ec84548aac208988391cd66a9b627d03c07d922cd6ad15ebecf3ad7:100000 \
+  --account b3566dd294833030380d74b39fdb0bf214e9c64906b175f8822c3d4386602b1a9340231e553f9c299d6d8a82b9d441da:100000 \
+  --account af1d997703d7c0a86a5988762bb9ac2642890b5f0599f9821372684487d580a5f211ec160c038c073cda604c3c646487:100000 \
+  --account 9689f5f8ffe6b73bb549e4058e54a3fc6a96ef2e784c415adeffd83d9488c9b435f075b59a778308f86226074f8b09b0:100000 \
+  --account 916b92be0561ee21d042d033cabdf58d1c2f9ed110b2e173ab9cdd2a585442bec6232ffe0d97b779976a1dfd6a9d38fc:100000 \
+  --account b9e4b8fbe06a12f4702617f71ef031206426c4205ca0bc3436d2e0cb047fd18473ad125ceefc7ef18b851a19af2f370b:100000 \
+  --account 8df32da800ad4b0657e333774889e6b08f768ab055ffb964d5935bbc8460aa8f91fa60a6a042f64ec144c7ec18ae02a3:100000 \
+  --approval-slots --base-fee 10 --faucet-amount 100000 \
   --out data/genesis.json
 ```
 

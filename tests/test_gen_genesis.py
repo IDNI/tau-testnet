@@ -14,6 +14,7 @@ import os
 import json
 import sys
 import tempfile
+import shlex
 import subprocess
 
 def test_gen_genesis_fee_injection():
@@ -441,3 +442,32 @@ def test_load_genesis_takes_the_faucet_amount_from_the_genesis(temp_database, mo
     assert chain_state._lifecycle_manager.faucet_amount == 250
     chain_state.load_state_from_db()
     assert chain_state._lifecycle_manager.faucet_amount == 250
+
+
+def _readme_v2_genesis_argv(out_path):
+    readme = os.path.join(os.path.dirname(__file__), "..", "README.md")
+    with open(readme) as f:
+        text = f.read()
+    marker = "builds `networks/tau-testnet-v2/genesis.json` again, byte for byte:"
+    block = text.split(marker, 1)[1].split("```bash\n", 1)[1].split("```", 1)[0]
+    argv = shlex.split(block.replace("\\\n", " "))
+    assert argv[:2] == ["python", "scripts/gen_genesis.py"], argv
+    argv = argv[2:]
+    argv[argv.index("--out") + 1] = out_path
+    return argv
+
+
+def test_the_readme_command_rebuilds_the_shipped_genesis():
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_path = os.path.join(tmpdir, "genesis.json")
+        result = subprocess.run(
+            [sys.executable, os.path.join(repo, "scripts", "gen_genesis.py")]
+            + _readme_v2_genesis_argv(out_path),
+            capture_output=True, text=True, env=os.environ, cwd=repo,
+        )
+        assert result.returncode == 0, result.stderr
+        with open(out_path, "rb") as f:
+            built = f.read()
+    with open(os.path.join(repo, "networks", "tau-testnet-v2", "genesis.json"), "rb") as f:
+        assert built == f.read()
