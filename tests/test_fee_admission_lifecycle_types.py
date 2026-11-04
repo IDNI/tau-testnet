@@ -14,10 +14,12 @@ import config
 import db
 from consensus.admission import TipAdmissionView
 from consensus.rule_offers import RuleOffer
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
 
-SENDER = "a" * 96
-RECIPIENT = "c" * 96
-APPROVER = "e" * 96
+SENDER = pubkey_hex(SK_ALICE)
+RECIPIENT = pubkey_hex(SK_BOB)
+APPROVER = pubkey_hex(SK_CAROL)
+SECRET_KEYS = {SENDER: SK_ALICE, RECIPIENT: SK_BOB}
 NEXT_HEIGHT = 50
 TIP_TS = 1_700_000_000
 FAR = 9_999_999_999
@@ -27,7 +29,7 @@ OFFER_RULE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
 
 @pytest.fixture
 def node(temp_database, monkeypatch):
-    """A real database, a mocked signature check, and a Tau with a flat fee."""
+    """A real database, real signatures, and a Tau with a flat fee."""
     from commands import sendtx
 
     script = {"calls": []}
@@ -41,9 +43,7 @@ def node(temp_database, monkeypatch):
         patch("tau_manager.tau_ready"),
         patch("tau_manager.communicate_with_tau", return_value="x1001"),
         patch("tau_manager.communicate_with_tau_multi", side_effect=multi),
-        patch("commands.sendtx.G2Basic"),
         patch("commands.sendtx.chain_state.get_sequence_number", return_value=1),
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)),
         patch("tau_native.compile_revisions_isolated_subprocess", return_value=None),
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}),
         patch.object(TipAdmissionView, "next_block_height",
@@ -55,7 +55,6 @@ def node(temp_database, monkeypatch):
     ]
     mocks = [p.start() for p in patches]
     mocks[0].is_set.return_value = True
-    mocks[3].Verify.return_value = True
     monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False)
     monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
     monkeypatch.setitem(chain_state._balances, RECIPIENT, 1_000_000)
@@ -72,7 +71,6 @@ def _envelope(tx_type, sender, fee_limit, **fields):
         "expiration_time": FAR,
         "expire_at_height": NEXT_HEIGHT + 100,
         "fee_limit": fee_limit,
-        "signature": "00" * 48,
     }
     tx.update(fields)
     return tx
@@ -114,6 +112,7 @@ def _payload(kind, fee_limit):
 
 
 def _queue(sendtx, payload):
+    sign_payload(payload, SECRET_KEYS[payload["sender_pubkey"]])
     with patch.object(TipAdmissionView, "get_offer", return_value=_offer_row()):
         return sendtx.queue_transaction(json.dumps(payload), propagate=False)
 

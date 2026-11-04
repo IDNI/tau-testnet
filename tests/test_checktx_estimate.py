@@ -16,10 +16,12 @@ import tau_admission
 from commands import checktx
 from consensus.admission import TipAdmissionView
 from consensus.rule_offers import RuleOffer
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
 
-SENDER = "a" * 96
-RECIPIENT = "c" * 96
-APPROVER = "e" * 96
+SENDER = pubkey_hex(SK_ALICE)
+RECIPIENT = pubkey_hex(SK_BOB)
+APPROVER = pubkey_hex(SK_CAROL)
+SECRET_KEYS = {SENDER: SK_ALICE, RECIPIENT: SK_BOB}
 NEXT_HEIGHT = 50
 TIP_TS = 1_700_000_000
 FAR = 9_999_999_999
@@ -84,9 +86,7 @@ def node(temp_database, monkeypatch):
         patch("tau_manager.tau_ready"),
         patch("tau_manager.communicate_with_tau_multi",
               side_effect=AssertionError("the in-process evaluator was used")),
-        patch("commands.sendtx.G2Basic"),
         patch("commands.sendtx.chain_state.get_sequence_number", return_value=1),
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)),
         patch("tau_native.compile_revisions_isolated_subprocess", return_value=None),
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}),
         patch.object(TipAdmissionView, "next_block_height",
@@ -99,7 +99,6 @@ def node(temp_database, monkeypatch):
     ]
     mocks = [p.start() for p in patches]
     mocks[3].is_set.return_value = True
-    mocks[5].Verify.return_value = True
     monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False)
     monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
     monkeypatch.setitem(chain_state._balances, RECIPIENT, 1_000_000)
@@ -123,7 +122,7 @@ def _offer_row():
 def _envelope(tx_type, sender, fee_limit, **fields):
     tx = {"tx_type": tx_type, "sender_pubkey": sender, "sequence_number": 1,
           "expiration_time": FAR, "expire_at_height": NEXT_HEIGHT + 20,
-          "fee_limit": fee_limit, "signature": "00" * 48}
+          "fee_limit": fee_limit}
     tx.update(fields)
     return tx
 
@@ -151,6 +150,7 @@ def _payload(kind, fee_limit="0"):
 
 
 def _check(payload, *, estimate=True):
+    sign_payload(payload, SECRET_KEYS[payload["sender_pubkey"]])
     word = "checktx estimate" if estimate else "checktx"
     return json.loads(checktx.execute(f"{word} {json.dumps(payload)}", None))
 
