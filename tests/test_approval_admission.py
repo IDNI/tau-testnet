@@ -30,12 +30,14 @@ from consensus.approvals import (
     validate_request_shape,
 )
 
-A = "1a" * 48          # sender
-B = "2b" * 48          # recipient
-AUTH = "aa" * 48
-SCAN = "bb" * 48
-PARTNER = "cc" * 48
-STRANGER = "de" * 48
+from bls_keys import pubkey_hex
+
+A = pubkey_hex(0x1A)          # sender
+B = pubkey_hex(0x2B)          # recipient
+AUTH = pubkey_hex(0xAA)
+SCAN = pubkey_hex(0xBB)
+PARTNER = pubkey_hex(0xCC)
+STRANGER = pubkey_hex(0xDE)
 NEXT_HEIGHT = 50
 EXPIRE = 500
 

@@ -11,7 +11,7 @@ import config
 from commands import sendtx, createblock
 from consensus.engine import TauConsensusEngine
 import chain_state, db, block, tau_defs
-from bls_keys import SK_ALICE, pubkey_hex, sign_payload, sign_tx
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_payload, sign_tx
 
 SENDER = pubkey_hex(SK_ALICE)
 
@@ -32,7 +32,7 @@ class TestConsensusTime(unittest.TestCase):
         db.init_db()
         chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
-        patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
+        patch('commands.sendtx.validate_bls_pubkey', return_value=None).start()
         patch('commands.createblock._BLS_AVAILABLE', True).start()
         patch('commands.createblock._validate_signature', return_value=True).start()
         patch('block.bls_signing_available', return_value=True).start()
@@ -75,7 +75,7 @@ class TestConsensusTime(unittest.TestCase):
 
         tip = db.get_canonical_head_block()["header"]["timestamp"]
         clock = tip + 1000
-        recipient = "ab" * 48
+        recipient = pubkey_hex(SK_BOB)
         tx = {
             "sender_pubkey": SENDER,
             "sequence_number": chain_state.get_sequence_number(SENDER),

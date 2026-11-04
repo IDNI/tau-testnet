@@ -15,8 +15,10 @@ from consensus.admission import (
 )
 from consensus.retractable import KIND_TIME, MAX_RELEASE_WINDOW_SECONDS
 
+from bls_keys import SK_BOB, pubkey_hex
+
 A = "1a" * 48
-B = "2b" * 48
+B = pubkey_hex(SK_BOB)
 NOW = 1_800_000_000
 
 
