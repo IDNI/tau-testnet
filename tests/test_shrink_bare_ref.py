@@ -148,3 +148,37 @@ def test_the_clear_error_is_only_for_a_type_inference_failure(temp_database):
     receipt = {"outcome": "REJECTED_NOT_ROUTED", "accepted": False, "report": {}}
     session._explain_untyped_shrunk(candidate, receipt)
     assert not receipt["report"].get("errors")
+
+
+def _counted_plan(monkeypatch, **rules):
+    import tau_reconstruction
+
+    calls = []
+    real = ts.prepare_rule
+
+    def _prepare(text, *args, **kwargs):
+        calls.append(text)
+        return real(text, *args, **kwargs)
+
+    monkeypatch.setattr(ts, "prepare_rule", _prepare)
+    return tau_reconstruction.plan_representation(**rules), len(calls)
+
+
+def test_one_planner_pass_when_no_plain_stream_was_interned(temp_database, monkeypatch):
+    # i4 is plain here, but no rule shrinks it: a second pass changes nothing.
+    candidate = _rule(f"!(i4[t] = ({{ #x{HEX96} }}:bv[384]))")
+    plan, calls = _counted_plan(monkeypatch, candidate_rules=[candidate])
+    assert plan.plain == frozenset({4})
+    assert calls == 1
+
+
+def test_a_second_pass_only_while_a_plain_stream_was_interned(temp_database, monkeypatch):
+    import chain_state
+
+    rule02 = chain_state._preprocess_tau_spec_text(chain_state.load_builtin_rules_from_disk()[1])
+    candidate = _rule(f"!(i4[t] = ({{ #x{HEX96} }}:bv[384]))")
+    plan, calls = _counted_plan(monkeypatch, history_rules=[rule02],
+                                candidate_rules=[candidate])
+    assert {3, 4} <= set(plan.plain)
+    assert not ({3, 4} & set(plan.interned))
+    assert calls == 4

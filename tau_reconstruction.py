@@ -150,9 +150,10 @@ def plan_representation(*, history_rules=(), candidate_rules=(), width=None):
                 continue
             interned |= set(prepared.shrunk_streams)
             grown |= set(prepared.wide_streams_unshrunk)
-        if grown == plain:
+        added, plain = grown - plain, grown
+        # Excluding a stream that no rule shrinks leaves every shrink set as it is.
+        if not added & interned:
             break
-        plain = grown
     # A stream that must be plain anywhere is plain everywhere.
     interned -= plain
     return RepresentationPlan(width=width, interned=frozenset(interned),

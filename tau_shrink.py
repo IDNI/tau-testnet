@@ -524,12 +524,8 @@ _VALUEISH = {"bvlit", "streamref", "num", "hexnum", "ident"}
 
 
 def _equality_edges(toks: list) -> list:
-    """(left_pos, right_pos, op_text) for each supported equality edge.
-
-    Both operands are single tokens directly adjacent to the operator, and each
-    is a COMPLETE operand. This rejects juxtaposition-AND (`= A B`) and a postfix
-    complement (`= A'`), which no operator scan can enumerate.
-    """
+    """(left_pos, right_pos, op_text) of each equality with two complete
+    single-token operands. This rejects `= A B` (juxtaposition AND) and `= A'`."""
     n = len(toks)
 
     def _operand_complete(pos: int, outward: int) -> bool:
@@ -555,12 +551,8 @@ def _equality_edges(toks: list) -> list:
 
 
 def _bare_ref_widths(toks: list, edges: list) -> dict:
-    """Width of each unannotated stream reference.
-
-    The engine types a bare `i4[t]` from its context, so the planner must give
-    it a width too: the canonical width of the stream, else the one declared
-    width all its equality partners agree on. Anything else stays unknown.
-    """
+    """Width of each bare stream reference, by token position: the canonical
+    width of the stream, else the one width that all its equality partners declare."""
     partners: dict = {}
     for lpos, rpos, _op in edges:
         partners.setdefault(lpos, []).append(rpos)

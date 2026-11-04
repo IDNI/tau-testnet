@@ -168,7 +168,8 @@ a pubkey as `iN[t]:bv[384]` at every reference, for example
 internal width. A bare `i13[t]` takes its width from the rule text around it,
 so it can conflict with another rule that uses the same stream. The node then
 refuses the rule, and the error tells you to write `i13[t]:bv[384]`. The bare
-form is correct for `i3`, `i4` and `i12`, because the node knows their width.
+form is correct for `i3`, `i4`, `i12` and the approval slots `i18` to `i25`,
+because the node knows their width.
 
 ### User Policy Rules (`o5`)
 
