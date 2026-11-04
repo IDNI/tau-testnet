@@ -75,7 +75,6 @@ class TestConsensusTime(unittest.TestCase):
 
         tip = db.get_canonical_head_block()["header"]["timestamp"]
         clock = tip + 1000
-        patch("consensus.facade.time", MagicMock(time=MagicMock(return_value=clock))).start()
         recipient = "ab" * 48
         tx = {
             "sender_pubkey": SENDER,
@@ -85,7 +84,8 @@ class TestConsensusTime(unittest.TestCase):
             "operations": {"1": [[SENDER, recipient, "1"]]},
             "fee_limit": "1000",
         }
-        res = sendtx.queue_transaction(json.dumps(sign_payload(tx, SK_ALICE)))
+        with patch("consensus.facade.time", MagicMock(time=MagicMock(return_value=clock))):
+            res = sendtx.queue_transaction(json.dumps(sign_payload(tx, SK_ALICE)))
         self.assertTrue(res["ok"], f"queue failed: {res}")
 
         transfer_inputs = [
