@@ -353,3 +353,25 @@ def test_an_estimate_under_force_test_does_not_say_admissible(node, kind):
     assert "estimated_fee" not in data
     assert data["note"].startswith("The fee check was skipped")
     assert script["steps"] == []
+
+
+def _fee_rule():
+    return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) "
+            "? (o8[t]:bv[24] = { #x000002 }:bv[24]) "
+            ": (o8[t]:bv[24] = { #x000000 }:bv[24]) )." % SENDER)
+
+
+def test_the_old_form_on_a_user_rule_opens_no_admission_context(node):
+    script, standby = node
+    payload = _envelope("user_tx", SENDER, "0", operations={"0": _fee_rule()})
+    with patch("tau_admission.open_context",
+               side_effect=AssertionError("the old form opened an admission context")), \
+            patch("commands.sendtx._preflight_prepared_rule",
+                  side_effect=AssertionError("the old form ran the preflight")):
+        env = _check(payload, estimate=False)
+    data = env["data"]
+    assert data["admissible"] is None, env
+    assert data["tau_evaluated"] is False
+    assert data["checks_skipped"] == ["tau_eval", "fee_limit"]
+    assert script["built"] == 0 and script["revisions"] == []
+    assert standby.taken == 0

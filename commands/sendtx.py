@@ -1152,7 +1152,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                 if rule_text:
                     if tau_force_test:
                         logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")
-                    elif admission_tau.isolated:
+                    elif admission_tau.isolated and not skip_tau_eval:
                         # The revision apply will make -- the rule itself, or the
                         # composite a routed o5 rule becomes -- offered to an
                         # evaluator rebuilt from the committed journal, so it
@@ -1252,9 +1252,12 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                             # so it passes text the live process cannot type. Now
                             # validate what apply will actually feed: the PREPARED
                             # runtime rule against the runtime baseline.
-                            preflight_err = _preflight_prepared_rule(rule_text)
-                            if preflight_err is not None:
-                                return preflight_err
+                            # The preflight prepares the rule in this process,
+                            # so a request that asks for no Tau run skips it.
+                            if not skip_tau_eval:
+                                preflight_err = _preflight_prepared_rule(rule_text)
+                                if preflight_err is not None:
+                                    return preflight_err
 
             # Step 2: Custom Input Validation (transfer-less user_tx only).
             # For txs WITH transfers the custom streams are merged into the
