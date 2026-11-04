@@ -30,6 +30,8 @@ back to the in-process path. It returns `estimated_fee` for every fee-bearing
 type. The fee limit of the payload does not change the estimate, so a wallet can
 sign a draft with any fee_limit, ask, and sign again with the estimate.
 `admissible` is then true only when the payload's fee_limit covers the estimate.
+When no fee step ran for a fee-bearing type (TAU_FORCE_TEST), `admissible` is
+null, as in the plain form.
 
 The flags say what really ran. `tau_evaluated` is true only when the admission
 context ran a Tau step. `fee_checked` is true only when the fee of a type in
@@ -85,8 +87,9 @@ def execute(raw_command: str, container):
     checks_skipped = ([] if tau_evaluated else ["tau_eval"]) + (
         [] if fee_checked else ["fee_limit"])
     if result.get("ok"):
+        fee_bearing = result.get("tx_type") in sendtx.FEE_BEARING_TX_TYPES
         data = {
-            "admissible": True if estimate else None,
+            "admissible": True if estimate and not fee_bearing else None,
             "fee_checked": fee_checked,
             "tx_hash": result["tx_hash"],
             "tx_type": result.get("tx_type"),
@@ -102,8 +105,10 @@ def execute(raw_command: str, container):
                 "The fee check was skipped: no fee was evaluated. "
                 "Use 'checktx estimate' for the fee and a full verdict."
             )
-        elif result.get("tx_type") not in sendtx.FEE_BEARING_TX_TYPES:
+        elif not fee_bearing:
             data["note"] = "fee_exempt: this transaction type pays no fee."
+        elif not fee_checked:
+            data["note"] = "The fee check was skipped: no fee was evaluated."
         if result.get("update_id"):
             data["update_id"] = result["update_id"]
         return api_response.success_response("checktx", data)

@@ -339,3 +339,17 @@ def test_the_old_form_on_an_accept_opens_no_admission_context(node):
     assert data["checks_skipped"] == ["tau_eval", "fee_limit"]
     assert script["built"] == 0 and script["revisions"] == []
     assert standby.taken == 0
+
+
+@pytest.mark.parametrize("kind", ["user_tx", "rule_offer"])
+def test_an_estimate_under_force_test_does_not_say_admissible(node, kind):
+    script, _ = node
+    with patch("tau_manager.is_force_test_enabled", return_value=True):
+        env = _check(_payload(kind))
+    data = env["data"]
+    assert data["admissible"] is None, env
+    assert data["fee_checked"] is False
+    assert "fee_limit" in data["checks_skipped"]
+    assert "estimated_fee" not in data
+    assert data["note"].startswith("The fee check was skipped")
+    assert script["steps"] == []
