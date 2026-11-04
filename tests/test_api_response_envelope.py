@@ -166,7 +166,6 @@ class TestSendtxAtProcessCommand(unittest.TestCase):
         container = _stub_container()
         from commands import sendtx as sendtx_mod
         container.command_handlers = {"sendtx": sendtx_mod}
-        sendtx_mod._PY_ECC_AVAILABLE = True
         try:
             success, body = server_mod.process_command(
                 "sendtx not-a-json", container, "test"

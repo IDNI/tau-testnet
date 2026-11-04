@@ -40,7 +40,6 @@ def setup_module(module):
     except Exception:
         pass
     db.clear_mempool()
-    sendtx._PY_ECC_AVAILABLE = True
 
 def teardown_module(module):
     if db._db_conn:

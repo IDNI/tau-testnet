@@ -100,16 +100,6 @@ class TestSendTxBasic(unittest.TestCase):
         shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.set_database_path(self.original_db_path)
         
-        # Reset globals that might affect other tests
-        if hasattr(sendtx, '_PY_ECC_AVAILABLE'):
-            # Re-detect or set to default
-            try:
-                import py_ecc.bls
-                sendtx._PY_ECC_AVAILABLE = True
-                sendtx._PY_ECC_BLS = py_ecc.bls
-            except ImportError:
-                sendtx._PY_ECC_AVAILABLE = False
-                sendtx._PY_ECC_BLS = None
 
     def _create_tx(self, transfers, expiration=None, sequence=None, sender_pubkey=None):
         ops = {"1": transfers}

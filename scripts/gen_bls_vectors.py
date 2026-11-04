@@ -4,6 +4,7 @@
 bls_g2basic_vectors.json: `expected` is py_ecc's G2Basic.Verify on (pk, msg, sig).
 bls_header_vectors.json: `expected` is G2Basic.Verify on a block header's proposer,
 proof and header digest.
+bls_keyvalidate_vectors.json: `expected` is G2Basic.KeyValidate on a 48-byte key.
 
 py_ecc is the reference the consensus verifier must match on every input. Inputs
 are built with arkworks (byte-identical to py_ecc, far faster) and are fully
@@ -50,7 +51,11 @@ from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_message  # noq
 SEED = 20261102
 DEFAULT_OUT = ROOT / "tests" / "fixtures" / "bls_g2basic_vectors.json"
 HEADER_OUT = ROOT / "tests" / "fixtures" / "bls_header_vectors.json"
+KEYVALIDATE_OUT = ROOT / "tests" / "fixtures" / "bls_keyvalidate_vectors.json"
 N_HEADER_VALID = 30
+N_KEYS_VALID = 40
+N_KEYS_OFFCURVE = 40
+N_KEYS_RANDOM = 40
 N_VALID = 50
 N_MUTANT_PK = 100
 N_MUTANT_SIG = 100
@@ -399,6 +404,16 @@ def edge_pubkeys(rng, pk0):
     return out
 
 
+def off_curve_pubkeys(rng, count):
+    """Well-formed compressed encodings whose x has no curve point."""
+    out = []
+    while len(out) < count:
+        x = rng.randrange(Q)
+        if pow((x**3 + 4) % Q, (Q - 1) // 2, Q) != 1:
+            out.append(("offcurve", g1_enc(1, 0, rng.randrange(2), x)))
+    return out
+
+
 def dedupe(cases):
     seen = set()
     out = []
@@ -407,6 +422,24 @@ def dedupe(cases):
             seen.add(key)
             out.append((label, key))
     return out
+
+
+def build_keyvalidate():
+    rng = random.Random(SEED + 2)
+    pk0 = pk_of(rand_sk(rng))
+    cases = []
+    for _ in range(N_KEYS_VALID):
+        pk = pk_of(rand_sk(rng))
+        cases.append(("valid", pk))
+        cases.append(("valid_sort_flipped", flip_sort(pk)))
+    cases += edge_pubkeys(rng, pk0)
+    cases += off_curve_pubkeys(rng, N_KEYS_OFFCURVE)
+    for v in rng.sample(range(256), 64):
+        cases.append(("sweep:first_byte", bytes([v]) + pk0[1:]))
+    for _ in range(N_KEYS_RANDOM):
+        cases.append(("random_bytes", rng.randbytes(48)))
+        cases.append(("mutant", mutate(rng, pk0)))
+    return dedupe(cases)
 
 
 def edge_proofs(rng, sig0):
@@ -554,6 +587,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     ap.add_argument("--header-out", type=Path, default=HEADER_OUT)
+    ap.add_argument("--keyvalidate-out", type=Path, default=KEYVALIDATE_OUT)
     args = ap.parse_args()
 
     vectors = []
@@ -588,6 +622,12 @@ def main():
             }
         )
     write_fixture(args.header_out, SEED + 1, headers)
+
+    keys = [
+        {"label": label, "pk": pk.hex(), "expected": bool(G2Basic.KeyValidate(pk))}
+        for label, pk in build_keyvalidate()
+    ]
+    write_fixture(args.keyvalidate_out, SEED + 2, keys)
 
 
 if __name__ == "__main__":
