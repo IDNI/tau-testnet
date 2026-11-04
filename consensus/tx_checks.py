@@ -10,7 +10,7 @@ from typing import Any, Optional, Tuple
 from consensus.approvals import TX_TYPE_APPROVAL_REQUEST
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
-from consensus.tx_signing import decode_pubkey
+from consensus import bls
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _AMOUNT_LIMIT = 1 << 256
@@ -23,7 +23,7 @@ def validate_bls_pubkey(key_hex: Any, key_name: str) -> Optional[str]:
     """Error text when `key_hex` is not a valid BLS12-381 public key, else None."""
     if not isinstance(key_hex, str) or len(key_hex) != 96 or not set(key_hex) <= _HEX_DIGITS:
         return f"Invalid {key_name}: must be a 96-character hex BLS12-381 public key."
-    if decode_pubkey(bytes.fromhex(key_hex)) is None:
+    if not bls.pubkey_valid(bytes.fromhex(key_hex)):
         return f"Invalid {key_name}: not a valid BLS12-381 public key."
     return None
 

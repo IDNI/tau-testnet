@@ -78,6 +78,7 @@ _LIFECYCLE_TX_TYPES = frozenset(
     | set(APPROVAL_TX_TYPES)
 )
 from consensus.tx_checks import apply_tx_error
+from consensus import bls
 from consensus.tx_signing import verify_tx_signature
 import tau_native
 import tau_advisory
@@ -727,7 +728,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return True
             if "require_bls_sig" in output:
                 try:
-                    from py_ecc.bls import G2Basic
                     import hashlib
                     block_sig = block.consensus_proof
                     if isinstance(block_sig, dict):
@@ -738,7 +738,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     msg_hash = hashlib.sha256(block.header.canonical_bytes()).digest()
                     pubkey_bytes = bytes.fromhex(block.header.proposer_pubkey)
                     sig_bytes = bytes.fromhex(block_sig)
-                    if not G2Basic.Verify(pubkey_bytes, msg_hash, sig_bytes):
+                    if not bls.verify(pubkey_bytes, msg_hash, sig_bytes):
                         logger.warning("Consensus: Block #%s cryptographic proof failed", block.header.block_number)
                         return False
                 except Exception as e:
