@@ -97,6 +97,55 @@ class TestConsensusTime(unittest.TestCase):
         self.assertIn(5, transfer_inputs[0], "i5 not injected at admission")
         self.assertEqual(transfer_inputs[0][5], str(max(tip, clock)))
 
+    def _queue_transfer_less_tx_at(self, clock):
+        chain_state._balances[SENDER] = 100000
+        tx = {
+            "sender_pubkey": SENDER,
+            "sequence_number": chain_state.get_sequence_number(SENDER),
+            "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
+            "operations": {"20": "custom_data"},
+            "fee_limit": "1000",
+        }
+        with patch("consensus.facade.time", MagicMock(time=MagicMock(return_value=clock))):
+            res = sendtx.queue_transaction(json.dumps(sign_payload(tx, SK_ALICE)))
+        self.assertTrue(res["ok"], f"queue failed: {res}")
+
+    @patch('tau_manager.is_force_test_enabled', return_value=False)
+    @patch('tau_manager.communicate_with_tau_multi', return_value={9: "0"})
+    @patch('tau_manager.communicate_with_tau', return_value="ok")
+    @patch('tau_manager.tau_ready')
+    def test_fee_estimate_i5_takes_admission_clock(self, mock_ready, mock_tau, mock_multi, mock_force):
+        mock_ready.is_set.return_value = True
+        tip = db.get_canonical_head_block()["header"]["timestamp"]
+        clock = tip + 1000
+        self._queue_transfer_less_tx_at(clock)
+
+        fee_inputs = [
+            c.kwargs.get("input_stream_values", {})
+            for c in mock_multi.call_args_list
+            if 12 in c.kwargs.get("input_stream_values", {})
+        ]
+        self.assertEqual(len(fee_inputs), 1, "no fee-query Tau call captured")
+        self.assertEqual(fee_inputs[0][5], str(clock))
+
+    @patch('tau_manager.is_force_test_enabled', return_value=False)
+    @patch('tau_admission.open_context')
+    @patch('tau_admission.enabled', return_value=True)
+    def test_unified_context_i5_takes_admission_clock(self, mock_enabled, mock_open, mock_force):
+        context = mock_open.return_value
+        context.step.return_value = {9: "0"}
+        tip = db.get_canonical_head_block()["header"]["timestamp"]
+        clock = tip + 1000
+        self._queue_transfer_less_tx_at(clock)
+
+        unified_inputs = [
+            c.args[0] for c in context.step.call_args_list if 12 not in c.args[0]
+        ]
+        self.assertEqual(len(unified_inputs), 1, "no unified custom step captured")
+        self.assertIn(20, unified_inputs[0])
+        self.assertEqual(unified_inputs[0][5], str(clock))
+
     @patch('tau_manager.communicate_with_tau_multi')
     @patch('tau_manager.communicate_with_tau')
     @patch('tau_manager.tau_ready')
