@@ -169,3 +169,65 @@ def test_the_error_never_turns_an_accepted_bare_ref_into_a_refusal(temp_database
         session.dispose()
     assert receipt["accepted"]
     assert not (receipt.get("report") or {}).get("errors")
+
+
+OTHER_KEY = "cd" * 48
+
+
+def _env():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+def _router():
+    with open(os.path.join(REPO, "genesis.tau")) as fh:
+        return f"always ( {fh.read().strip()} )."
+
+
+def _no_shrink_plan(width):
+    import tau_reconstruction
+
+    return tau_reconstruction.RepresentationPlan(width=width, interned=frozenset(),
+                                                 plain=frozenset())
+
+
+def _addr(hex_digits):
+    return "{ #x" + hex_digits + " }:bv[384]"
+
+
+def _run_rules(plan, rules, inputs):
+    """The accepted flag of each rule, then the outputs of each input step."""
+    import tau_session
+
+    session = tau_session.WorkerSession.spawn(_router(), cwd=REPO, env=_env(), plan=plan)
+    try:
+        accepted = []
+        for rule in rules:
+            session.apply_rule(rule, record=False)
+            accepted.append(session.last_receipt()["accepted"])
+        outputs = [session.evaluate(step, multi=True, record=False) for step in inputs]
+    finally:
+        session.dispose()
+    return accepted, outputs
+
+
+VERDICT_RULES = {
+    "annotated": SHRINKS_I13,
+    "bare_with_literal": ("always ( i13[t] = { #x" + CUSTOM_KEY + " }:bv[384]"
+                          " -> o6[t]:bv[24] = { #x000001 }:bv[24] )."),
+}
+
+
+@pytest.mark.parametrize("name", sorted(VERDICT_RULES))
+def test_a_rule_gives_the_same_verdict_with_and_without_shrink(temp_database, name):
+    import tau_reconstruction
+
+    rule = VERDICT_RULES[name]
+    plan = tau_reconstruction.plan_representation(candidate_rules=[rule])
+    assert 13 in plan.interned
+    inputs = [{13: _addr(CUSTOM_KEY)}, {13: _addr(OTHER_KEY)}]
+    shrunk = _run_rules(plan, [rule], inputs)
+    canonical = _run_rules(_no_shrink_plan(plan.width), [rule], inputs)
+    assert shrunk[0] == [True]
+    assert shrunk == canonical
