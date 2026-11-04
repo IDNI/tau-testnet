@@ -56,7 +56,7 @@ class _TauDeterminismBase(unittest.TestCase):
         # Force NO TAU_FORCE_TEST
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}).start()
 
-        sendtx._PY_ECC_AVAILABLE = False
+        patch("commands.sendtx._PY_ECC_AVAILABLE", False).start()
         patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
         patch("commands.createblock._BLS_AVAILABLE", True).start()
         patch("commands.createblock._validate_signature", return_value=True).start()
