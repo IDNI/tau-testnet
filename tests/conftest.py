@@ -54,6 +54,23 @@ def test_environment() -> Iterator[None]:
         config.reload_settings(env=original_env)
 
 @pytest.fixture(autouse=True)
+def reset_tau_stream_types() -> Iterator[None]:
+    """Start every test from an engine that has typed no stream.
+
+    Stream types are process-global and the first spec that types a stream
+    pins it, so without this a test's outcome depends on which tests ran
+    before it in the same process: one that types o5 as bv[16] leaves
+    genesis.tau (o5 pinned at bv[24]) uncompilable for the rest of the run.
+    Interpreters already built keep their own streams. Tau builds that
+    predate reset_definitions() are left as they are.
+    """
+    reset = getattr(sys.modules.get("tau"), "reset_definitions", None)
+    if reset is not None:
+        reset()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def mock_consensus_for_unrelated_tests(monkeypatch, request):
     """Automatically allow block creation turns in non-consensus tests to avoid breaking mempool/faucet tests."""
     if hasattr(request, "module") and request.module and "test_poa" not in request.module.__name__ and "test_network" not in request.module.__name__:
