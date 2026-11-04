@@ -10,6 +10,9 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import tau_defs
+from errors import BlockchainBug
+
+_MISSING = object()
 
 #: The amount of a network whose genesis names none: no faucet.
 DEFAULT_FAUCET_AMOUNT = 0
@@ -26,9 +29,13 @@ def validate_faucet_amount(value: Any) -> Optional[str]:
 
 def amount(lifecycle) -> int:
     """The grant of the network that `lifecycle` belongs to. 0 is no faucet."""
-    value = getattr(lifecycle, "faucet_amount", DEFAULT_FAUCET_AMOUNT)
-    if validate_faucet_amount(value) is not None:
-        return DEFAULT_FAUCET_AMOUNT
+    # The genesis load validates the amount, so a missing or bad value here is a node bug.
+    value = getattr(lifecycle, "faucet_amount", _MISSING)
+    if value is _MISSING:
+        raise BlockchainBug("lifecycle manager has no faucet_amount")
+    err = validate_faucet_amount(value)
+    if err is not None:
+        raise BlockchainBug(f"lifecycle faucet_amount {err}: {value!r}")
     return value
 
 

@@ -3,6 +3,11 @@
 Each block runs on the production path (a proposal) and on the test-mode path
 (no proposal). Both paths must give the same balances and the same state hash.
 """
+import copy
+import json
+import subprocess
+import types
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -317,3 +322,55 @@ def test_admission_judges_the_same_spendable_balance(temp_database, monkeypatch)
     zero = json.loads(checktx.execute(f"checktx {json.dumps(case._tx())}", None))
     assert fresh["status"] == "ok" and fresh["data"]["admissible"] is True, fresh
     assert zero["status"] != "ok", zero
+
+
+class _NoFaucetField:
+    pass
+
+
+class _Faucet:
+    def __init__(self, value):
+        self.faucet_amount = value
+
+
+def test_amount_gives_a_valid_value():
+    assert faucet.amount(_Faucet(GRANT)) == GRANT
+    assert faucet.amount(_Faucet(0)) == 0
+    assert faucet.amount(ConsensusLifecycleManager()) == 0
+
+
+def test_amount_refuses_a_missing_value():
+    with pytest.raises(BlockchainBug, match="no faucet_amount"):
+        faucet.amount(_NoFaucetField())
+    with pytest.raises(BlockchainBug, match="no faucet_amount"):
+        faucet.amount(None)
+
+
+@pytest.mark.parametrize("value", ["100000", None, True, -1, tau_defs.MAX_TRANSFER_VALUE + 1, 1.5])
+def test_amount_refuses_a_bad_value(value):
+    with pytest.raises(BlockchainBug, match="faucet_amount"):
+        faucet.amount(_Faucet(value))
+
+
+def _committed_genesis_files():
+    repo = Path(__file__).resolve().parent.parent
+    out = subprocess.run(["git", "ls-files", "*genesis*.json"], cwd=repo,
+                         capture_output=True, text=True, check=True).stdout
+    return [repo / name for name in out.split()]
+
+
+def test_the_repo_ships_a_genesis_file():
+    assert _committed_genesis_files()
+
+
+@pytest.mark.parametrize("path", _committed_genesis_files(), ids=lambda p: p.parent.name)
+def test_each_committed_genesis_still_loads(temp_database, monkeypatch, path):
+    for name, value in list(vars(chain_state).items()):
+        if name.startswith("_") and not name.startswith("__") and not callable(value) \
+                and not isinstance(value, types.ModuleType):
+            fresh = copy.copy(value) if isinstance(value, (dict, list, set)) else value
+            monkeypatch.setattr(chain_state, name, fresh)
+    meta = json.loads(path.read_text())["consensus_meta"]
+    pinned = meta.get("mechanism_specific_metadata", {}).get("faucet_amount", 0)
+    chain_state.load_genesis(str(path))
+    assert faucet.amount(chain_state._lifecycle_manager) == pinned
