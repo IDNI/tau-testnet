@@ -326,3 +326,16 @@ def test_an_estimate_of_a_request_the_policy_does_not_gate_is_refused(node):
     assert details["tau_evaluated"] is True
     assert details["fee_checked"] is False
     assert details["checks_skipped"] == ["fee_limit"]
+
+
+def test_the_old_form_on_an_accept_opens_no_admission_context(node):
+    script, standby = node
+    with patch("tau_admission.open_context",
+               side_effect=AssertionError("the old form opened an admission context")):
+        env = _check(_payload("rule_offer_accept"), estimate=False)
+    data = env["data"]
+    assert data["admissible"] is None, env
+    assert data["tau_evaluated"] is False
+    assert data["checks_skipped"] == ["tau_eval", "fee_limit"]
+    assert script["built"] == 0 and script["revisions"] == []
+    assert standby.taken == 0

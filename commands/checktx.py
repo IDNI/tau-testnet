@@ -82,11 +82,8 @@ def execute(raw_command: str, container):
     # The flags say what really ran, not what the mode allowed.
     tau_evaluated = bool(result.get("tau_evaluated", False))
     fee_checked = bool(result.get("fee_checked", False))
-    if estimate:
-        checks_skipped = ([] if tau_evaluated else ["tau_eval"]) + (
-            [] if fee_checked else ["fee_limit"])
-    else:
-        checks_skipped = ["tau_eval", "fee_limit"]
+    checks_skipped = ([] if tau_evaluated else ["tau_eval"]) + (
+        [] if fee_checked else ["fee_limit"])
     if result.get("ok"):
         data = {
             "admissible": True if estimate else None,

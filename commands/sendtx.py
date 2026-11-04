@@ -1074,7 +1074,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             # already built it (see consensus/admission._compose_with_clause).
             composite_rule = (admission_eval.data or {}).get("composite_rule")
             if (composite_rule and not tau_force_test and admission_tau.isolated
-                    and tx_type == TX_TYPE_RULE_OFFER_ACCEPT):
+                    and not skip_tau_eval and tx_type == TX_TYPE_RULE_OFFER_ACCEPT):
                 # Accepting folds the clause into the stream's composite, and
                 # apply feeds that composite to an evaluator carrying the
                 # committed type history. Validate it there -- a fresh process
