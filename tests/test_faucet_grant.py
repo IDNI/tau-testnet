@@ -11,13 +11,16 @@ import chain_state
 import config
 import tau_defs
 from block import Block
+from bls_keys import sign_payload
 from consensus import faucet
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager
 from consensus.retractable import KIND_HEIGHT, RetractableEntry
 from consensus.state import TauStateSnapshot
 from errors import BlockchainBug
-from test_retractable_apply import ALICE, BOB, CAROL, HEIGHT, PROPOSER, TS, park_tx, spend_tx
+from test_retractable_apply import (
+    ALICE, BOB, CAROL, HEIGHT, PROPOSER, SK_BOB, TS, park_tx, spend_tx,
+)
 from test_retractable_apply_proposal import _Session, _engine, _proposal, _view
 
 GRANT = 100000
@@ -140,6 +143,7 @@ def test_a_sequence_record_has_no_pending_grant(temp_database, path):
 def test_a_record_made_by_the_nonce_alone_gets_the_grant(temp_database, path):
     no_transfer = spend_tx(BOB, CAROL, 1, 0, fee_limit="0")
     no_transfer["operations"] = {"100": "42"}
+    sign_payload(no_transfer, SK_BOB)
     result = _run(path, [no_transfer], _parent({ALICE: 1000}))
     assert result.accepted_tx_ids == [no_transfer["tx_id"]]
     assert result.next_snapshot.metadata["sequence_numbers"][BOB] == 1
