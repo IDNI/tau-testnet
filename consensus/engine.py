@@ -653,6 +653,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         getattr(getattr(block, "header", None), "block_number", "?"),
                     )
                     return False
+                # Stake is consensus data: like get_committed_balance, it ignores a pending faucet grant.
                 proposer_stake = int(balances.get((block.header.proposer_pubkey or "").lower(), 0))
             tau_inputs = self._build_consensus_input_streams(
                 proposer_pubkey=block.header.proposer_pubkey,
@@ -823,7 +824,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             lm = copy.deepcopy(parent_lm)
         else:
             # Fallback if somehow not provided (tests, legacy)
+            import chain_state
             from consensus.governance import ConsensusLifecycleManager
+            if chain_state._genesis_faucet_amount:
+                raise BlockchainBug("no parent lifecycle on a network with a genesis faucet")
             lm = ConsensusLifecycleManager(active_validators=[bytes.fromhex(v) for v in self._validators])
         if proposal is not None:
             # The block's lifecycle IS the proposal's from here: transactions

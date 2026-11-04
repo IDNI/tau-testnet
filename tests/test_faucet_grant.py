@@ -374,3 +374,15 @@ def test_each_committed_genesis_still_loads(temp_database, monkeypatch, path):
     pinned = meta.get("mechanism_specific_metadata", {}).get("faucet_amount", 0)
     chain_state.load_genesis(str(path))
     assert faucet.amount(chain_state._lifecycle_manager) == pinned
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_no_parent_lifecycle_on_a_faucet_network_is_a_bug(temp_database, monkeypatch, path):
+    parent = _parent({ALICE: 200000})
+    del parent.metadata["lifecycle_manager"]
+    tx = spend_tx(ALICE, BOB, 5001, 0, fee_limit="10")
+    monkeypatch.setattr(chain_state, "_genesis_faucet_amount", GRANT)
+    with pytest.raises(BlockchainBug, match="genesis faucet"):
+        _run(path, [tx], parent, fee="10")
+    monkeypatch.setattr(chain_state, "_genesis_faucet_amount", 0)
+    assert _run(path, [tx], parent, fee="10").accepted_tx_ids == [tx["tx_id"]]
