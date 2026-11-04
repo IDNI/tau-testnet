@@ -241,7 +241,7 @@ class TestEngineFeeCharging(EngineFeeBase):
 
     def test_governance_tx_exempt(self):
         self.mock_multi.return_value = {1: "1", 9: "10"}
-        lifecycle = MagicMock()
+        lifecycle = MagicMock(faucet_amount=0)
         lifecycle.can_admit_vote.return_value = True
         lifecycle.submit_vote.return_value = True
         balances = {}  # zero-balance validator

@@ -47,6 +47,7 @@ class _Approvals:
 def _lifecycle():
     mgr = MagicMock()
     mgr.approval_slots_active = True
+    mgr.faucet_amount = 0
     mgr.rule_offers = _Offers()
     mgr.approval_requests = _Approvals()
     return mgr

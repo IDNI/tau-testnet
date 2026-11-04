@@ -87,6 +87,7 @@ class _Lifecycle:
     def __init__(self):
         self.approval_slots_active = True
         self.retractable_transfers = RetractableBook()
+        self.faucet_amount = 0
         self.rule_offers = RuleOfferLifecycleManager(
             accepted_clauses={(SENDER_B.lower(), STREAM): PREVIOUS_BODY}
         )

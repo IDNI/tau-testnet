@@ -80,7 +80,7 @@ def _proposal(session, label="proposal"):
         allocator=alloc.Allocator(alloc.DbMappingSnapshot(), width=plan.width,
                                   label="proposal"),
         plan=plan,
-        lifecycle=MagicMock(approval_slots_active=False),
+        lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
         label=label,
     )
 
