@@ -140,6 +140,9 @@ def plan_representation(*, history_rules=(), candidate_rules=(), width=None):
             try:
                 with tau_shrink.speculative_allocation(allocator=scratch):
                     prepared = tau_shrink.prepare_rule(text, exclude_streams=frozenset(plain))
+            except tau_shrink.ShrinkWidthOverflow:
+                # The process width is too small for a committed id: a re-exec, not a plain stream.
+                raise
             except Exception:
                 # An unanalyzable rule cannot be shown to be shrinkable: everything it
                 # touches stays plain.
