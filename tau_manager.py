@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 import threading
@@ -459,6 +460,15 @@ def _handle_width_overflow(exc: "tau_shrink.ShrinkWidthOverflow"):
         "typing cannot widen in-process).", exc
     )
     os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+@contextlib.contextmanager
+def reexec_on_width_overflow():
+    """Send a ShrinkWidthOverflow to the re-exec, never to a fallback or a plain stream."""
+    try:
+        yield
+    except tau_shrink.ShrinkWidthOverflow as exc:
+        _handle_width_overflow(exc)
 
 
 def start_and_manage_tau_process():

@@ -231,8 +231,10 @@ def _conflicts(plan, candidate_rules) -> bool:
     test that decides whether the authority can be lent."""
     if not candidate_rules:
         return False
+    import tau_manager
     import tau_reconstruction
-    needs = tau_reconstruction.plan_representation(candidate_rules=list(candidate_rules))
+    with tau_manager.reexec_on_width_overflow():
+        needs = tau_reconstruction.plan_representation(candidate_rules=list(candidate_rules))
     return bool(set(needs.plain) & set(plan.interned))
 
 
@@ -257,9 +259,11 @@ def _plan_for(anchor, entries, candidate_rules):
             return committed
     history = [e.rule_text for e in entries
                if e.kind == tau_journal.REVISION and e.rule_text]
-    return tau_reconstruction.plan_representation(
-        history_rules=history, candidate_rules=list(candidate_rules or ()),
-    )
+    import tau_manager
+    with tau_manager.reexec_on_width_overflow():
+        return tau_reconstruction.plan_representation(
+            history_rules=history, candidate_rules=list(candidate_rules or ()),
+        )
 
 
 def _build(*, candidate_rules, label, deadline, cwd, env, store):
