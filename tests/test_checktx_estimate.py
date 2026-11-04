@@ -375,3 +375,32 @@ def test_the_old_form_on_a_user_rule_opens_no_admission_context(node):
     assert data["checks_skipped"] == ["tau_eval", "fee_limit"]
     assert script["built"] == 0 and script["revisions"] == []
     assert standby.taken == 0
+
+
+def test_the_estimate_of_a_user_tx_with_a_rule(node):
+    script, _ = node
+    rule = _fee_rule()
+    env = _check(_envelope("user_tx", SENDER, "0", operations={"0": rule}))
+    data = env["data"]
+    assert data["estimated_fee"] == str(BASE_FEE + CUSTOM_FEE), env
+    assert data["admissible"] is False
+    assert data["tau_evaluated"] is True and data["fee_checked"] is True
+    assert data["checks_skipped"] == []
+    assert script["revisions"] == [rule]
+    # the custom step after the rule, then the fee query
+    assert len(script["steps"]) == 2
+    assert script["labels"] == ["estimate"] and script["disposed"] == 1
+
+
+def test_the_estimate_of_a_user_tx_with_custom_inputs(node):
+    script, _ = node
+    env = _check(_envelope("user_tx", SENDER, "1000", operations={"30": "7"}))
+    data = env["data"]
+    assert data["estimated_fee"] == str(BASE_FEE + CUSTOM_FEE), env
+    assert data["admissible"] is True
+    assert data["tau_evaluated"] is True and data["fee_checked"] is True
+    assert data["checks_skipped"] == []
+    assert script["revisions"] == []
+    custom_step, fee_query = script["steps"]
+    assert custom_step[30] == ["7"] and custom_step[5]
+    assert fee_query[30] == ["7"]
