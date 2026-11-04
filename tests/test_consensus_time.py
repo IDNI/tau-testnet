@@ -163,7 +163,7 @@ class TestConsensusTime(unittest.TestCase):
             "expiration_time": int(time.time()) + 1000,
             "expire_at_height": 5000,
             "operations": {
-                "1": [[sender, "some_addr", "1"]],
+                "1": [[sender, pubkey_hex(SK_BOB), "1"]],
                 "20": "custom_data"
             },
             "fee_limit": "0",
@@ -205,7 +205,7 @@ class TestConsensusTime(unittest.TestCase):
             "sender_pubkey": sender,
             "sequence_number": chain_state.get_sequence_number(sender),
             "operations": {
-                "1": [[sender, "some_addr", "1"]],
+                "1": [[sender, pubkey_hex(SK_BOB), "1"]],
                 "20": "custom_data"
             },
         }, SK_ALICE)

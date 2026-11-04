@@ -62,6 +62,7 @@ def test_validate_bls_pubkey_matches_py_ecc_key_validate(key_hex):
 def _user_tx_transfer(to_key: str, *, from_key: str | None = None):
     sender = from_key or SENDER
     return {
+        "sender_pubkey": sender,
         "operations": {
             "1": [[sender, to_key, "1"]],
         },

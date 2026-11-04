@@ -241,7 +241,7 @@ class TestMinerHardening(unittest.TestCase):
             "expiration_time": int(time.time() + 3600),
             "expire_at_height": 5000,
             "operations": {
-                "1": [[user_addr, "Bob", str(transfer_amount)]]
+                "1": [[user_addr, pubkey_hex(SK_BOB), str(transfer_amount)]]
             }
         }, SK_ALICE))
         db.add_mempool_tx(payload, "hash_faucet", 1000)
