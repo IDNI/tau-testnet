@@ -770,6 +770,20 @@ def untyped_input_streams(text: str) -> frozenset:
     return frozenset(out)
 
 
+#: Engine report codes of a type-inference failure: type_error and
+#: missing_type_information in the diagnostics of the parser library.
+TYPE_INFERENCE_CODES = frozenset({4, 8})
+
+
+def untyped_shrunk_hint(rule_text: str, shrunk_streams, codes):
+    """The author's fix for a type-inference failure at a bare reference to a
+    shrunk stream, or None for any other refusal."""
+    if not TYPE_INFERENCE_CODES.intersection(codes or ()):
+        return None
+    streams = set(shrunk_streams) & untyped_input_streams(rule_text)
+    return untyped_shrunk_stream_error(streams) if streams else None
+
+
 def untyped_shrunk_stream_error(streams) -> str:
     """The author-facing reason for a rule the engine refused because a bare
     reference met a stream this node runs shrunk."""

@@ -42,10 +42,6 @@ def _shrink_width():
 #: Revision outcomes that mean the engine took the candidate.
 _ACCEPTED = ("ACCEPTED_CHANGED", "ACCEPTED_NOOP")
 
-#: Engine report codes of a type-inference failure: type_error and
-#: missing_type_information in the diagnostics of the parser library.
-_TYPE_INFERENCE_CODES = frozenset({4, 8})
-
 #: A replay entry this slow is logged: replay time is what a restart, a
 #: proposal and an admission context each pay, and it has no deadline.
 SLOW_REPLAY_SECONDS = 10.0
@@ -487,17 +483,13 @@ class WorkerSession(EvaluatorSession):
         if self.plan is None or getattr(receipt, "accepted", False):
             return
         report = receipt.get("report")
-        codes = report.get("codes") if isinstance(report, dict) else None
-        if not _TYPE_INFERENCE_CODES.intersection(codes or ()):
+        if not isinstance(report, dict):
             return
         import tau_shrink
-        # The plan and the rule text already say which bare refs meet a shrunk feed.
-        streams = (set(self.plan.interned)
-                   & tau_shrink.untyped_input_streams(rule_text))
-        if not streams:
-            return
-        report["errors"] = ([tau_shrink.untyped_shrunk_stream_error(streams)]
-                            + list(report.get("errors") or []))
+        hint = tau_shrink.untyped_shrunk_hint(rule_text, self.plan.interned,
+                                              report.get("codes"))
+        if hint is not None:
+            report["errors"] = [hint] + list(report.get("errors") or [])
 
     def _excluded_streams(self, rule_text):
         """Streams this rule must leave at full width under this session's plan.

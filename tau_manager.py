@@ -615,6 +615,7 @@ def communicate_with_tau(
 
         # --- Shrink: canonical (persisted) vs runtime (interpreter) split ---
         prepared = None
+        author_text = rule_text
         if rule_text is not None:
             prepared = _prepare_rule_for_tau(rule_text)
             if prepared is not None:
@@ -666,10 +667,16 @@ def communicate_with_tau(
                     or any(p.shrink_enabled for p in i0_stream_preps)
                 ),
             )
-        except (TauSpecRejected, TauSpecIntegrationError):
+        except TauSpecRejected as exc:
             # W9: typed, deterministic verdicts about the INPUT. Flattening these
             # into TauCommunicationError erased the only signal that said whose
             # fault the failure was.
+            hint = (tau_shrink.untyped_shrunk_hint(author_text, effective_shrunk, exc.codes)
+                    if author_text else None)
+            if hint is None:
+                raise
+            raise TauSpecRejected(f"{hint} {exc}", codes=exc.codes) from exc
+        except TauSpecIntegrationError:
             raise
         except Exception as ex:
             raise TauCommunicationError(f"Direct Tau communication failed: {ex}", last_state=last_known_tau_spec)

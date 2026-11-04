@@ -33,6 +33,10 @@ class TauSpecRejected(TauTestnetError):
     monitor.
     """
 
+    def __init__(self, *args, codes=()):
+        super().__init__(*args)
+        self.codes = tuple(codes)
+
 
 class TauSpecIntegrationError(TauTestnetError):
     """The engine refused text THIS NODE generated from valid canonical input.
