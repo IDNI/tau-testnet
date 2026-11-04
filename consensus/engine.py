@@ -1268,11 +1268,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             target_lifecycle if target_lifecycle is not None
             else chain_state._lifecycle_manager
         )
+        # Identity is kept: the block builder hashes this same object after apply.
+        # On both apply paths an accepted transaction's fork is adopted INTO it.
         if proposal is not None:
-            # The proposal owns it from here. Identity is kept deliberately: the
-            # block builder holds this same object and hashes it after apply
-            # returns, so the proposal adopts a transaction's clone INTO it
-            # rather than swapping in a different manager.
             proposal.lifecycle = _block_lifecycle
         lifecycle_mgr = _block_lifecycle
         # The evaluator this apply drives. The default binds to THIS module's
@@ -1474,8 +1472,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # clone, and the proposal adopts it only on acceptance.
                 lifecycle_mgr = _branch.lifecycle
             elif _block_lifecycle is not None:
-                # Same discipline without a proposal: a rejected transaction must
-                # leave no lifecycle write, or the re-apply without it hashes apart.
+                # A rejected tx must leave no lifecycle write.
                 lifecycle_mgr = _block_lifecycle.fork()
             tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
             # operations is signed only for user_tx.
