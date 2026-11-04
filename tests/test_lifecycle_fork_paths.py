@@ -409,3 +409,39 @@ def test_both_apply_paths_give_the_same_state_hash(temp_database, name):
     assert len(direct.invalid_tx_ids) < len(txs), direct.outcomes
     assert direct.next_snapshot.state_hash != empty.next_snapshot.state_hash
     assert by_proposal.next_snapshot.state_hash == direct.next_snapshot.state_hash
+
+
+# --- the fork is lazy ---------------------------------------------------------
+
+def _transfer_tx(fee_limit="10000"):
+    return _sign(_envelope(
+        ALICE, "user_tx", fee_limit=fee_limit,
+        operations={"1": [[ALICE, BOB, 100]]},
+    ), SK_ALICE)
+
+
+def _count_forks(txs, mode):
+    real_fork = ConsensusLifecycleManager.fork
+    with patch.object(ConsensusLifecycleManager, "fork", autospec=True,
+                      side_effect=real_fork) as fork:
+        result = _apply_block(txs, mode)
+    return result, fork.call_count
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_plain_transfer_makes_no_fork(temp_database, mode):
+    tx = _transfer_tx()
+    result, forks = _count_forks([tx], mode)
+
+    assert result.invalid_tx_ids == [], _logs(result, tx)
+    assert result.next_snapshot.metadata["balances"][BOB] == 100_100
+    assert forks == 0
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_lifecycle_tx_makes_one_fork(temp_database, mode):
+    tx = _offer_tx(_offer(), fee_limit="10000")
+    result, forks = _count_forks([tx], mode)
+
+    assert result.invalid_tx_ids == [], _logs(result, tx)
+    assert forks == 1
