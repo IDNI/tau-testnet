@@ -275,6 +275,7 @@ def _parked_transfer_inputs(sender_pubkey: str, request: dict, tip_view,
         4: "{ #x" + request["recipient_pubkey"] + " }:bv[384]",
         12: "{ #x" + sender_pubkey + " }:bv[384]",
     }
+    # TODO: feed i16 here, as apply does, when tau_defs.COOLDOWN_STREAM_ACTIVE goes on.
     for k, v in (request.get("custom_inputs") or {}).items():
         values[int(k)] = str(v)
     for slot in _approval_slot_feed(tip_view):

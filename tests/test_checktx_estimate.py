@@ -404,3 +404,11 @@ def test_the_estimate_of_a_user_tx_with_custom_inputs(node):
     custom_step, fee_query = script["steps"]
     assert custom_step[30] == ["7"] and custom_step[5]
     assert fee_query[30] == ["7"]
+
+
+def test_an_unfunded_sender_gets_no_estimate(node, monkeypatch):
+    monkeypatch.setitem(chain_state._balances, SENDER, 0)
+    env = _check(_payload("rule_offer", fee_limit="1000"))
+    assert env["error"]["code"] == "INSUFFICIENT_FUNDS", env
+    assert env["error"]["details"]["required"] == BASE_FEE + CUSTOM_FEE
+    assert "estimated_fee" not in env["error"]["details"]

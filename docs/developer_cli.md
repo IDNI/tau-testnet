@@ -385,6 +385,8 @@ depend on the draft's `fee_limit`. When the node gives no estimate
 (`ESTIMATE_BUSY`, `ADMISSION_UNAVAILABLE`, or any rejection), the CLI stops
 before the final signature, prints the node error, and exits `1`. Give `--fee`
 in that case.
+A sender that cannot pay the estimated fee gets `INSUFFICIENT_FUNDS` and no
+estimate, even with `--fee`. Fund the sender first.
 
 The fee-exempt commands have no `--fee`: `approval approve`, `approval decline`,
 `retractable retract`, `gov propose` and `gov vote`. They sign `fee_limit` 0.
