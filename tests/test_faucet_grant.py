@@ -386,3 +386,49 @@ def test_no_parent_lifecycle_on_a_faucet_network_is_a_bug(temp_database, monkeyp
         _run(path, [tx], parent, fee="10")
     monkeypatch.setattr(chain_state, "_genesis_faucet_amount", 0)
     assert _run(path, [tx], parent, fee="10").accepted_tx_ids == [tx["tx_id"]]
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_a_fee_credit_is_the_first_touch_of_the_proposer(temp_database, path):
+    tx = spend_tx(ALICE, BOB, 100, 0, fee_limit="10")
+    result = _run(path, [tx], _parent({ALICE: 200000, BOB: 50}), fee="10")
+    assert result.accepted_tx_ids == [tx["tx_id"]]
+    assert _bal(result)[BOB] == 150
+    assert _bal(result)[PROPOSER] == GRANT + 10
+    assert _supply(result) == 200050 + GRANT
+
+
+def test_both_paths_agree_on_a_fee_credit_first_touch(temp_database):
+    tx = spend_tx(ALICE, BOB, 100, 0, fee_limit="10")
+    prod = _run("proposal", [tx], _parent({ALICE: 200000, BOB: 50}), fee="10")
+    plain = _run("plain", [tx], _parent({ALICE: 200000, BOB: 50}), fee="10")
+    assert prod.next_snapshot.state_hash == plain.next_snapshot.state_hash
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_a_rule_offer_from_a_new_sender_pays_its_fee_from_the_grant(temp_database, path):
+    from bls_keys import SK_CAROL as SK_NEW, pubkey_hex
+    from consensus.rule_offers import RuleOffer
+    new = pubkey_hex(SK_NEW)
+    offer = RuleOffer(offerer_pubkey=new, recipient_pubkey=ALICE,
+                      rule_text="always ( o5[t]:bv[24] = { #x000001 }:bv[24] ).",
+                      expire_at_height=HEIGHT + 100)
+    tx = sign_payload({
+        "tx_id": "offer-from-new",
+        "tx_type": "rule_offer",
+        "sender_pubkey": new,
+        "sequence_number": 0,
+        "expiration_time": TS + 10_000,
+        "recipient_pubkey": ALICE,
+        "rule_text": offer.rule_text,
+        "expire_at_height": offer.expire_at_height,
+        "fee_limit": "10",
+    }, SK_NEW)
+    result = _run(path, [tx], _parent({ALICE: 1000, PROPOSER: 0}), fee="10")
+    assert result.accepted_tx_ids == [tx["tx_id"]]
+    lm = result.next_snapshot.metadata["lifecycle_manager"]
+    assert bytes.fromhex(offer.offer_id_hex) in lm.rule_offers.offered
+    assert _bal(result)[new] == GRANT - 10
+    assert result.next_snapshot.metadata["sequence_numbers"][new] == 1
+    assert _bal(result)[PROPOSER] == 10
+    assert _supply(result) == 1000 + GRANT
