@@ -170,10 +170,20 @@ class AdvisoryEvaluator:
 
     @staticmethod
     def _named(inputs: dict) -> dict:
+        """Input values go bare, as the worker-backed authority feeds them.
+
+        Callers spell a pubkey `{ #x.. }:bv[384]` because that is the shape the
+        in-process shrink layer interns. Nothing interns here, and the engine
+        does not parse in-spec literal syntax as an input value: it refused the
+        step, the answer came back with no o6/o7, and every block proposed under
+        `tau_validator_set` was judged invalid.
+        """
+        import tau_session
+
         named = {}
         for key, value in (inputs or {}).items():
             name = key if isinstance(key, str) and key.startswith("i") else f"i{key}"
-            named[name] = "" if value is None else str(value)
+            named[name] = tau_session.WorkerSession._bare(value)
         return named
 
     def evaluate(self, canonical_spec: str, inputs: dict, target: int):
