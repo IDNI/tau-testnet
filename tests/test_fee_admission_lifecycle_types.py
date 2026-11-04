@@ -32,12 +32,12 @@ def node(temp_database, monkeypatch):
     """A real database, real signatures, and a Tau with a flat fee."""
     from commands import sendtx
 
-    script = {"calls": []}
+    # o5 blocks, so a parked approval request is what the sender's policy asks for.
+    script = {"calls": [], "o5": "0"}
 
     def multi(**kwargs):
         script["calls"].append(kwargs)
-        # o5 blocks, so a parked approval request is what the sender's policy asks for.
-        return {5: "0", 9: str(BASE_FEE)}
+        return {5: script["o5"], 9: str(BASE_FEE)}
 
     patches = [
         patch("tau_manager.tau_ready"),
@@ -152,3 +152,13 @@ def test_an_approval_request_is_priced_on_its_parked_transfer(node):
     assert SENDER in inputs[3] and RECIPIENT in inputs[4]
     assert inputs[18] == "0"
     assert list(inputs)[-1] == 5
+
+
+def test_sendtx_refuses_a_request_the_policy_does_not_gate(node):
+    sendtx, script = node
+    script["o5"] = "1"
+    result = _queue(sendtx, _payload("approval_request", "1000"))
+    assert result["ok"] is False, result
+    assert result["code"] == "APPROVAL_NOT_NEEDED", result
+    assert result["details"]["request_id"]
+    assert _mempool_fees() == []
