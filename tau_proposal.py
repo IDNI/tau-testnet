@@ -24,7 +24,6 @@ Two facts drive the reconstruction rule:
 from __future__ import annotations
 
 import contextlib
-import copy
 import logging
 
 import tau_journal
@@ -119,19 +118,16 @@ class TxBranch:
         and the offer book are mutated in place by the paths that own them --
         `resolve_all_for_sender` marks requests failed, `accepted_clauses[key]`
         is overwritten -- and there is no inverse for any of it that survives
-        contact with the next change. So the transaction gets its own copy and
-        the proposal keeps the parent until the transaction is accepted.
-
-        Cloned lazily because most transactions never touch lifecycle state and
-        a deepcopy per transfer would be paid for nothing.
+        contact with the next change. Each transaction gets its own fork on
+        both apply paths; a rejected one drops its copy and never adopts.
         """
-        if self._lifecycle is None:
+        if self._lifecycle is None and self.proposal.lifecycle is not None:
             # The parent is captured HERE, by identity. Adoption later checks
             # that the proposal still holds this exact object: a clone taken
             # from one lifecycle and adopted into another would write a history
             # that never happened, and a type check cannot see that.
             self._lifecycle_parent = self.proposal.lifecycle
-            self._lifecycle = copy.deepcopy(self._lifecycle_parent)
+            self._lifecycle = self._lifecycle_parent.fork()
         return self._lifecycle
 
     @property
@@ -159,12 +155,7 @@ class TxBranch:
                 f"{self.tx_id}: the proposal's lifecycle was replaced while this "
                 "transaction held a clone of the previous one"
             )
-        try:
-            parent.__dict__ = dict(child.__dict__)
-        except (AttributeError, TypeError):
-            # __slots__ or a type that refuses the rebind. Identity is worth
-            # keeping but not at the price of a half-adopted object.
-            self.proposal.lifecycle = child
+        parent.adopt(child)
 
     def _bind(self) -> None:
         session = getattr(self.proposal, "session", None)

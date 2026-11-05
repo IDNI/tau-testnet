@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Optional, Iterable, Union
+import copy
 import logging
 import re
 from dataclasses import dataclass
@@ -454,6 +455,16 @@ class ConsensusLifecycleManager:
         # so an activation recorded in block H governs H+1 onward.
         self.approval_slots_active: bool = False
         self.recompute_approval_threshold()
+
+    def fork(self) -> "ConsensusLifecycleManager":
+        """A private copy for one transaction. A rejected transaction drops it,
+        and an accepted one goes back through adopt()."""
+        return copy.deepcopy(self)
+
+    def adopt(self, fork: "ConsensusLifecycleManager") -> None:
+        """Take the state of an accepted fork into this manager."""
+        # Identity is kept: the block builder hashes this same object after apply.
+        self.__dict__ = dict(fork.__dict__)
 
     def effective_quorum_policy(self) -> str:
         """Deterministic resolved quorum policy: the genesis-pinned value, else
