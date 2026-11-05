@@ -7,6 +7,8 @@ Test script for sequential multi-operation sendtx functionality.
 import sys
 import os
 import json
+import shutil
+import tempfile
 import time
 import argparse
 from unittest.mock import patch, MagicMock
@@ -16,6 +18,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 import commands.sendtx as sendtx_module # So we can patch its internals
 from commands.sendtx import queue_transaction, _get_signing_message_bytes
+import config
 import chain_state
 import db
 import tau_defs
@@ -69,8 +72,9 @@ def run_test_sequential_ops():
     print("\n=== Testing Sequential Multi-Operation SendTX ===\n")
     
     # Setup Mocks and Test Environment
-    if os.path.exists("test_sequential_sendtx.sqlite"): os.remove("test_sequential_sendtx.sqlite")
-    db.STRING_DB_PATH = "test_sequential_sendtx.sqlite"
+    tmpdir = tempfile.mkdtemp()
+    original_db_path = config.STRING_DB_PATH
+    config.set_database_path(os.path.join(tmpdir, "test_sequential_sendtx.sqlite"))
     db.init_db()
     chain_state.load_genesis("data/genesis.json")
     sendtx_module._PY_ECC_AVAILABLE = True # Enable crypto for these tests
@@ -182,7 +186,11 @@ def run_test_sequential_ops():
     assert chain_state.get_sequence_number(sender_pub_key) == 2
 
     patcher_tau.stop()
-    if os.path.exists("test_sequential_sendtx.sqlite"): os.remove("test_sequential_sendtx.sqlite")
+    if db._db_conn:
+        db._db_conn.close()
+        db._db_conn = None
+    config.set_database_path(original_db_path)
+    shutil.rmtree(tmpdir, ignore_errors=True)
     print("\nSequential Multi-Op SendTX tests finished.")
 
 if __name__ == "__main__":

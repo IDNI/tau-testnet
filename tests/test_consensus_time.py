@@ -1,3 +1,4 @@
+import shutil, tempfile
 import unittest, os, sys, json, time
 from unittest.mock import patch, MagicMock
 
@@ -16,11 +17,10 @@ SENDER = pubkey_hex(SK_ALICE)
 
 class TestConsensusTime(unittest.TestCase):
     def setUp(self):
-        self.test_db = "test_consensus_time_db.sqlite"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_consensus_time_db.sqlite")
         self.original_db = config.STRING_DB_PATH
         config.set_database_path(self.test_db)
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
         if db._db_conn:
             db._db_conn.close(); db._db_conn = None
         
@@ -42,8 +42,7 @@ class TestConsensusTime(unittest.TestCase):
         patch.stopall()
         if db._db_conn:
             db._db_conn.close(); db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.set_database_path(self.original_db)
 
     def test_mempool_rejects_reserved_streams(self):

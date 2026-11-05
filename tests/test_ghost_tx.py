@@ -1,5 +1,7 @@
 import unittest
 import os
+import shutil
+import tempfile
 import json
 import time
 import sys
@@ -28,19 +30,17 @@ import blake3
 class TestGhostTx(unittest.TestCase):
     def setUp(self):
         # Use a temporary DB
-        self.test_db = "test_ghost_tx.db"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_ghost_tx.db")
         config.STRING_DB_PATH = self.test_db
         db._db_conn = None # Force re-init
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
         db.init_db()
 
     def tearDown(self):
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def test_mempool_reservation_isolation(self):
         print("\n[TEST] Verifying Mempool Reservation Isolation (Ghost TX Fix)...")
@@ -95,15 +95,14 @@ from commands import createblock
 
 class TestGhostTxIntegration(unittest.TestCase):
     def setUp(self):
-        self.test_db = "test_ghost_integration.db"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_ghost_integration.db")
         config.DB_PATH = self.test_db
         config.STRING_DB_PATH = self.test_db # Ensure db.py uses this
         config.TESTNET_AUTO_FAUCET = True # Allow funding
         
         # Reset DB connection
         db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
         db.init_db()
         
         # Set dummy miner key for block creation
@@ -127,8 +126,7 @@ class TestGhostTxIntegration(unittest.TestCase):
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.MINER_PRIVKEY = self.original_privkey
 
     @patch('commands.createblock.tau_manager')

@@ -13,6 +13,8 @@ them, and it fails if any layer loses the registry.
 import hashlib
 import json
 import os
+import shutil
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
@@ -52,13 +54,12 @@ EXPIRE_AT = 5000
 
 class RuleSharingE2E(unittest.TestCase):
     def setUp(self):
-        self.test_db = "test_rule_sharing_e2e.sqlite"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_rule_sharing_e2e.sqlite")
         config.set_database_path(self.test_db)
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
 
         # Assign fresh dicts rather than clearing in place: an earlier test in
         # the suite can leave these replaced by mocks, and mutating a mock
@@ -116,8 +117,7 @@ class RuleSharingE2E(unittest.TestCase):
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     # -- helpers -----------------------------------------------------------
 

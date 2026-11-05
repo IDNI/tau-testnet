@@ -1,5 +1,6 @@
 
 
+import shutil, tempfile
 import unittest, os, sys, json, time, hashlib, importlib
 from unittest.mock import patch
 from py_ecc.bls import G2Basic as bls
@@ -21,9 +22,8 @@ ADDR_B = bls.SkToPk(bls.KeyGen(b"crypto_seed_B")).hex()
 class TestSendTxCrypto(unittest.TestCase):
     def setUp(self):
         importlib.reload(sendtx)
-        self.db_path = "test_tau_crypto_db.sqlite"
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
+        self._tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self._tmpdir, "test_tau_crypto_db.sqlite")
         if db._db_conn:
             db._db_conn.close(); db._db_conn = None
         
@@ -79,8 +79,7 @@ class TestSendTxCrypto(unittest.TestCase):
         patch.stopall()
         if db._db_conn:
             db._db_conn.close(); db._db_conn = None
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         # Restore original DB path
         import config
         config.set_database_path(self.old_db_path)

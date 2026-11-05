@@ -12,6 +12,8 @@ unavailable — run with e.g.:
 """
 import json
 import os
+import shutil
+import tempfile
 import sys
 import time
 import unittest
@@ -60,11 +62,10 @@ class _NativeFeeE2EBase(unittest.TestCase):
                 "data_local/test_miner.key absent; local miner identity required "
                 "for real PoA mining (see config.DATA_LOCAL_DIR)"
             )
-        self.test_db = "test_fee_native_db.sqlite"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_fee_native_db.sqlite")
         self.original_db = config.STRING_DB_PATH
         config.set_database_path(self.test_db)
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
         if db._db_conn:
             db._db_conn.close()
         db._db_conn = None
@@ -110,8 +111,7 @@ class _NativeFeeE2EBase(unittest.TestCase):
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.set_database_path(self.original_db)
 
     def _seed_rule(self, rule_text, label):

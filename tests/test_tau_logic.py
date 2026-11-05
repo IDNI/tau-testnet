@@ -33,6 +33,8 @@ import sys
 import time
 import threading
 import glob
+import shutil
+import tempfile
 
 # Add the project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -40,7 +42,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Ensure TAU_DB_PATH is set for db.py
-TEST_DB_PATH = "test_tau_logic_db.sqlite"
+TEST_DB_PATH = os.path.join(tempfile.mkdtemp(), "test_tau_logic_db.sqlite")
 
 import tau_manager
 import tau_defs
@@ -55,6 +57,7 @@ class TestTauLogic(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Starts the Tau manager, loads rules, and prepares for testing."""
+        cls._orig_db_env = os.environ.get("TAU_DB_PATH")
         os.environ["TAU_DB_PATH"] = TEST_DB_PATH
         os.environ["TAU_FORCE_TEST"] = "0" # FORCE REAL ENGINE
         print("\n--- Starting Tau Manager for TestTauLogic ---")
@@ -152,11 +155,11 @@ class TestTauLogic(unittest.TestCase):
         tau_manager.tau_ready.clear()
         tau_manager.server_should_stop.clear()
         os.environ["TAU_FORCE_TEST"] = "1"
-        if os.path.exists(TEST_DB_PATH):
-            try:
-                os.remove(TEST_DB_PATH)
-            except OSError:
-                pass
+        if cls._orig_db_env is None:
+            os.environ.pop("TAU_DB_PATH", None)
+        else:
+            os.environ["TAU_DB_PATH"] = cls._orig_db_env
+        shutil.rmtree(os.path.dirname(TEST_DB_PATH), ignore_errors=True)
 
     def _construct_stream_inputs(self, amount: int, balance: int, from_id_idx: int, to_id_idx: int) -> dict:
         """Construct input dictionary for i1, i2, i3, i4 (Amount, Bal, From, To)."""

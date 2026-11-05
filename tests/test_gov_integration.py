@@ -4,6 +4,8 @@ import pytest
 import os
 import sys
 import importlib
+import shutil
+import tempfile
 from unittest.mock import Mock, patch
 from py_ecc.bls import G2Basic as bls
 import hashlib
@@ -17,13 +19,14 @@ import config
 from commands import sendtx
 import chain_state, db
 
+_tmpdir = None
+
 def setup_module(module):
-    test_db = "test_gov_db.sqlite"
-    config.set_database_path(test_db)
+    global _tmpdir
+    _tmpdir = tempfile.mkdtemp()
+    config.set_database_path(os.path.join(_tmpdir, "test_gov_db.sqlite"))
     if db._db_conn:
         db._db_conn.close(); db._db_conn = None
-    if os.path.exists(test_db):
-        os.remove(test_db)
 
     chain_state._balances.clear(); chain_state._sequence_numbers.clear()
     db.init_db()
@@ -42,8 +45,7 @@ def setup_module(module):
 def teardown_module(module):
     if db._db_conn:
         db._db_conn.close(); db._db_conn = None
-    if os.path.exists("test_gov_db.sqlite"):
-        os.remove("test_gov_db.sqlite")
+    shutil.rmtree(_tmpdir, ignore_errors=True)
 
 def _require_miner_privkey():
     # The signing tests below need a miner private key, sourced by the "test"
