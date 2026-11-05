@@ -37,10 +37,18 @@ SENTINEL = "RESERVED_OUTPUT_RESULT "
 
 HOSTILE_O9 = "always ( o9[t]:bv[24] = { #x000000 }:bv[24] )."
 HOSTILE_O1 = "always ( o1[t]:bv[24] = { #x000000 }:bv[24] )."
-HOSTILE_O1_GUARDED = (
-    "always ( ( i12[t]:bv[384] = { #x" + "cc" * 48 + " }:bv[384] ) -> "
-    "( o1[t]:bv[24] = { #x000000 }:bv[24] ) )."
-)
+SENDER_PUBKEY = "aa" * 48
+
+
+def _o1_guarded_on(pubkey):
+    return (
+        "always ( ( i12[t]:bv[384] = { #x" + pubkey + " }:bv[384] ) -> "
+        "( o1[t]:bv[24] = { #x000000 }:bv[24] ) )."
+    )
+
+
+HOSTILE_O1_GUARDED = _o1_guarded_on(SENDER_PUBKEY)
+HOSTILE_O1_GUARDED_ELSEWHERE = _o1_guarded_on("cc" * 48)
 
 AMOUNT = 100
 FEE = 10
@@ -88,7 +96,7 @@ os.environ["TAU_FORCE_TEST"] = "0"
 os.environ["TAU_SHRINK_ENABLED"] = os.environ.get("CHILD_SHRINK", "false")
 
 SENTINEL = %(sentinel)r
-A = "aa" * 48
+A = %(sender)r
 B = "bb" * 48
 PROPOSER = "dd" * 48
 
@@ -136,7 +144,7 @@ def boot_interface(through_manager=False):
     for rule in chain_state.load_builtin_rules_from_disk():
         revise(rule)
     return iface, revise
-''' % {"sentinel": SENTINEL}
+''' % {"sentinel": SENTINEL, "sender": SENDER_PUBKEY}
 
 
 _CHARACTERIZE_BODY = r'''
@@ -256,22 +264,25 @@ def _run_child(tmp_path, name, body, env_extra):
 
 @requires_native
 @pytest.mark.parametrize(
-    "stream,rule,expect_before",
+    "stream,rule,expect_before,expect_after",
     [
-        ("o9", HOSTILE_O9, FEE),
-        ("o1", HOSTILE_O1, AMOUNT),
-        ("o1", HOSTILE_O1_GUARDED, AMOUNT),
+        ("o9", HOSTILE_O9, FEE, 0),
+        ("o1", HOSTILE_O1, AMOUNT, 0),
+        ("o1", HOSTILE_O1_GUARDED, AMOUNT, 0),
+        ("o1", HOSTILE_O1_GUARDED_ELSEWHERE, AMOUNT, AMOUNT),
     ],
-    ids=["o9-unguarded", "o1-unguarded", "o1-sender-guarded"],
+    ids=["o9-unguarded", "o1-unguarded", "o1-sender-guarded", "o1-other-pubkey-guarded"],
 )
-def test_hostile_unit_displaces_the_builtin_value(tmp_path, stream, rule, expect_before):
+def test_hostile_unit_displaces_the_builtin_value(
+    tmp_path, stream, rule, expect_before, expect_after
+):
     """Pins the engine behaviour the reserved-output screen guards against: a
-    later unit on a consensus-owned stream wins for every sender, even when the
-    unit is guarded on someone else's pubkey."""
+    later unit on a consensus-owned stream displaces the built-in value for
+    every sender it applies to; a unit guarded on another pubkey leaves it."""
     out = _run_child(tmp_path, "characterize", _CHARACTERIZE_BODY,
                      {"HOSTILE_RULE": rule})
     assert int(out["before"][stream]) == expect_before
-    assert int(out["after"][stream]) == 0
+    assert int(out["after"][stream]) == expect_after
 
 
 def _apply(tmp_path, rule, replay):

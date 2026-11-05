@@ -249,7 +249,7 @@ def _sign_tx(tx_dict: dict, sk) -> str:
 
 
 def test_concurrent_sendtx_and_createblock(node_state):
-    """A `sendtx` admitted while the block producer is inside Tau must survive.
+    """A `sendtx` admitted while the block producer is running must survive and be mined.
 
     Before the fix the two threads collided inside the native engine and
     admission returned
@@ -283,7 +283,7 @@ def test_concurrent_sendtx_and_createblock(node_state):
                 "expiration_time": int(time.time()) + 3600,
                 "expire_at_height": 5000,
                 "operations": {"1": [[pk, recipient, "10"]]},
-                "fee_limit": "0",
+                "fee_limit": "100",
             }
             admission_results.append(
                 sendtx.queue_transaction(_sign_tx(tx, sk), propagate=False)
@@ -306,6 +306,14 @@ def test_concurrent_sendtx_and_createblock(node_state):
             submitter.start()
             submitter.join(timeout=120)
             assert not submitter.is_alive(), "sendtx admission deadlocked"
+            # Keep the producer running until it has committed what was admitted.
+            deadline = time.time() + 120
+            while time.time() < deadline and not (
+                db.count_mempool_txs() == 0 and producer_errors == []
+            ):
+                if not producer.is_alive():
+                    break
+                time.sleep(0.2)
         finally:
             stop_producing.set()
             producer.join(timeout=120)
@@ -318,10 +326,14 @@ def test_concurrent_sendtx_and_createblock(node_state):
     assert rejected == [], f"transactions rejected during concurrent mining: {rejected}"
     assert len(admission_results) == n_senders
     assert producer_errors == [], producer_errors
-    # Guard against a vacuous pass: both threads must really have driven the
-    # engine (admission tags its calls with the sender pubkey; the producer's
-    # apply path does not pass a source).
+    # Guard against a vacuous pass: admission tags its engine calls with the
+    # sender pubkey; block production evaluates in a separate proposal worker.
     admission_sources = {pk for _, pk in senders} & set(engine.sources)
     assert len(admission_sources) == n_senders, \
         f"admission never reached the engine: {sorted(set(engine.sources))}"
-    assert engine.calls > n_senders, "block production never reached the engine"
+    head = db.get_canonical_head()
+    assert head is not None and head["header"]["block_number"] > 0, "no block was produced"
+    assert db.count_mempool_txs() == 0, "mempool not drained by block production"
+    for result in admission_results:
+        assert db.get_tx_block_locations(result["tx_hash"]), \
+            f"admitted tx {result['tx_hash']} never landed in a block"
