@@ -682,6 +682,7 @@ class MainActivity : AppCompatActivity() {
 
             val expiry = (System.currentTimeMillis() / 1000L + 3600).toInt()
             val payloadNoSig = mapOf(
+                "tx_type" to "user_tx",
                 "sender_pubkey" to senderPk,
                 "sequence_number" to seq,
                 "expiration_time" to expiry,

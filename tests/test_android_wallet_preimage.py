@@ -117,19 +117,12 @@ OPERATIONS = [
     pytest.param({"13": "a\"b\\c\n\x01"}, id="escapes"),
 ]
 
-APP_HAS_NO_TX_TYPE = pytest.mark.xfail(
-    strict=True, reason="the app signs a payload without tx_type"
-)
-
-
-@APP_HAS_NO_TX_TYPE
 @pytest.mark.parametrize("operations", OPERATIONS)
 def test_app_preimage_is_the_node_preimage(operations):
     payload = _app_payload(operations)
     assert _kotlin_to_json(payload).encode("utf-8") == signing_message_bytes(payload)
 
 
-@APP_HAS_NO_TX_TYPE
 @pytest.mark.parametrize("operations", OPERATIONS)
 def test_app_signature_passes_the_node_check(operations):
     ok, reason = verify_tx_signature(_sign_like_app(_app_payload(operations)))
