@@ -586,7 +586,6 @@ class TestMinedBlocksReverify(ChainTestCase):
             patch('commands.createblock.tau_manager', self.mock_tau),
             patch('consensus.engine.tau_manager', self.mock_tau),
             patch('chain_state.tau_manager', self.mock_tau),
-            patch('commands.createblock._validate_signature', return_value=True),
         ]
         for p in self.patches:
             p.start()
