@@ -263,6 +263,13 @@ def isolated_chain_state(monkeypatch) -> Iterator[None]:
         "_active_consensus_id",
         "_tau_engine_state_hash",
         "_canonical_head_hash",
+        "_genesis_accounts_state",
+        "_genesis_active_validators",
+        "_genesis_vote_quorum",
+        "_genesis_eligibility_mode",
+        "_genesis_fee_beneficiary",
+        "_genesis_application_rules",
+        "_genesis_consensus_rules",
     ):
         monkeypatch.setattr(chain_state, name, getattr(chain_state, name))
 

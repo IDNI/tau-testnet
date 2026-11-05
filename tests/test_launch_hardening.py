@@ -800,6 +800,7 @@ class TestApplyRuleHonesty:
         from unittest.mock import MagicMock, patch
         from consensus.engine import TauConsensusEngine
         from consensus.state import TauStateSnapshot
+        from consensus.governance import ConsensusLifecycleManager
 
         engine = TauConsensusEngine(state_store=MagicMock())
         engine._state_store.commit.side_effect = lambda snap: snap
@@ -824,6 +825,8 @@ class TestApplyRuleHonesty:
                 proposer_pubkey=self.PROPOSER,
                 block_height=1,
                 replay_mode=replay_mode,
+                # Ambient lifecycle may carry approval slots from other tests.
+                target_lifecycle=ConsensusLifecycleManager(),
             )
         return result, comm
 
