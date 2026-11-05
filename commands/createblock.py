@@ -389,6 +389,7 @@ def _speculative_proposal(candidate_rules=()):
         allocator=tau_allocator.Allocator(snapshot, width=plan.width,
                                           label="proposal"),
         plan=plan, rebuild=rebuild, label="miner",
+        respawn=lambda current_plan: _spawn([], current_plan),
     )
 
 
