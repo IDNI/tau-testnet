@@ -10,6 +10,8 @@ import sys
 import tempfile
 import unittest
 
+import pytest
+
 # Ensure project root is importable
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
@@ -166,6 +168,7 @@ class TestGoldenVectors(unittest.TestCase):
         self.assertEqual(state_hash, EXPECTED_STATE_HASH)
 
 
+@pytest.mark.usefixtures("isolated_chain_state")
 class TestGenesisReplay(unittest.TestCase):
     """Verify that loading genesis.json into an empty DB produces the correct state."""
 
@@ -284,6 +287,7 @@ class TestGenesisReplay(unittest.TestCase):
         self.assertEqual(head["block_hash"], EXPECTED_BLOCK_HASH)
 
 
+@pytest.mark.usefixtures("isolated_chain_state")
 class TestGenesisMismatchFatal(unittest.TestCase):
     """Verify that DB/genesis.json mismatches are fatal startup errors."""
 

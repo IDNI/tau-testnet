@@ -3,6 +3,7 @@ import unittest
 import time
 import threading
 import os
+import tempfile
 import shutil
 import json
 import config
@@ -14,7 +15,8 @@ from consensus.mempool import load_transactions
 
 class TestMiningLoopIntegration(unittest.TestCase):
     def setUp(self):
-        self.db_path = "test_mining_loop.sqlite"
+        self._tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self._tmpdir, "test_mining_loop.sqlite")
         self.original_db_path = config.STRING_DB_PATH
         config.set_database_path(self.db_path)
         db.init_db()
@@ -83,8 +85,7 @@ class TestMiningLoopIntegration(unittest.TestCase):
         from py_ecc.bls import G2Basic
         G2Basic.Verify = self.original_verify
 
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.MINER_PRIVKEY = self.original_key
         config.set_database_path(self.original_db_path)
 

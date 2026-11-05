@@ -5,6 +5,8 @@ import json
 import logging
 import sys
 import os
+import shutil
+import tempfile
 
 # Assume dependencies exist in the environment (as seen in user logs).
 # If not, we should install them, but mocking sys.modules globally is dangerous.
@@ -308,13 +310,12 @@ class TestCustomInputUnification(unittest.TestCase):
         self._sender = bls.SkToPk(self._sk).hex()
         self._addr_a = bls.SkToPk(bls.KeyGen(b"unify_A")).hex()
 
-        self.test_db = "test_custom_unify_db.sqlite"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_custom_unify_db.sqlite")
         self._orig_db_path = config.STRING_DB_PATH
         config.set_database_path(self.test_db)
         if db._db_conn:
             db._db_conn.close(); db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
@@ -338,8 +339,7 @@ class TestCustomInputUnification(unittest.TestCase):
     def tearDown(self):
         if self._db._db_conn:
             self._db._db_conn.close(); self._db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         self._config.set_database_path(self._orig_db_path)
 
     def _tx(self, transfers, custom=None):

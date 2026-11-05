@@ -29,7 +29,7 @@ import tau_logging
 
 
 @pytest.fixture(scope="session", autouse=True)
-def test_environment() -> Iterator[None]:
+def test_environment(tmp_path_factory) -> Iterator[None]:
     """Ensure tests run with the dedicated 'test' configuration and logging."""
     original_env = os.environ.get("TAU_ENV")
     os.environ["TAU_ENV"] = "test"
@@ -41,11 +41,19 @@ def test_environment() -> Iterator[None]:
     # TAU_FORCE_TEST=0 in their own setup.
     os.environ.setdefault("TAU_FORCE_TEST", "1")
 
+    # Per-worker default DB so tests that never pick a path don't share a repo-root file.
+    original_db_path = os.environ.get("TAU_DB_PATH")
+    os.environ["TAU_DB_PATH"] = str(tmp_path_factory.mktemp("default_db") / "node.db")
+
     config.reload_settings(env="test")
     tau_logging.configure(config.LOGGING, force=True)
 
     yield
 
+    if original_db_path is None:
+        os.environ.pop("TAU_DB_PATH", None)
+    else:
+        os.environ["TAU_DB_PATH"] = original_db_path
     if original_env is None:
         os.environ.pop("TAU_ENV", None)
         config.reload_settings(env="development")
@@ -255,6 +263,13 @@ def isolated_chain_state(monkeypatch) -> Iterator[None]:
         "_active_consensus_id",
         "_tau_engine_state_hash",
         "_canonical_head_hash",
+        "_genesis_accounts_state",
+        "_genesis_active_validators",
+        "_genesis_vote_quorum",
+        "_genesis_eligibility_mode",
+        "_genesis_fee_beneficiary",
+        "_genesis_application_rules",
+        "_genesis_consensus_rules",
     ):
         monkeypatch.setattr(chain_state, name, getattr(chain_state, name))
 

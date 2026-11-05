@@ -1,4 +1,6 @@
 import os
+import shutil
+import tempfile
 import sys
 import unittest
 import hashlib
@@ -84,7 +86,8 @@ class TestBlockCreation(unittest.TestCase):
     
     def setUp(self):
         """Set up a temporary database for testing block creation."""
-        self.test_db_path = "test_blockchain_db.sqlite"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db_path = os.path.join(self._tmpdir, "test_blockchain_db.sqlite")
         self.original_db_path = config.STRING_DB_PATH
         config.set_database_path(self.test_db_path)
         init_db()
@@ -148,8 +151,7 @@ class TestBlockCreation(unittest.TestCase):
         if hasattr(createblock.db, '_db_conn') and createblock.db._db_conn is not None:
             createblock.db._db_conn.close()
             createblock.db._db_conn = None
-        if os.path.exists(self.test_db_path):
-            os.remove(self.test_db_path)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         # Restore original db path if needed elsewhere
         config.set_database_path(self.original_db_path)
         config.MINER_PRIVKEY = self.original_miner_privkey

@@ -1,6 +1,8 @@
 
 import unittest
 import os
+import shutil
+import tempfile
 import json
 import time
 import sys
@@ -57,12 +59,11 @@ from commands import createblock
 
 class TestMinerHardening(unittest.TestCase):
     def setUp(self):
-        self.test_db = "test_hardening.db"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_hardening.db")
         self.original_db_path = config.STRING_DB_PATH
         config.STRING_DB_PATH = self.test_db
         db._db_conn = None 
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
         db.init_db()
         
         # Reset Chain State
@@ -91,8 +92,7 @@ class TestMinerHardening(unittest.TestCase):
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.STRING_DB_PATH = self.original_db_path
 
     def test_stale_reservation_release(self):

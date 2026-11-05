@@ -8,6 +8,8 @@ communicate_with_tau_multi mocks.
 """
 import json
 import os
+import shutil
+import tempfile
 import sqlite3
 import unittest
 from unittest.mock import MagicMock, patch
@@ -569,7 +571,8 @@ class TestAdmissionFees(unittest.TestCase):
 
 class TestMempoolFeePriority(unittest.TestCase):
     def setUp(self):
-        self.test_db_path = "test_fee_mempool.sqlite"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db_path = os.path.join(self._tmpdir, "test_fee_mempool.sqlite")
         self.original_db_path = config.STRING_DB_PATH
         config.set_database_path(self.test_db_path)
         if db._db_conn is not None:
@@ -581,8 +584,7 @@ class TestMempoolFeePriority(unittest.TestCase):
         if db._db_conn is not None:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db_path):
-            os.remove(self.test_db_path)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.set_database_path(self.original_db_path)
 
     def test_priority_by_estimated_fee(self):

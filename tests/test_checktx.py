@@ -11,6 +11,8 @@ import hashlib as _hashlib
 import importlib
 import json
 import os
+import shutil
+import tempfile
 import sys
 import time
 import unittest
@@ -40,14 +42,13 @@ def _mock_tau_multi_ok(*args, **kwargs):
 class TestChecktx(unittest.TestCase):
     def setUp(self):
         importlib.reload(sendtx)
-        self.test_db = "test_checktx.sqlite"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_checktx.sqlite")
         self.old_db = config.STRING_DB_PATH
         config.set_database_path(self.test_db)
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
         chain_state._balances.clear()
         chain_state._sequence_numbers.clear()
         db.init_db()
@@ -62,8 +63,7 @@ class TestChecktx(unittest.TestCase):
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.set_database_path(self.old_db)
 
     def _tx(self, **overrides):

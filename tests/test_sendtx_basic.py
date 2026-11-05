@@ -1,5 +1,6 @@
 
 
+import shutil, tempfile
 import unittest, os, sys, json, time, hashlib, importlib
 from unittest.mock import Mock, patch
 from py_ecc.bls import G2Basic as bls
@@ -33,14 +34,13 @@ class TestSendTxBasic(unittest.TestCase):
     def setUp(self):
         importlib.reload(sendtx)
         # cleanup and init
-        self.test_db = "test_tau_string_db.sqlite"
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_tau_string_db.sqlite")
         self.original_db_path = config.STRING_DB_PATH
         config.set_database_path(self.test_db)
         
         if db._db_conn:
             db._db_conn.close(); db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
             
         chain_state._balances.clear(); chain_state._sequence_numbers.clear()
         db.init_db(); chain_state.load_genesis("data/genesis.json")
@@ -97,8 +97,7 @@ class TestSendTxBasic(unittest.TestCase):
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
-        if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.set_database_path(self.original_db_path)
         
         # Reset globals that might affect other tests
