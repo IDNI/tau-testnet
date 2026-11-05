@@ -804,7 +804,8 @@ class MainActivity : AppCompatActivity() {
                         '\t' -> sb.append("\\t")
                         '\b' -> sb.append("\\b")
                         '\u000C' -> sb.append("\\f")
-                        else -> if (c.code < 32) {
+                        // json.dumps escapes every unit outside 0x20..0x7E, and the signature covers its bytes.
+                        else -> if (c.code < 0x20 || c.code > 0x7E) {
                             sb.append(String.format("\\u%04x", c.code))
                         } else {
                             sb.append(c)

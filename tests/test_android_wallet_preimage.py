@@ -65,7 +65,7 @@ def _kotlin_escape(s: str) -> str:
     for unit in units:
         if unit in _KOTLIN_ESCAPES:
             esc = _KOTLIN_ESCAPES[unit]
-        elif unit < 32:
+        elif unit < 0x20 or unit > 0x7E:
             esc = "\\u%04x" % unit
         else:
             plain.append(unit)
@@ -115,6 +115,7 @@ OPERATIONS = [
         {"0": "always (o13[t] = { #x01 }:bv[24]).", "13": "7"}, id="rule-and-custom-op"
     ),
     pytest.param({"13": "a\"b\\c\n\x01"}, id="escapes"),
+    pytest.param({"0": "always (o13[t] = i13[t]). # caf\u00e9 \U0001F600 \x7f"}, id="non-ascii"),
 ]
 
 @pytest.mark.parametrize("operations", OPERATIONS)
