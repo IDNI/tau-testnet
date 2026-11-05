@@ -41,6 +41,7 @@ jobs:
           python scripts/generate_miner_keys.py
           python scripts/gen_genesis.py --validator-privkey "$(cat test_miner.key)" --out data/genesis.json
           mv test_miner.key test_miner.pub data/
+          mkdir -p data_local && cp data/test_miner.key data/test_miner.pub data_local/
 
       - name: Run test suite
         run: >
@@ -81,6 +82,7 @@ jobs:
           python scripts/generate_miner_keys.py &&
           python scripts/gen_genesis.py --validator-privkey \"\$(cat test_miner.key)\" --out data/genesis.json &&
           mv test_miner.key test_miner.pub data/ &&
+          mkdir -p data_local && cp data/test_miner.key data/test_miner.pub data_local/ &&
           python -m pytest
           tests/test_governance.py
           tests/test_gov_integration.py
