@@ -46,8 +46,6 @@ jobs:
         run: >
           python -m pytest tests/
           --ignore=tests/test_web_wallet_examples.py
-          --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_temporary_spending_limit
-          --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_time_decaying_multisig
           -p no:asyncio -q
 
   native-tau-tests:
@@ -92,7 +90,5 @@ jobs:
           tests/test_custom_inputs.py
           tests/test_fee_model_native.py
           tests/test_rule_scoping_native.py
-          --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_temporary_spending_limit
-          --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_time_decaying_multisig
           -p no:asyncio -v
           "
