@@ -41,9 +41,6 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-# Ensure TAU_DB_PATH is set for db.py
-TEST_DB_PATH = os.path.join(tempfile.mkdtemp(), "test_tau_logic_db.sqlite")
-
 import tau_manager
 import tau_defs
 import utils
@@ -57,8 +54,11 @@ class TestTauLogic(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Starts the Tau manager, loads rules, and prepares for testing."""
+        cls._tmpdir = tempfile.mkdtemp()
+        cls.addClassCleanup(shutil.rmtree, cls._tmpdir, True)
+        cls._db_path = os.path.join(cls._tmpdir, "test_tau_logic_db.sqlite")
         cls._orig_db_env = os.environ.get("TAU_DB_PATH")
-        os.environ["TAU_DB_PATH"] = TEST_DB_PATH
+        os.environ["TAU_DB_PATH"] = cls._db_path
         os.environ["TAU_FORCE_TEST"] = "0" # FORCE REAL ENGINE
         print("\n--- Starting Tau Manager for TestTauLogic ---")
         chain_state._balances.clear()
@@ -67,9 +67,9 @@ class TestTauLogic(unittest.TestCase):
         chain_state._consensus_rules_state = ""
         chain_state._canonical_head_hash = ""
         
-        if os.path.exists(TEST_DB_PATH):
+        if os.path.exists(cls._db_path):
             try:
-                os.remove(TEST_DB_PATH)
+                os.remove(cls._db_path)
             except OSError:
                 pass
         if getattr(db, "_db_conn", None):
@@ -159,7 +159,6 @@ class TestTauLogic(unittest.TestCase):
             os.environ.pop("TAU_DB_PATH", None)
         else:
             os.environ["TAU_DB_PATH"] = cls._orig_db_env
-        shutil.rmtree(os.path.dirname(TEST_DB_PATH), ignore_errors=True)
 
     def _construct_stream_inputs(self, amount: int, balance: int, from_id_idx: int, to_id_idx: int) -> dict:
         """Construct input dictionary for i1, i2, i3, i4 (Amount, Bal, From, To)."""
