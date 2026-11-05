@@ -1,175 +1,159 @@
+import json
 import os
-import shutil
-import tempfile
+import pathlib
+import subprocess
 import sys
-import unittest
-from unittest.mock import patch
+
 import pytest
 
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+_REPO = pathlib.Path(__file__).resolve().parent.parent
+GENESIS_TAU = str(_REPO / "genesis.tau")
 
-try:
-    import tau_native
-    tau_native.load_tau_module()
-    _NATIVE_TAU = True
-except Exception:
-    _NATIVE_TAU = False
+SENTINEL = "TAU_DETERMINISM_RESULT "
+FRESH_INSTANCES = 3
+REPEATED_STEPS = 3
 
-import config
-import chain_state
-import db
-import tau_manager
-import tau_defs
-from commands import sendtx
+KEY = "11" * 48
+OTHER_KEY = "22" * 48
 
-GENESIS_TAU = os.path.join(project_root, "genesis.tau")
-TRANSFER_RULE_PATH = os.path.join(project_root, "rules", "04_handle_valid_transfer.tau")
+# Process-global per-stream bv-width typing forces one child per rule; the
+# native engine also segfaults on teardown, so the child os._exit()s after
+# emitting its result.
+_CHILD_SRC = r'''
+import json, os, sys
+os.environ["TAU_FORCE_TEST"] = "0"
+import tau_native
 
-
-class _TauDeterminismBase(unittest.TestCase):
-    def setUp(self):
-        self._tmpdir = tempfile.mkdtemp()
-        self.test_db = os.path.join(self._tmpdir, "test_determinism_db.sqlite")
-        self.original_db = config.STRING_DB_PATH
-        config.set_database_path(self.test_db)
-        if db._db_conn:
-            db._db_conn.close()
-        db._db_conn = None
-
-        chain_state._balances.clear()
-        chain_state._sequence_numbers.clear()
-        db.init_db()
-        chain_state.load_genesis("data/genesis.json")
-        db.clear_mempool()
-
-        self.sender = chain_state.GENESIS_ADDRESS
-        chain_state._balances[self.sender] = 100000
-        self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
-
-        # Live interpreter from the real genesis program
-        tau_manager.tau_direct_interface = tau_native.TauInterface(GENESIS_TAU)
-        tau_manager.tau_ready.set()
-        self._seed_rule(open(TRANSFER_RULE_PATH).read(), "transfer-rule")
-
-        # Force NO TAU_FORCE_TEST
-        patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}).start()
-
-        patch("commands.sendtx._PY_ECC_AVAILABLE", False).start()
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
-        patch("commands.createblock._BLS_AVAILABLE", True).start()
-        patch("commands.createblock._validate_signature", return_value=True).start()
-        patch("block.bls_signing_available", return_value=True).start()
-        patch("consensus.engine.TauConsensusEngine.verify_block_header", return_value=True).start()
-        patch("consensus.engine.TauConsensusEngine.query_eligibility", return_value=True).start()
-
-    def tearDown(self):
-        patch.stopall()
-        tau_manager.tau_ready.clear()
-        tau_manager.tau_direct_interface = None
-        config.TESTNET_AUTO_FAUCET = self.original_faucet
-        if db._db_conn:
-            db._db_conn.close()
-            db._db_conn = None
-        shutil.rmtree(self._tmpdir, ignore_errors=True)
-        config.set_database_path(self.original_db)
-
-    def _seed_rule(self, rule_text, label):
-        out = tau_manager.communicate_with_tau(
-            rule_text=rule_text,
-            target_output_stream_index=0,
-            apply_rules_update=False,
-            source=f"seed-{label}",
-        )
-        self.assertNotIn("error", str(out).lower(), f"seeding {label} failed: {out}")
+SENTINEL = %(sentinel)r
+spec = json.loads(sys.argv[1])
 
 
-@pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
-class TestTauOutputDeterminism(_TauDeterminismBase):
-
-    DET_RULE = (
-        "always ( ((i1[t]:bv[24] >  i2[t]:bv[24]) && o2[t] = { #x000001 }:bv[24])"
-        "      || ((i1[t]:bv[24] <= i2[t]:bv[24]) && o2[t] = { #x000000 }:bv[24]) )."
+def build():
+    iface = tau_native.TauInterface(spec["genesis"])
+    iface.communicate(
+        rule_text=iface.preprocess_spec_text(spec["rule"]),
+        target_output_stream_index=0,
+        apply_rules_update=False,
     )
+    return iface
 
-    def test_determinism_same_instance_repeated_inputs(self):
-        self._seed_rule(self.DET_RULE, "same-instance-det")
 
-        # target_output_stream_index=2 is o2
-        inputs = {1: ["100"], 2: ["50"]}
-        tau_manager.tau_ready.set()
+def step(iface, row):
+    values = {int(k): v for k, v in row.items()}
+    out = iface.communicate_multi(
+        rule_text=None, input_stream_values=values, apply_rules_update=False)
+    return {str(k): v for k, v in out.items()}
 
-        result1 = tau_manager.communicate_with_tau(
-            rule_text=None,
-            target_output_stream_index=2,
-            input_stream_values=inputs,
-            apply_rules_update=False
+
+fresh = []
+for _ in range(spec["fresh"]):
+    iface = build()
+    fresh.append([step(iface, row) for row in spec["rows"]])
+
+iface = build()
+repeated = [step(iface, spec["rows"][0]) for _ in range(spec["repeats"])]
+
+print(SENTINEL + json.dumps({"fresh": fresh, "repeated": repeated}))
+sys.stdout.flush()
+os._exit(0)
+''' % {"sentinel": SENTINEL}
+
+
+def _child_env():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([str(_REPO), env.get("PYTHONPATH", "")])
+    return env
+
+
+def _native_available():
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import tau_native; assert tau_native.load_tau_module() is not None"],
+            capture_output=True, text=True, env=_child_env(), timeout=120,
         )
-        result2 = tau_manager.communicate_with_tau(
-            rule_text=None,
-            target_output_stream_index=2,
-            input_stream_values=inputs,
-            apply_rules_update=False
-        )
-        self.assertEqual(result1, result2)
+        return proc.returncode == 0
+    except Exception:
+        return False
 
-    def test_determinism_fresh_instances_identical_inputs(self):
-        rule = self.DET_RULE
 
-        interface1 = tau_native.TauInterface(GENESIS_TAU)
-        interface2 = tau_native.TauInterface(GENESIS_TAU)
-        
-        # Preprocess rule
-        prep_rule = interface1.preprocess_spec_text(rule)
-        
-        # Seed both interfaces
-        interface1.communicate(rule_text=prep_rule, target_output_stream_index=0, apply_rules_update=False)
-        interface2.communicate(rule_text=prep_rule, target_output_stream_index=0, apply_rules_update=False)
-        
-        inputs = {1: ["100"], 2: ["50"]}
-        result1 = interface1.communicate_multi(rule_text=None, input_stream_values=inputs, apply_rules_update=False)
-        result2 = interface2.communicate_multi(rule_text=None, input_stream_values=inputs, apply_rules_update=False)
-        
-        self.assertEqual(result1, result2)
+pytestmark = pytest.mark.skipif(
+    not _native_available(), reason="native tau module not available")
 
-    def test_determinism_o5_user_policy(self):
-        # o5 is index 5
-        rule = "always ((i3[t] = {#x0011}:bv[16] && i1[t] > {1000}:bv[24]) ? o5[t] = {0}:bv[16] : o5[t] = {1}:bv[16])."
-        
-        interface1 = tau_native.TauInterface(GENESIS_TAU)
-        interface2 = tau_native.TauInterface(GENESIS_TAU)
-        
-        prep_rule = interface1.preprocess_spec_text(rule)
-        interface1.communicate(rule_text=prep_rule, target_output_stream_index=0, apply_rules_update=False)
-        interface2.communicate(rule_text=prep_rule, target_output_stream_index=0, apply_rules_update=False)
-        
-        inputs = {
-            1: ["2000"],
-            3: ["#x0011"]
-        }
-        result1 = interface1.communicate_multi(rule_text=None, input_stream_values=inputs, apply_rules_update=False)
-        result2 = interface2.communicate_multi(rule_text=None, input_stream_values=inputs, apply_rules_update=False)
-        
-        self.assertEqual(result1.get(5), result2.get(5))
 
-    def test_determinism_o9_consensus_fee(self):
-        # o9 is index 9
-        rule = "always (o9[t]:bv[24] = { #x00000a }:bv[24])."
-        
-        interface1 = tau_native.TauInterface(GENESIS_TAU)
-        interface2 = tau_native.TauInterface(GENESIS_TAU)
-        
-        prep_rule = interface1.preprocess_spec_text(rule)
-        interface1.communicate(rule_text=prep_rule, target_output_stream_index=0, apply_rules_update=False)
-        interface2.communicate(rule_text=prep_rule, target_output_stream_index=0, apply_rules_update=False)
-        
-        inputs = {
-            1: ["100"],
-            5: ["1700000000"]
-        }
-        result1 = interface1.communicate_multi(rule_text=None, input_stream_values=inputs, apply_rules_update=False)
-        result2 = interface2.communicate_multi(rule_text=None, input_stream_values=inputs, apply_rules_update=False)
-        
-        self.assertEqual(result1.get(9), result2.get(9))
+def _run_case(rule, rows):
+    spec = {
+        "genesis": GENESIS_TAU,
+        "rule": rule,
+        "rows": rows,
+        "fresh": FRESH_INSTANCES,
+        "repeats": REPEATED_STEPS,
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", _CHILD_SRC, json.dumps(spec)],
+        capture_output=True, text=True, env=_child_env(), timeout=300,
+        cwd=str(_REPO),
+    )
+    for line in proc.stdout.splitlines():
+        if line.startswith(SENTINEL):
+            return json.loads(line[len(SENTINEL):])
+    pytest.fail(
+        f"child produced no result (rc={proc.returncode})\n"
+        f"stdout:\n{proc.stdout[-2000:]}\nstderr:\n{proc.stderr[-2000:]}")
+
+
+def _stream(result_rows, index):
+    return [row.get(str(index)) for row in result_rows]
+
+
+def _assert_identical(result, index, expected):
+    for run in result["fresh"]:
+        assert _stream(run, index) == expected
+    for row in result["repeated"]:
+        assert row.get(str(index)) == expected[0]
+
+
+O1_RULE = (
+    "always ((i1[t]:bv[24] > i2[t]:bv[24]) -> "
+    "o1[t]:bv[24] = { #x000001 }:bv[24])."
+)
+
+O5_RULE = (
+    f"always ((i3[t]:bv[384] = {{ #x{KEY} }}:bv[384] && "
+    "i1[t]:bv[24] > { #x0003e8 }:bv[24]) ? "
+    "o5[t]:bv[24] = { #x000000 }:bv[24] : "
+    "o5[t]:bv[24] = { #x000001 }:bv[24])."
+)
+
+O9_RULE = "always (o9[t]:bv[24] = { #x00000a }:bv[24])."
+
+
+def test_determinism_same_instance_repeated_inputs():
+    result = _run_case(O1_RULE, [{"1": ["100"], "2": ["50"]}])
+    assert len(result["repeated"]) == REPEATED_STEPS
+    assert {row["1"] for row in result["repeated"]} == {"1"}
+
+
+def test_determinism_fresh_instances_identical_inputs():
+    result = _run_case(
+        O1_RULE,
+        [{"1": ["100"], "2": ["50"]}, {"1": ["50"], "2": ["100"]}],
+    )
+    assert len(result["fresh"]) == FRESH_INSTANCES
+    for run in result["fresh"]:
+        assert _stream(run, 1) == ["1", "0"]
+
+
+def test_determinism_o5_user_policy():
+    rows = [
+        {"1": ["2000"], "3": [f"#x{KEY}"]},
+        {"1": ["2000"], "3": [f"#x{OTHER_KEY}"]},
+        {"1": ["10"], "3": [f"#x{KEY}"]},
+    ]
+    result = _run_case(O5_RULE, rows)
+    _assert_identical(result, 5, ["0", "1", "1"])
+
+
+def test_determinism_o9_consensus_fee():
+    result = _run_case(O9_RULE, [{"1": ["100"], "5": ["1700000000"]}])
+    _assert_identical(result, 9, ["10"])
