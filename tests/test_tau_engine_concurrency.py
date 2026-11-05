@@ -297,8 +297,11 @@ def test_concurrent_sendtx_and_createblock(node_state):
                 producer_errors.append(f"{type(exc).__name__}: {exc}")
                 return
 
+    # With the native module importable, createblock would simulate on a
+    # worker proposal and never reach the fake engine; keep it in-process.
     with patch("consensus.engine.TauConsensusEngine.query_eligibility", return_value=True), \
-         patch("consensus.engine.TauConsensusEngine.verify_block_header", return_value=True):
+         patch("consensus.engine.TauConsensusEngine.verify_block_header", return_value=True), \
+         patch("commands.createblock._speculative_proposal", return_value=None):
         producer = threading.Thread(target=produce, daemon=True)
         producer.start()
         try:

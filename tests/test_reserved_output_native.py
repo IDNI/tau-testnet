@@ -256,22 +256,25 @@ def _run_child(tmp_path, name, body, env_extra):
 
 @requires_native
 @pytest.mark.parametrize(
-    "stream,rule,expect_before",
+    "stream,rule,expect_before,expect_after",
     [
-        ("o9", HOSTILE_O9, FEE),
-        ("o1", HOSTILE_O1, AMOUNT),
-        ("o1", HOSTILE_O1_GUARDED, AMOUNT),
+        ("o9", HOSTILE_O9, FEE, 0),
+        ("o1", HOSTILE_O1, AMOUNT, 0),
+        # Revision is pointwise: for a sender the guard does not match, the
+        # unit says nothing about o1, so the builtin clause still holds.
+        ("o1", HOSTILE_O1_GUARDED, AMOUNT, AMOUNT),
     ],
     ids=["o9-unguarded", "o1-unguarded", "o1-sender-guarded"],
 )
-def test_hostile_unit_displaces_the_builtin_value(tmp_path, stream, rule, expect_before):
+def test_hostile_unit_displaces_the_builtin_value(tmp_path, stream, rule,
+                                                  expect_before, expect_after):
     """Pins the engine behaviour the reserved-output screen guards against: a
-    later unit on a consensus-owned stream wins for every sender, even when the
-    unit is guarded on someone else's pubkey."""
+    later unguarded unit on a consensus-owned stream wins for every sender; a
+    unit guarded on someone else's pubkey leaves the builtin value in place."""
     out = _run_child(tmp_path, "characterize", _CHARACTERIZE_BODY,
                      {"HOSTILE_RULE": rule})
     assert int(out["before"][stream]) == expect_before
-    assert int(out["after"][stream]) == 0
+    assert int(out["after"][stream]) == expect_after
 
 
 def _apply(tmp_path, rule, replay):

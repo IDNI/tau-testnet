@@ -29,6 +29,7 @@ import tau_session as ts
 from bls_keys import SK_BOB, SK_CAROL, pubkey_hex, sign_tx
 from consensus.approvals import ApprovalRequestEntry, ApprovalRequestLifecycleManager
 from consensus.engine import TauConsensusEngine
+from consensus.retractable import RetractableBook
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.state import TauStateSnapshot
 
@@ -99,6 +100,7 @@ class _Lifecycle:
                 )
             }
         )
+        self.retractable_transfers = RetractableBook()
 
     def effective_fee_beneficiary(self):
         return ""
