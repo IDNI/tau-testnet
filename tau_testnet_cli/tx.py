@@ -261,6 +261,39 @@ def submit_tx(
     )
 
 
+def estimate_fee(
+    payload: dict,
+    *,
+    host: str,
+    port: int,
+    timeout: float = rpc_mod.DEFAULT_TIMEOUT,
+) -> str:
+    """The node's fee estimate for a signed draft, from ``checktx estimate``.
+
+    Raises RuntimeError with the node's own code and message when the node
+    gives no estimate.
+    """
+    blob = json.dumps(payload, separators=(",", ":"))
+    response = rpc_mod.send_command(
+        f"checktx estimate '{blob}'", host, port, timeout=timeout
+    )
+    try:
+        parsed = json.loads(response)
+    except (ValueError, TypeError):
+        raise RuntimeError(f"unexpected checktx response: {response!r}")
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"unexpected checktx response: {response!r}")
+    if parsed.get("status") == "error":
+        err = parsed.get("error", {}) or {}
+        raise RuntimeError(
+            f"{err.get('code', 'ERROR')} {err.get('message', '')}".strip()
+        )
+    fee = (parsed.get("data") or {}).get("estimated_fee")
+    if not isinstance(fee, str) or not fee.isdigit():
+        raise RuntimeError(f"no estimated_fee in the checktx response: {response!r}")
+    return fee
+
+
 def build_rule_offer_tx(
     *,
     sender_pubkey: str,

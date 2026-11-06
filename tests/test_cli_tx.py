@@ -151,6 +151,13 @@ def test_assemble_operations_json_overrides(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+# The node's answer to `checktx estimate`. `tx send` asks for it before the
+# final signature when no --fee is given.
+ESTIMATE = '{"status":"ok","command":"checktx","data":{"admissible":false,"estimated_fee":"12","fee_limit":"0"}}'
+SEQ = '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}'
+QUEUED = '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"abcd"}}'
+
+
 def _run_cli(argv, *, send_responses=None, recorded=None):
     """Invoke cli.main with rpc.send_command stubbed.
 
@@ -199,15 +206,21 @@ def test_tx_send_builds_signed_payload(tmp_path, monkeypatch):
             "--amount",
             "10",
         ],
-        send_responses=['{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":5,"tip_height":7}}', '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"deadbeef"}}'],
+        send_responses=['{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":5,"tip_height":7}}', ESTIMATE, '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"deadbeef"}}'],
         recorded=recorded,
     )
     assert rc == 0, err
     assert recorded[0] == f"getsequence {pk_hex}"
-    assert recorded[1].startswith("sendtx '")
+    assert recorded[1].startswith("checktx estimate '")
+    assert recorded[2].startswith("sendtx '")
 
-    blob = recorded[1][len("sendtx '") : -1]
+    draft = json.loads(recorded[1][len("checktx estimate '") : -1])
+    blob = recorded[2][len("sendtx '") : -1]
     payload = json.loads(blob)
+    assert draft["fee_limit"] == "0"
+    assert payload["fee_limit"] == "12"
+    assert {k: v for k, v in draft.items() if k not in ("fee_limit", "signature")} \
+        == {k: v for k, v in payload.items() if k not in ("fee_limit", "signature")}
     assert payload["tx_type"] == "user_tx"
     assert payload["sender_pubkey"] == pk_hex
     assert payload["sequence_number"] == 5
@@ -242,13 +255,14 @@ def test_tx_send_falls_back_to_getblocks_for_the_tip(tmp_path, monkeypatch):
         send_responses=[
             '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0}}',
             chain,
-            '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"abcd"}}',
+            ESTIMATE,
+            QUEUED,
         ],
         recorded=recorded,
     )
     assert rc == 0, err
     assert recorded[1] == "getblocks 1"
-    payload = json.loads(recorded[2][len("sendtx '") : -1])
+    payload = json.loads(recorded[3][len("sendtx '") : -1])
     assert payload["expire_at_height"] == 5_000 + 1 + tx_mod.DEFAULT_EXPIRY_BLOCKS
 
 
@@ -295,7 +309,8 @@ def test_tx_send_error_response_exits_1(tmp_path, monkeypatch):
             "1",
         ],
         send_responses=[
-            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}',
+            SEQ,
+            ESTIMATE,
             '{"status":"error","command":"sendtx","error":{"code":"TX_REJECTED","message":"insufficient funds"}}',
         ],
     )
@@ -359,16 +374,51 @@ def test_tx_send_multiple_transfers_combine(tmp_path, monkeypatch):
             "--transfer",
             f"{b}:2",
         ],
-        send_responses=[
-            '{"status":"ok","command":"getsequence","data":{"address":"x","sequence_number":0,"tip_height":7}}',
-            '{"status":"ok","command":"sendtx","data":{"message":"Transaction queued.","tx_hash":"abcd"}}',
-        ],
+        send_responses=[SEQ, ESTIMATE, QUEUED],
         recorded=recorded,
     )
     assert rc == 0
-    blob = recorded[1][len("sendtx '") : -1]
+    blob = recorded[2][len("sendtx '") : -1]
     payload = json.loads(blob)
     assert payload["operations"]["1"] == [
         [pk_hex, a, "1"],
         [pk_hex, b, "2"],
     ]
+
+
+def test_tx_send_with_fee_asks_for_no_estimate(tmp_path, monkeypatch):
+    monkeypatch.setattr(keys_mod, "KEY_DIR_DEFAULT", tmp_path)
+    keys_mod.save_key("alice", tmp_path)
+    recorded = []
+    rc, _, err = _run_cli(
+        ["tx", "send", "--key", "alice", "--to", "ab" * 48, "--amount", "1",
+         "--fee", "30"],
+        send_responses=[SEQ, QUEUED],
+        recorded=recorded,
+    )
+    assert rc == 0, err
+    assert not any(c.startswith("checktx") for c in recorded)
+    assert json.loads(recorded[1][len("sendtx '") : -1])["fee_limit"] == "30"
+
+
+@pytest.mark.parametrize("answer", [
+    '{"status":"error","command":"checktx","error":{"code":"ESTIMATE_BUSY","message":"Another fee estimate is running on this node; please retry."}}',
+    '{"status":"error","command":"checktx","error":{"code":"ADMISSION_UNAVAILABLE","message":"This node has no isolated admission context, so it cannot estimate a fee."}}',
+    '{"status":"ok","command":"checktx","data":{"admissible":true,"tau_evaluated":false}}',
+])
+def test_tx_send_stops_before_the_final_signature_without_an_estimate(
+        tmp_path, monkeypatch, answer):
+    monkeypatch.setattr(keys_mod, "KEY_DIR_DEFAULT", tmp_path)
+    keys_mod.save_key("alice", tmp_path)
+    recorded = []
+    rc, out, err = _run_cli(
+        ["tx", "send", "--key", "alice", "--to", "ab" * 48, "--amount", "1"],
+        send_responses=[SEQ, answer],
+        recorded=recorded,
+    )
+    assert rc == 1
+    assert not any(c.startswith("sendtx") for c in recorded)
+    assert "--fee" in err
+    code = json.loads(answer).get("error", {}).get("code")
+    if code:
+        assert code in err

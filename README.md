@@ -260,11 +260,14 @@ tau-testnet blocks --limit 10
 tau-testnet mempool
 tau-testnet governance
 
-# send a transfer (default fee 10, expiry 600s)
+# send a transfer (expiry 600s). Without --fee the CLI signs a draft, asks the
+# node with `checktx estimate`, and signs again with the estimate as fee_limit.
+# This applies to every fee-bearing command (tx, rule, approval request,
+# retractable send). With no estimate the CLI stops and asks for --fee.
 tau-testnet tx send --key alice --to <recipient_pubkey> --amount 10
 tau-testnet tx send --key alice --transfer <pk1>:5 --transfer <pk2>:3 --fee 10
 
-# governance (sender must be an active validator; default fee 0)
+# governance (sender must be an active validator; fee-exempt, no --fee)
 tau-testnet gov propose --key alice --file consensus_update.json
 tau-testnet gov vote --key alice --update-id <update_id_hex>
 
@@ -658,7 +661,7 @@ Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSoc
 
 - `status` is `"ok"` or `"error"`; `command` echoes the request; `data` on success, `error.code`/`error.message`(+`details`) on failure.
 - Types: addresses/hashes/IDs and token amounts are **strings** (overflow-safe); counts/heights/sequence numbers are integers; timestamps are ISO 8601 strings.
-- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `BLS_UNAVAILABLE`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `DUPLICATE_UPDATE`, `UNSCOPED_USER_RULE`, `TEMPORAL_REFERENCE`, `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
+- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `BLS_UNAVAILABLE`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `DUPLICATE_UPDATE`, `UNSCOPED_USER_RULE`, `TEMPORAL_REFERENCE`, `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `ESTIMATE_BUSY`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
 - `DUPLICATE_UPDATE` carries `details.update_id` and `details.lifecycle_state`, so a
   wallet retrying a `consensus_rule_update` can tell "already landed" from a real
   rejection. `ADMISSION_TIMEOUT` / `ADMISSION_UNAVAILABLE` mean the isolated rule
@@ -711,10 +714,25 @@ poll `gettxstatus` immediately after queuing.
   accept this? Nothing enters the mempool, nothing is broadcast, nothing is
   charged. Rejections carry the identical `code`/`details` `sendtx` would have
   returned. Tau evaluation is **not** performed (`tau_evaluated: false`), so
-  there is no `estimated_fee` and no `o5` policy verdict — those steps mutate
-  interpreter and intern state, which a free unauthenticated RPC must not do.
+  there is no `estimated_fee` and no `o5` policy verdict. A success answer has
+  `admissible: null` and `fee_checked: false`, `checks_skipped` names
+  `tau_eval` and `fee_limit`, and `note` says that the fee check was skipped.
   Use it as the pre-flight before asking a user to sign; `gettxstatus` is the
   post-flight.
+- **`checktx estimate <json_payload>`** — the same dry-run with the Tau steps,
+  in an isolated admission context. It returns `estimated_fee` for every
+  fee-bearing type, whatever `fee_limit` the payload carries, and `admissible`
+  is true only when that `fee_limit` covers the estimate. The flags say what
+  really ran: `tau_evaluated` is true only when a Tau step ran, and
+  `fee_checked` only when the fee of a fee-bearing type was estimated. A
+  fee-exempt type (an approval vote, a retract, a governance vote) answers
+  `fee_checked: false`, names `fee_limit` in `checks_skipped`, and has a
+  `note` that starts with `fee_exempt`.
+  A rejection of either form adds `tau_evaluated`, `checks_skipped` and
+  `fee_checked` to the `details` of `sendtx`. Estimates run one at a
+  time: a second one gets `ESTIMATE_BUSY` at once. A node without isolated
+  admission contexts answers `ADMISSION_UNAVAILABLE`. The CLI signs a draft,
+  asks for the estimate, and signs again with it as `fee_limit`.
 
 ## Block structure
 
