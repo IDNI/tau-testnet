@@ -67,13 +67,15 @@ class TestConsensusTime(unittest.TestCase):
     @patch('tau_manager.communicate_with_tau_multi')
     @patch('tau_manager.tau_ready')
     def test_admission_injects_advisory_i5(self, mock_ready, mock_multi, mock_force):
-        """queue_transaction feeds the advisory tip timestamp on i5 per transfer
+        """queue_transaction feeds the advisory next-block timestamp on i5 per transfer
         so time-lock o5 rules can pre-check at admission (apply is authoritative)."""
         mock_ready.is_set.return_value = True
         mock_multi.return_value = {1: "1", 5: "1"}  # o1 success flag, o5 allow
         chain_state._balances[SENDER] = 100000
 
         tip = db.get_canonical_head_block()["header"]["timestamp"]
+        clock = tip + 1000
+        patch("consensus.facade.time", MagicMock(time=MagicMock(return_value=clock))).start()
         recipient = "ab" * 48
         tx = {
             "sender_pubkey": SENDER,
@@ -93,7 +95,7 @@ class TestConsensusTime(unittest.TestCase):
         ]
         self.assertTrue(transfer_inputs, "no per-transfer Tau call captured")
         self.assertIn(5, transfer_inputs[0], "i5 not injected at admission")
-        self.assertEqual(transfer_inputs[0][5], str(tip))
+        self.assertEqual(transfer_inputs[0][5], str(max(tip, clock)))
 
     @patch('tau_manager.communicate_with_tau_multi')
     @patch('tau_manager.communicate_with_tau')
