@@ -168,9 +168,9 @@ def test_stream_disqualified_if_any_arithmetic_use(temp_database):
 
 
 def test_unannotated_stream_not_shrunk(temp_database):
-    # i12 used equality-only but with no/ambiguous bv width -> refuse.
-    p = ts.prepare_rule(_rule(f"i12[t] = {{ #x{HEX96} }}:bv[384]"))
-    assert 12 not in p.shrunk_streams
+    # i13 has no canonical width, and nothing else gives one -> refuse.
+    p = ts.prepare_rule(_rule("i13[t] != 0"))
+    assert 13 not in p.shrunk_streams
 
 
 def test_bare_zero_in_arithmetic_untouched(temp_database):
