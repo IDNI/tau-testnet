@@ -27,6 +27,9 @@ MAX_SYNC_PAGES = 50
 SYNC_READ_TIMEOUT = 120.0
 # A tx or gossip request is one write of at most 1 MiB, so it arrives in seconds.
 REQUEST_READ_TIMEOUT = 30.0
+# Handshake and ping payloads are small; a silent peer must not block forever.
+HANDSHAKE_READ_TIMEOUT = 30.0
+PING_READ_TIMEOUT = 10.0
 SYNC_BLOCKS_REPLY_CAP = 20 * 1024 * 1024
 SYNC_BLOCKS_CHUNK = 128
 # Bound on remembered peers that failed the genesis gate.
@@ -218,14 +221,16 @@ class NetworkService:
 
     async def _handshake_once(self, peer_id: Any) -> None:
         from .protocols import TAU_PROTOCOL_HANDSHAKE
-        from .libp2p_compat import read_until_eof
+        from .libp2p_compat import close_stream_safely, read_until_eof
         import json
+        stream = None
         try:
             stream = await self.host.new_stream(peer_id, [TAU_PROTOCOL_HANDSHAKE])
             payload = self._build_handshake_payload()
             await stream.write(json.dumps(payload).encode())
-            data = await read_until_eof(stream, 65535)
-            await stream.close()
+            data = await read_until_eof(
+                stream, 65535, read_timeout=HANDSHAKE_READ_TIMEOUT
+            )
             
             # Process response
             if data:
@@ -342,6 +347,9 @@ class NetworkService:
                     logger.debug("Handshake-triggered sync failed to schedule", exc_info=True)
         except Exception:
             raise  # retry policy (backoff, attempt cap) lives in _perform_handshake
+        finally:
+            if stream is not None:
+                await close_stream_safely(stream)
 
     def _self_advertised_addrs(self) -> List[str]:
         """Addrs we tell peers to dial: configured announce addrs (NAT/public)
@@ -952,7 +960,11 @@ class NetworkService:
         import json
         import multiaddr
         import db
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import (
+            close_stream_safely,
+            read_json_object,
+            reset_stream_on_error,
+        )
 
         # Prepare response (default)
         resp = {
@@ -975,7 +987,14 @@ class NetworkService:
 
         try:
             # Read payload
-            data = await bounded_stream_read(stream, 65535)
+            data = b""
+            async with reset_stream_on_error(stream):
+                try:
+                    data = await read_json_object(
+                        stream, 65535, read_timeout=HANDSHAKE_READ_TIMEOUT
+                    )
+                except ValueError:
+                    data = b""
             if logger.isEnabledFor(logging.DEBUG):
                  # Log length only to confirm receipt without flooding raw bytes
                  logger.debug("Handshake received %d bytes", len(data))
@@ -1122,9 +1141,16 @@ class NetworkService:
     async def _handle_ping(self, stream) -> None:
         import json
         import time
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import (
+            close_stream_safely,
+            read_json_object,
+            reset_stream_on_error,
+        )
         try:
-            data = await bounded_stream_read(stream, 65535)
+            async with reset_stream_on_error(stream):
+                data = await read_json_object(
+                    stream, 65535, read_timeout=PING_READ_TIMEOUT
+                )
             req = json.loads(data.decode())
             resp = {
                 "nonce": req.get("nonce"),
@@ -1225,9 +1251,22 @@ class NetworkService:
     async def _handle_blocks(self, stream) -> None:
         import json
         import db
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import (
+            close_stream_safely,
+            read_json_object,
+            reset_stream_on_error,
+        )
         try:
-            data = await bounded_stream_read(stream, 10 * 1024 * 1024)
+            data = b""
+            async with reset_stream_on_error(stream):
+                try:
+                    data = await read_json_object(
+                        stream,
+                        10 * 1024 * 1024,
+                        read_timeout=REQUEST_READ_TIMEOUT,
+                    )
+                except ValueError:
+                    data = b""
             req: Dict[str, Any] = {}
             if data:
                 try:
