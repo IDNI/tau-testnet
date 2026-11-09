@@ -425,6 +425,79 @@ async def test_fetch_block_chunk_refetches_after_a_short_reply(service, monkeypa
     assert len(opens) == 3
 
 
+class _RepliesFromRequest:
+    def __init__(self, reply_for_hashes):
+        self.reply_for_hashes = reply_for_hashes
+        self.payload = b""
+
+    async def write(self, data):
+        hashes = json.loads(data.decode())["hashes"]
+        self.payload = json.dumps({"blocks": self.reply_for_hashes(hashes)}).encode()
+
+    async def read(self, n=None):
+        out, self.payload = self.payload, b""
+        if not out:
+            raise EOFError()
+        return out
+
+    async def close(self):
+        pass
+
+    async def reset(self):
+        pass
+
+
+def _serve_blocks(service, reply_for_hashes) -> List[List[str]]:
+    requests: List[List[str]] = []
+
+    def recording(hashes):
+        requests.append(hashes)
+        return reply_for_hashes(hashes)
+
+    async def new_stream(peer_id, protocols):
+        return _RepliesFromRequest(recording)
+
+    service.host.new_stream = new_stream
+    return requests
+
+
+async def test_fetch_block_chunk_stops_on_an_empty_reply(service):
+    requests = _serve_blocks(service, lambda hashes: [])
+    with trio.fail_after(5):
+        assert await service._fetch_block_chunk("peerA", ["h0", "h1"]) == []
+    assert requests == [["h0", "h1"]]
+
+
+async def test_fetch_block_chunk_stops_when_the_peer_lacks_the_rest(service):
+    known = {"h0": {"block_hash": "h0", "header": {"block_number": 0}}}
+    requests = _serve_blocks(
+        service, lambda hashes: [known[h] for h in hashes if h in known]
+    )
+    with trio.fail_after(5):
+        got = await service._fetch_block_chunk("peerA", ["h0", "h1", "h2"])
+    assert got == [known["h0"]]
+    assert requests == [["h0", "h1", "h2"], ["h1", "h2"]]
+
+
+async def test_fetch_block_chunk_keeps_blocks_before_an_over_cap_block(
+    service, monkeypatch
+):
+    from network.service import BlockOverReplyCap
+
+    monkeypatch.setattr("network.service.SYNC_BLOCKS_REPLY_CAP", 1000)
+    small = {"block_hash": "h0", "header": {"block_number": 0}}
+    big = {"block_hash": "h1", "header": {"block_number": 1}, "padding": "x" * 5000}
+
+    def reply(hashes):
+        return [small] if hashes[0] == "h0" else [big]
+
+    _serve_blocks(service, reply)
+    with pytest.raises(BlockOverReplyCap) as err:
+        await service._fetch_block_chunk("peerA", ["h0", "h1"])
+    assert err.value.block_hash == "h1"
+    assert err.value.fetched == [small]
+
+
 async def test_sync_splits_a_block_chunk_over_the_reply_cap(service, monkeypatch):
     chain = LargeBlockChain([MiB] * 30)
     _wire(service, chain, monkeypatch)

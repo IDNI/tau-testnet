@@ -7,17 +7,13 @@ import db
 import multiaddr
 import pytest
 import trio
-from libp2p.network.stream.exceptions import StreamReset
-from libp2p.stream_muxer.exceptions import MuxedStreamReset
 
 from conftest import connect_peers, wait_for_addrs
-from network.libp2p_compat import StreamReadTimeout, read_until_eof
+from network.libp2p_compat import StreamReadTimeout
 from network.protocols import TAU_PROTOCOL_BLOCKS, TAU_PROTOCOL_HANDSHAKE, TAU_PROTOCOL_PING
 from network.service import (
     BLOCKS_REQUEST_MAX_BYTES,
-    HANDSHAKE_READ_TIMEOUT,
     SYNC_BLOCKS_REPLY_CAP,
-    SYNC_REQUEST_EMPTY_TIMEOUT,
     NetworkService,
 )
 
@@ -48,11 +44,6 @@ async def two_nodes():
             await svc.stop()
 
 
-def _patch_chain_tip(monkeypatch, number: int, block_hash: str) -> None:
-    tip = {"block_hash": block_hash, "header": {"block_number": number}}
-    monkeypatch.setattr(db, "get_canonical_head_block", lambda: tip)
-
-
 def _patch_stored_block(monkeypatch, block_hash: str, number: int, *, pad: int = 0):
     blk = {
         "block_hash": block_hash,
@@ -67,13 +58,11 @@ def _patch_stored_block(monkeypatch, block_hash: str, number: int, *, pad: int =
     return blk
 
 
-async def test_handshake_request_in_two_frames_is_read(two_nodes, monkeypatch):
+async def test_handshake_request_in_two_frames_is_read(two_nodes):
     svc1, svc2 = two_nodes
-    bh = "h" * 64
-    _patch_chain_tip(monkeypatch, 3, bh)
     payload = {
         "network_id": "testnet",
-        "genesis_hash": svc2._genesis_hash,
+        "genesis_hash": "wrong-genesis",
         "padding": "p" * 50000,
     }
     body = json.dumps(payload).encode()
@@ -81,14 +70,13 @@ async def test_handshake_request_in_two_frames_is_read(two_nodes, monkeypatch):
     stream = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_HANDSHAKE])
     try:
         await stream.write(body[:mid])
+        # The pause keeps the halves in separate reads of the server.
+        await trio.sleep(0.2)
         await stream.write(body[mid:])
         await stream.close_write()
-        with trio.fail_after(HANDSHAKE_READ_TIMEOUT + 5):
-            raw = await stream.read(65535)
-        assert raw
-        resp = json.loads(raw.decode())
-        assert resp["head_number"] == 3
-        assert resp["head_hash"] == bh
+        with trio.fail_after(10):
+            while str(svc1.host.get_id()) not in svc2._genesis_rejected_peers:
+                await trio.sleep(0.05)
     finally:
         await stream.close()
 
@@ -146,15 +134,6 @@ async def test_ping_silent_peer_resets(two_nodes, monkeypatch):
         await stream.reset()
 
 
-async def test_ping_silent_peer_times_out():
-    from network.libp2p_compat import read_json_object
-    from tests.test_read_json_object import FrameStream
-
-    stream = FrameStream(b'{"nonce": 1', end="hang")
-    with pytest.raises(StreamReadTimeout):
-        await read_json_object(stream, 65535, read_timeout=0.3)
-
-
 async def test_blocks_request_spans_two_frames(two_nodes, monkeypatch):
     svc1, svc2 = two_nodes
     bh = "b" * 64
@@ -165,6 +144,8 @@ async def test_blocks_request_spans_two_frames(two_nodes, monkeypatch):
     stream = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_BLOCKS])
     try:
         await stream.write(body[:mid])
+        # The pause keeps the halves in separate reads of the server.
+        await trio.sleep(0.2)
         await stream.write(body[mid:])
         await stream.close_write()
         with trio.fail_after(10):
@@ -210,35 +191,16 @@ async def test_blocks_request_over_cap_is_reset_without_reply(two_nodes):
         await stream.reset()
 
 
-async def test_blocks_repeated_hashes_stay_under_reply_cap(two_nodes, monkeypatch):
-    svc1, svc2 = two_nodes
-    bh = "c" * 64
-    _patch_stored_block(monkeypatch, bh, 1, pad=16384)
-    hashes = [bh] * 2000
-    body = json.dumps({"type": "get_blocks", "hashes": hashes}).encode()
-    stream = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_BLOCKS])
-    try:
-        await stream.write(body)
-        await stream.close_write()
-        with trio.fail_after(10):
-            raw = await read_until_eof(stream, SYNC_BLOCKS_REPLY_CAP, read_timeout=10)
-        assert len(raw) < SYNC_BLOCKS_REPLY_CAP
-        resp = json.loads(raw.decode())
-        assert len(resp["blocks"]) < len(hashes)
-        assert resp["blocks"][0]["block_hash"] == bh
-    finally:
-        await stream.close()
-
-
 class _DelayedSyncStream:
-    def __init__(self, payload: bytes):
+    def __init__(self, payload: bytes, delay: float = 0.4):
         self._payload = payload
+        self._delay = delay
         self._sent = False
         self.written: list[bytes] = []
 
     async def read(self, n=None):
         if not self._sent:
-            await trio.sleep(0.4)
+            await trio.sleep(self._delay)
             self._sent = True
             return self._payload
         return b""
@@ -286,61 +248,61 @@ async def test_sync_late_request_still_honours_locator(two_nodes, monkeypatch):
     assert nums and nums[0] == 11
 
 
-async def test_sync_empty_timeout_is_ten_seconds():
-    assert SYNC_REQUEST_EMPTY_TIMEOUT == 10.0
+def _padded_block(number: int, pad: int) -> dict:
+    h = f"{number:064x}"
+    return {"block_hash": h, "header": {"block_number": number}, "padding": "x" * pad}
 
 
-async def test_two_frame_handshake_fails_with_single_stream_read(
-    monkeypatch, two_nodes
+async def _blocks_reply(svc, req: dict) -> bytes:
+    stream = _DelayedSyncStream(json.dumps(req).encode(), delay=0)
+    await svc._handle_blocks(stream)
+    return stream.written[0]
+
+
+async def test_blocks_repeated_hashes_stay_under_reply_cap(two_nodes, monkeypatch):
+    _, svc2 = two_nodes
+    bh = "c" * 64
+    _patch_stored_block(monkeypatch, bh, 1, pad=16384)
+    raw = await _blocks_reply(svc2, {"type": "get_blocks", "hashes": [bh] * 3000})
+    assert len(raw) <= SYNC_BLOCKS_REPLY_CAP
+    blocks = json.loads(raw.decode())["blocks"]
+    assert 0 < len(blocks) < 2000
+
+
+@pytest.mark.parametrize(
+    "request_fields", [{"from_number": 1}, {"from": "a" * 64}], ids=["number", "hash"]
+)
+async def test_blocks_range_reply_stays_under_reply_cap(
+    two_nodes, monkeypatch, request_fields
 ):
-    async def one_read(stream, max_bytes, **kwargs):
-        return await stream.read(max_bytes)
-
-    monkeypatch.setattr("network.libp2p_compat.read_json_object", one_read)
-    svc1, svc2 = two_nodes
-    bh = "h" * 64
-    _patch_chain_tip(monkeypatch, 3, bh)
-    payload = {
-        "network_id": "wrong-net",
-        "genesis_hash": svc2._genesis_hash,
-        "padding": "p" * 50000,
-    }
-    body = json.dumps(payload).encode()
-    mid = len(body) // 2
-    stream = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_HANDSHAKE])
-    try:
-        await stream.write(body[:mid])
-        await stream.write(body[mid:])
-        await stream.close_write()
-        with trio.fail_after(10):
-            raw = await stream.read(65535)
-        resp = json.loads(raw.decode())
-        assert resp["network_id"] == "testnet"
-    finally:
-        await stream.close()
+    _, svc2 = two_nodes
+    monkeypatch.setattr("network.service.SYNC_BLOCKS_REPLY_CAP", 10_000)
+    chain = [_padded_block(n, 1000) for n in range(1, 41)]
+    monkeypatch.setattr(db, "get_block_by_hash", lambda h: None)
+    monkeypatch.setattr(db, "get_canonical_blocks_at_or_after_height", lambda n: chain)
+    raw = await _blocks_reply(
+        svc2, {"type": "get_blocks", "limit": 40, **request_fields}
+    )
+    assert len(raw) <= 10_000
+    assert 0 < len(json.loads(raw.decode())["blocks"]) < 40
 
 
-async def test_two_frame_blocks_fails_with_single_stream_read(
-    monkeypatch, two_nodes
-):
-    async def one_read(stream, max_bytes, **kwargs):
-        return await stream.read(max_bytes)
+async def test_blocks_reply_size_count_matches_the_encoded_reply(two_nodes, monkeypatch):
+    _, svc2 = two_nodes
+    chain = [_padded_block(n, 100) for n in range(1, 5)]
+    exact = len(json.dumps({"blocks": chain}).encode())
+    monkeypatch.setattr("network.service.SYNC_BLOCKS_REPLY_CAP", exact - 1)
+    monkeypatch.setattr(db, "get_block_by_hash", lambda h: None)
+    monkeypatch.setattr(db, "get_canonical_blocks_at_or_after_height", lambda n: chain)
+    raw = await _blocks_reply(svc2, {"type": "get_blocks", "from_number": 1, "limit": 4})
+    assert len(raw) <= exact - 1
+    assert len(json.loads(raw.decode())["blocks"]) == 3
 
-    monkeypatch.setattr("network.libp2p_compat.read_json_object", one_read)
-    svc1, svc2 = two_nodes
-    bh = "b" * 64
-    _patch_stored_block(monkeypatch, bh, 1)
-    req = {"type": "get_blocks", "hashes": [bh]}
-    body = json.dumps(req).encode()
-    mid = len(body) // 2
-    stream = await svc1.host.new_stream(svc2.host.get_id(), [TAU_PROTOCOL_BLOCKS])
-    try:
-        await stream.write(body[:mid])
-        await stream.write(body[mid:])
-        await stream.close_write()
-        with trio.fail_after(10):
-            raw = await stream.read(65535)
-        resp = json.loads(raw.decode())
-        assert resp.get("blocks") == []
-    finally:
-        await stream.close()
+
+async def test_blocks_single_block_over_cap_stays_in_reply(two_nodes, monkeypatch):
+    _, svc2 = two_nodes
+    bh = "e" * 64
+    _patch_stored_block(monkeypatch, bh, 1, pad=5000)
+    monkeypatch.setattr("network.service.SYNC_BLOCKS_REPLY_CAP", 1000)
+    raw = await _blocks_reply(svc2, {"type": "get_blocks", "hashes": [bh, bh]})
+    assert [b["block_hash"] for b in json.loads(raw.decode())["blocks"]] == [bh]

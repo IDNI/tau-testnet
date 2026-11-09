@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import itertools
 from collections import OrderedDict
 import logging
 import sys
@@ -50,20 +51,22 @@ class BlockOverReplyCap(Exception):
         self.fetched = fetched
 
 
-def _blocks_reply_for_hashes(hashes: List[str], reply_cap: int) -> List[Dict[str, Any]]:
-    """Collect blocks in hash order without exceeding the reply byte cap."""
-    import db
+def _capped_block_reply(
+    stored: Iterable[Optional[Dict[str, Any]]], reply_cap: int
+) -> List[Dict[str, Any]]:
+    """Collect blocks in order until the JSON reply would exceed the byte cap.
+
+    A first block over the cap stays in the reply, so the client can report it.
+    """
     import json
 
     blocks: List[Dict[str, Any]] = []
-    size = len(b'{"blocks":[]}')
-    for h in hashes:
-        blk = db.get_block_by_hash(h)
+    size = len(json.dumps({"blocks": []}).encode())
+    for blk in stored:
         if not blk:
             continue
-        encoded = json.dumps(blk).encode()
-        extra = len(encoded) if not blocks else 1 + len(encoded)
-        if size + extra > reply_cap:
+        extra = len(json.dumps(blk).encode()) + (2 if blocks else 0)
+        if blocks and size + extra > reply_cap:
             break
         blocks.append(blk)
         size += extra
@@ -74,6 +77,9 @@ def _remaining_hashes_after_partial(
     hashes: List[str], blocks: List[Dict[str, Any]]
 ) -> List[str]:
     """Hashes after the last block returned for a capped get_blocks reply."""
+    # An empty reply gives no progress, so asking again could never end.
+    if not blocks:
+        return []
     bi = 0
     hi = 0
     while hi < len(hashes) and bi < len(blocks):
@@ -1333,7 +1339,9 @@ class NetworkService:
             if isinstance(req, dict) and isinstance(req.get("block_hashes"), list):
                 hashes = [str(h) for h in req.get("block_hashes") if h]
                 hashes = hashes[:BLOCKS_HASH_LIMIT]
-                blocks = _blocks_reply_for_hashes(hashes, SYNC_BLOCKS_REPLY_CAP)
+                blocks = _capped_block_reply(
+                    map(db.get_block_by_hash, hashes), SYNC_BLOCKS_REPLY_CAP
+                )
                 resp = {"blocks": blocks}
                 await stream.write(json.dumps(resp).encode())
                 return
@@ -1347,7 +1355,9 @@ class NetworkService:
             if isinstance(req.get("hashes"), list):
                 hashes = [str(h) for h in req["hashes"] if h]
                 hashes = hashes[:BLOCKS_HASH_LIMIT]
-                blocks = _blocks_reply_for_hashes(hashes, SYNC_BLOCKS_REPLY_CAP)
+                blocks = _capped_block_reply(
+                    map(db.get_block_by_hash, hashes), SYNC_BLOCKS_REPLY_CAP
+                )
                 resp = {"blocks": blocks}
                 await stream.write(json.dumps(resp).encode())
                 return
@@ -1369,10 +1379,12 @@ class NetworkService:
                     except Exception:
                         start_number = 0
 
-                for blk in db.get_canonical_blocks_at_or_after_height(start_number):
-                    blocks.append(blk)
-                    if len(blocks) >= limit:
-                        break
+                blocks = _capped_block_reply(
+                    itertools.islice(
+                        db.get_canonical_blocks_at_or_after_height(start_number), limit
+                    ),
+                    SYNC_BLOCKS_REPLY_CAP,
+                )
                 resp = {"blocks": blocks}
                 await stream.write(json.dumps(resp).encode())
                 return
@@ -1389,10 +1401,12 @@ class NetworkService:
                     limit = 1
                 limit = max(1, min(limit, 2000))
 
-                for blk in db.get_canonical_blocks_at_or_after_height(start_number):
-                    blocks.append(blk)
-                    if len(blocks) >= limit:
-                        break
+                blocks = _capped_block_reply(
+                    itertools.islice(
+                        db.get_canonical_blocks_at_or_after_height(start_number), limit
+                    ),
+                    SYNC_BLOCKS_REPLY_CAP,
+                )
                 resp = {"blocks": blocks}
                 await stream.write(json.dumps(resp).encode())
                 return
@@ -2094,7 +2108,11 @@ class NetworkService:
             blocks = list(resp.get("blocks") or [])
             remaining = _remaining_hashes_after_partial(hashes, blocks)
             if remaining:
-                blocks.extend(await self._fetch_block_chunk(pid_obj, remaining))
+                try:
+                    blocks.extend(await self._fetch_block_chunk(pid_obj, remaining))
+                except BlockOverReplyCap as exc:
+                    exc.fetched = blocks + exc.fetched
+                    raise
             return blocks
 
         half = len(hashes) // 2
