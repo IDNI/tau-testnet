@@ -455,18 +455,11 @@ def _admission_timestamp() -> int:
 
     Apply re-checks against the AUTHORITATIVE block timestamp, so this is a soft
     pre-check only: a tx may pass admission yet be rejected at inclusion near a
-    time threshold (and vice versa). The chain tip's timestamp (deterministic
-    across this node's view, no wall-clock skew); wall clock if unavailable.
+    time threshold (and vice versa).
     """
-    try:
-        head = db.get_canonical_head_block()
-        if isinstance(head, dict):
-            header = head.get("header")
-            if isinstance(header, dict) and header.get("timestamp") is not None:
-                return int(header.get("timestamp"))
-    except Exception:
-        pass
-    return int(time.time())
+    from consensus.facade import TipAdmissionView
+
+    return TipAdmissionView().next_block_timestamp
 
 
 class _AdmissionTau:
