@@ -160,6 +160,8 @@ class GossipManager:
                 return
             stream = await host.new_stream(peer_id, [TAU_PROTOCOL_GOSSIP])
             await stream.write(payload)
+            # The half-close ends the request also for a server that reads until EOF.
+            await stream.close()
             # Best-effort read of the responder ack. This greatly reduces races where a caller
             # assumes subscriptions/messages have been processed once the send completes.
             with trio.move_on_after(0.5):
@@ -167,7 +169,6 @@ class GossipManager:
                     await stream.read(65535)
                 except Exception:
                     pass
-            await stream.close()
         except Exception:
             # logger.debug("Failed to send gossip to %s", peer_id)
             pass

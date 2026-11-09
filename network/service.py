@@ -25,6 +25,8 @@ MAX_HANDSHAKE_PROVIDERS = 50
 MAX_SYNC_PAGES = 50
 # A peer that never closes a sync reply must not hold the sync forever.
 SYNC_READ_TIMEOUT = 120.0
+# A tx or gossip request is one write of at most 1 MiB, so it arrives in seconds.
+REQUEST_READ_TIMEOUT = 30.0
 SYNC_BLOCKS_REPLY_CAP = 20 * 1024 * 1024
 SYNC_BLOCKS_CHUNK = 128
 # Bound on remembered peers that failed the genesis gate.
@@ -1316,9 +1318,13 @@ class NetworkService:
 
     async def _handle_tx(self, stream) -> None:
         import json
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import close_stream_safely, read_json_object, reset_stream_on_error
+        from .protocols import TAU_STREAM_REQUEST_MAX_BYTES
         try:
-            data = await bounded_stream_read(stream, 65535)
+            async with reset_stream_on_error(stream):
+                data = await read_json_object(
+                    stream, TAU_STREAM_REQUEST_MAX_BYTES, read_timeout=REQUEST_READ_TIMEOUT
+                )
             req = json.loads(data.decode())
             # Submit tx off the event loop -- see the note in
             # _process_gossip_payload; admission can block for seconds.
@@ -1334,9 +1340,13 @@ class NetworkService:
 
     async def _handle_gossip_stream(self, stream) -> None:
         import json
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import close_stream_safely, read_json_object, reset_stream_on_error
+        from .protocols import TAU_STREAM_REQUEST_MAX_BYTES
         try:
-            data = await bounded_stream_read(stream, 65535)
+            async with reset_stream_on_error(stream):
+                data = await read_json_object(
+                    stream, TAU_STREAM_REQUEST_MAX_BYTES, read_timeout=REQUEST_READ_TIMEOUT
+                )
             req = json.loads((data or b"{}").decode())
 
             sender_pid = req.get("peer_id")

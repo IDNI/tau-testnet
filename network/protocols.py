@@ -26,6 +26,9 @@ TAU_GOSSIP_TOPIC_PEERS = "tau/peers/2.0.0"
 
 # Mempool & Edge Ingestion Limits
 TAU_GOSSIP_MAX_RAW_TX_BYTES = 262144
+# A tx or gossip request carries one payload as a JSON string. JSON escapes can
+# double its size, and the envelope adds a little more.
+TAU_STREAM_REQUEST_MAX_BYTES = 4 * TAU_GOSSIP_MAX_RAW_TX_BYTES
 TAU_MAX_USER_TX_BYTES = 8192
 TAU_MAX_GOVERNANCE_VOTE_BYTES = 8192
 TAU_MAX_GOVERNANCE_UPDATE_BYTES = 262144
