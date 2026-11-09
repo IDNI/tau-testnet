@@ -378,6 +378,53 @@ class LargeBlockChain(FakeChain):
         return _S()
 
 
+async def test_fetch_block_chunk_refetches_after_a_short_reply(service, monkeypatch):
+    from network.protocols import TAU_PROTOCOL_BLOCKS
+
+    opens: List[int] = []
+
+    class ShortReplyStream:
+        def __init__(self):
+            self.payload = b""
+            self.offset = 0
+
+        async def write(self, data):
+            req = json.loads(data.decode())
+            hashes = req["hashes"]
+            blocks = [
+                {"block_hash": h, "header": {"block_number": i}}
+                for i, h in enumerate(hashes)
+            ]
+            short = blocks[:2] if len(blocks) > 2 else blocks
+            self.payload = json.dumps({"blocks": short}).encode()
+            self.offset = 0
+
+        async def read(self, n=None):
+            take = min(FRAME, n or FRAME)
+            out = self.payload[self.offset : self.offset + take]
+            self.offset += len(out)
+            if not out:
+                raise EOFError()
+            return out
+
+        async def close(self):
+            pass
+
+        async def reset(self):
+            pass
+
+    async def new_stream(peer_id, protocols):
+        assert TAU_PROTOCOL_BLOCKS in protocols
+        opens.append(1)
+        return ShortReplyStream()
+
+    service.host.new_stream = new_stream
+    hashes = [f"h{i}" for i in range(6)]
+    got = await service._fetch_block_chunk("peerA", hashes)
+    assert len(got) == 6
+    assert len(opens) == 3
+
+
 async def test_sync_splits_a_block_chunk_over_the_reply_cap(service, monkeypatch):
     chain = LargeBlockChain([MiB] * 30)
     _wire(service, chain, monkeypatch)

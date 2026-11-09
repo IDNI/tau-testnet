@@ -14,17 +14,23 @@ from network.libp2p_compat import close_stream_safely
 
 pytestmark = [pytest.mark.trio, pytest.mark.usefixtures("isolate_db")]
 
+TRANSPORTS = [
+    pytest.param("/ip4/127.0.0.1/tcp/0", id="tcp"),
+    pytest.param("/ip4/127.0.0.1/udp/0/quic-v1", id="quic"),
+]
 
-@pytest.fixture
-async def two_nodes():
+
+@pytest.fixture(params=TRANSPORTS)
+async def two_nodes(request):
     from network.config import NetworkConfig
     from network.service import NetworkService
 
+    listen = multiaddr.Multiaddr(request.param)
     services = [
         NetworkService(
             NetworkConfig(
                 network_id="testnet",
-                listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
+                listen_addrs=[listen],
             ),
         )
         for _ in range(2)
@@ -40,7 +46,9 @@ async def two_nodes():
             await svc.stop()
 
 
-async def test_send_gossip_half_close_reads_ack_and_closes_stream(two_nodes, monkeypatch):
+async def test_send_gossip_half_close_reads_ack_and_closes_stream(
+    two_nodes, monkeypatch
+):
     svc1, svc2 = two_nodes
     topic = "tau/half-close/1.0.0"
     received: List[Dict[str, Any]] = []
@@ -66,11 +74,16 @@ async def test_send_gossip_half_close_reads_ack_and_closes_stream(two_nodes, mon
     ).encode()
 
     real_read = NetStream.read
-    recording = False
+    orig_new_stream = svc1.host.new_stream
 
-    async def read_record(self, n: int) -> bytes:
+    async def marking_new_stream(peer_id, protos):
+        stream = await orig_new_stream(peer_id, protos)
+        stream._half_close_sender = True
+        return stream
+
+    async def read_sender_only(self, n: int) -> bytes:
         data = await real_read(self, n)
-        if recording and data:
+        if data and getattr(self, "_half_close_sender", False):
             ack_bytes.append(data)
         return data
 
@@ -78,15 +91,14 @@ async def test_send_gossip_half_close_reads_ack_and_closes_stream(two_nodes, mon
         closed_streams.append(stream)
         await close_stream_safely(stream)
 
-    monkeypatch.setattr(NetStream, "read", read_record)
+    monkeypatch.setattr(svc1.host, "new_stream", marking_new_stream)
+    monkeypatch.setattr(NetStream, "read", read_sender_only)
     monkeypatch.setattr(
         "network.gossip.close_stream_safely",
         close_record,
     )
 
-    recording = True
     await svc1._gossip_manager._send_gossip(svc2.host.get_id(), payload)
-    recording = False
 
     assert ack_bytes
     ack = json.loads(ack_bytes[-1].decode())
