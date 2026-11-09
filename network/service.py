@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 MAX_HANDSHAKE_PROVIDERS = 50
 # Hard bound on header pages pulled in one sync call.
 MAX_SYNC_PAGES = 50
+# A peer that never closes a sync reply must not hold the sync forever.
+SYNC_READ_TIMEOUT = 120.0
 # Bound on remembered peers that failed the genesis gate.
 MAX_GENESIS_REJECTED_PEERS = 1024
 
@@ -1855,7 +1857,7 @@ class NetworkService:
     ) -> "tuple[int, bool]":
         """Fetch and ingest one header page. Returns (ingested, peer_may_have_more)."""
         from .protocols import TAU_PROTOCOL_SYNC, TAU_PROTOCOL_BLOCKS
-        from .libp2p_compat import read_until_eof
+        from .libp2p_compat import close_stream_safely, read_until_eof, reset_stream_on_error
         import json
         import db
 
@@ -1864,9 +1866,12 @@ class NetworkService:
         try:
             req = {"type": "get_headers", "locator": list(locator), "stop": stop, "limit": limit}
             stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_SYNC])
-            await stream.write(json.dumps(req).encode())
-            resp_raw = await read_until_eof(stream, 2 * 1024 * 1024)
-            await stream.close()
+            async with reset_stream_on_error(stream):
+                await stream.write(json.dumps(req).encode())
+                resp_raw = await read_until_eof(
+                    stream, 2 * 1024 * 1024, read_timeout=SYNC_READ_TIMEOUT
+                )
+            await close_stream_safely(stream)
             resp = json.loads((resp_raw or b"{}").decode())
             headers = resp.get("headers") or []
         except Exception:
@@ -1910,9 +1915,12 @@ class NetworkService:
             try:
                 req = {"type": "get_blocks", "hashes": chunk}
                 stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_BLOCKS])
-                await stream.write(json.dumps(req).encode())
-                resp_raw = await read_until_eof(stream, 20 * 1024 * 1024)
-                await stream.close()
+                async with reset_stream_on_error(stream):
+                    await stream.write(json.dumps(req).encode())
+                    resp_raw = await read_until_eof(
+                        stream, 20 * 1024 * 1024, read_timeout=SYNC_READ_TIMEOUT
+                    )
+                await close_stream_safely(stream)
                 resp = json.loads((resp_raw or b"{}").decode())
                 blocks.extend(resp.get("blocks") or [])
             except Exception:

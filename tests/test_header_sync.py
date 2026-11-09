@@ -11,7 +11,12 @@ import trio
 
 from network import service as service_mod
 from network.config import NetworkConfig
-from network.libp2p_compat import StreamTooLarge, read_until_eof
+from network.libp2p_compat import (
+    StreamReadTimeout,
+    StreamTooLarge,
+    read_until_eof,
+    reset_stream_on_error,
+)
 from network.service import NetworkService
 
 pytestmark = pytest.mark.trio
@@ -75,6 +80,52 @@ async def test_read_until_eof_propagates_other_errors():
 
     with pytest.raises(ConnectionResetError):
         await read_until_eof(Resetting(), 1024)
+
+
+async def test_read_until_eof_times_out_when_peer_never_closes():
+    class Hanging:
+        async def read(self, n=None):
+            await trio.sleep_forever()
+
+    with pytest.raises(StreamReadTimeout):
+        await read_until_eof(Hanging(), 1024, read_timeout=0.05)
+
+
+# --------------------------------------------------------------------------
+# reset_stream_on_error
+# --------------------------------------------------------------------------
+
+
+class RecordingStream:
+    def __init__(self):
+        self.resets = 0
+
+    async def reset(self):
+        await trio.sleep(0)
+        self.resets += 1
+
+
+async def test_reset_stream_on_error_resets_and_reraises():
+    stream = RecordingStream()
+    with pytest.raises(StreamTooLarge):
+        async with reset_stream_on_error(stream):
+            raise StreamTooLarge("too big")
+    assert stream.resets == 1
+
+
+async def test_reset_stream_on_error_resets_when_cancelled():
+    stream = RecordingStream()
+    with trio.move_on_after(0.01):
+        async with reset_stream_on_error(stream):
+            await trio.sleep_forever()
+    assert stream.resets == 1
+
+
+async def test_reset_stream_on_error_keeps_stream_on_success():
+    stream = RecordingStream()
+    async with reset_stream_on_error(stream):
+        pass
+    assert stream.resets == 0
 
 
 # --------------------------------------------------------------------------
@@ -255,6 +306,86 @@ async def test_sync_guard_released_after_failure(service, monkeypatch):
     service.host.new_stream = boom
     assert await service._sync_and_ingest_from_peer("peerA", chain.locator()) == 0
     assert not service._syncing_peers
+
+
+class SyncStream:
+    """One sync stream that replies with `reply` and records how it ends."""
+
+    def __init__(self, reply: bytes, *, hang: bool = False, close_error: bool = False):
+        self.reply = reply
+        self.hang = hang
+        self.close_error = close_error
+        self.closed = 0
+        self.resets = 0
+
+    async def write(self, data):
+        pass
+
+    async def read(self, n=None):
+        if self.hang:
+            await trio.sleep_forever()
+        take = min(FRAME, n or FRAME)
+        out, self.reply = self.reply[:take], self.reply[take:]
+        if not out:
+            raise EOFError()
+        return out
+
+    async def close(self):
+        self.closed += 1
+        if self.close_error:
+            raise RuntimeError("close failed")
+
+    async def reset(self):
+        self.resets += 1
+
+
+def _wire_sync_streams(service, streams: List[SyncStream], monkeypatch):
+    import db
+
+    pending = list(streams)
+
+    async def new_stream(peer_id, protocols):
+        return pending.pop(0)
+
+    service.host.new_stream = new_stream
+    service._ingest_blocks = lambda blocks, peer_id: len(blocks)
+    monkeypatch.setattr(db, "get_block_by_hash", lambda h: None)
+
+
+def _headers_reply(count: int) -> bytes:
+    headers = [{"block_number": i, "block_hash": f"h{i}"} for i in range(count)]
+    return json.dumps({"headers": headers}).encode()
+
+
+def _blocks_reply(count: int) -> bytes:
+    blocks = [{"block_hash": f"h{i}", "header": {"block_number": i}} for i in range(count)]
+    return json.dumps({"blocks": blocks}).encode()
+
+
+async def test_sync_resets_header_stream_over_cap(service, monkeypatch):
+    stream = SyncStream(b"x" * (2 * 1024 * 1024 + 1))
+    _wire_sync_streams(service, [stream], monkeypatch)
+    assert await service._sync_and_ingest_from_peer("peerA", ["genesis_local"]) == 0
+    assert stream.resets == 1
+    assert stream.closed == 0
+
+
+async def test_sync_resets_block_stream_when_peer_never_closes(service, monkeypatch):
+    monkeypatch.setattr(service_mod, "SYNC_READ_TIMEOUT", 0.05)
+    headers = SyncStream(_headers_reply(3))
+    blocks = SyncStream(b"", hang=True)
+    _wire_sync_streams(service, [headers, blocks], monkeypatch)
+    assert await service._sync_and_ingest_from_peer("peerA", ["genesis_local"], limit=10) == 0
+    assert headers.closed == 1 and headers.resets == 0
+    assert blocks.resets == 1 and blocks.closed == 0
+
+
+async def test_sync_keeps_reply_when_close_fails(service, monkeypatch):
+    headers = SyncStream(_headers_reply(3), close_error=True)
+    blocks = SyncStream(_blocks_reply(3), close_error=True)
+    _wire_sync_streams(service, [headers, blocks], monkeypatch)
+    assert await service._sync_and_ingest_from_peer("peerA", ["genesis_local"], limit=10) == 3
+    assert headers.resets == 0 and blocks.resets == 0
 
 
 # --------------------------------------------------------------------------

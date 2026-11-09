@@ -18,7 +18,8 @@ API surface lands incrementally per the unification plan
         attach_resource_manager, collect_listen_addrs, wait_for_listening,
         split_listen_outcome, describe_bind_failure)
 - A4 — discovery (ensure_peer_id, seed_peerstore)
-- A5 — stream primitives (bounded_stream_read, read_until_eof, close_stream_safely)
+- A5 — stream primitives (bounded_stream_read, read_until_eof, close_stream_safely,
+        reset_stream_safely, reset_stream_on_error)
 - A6 — DHT validator wrap (install_validating_dht)
 - A7 — trio↔async bridge (run_trio_from_thread)
 - A9 — QUIC shim (apply_quic_cleanup_shim)
@@ -26,9 +27,10 @@ API surface lands incrementally per the unification plan
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple
 
 import multiaddr
 import nacl.utils
@@ -475,26 +477,45 @@ class StreamTooLarge(ValueError):
     """A peer's response exceeded the caller's byte cap."""
 
 
-async def read_until_eof(stream, max_bytes: int) -> bytes:
+class StreamReadTimeout(Exception):
+    """A peer did not close its side of the stream within the read timeout."""
+
+
+async def read_until_eof(
+    stream, max_bytes: int, *, read_timeout: Optional[float] = None
+) -> bytes:
     """Read `stream` until the peer closes it, returning every byte received.
 
     A single `stream.read(n)` yields only what is buffered (one muxer frame),
     so a multi-frame response needs this loop. Raises `StreamTooLarge` instead
-    of returning a truncated payload. Stream resets and other errors propagate.
+    of returning a truncated payload. Raises `StreamReadTimeout` when
+    `read_timeout` seconds pass before EOF. Stream resets and other errors
+    propagate.
     """
     chunks: List[bytes] = []
     total = 0
-    while True:
-        try:
-            chunk = await stream.read(max_bytes + 1 - total)
-        except EOFError:
-            break
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > max_bytes:
-            raise StreamTooLarge(f"stream response exceeds {max_bytes} bytes")
-        chunks.append(chunk)
+    timeout_scope = (
+        trio.fail_after(read_timeout)
+        if read_timeout is not None
+        else contextlib.nullcontext()
+    )
+    try:
+        with timeout_scope:
+            while True:
+                try:
+                    chunk = await stream.read(max_bytes + 1 - total)
+                except EOFError:
+                    break
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise StreamTooLarge(f"stream response exceeds {max_bytes} bytes")
+                chunks.append(chunk)
+    except trio.TooSlowError:
+        raise StreamReadTimeout(
+            f"stream read timed out after {read_timeout}s ({total} bytes so far)"
+        ) from None
     return b"".join(chunks)
 
 
@@ -507,6 +528,26 @@ async def close_stream_safely(stream) -> None:
         await stream.close()
     except Exception:
         logger.debug("stream.close() raised", exc_info=True)
+
+
+async def reset_stream_safely(stream) -> None:
+    """`await stream.reset()` wrapped so reset errors do not mask handler errors."""
+    try:
+        await stream.reset()
+    except Exception:
+        logger.debug("stream.reset() raised", exc_info=True)
+
+
+@contextlib.asynccontextmanager
+async def reset_stream_on_error(stream) -> AsyncIterator[Any]:
+    """Reset `stream` when the enclosed block raises or is cancelled, then re-raise."""
+    try:
+        yield stream
+    except BaseException:
+        # A cancelled scope would abort the reset before the RST goes out.
+        with trio.CancelScope(shield=True), trio.move_on_after(1):
+            await reset_stream_safely(stream)
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -772,7 +813,10 @@ __all__ = [
     "bounded_stream_read",
     "read_until_eof",
     "StreamTooLarge",
+    "StreamReadTimeout",
     "close_stream_safely",
+    "reset_stream_safely",
+    "reset_stream_on_error",
     # DHT validator wrap (A6)
     "install_validating_dht",
     # Trio↔async bridge (A7)
