@@ -25,8 +25,20 @@ MAX_HANDSHAKE_PROVIDERS = 50
 MAX_SYNC_PAGES = 50
 # A peer that never closes a sync reply must not hold the sync forever.
 SYNC_READ_TIMEOUT = 120.0
+SYNC_BLOCKS_REPLY_CAP = 20 * 1024 * 1024
+SYNC_BLOCKS_CHUNK = 128
 # Bound on remembered peers that failed the genesis gate.
 MAX_GENESIS_REJECTED_PEERS = 1024
+
+
+class BlockOverReplyCap(Exception):
+    """One block is larger than the get_blocks reply cap, so no request can fetch it."""
+
+    def __init__(self, block_hash: str, fetched: List[Dict[str, Any]]):
+        super().__init__(block_hash)
+        self.block_hash = block_hash
+        self.fetched = fetched
+
 
 # Install the libp2p shims (QUIC cleanup race, AutoConnector backoff overflow) at
 # module load. Their bodies live in `network/libp2p_compat.py`; calling them here
@@ -1856,7 +1868,7 @@ class NetworkService:
         self, pid_obj: Any, peer_id: Any, locator: List[str], stop: Optional[str], limit: int
     ) -> "tuple[int, bool]":
         """Fetch and ingest one header page. Returns (ingested, peer_may_have_more)."""
-        from .protocols import TAU_PROTOCOL_SYNC, TAU_PROTOCOL_BLOCKS
+        from .protocols import TAU_PROTOCOL_SYNC
         from .libp2p_compat import close_stream_safely, read_until_eof, reset_stream_on_error
         import json
         import db
@@ -1909,20 +1921,21 @@ class NetworkService:
 
         # 3) Fetch missing blocks by hash
         blocks: List[Dict[str, Any]] = []
-        chunk_size = 128
-        for i in range(0, len(missing_hashes), chunk_size):
-            chunk = missing_hashes[i : i + chunk_size]
+        for i in range(0, len(missing_hashes), SYNC_BLOCKS_CHUNK):
+            chunk = missing_hashes[i : i + SYNC_BLOCKS_CHUNK]
             try:
-                req = {"type": "get_blocks", "hashes": chunk}
-                stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_BLOCKS])
-                async with reset_stream_on_error(stream):
-                    await stream.write(json.dumps(req).encode())
-                    resp_raw = await read_until_eof(
-                        stream, 20 * 1024 * 1024, read_timeout=SYNC_READ_TIMEOUT
-                    )
-                await close_stream_safely(stream)
-                resp = json.loads((resp_raw or b"{}").decode())
-                blocks.extend(resp.get("blocks") or [])
+                blocks.extend(await self._fetch_block_chunk(pid_obj, chunk))
+            except BlockOverReplyCap as exc:
+                logger.error(
+                    "Block %s from %s is larger than the reply cap of %d bytes; "
+                    "the sync stops before this block",
+                    exc.block_hash,
+                    peer_id,
+                    SYNC_BLOCKS_REPLY_CAP,
+                )
+                blocks.extend(exc.fetched)
+                more = False
+                break
             except Exception:
                 logger.warning("Failed to fetch block bodies from %s", peer_id, exc_info=True)
                 break
@@ -1950,6 +1963,46 @@ class NetworkService:
         except Exception:
             logger.warning("Failed to ingest blocks from %s", peer_id, exc_info=True)
             return 0, False
+
+    async def _fetch_block_chunk(self, pid_obj: Any, hashes: List[str]) -> List[Dict[str, Any]]:
+        """Fetch `hashes` with get_blocks, in halves when a reply exceeds the cap.
+
+        Raises `BlockOverReplyCap` with the blocks fetched before the block
+        that no request can carry.
+        """
+        from .protocols import TAU_PROTOCOL_BLOCKS
+        from .libp2p_compat import (
+            StreamTooLarge,
+            close_stream_safely,
+            read_until_eof,
+            reset_stream_on_error,
+        )
+        import json
+
+        try:
+            req = {"type": "get_blocks", "hashes": hashes}
+            stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_BLOCKS])
+            async with reset_stream_on_error(stream):
+                await stream.write(json.dumps(req).encode())
+                resp_raw = await read_until_eof(
+                    stream, SYNC_BLOCKS_REPLY_CAP, read_timeout=SYNC_READ_TIMEOUT
+                )
+            await close_stream_safely(stream)
+        except StreamTooLarge:
+            if len(hashes) == 1:
+                raise BlockOverReplyCap(hashes[0], [])
+        else:
+            resp = json.loads((resp_raw or b"{}").decode())
+            return list(resp.get("blocks") or [])
+
+        half = len(hashes) // 2
+        first = await self._fetch_block_chunk(pid_obj, hashes[:half])
+        try:
+            second = await self._fetch_block_chunk(pid_obj, hashes[half:])
+        except BlockOverReplyCap as exc:
+            exc.fetched = first + exc.fetched
+            raise
+        return first + second
 
     @staticmethod
     def _ingest_blocks(sorted_blocks: List[Dict[str, Any]], peer_id: Any) -> int:

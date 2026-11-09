@@ -378,17 +378,15 @@ class LargeBlockChain(FakeChain):
         return _S()
 
 
-@pytest.mark.xfail(strict=True, reason="a get_blocks reply over 20 MiB stops the sync")
 async def test_sync_splits_a_block_chunk_over_the_reply_cap(service, monkeypatch):
     chain = LargeBlockChain([MiB] * 30)
     _wire(service, chain, monkeypatch)
     total = await service._sync_and_ingest_from_peer("peerA", chain.locator())
     assert total == 30
     assert chain.head == 29
-    assert chain.block_request_sizes[0] == 30
+    assert chain.block_request_sizes == [30, 15, 15]
 
 
-@pytest.mark.xfail(strict=True, reason="a get_blocks reply over 20 MiB stops the sync")
 async def test_sync_ingests_up_to_a_single_block_over_the_reply_cap(service, monkeypatch, caplog):
     chain = LargeBlockChain([1024, 1024, 1024, 21 * MiB, 1024, 1024])
     _wire(service, chain, monkeypatch)
@@ -396,6 +394,7 @@ async def test_sync_ingests_up_to_a_single_block_over_the_reply_cap(service, mon
         total = await service._sync_and_ingest_from_peer("peerA", chain.locator())
     assert total == 3
     assert chain.head == 2
+    assert chain.block_request_sizes == [6, 3, 3, 1]
     errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
     assert len(errors) == 1
     assert "h3" in errors[0] and "reply cap" in errors[0]
