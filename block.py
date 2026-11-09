@@ -30,9 +30,37 @@ except Exception:  # pragma: no cover - optional dependency
 
 EMPTY_STATE_HASH = "0" * 64
 
+# Consensus cap on stored block JSON (UTF-8 bytes). Every valid block must
+# fit one get_blocks reply on the sync path.
+MAX_BLOCK_BYTES = 18874368
+
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def block_storage_json_bytes(block: "Block | Dict") -> int:
+    """Byte length of ``json.dumps`` of a block in the DB / get_blocks body form."""
+    payload = block.to_dict() if isinstance(block, Block) else block
+    return len(json.dumps(payload).encode("utf-8"))
+
+
+def block_byte_cap_reason(block: "Block | Dict") -> Optional[str]:
+    """None when the block is within ``MAX_BLOCK_BYTES``, else a short reason."""
+    n = block_storage_json_bytes(block)
+    if n <= MAX_BLOCK_BYTES:
+        return None
+    return (
+        f"block JSON is {n} bytes, over the consensus cap {MAX_BLOCK_BYTES}"
+    )
+
+
+def transaction_json_bytes_in_block(tx: Dict, *, first: bool) -> int:
+    """Bytes that one transaction and its ``tx_ids`` entry add to the block JSON."""
+    # A tx_ids entry is 64 hex digits and 2 quotes. After the first entry, each
+    # list also gets a ", " separator.
+    added = len(json.dumps(tx).encode("utf-8")) + 66
+    return added if first else added + 4
 
 
 def compute_tx_hash(tx: Dict) -> str:
