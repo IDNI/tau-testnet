@@ -325,6 +325,82 @@ async def test_sync_guard_released_after_failure(service, monkeypatch):
     assert not service._syncing_peers
 
 
+MiB = 1024 * 1024
+
+
+class LargeBlockChain(FakeChain):
+    """FakeChain whose block `i` carries `sizes[i]` bytes of transaction data."""
+
+    def __init__(self, sizes: List[int]):
+        super().__init__(len(sizes))
+        self.sizes = sizes
+        self.block_request_sizes: List[int] = []
+
+    def _respond(self, req: Dict[str, Any]) -> bytes:
+        if req["type"] == "get_headers":
+            return super()._respond(req)
+        self.block_requests += 1
+        self.block_request_sizes.append(len(req["hashes"]))
+        blocks = [
+            {
+                "block_hash": h,
+                "header": {"block_number": int(h[1:])},
+                "transactions": ["x" * self.sizes[int(h[1:])]],
+            }
+            for h in req["hashes"]
+        ]
+        return json.dumps({"blocks": blocks}).encode()
+
+    async def new_stream(self, peer_id, protocols):
+        chain = self
+
+        class _S:
+            payload = b""
+            offset = 0
+
+            async def write(self, data):
+                self.payload = chain._respond(json.loads(data.decode()))
+
+            async def read(self, n=None):
+                take = min(FRAME, n or FRAME)
+                out = self.payload[self.offset : self.offset + take]
+                self.offset += len(out)
+                if not out:
+                    raise EOFError()
+                return out
+
+            async def close(self):
+                pass
+
+            async def reset(self):
+                pass
+
+        return _S()
+
+
+@pytest.mark.xfail(strict=True, reason="a get_blocks reply over 20 MiB stops the sync")
+async def test_sync_splits_a_block_chunk_over_the_reply_cap(service, monkeypatch):
+    chain = LargeBlockChain([MiB] * 30)
+    _wire(service, chain, monkeypatch)
+    total = await service._sync_and_ingest_from_peer("peerA", chain.locator())
+    assert total == 30
+    assert chain.head == 29
+    assert chain.block_request_sizes[0] == 30
+
+
+@pytest.mark.xfail(strict=True, reason="a get_blocks reply over 20 MiB stops the sync")
+async def test_sync_ingests_up_to_a_single_block_over_the_reply_cap(service, monkeypatch, caplog):
+    chain = LargeBlockChain([1024, 1024, 1024, 21 * MiB, 1024, 1024])
+    _wire(service, chain, monkeypatch)
+    with caplog.at_level("ERROR"):
+        total = await service._sync_and_ingest_from_peer("peerA", chain.locator())
+    assert total == 3
+    assert chain.head == 2
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "h3" in errors[0] and "reply cap" in errors[0]
+
+
 class SyncStream:
     """One sync stream that replies with `reply` and records how it ends."""
 
