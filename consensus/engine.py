@@ -804,9 +804,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         Pure Implementation: Operates on state passed implicitly through parent_snapshot.metadata and returns ApplyBlockResult.
         """
         import copy
+        from block import block_byte_cap_reason
+        from errors import BlockByteCapExceeded
         from consensus.state import compute_consensus_state_hash
         from chain_state import compute_accounts_hash
         import chain_state
+
+        over = block_byte_cap_reason(block)
+        if over:
+            raise BlockByteCapExceeded(over)
 
         # 1. State Extraction
         metadata = parent_snapshot.metadata
