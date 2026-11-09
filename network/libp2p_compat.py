@@ -40,10 +40,12 @@ from nacl.signing import SigningKey, VerifyKey
 
 from libp2p.abc import IHost, INotifee
 from libp2p.crypto.keys import KeyPair, KeyType, PrivateKey, PublicKey
+from libp2p.network.stream.exceptions import StreamReset
 from libp2p.peer.id import ID
 from libp2p.peer.peerstore import PERMANENT_ADDR_TTL
 from libp2p.rcmgr.connection_limits import ConnectionLimits
 from libp2p.rcmgr.manager import ResourceLimits, ResourceManager
+from libp2p.stream_muxer.exceptions import MuxedStreamReset
 
 logger = logging.getLogger(__name__)
 
@@ -477,6 +479,19 @@ class StreamTooLarge(ValueError):
     """A peer's response exceeded the caller's byte cap."""
 
 
+def _raise_if_reset(stream, total: int) -> None:
+    """Raise a reset error when the end of `stream` came from an RST, not a FIN."""
+    muxed = getattr(stream, "muxed_stream", stream)
+    # yamux drops a reset stream once its buffer is empty and reports EOF.
+    reset = getattr(muxed, "reset_received", False) is True
+    event_reset = getattr(muxed, "event_reset", None)  # mplex
+    if isinstance(event_reset, trio.Event) and event_reset.is_set():
+        reset = True
+    if reset:
+        error = StreamReset if muxed is not stream else MuxedStreamReset
+        raise error(f"stream reset by peer after {total} bytes")
+
+
 class StreamReadTimeout(Exception):
     """A peer did not close its side of the stream within the read timeout."""
 
@@ -489,8 +504,9 @@ async def read_until_eof(
     A single `stream.read(n)` yields only what is buffered (one muxer frame),
     so a multi-frame response needs this loop. Raises `StreamTooLarge` instead
     of returning a truncated payload. Raises `StreamReadTimeout` when
-    `read_timeout` seconds pass before EOF. Stream resets and other errors
-    propagate.
+    `read_timeout` seconds pass before EOF. A stream reset raises
+    `StreamReset` or `MuxedStreamReset`, also when libp2p reports it as EOF.
+    Other errors propagate.
     """
     chunks: List[bytes] = []
     total = 0
@@ -505,8 +521,10 @@ async def read_until_eof(
                 try:
                     chunk = await stream.read(max_bytes + 1 - total)
                 except EOFError:
+                    _raise_if_reset(stream, total)
                     break
                 if not chunk:
+                    _raise_if_reset(stream, total)
                     break
                 total += len(chunk)
                 if total > max_bytes:

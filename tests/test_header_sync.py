@@ -82,6 +82,23 @@ async def test_read_until_eof_propagates_other_errors():
         await read_until_eof(Resetting(), 1024)
 
 
+async def test_read_until_eof_raises_when_mplex_reports_reset_as_eof():
+    from libp2p.network.stream.exceptions import StreamReset
+
+    stream = ChunkedStream(b"x" * 1000, eof="raise", frame=300)
+    stream.muxed_stream = MagicMock(spec=["event_reset"])
+    stream.muxed_stream.event_reset = trio.Event()
+    stream.muxed_stream.event_reset.set()
+    with pytest.raises(StreamReset):
+        await read_until_eof(stream, 4096)
+
+
+async def test_read_until_eof_ignores_reset_attributes_of_a_mock():
+    stream = ChunkedStream(b"x" * 1000, eof="raise", frame=300)
+    stream.muxed_stream = MagicMock()
+    assert await read_until_eof(stream, 4096) == b"x" * 1000
+
+
 async def test_read_until_eof_times_out_when_peer_never_closes():
     class Hanging:
         async def read(self, n=None):
