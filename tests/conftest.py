@@ -79,6 +79,14 @@ def reset_tau_stream_types() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def restore_genesis_approval_slots(monkeypatch):
+    """Keep the genesis slot flag of one test out of the next test."""
+    import chain_state
+    monkeypatch.setattr(chain_state, "_genesis_approval_slots_active",
+                        chain_state._genesis_approval_slots_active)
+
+
+@pytest.fixture(autouse=True)
 def mock_consensus_for_unrelated_tests(monkeypatch, request):
     """Automatically allow block creation turns in non-consensus tests to avoid breaking mempool/faucet tests."""
     if hasattr(request, "module") and request.module and "test_poa" not in request.module.__name__ and "test_network" not in request.module.__name__:

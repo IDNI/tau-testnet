@@ -492,6 +492,7 @@ _genesis_active_validators: list = []
 _genesis_vote_quorum: str = ""
 _genesis_eligibility_mode: str = ""
 _genesis_fee_beneficiary: str = ""
+_genesis_approval_slots_active: bool = False
 # Genesis rule text, re-seeded on full rebuild so the replayed state hash
 # matches the mined chain (the reorg path replays only the new suffix, not
 # the genesis block, so its rules would otherwise be lost).
@@ -1153,6 +1154,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             _lifecycle_manager.quorum_policy = _genesis_vote_quorum
             _lifecycle_manager.eligibility_mode = _genesis_eligibility_mode
             _lifecycle_manager.fee_beneficiary = _genesis_fee_beneficiary
+            if _genesis_approval_slots_active:
+                _lifecycle_manager.activate_approval_slots()
             _lifecycle_manager.recompute_approval_threshold()
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
@@ -1494,7 +1497,7 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     # Remember the artifact's pre-funded accounts for rebuild/reorg seeding,
     # regardless of whether the DB is fresh or already provisioned.
     global _genesis_accounts_state, _genesis_active_validators, _genesis_vote_quorum
-    global _genesis_eligibility_mode, _genesis_fee_beneficiary
+    global _genesis_eligibility_mode, _genesis_fee_beneficiary, _genesis_approval_slots_active
     global _genesis_application_rules, _genesis_consensus_rules
     _genesis_accounts_state = {
         k: int(v) for k, v in genesis_data.get("accounts_state", {}).items()
@@ -1504,6 +1507,9 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     _genesis_vote_quorum = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("vote_quorum", "")
     _genesis_eligibility_mode = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("eligibility_mode", "")
     _genesis_fee_beneficiary = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("fee_beneficiary", "")
+    _genesis_approval_slots_active = (
+        (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("approval_slots_active") is True
+    )
     _genesis_application_rules = genesis_data.get("application_rules", "")
     _genesis_consensus_rules = genesis_data.get("consensus_rules", "")
 
@@ -1555,7 +1561,7 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
             # A fresh chain may ship with co-signature approval slots already
             # reserved (scripts/gen_genesis.py --approval-slots). One-way, so
             # this only ever turns it on.
-            if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
+            if _genesis_approval_slots_active:
                 _lifecycle_manager.activate_approval_slots()
                 # Persist immediately. TipAdmissionView reads this key, not the
                 # manager, so without it admission treats a genesis-activated
@@ -2319,8 +2325,19 @@ def load_state_from_db() -> bool:
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
         persisted_slots = db.get_chain_state_value("approval_slots_active", _MISSING)
-        if persisted_slots is not _MISSING and str(persisted_slots) == "1":
+        # The genesis flag also counts: the flag is one-way, so a genesis that
+        # turns it on keeps it on at every height.
+        if _genesis_approval_slots_active or (
+            persisted_slots is not _MISSING and str(persisted_slots) == "1"
+        ):
             _lifecycle_manager.activate_approval_slots()
+            if str(persisted_slots) != "1":
+                try:
+                    db.set_chain_state_value("approval_slots_active", "1")
+                except Exception:
+                    logger.warning(
+                        "could not persist approval_slots_active from genesis",
+                        exc_info=True)
 
         for p in pending_updates:
             update = ConsensusRuleUpdate(
