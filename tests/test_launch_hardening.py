@@ -198,7 +198,8 @@ class TestAdmissionLimits:
     def test_transfers_at_limit_accepted(self):
         from consensus.admission import validate_user_tx_reserved_domains, MAX_TRANSFERS_PER_TX
         from bls_keys import SK_ALICE, SK_BOB, pubkey_hex
-        tx = {"operations": {"1": [[pubkey_hex(SK_ALICE), pubkey_hex(SK_BOB), "1"]] * MAX_TRANSFERS_PER_TX}}
+        tx = {"sender_pubkey": pubkey_hex(SK_ALICE),
+              "operations": {"1": [[pubkey_hex(SK_ALICE), pubkey_hex(SK_BOB), "1"]] * MAX_TRANSFERS_PER_TX}}
         assert validate_user_tx_reserved_domains(tx, self._tip_view()).is_valid
 
     def test_too_many_rule_revisions_rejected(self):

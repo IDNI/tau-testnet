@@ -58,7 +58,7 @@ from consensus.retractable import (
     parse_retractable_transfer,
     validate_park_shape,
 )
-from consensus.tx_checks import validate_bls_pubkey
+from consensus.tx_checks import check_transfer, validate_bls_pubkey
 from consensus.governance import (
     normalize_validator_delta,
     normalize_validator_set,
@@ -349,20 +349,13 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
     if isinstance(transfers, list) and len(transfers) > MAX_TRANSFERS_PER_TX:
         return format_error(f"user_tx exceeds MAX_TRANSFERS_PER_TX ({len(transfers)} > {MAX_TRANSFERS_PER_TX}).")
     if isinstance(transfers, list):
-        for transfer_entry in transfers:
-            if not (isinstance(transfer_entry, (list, tuple)) and len(transfer_entry) == 3):
+        for index, transfer_entry in enumerate(transfers):
+            err = check_transfer(transfer_entry, tx.get("sender_pubkey"))
+            if err:
                 return format_error(
-                    f"Invalid transfer entry format: {transfer_entry}",
+                    f"Transaction invalid. Transfer #{index + 1}: {err}",
                     code="TX_INVALID",
                 )
-            from_addr_key, to_addr_key, _amount = map(str, transfer_entry)
-            for key_hex, key_name in (
-                (from_addr_key, "'from' address"),
-                (to_addr_key, "'to' address"),
-            ):
-                err = validate_bls_pubkey(key_hex, key_name)
-                if err:
-                    return format_error(f"Transaction invalid. {err}", code="TX_INVALID")
     custom_stream_count = sum(1 for k in operations if str(k).isdigit() and int(k) not in (0, 1))
     if custom_stream_count > MAX_CUSTOM_INPUT_STREAMS:
         return format_error(
