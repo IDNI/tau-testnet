@@ -457,13 +457,14 @@ class ConsensusLifecycleManager:
         self.recompute_approval_threshold()
 
     def fork(self) -> "ConsensusLifecycleManager":
-        """A private copy for one transaction. A rejected transaction drops it,
-        and an accepted one goes back through adopt()."""
+        """A private copy for one transaction. Only an accepted one is adopted."""
         return copy.deepcopy(self)
 
     def adopt(self, fork: "ConsensusLifecycleManager") -> None:
-        """Take the state of an accepted fork into this manager."""
-        # Identity is kept: the block builder hashes this same object after apply.
+        """Take the state of an accepted fork, and keep this object for the block hash.
+
+        The sub-managers are replaced. No caller keeps one across an adopt.
+        """
         self.__dict__ = dict(fork.__dict__)
 
     def effective_quorum_policy(self) -> str:

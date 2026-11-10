@@ -112,20 +112,13 @@ class TxBranch:
 
     @property
     def lifecycle(self):
-        """This transaction's private lifecycle state, cloned on first use.
+        """This transaction's private lifecycle state, forked on first use.
 
-        Replacement, not undo. The registered-clause registry, the approval book
-        and the offer book are mutated in place by the paths that own them --
-        `resolve_all_for_sender` marks requests failed, `accepted_clauses[key]`
-        is overwritten -- and there is no inverse for any of it that survives
-        contact with the next change. Each transaction gets its own fork on
-        both apply paths; a rejected one drops its copy and never adopts.
+        A fork replaces the state, because the books change in place with no undo.
         """
         if self._lifecycle is None and self.proposal.lifecycle is not None:
-            # The parent is captured HERE, by identity. Adoption later checks
-            # that the proposal still holds this exact object: a clone taken
-            # from one lifecycle and adopted into another would write a history
-            # that never happened, and a type check cannot see that.
+            # Kept by identity: a clone adopted into another lifecycle would
+            # write a history that never happened.
             self._lifecycle_parent = self.proposal.lifecycle
             self._lifecycle = self._lifecycle_parent.fork()
         return self._lifecycle
@@ -135,14 +128,7 @@ class TxBranch:
         return self._lifecycle is not None
 
     def _adopt_lifecycle(self) -> None:
-        """Make the child's state the proposal's, in one rebind.
-
-        The contents are replaced wholesale; object IDENTITY is preserved on
-        purpose. The block builder holds this same manager and hashes it after
-        apply returns, so handing the proposal a different object would leave the
-        caller hashing the parent -- accepted lifecycle changes silently missing
-        from the consensus state hash.
-        """
+        """Adopt the child into the proposal's lifecycle object."""
         child = self._lifecycle
         if child is None:
             return

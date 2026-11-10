@@ -1267,8 +1267,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             target_lifecycle if target_lifecycle is not None
             else chain_state._lifecycle_manager
         )
-        # Identity is kept: the block builder hashes this same object after apply.
-        # On both apply paths an accepted transaction's fork is adopted INTO it.
         if proposal is not None:
             proposal.lifecycle = _block_lifecycle
         lifecycle_mgr = _block_lifecycle
@@ -1457,7 +1455,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             Every lifecycle write goes through here, on both apply paths, so a
             plain transfer pays no copy.
             """
-            # A rejected tx must leave no lifecycle write.
             nonlocal lifecycle_mgr
             if lifecycle_mgr is _block_lifecycle and _block_lifecycle is not None:
                 lifecycle_mgr = (
@@ -1632,8 +1629,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     _did_not_land("o5 clause ignored (no sender)")
                     return True
 
-                offers = _lifecycle_for_write().rule_offers
-                approvals_mgr = lifecycle_mgr.approval_requests
+                offers = lifecycle_mgr.rule_offers
                 sender_n = sender.lower()
                 stream = tau_defs.USER_POLICY_STREAM_INDEX
 
@@ -1672,7 +1668,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # clause, so changing the clause under an open request would
                 # silently change what its recorded votes mean, or strand it
                 # until expiry. Resolve them first, in canonical id order.
-                doomed = approvals_mgr.resolve_all_for_sender(sender_n, STATUS_FAILED)
+                lifecycle = _lifecycle_for_write()
+                offers = lifecycle.rule_offers
+                doomed = lifecycle.approval_requests.resolve_all_for_sender(
+                    sender_n, STATUS_FAILED
+                )
                 if doomed:
                     tx_receipt["logs"].append(
                         "Policy change failed %d open approval request(s)" % len(doomed))

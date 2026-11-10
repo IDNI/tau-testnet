@@ -1,8 +1,6 @@
-"""Each transaction forks the lifecycle, on the proposal path and the direct path.
+"""A rejected transaction leaves no lifecycle write, on both apply paths.
 
-A rejected transaction drops its fork. The block without that transaction must
-then give the same state hash, or the node refuses its own block. The two apply
-paths must also give the same state hash for the same block.
+Else the block without it hashes differently, and the node refuses its own block.
 """
 import hashlib
 import itertools
@@ -11,7 +9,6 @@ from unittest.mock import patch
 import pytest
 from py_ecc.bls import G2Basic
 
-import config
 import tau_allocator as alloc
 import tau_defs
 import tau_journal as tj
@@ -21,7 +18,7 @@ from block import Block
 from consensus.approvals import ApprovalRequest
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager, ConsensusRuleUpdate
-from consensus.rule_offers import RuleOffer
+from consensus.rule_offers import NEUTRAL_O5_CLAUSE_BODY, RuleOffer
 from consensus.state import TauStateSnapshot
 from consensus.tx_signing import signing_message_bytes
 
@@ -43,11 +40,6 @@ SK_ALICE, ALICE = _key(11111)
 SK_AUTH, AUTH = _key(22222)
 SK_BOB, BOB = _key(44444)
 PROPOSER = "d4" * 48
-
-
-@pytest.fixture(autouse=True)
-def _no_faucet(monkeypatch):
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False)
 
 
 class _Session:
@@ -116,9 +108,9 @@ def _offer(expire=EXPIRE):
                      rule_text=OFFER_RULE, expire_at_height=expire)
 
 
-def _offer_tx(offer, fee_limit="100"):
+def _offer_tx(offer, fee_limit="100", seq=0):
     return _sign(_envelope(
-        ALICE, "rule_offer", fee_limit=fee_limit,
+        ALICE, "rule_offer", seq=seq, fee_limit=fee_limit,
         expire_at_height=offer.expire_at_height,
         recipient_pubkey=offer.recipient_pubkey, rule_text=offer.rule_text,
     ), SK_ALICE)
@@ -134,9 +126,9 @@ def _decision_tx(offer, accept, fee_limit="100", seq=0):
     ), SK_BOB)
 
 
-def _request():
+def _request(sender=ALICE, recipient=BOB):
     return ApprovalRequest(
-        sender_pubkey=ALICE, recipient_pubkey=BOB, amount=5000,
+        sender_pubkey=sender, recipient_pubkey=recipient, amount=5000,
         sequence_number=0, expire_at_height=EXPIRE,
         approvers={18: AUTH}, custom_inputs={},
     )
@@ -155,6 +147,12 @@ def _park_tx(fee_limit="100", seq=0):
     return _sign(_envelope(
         ALICE, "retractable_transfer", seq=seq, fee_limit=fee_limit,
         recipient_pubkey=BOB, amount=100, release_at_height=HEIGHT + 10,
+    ), SK_ALICE)
+
+
+def _declare_tx(fee_limit="100"):
+    return _sign(_envelope(
+        ALICE, "user_tx", fee_limit=fee_limit, operations={"0": OFFER_RULE},
     ), SK_ALICE)
 
 
@@ -182,7 +180,7 @@ def _proposal(session):
     )
 
 
-def _apply_block(txs, mode, *, seed=None, **session_args):
+def _apply_block(txs, mode, *, seed=None, replay_mode=False, **session_args):
     lifecycle = ConsensusLifecycleManager(active_validators=[ALICE])
     lifecycle.approval_slots_active = True
     if seed is not None:
@@ -191,7 +189,8 @@ def _apply_block(txs, mode, *, seed=None, **session_args):
         state_hash="0" * 64,
         tau_bytes=b"rules",
         metadata={
-            "balances": {ALICE: 100_000, BOB: 100_000, AUTH: 0},
+            # Every account is listed, so no balance read falls back to the faucet.
+            "balances": {ALICE: 100_000, BOB: 100_000, AUTH: 0, PROPOSER: 0},
             "sequence_numbers": {},
             "last_transfer_ts": {},
             "lifecycle_manager": lifecycle,
@@ -217,6 +216,7 @@ def _apply_block(txs, mode, *, seed=None, **session_args):
         ready.is_set.return_value = True
         return TauConsensusEngine().apply_block(
             view, block, parent, session=session, proposal=proposal,
+            replay_mode=replay_mode,
         )
 
 
@@ -286,25 +286,81 @@ def test_an_accepted_governance_update_is_recorded(temp_database, mode):
     assert mined.next_snapshot.state_hash != empty.next_snapshot.state_hash
 
 
+def _rejected_by(cause):
+    if cause == "fee":
+        return {"fee": "500"}
+    return {"fee": "0", "rule_accepted": False}
+
+
+# --- the routed o5 path writes before the composite and the fee ---------------
+
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("cause", ["fee", "composite"])
 def test_a_rejected_offer_accept_leaves_no_lifecycle_write(temp_database, mode, cause):
-    """The accept resolves the offer and registers the clause before the
-    composite runs and before the fee settles."""
+    """The accept resolves the offer, registers the clause and fails the open
+    requests of the acceptor before the composite runs and the fee settles."""
     offer = _offer()
-    seed = lambda lm: lm.rule_offers.submit_offer(offer)  # noqa: E731
-    if cause == "fee":
-        session_args = {"fee": "500"}
-    else:
-        session_args = {"fee": "0", "rule_accepted": False}
+    request = _request(sender=BOB, recipient=ALICE)
+
+    def seed(lm):
+        lm.rule_offers.submit_offer(offer)
+        lm.approval_requests.submit_request(request)
+
     tx = _decision_tx(offer, accept=True)
-    mined = _apply_block([tx], mode, seed=seed, **session_args)
-    empty = _apply_block([], mode, seed=seed, **session_args)
+    mined = _apply_block([tx], mode, seed=seed, **_rejected_by(cause))
+    empty = _apply_block([], mode, seed=seed, **_rejected_by(cause))
 
     _assert_no_trace(mined, empty, tx)
-    offers = _lifecycle_of(mined).rule_offers
-    assert offer.offer_id in offers.offered
-    assert offers.accepted_clauses == {}
+    lifecycle = _lifecycle_of(mined)
+    assert offer.offer_id in lifecycle.rule_offers.offered
+    assert lifecycle.rule_offers.accepted_clauses == {}
+    assert request.request_id in lifecycle.approval_requests.open_requests
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("cause", ["fee", "composite"])
+def test_a_rejected_o5_declare_leaves_no_lifecycle_write(temp_database, mode, cause):
+    """The op-0 declare registers the clause and fails the open requests of
+    the sender before the composite runs and the fee settles."""
+    request = _request()
+    seed = lambda lm: lm.approval_requests.submit_request(request)  # noqa: E731
+    tx = _declare_tx()
+    mined = _apply_block([tx], mode, seed=seed, **_rejected_by(cause))
+    empty = _apply_block([], mode, seed=seed, **_rejected_by(cause))
+
+    _assert_no_trace(mined, empty, tx)
+    lifecycle = _lifecycle_of(mined)
+    assert lifecycle.rule_offers.accepted_clauses == {}
+    assert request.request_id in lifecycle.approval_requests.open_requests
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_an_accepted_o5_declare_registers_the_clause(temp_database, mode):
+    request = _request()
+    seed = lambda lm: lm.approval_requests.submit_request(request)  # noqa: E731
+    tx = _declare_tx(fee_limit="10000")
+    mined = _apply_block([tx], mode, seed=seed)
+
+    assert mined.invalid_tx_ids == [], _logs(mined, tx)
+    lifecycle = _lifecycle_of(mined)
+    assert list(lifecycle.rule_offers.accepted_clauses) == [
+        (ALICE, tau_defs.USER_POLICY_STREAM_INDEX)
+    ]
+    assert request.request_id not in lifecycle.approval_requests.open_requests
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_refused_o5_declare_makes_no_fork(temp_database, mode):
+    """A revocation with nothing registered is refused before any write."""
+    tx = _sign(_envelope(
+        ALICE, "user_tx", fee_limit="10000",
+        operations={"0": "always %s." % NEUTRAL_O5_CLAUSE_BODY},
+    ), SK_ALICE)
+    result, forks = _count_forks([tx], mode)
+
+    assert result.invalid_tx_ids == [tx["tx_id"]]
+    assert "o5 clause revocation ignored (nothing registered)" in _logs(result, tx)
+    assert forks == 0
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -334,6 +390,59 @@ def test_an_accepted_offer_reject_resolves_the_offer(temp_database, mode):
     offers = _lifecycle_of(mined).rule_offers
     assert offer.offer_id not in offers.offered
     assert offer.offer_id in offers.resolved
+
+
+# --- a rule offer and its fee -------------------------------------------------
+
+@pytest.mark.parametrize("mode", MODES)
+def test_an_offer_rejected_at_fee_settlement_hashes_like_an_empty_block(
+        temp_database, mode):
+    tx = _offer_tx(_offer(), fee_limit="0")
+    mined = _apply_block([tx], mode)
+    empty = _apply_block([], mode)
+
+    assert "Fee 500 exceeds fee_limit 0" in _logs(mined, tx)
+    _assert_no_trace(mined, empty, tx)
+    assert _lifecycle_of(mined).rule_offers.offered == {}
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_an_offer_that_pays_its_fee_is_recorded(temp_database, mode):
+    tx = _offer_tx(_offer(), fee_limit="1000")
+    mined = _apply_block([tx], mode)
+    empty = _apply_block([], mode)
+
+    offers = _lifecycle_of(mined).rule_offers
+    assert mined.invalid_tx_ids == [], _logs(mined, tx)
+    assert mined.next_snapshot.state_hash != empty.next_snapshot.state_hash
+    assert len(offers.offered) == 1
+    assert list(offers.offer_payloads.values()) == [OFFER_RULE]
+
+
+# --- replay keeps a transaction whose fee is not paid -------------------------
+
+@pytest.mark.parametrize("mode", MODES)
+def test_replay_keeps_a_parked_request_with_an_unpaid_fee(temp_database, mode):
+    """Replay must rebuild the mined chain, so the request stays parked."""
+    request = _request()
+    tx = _request_tx(request)
+    replayed = _apply_block([tx], mode, replay_mode=True, block_o5=True)
+    empty = _apply_block([], mode, replay_mode=True, block_o5=True)
+
+    logs = _logs(replayed, tx)
+    assert replayed.invalid_tx_ids == [], logs
+    assert "Replay: fee exceeds fee_limit; fee skipped" in logs
+    assert request.request_id in _lifecycle_of(replayed).approval_requests.open_requests
+    assert replayed.next_snapshot.state_hash != empty.next_snapshot.state_hash
+
+
+def test_replay_gives_the_same_state_hash_on_both_paths(temp_database):
+    txs = [_request_tx(_request()), _offer_tx(_offer(), seq=1)]
+    by_proposal = _apply_block(txs, "proposal", replay_mode=True, block_o5=True)
+    direct = _apply_block(txs, "direct", replay_mode=True, block_o5=True)
+
+    assert by_proposal.invalid_tx_ids == direct.invalid_tx_ids == []
+    assert by_proposal.next_snapshot.state_hash == direct.next_snapshot.state_hash
 
 
 # --- a rejected and an accepted transaction from one sender -------------------
