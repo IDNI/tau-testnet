@@ -183,8 +183,6 @@ def test_the_node_environment_does_not_change_the_state_hash(temp_database, monk
                 {"TAU_AUTO_FAUCET": "false"}):
         for key, value in env.items():
             monkeypatch.setenv(key, value)
-        for name in ("TESTNET_AUTO_FAUCET", "TESTNET_AUTO_FAUCET_AMOUNT"):
-            monkeypatch.setattr(config, name, env.get("TAU_AUTO_FAUCET") == "true", raising=False)
         result = _run("proposal", [tx], _parent({ALICE: 200000}), fee="10")
         assert result.accepted_tx_ids == [tx["tx_id"]]
         hashes.append(result.next_snapshot.state_hash)
