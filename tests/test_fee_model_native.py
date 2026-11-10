@@ -111,7 +111,6 @@ class _NativeFeeE2EBase(unittest.TestCase):
 
         patch("commands.sendtx.validate_bls_pubkey", return_value=None).start()
         patch("commands.createblock._BLS_AVAILABLE", True).start()
-        patch("commands.createblock._validate_signature", return_value=True).start()
         patch("block.bls_signing_available", return_value=True).start()
         patch("consensus.engine.TauConsensusEngine.verify_block_header", return_value=True).start()
         patch("consensus.engine.TauConsensusEngine.query_eligibility", return_value=True).start()
