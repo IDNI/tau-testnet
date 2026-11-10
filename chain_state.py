@@ -1557,11 +1557,8 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
             # this only ever turns it on.
             if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
                 _lifecycle_manager.activate_approval_slots()
-                # Persist immediately. TipAdmissionView reads this key, not the
-                # manager, so without it admission treats a genesis-activated
-                # chain as INACTIVE until the first block commits -- and rejects
-                # every co-signature policy in the meantime. Found by the
-                # live-node e2e.
+                # Persist immediately, so a restart before the first block
+                # still reads the flag back from the chain_state row.
                 try:
                     db.set_chain_state_value("approval_slots_active", "1")
                 except Exception:
