@@ -237,17 +237,23 @@ def _assert_representation_compatible(prepared) -> None:
     revision and never re-types it. Checking only the stream that caused the
     fallback would let the others through.
     """
+    runtime_shrunk = frozenset(_runtime_shrunk_streams)
     wide = frozenset(getattr(prepared, "wide_streams_unshrunk", ()) or ())
     # The engine types a bare reference with no width source from the shrunk
     # width, while the inputs of its equality partners stay full width.
-    wide |= tau_shrink.untyped_input_streams(getattr(prepared, "canonical_text", "") or "")
-    conflict = wide & frozenset(_runtime_shrunk_streams)
+    untyped = tau_shrink.untyped_input_streams(
+        getattr(prepared, "canonical_text", "") or ""
+    ) & runtime_shrunk
+    conflict = (wide & runtime_shrunk) | untyped
     conflict |= _evaluator_state.conflicts(
         prepared, width=tau_shrink.current_shrink_width()
     )
     if conflict:
+        # The author can fix an untyped reference, so give that fix first.
+        hint = f"{tau_shrink.untyped_shrunk_stream_error(untyped)} " if untyped else ""
         raise tau_shrink.ShrinkTypeConflict(
-            "rule references "
+            hint
+            + "rule references "
             + ", ".join(f"i{i}" for i in sorted(conflict))
             + " at a width this process has already committed differently; no "
             "representation of it can be typed here. A fresh process rebuilds "
@@ -618,7 +624,6 @@ def communicate_with_tau(
 
         # --- Shrink: canonical (persisted) vs runtime (interpreter) split ---
         prepared = None
-        author_text = rule_text
         if rule_text is not None:
             prepared = _prepare_rule_for_tau(rule_text)
             if prepared is not None:
@@ -670,16 +675,10 @@ def communicate_with_tau(
                     or any(p.shrink_enabled for p in i0_stream_preps)
                 ),
             )
-        except TauSpecRejected as exc:
+        except (TauSpecRejected, TauSpecIntegrationError):
             # W9: typed, deterministic verdicts about the INPUT. Flattening these
             # into TauCommunicationError erased the only signal that said whose
             # fault the failure was.
-            hint = (tau_shrink.untyped_shrunk_hint(author_text, effective_shrunk, exc.codes)
-                    if author_text else None)
-            if hint is None:
-                raise
-            raise TauSpecRejected(f"{hint} {exc}", codes=exc.codes) from exc
-        except TauSpecIntegrationError:
             raise
         except Exception as ex:
             raise TauCommunicationError(f"Direct Tau communication failed: {ex}", last_state=last_known_tau_spec)

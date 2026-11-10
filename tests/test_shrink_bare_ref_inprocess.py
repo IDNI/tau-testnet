@@ -1,8 +1,8 @@
 """The in-process paths and a bare reference with no width source.
 
 The process cannot plan again, so a bare reference to a stream that it runs
-shrunk stops at the guard as a node-local conflict. Other refusals keep the
-engine text.
+shrunk stops at the guard as a node-local conflict. The guard message gives
+the author the fix. Other refusals keep the engine text.
 """
 import threading
 from unittest.mock import MagicMock, patch
@@ -59,8 +59,21 @@ def test_in_process_bare_ref_of_a_shrunk_stream_stops_at_the_guard(in_process):
     import tau_shrink
 
     engine = in_process(codes=(4, 15))
-    with pytest.raises(tau_shrink.ShrinkTypeConflict, match="i13"):
+    with pytest.raises(tau_shrink.ShrinkTypeConflict, match="i13") as info:
         tau_manager.communicate_with_tau(rule_text=BARE_I13, apply_rules_update=False)
+    assert str(info.value).startswith(tau_shrink.untyped_shrunk_stream_error({13}))
+    assert engine.rules == []
+
+
+def test_in_process_admission_gives_the_author_the_fix(in_process):
+    import commands.sendtx as sendtx
+
+    engine = in_process(codes=(4,))
+    with patch.object(sendtx, "_test_mode_was_requested", return_value=False):
+        out = sendtx._preflight_prepared_rule(BARE_I13)
+    assert out["code"] == "ADMISSION_UNAVAILABLE"
+    assert "i13 without a width" in out["message"]
+    assert "Write i13[t]:bv[384]" in out["message"]
     assert engine.rules == []
 
 
@@ -110,7 +123,9 @@ def test_block_apply_bare_ref_of_a_shrunk_stream_is_node_local(in_process):
     assert "r1" in [t.get("tx_id") for t in result.rejected_transactions]
     receipt = result.receipts["r1"]
     assert receipt["reason"] == "rule_type_conflict"
-    assert "Error: runtime type conflict: rule references i13" in "\n".join(receipt["logs"])
+    logs = "\n".join(receipt["logs"])
+    assert "Error: runtime type conflict: The rule references i13 without a width" in logs
+    assert "Write i13[t]:bv[384]" in logs
     assert engine.rules == []
 
 
