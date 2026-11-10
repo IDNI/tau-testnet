@@ -184,6 +184,61 @@ its own name: a `getcurrenttimestamp` request comes back with
 The five approval commands return `FEATURE_INACTIVE` unless the co-signature
 slots are reserved at the tip.
 
+### `checktx`: admission dry-run
+
+`checktx` tells if `sendtx` would accept a transaction. It does not write the
+mempool, it does not broadcast, and it charges nothing. The verdict comes from
+the `sendtx` code path. A refusal has the same `code` and `details` as `sendtx`.
+
+**Plain form.** `checktx <json_payload>` runs no Tau step. On the in-process
+path, a Tau step interns addresses into SQLite and advances the logical time of
+the live interpreter. An RPC with no fee must not do that. The plain form
+checks the JSON shape, the fields, the BLS signature, the sequence, the
+admission screens, the transfers and the custom inputs. The consensus-revision
+compile also runs, in a separate process that the node can stop.
+A success gives `admissible: null` and `fee_checked: false`, because no fee was
+evaluated. `checks_skipped` holds `tau_eval` and `fee_limit`. The answer has no
+`estimated_fee`. A wallet that used "0" as `fee_limit` would get a refusal at
+submit.
+
+**Estimate form.** `checktx estimate <json_payload>` also runs the Tau steps,
+in an isolated admission context on its own single slot.
+
+- It never uses the in-process path. A node with no isolated context gives
+  `ADMISSION_UNAVAILABLE`.
+- When another estimate runs, it gives `ESTIMATE_BUSY` at once.
+- It gives `estimated_fee` for every fee-bearing type. The `fee_limit` of the
+  payload does not change the estimate. A wallet can sign a draft with any
+  `fee_limit`, ask, and sign again with the estimate.
+- `admissible` is true only when the `fee_limit` of the payload covers the
+  estimate. When no fee step ran for a fee-bearing type (`TAU_FORCE_TEST`),
+  `admissible` is null, as in the plain form.
+- The node checks the sequence and the balance before it takes the estimate
+  slot. A sender whose balance does not exceed the sum of its transfers gets
+  `INSUFFICIENT_FUNDS` with no Tau step. This floor assumes a fee of at least 1.
+  On a network with no fee rule, give `--fee 0`.
+- After the Tau steps, a sender that cannot pay the transfers plus the
+  estimated fee gets `INSUFFICIENT_FUNDS` and no estimate.
+
+**Flags.** `tau_evaluated` is true only when the admission context ran a Tau
+step. `fee_checked` is true only when the node estimated the fee of a
+fee-bearing type. A fee-exempt type (an approval vote, a retract, a governance
+vote) runs no fee step. It gives `fee_checked: false`, `fee_limit` in
+`checks_skipped` (and `tau_eval` when no step ran), and a `note` that starts
+with `fee_exempt`. A refusal has `tau_evaluated`, `checks_skipped` and
+`fee_checked` in `details`, with the same meaning.
+
+`checktx` never gives `MEMPOOL_FULL`. A full mempool is a fact about the node
+now, not a verdict about the transaction.
+
+**Tau workers.** Each admission context is one process that holds a native
+interpreter. Admission uses at most four contexts at a time, plus one standby
+context. The estimate slot adds one more process, so admission can hold six
+processes at the same time. The estimate does not count in the four admission
+slots, so a burst of estimates cannot block `sendtx`. On a short chain, one
+process uses about 55 MB of resident memory. The memory grows with the
+committed specification.
+
 ### Locality: `createblock`
 
 `createblock` is refused with `FORBIDDEN` unless the peer address is
@@ -381,10 +436,11 @@ connection/timeout errors.
 `rule offer|accept|reject`, `approval request`, `retractable send`) signs a
 draft with `fee_limit` 0, asks the node with `checktx estimate`, and signs the
 transaction again with the estimate as `fee_limit`. The estimate does not
-depend on the draft's `fee_limit`. When the node gives no estimate
-(`ESTIMATE_BUSY`, `ADMISSION_UNAVAILABLE`, or any rejection), the CLI stops
-before the final signature, prints the node error, and exits `1`. Give `--fee`
-in that case.
+depend on the draft's `fee_limit`. On `ESTIMATE_BUSY`, the CLI asks again up to
+3 times. It waits 0.5, 1 and 2 seconds before these attempts. When the node
+gives no estimate (`ESTIMATE_BUSY` after the last attempt,
+`ADMISSION_UNAVAILABLE`, or any rejection), the CLI stops before the final
+signature, prints the node error, and exits `1`. Give `--fee` in that case.
 A sender that cannot pay the estimated fee gets `INSUFFICIENT_FUNDS` and no
 estimate, even with `--fee`. Fund the sender first.
 

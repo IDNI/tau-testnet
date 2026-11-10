@@ -401,24 +401,47 @@ def test_tx_send_with_fee_asks_for_no_estimate(tmp_path, monkeypatch):
     assert json.loads(recorded[1][len("sendtx '") : -1])["fee_limit"] == "30"
 
 
-@pytest.mark.parametrize("answer", [
-    '{"status":"error","command":"checktx","error":{"code":"ESTIMATE_BUSY","message":"Another fee estimate is running on this node; please retry."}}',
-    '{"status":"error","command":"checktx","error":{"code":"ADMISSION_UNAVAILABLE","message":"This node has no isolated admission context, so it cannot estimate a fee."}}',
-    '{"status":"ok","command":"checktx","data":{"admissible":true,"tau_evaluated":false}}',
+BUSY = '{"status":"error","command":"checktx","error":{"code":"ESTIMATE_BUSY","message":"Another fee estimate is running on this node; please retry."}}'
+RETRIES = len(tx_mod.ESTIMATE_BUSY_BACKOFF)
+
+
+@pytest.mark.parametrize("answers", [
+    [BUSY] * (RETRIES + 1),
+    ['{"status":"error","command":"checktx","error":{"code":"ADMISSION_UNAVAILABLE","message":"This node has no isolated admission context, so it cannot estimate a fee."}}'],
+    ['{"status":"ok","command":"checktx","data":{"admissible":true,"tau_evaluated":false}}'],
 ])
 def test_tx_send_stops_before_the_final_signature_without_an_estimate(
-        tmp_path, monkeypatch, answer):
+        tmp_path, monkeypatch, answers):
     monkeypatch.setattr(keys_mod, "KEY_DIR_DEFAULT", tmp_path)
+    monkeypatch.setattr(tx_mod.time, "sleep", lambda s: None)
     keys_mod.save_key("alice", tmp_path)
+    answer = answers[-1]
     recorded = []
     rc, out, err = _run_cli(
         ["tx", "send", "--key", "alice", "--to", "ab" * 48, "--amount", "1"],
-        send_responses=[SEQ, answer],
+        send_responses=[SEQ, *answers],
         recorded=recorded,
     )
+    assert sum(c.startswith("checktx estimate") for c in recorded) == len(answers)
     assert rc == 1
     assert not any(c.startswith("sendtx") for c in recorded)
     assert "--fee" in err
     code = json.loads(answer).get("error", {}).get("code")
     if code:
         assert code in err
+
+
+def test_tx_send_retries_a_busy_estimate_with_a_backoff(tmp_path, monkeypatch):
+    monkeypatch.setattr(keys_mod, "KEY_DIR_DEFAULT", tmp_path)
+    waits = []
+    monkeypatch.setattr(tx_mod.time, "sleep", waits.append)
+    keys_mod.save_key("alice", tmp_path)
+    recorded = []
+    rc, out, err = _run_cli(
+        ["tx", "send", "--key", "alice", "--to", "ab" * 48, "--amount", "1"],
+        send_responses=[SEQ, BUSY, BUSY, ESTIMATE, QUEUED],
+        recorded=recorded,
+    )
+    assert rc == 0, err
+    assert waits == list(tx_mod.ESTIMATE_BUSY_BACKOFF[:2])
+    assert json.loads(recorded[-1][len("sendtx '") : -1])["fee_limit"] == "12"

@@ -275,7 +275,6 @@ def _parked_transfer_inputs(sender_pubkey: str, request: dict, tip_view,
         4: "{ #x" + request["recipient_pubkey"] + " }:bv[384]",
         12: "{ #x" + sender_pubkey + " }:bv[384]",
     }
-    # TODO: feed i16 here, as apply does, when tau_defs.COOLDOWN_STREAM_ACTIVE goes on.
     for k, v in (request.get("custom_inputs") or {}).items():
         values[int(k)] = str(v)
     for slot in _approval_slot_feed(tip_view):
@@ -828,31 +827,9 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                       estimate: bool = False) -> dict:
     """Validate a transaction and (unless dry_run) queue it in the mempool.
 
-    `dry_run` returns the verdict just before the two mutations
-    (db.add_mempool_tx, broadcast_transaction), so checktx (#26) answers "would
-    this be admitted?" with byte-identical codes and details to what sendtx would
-    have produced. It is a flag on this function rather than an extracted pure
-    copy deliberately: there are 34 distinct error returns and three outer
-    exception handlers here, so verdict parity is worth guaranteeing by
-    construction instead of by test.
-
-    `skip_tau_eval` additionally skips Tau steps 2/3/3b. Those are NOT
-    side-effect-free — they intern addresses into SQLite, advance the live
-    interpreter's logical time by up to 100 steps per call (up to 64 transfers
-    per tx), can rebuild the interpreter from stdout, and on intern-width
-    overflow re-exec the process. An unauthenticated, fee-free RPC must not
-    reach them. The rule-compile step is unaffected: it already runs in a
-    SIGKILL-able subprocess and is genuinely pure.
-
-    `estimate` is a dry run that does run steps 2/3/3b, in an isolated admission
-    context on the estimate slot (tau_admission.open_context). It answers with
-    the fee whatever fee_limit the draft carries, so the fee-limit check is off.
-    Without an isolated context it refuses: the in-process steps have the side
-    effects above.
-
-    A dry-run verdict, admitted or refused, also says what really ran:
-    `tau_evaluated` (a Tau step ran) and `fee_checked` (the fee of a
-    fee-bearing type was estimated).
+    The flags give the forms of checktx (docs/developer_cli.md). Flags on this one
+    function keep a dry-run verdict equal to the sendtx verdict by construction.
+    `skip_tau_eval` exists because in-process Tau steps intern addresses and advance time.
     """
     facts = _TauFacts()
     verdict = _queue_transaction(
@@ -1057,6 +1034,18 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             "ADMISSION_UNAVAILABLE",
             "This node has no isolated admission context, so it cannot estimate a fee.",
         )
+    if estimate and tx_type in FEE_BEARING_TX_TYPES:
+        # Refused before the one estimate slot is taken, so unfunded keys cannot hold it.
+        # The floor assumes a fee of at least 1. On a network with no fee rule, give --fee 0.
+        floor = sum(amt for _, _, amt in all_validated_transfers) + 1
+        sender_balance = chain_state.get_balance(sender_pubkey)
+        if sender_balance < floor:
+            return _qt_err(
+                "INSUFFICIENT_FUNDS",
+                f"Sender balance {sender_balance} cannot cover transfers and a fee.",
+                balance=sender_balance,
+                required=floor,
+            )
     admission_tau = _AdmissionTau(
         candidate_rules=(admission_candidate,) if admission_candidate else (),
         estimate=estimate, facts=facts,

@@ -1,7 +1,7 @@
 """checktx estimate: the fee of a draft, from an isolated admission context.
 
 The estimate runs the Tau steps of admission in a context of its own, on a
-single slot apart from the sendtx slots, and never touches the standby. The old
+single slot apart from the sendtx slots, and never touches the standby. The plain
 form runs no Tau and says that the fee check was skipped.
 """
 import json
@@ -235,7 +235,7 @@ def test_no_isolated_context_means_no_estimate(node):
     assert script["steps"] == []
 
 
-def test_the_old_form_says_the_fee_check_was_skipped(node):
+def test_the_plain_form_says_the_fee_check_was_skipped(node):
     script, _ = node
     env = _check(_payload("user_tx", fee_limit="0"), estimate=False)
     data = env["data"]
@@ -248,7 +248,7 @@ def test_the_old_form_says_the_fee_check_was_skipped(node):
     assert script["steps"] == [] and script["built"] == 0
 
 
-def test_the_old_form_rejection_names_the_skipped_fee_check(node):
+def test_the_plain_form_rejection_names_the_skipped_fee_check(node):
     payload = _payload("user_tx")
     payload["sequence_number"] = 7
     env = _check(payload, estimate=False)
@@ -328,10 +328,10 @@ def test_an_estimate_of_a_request_the_policy_does_not_gate_is_refused(node):
     assert details["checks_skipped"] == ["fee_limit"]
 
 
-def test_the_old_form_on_an_accept_opens_no_admission_context(node):
+def test_the_plain_form_on_an_accept_opens_no_admission_context(node):
     script, standby = node
     with patch("tau_admission.open_context",
-               side_effect=AssertionError("the old form opened an admission context")):
+               side_effect=AssertionError("the plain form opened an admission context")):
         env = _check(_payload("rule_offer_accept"), estimate=False)
     data = env["data"]
     assert data["admissible"] is None, env
@@ -361,13 +361,13 @@ def _fee_rule():
             ": (o8[t]:bv[24] = { #x000000 }:bv[24]) )." % SENDER)
 
 
-def test_the_old_form_on_a_user_rule_opens_no_admission_context(node):
+def test_the_plain_form_on_a_user_rule_opens_no_admission_context(node):
     script, standby = node
     payload = _envelope("user_tx", SENDER, "0", operations={"0": _fee_rule()})
     with patch("tau_admission.open_context",
-               side_effect=AssertionError("the old form opened an admission context")), \
+               side_effect=AssertionError("the plain form opened an admission context")), \
             patch("commands.sendtx._preflight_prepared_rule",
-                  side_effect=AssertionError("the old form ran the preflight")):
+                  side_effect=AssertionError("the plain form ran the preflight")):
         env = _check(payload, estimate=False)
     data = env["data"]
     assert data["admissible"] is None, env
@@ -406,9 +406,27 @@ def test_the_estimate_of_a_user_tx_with_custom_inputs(node):
     assert fee_query[30] == ["7"]
 
 
-def test_an_unfunded_sender_gets_no_estimate(node, monkeypatch):
+def test_an_unfunded_sender_is_refused_before_the_estimate_slot(node, monkeypatch):
+    """Unfunded keys with valid signatures must not hold the one estimate slot."""
+    script, _ = node
     monkeypatch.setitem(chain_state._balances, SENDER, 0)
-    env = _check(_payload("rule_offer", fee_limit="1000"))
+    with patch("tau_admission._estimate_slot.acquire",
+               side_effect=AssertionError("the estimate slot was taken")):
+        env = _check(_payload("rule_offer", fee_limit="1000"))
     assert env["error"]["code"] == "INSUFFICIENT_FUNDS", env
-    assert env["error"]["details"]["required"] == BASE_FEE + CUSTOM_FEE
+    assert env["error"]["details"]["required"] == 1
+    assert "estimated_fee" not in env["error"]["details"]
+    assert script["built"] == 0 and script["steps"] == []
+
+    monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
+    env = _check(_payload("rule_offer", fee_limit="1000"))
+    assert env["data"]["estimated_fee"] == str(BASE_FEE + CUSTOM_FEE), env
+    assert script["built"] == 1
+
+
+def test_a_sender_who_cannot_pay_the_fee_gets_no_estimate(node, monkeypatch):
+    monkeypatch.setitem(chain_state._balances, SENDER, 100 + 1)
+    env = _check(_payload("user_tx", fee_limit="1000"))
+    assert env["error"]["code"] == "INSUFFICIENT_FUNDS", env
+    assert env["error"]["details"]["required"] == 100 + BASE_FEE + CUSTOM_FEE
     assert "estimated_fee" not in env["error"]["details"]

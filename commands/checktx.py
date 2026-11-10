@@ -1,50 +1,7 @@
-"""Read-only admission dry-run (issue #26).
+"""Read-only admission dry-run. The forms and fields are in docs/developer_cli.md.
 
-`checktx <json_payload>` answers "would sendtx accept this?" without touching the
-mempool, broadcasting, or charging anything. The verdict comes from
-`sendtx.queue_transaction(dry_run=True)` — the same code path, so the `code` and
-`details` on a rejection are byte-identical to what `sendtx` would have returned,
-which is the whole value of the command. Anything else would be a second
-implementation of admission that drifts.
-
-Two forms:
-
-`checktx <json_payload>` performs no Tau evaluation (`tau_evaluated: false`).
-Steps 2/3/3b of admission are not side-effect-free on the in-process path: they
-intern addresses into SQLite, advance the live interpreter's logical time, can
-rebuild it from stdout, and on intern-width overflow re-exec the node. So this
-form checks JSON shape, all field validation, BLS signature, sequence,
-admission (including the consensus-revision staging compile, which already runs
-in a SIGKILL-able subprocess), transfer structure and custom-input screening.
-A success answer has `admissible: null` and `fee_checked: false`: the fee
-limit is checked against a fee that was never evaluated, so the answer cannot
-say "admissible". It reports `tau_eval` and `fee_limit` in `checks_skipped`,
-and it gives no `estimated_fee`: a "0" there would be used as a fee_limit and
-then refused at submit.
-
-`checktx estimate <json_payload>` also runs steps 2/3/3b, only in an isolated
-admission context on its own single slot (`tau_admission.open_context`). It
-returns `ESTIMATE_BUSY` at once when another estimate runs, and
-`ADMISSION_UNAVAILABLE` when the node has no isolated context; it never falls
-back to the in-process path. It returns `estimated_fee` for every fee-bearing
-type. The fee limit of the payload does not change the estimate, so a wallet can
-sign a draft with any fee_limit, ask, and sign again with the estimate.
-`admissible` is then true only when the payload's fee_limit covers the estimate.
-When no fee step ran for a fee-bearing type (TAU_FORCE_TEST), `admissible` is
-null, as in the plain form.
-
-The flags say what really ran. `tau_evaluated` is true only when the admission
-context ran a Tau step. `fee_checked` is true only when the fee of a type in
-`FEE_BEARING_TX_TYPES` was estimated. A fee-exempt type (an approval vote, a
-retract, a governance vote) runs no fee step: `fee_checked` is false,
-`checks_skipped` names `fee_limit` (and `tau_eval` when no step ran), and
-`note` starts with `fee_exempt`.
-
-A rejection carries the `code` and `details` of `sendtx`, plus `tau_evaluated`,
-`checks_skipped` and `fee_checked` in `details`, with the same meaning.
-
-`MEMPOOL_FULL` is never reported: that is a fact about the node's capacity right
-now, not a verdict about this transaction.
+The verdict comes from `sendtx.queue_transaction(dry_run=True)`, so a refusal has
+the same `code` and `details` as `sendtx`. A second admission implementation drifts.
 """
 import logging
 

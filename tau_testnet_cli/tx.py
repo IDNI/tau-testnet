@@ -261,12 +261,18 @@ def submit_tx(
     )
 
 
+#: Waits in seconds before each retry after ESTIMATE_BUSY: the node runs one
+#: estimate at a time, so the slot is often free again soon.
+ESTIMATE_BUSY_BACKOFF = (0.5, 1.0, 2.0)
+
+
 def estimate_fee(
     payload: dict,
     *,
     host: str,
     port: int,
     timeout: float = rpc_mod.DEFAULT_TIMEOUT,
+    backoff: tuple = ESTIMATE_BUSY_BACKOFF,
 ) -> str:
     """The node's fee estimate for a signed draft, from ``checktx estimate``.
 
@@ -274,24 +280,28 @@ def estimate_fee(
     gives no estimate.
     """
     blob = json.dumps(payload, separators=(",", ":"))
-    response = rpc_mod.send_command(
-        f"checktx estimate '{blob}'", host, port, timeout=timeout
-    )
-    try:
-        parsed = json.loads(response)
-    except (ValueError, TypeError):
-        raise RuntimeError(f"unexpected checktx response: {response!r}")
-    if not isinstance(parsed, dict):
-        raise RuntimeError(f"unexpected checktx response: {response!r}")
-    if parsed.get("status") == "error":
-        err = parsed.get("error", {}) or {}
-        raise RuntimeError(
-            f"{err.get('code', 'ERROR')} {err.get('message', '')}".strip()
+    for delay in (*backoff, None):
+        response = rpc_mod.send_command(
+            f"checktx estimate '{blob}'", host, port, timeout=timeout
         )
-    fee = (parsed.get("data") or {}).get("estimated_fee")
-    if not isinstance(fee, str) or not fee.isdigit():
-        raise RuntimeError(f"no estimated_fee in the checktx response: {response!r}")
-    return fee
+        try:
+            parsed = json.loads(response)
+        except (ValueError, TypeError):
+            raise RuntimeError(f"unexpected checktx response: {response!r}")
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"unexpected checktx response: {response!r}")
+        if parsed.get("status") == "error":
+            err = parsed.get("error", {}) or {}
+            if err.get("code") == "ESTIMATE_BUSY" and delay is not None:
+                time.sleep(delay)
+                continue
+            raise RuntimeError(
+                f"{err.get('code', 'ERROR')} {err.get('message', '')}".strip()
+            )
+        fee = (parsed.get("data") or {}).get("estimated_fee")
+        if not isinstance(fee, str) or not fee.isdigit():
+            raise RuntimeError(f"no estimated_fee in the checktx response: {response!r}")
+        return fee
 
 
 def build_rule_offer_tx(
