@@ -15,6 +15,7 @@ import pytest
 from py_ecc.bls import G2Basic as bls
 from unittest.mock import patch
 
+from bls_keys import SK_CAROL, pubkey_hex
 import chain_state
 import db
 import tau_admission
@@ -24,6 +25,7 @@ from commands import createblock, sendtx
 from commands.sendtx import _get_signing_message_bytes
 from consensus.engine import TauConsensusEngine
 
+TRANSFER_PEER = pubkey_hex(SK_CAROL)
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -133,7 +135,7 @@ def test_while_lent_every_other_path_is_refused_or_gets_a_worker_of_its_own(auth
         other.dispose()
     # admission answers from a context of its own
     sk_b, pk_b = _sender("lend_b")
-    assert _submit(sk_b, pk_b, {"1": [[pk_b, "aa" * 48, "3"]]}).get("ok")
+    assert _submit(sk_b, pk_b, {"1": [[pk_b, TRANSFER_PEER, "3"]]}).get("ok")
 
     assert _requests(lent) == seen, (
         "something other than candidate A's proposal stepped the lent worker"
@@ -160,7 +162,7 @@ def test_two_candidates_off_one_parent_only_the_bound_artifact_commits(authority
     # Candidate B: same parent, different content, and NO local artifact -- the
     # shape of a block that arrives from a peer while A is still pending.
     sk_b, pk_b = _sender("fork_b")
-    assert _submit(sk_b, pk_b, {"1": [[pk_b, "aa" * 48, "3"]]}).get("ok")
+    assert _submit(sk_b, pk_b, {"1": [[pk_b, TRANSFER_PEER, "3"]]}).get("ok")
     evaluated = {}
     real_freeze = tc.PreparedBlockCommit.freeze.__func__
 
@@ -216,7 +218,7 @@ def test_a_stale_loan_returned_late_does_not_take_the_authority_out_of_service(a
     assert _submit(sk, pk, {"0": HISTORY_RULE}).get("ok")
     _hold_candidate()                                    # A: pending, lent
     sk_b, pk_b = _sender("late_b")
-    assert _submit(sk_b, pk_b, {"1": [[pk_b, "aa" * 48, "3"]]}).get("ok")
+    assert _submit(sk_b, pk_b, {"1": [[pk_b, TRANSFER_PEER, "3"]]}).get("ok")
     with patch.object(tc.ProposalRegistry, "offer",
                       lambda self, key, prepared, proposal: proposal.dispose()):
         out = createblock.create_block_from_mempool()    # B: its own worker

@@ -18,7 +18,7 @@ import config
 import db
 import tau_defs
 import consensus.retractable as retractable
-from bls_keys import SK_ALICE, pubkey_hex, sign_payload
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_payload
 from consensus.admission import (
     TipAdmissionView,
     validate_mempool_admission,
@@ -34,9 +34,9 @@ from consensus.retractable import (
     parse_retractable_transfer,
 )
 
-A = "1a" * 48
-B = "2b" * 48
-C = "3c" * 48
+A = pubkey_hex(0x1A)
+B = pubkey_hex(0x2B)
+C = pubkey_hex(0x3C)
 NEXT_HEIGHT = 50
 TIP_TS = 1_700_000_000
 FAR = 9_999_999_999
@@ -269,7 +269,7 @@ def test_a_malformed_retractable_id_is_refused(tip_view, rid):
 # --- queue_transaction flows -------------------------------------------------
 
 SENDER = pubkey_hex(SK_ALICE)
-RECIPIENT = "c" * 96
+RECIPIENT = pubkey_hex(SK_BOB)
 
 
 @pytest.fixture
@@ -294,7 +294,7 @@ def node(temp_database, monkeypatch):
         patch("tau_manager.communicate_with_tau", return_value="x1001"),
         patch("tau_manager.communicate_with_tau_multi", side_effect=multi),
         patch("commands.sendtx.chain_state.get_sequence_number", return_value=1),
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)),
+        patch("commands.sendtx.validate_bls_pubkey", return_value=None),
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}),
     ]
     mocks = [p.start() for p in patches]

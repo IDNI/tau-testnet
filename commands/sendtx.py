@@ -17,6 +17,7 @@ from errors import TauCommunicationError
 from consensus import fees
 from consensus.fees import FeeRuleError
 from consensus.lanes import classify_lane
+from consensus.tx_checks import validate_bls_pubkey
 from consensus.tx_signing import signing_message_bytes, verify_tx_signature
 from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
@@ -127,38 +128,6 @@ except Exception as e:
     logger.warning("Error importing py_ecc.bls (%s). Skipping BLS public key validation.", e)
 
 
-def _validate_bls12_381_pubkey(key_hex: str, key_name: str) -> tuple[bool, str | None]:
-    """
-    Validates a 48-byte BLS12-381 public key.
-    Checks for 96-character hex format and, if py_ecc is available, cryptographic validity.
-    Args:
-        key_hex: The public key as a hexadecimal string.
-        key_name: Descriptive name for the key (e.g., "sender_pubkey") for error messages.
-    Returns:
-        A tuple (is_valid, error_message). error_message is None if is_valid is True.
-    """
-    if not (isinstance(key_hex, str) and len(key_hex) == 96):
-        return False, f"Invalid {key_name}: Must be a 96-character hex string representing 48 bytes, got length {len(key_hex)}."
-
-    try:
-        key_bytes = bytes.fromhex(key_hex)
-        if len(key_bytes) != 48:
-             return False, f"Invalid {key_name}: Hex string decodes to {len(key_bytes)} bytes, expected 48."
-    except ValueError:
-        return False, f"Invalid {key_name}: Not a valid hexadecimal string."
-
-    if not all(c in '0123456789abcdefABCDEF' for c in key_hex):
-        return False, f"Invalid {key_name}: Contains non-hexadecimal characters."
-
-    if _PY_ECC_AVAILABLE:
-        try:
-            G2Basic.KeyValidate(key_bytes)
-        except Exception as e:
-            return False, f"Invalid {key_name} (cryptographic validation failed): {e}. Key: {key_hex[:10]}..."
-
-    return True, None
-
-
 def _parse_bitvector_string(bv_str: str) -> int:
     """Helper to parse a bitvector string from Tau's output (#b, #x, or decimal)."""
     bv_str = bv_str.strip()
@@ -186,13 +155,6 @@ def _prepare_transfer_inputs(transfer_entry, sender_balance: int) -> dict:
         raise ValueError("Invalid 'from' address: Must be a 96-character hex BLS12-381 public key")
     if not (isinstance(to_addr_key, str) and len(to_addr_key) == 96 and all(c in hex_chars for c in to_addr_key)):
         raise ValueError("Invalid 'to' address: Must be a 96-character hex BLS12-381 public key")
-
-    is_valid_from, err_from = _validate_bls12_381_pubkey(from_addr_key, "'from' address")
-    if not is_valid_from:
-        raise ValueError(err_from)
-    is_valid_to, err_to = _validate_bls12_381_pubkey(to_addr_key, "'to' address")
-    if not is_valid_to:
-        raise ValueError(err_to)
 
     # i3/i4 now carry the FULL 384-bit pubkey (lowercase hex). The bv-shrink layer
     # interns equality-only address streams to a small bv automatically -- no
@@ -573,8 +535,8 @@ def _check_tx_envelope(payload: dict) -> dict | None:
     if 'sender_pubkey' not in payload:
         return _qt_err("INVALID_PARAMS", "Missing 'sender_pubkey' in transaction.")
     sender_pubkey = payload['sender_pubkey']
-    is_valid_sender, err_sender = _validate_bls12_381_pubkey(sender_pubkey, "sender_pubkey")
-    if not is_valid_sender:
+    err_sender = validate_bls_pubkey(sender_pubkey, "sender_pubkey")
+    if err_sender:
         return _qt_err("TX_INVALID", f"Transaction invalid. {err_sender}")
 
     if 'sequence_number' not in payload:

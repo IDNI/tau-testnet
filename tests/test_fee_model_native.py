@@ -109,7 +109,7 @@ class _NativeFeeE2EBase(unittest.TestCase):
         # is real (conftest defaults it to "1" for the legacy suite).
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}).start()
 
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
+        patch("commands.sendtx.validate_bls_pubkey", return_value=None).start()
         patch("commands.createblock._BLS_AVAILABLE", True).start()
         patch("commands.createblock._validate_signature", return_value=True).start()
         patch("block.bls_signing_available", return_value=True).start()
