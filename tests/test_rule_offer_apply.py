@@ -49,9 +49,8 @@ def _offer(offerer=A, recipient=B, text=BLOCK_RULE, expire=EXPIRE):
                      rule_text=text, expire_at_height=expire)
 
 
-# `tx_id` mirrors what commands/createblock.py:309 injects before execution
-# (the transaction hash). apply_block looks receipts up by it with no fallback,
-# so a synthetic block without it loses every receipt log.
+# `tx_id` mirrors what commands/createblock.py injects before execution
+# (the transaction hash).
 _TX_SEQ = itertools.count()
 
 
