@@ -1281,7 +1281,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             active_view = engine.derive_active_consensus(parent_snapshot, block_number)
             
             # 3. Verify Block Header
-            # proof_ok skips the cryptography re-checks (db integrity covers them); o6/o7 still run.
+            # proof_ok skips the signature re-check: ingest and process_new_block verified it before the row was stored.
+            # o6/o7 still run.
             # Under worker-backed authority they run on the advisory evaluator, so a down interpreter is no reason to skip.
             if _enabled:
                 if block_number == 0:
@@ -2600,6 +2601,13 @@ def ingest_block(block: Block) -> IngestResult:
             block.header.block_number, block.block_hash[:16], body_reason,
         )
         return IngestResult('invalid', f"Block body verification failed: {body_reason}")
+    # A fork that wins fork choice is replayed without re-checking proofs, so this is the only gate.
+    if not block.verify_consensus_proof():
+        logger.warning(
+            "[chain_state] Block #%s %s... not ingested: its consensus proof does not verify.",
+            block.header.block_number, block.block_hash[:16],
+        )
+        return IngestResult('invalid', "Block consensus proof verification failed")
     engine = TauConsensusEngine()
     # NOTE: legacy verify signature (no active_view): membership/stake gates and
     # the parent-state stake input do NOT run here. This pre-filter only checks

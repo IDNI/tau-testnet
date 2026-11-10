@@ -21,7 +21,7 @@ import tau_authority
 import tau_manager
 from chain_state import GENESIS_ADDRESS, GENESIS_BALANCE
 from block import Block, BlockHeader, compute_merkle_root, compute_tx_hash, sha256_hex
-from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload, sign_tx
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_header, sign_payload, sign_tx
 from consensus.engine import TauConsensusEngine
 
 SENDER = pubkey_hex(SK_ALICE)
@@ -390,10 +390,13 @@ class ChainTestCase(unittest.TestCase):
         return db.get_canonical_head()['block_hash']
 
     def make(self, number, txs, previous_hash=None, proposer=SENDER):
-        return Block.create(
+        blk = Block.create(
             block_number=number, previous_hash=previous_hash or self.genesis_hash,
             transactions=txs, proposer_pubkey=proposer, timestamp=BASE_TS + number,
         )
+        if proposer == SENDER:
+            blk.consensus_proof = sign_header(blk.header, SK_ALICE)
+        return blk
 
     def tampered_copy(self, block):
         """The same block as a relayer would alter it: an extra transaction, header
