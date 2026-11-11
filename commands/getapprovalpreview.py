@@ -24,6 +24,7 @@ from consensus.approvals import (
     _normalize_index_map,
     _normalize_pubkey,
 )
+from consensus import sender_policy
 
 _CMD = "getapprovalpreview"
 
@@ -36,13 +37,29 @@ def _o5_allows(outputs):
                 and tau_manager.parse_tau_output(o5) == tau_defs.USER_POLICY_BLOCK_VALUE)
 
 
-def _step(inputs):
+def _own_clause_allows(clause, inputs):
+    """False when the sender's own registered clause blocks these inputs."""
+    from tau_speculation import SpeculationError, WorkerLost, WorkerTimeout
+
+    try:
+        blocked, _detail = sender_policy.clause_blocks(
+            clause, inputs, pool="admission",
+            timeout=tau_admission.default_budget(),
+        )
+    except WorkerTimeout as exc:
+        raise tau_admission.AdmissionTimeout(str(exc)) from exc
+    except (WorkerLost, SpeculationError) as exc:
+        raise tau_admission.AdmissionUnavailable(str(exc)) from exc
+    return not blocked
+
+
+def _step(inputs, clause=None):
     # The in-process interpreter holds no user rules under worker-backed authority.
     if tau_admission.enabled():
         raise RuntimeError("the in-process interpreter cannot answer under authority")
     return _o5_allows(tau_manager.communicate_with_tau_multi(
         input_stream_values=inputs, apply_rules_update=False,
-    ))
+    )) and _own_clause_allows(clause, inputs)
 
 
 def _enumerate(slots, base, candidates, step):
@@ -143,6 +160,7 @@ def execute(raw_command: str, container):
     base[5] = str(int(_time.time()))
 
     slots = sorted(candidates)
+    clause = tip.clause_for(sender, tau_defs.USER_POLICY_STREAM_INDEX)
     if tau_admission.enabled():
         # The in-process interpreter holds consensus rules only; the user's o5
         # policy lives in the authority, so the probe runs in a context of its own.
@@ -150,7 +168,8 @@ def execute(raw_command: str, container):
             with tau_admission.open_context(label="approval_preview") as ctx:
                 results = _enumerate(
                     slots, base, candidates,
-                    lambda inputs: _o5_allows(ctx.step(inputs)),
+                    lambda inputs: (_o5_allows(ctx.step(inputs))
+                                    and _own_clause_allows(clause, inputs)),
                 )
         except (tau_admission.AdmissionUnavailable, tau_admission.StepRefused) as exc:
             return api_response.success_response(_CMD, {
@@ -167,7 +186,9 @@ def execute(raw_command: str, container):
         # interleaves and re-types a stream between subsets.
         try:
             with tau_manager.tau_comm_lock:
-                results = _enumerate(slots, base, candidates, _step)
+                results = _enumerate(
+                    slots, base, candidates, lambda inputs: _step(inputs, clause)
+                )
         except Exception as exc:
             return api_response.error_response(
                 _CMD, f"Evaluation failed: {exc}", "TAU_ERROR"

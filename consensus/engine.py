@@ -16,6 +16,7 @@ from .governance import (
     is_tau_authoritative_eligibility_mode,
 )
 from . import fees
+from . import sender_policy
 from .fees import FeeRuleError
 from .approvals import (
     APPROVAL_TX_TYPES,
@@ -1789,6 +1790,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     and tau_manager.parse_tau_output(o5_raw)
                     == tau_defs.USER_POLICY_BLOCK_VALUE
                 )
+                if allows:
+                    own_blocks, _own_o5 = sender_policy.clause_blocks(
+                        lifecycle_mgr.rule_offers.clause_for(
+                            from_addr, tau_defs.USER_POLICY_STREAM_INDEX),
+                        inputs, pool="apply",
+                        timeout=getattr(_session, "request_budget", None),
+                    )
+                    allows = not own_blocks
                 fee = fees.parse_consensus_fee(
                     outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
                     context=f"tx {tx_id} parked",
@@ -1898,6 +1907,27 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["reason"] = "user_policy_block"
                             tx_receipt["logs"].append(
                                 f"Transfer rejected by user policy (o5={o5_raw})"
+                            )
+                            return False
+
+                        own_blocks, own_o5 = sender_policy.clause_blocks(
+                            lifecycle_mgr.rule_offers.clause_for(
+                                from_addr, tau_defs.USER_POLICY_STREAM_INDEX),
+                            tau_input_stream_values, pool="apply",
+                            timeout=getattr(_session, "request_budget", None),
+                        )
+                        if own_blocks:
+                            logger.info(
+                                "Transfer rejected by the sender's own policy clause for %s->%s (o5=%s)",
+                                str(from_addr)[:10], str(to_addr)[:10], own_o5,
+                            )
+                            if not replay_mode:
+                                accepted_in_block = False
+                                hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = "user_policy_block"
+                            tx_receipt["logs"].append(
+                                f"Transfer rejected by the sender's own policy clause (o5={own_o5})"
                             )
                             return False
 

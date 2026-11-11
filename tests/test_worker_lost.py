@@ -798,7 +798,8 @@ _SESSION_APIS = re.compile(
 
 #: Modules that define the loss, or carry it without catching it.
 _DEFINES = {"tau_speculation.py", "tau_session.py", "tau_proposal.py"}
-_PROPAGATES = {os.path.join("consensus", "engine.py")}
+_PROPAGATES = {os.path.join("consensus", "engine.py"),
+               os.path.join("consensus", "sender_policy.py")}
 
 #: Modules that own a session or a proposal, and so must translate the loss.
 _OWNERS = {
@@ -808,6 +809,7 @@ _OWNERS = {
     "tau_advisory.py": "WorkerLost",
     "tau_authority.py": "WorkerLost",
     "tau_preflight.py": "WorkerLost",
+    "tau_policy.py": "WorkerLost",
     # These go through an AdmissionContext, which turns the loss into
     # AdmissionUnavailable at its own edge.
     os.path.join("commands", "getapprovalpreview.py"): "AdmissionUnavailable",

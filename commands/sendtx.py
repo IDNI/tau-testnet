@@ -14,7 +14,7 @@ import tau_manager
 from tau_manager import parse_tau_output
 import utils
 from errors import TauCommunicationError
-from consensus import fees
+from consensus import fees, sender_policy
 from consensus.fees import FeeRuleError
 from consensus.lanes import classify_lane
 from consensus.tx_signing import signing_message_bytes, verify_tx_signature
@@ -528,6 +528,21 @@ def _routed_o5_composite(tip_view, sender_pubkey: str, action: str, body: str):
         clauses[key] = body
     composite = compose_stream_rule(stream, clauses) if clauses else None
     return composite or "always ( %s )." % NEUTRAL_O5_CLAUSE_BODY
+
+
+def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
+    """(blocked, detail) for the sender's own o5 clause on one transfer's inputs."""
+    from tau_speculation import SpeculationError, WorkerLost, WorkerTimeout
+
+    body = tip_view.clause_for(sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX)
+    try:
+        return sender_policy.clause_blocks(
+            body, values, pool="admission", timeout=budget
+        )
+    except WorkerTimeout as exc:
+        raise tau_admission.AdmissionTimeout(str(exc)) from exc
+    except (WorkerLost, SpeculationError) as exc:
+        raise tau_admission.AdmissionUnavailable(str(exc)) from exc
 
 
 def _revision_refusal(receipt: dict):
@@ -1307,6 +1322,21 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
                                     ),
                                     transfer_index=i + 1,
                                 )
+
+                        own_blocks, own_o5 = _sender_clause_blocks(
+                            tip_view, sender_pubkey,
+                            tau_input_stream_values, admission_tau.budget,
+                        )
+                        if own_blocks:
+                            return _qt_err(
+                                "TX_REJECTED",
+                                (
+                                    f"Transaction rejected: the sender's own policy clause "
+                                    f"blocked transfer #{i+1} ({transfer_details}). "
+                                    f"Policy output: {own_o5}"
+                                ),
+                                transfer_index=i + 1,
+                            )
 
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.
