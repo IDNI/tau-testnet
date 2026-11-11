@@ -780,20 +780,46 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
     The flags give the forms of checktx (docs/developer_cli.md). Flags on this one
     function keep a dry-run verdict equal to the sendtx verdict by construction.
     `skip_tau_eval` exists because in-process Tau steps intern addresses and advance time.
+
+    During a reorg the state is at a lower height than the head, so every
+    verdict that reads it is refused with REORG_IN_PROGRESS.
     """
+    reorg_seen = chain_state.reorg_counter()
+    if reorg_seen % 2:
+        return _reorg_refusal()
     facts = _TauFacts()
+    progress = _AdmissionProgress()
     verdict = _queue_transaction(
         json_blob, propagate, dry_run=dry_run, skip_tau_eval=skip_tau_eval,
-        estimate=estimate, facts=facts,
+        estimate=estimate, facts=facts, reorg_seen=reorg_seen, progress=progress,
     )
+    # A rejection after the insert keeps its code: the transaction is in the mempool.
+    if (not verdict.get("ok") and not progress.queued
+            and chain_state.reorg_counter() != reorg_seen):
+        verdict = _reorg_refusal()
     if dry_run:
         verdict["tau_evaluated"] = facts.tau_steps > 0
         verdict["fee_checked"] = facts.fee_estimated
     return verdict
 
 
+class _AdmissionProgress:
+    __slots__ = ("queued",)
+
+    def __init__(self) -> None:
+        self.queued = False
+
+
+def _reorg_refusal() -> dict:
+    return _qt_err(
+        "REORG_IN_PROGRESS",
+        "The node is replaying the chain for a reorg. Send the transaction again.",
+    )
+
+
 def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
-                       skip_tau_eval: bool, estimate: bool, facts: _TauFacts) -> dict:
+                       skip_tau_eval: bool, estimate: bool, facts: _TauFacts,
+                       reorg_seen: int, progress: _AdmissionProgress) -> dict:
     if estimate and (not dry_run or skip_tau_eval):
         raise ValueError("estimate is a dry run that evaluates Tau")
     blob = json_blob.strip()
@@ -1446,6 +1472,9 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
 
         tx_message_id, tx_canonical_blob = _compute_transaction_message_id(payload)
 
+        if chain_state.reorg_counter() != reorg_seen:
+            return _reorg_refusal()
+
         # --- Evaluation ends here; everything below mutates state. -----------
         # A dry run returns the verdict now: before the mempool-capacity check
         # (a capacity fact about the node, not a verdict about this tx) and
@@ -1482,6 +1511,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             estimated_fee=estimated_fee_total if tx_type in FEE_BEARING_TX_TYPES else 0,
             lane=classify_lane(payload),
         )
+        progress.queued = True
         logger.info("Transaction successfully queued in mempool.")
         if propagate:
             if network_bus is not None:
