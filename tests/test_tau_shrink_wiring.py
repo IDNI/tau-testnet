@@ -59,6 +59,15 @@ class FakeIface:
         self.spec = text
 
 
+@pytest.fixture(autouse=True)
+def restore_tau_ready():
+    # A set flag with no interface sends later mock-engine tests to the missing engine.
+    was_ready = tau_manager.tau_ready.is_set()
+    yield
+    if not was_ready:
+        tau_manager.tau_ready.clear()
+
+
 @pytest.fixture()
 def direct_mode(temp_database, monkeypatch):
     """Direct mode with a FakeIface, shrink explicitly ENABLED."""

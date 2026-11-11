@@ -79,6 +79,22 @@ def reset_tau_stream_types() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def restore_lifecycle_manager() -> Iterator[None]:
+    """Keep the validator set of one test out of later tests.
+
+    Tests rebind the manager or assign its fields in place. A left-over set
+    without the local miner makes block production refuse to propose.
+    """
+    import chain_state
+
+    manager = chain_state._lifecycle_manager
+    fields = dict(vars(manager))
+    yield
+    vars(manager).update(fields)
+    chain_state._lifecycle_manager = manager
+
+
+@pytest.fixture(autouse=True)
 def mock_consensus_for_unrelated_tests(monkeypatch, request):
     """Automatically allow block creation turns in non-consensus tests to avoid breaking mempool/faucet tests."""
     if hasattr(request, "module") and request.module and "test_poa" not in request.module.__name__ and "test_network" not in request.module.__name__:
