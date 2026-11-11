@@ -2002,8 +2002,8 @@ def get_block_by_hash(block_hash: str) -> Optional[Dict]:
     if not row:
         return None
     try:
-        return json.loads(row[0])
-    except json.JSONDecodeError:
+        return parse_block_json(row[0])
+    except ValueError:
         logger.debug("Stored block hash %s contains invalid JSON", block_hash, exc_info=True)
         return None
 
@@ -2019,12 +2019,19 @@ def get_genesis_hash() -> str:
         return row[0]
     return ""
 
+def parse_block_json(text: str):
+    """Decode one stored block. NaN and Infinity raise ValueError."""
+    from consensus.json_numbers import loads_strict
+
+    return loads_strict(text)
+
+
 def _parse_block_data_rows(rows) -> List[Dict]:
     """JSON-decode block_data blobs. Callers must not hold `_db_lock`."""
     out: List[Dict] = []
     for (block_json,) in rows:
         try:
-            out.append(json.loads(block_json))
+            out.append(parse_block_json(block_json))
         except Exception:
             continue
     return out
@@ -2101,7 +2108,7 @@ def get_canonical_blocks_at_or_after_height(block_number: int) -> List[Dict]:
     for block_json, b_hash in rows:
         if b_hash in path_hashes:
             try:
-                out.append(json.loads(block_json))
+                out.append(parse_block_json(block_json))
             except Exception:
                 continue
     return out

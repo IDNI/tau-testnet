@@ -17,6 +17,7 @@ from errors import TauCommunicationError
 from consensus import fees
 from consensus.fees import FeeRuleError
 from consensus.lanes import classify_lane
+from consensus.json_numbers import loads_strict, number_error
 from consensus.tx_checks import check_transfer, validate_bls_pubkey
 from consensus.tx_signing import signing_message_bytes, verify_tx_signature
 from consensus.rule_offers import (
@@ -554,6 +555,9 @@ def _revision_refusal(receipt: dict):
 def _check_tx_envelope(payload: dict) -> dict | None:
     """Shape, wall-clock expiry and BLS signature checks, in the order sendtx
     reports them. The `_qt_err` verdict, or None when the envelope is sound."""
+    bad_number = number_error(payload)
+    if bad_number:
+        return _qt_err("INVALID_PARAMS", f"Transaction invalid: {bad_number}.")
     if 'sender_pubkey' not in payload:
         return _qt_err("INVALID_PARAMS", "Missing 'sender_pubkey' in transaction.")
     sender_pubkey = payload['sender_pubkey']
@@ -782,7 +786,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
     if len(blob) >= 2 and ((blob[0] == '"' and blob[-1] == '"') or (blob[0] == "'" and blob[-1] == "'")):
         blob = blob[1:-1]
     try:
-        payload = json.loads(blob)
+        payload = loads_strict(blob)
     except Exception as e:
         return _qt_err("PARSE_ERROR", f"Invalid JSON payload: {e}")
     if not isinstance(payload, dict):

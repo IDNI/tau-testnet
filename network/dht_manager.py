@@ -187,8 +187,9 @@ class DHTManager:
             
         try:
             from block import Block
+            from consensus.json_numbers import loads_strict
 
-            data = json.loads(value.decode("utf-8"))
+            data = loads_strict(value.decode("utf-8"))
             if not isinstance(data, dict):
                 return False
             block = Block.from_dict(data)
@@ -205,11 +206,11 @@ class DHTManager:
              return False
 
         try:
-            import json
             from block import compute_tx_hash
+            from consensus.json_numbers import loads_strict, number_error
 
-            payload = json.loads(value.decode("utf-8"))
-            if not isinstance(payload, dict):
+            payload = loads_strict(value.decode("utf-8"))
+            if not isinstance(payload, dict) or number_error(payload):
                 return False
 
             computed_id = compute_tx_hash(payload)

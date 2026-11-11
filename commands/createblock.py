@@ -11,7 +11,8 @@ import db
 import block
 import chain_state
 import config
-from errors import BlockByteCapExceeded, EvaluatorLost
+from errors import BlockByteCapExceeded, BlockNumberInvalid, EvaluatorLost
+from consensus.json_numbers import loads_strict, number_error
 from consensus.state import compute_state_hash
 from consensus.lanes import TAU_EVALUATING_TX_TYPES
 
@@ -597,7 +598,10 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
             if clean_data.startswith("json:"):
                 clean_data = clean_data[5:]
             
-            tx = json.loads(clean_data)
+            tx = loads_strict(clean_data)
+            bad_number = number_error(tx)
+            if bad_number:
+                raise ValueError(f"transaction {bad_number}")
             # Ensure every tx has a stable identifier so the consensus engine can
             # report acceptance/rejection. Keep this synthetic ID out of the
             # persisted block body so tx_ids remains the canonical ID surface.
@@ -607,7 +611,7 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
             transactions.append(tx)
             execution_transactions.append(execution_tx)
             filtered_reserved_ids.append(r_id)
-        except json.JSONDecodeError as e:
+        except ValueError as e:
             print(f"[WARN][createblock] Skipping invalid JSON transaction #{i+1}: {e}")
             skipped_count += 1
             # Not added to the filtered lists, so they stay aligned. Disposal
@@ -618,7 +622,7 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
 
     # Drop the unparseable rows now. Unlike the engine's accept/reject verdicts
     # (which depend on the parent state and so do not survive a lost race), "this
-    # payload is not JSON" is final. Left in place they would sit `reserved`,
+    # payload is not valid JSON" is final. Left in place they would sit `reserved`,
     # recycle through the 60s stale sweep forever, and consume a slot in every
     # reservation batch. Record them first so gettxstatus reports `rejected`
     # rather than `unknown`.
@@ -820,7 +824,7 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
                         active_view, candidate_block, parent_snapshot,
                         session=sim_session, proposal=sim_proposal,
                     )
-                except BlockByteCapExceeded as exc:
+                except (BlockByteCapExceeded, BlockNumberInvalid) as exc:
                     db.unreserve_mempool_txs(reserved_ids)
                     if sim_proposal is not None:
                         try:
@@ -926,7 +930,7 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
             msg = f"Failed to sign block: {e}"
             return {"error": msg, "message": msg}
 
-        over = block.block_byte_cap_reason(candidate_block)
+        over = block.block_validity_reason(candidate_block)
         if over:
             import db as _db
             _db.unreserve_mempool_txs(reserved_ids)
