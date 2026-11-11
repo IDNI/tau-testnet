@@ -37,10 +37,8 @@ from .retractable import (
     parse_retractable_transfer,
 )
 from .rule_offers import (
-    NEUTRAL_O5_CLAUSE_BODY,
     RULE_OFFER_TX_TYPES,
     RuleOfferShapeError,
-    clause_author_cap,
     clause_body_v1,
     is_neutral_clause_body,
     TX_TYPE_RULE_OFFER,
@@ -209,73 +207,6 @@ class ConsensusEngine(ABC):
         """
         pass
 
-def _apply_composite_rule(composite: Optional[str], tx_receipt: Dict,
-                          session=None) -> Tuple[bool, str]:
-    """Route a regenerated composite rule through i0, as an op-"0" rule would.
-
-    Returns (ok, detail). `composite` is None only when the acceptor's clause
-    was the last one for that stream, which cannot happen on an accept, so a
-    None here is a programming error rather than a chain condition.
-
-    A rejection is deterministic: every node applying this block composes the
-    same text from the same registry and feeds it to the same engine, so all of
-    them either accept or hard-reject the transaction identically.
-
-    `session` is the evaluator this composite belongs to and is NOT optional in
-    proposal mode -- it is defaulted only so the live apply path and the existing
-    callers keep working unchanged. Reaching `tau_manager` from inside a proposal
-    would step the authoritative interpreter for a block that may never commit,
-    which is the one thing the whole speculative path exists to prevent; the
-    isolation guard traps that call, so the default here is a convenience for the
-    authoritative path and a hard error for a proposal.
-    """
-    if not composite:
-        return False, "composite is empty"
-
-    _session = (
-        session if session is not None
-        else tau_session.InProcessSession(manager=tau_manager)
-    )
-
-    if not _session.ready(timeout=5):
-        # Soft failure shape is not available here: the clause is already
-        # registered in the caller's registry, so refusing the tx is the only way
-        # to keep the emitted spec and the registry consistent.
-        return False, "Tau not ready"
-
-    try:
-        # NOT accumulated: the composite feeds the interpreter but skips the
-        # rules handler, so it never enters the application-rules accumulation.
-        # save_effective_tau_spec only dedups EXACT units, so appending left
-        # every earlier composite in place -- several per stream, net effect
-        # dependent on replay order, and the spec growing with every acceptance.
-        # The clause registry is the consensus-bound source of truth and
-        # chain_state's restore plan rebuilds the composite from it.
-        output = _session.apply_rule(composite, target=0, accumulate=False)
-    except Exception as exc:  # noqa: BLE001 - deliberately broad, see below
-        # A deterministic parse/compile failure surfaces as an engine error in
-        # the exception text. Anything else (transient outage) is equally fatal
-        # for this transaction, because the registry has already moved.
-        return False, str(exc)
-
-    tx_receipt["logs"].append(f"Tau(composite) o0: {output}")
-
-    # W6, same correction the ordinary rule path got: the engine's own verdict
-    # rather than a guess at the formatted output. The string test cannot tell an
-    # accepted no-op from a composite the engine never routed -- an unsatisfiable
-    # one lands in the no-revision branch and prints nothing that looks like an
-    # error -- and it is blind to ANSI-wrapped diagnostics besides.
-    receipt = _session.last_receipt()
-    if receipt is not None:
-        if not receipt.get("accepted", False):
-            return False, f"{receipt.get('outcome')}: {output}"
-        return True, ""
-    if "error" in str(output).lower() and "x1001" not in str(output).lower():
-        return False, str(output)
-    return True, ""
-
-
-
 def _retractable_book(lm) -> Optional[RetractableBook]:
     book = getattr(lm, "retractable_transfers", None)
     return book if isinstance(book, RetractableBook) else None
@@ -297,14 +228,6 @@ def _release_due_retractables(lm, balances, height, timestamp) -> List[str]:
             int(balances.get(entry.recipient_pubkey, 0)) + entry.amount
         )
     return [entry.retractable_id.hex() for entry in released]
-
-
-def _revised_policy_composite(proposal) -> bool:
-    # Only composites and activations are fed with accumulate=False; op-0 rules accumulate.
-    return any(
-        entry.kind == tau_journal.REVISION and not entry.accumulate
-        for entry in proposal.journal.entries()
-    )
 
 
 TEMPORAL_REFERENCE_REASON = "temporal_reference"
@@ -533,10 +456,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
     @classmethod
     def _counts_against_rule_budget(cls, tx: dict, slots_active: bool) -> bool:
-        """Whether this transaction costs an interpreter rebuild.
+        """Whether this transaction costs a clause build.
 
         The rule-sharing types always do. A user_tx carrying an o5 policy rule
-        does too ONCE routing is active, because it re-derives the composite --
+        does too ONCE routing is active, because it builds the clause --
         and not counting it would leave the flood vector wide open on the one
         path this feature adds.
 
@@ -610,10 +533,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             logger.warning("Consensus: Block #%s has no consensus proof", block.header.block_number)
             return False
 
-        # Per-block rule-transaction budget. Applying a rule regenerates and
-        # recompiles a composite, whose cost climbs steeply with specification
-        # complexity; without a ceiling a proposer could author a block that
-        # every validator times out on (COMM_TIMEOUT, then a watchdog kill).
+        # Per-block rule-transaction budget. Applying a rule builds an
+        # engine unit, whose cost climbs steeply with its complexity; without a
+        # ceiling a proposer could author a block that every validator times out
+        # on (COMM_TIMEOUT, then a watchdog kill).
         # This is consensus, not policy: over-budget blocks are invalid.
         #
         # Counts ONLY the rule-sharing types. Legacy operations["0"] user_tx
@@ -1000,19 +923,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             next_cons_rules = "\n".join(last_update.rule_revisions)
             next_active_consensus_id = last_update.update_id_hex[:16]
 
-        if proposal is not None and (newly_active or _revised_policy_composite(proposal)):
-            # Activations and composites fed through i0 layer instead of replacing;
+        if proposal is not None and newly_active:
+            # Activations are fed through i0 and layer instead of replacing;
             # collapsing to the hashed state matches a restart and bounds apply cost.
-            units = chain_state.restore_plan_for(
-                next_cons_rules, next_app_rules, lifecycle=lm,
-            )
+            units = chain_state.restore_plan_for(next_cons_rules, next_app_rules)
             try:
                 proposal.reset(units)
             except Exception as exc:
                 # Deterministic: every node composes the same plan from the same hashed state.
-                cause = "governance activation" if newly_active else "policy revision"
                 raise FeeRuleError(
-                    f"Block #{block.header.block_number} ({cause}) "
+                    f"Block #{block.header.block_number} (governance activation) "
                     f"could not collapse the evaluator: {exc}"
                 )
 
@@ -1468,11 +1388,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 _session = proposal.session
                 # Lifecycle state is branched like everything else. The routed
                 # o5 path resolves the sender's open approval requests and
-                # replaces their registered clause BEFORE the composite is even
-                # evaluated, and the offer path does the same on accept -- both
-                # mutate in place, with no inverse worth trusting. So the
-                # transaction mutates a clone, derives its composite from THAT
-                # clone, and the proposal adopts it only on acceptance.
+                # replaces their registered clause, and the offer path does the same
+                # on accept -- both mutate in place, with no inverse worth
+                # trusting. So the transaction mutates a clone, and the proposal
+                # adopts it only on acceptance.
                 lifecycle_mgr = _branch.lifecycle
             tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
             # operations is signed only for user_tx.
@@ -1663,11 +1582,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     _did_not_land(
                         "o5 clause revocation ignored (nothing registered)")
                     return True
-                if not revoking and not registered:
-                    cap = clause_author_cap(stream, True)
-                    if len(offers.clauses_for_stream(stream)) >= cap:
-                        _did_not_land(
-                            f"o5 clause ignored (registry full: {cap} authors)")
+                if not revoking:
+                    builds, build_error = sender_policy.clause_builds(
+                        body, pool="apply",
+                        timeout=getattr(_session, "request_budget", None),
+                    )
+                    if not builds:
+                        _did_not_land(f"o5 clause ignored (does not build: {build_error})")
                         return True
 
                 # A request snapshots its approvers but re-evaluates the CURRENT
@@ -1684,31 +1605,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 else:
                     offers.accepted_clauses[key] = body
 
-                composite = offers.composite_for_stream(stream)
-                if composite is None:
-                    # The registry is empty now. Feeding nothing would leave the
-                    # PREVIOUS composite in force on this already-running
-                    # interpreter while a restarted node -- whose restore plan
-                    # emits no composite for an empty registry -- would allow the
-                    # transfer. Same block, two verdicts. So feed the neutral
-                    # composite explicitly: it supersedes the old one, and "o5
-                    # emits allow" and "o5 is never mentioned" are the same
-                    # verdict.
-                    composite = "always ( %s )." % NEUTRAL_O5_CLAUSE_BODY
-
-                ok_apply, detail = _apply_composite_rule(
-                    composite, tx_receipt, session=_session
+                tx_receipt["logs"].append(
+                    "o5 clause %s for %s"
+                    % ("revoked" if revoking else "registered", sender_n[:10])
                 )
-                if not ok_apply:
-                    accepted_in_block = False
-                    hard_reject = True
-                    execution_success = False
-                    tx_receipt["logs"].append(f"Error: o5 composite rejected: {detail}")
-                else:
-                    tx_receipt["logs"].append(
-                        "o5 clause %s for %s"
-                        % ("revoked" if revoking else "registered", sender_n[:10])
-                    )
                 return True
 
             def _transfer_input_map(from_addr, to_addr, amount,
@@ -2045,12 +1945,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     accepted_in_block = False # Structural invalidity rejects entirely in most chains
 
             elif tx_type in RULE_OFFER_TX_TYPES:
-                # Bounds and cap breaches are SOFT no-ops with a receipt log,
+                # Bound breaches are SOFT no-ops with a receipt log,
                 # matching the activation-delay handling above: the block stays
                 # valid and the offer simply is not recorded, so replay is
-                # deterministic regardless of tip state. Only a Tau failure on
-                # the composed rule hard-rejects, because that means the text
-                # could not have entered the specification at all.
+                # deterministic regardless of tip state. Only a clause that
+                # does not build hard-rejects.
                 offers = lifecycle_mgr.rule_offers
 
                 if tx_type == TX_TYPE_RULE_OFFER:
@@ -2104,10 +2003,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         accepted_in_block = False
                     else:
                         ok, reason = offers.can_admit_decision(decision)
-                        rejection = (
-                            _clause_domain_rejection(clause_body_v1(decision.rule_text))
-                            if ok and accept else None
+                        accepted_body = (
+                            clause_body_v1(decision.rule_text) if ok and accept else None
                         )
+                        rejection = (
+                            _clause_domain_rejection(accepted_body)
+                            if accepted_body is not None else None
+                        )
+                        if accepted_body is not None and not rejection:
+                            builds, build_error = sender_policy.clause_builds(
+                                accepted_body, pool="apply",
+                                timeout=getattr(_session, "request_budget", None),
+                            )
+                            if not builds:
+                                rejection = (build_error, "rule_not_applied")
                         if not ok:
                             tx_receipt["logs"].append(
                                 f"Offer decision ignored ({reason})"
@@ -2120,32 +2029,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["reason"] = domain_reason
                             tx_receipt["logs"].append(f"Error: {domain_error}")
                         else:
-                            target_stream = offers.submit_decision(
-                                decision, approval_slots_active=approval_slots_on
-                            )
+                            target_stream = offers.submit_decision(decision)
                             if target_stream is None:
-                                # An accept that registers nothing hit the cap.
                                 tx_receipt["logs"].append(
-                                    ("Offer accept ignored (clause registry full): "
-                                     if accept else "Offer resolved: ")
-                                    + decision.offer_id_hex
+                                    "Offer resolved: " + decision.offer_id_hex
                                 )
                             else:
-                                # Re-emit the whole composite for the stream.
-                                # Individually guarded units cannot be appended:
-                                # an unconstrained stream materializes with an
-                                # arbitrary witness, and two total-form rules on
-                                # one stream either fail to conjoin or supersede
-                                # each other. See tests/test_rule_scoping_native.
-                                if (accept and target_stream
-                                        == tau_defs.USER_POLICY_STREAM_INDEX):
-                                    # Accepting an offered o5 clause replaces
-                                    # the acceptor's registered policy, exactly
-                                    # as an op-"0" declare does. Same hazard,
-                                    # same remedy: a request snapshots its
-                                    # approvers but re-evaluates the CURRENT
-                                    # clause, so recorded votes would come to
-                                    # mean something they were never given for.
+                                if target_stream == tau_defs.USER_POLICY_STREAM_INDEX:
+                                    # A request snapshots its approvers but
+                                    # re-evaluates the CURRENT clause, so a
+                                    # changed clause would change what its
+                                    # recorded votes mean.
                                     book = lifecycle_mgr.approval_requests
                                     doomed = book.resolve_all_for_sender(
                                         decision.actor_pubkey, STATUS_FAILED
@@ -2155,27 +2049,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                             "Policy change failed %d open approval "
                                             "request(s)" % len(doomed)
                                         )
-                                composite = offers.composite_for_stream(target_stream)
-                                ok_apply, detail = _apply_composite_rule(
-                                    composite, tx_receipt, session=_session
+                                tx_receipt["logs"].append(
+                                    f"Offer accepted, o{target_stream} clause registered: "
+                                    + decision.offer_id_hex
                                 )
-                                if not ok_apply:
-                                    accepted_in_block = False
-                                    hard_reject = True
-                                    execution_success = False
-                                    tx_receipt["logs"].append(
-                                        f"Error: composite rule rejected: {detail}"
-                                    )
-                                else:
-                                    # current_tau_bytes deliberately unchanged:
-                                    # the composite is not part of the
-                                    # application-rules accumulation. What binds
-                                    # it into the state hash is the clause
-                                    # registry root in consensus_meta.
-                                    tx_receipt["logs"].append(
-                                        f"Offer accepted, o{target_stream} composite applied: "
-                                        + decision.offer_id_hex
-                                    )
 
             elif tx_type in APPROVAL_TX_TYPES:
                 # Bounds and state disagreements are SOFT no-ops with a receipt
@@ -2523,8 +2400,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                      if isinstance(rule_op_data, str) and rule_op_data.strip() \
                              and _verdict_still_open \
                              and _apply_o5_clause_routing(rule_op_data.strip()):
-                        # Registered as this sender's policy clause; the
-                        # composite was fed instead of accumulating the text.
+                        # Registered in the clause registry, not accumulated.
                         pass
                      elif isinstance(rule_op_data, str) and rule_op_data.strip():
                         rule_text = rule_op_data.strip()

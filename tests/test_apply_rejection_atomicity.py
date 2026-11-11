@@ -20,7 +20,7 @@ SK_SENDER = 33333
 SENDER = pubkey_hex(SK_SENDER)
 PROPOSER = "bb" * 48
 STREAM = tau_defs.USER_POLICY_STREAM_INDEX
-# A registered clause carries NO i12 guard -- the composer supplies the scope.
+# A registered clause carries NO i12 guard -- the node supplies the scope.
 CLAUSE = f"always ( o{STREAM}[t]:bv[24] = {{ #x000000 }}:bv[24] )."
 
 
@@ -30,9 +30,6 @@ class _Offers:
 
     def clauses_for_stream(self, stream):
         return {k: v for k, v in self.accepted_clauses.items() if k[1] == stream}
-
-    def composite_for_stream(self, stream):
-        return f"always ( o{stream}[t]:bv[24] = {{ #x000001 }}:bv[24] )."
 
 
 class _Approvals:

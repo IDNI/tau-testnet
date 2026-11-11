@@ -678,7 +678,6 @@ class TestPolicyWidthScreen:
         view.eligibility_mode = ""
         view.approval_slots_active = slots
         view.clause_for.return_value = None
-        view.clause_author_count.return_value = 0
         return view
 
     def _screen(self, rule, slots=False):

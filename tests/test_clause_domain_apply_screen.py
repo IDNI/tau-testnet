@@ -94,7 +94,6 @@ def tip_view():
     view.pending_offers_for_recipient.return_value = 0
     view.pending_offers_for_offerer.return_value = 0
     view.clause_for.return_value = None
-    view.clause_author_count.return_value = 0
     view.clauses_for_stream.return_value = {}
     return view
 
@@ -228,7 +227,7 @@ def _outcome(result, tx_id):
     return next(o for o in result.outcomes if o.tx_id == tx_id)
 
 
-def _fed_a_composite(fed):
+def _fed_a_sender_guard(fed):
     return any("i12[t]:bv[384]" in text for text in fed)
 
 
@@ -243,7 +242,7 @@ def test_apply_hard_rejects_an_offer_the_domain_screens_refuse(name, slots):
     assert result.accepted_tx_ids == []
     assert _outcome(result, "offer").reason == EXPECTED_REASON[name]
     assert post.rule_offers.get_offer(_offer(text).offer_id) is None
-    assert not _fed_a_composite(fed)
+    assert not _fed_a_sender_guard(fed)
 
 
 @pytest.mark.parametrize("slots", [False, True])
@@ -256,7 +255,7 @@ def test_apply_hard_rejects_an_accept_the_domain_screens_refuse(name, slots):
     assert _outcome(result, "accept").reason == EXPECTED_REASON[name]
     assert post.rule_offers.clause_for(ALICE, 5) is None
     assert post.rule_offers.get_offer(_offer(text).offer_id) is not None
-    assert not _fed_a_composite(fed)
+    assert not _fed_a_sender_guard(fed)
 
 
 @pytest.mark.parametrize("kind", ["offer", "accept"])
@@ -314,4 +313,4 @@ def test_apply_keeps_a_clean_accept(body):
     result, post, fed = _apply(_accept_tx(body), _lifecycle(slots=True, open_offer=body))
     assert result.accepted_tx_ids == ["accept"]
     assert post.rule_offers.clause_for(ALICE, 5) is not None
-    assert _fed_a_composite(fed)
+    assert not _fed_a_sender_guard(fed)

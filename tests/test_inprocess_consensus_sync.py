@@ -17,7 +17,7 @@ import tau_manager
 PLAN = [
     {"label": "consensus_rules", "text": "C", "persist": False},
     {"label": "application_rule_1", "text": "A", "persist": False},
-    {"label": "rule_composite_o5", "text": "X", "persist": False},
+    {"label": "application_rule_2", "text": "X", "persist": False},
 ]
 
 

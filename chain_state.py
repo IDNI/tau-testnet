@@ -1822,8 +1822,7 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
         with _rules_lock:
             consensus_snapshot = _consensus_rules_state or ""
             application_snapshot = _application_rules_state or ""
-        return restore_plan_for(consensus_snapshot, application_snapshot,
-                                lifecycle=_lifecycle_manager)
+        return restore_plan_for(consensus_snapshot, application_snapshot)
     genesis_path = os.path.join(os.path.dirname(__file__), "data", "genesis.json")
     try:
         with open(genesis_path, "r", encoding="utf-8") as f:
@@ -1831,17 +1830,15 @@ def get_tau_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, obj
     except Exception:
         logger.exception("Failed to load genesis data from %s", genesis_path)
         return []
-    return restore_plan_for(genesis_data.get("consensus_rules", ""), "",
-                            lifecycle=None)
+    return restore_plan_for(genesis_data.get("consensus_rules", ""), "")
 
 
-def restore_plan_for(consensus_rules: str, application_rules: str, *,
-                     lifecycle=None) -> List[Dict[str, object]]:
+def restore_plan_for(consensus_rules: str, application_rules: str) -> List[Dict[str, object]]:
     """The restore plan for GIVEN rule state, not the module globals.
 
     A governance activation inside a proposal needs the POST-block plan -- the
-    newly activated consensus rules, the block's application rules, its clause
-    registry -- while the globals still describe the parent. Same construction as
+    newly activated consensus rules and the block's application rules -- while
+    the globals still describe the parent. Same construction as
     the startup plan, so a collapse at activation and a restart agree.
     """
     normalized_consensus = _preprocess_tau_spec_text(consensus_rules or "")
@@ -1876,36 +1873,7 @@ def restore_plan_for(consensus_rules: str, application_rules: str, *,
             "persist": True,
         })
 
-    if lifecycle is not None:
-        for label, text in _rule_composite_plan_entries(lifecycle):
-            plan.append({"label": label, "text": text, "persist": False})
-
     return plan
-
-
-def _rule_composite_plan_entries(lifecycle=None) -> List[tuple]:
-    """(label, text) for one composite per output stream with accepted clauses.
-
-    Ordered by stream index so every node replays them identically.
-    """
-    from consensus.rule_offers import ALLOWED_TARGET_STREAMS
-
-    entries: List[tuple] = []
-    manager = getattr(lifecycle if lifecycle is not None else _lifecycle_manager,
-                      "rule_offers", None)
-    if manager is None:
-        return entries
-    for stream in sorted(ALLOWED_TARGET_STREAMS):
-        try:
-            composite = manager.composite_for_stream(stream)
-        except Exception:
-            logger.warning(
-                "Could not compose the rule for o%s during restore", stream, exc_info=True
-            )
-            continue
-        if composite:
-            entries.append((f"rule_composite_o{stream}", composite))
-    return entries
 
 
 def replay_tau_restore_plan(plan: List[Dict[str, object]], *, source_prefix: str = "restore") -> bool:
@@ -1947,7 +1915,7 @@ def advisory_restore_plan(use_persisted_state: bool = True) -> List[Dict[str, ob
     """The restore plan reduced to the consensus unit.
 
     The in-process interpreter is only a fallback for o6/o7 under worker-backed
-    authority; user rules and composites are the authority's business.
+    authority; user rules are the authority's business.
     """
     return [e for e in get_tau_restore_plan(use_persisted_state=use_persisted_state)
             if e.get("label") == "consensus_rules"]

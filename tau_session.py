@@ -170,9 +170,9 @@ class InProcessSession(EvaluatorSession):
                    accumulate: bool = True):
         """`accumulate=False` feeds the interpreter without the rules handler.
 
-        That is how a regenerated o5 composite is applied: it changes the
+        That is how a governance activation is applied: it changes the
         evaluator but is not part of the application-rules accumulation, because
-        the clause registry is what the restore plan rebuilds it from. It still
+        the hashed consensus rules are what the restore plan rebuilds it from. It still
         goes in the journal -- an unrecorded revision that changed the evaluator
         is precisely what makes a replay diverge.
         """

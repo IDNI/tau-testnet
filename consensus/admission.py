@@ -8,7 +8,6 @@ import config
 import tau_defs
 from consensus.serialization import compute_update_id, compute_offer_id
 from consensus.rule_offers import (
-    MAX_ACCEPTORS_PER_STREAM,
     MAX_OFFER_RULE_BYTES,
     MAX_OFFER_WINDOW_BLOCKS,
     MAX_PENDING_OFFERS_PER_OFFERER,
@@ -17,12 +16,9 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
     TX_TYPE_RULE_OFFER_ACCEPT,
     TX_TYPE_RULE_OFFER_REJECT,
-    NEUTRAL_O5_CLAUSE_BODY,
     RuleOfferShapeError,
-    clause_author_cap,
     clause_body_v1,
     clause_output_streams,
-    compose_stream_rule,
     is_neutral_clause_body,
     normalize_offer_rule_text,
     parse_rule_offer,
@@ -32,7 +28,6 @@ from consensus.rule_offers import (
 from consensus.facade import TipAdmissionView
 from consensus.approvals import (
     MAX_APPROVAL_WINDOW_BLOCKS,
-    MAX_TIER_AUTHORS,
     audit_stream_collisions,
     MAX_PENDING_REQUESTS_PER_APPROVER,
     approval_slots_active,
@@ -839,8 +834,7 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
 
     Everything here is a deterministic function of the transaction and the tip
     tables, so admission and apply reach the same verdict on the same inputs.
-    The expensive compile of the composed rule happens separately (see
-    stage_and_validate_offer_clause) so a spammer cannot get a subprocess
+    The clause build happens separately (in sendtx) so a spammer cannot get a subprocess
     spawned for free on a payload that fails a cheap check.
     """
     offer = parse_rule_offer(tx)
@@ -899,60 +893,11 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
     if domain_error:
         return _admission_from_domain_error(domain_error)
 
-    # Compose the rule as it WOULD look if the recipient accepted, so an offer
-    # that could never be accepted is rejected at the source rather than
-    # wasting the recipient's inbox slot and review time.
-    composite, compose_error = _compose_with_clause(
-        tip_view, target_stream, offer.recipient_pubkey, body
-    )
-    if compose_error:
-        return compose_error
-
     return success({
         "offer_id": offer_id_hex,
         "clause_body": body,
         "target_stream": target_stream,
-        "composite_rule": composite,
     })
-
-
-def _compose_with_clause(tip_view, target_stream: int, acceptor: str, body: str):
-    """Composite for `target_stream` with `acceptor`'s clause set to `body`.
-
-    Returns (composite_text, error), where error is a ready AdmissionResult. An
-    acceptor REPLACING their own clause does not grow the composite, so the
-    acceptor cap only applies to a genuinely new one.
-    """
-    clauses = dict(tip_view.clauses_for_stream(target_stream))
-    cap = clause_author_cap(target_stream, approval_slots_active(tip_view))
-    if acceptor not in clauses and len(clauses) >= cap:
-        if cap == MAX_TIER_AUTHORS:
-            # The measured tier cap bound this stream, not the frozen ceiling.
-            return None, _registry_full_error(len(clauses))
-        return None, format_error(
-            f"o{target_stream} already has the maximum "
-            f"{MAX_ACCEPTORS_PER_STREAM} accepted clauses."
-        )
-    clauses[acceptor] = body
-    try:
-        return compose_stream_rule(target_stream, clauses), None
-    except RuleOfferShapeError as exc:
-        return None, format_error(
-            f"Composed rule for o{target_stream} is invalid: {exc}"
-        )
-
-
-def _registry_full_error(authors: int) -> AdmissionResult:
-    return format_error(
-        f"The o5 policy registry is full: {authors} of "
-        f"{MAX_TIER_AUTHORS} author slots are taken. This is a MEASURED "
-        f"ceiling, not a quota: every author and every policy change makes "
-        f"the shared o5 rule dearer to rebuild, and a rebuild must finish "
-        f"inside the 60s COMM_TIMEOUT. An existing author can free a slot "
-        f"by submitting the neutral clause "
-        f"`always ( {NEUTRAL_O5_CLAUSE_BODY} ).`",
-        code="CLAUSE_REGISTRY_FULL",
-    )
 
 
 def _screen_clause_domains(body: str) -> Optional[str]:
@@ -1079,17 +1024,10 @@ def validate_rule_offer_decision_payload(
     if domain_error:
         return _admission_from_domain_error(domain_error)
 
-    composite, compose_error = _compose_with_clause(
-        tip_view, target_stream, decision.actor_pubkey, body
-    )
-    if compose_error:
-        return compose_error
-
     return success({
         "offer_id": offer_id_hex,
         "clause_body": body,
         "target_stream": target_stream,
-        "composite_rule": composite,
     })
 
 
@@ -1139,9 +1077,8 @@ def validate_o5_clause_routing(
     measured what that does on a shared stream: two guarded total-form rules on
     o5 conjoin to unsatisfiable, and fed sequentially through i0 the later one
     silently supersedes the earlier. So the second user to deploy a policy rule
-    knocks out the first. The accepted-clause registry plus the derived composite
-    exists to fix exactly that, but its only door was someone else offering you a
-    rule. This is the missing self-service door: the sender still sends an
+    knocks out the first. The accepted-clause registry exists to fix exactly that,
+    but its only door was someone else offering you a rule. This is the missing self-service door: the sender still sends an
     ordinary user rule, and "user rules are automatically scoped by user and
     added to the state" becomes literally true instead of approximately true.
     """
@@ -1179,19 +1116,11 @@ def validate_o5_clause_routing(
     sender_n = sender.strip().lower()
 
     if is_neutral_clause_body(body, tau_defs.USER_POLICY_STREAM_INDEX):
-        # Revocation. Always allowed, never capped: it can only shrink the
-        # composite, and refusing it would make the author cap a permanent
-        # land-grab.
+        # Revocation makes no engine call.
         return success({
             "o5_clause_action": "revoke",
             "o5_clause_body": body,
         })
-
-    existing = tip_view.clause_for(sender_n, tau_defs.USER_POLICY_STREAM_INDEX)
-    if existing is None:
-        authors = tip_view.clause_author_count(tau_defs.USER_POLICY_STREAM_INDEX)
-        if authors >= clause_author_cap(tau_defs.USER_POLICY_STREAM_INDEX, True):
-            return _registry_full_error(authors)
 
     return success({
         "o5_clause_action": "declare",

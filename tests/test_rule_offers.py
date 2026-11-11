@@ -1,14 +1,11 @@
-"""Rule-offer shape validation, composite emission, and lifecycle transitions.
+"""Rule-offer shape validation, the clause registry, and lifecycle transitions.
 
-The canonicalization and composition functions determine the exact text
-appended to the application-rules state, which is hashed into the block state
-hash. Byte-stability tests here are consensus tests, not cosmetics.
+The canonicalization functions determine the clause text the registry root
+commits to. Byte-stability tests here are consensus tests, not cosmetics.
 """
 import pytest
 
 from consensus.rule_offers import (
-    ALLOWED_TARGET_STREAMS,
-    MAX_ACCEPTORS_PER_STREAM,
     MAX_OFFER_RULE_BYTES,
     MAX_OFFER_WINDOW_BLOCKS,
     MAX_PENDING_OFFERS_PER_OFFERER,
@@ -23,7 +20,6 @@ from consensus.rule_offers import (
     canonicalize_clause_v1,
     clause_body_v1,
     clause_output_streams,
-    compose_stream_rule,
     normalize_acceptor_pubkey,
     normalize_offer_rule_text,
     parse_rule_offer,
@@ -79,7 +75,7 @@ def test_canonicalize_rejects_empty(text):
 
 def test_two_units_are_rejected():
     """The greedy `.*` in the unit regex matches "a). always (b", which would
-    smuggle a second, UNGUARDED unit into the composite."""
+    smuggle a second unit into one clause."""
     with pytest.raises(RuleOfferShapeError, match="unbalanced|one rule unit"):
         clause_body_v1("always ( o5[t] = 1 ). always ( o1[t] = 2 ).")
 
@@ -130,66 +126,7 @@ def test_supported_target_accepted():
     assert body == "o5[t]:bv[24] = { #x000000 }:bv[24]"
 
 
-# --- composite emitter ------------------------------------------------------
-
-def test_empty_registry_emits_nothing():
-    """No clauses must mean the stream is never mentioned. Mentioning it would
-    materialize it for every sender with an arbitrary witness (observed 0,
-    i.e. BLOCK) -- see tests/test_rule_scoping_native.py."""
-    assert compose_stream_rule(TARGET, {}) is None
-
-
-def test_composite_is_order_independent():
-    body, _ = normalize_offer_rule_text(BLOCK_RULE)
-    forward = compose_stream_rule(TARGET, {A: body, B: body})
-    reverse = compose_stream_rule(TARGET, {B: body, A: body})
-    assert forward == reverse
-
-
-def test_composite_orders_by_key_bytes():
-    body, _ = normalize_offer_rule_text(BLOCK_RULE)
-    out = compose_stream_rule(TARGET, {C: body, A: body, B: body})
-    assert out.index(A) < out.index(B) < out.index(C)
-
-
-def test_composite_ends_in_the_neutral_value():
-    """The innermost else-branch is what every uncovered sender gets. For o5
-    that must be ALLOW, or accepting one user's rule blocks the network."""
-    body, _ = normalize_offer_rule_text(BLOCK_RULE)
-    out = compose_stream_rule(TARGET, {A: body})
-    neutral = ALLOWED_TARGET_STREAMS[TARGET]["neutral"]
-    assert out.rstrip().endswith(
-        f"(o5[t]:bv[24] = {{ #x{neutral:06x} }}:bv[24])) )."
-    ), out
-
-
-def test_composite_is_a_single_always_unit():
-    body, _ = normalize_offer_rule_text(BLOCK_RULE)
-    out = compose_stream_rule(TARGET, {A: body, B: body, C: body})
-    assert out.startswith("always ( ")
-    assert out.endswith(" ).")
-    assert out.count("always") == 1
-    assert out.count("(") == out.count(")")
-
-
-def test_composite_case_normalizes_pubkeys():
-    body, _ = normalize_offer_rule_text(BLOCK_RULE)
-    upper = compose_stream_rule(TARGET, {A.upper(): body})
-    lower = compose_stream_rule(TARGET, {A: body})
-    assert upper == lower
-
-
-def test_composite_respects_the_acceptor_cap():
-    body, _ = normalize_offer_rule_text(BLOCK_RULE)
-    clauses = {format(i, "096x"): body for i in range(MAX_ACCEPTORS_PER_STREAM + 1)}
-    with pytest.raises(RuleOfferShapeError, match="limit"):
-        compose_stream_rule(TARGET, clauses)
-
-
-def test_composite_rejects_unsupported_stream():
-    with pytest.raises(RuleOfferShapeError):
-        compose_stream_rule(12, {A: "o12[t] = 1"})
-
+# --- public keys ------------------------------------------------------------
 
 @pytest.mark.parametrize("bad", ["", "zz" * 48, "aa" * 47, 5, None])
 def test_pubkey_normalization_rejects_junk(bad):
@@ -384,7 +321,7 @@ def test_offerer_outbox_cap(mgr):
     assert not ok and "offerer" in reason
 
 
-def test_accept_registers_clause_and_composite(mgr):
+def test_accept_registers_the_clause(mgr):
     offer = _offer()
     mgr.submit_offer(offer)
     decision = RuleOfferDecision(offer_id=offer.offer_id, actor_pubkey=B,
@@ -398,8 +335,6 @@ def test_accept_registers_clause_and_composite(mgr):
     assert offer.offer_id not in mgr.offered
     body, _ = normalize_offer_rule_text(BLOCK_RULE)
     assert mgr.clause_for(B, TARGET) == body
-    composite = mgr.composite_for_stream(TARGET)
-    assert composite and B in composite
 
 
 def test_reject_resolves_without_a_clause(mgr):
@@ -410,7 +345,7 @@ def test_reject_resolves_without_a_clause(mgr):
     assert mgr.submit_decision(decision) is None
     assert mgr.terminal_status[offer.offer_id] == STATUS_REJECTED
     assert mgr.clause_for(B, TARGET) is None
-    assert mgr.composite_for_stream(TARGET) is None
+    assert mgr.clauses_for_stream(TARGET) == {}
 
 
 def test_only_the_recipient_may_decide(mgr):
@@ -475,8 +410,7 @@ def test_accepting_a_second_offer_replaces_the_acceptor_clause(mgr):
 
 
 def test_two_acceptors_both_keep_their_clauses(mgr):
-    """The regression the composite design exists to prevent: a second
-    acceptance must not disable the first acceptor's policy."""
+    """A second acceptance must not disable the first acceptor's policy."""
     first = _offer(recipient=B, text=BLOCK_RULE, expire=500)
     second = _offer(recipient=C, text=BLOCK_RULE, expire=501)
     mgr.submit_offer(first)
@@ -488,8 +422,7 @@ def test_two_acceptors_both_keep_their_clauses(mgr):
 
     assert mgr.clause_for(B, TARGET) is not None
     assert mgr.clause_for(C, TARGET) is not None
-    composite = mgr.composite_for_stream(TARGET)
-    assert B in composite and C in composite
+    assert set(mgr.clauses_for_stream(TARGET)) == {B, C}
 
 
 def test_expiry_resolves_only_closed_windows(mgr):
@@ -521,3 +454,15 @@ def test_snapshots_cover_offered_and_resolved(mgr):
     clauses = mgr.snapshot_clauses()
     assert clauses == [{"acceptor_pubkey": B, "target_stream": TARGET,
                         "clause_body": clause_body_v1(BLOCK_RULE)}]
+
+
+def test_the_registry_has_no_author_limit(mgr):
+    body, _ = normalize_offer_rule_text(BLOCK_RULE)
+    for i in range(100):
+        author = format(i + 1, "096x")
+        offer = _offer(recipient=author, expire=500 + i)
+        assert mgr.submit_offer(offer)
+        mgr.submit_decision(RuleOfferDecision(
+            offer_id=offer.offer_id, actor_pubkey=author, accept=True,
+            rule_text=BLOCK_RULE))
+    assert len(mgr.clauses_for_stream(TARGET)) == 100

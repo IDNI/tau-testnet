@@ -142,11 +142,8 @@ def test_every_evaluator_call_site_is_classified():
     speculative   : the miner simulation         -> disposable worker
                     _apply_block in proposal mode -> the proposal's session
 
-    `_apply_composite_rule` is deliberately NOT here any more: it takes the
-    session explicitly, so its authoritative behaviour comes from the session it
-    is given rather than from a hard-wired manager reference. `_apply_block`
-    stays, because the governance activation still drives the manager directly
-    when no proposal owns the block -- which is the committed path.
+    `_apply_block` is listed because the governance activation drives the
+    manager directly when no proposal owns the block -- the committed path.
     """
     import re
 

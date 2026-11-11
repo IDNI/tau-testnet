@@ -362,7 +362,6 @@ def test_an_unguarded_o5_clause_reading_a_slot_is_accepted(tip_view):
             "? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
             ": (o5[t]:bv[24] = { #x000001 }:bv[24]) ) ).")
     tip_view.clause_for.return_value = None
-    tip_view.clause_author_count.return_value = 0
     result = validate_user_tx_reserved_domains(_user_tx(operations={"0": rule}), tip_view)
     assert result.is_valid is True, result.error
     assert result.data["o5_clause_action"] == "declare"
@@ -507,7 +506,6 @@ def test_clause_body_bv16_is_refused_by_routing(tip_view):
             "? (o5[t]:bv[16] = { #x000000 }:bv[16]) "
             ": (o5[t]:bv[16] = { #x000001 }:bv[16]) ) ).")
     tip_view.clause_for.return_value = None
-    tip_view.clause_author_count.return_value = 0
     result = validate_user_tx_reserved_domains(_user_tx(operations={"0": rule}), tip_view)
     assert result.is_valid is False
     assert result.code == "WIDTH_MISMATCH"

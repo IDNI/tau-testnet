@@ -5,14 +5,13 @@ because the mutation happens BEFORE the transaction's later stages run:
 
     resolve_all_for_sender(sender, FAILED)   # open approvals terminated
     accepted_clauses[key] = body             # registered policy replaced
-    _apply_composite_rule(composite)         # evaluator takes the new policy
     ... transfer / fee settlement ...        # and only NOW can it reject
 
 The existing verdict guard closes the case where the transaction was already
 rejected on arrival. It cannot close this one: at the moment of mutation the
 transaction is still live. The remedy is ownership, not ordering -- the
-transaction mutates a CLONE of the proposal's lifecycle, derives its composite
-from that clone, and the proposal adopts it only on acceptance.
+transaction mutates a CLONE of the proposal's lifecycle, and the proposal adopts
+it only on acceptance.
 """
 import copy
 import os
@@ -55,7 +54,7 @@ PROPOSER = "d4" * 48
 STREAM = tau_defs.USER_POLICY_STREAM_INDEX
 
 #: What B has registered before the block. A registered clause carries no i12
-#: guard -- the composer supplies the scope -- and `clause_body_v1` returns it
+#: guard -- the node supplies the scope -- and `clause_body_v1` returns it
 #: without the outer parentheses, which is the spelling the registry holds.
 PREVIOUS_BODY = f"o{STREAM}[t]:bv[24] = {{ #x000000 }}:bv[24]"
 #: What B's transaction tries to register instead.
@@ -80,7 +79,7 @@ class _Lifecycle:
     """The parts of the lifecycle manager the routed path touches, for real.
 
     Real `RuleOfferLifecycleManager` and `ApprovalRequestLifecycleManager`, so
-    `resolve_all_for_sender` and `composite_for_stream` behave as they do in
+    `resolve_all_for_sender` and `clauses_for_stream` behave as they do in
     production; the governance queues around them are not what this exercises.
     """
 
@@ -172,8 +171,8 @@ def test_a_routed_clause_rejected_at_a_later_stage_leaves_the_registry_alone(
         temp_database):
     """B registers a clause, then cannot meet its fee.
 
-    The registration, the approval resolution and the composite application all
-    happened while B was still live. Only ownership can take them back.
+    The registration and the approval resolution happened while B was still
+    live. Only ownership can take them back.
     """
     ctx, result, lifecycle = _run([
         _tx("B", SENDER_B, rule=NEW_CLAUSE, fee_limit="1"),
@@ -218,61 +217,32 @@ def test_a_routed_clause_that_is_accepted_does_land(temp_database):
 def _revisions(session):
     """How many revisions this evaluator has taken.
 
-    Representation-independent on purpose. Probing the policy by feeding a
-    sender and reading o5 does NOT work here: inputs are requested lazily, so a
-    single step after a revision returns no o5 at all -- and even when it does,
-    a runtime id is private to the context that minted it, so a fresh probe
-    against a rebuilt session mints a different one and matches nothing. The
-    revision count is visible to both sessions and means the same thing in each.
+    Representation-independent on purpose: the revision count is visible to
+    every session and means the same thing in each, where a probe by feeding a
+    sender and reading o5 depends on lazily requested inputs and private ids.
     """
     return session._spec.state()["spec_revision"]
 
 
-def test_the_rejected_clause_is_gone_from_the_evaluator_too(temp_database):
-    """Canonical state is only half of it: the composite was EVALUATED.
-
-    A rejected transaction whose composite is still in the proposal's evaluator
-    would price and police every later transaction in the block under a policy
-    the block does not contain. There is no in-process undo, so the branch marks
-    the proposal dirty and the evaluator is REBUILT from the accepted journal --
-    which by construction never held the rejected composite.
-
-    B is deliberately the last transaction in the block, because that is the
-    case nothing else covers: a later transaction would have triggered the
-    rebuild on its way in, and the contract would look satisfied by accident.
-    """
-    ctx, result, lifecycle = _run([
-        _tx("B", SENDER_B, rule=NEW_CLAUSE, fee_limit="1"),
-    ])
-    try:
-        # The proposal journal is what defines the evaluator after resolution,
-        # and a rejected branch contributes nothing to it.
-        assert len(ctx.journal) == 0, (
-            "the rejected transaction left entries in the proposal journal: "
-            f"{[e.kind for e in ctx.journal.entries()]}"
-        )
-        ctx.journal.verify_chain()
-
-        # The evaluator itself is NOT clean yet, and says so. Asserting this is
-        # the point: a caller that promotes a dirty proposal's worker would be
-        # promoting an evaluator holding a rule the block rejected.
-        assert ctx.dirty, (
-            "the proposal ran a rejected transaction's composite and did not "
-            "mark itself for reconstruction"
-        )
-        contaminated = _revisions(ctx.session)
-        assert contaminated > 0, (
-            "expected the un-rebuilt session to still carry B's composite; it "
-            "reports no revisions at all, so this test would pass for a "
-            "proposal that never ran the composite either"
-        )
-
-        ctx.reconstruct()
-        assert not ctx.dirty
-        rebuilt = _revisions(ctx.session)
-        assert rebuilt == 0, (
-            f"B's rejected composite survived reconstruction: {rebuilt} "
-            f"revision(s) in an evaluator whose accepted journal is empty"
-        )
-    finally:
-        ctx.dispose()
+def test_a_routed_clause_is_never_fed_to_the_evaluator(temp_database):
+    """The clause lives in the registry and is built in the policy evaluator, so
+    neither an accepted nor a rejected registration revises the proposal's
+    evaluator, and a rejected one leaves nothing in its journal."""
+    for fee_limit in ("1", "1000"):
+        ctx, result, lifecycle = _run([
+            _tx("B", SENDER_B, rule=NEW_CLAUSE, fee_limit=fee_limit),
+        ])
+        try:
+            assert not [e for e in ctx.journal.entries() if e.kind == tj.REVISION], (
+                "a clause registration revised the evaluator: "
+                f"{[e.kind for e in ctx.journal.entries()]}"
+            )
+            ctx.journal.verify_chain()
+            assert _revisions(ctx.session) == 0
+            if fee_limit == "1":
+                assert len(ctx.journal) == 0
+            if ctx.dirty:
+                ctx.reconstruct()
+            assert _revisions(ctx.session) == 0
+        finally:
+            ctx.dispose()

@@ -2,18 +2,13 @@
 
 Design constraints these tests encode:
 
-- Bounds and cap breaches are SOFT no-ops with a receipt log, matching the
+- Bound breaches are SOFT no-ops with a receipt log, matching the
   governance activation-delay handling, so block validity is a deterministic
   function of the block alone and replay never diverges.
-- An accept re-emits the WHOLE composite for the target stream. Appending
-  individually guarded units cannot work: an unconstrained output stream
-  materializes with an arbitrary witness, and two total-form rules on one
-  stream either fail to conjoin or supersede each other (see
-  tests/test_rule_scoping_native.py). A second acceptance must therefore leave
-  the first acceptor's policy in force -- that is the regression the composite
-  design exists to prevent.
-- Only a Tau failure on the composed rule hard-rejects, because that means the
-  text could not have entered the specification at all.
+- An accept registers the clause in the registry and builds it once in the
+  policy evaluator; nothing is fed to the main interpreter. A second acceptance
+  leaves the first acceptor's clause in place.
+- Only a clause that does not build hard-rejects.
 """
 import itertools
 
@@ -22,8 +17,10 @@ from unittest.mock import patch
 
 from block import Block
 from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
+from consensus import sender_policy
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager
+from consensus.policy_mock import MockPolicyEvaluator
 from consensus.rule_offers import (
     MAX_OFFER_WINDOW_BLOCKS,
     STATUS_ACCEPTED,
@@ -84,6 +81,14 @@ def decision_tx(offer, *, accept, sender=None, rule_text=None, seq=0):
     if accept:
         tx["rule_text"] = rule_text if rule_text is not None else offer.rule_text
     return sign_payload(tx, _SK[sender])
+
+
+@pytest.fixture(autouse=True)
+def policy():
+    evaluator = MockPolicyEvaluator(pool="apply")
+    sender_policy.set_evaluator("apply", evaluator)
+    yield evaluator
+    sender_policy.set_evaluator("apply", None)
 
 
 def _apply(txs, lm=None, height=HEIGHT, tau_output="T"):
@@ -215,25 +220,16 @@ def test_duplicate_offer_in_the_same_block_is_ignored_once():
 
 # --- accept -----------------------------------------------------------------
 
-def test_accept_registers_the_clause_and_applies_the_composite():
+def test_accept_registers_the_clause_and_builds_it_once(policy):
     offer = _offer()
     result, lm, calls = _apply([offer_tx(offer), decision_tx(offer, accept=True)])
 
-    assert lm.rule_offers.clause_for(B, TARGET) == clause_body_v1(BLOCK_RULE)
+    body = clause_body_v1(BLOCK_RULE)
+    assert lm.rule_offers.clause_for(B, TARGET) == body
     assert lm.rule_offers.terminal_status[offer.offer_id] == STATUS_ACCEPTED
-
-    rule_calls = [c for c in calls if c.get("rule_text")]
-    composites = [c for c in rule_calls if "i12" in c["rule_text"]]
-    assert len(composites) == 1, [c["rule_text"] for c in rule_calls]
-    composite = composites[0]
-    assert composite["target_output_stream_index"] == 0
-    # Fed to the interpreter but NOT accumulated: save_effective_tau_spec only
-    # dedups exact units, so appending would leave every earlier composite in
-    # place. The clause registry is the source of truth and chain_state's
-    # restore plan rebuilds the composite from it.
-    assert composite["apply_rules_update"] is False
-    assert B in composite["rule_text"]
-    assert "composite applied" in _logs(result)
+    assert policy.validate_calls == [body]
+    assert not [c for c in calls if c.get("rule_text")]
+    assert "clause registered" in _logs(result)
 
 
 def test_accept_by_a_non_recipient_is_a_soft_no_op():
@@ -262,8 +258,7 @@ def test_accept_with_mismatched_text_is_a_soft_no_op():
     assert "ignored" in _logs(result)
 
 
-def test_second_acceptor_does_not_disable_the_first():
-    """The core regression the composite design prevents."""
+def test_second_acceptor_does_not_disable_the_first(policy):
     first = _offer(recipient=B, expire=EXPIRE)
     second = _offer(recipient=C, expire=EXPIRE + 1)
     result, lm, calls = _apply([
@@ -273,13 +268,8 @@ def test_second_acceptor_does_not_disable_the_first():
 
     assert lm.rule_offers.clause_for(B, TARGET) is not None, "first acceptor's clause lost"
     assert lm.rule_offers.clause_for(C, TARGET) is not None
-
-    composites = [c["rule_text"] for c in calls if c.get("rule_text") and "i12" in c["rule_text"]]
-    assert len(composites) == 2
-    # The final composite must carry BOTH acceptors.
-    assert B in composites[-1] and C in composites[-1]
-    # ...and it is one unit, not an accumulation.
-    assert composites[-1].count("always") == 1
+    assert len(policy.validate_calls) == 2
+    assert not [c for c in calls if c.get("rule_text")]
 
 
 def test_accepting_again_replaces_the_acceptors_own_clause():
@@ -294,16 +284,14 @@ def test_accepting_again_replaces_the_acceptors_own_clause():
     assert len(lm.rule_offers.clauses_for_stream(TARGET)) == 1
 
 
-def test_tau_error_on_the_composite_hard_rejects():
+def test_a_clause_that_does_not_build_hard_rejects(policy):
     offer = _offer()
-    result, lm, _ = _apply(
-        [offer_tx(offer), decision_tx(offer, accept=True)],
-        tau_output="(Error) Syntax Error",
-    )
-    logs = _logs(result)
-    assert "composite rule rejected" in logs
-    # The transaction is excluded from the block rather than silently accepted.
-    assert result.invalid_tx_ids or "Error" in logs
+    policy.fail_build(clause_body_v1(BLOCK_RULE), "Syntax Error")
+    result, lm, _ = _apply([offer_tx(offer), decision_tx(offer, accept=True)])
+    assert "Error: Syntax Error" in _logs(result)
+    assert result.invalid_tx_ids
+    assert lm.rule_offers.clause_for(B, TARGET) is None
+    assert lm.rule_offers.get_offer(offer.offer_id) is not None
 
 
 # --- reject -----------------------------------------------------------------
@@ -315,8 +303,7 @@ def test_reject_resolves_without_touching_the_spec():
     assert lm.rule_offers.terminal_status[offer.offer_id] == STATUS_REJECTED
     assert offer.offer_id in lm.rule_offers.resolved
     assert lm.rule_offers.clause_for(B, TARGET) is None
-    # No composite is emitted for a rejection.
-    assert not [c for c in calls if c.get("rule_text") and "i12" in c["rule_text"]]
+    assert not [c for c in calls if c.get("rule_text")]
 
 
 def test_reject_by_a_non_recipient_is_a_soft_no_op():

@@ -32,8 +32,8 @@ from dataclasses import dataclass, field, asdict, replace
 REVISION = "revision"
 STEP = "step"
 #: Re-initialize the evaluator from the program baseline, then apply `units`.
-#: Recorded after a governance activation and after a block that revised a policy
-#: composite, since both layer through i0; nothing before the last RESET matters.
+#: Recorded after a governance activation, which layers through i0; nothing
+#: before the last RESET matters.
 RESET = "reset"
 
 # Why an entry is authoritative -- or why it is not.
@@ -217,9 +217,9 @@ class JournalEntry:
     inputs: dict = field(default_factory=dict)   # canonical logical values
     target: int | None = None
     #: Whether the authoritative path ALSO accumulated this revision into the
-    #: application-rules state. A regenerated o5 composite is fed with
-    #: accumulate=False -- it changes the evaluator but the clause registry, not
-    #: the accumulation, is what a restore rebuilds it from. Recorded because the
+    #: application-rules state. A governance activation is fed with
+    #: accumulate=False -- it changes the evaluator but the hashed consensus rules,
+    #: not the accumulation, are what a restore rebuilds it from. Recorded because the
     #: two produce different canonical state from the same evaluator history.
     accumulate: bool = True
     #: RESET only: the (rule text, persist) units applied after re-initializing.
@@ -407,7 +407,7 @@ class Journal:
             raise ValueError("cannot merge a discarded journal")
         for entry in child.entries():
             # Every field that is part of the record, not just the ones replay
-            # reads. Dropping `accumulate` recorded a merged o5 composite as part
+            # reads. Dropping `accumulate` recorded a merged activation as part
             # of the application-rules accumulation, and dropping `identity`
             # erased which prepared payload the worker actually evaluated.
             self.record(entry.kind, phase=self._phase_for(entry), rule_text=entry.rule_text,

@@ -1,7 +1,7 @@
 """Per-block rule-transaction budget (consensus-enforced).
 
-Applying a rule regenerates and recompiles a composite. That cost climbs
-steeply with specification complexity, so an unbounded count lets a proposer
+Applying a rule builds an engine unit. That cost climbs steeply with
+the unit's complexity, so an unbounded count lets a proposer
 author a block that every validator times out on -- COMM_TIMEOUT, then a
 watchdog kill. The budget is therefore block validity, not local policy.
 

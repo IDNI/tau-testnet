@@ -3,7 +3,7 @@
 
 tests/test_approval_apply.py mocks the engine; this drives a live node with the
 NATIVE one, so it exercises what only exists at runtime: real clause
-compilation, the derived composite in the live interpreter, the restore plan
+compilation, the per-account clause evaluator, the restore plan
 after a restart, and a parked transfer actually being released.
 
 WHAT IT ASSERTS THAT A UNIT TEST CANNOT

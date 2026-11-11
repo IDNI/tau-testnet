@@ -36,8 +36,7 @@ CONSENSUS-FROZEN SURFACE
 ------------------------
 The bounds below are module constants, deliberately not config: a per-node value
 would let two honest nodes disagree about whether a transaction is admissible,
-which forks. `MAX_TIER_AUTHORS` is a *measured* ceiling, not a taste -- see the
-note on it.
+which forks.
 """
 from __future__ import annotations
 
@@ -74,13 +73,6 @@ MAX_CUSTOM_INPUT_BYTES = 256
 # `block.compute_tx_hash` covers it), but deliberately NOT in the approval-state
 # root: node-local colour, no consensus meaning.
 MAX_VOTE_REASON_BYTES = 256
-
-# How many principals may hold a registered o5 policy clause at once.
-#
-# Composite rebuild cost grows with every author and policy change and must fit
-# config.COMM_TIMEOUT; raising this needs a fresh measurement. Separate from the
-# consensus-frozen MAX_ACCEPTORS_PER_STREAM; binds both doors once slots are active.
-MAX_TIER_AUTHORS = 2
 
 # --- Terminal status, encoded as a uint8 in the hashed root ------------------
 
@@ -313,10 +305,10 @@ def audit_stream_collisions(spec_texts) -> List[str]:
        i18 at, say, bv[24] means the first co-signature clause typing it bv[384]
        makes `get_interpreter` fail -- for everyone, until restart.
 
-    2. **A legacy raw o5 writer.** The first derived composite becomes a second
-       total-form unit on o5 beside it, and two of those either fail to conjoin
-       (unsatisfiable) or silently supersede one another. Grandfathering them is
-       not safe, which is why this reports rather than tolerates.
+    2. **A legacy raw o5 writer.** A raw o5 rule keeps writing o5 on the main
+       interpreter beside the per-account clauses, so a sender could be blocked by
+       a rule the registry does not show. Grandfathering them is not safe, which is
+       why this reports rather than tolerates.
 
     `spec_texts` is an iterable of (label, text) pairs covering the COMPLETE
     effective spec: consensus rules, genesis/builtin rules, the application-rules
@@ -343,14 +335,14 @@ def audit_stream_collisions(spec_texts) -> List[str]:
             )
 
         # Only the raw accumulation can hold a legacy o5 writer: a registered
-        # clause is fed with apply_rules_update=False and never enters it.
+        # clause lives in the registry and never enters it.
         if label.startswith("application_rules") and \
                 tau_defs.USER_POLICY_STREAM_INDEX in clause_output_streams(text):
             findings.append(
-                f"{label} contains a raw o5 policy rule; the first derived "
-                f"composite would be a second total-form unit on o5 beside it, "
-                f"which either fails to conjoin or silently supersedes it. Clear "
-                f"it or start from fresh state before activating."
+                f"{label} contains a raw o5 policy rule; "
+                f"it would keep writing o5 on the main interpreter beside the "
+                f"registered clauses. Clear it or start from fresh state before "
+                f"activating."
             )
     return findings
 

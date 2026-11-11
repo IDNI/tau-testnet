@@ -72,3 +72,12 @@ def clause_blocks(body, values: dict, *, pool: str,
     except PolicyBuildError as exc:
         return True, str(exc)
     return verdict.blocked, str(verdict.o5)
+
+
+def clause_builds(body, *, pool: str, timeout=_SESSION_DEFAULT) -> tuple[bool, str]:
+    """(ok, engine_error) for building `always ( body ).` in the pool's evaluator.
+
+    Loss or timeout of the evaluator propagates: it says nothing about the clause.
+    """
+    result = evaluator(pool).validate(body, timeout=timeout)
+    return result.ok, result.error

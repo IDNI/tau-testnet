@@ -430,9 +430,8 @@ def encode_clause_registry(clauses: Dict[tuple, str]) -> bytes:
     """Canonical serialization of the accepted-clause registry.
 
     `clauses` maps (acceptor_pubkey_hex, target_output_stream) -> clause body.
-    Sorted by raw public-key bytes then stream index, matching the order the
-    composite emitter uses, so the registry root and the emitted rule text can
-    never disagree about ordering.
+    Sorted by raw public-key bytes then stream index, so the root does not depend
+    on insertion order.
     """
     items = sorted(
         (

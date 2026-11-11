@@ -6,7 +6,7 @@ process could not type.
 
 | state | contents | lifetime |
 |---|---|---|
-| canonical execution context | accepted rules, composites, host contract, position | changes at transaction commit |
+| canonical execution context | accepted rules, host contract, position | changes at transaction commit |
 | process type commitments | widths this PROCESS established | until real process exit / re-exec |
 | active evaluator state | reconstruction position, temporal state, protocol state, health | changes as execution advances |
 | encoding context | canonical/runtime types, encoding kind, mapping identity | changes with accepted runtime updates |

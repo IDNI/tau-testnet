@@ -1,7 +1,7 @@
 """Real-engine characterization of rule-composition semantics (no mocks).
 
-These tests pin down four engine behaviours that the rule-sharing design rests
-on. All four were empirically discovered; none was previously covered, and the
+These tests pin down three engine behaviours that the rule-sharing design rests
+on. All three were empirically discovered; none was previously covered, and the
 first one is a live latent bug in the `o5` user-policy convention documented in
 `tau_defs.py`.
 
@@ -23,10 +23,6 @@ first one is a live latent bug in the `o5` user-policy convention documented in
    unsatisfiable and `get_interpreter` fails. Fed sequentially through
    `i0`, the later rule silently SUPERSEDES the earlier one. Either way,
    "append one rule unit per user" cannot work for a shared stream.
-
-4. A SINGLE COMPOSITE TOTAL-FORM RULE DOES WORK, and applying it through `i0`
-   is equivalent to building it conjoined -- which is what makes replay after
-   restart match a live node.
 """
 import json
 import os
@@ -209,8 +205,8 @@ def test_strip_ansi_removes_colour_codes():
 def test_implication_guard_does_not_isolate_users(tmp_path):
     """`guard -> o5=1` gives the guarded sender 1 and EVERYONE ELSE 0 (= block).
 
-    This is why accepted rules are composed into one total-form composite per
-    stream instead of being appended as individually guarded units.
+    This is why a registered clause is evaluated on its own for its owner
+    instead of being appended to the shared interpreter as a guarded unit.
     """
     proc, parsed = _run_child(tmp_path, "impl_guard", r'''
 res = {}
@@ -239,8 +235,8 @@ emit(res)
     assert str(parsed["implication"]["A"]) == "1", parsed["implication"]
     # ...and the unguarded third party gets a materialized 0 == BLOCK.
     assert str(parsed["implication"]["C"]) == "0", (
-        "engine no longer materializes unconstrained o5 as 0; the composite "
-        "design's premise changed and the scoping model must be revisited: "
+        "engine no longer materializes unconstrained o5 as 0; the "
+        "per-account clause design's premise changed and must be revisited: "
         f"{parsed['implication']}"
     )
 
@@ -291,111 +287,8 @@ emit(res)
     # ...while A's clause has been superseded -- A is no longer blocked.
     assert str(seq["A"]) == "1", (
         "the later i0 rule no longer supersedes the earlier one for the same "
-        f"stream; the composite design's premise changed: {seq}"
+        f"stream; the per-account clause design's premise changed: {seq}"
     )
-
-
-# ---------------------------------------------------------------------------
-# 4. The composite works, and i0 replay matches a conjoined build
-# ---------------------------------------------------------------------------
-
-@requires_native
-def test_composite_isolates_and_is_replay_equivalent(tmp_path):
-    """One nested total-form unit per stream: each acceptor keeps its own policy."""
-    proc, parsed = _run_child(tmp_path, "composite", r'''
-res = {}
-
-# Composite: A blocked, B blocked, everyone else allowed.
-composite = ("(" + guard(A) + " ? " + o5("000000")
-             + " : (" + guard(B) + " ? " + o5("000000")
-             + " : " + o5("000001") + "))")
-
-# (a) Conjoined build.
-tau_mod = tau_native.load_tau_module()
-spec = "always ( (" + BASE + ") && " + composite + " )."
-built = tau_mod.get_interpreter(tau_native.TauInterface.preprocess_spec_text(spec))
-res["conjoined_built"] = bool(built)
-res["conjoined_err"] = tau_native.report_errors(built.report)[:300]
-
-# (b) Sequential i0 application -- the path a live node and a replaying node
-#     both take.
-iface = new_iface()
-iface.communicate(rule_text="always ( " + BASE + " ).", target_output_stream_index=0)
-iface.communicate(rule_text="always ( " + composite + " ).", target_output_stream_index=0)
-res["sequential"] = {who: sender_step(iface, pk).get(5)
-                     for who, pk in (("A", A), ("B", B), ("C", C))}
-res["sequential_o1"] = sender_step(iface, C).get(1)
-emit(res)
-''')
-    _assert_ok(proc, parsed)
-
-    assert parsed["conjoined_built"] is True, (
-        f"composite failed to build: {parsed['conjoined_err']}"
-    )
-
-    seq = parsed["sequential"]
-    assert str(seq["A"]) == "0", seq   # A's policy in force
-    assert str(seq["B"]) == "0", seq   # B's policy ALSO in force (the whole point)
-    assert str(seq["C"]) == "1", seq   # third party unaffected -> allowed
-    # The unrelated base rule still applies: o1 echoes the amount unchanged.
-    assert str(parsed["sequential_o1"]) == "100", parsed["sequential_o1"]
-
-
-# ---------------------------------------------------------------------------
-# 5. The real emitter output, on the real engine
-# ---------------------------------------------------------------------------
-
-@requires_native
-def test_emitted_composite_isolates_acceptors_on_the_engine(tmp_path):
-    """End-to-end check of `compose_stream_rule`'s actual output.
-
-    The cases above use hand-written text to characterize the engine. This one
-    closes the loop: it feeds exactly what the production emitter produces and
-    asserts each acceptor's policy applies to that acceptor only.
-
-    The composite is built in the parent (which has the repo's dependencies)
-    and passed to the child as text, so the child needs nothing but the
-    nanobind module on PYTHONPATH.
-    """
-    from consensus.rule_offers import compose_stream_rule, normalize_offer_rule_text
-
-    block_body, target = normalize_offer_rule_text(
-        "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
-    )
-    allow_body, _ = normalize_offer_rule_text(
-        "always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."
-    )
-    # A blocks itself, B explicitly allows itself, C has no clause at all.
-    composite = compose_stream_rule(target, {A: block_body, B: allow_body})
-    solo = compose_stream_rule(target, {A: block_body})
-
-    body = (
-        "COMPOSITE = " + json.dumps(composite) + "\n"
-        "SOLO = " + json.dumps(solo) + "\n"
-        + r'''
-def probe(composite):
-    iface = new_iface()
-    iface.communicate(rule_text="always ( " + BASE + " ).", target_output_stream_index=0)
-    iface.communicate(rule_text=composite, target_output_stream_index=0)
-    return {who: sender_step(iface, pk).get(5) for who, pk in (("A", A), ("B", B), ("C", C))}
-
-emit({"multi": probe(COMPOSITE), "solo": probe(SOLO)})
-'''
-    )
-    proc, parsed = _run_child(tmp_path, "emitted_composite", body)
-    _assert_ok(proc, parsed)
-
-    multi = parsed["multi"]
-    assert str(multi["A"]) == "0", multi   # A's own block clause
-    assert str(multi["B"]) == "1", multi   # B's own allow clause
-    assert str(multi["C"]) == "1", multi   # no clause -> neutral (allow)
-
-    solo_res = parsed["solo"]
-    assert str(solo_res["A"]) == "0", solo_res
-    # With only A's clause registered, B falls through to neutral rather than
-    # inheriting A's policy.
-    assert str(solo_res["B"]) == "1", solo_res
-    assert str(solo_res["C"]) == "1", solo_res
 
 
 # ---------------------------------------------------------------------------

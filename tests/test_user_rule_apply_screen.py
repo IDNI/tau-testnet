@@ -121,7 +121,6 @@ def _tip(slots, mode):
     view.eligibility_mode = mode
     view.approval_slots_active = slots
     view.clause_for.return_value = None
-    view.clause_author_count.return_value = 0
     view.clauses_for_stream.return_value = {}
     return view
 

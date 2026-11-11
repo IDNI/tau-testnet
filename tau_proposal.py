@@ -369,9 +369,8 @@ class ProposalContext:
     def reset(self, units) -> None:
         """Collapse the evaluator to the program baseline plus `units`, recorded.
 
-        Done for a governance activation and for a block whose accepted execution
-        revised a policy composite: both layer through i0 on what the hashed
-        state replaces. The collapse happens inside the proposal, before anything
+        Done for a governance activation, which layers through i0 on what the
+        hashed state replaces. The collapse happens inside the proposal, before anything
         is durable, and is recorded as a RESET so a reconstruction collapses at
         the same point. The worker that gets promoted is the collapsed one.
         """
@@ -413,8 +412,8 @@ class ProposalContext:
     def replan(self, required_plain) -> None:
         """Extend the representation and rebuild, keeping the accepted prefix.
 
-        A rule discovered DURING apply -- a regenerated composite, an accepted
-        offer, an activated governance revision -- can need a representation the
+        A rule discovered DURING apply -- an accepted offer, an activated
+        governance revision -- can need a representation the
         current worker cannot express. That is not a transaction rejection: the
         accepted journal and allocation plan are retained, the plan is widened,
         and the accepted prefix is replayed.

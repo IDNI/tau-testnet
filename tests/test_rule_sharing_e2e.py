@@ -7,8 +7,8 @@ signing digests, admission dispatch, mempool lanes, block inclusion, apply,
 persistence, and the read RPCs.
 
 The load-bearing assertion is `test_two_acceptors_keep_independent_policies`:
-that is the whole point of composing accepted clauses rather than appending
-them, and it fails if any layer loses the registry.
+that is the whole point of a per-account registry, and it fails if any layer
+loses it.
 """
 import hashlib
 import json
@@ -71,8 +71,8 @@ class RuleSharingE2E(unittest.TestCase):
         chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
 
-        # Record every rule routed through i0 so the tests can assert on the
-        # composite text the node actually emits.
+        # Record every rule routed through i0 so the tests can assert that a
+        # clause never reaches the main interpreter.
         self.rule_calls = []
 
         def mock_tau(rule_text=None, target_output_stream_index=1,
@@ -203,9 +203,13 @@ class RuleSharingE2E(unittest.TestCase):
         self.assertEqual(statuses["reserved_domains"], "ok")
         # Never claims satisfiability -- the bindings cannot answer it.
         self.assertEqual(statuses["unrealizable"], "unavailable")
-        self.assertIn(BOB, report["composed_rule"])
+        self.assertEqual(statuses["compile"], "ok")
+        self.assertEqual(set(report), {
+            "offer_id", "acceptor_pubkey", "target_stream", "status", "verdict",
+            "advisory", "layers", "supported_target_streams",
+        })
 
-    def test_accept_registers_the_clause_and_emits_a_composite(self):
+    def test_accept_registers_the_clause_without_touching_the_interpreter(self):
         offer_id = self._offer(SK_ALICE, ALICE, BOB)
         self._mine()
         self.rule_calls.clear()
@@ -222,14 +226,9 @@ class RuleSharingE2E(unittest.TestCase):
         row = next(r for r in db.load_rule_offers() if r["offer_id"] == offer_id)
         self.assertEqual(row["status"], STATUS_ACCEPTED)
 
-        composites = [r for r in self.rule_calls if "i12" in r]
-        self.assertTrue(composites, "no composite rule was applied")
-        self.assertIn(BOB, composites[-1])
-        # One guarded unit, not an accumulation.
-        self.assertEqual(composites[-1].count("always"), 1)
+        self.assertEqual(self.rule_calls, [])
 
     def test_two_acceptors_keep_independent_policies(self):
-        """The regression the composite design exists to prevent."""
         first = self._offer(SK_ALICE, ALICE, BOB)
         second = self._offer(SK_ALICE, ALICE, CAROL)
         self._mine()
@@ -245,10 +244,7 @@ class RuleSharingE2E(unittest.TestCase):
         }
         self.assertIn((BOB, TARGET), clauses, "first acceptor's clause was lost")
         self.assertIn((CAROL, TARGET), clauses)
-
-        composites = [r for r in self.rule_calls if "i12" in r]
-        self.assertIn(BOB, composites[-1])
-        self.assertIn(CAROL, composites[-1])
+        self.assertEqual(self.rule_calls, [])
 
     def test_accepting_again_replaces_the_acceptors_clause(self):
         first = self._offer(SK_ALICE, ALICE, BOB, rule_text=BLOCK_RULE)
@@ -355,7 +351,6 @@ class RuleSharingE2E(unittest.TestCase):
         self._mine()
 
         before = chain_state._lifecycle_manager.consensus_meta_hash()
-        composite_before = chain_state._lifecycle_manager.rule_offers.composite_for_stream(TARGET)
 
         from consensus.governance import ConsensusLifecycleManager
         chain_state._lifecycle_manager = ConsensusLifecycleManager()
@@ -365,9 +360,6 @@ class RuleSharingE2E(unittest.TestCase):
         self.assertEqual(reloaded.rule_offers.clause_for(BOB, TARGET),
                          clause_body_v1(BLOCK_RULE))
         self.assertEqual(reloaded.consensus_meta_hash(), before)
-        self.assertEqual(
-            reloaded.rule_offers.composite_for_stream(TARGET), composite_before
-        )
 
 
 if __name__ == "__main__":

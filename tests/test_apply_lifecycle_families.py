@@ -27,9 +27,11 @@ import tau_journal as tj
 import tau_proposal as tp
 import tau_reconstruction as tr
 from consensus.approvals import ApprovalRequest
+from consensus import sender_policy
 from consensus.engine import TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager
-from consensus.rule_offers import RuleOffer
+from consensus.policy_mock import MockPolicyEvaluator
+from consensus.rule_offers import RuleOffer, clause_body_v1
 from consensus.state import TauStateSnapshot
 from consensus.tx_signing import signing_message_bytes
 
@@ -268,31 +270,44 @@ def _accept_tx(offer, fee_limit="10000", sk=SK_BOB):
     }, sk)
 
 
-def test_a_rejected_composite_leaves_the_offer_book_untouched(temp_database):
-    """`submit_decision` runs BEFORE the composite is evaluated.
-
-    So an accept whose composite the engine refuses has already resolved the
-    offer and registered the acceptor's clause by the time the transaction
-    hard-rejects. Ownership is the only thing that takes that back -- the
-    decision was recorded on a clone.
-    """
-    lifecycle = _lifecycle()
-    offer = _offer()
-    # Park the offer with an affordable transaction first.
-    _run([_offer_tx(offer, fee_limit="10000")], lifecycle)
-    assert offer.offer_id in lifecycle.rule_offers.offered
-
-    proposal, result, session = _run(
-        [_accept_tx(offer)], lifecycle, rule_accepted=False,
-    )
-
-    assert result.rejected_transactions, "a refused composite must hard-reject"
-    assert session.rules_seen, "the composite was never evaluated, so this proves nothing"
+def _assert_accept_left_nothing_behind(lifecycle, offer, result):
+    assert result.rejected_transactions, "the accept must hard-reject"
     assert offer.offer_id in lifecycle.rule_offers.offered, \
         "a rejected acceptance resolved the offer anyway"
     assert offer.offer_id not in lifecycle.rule_offers.resolved
     assert lifecycle.rule_offers.accepted_clauses == {}, \
         "a rejected acceptance registered the acceptor's clause"
+
+
+def test_an_accept_whose_clause_does_not_build_leaves_the_offer_book_untouched(
+        temp_database):
+    lifecycle = _lifecycle()
+    offer = _offer()
+    _run([_offer_tx(offer, fee_limit="10000")], lifecycle)
+    assert offer.offer_id in lifecycle.rule_offers.offered
+
+    evaluator = MockPolicyEvaluator(pool="apply")
+    evaluator.fail_build(clause_body_v1(offer.rule_text), "Syntax Error")
+    sender_policy.set_evaluator("apply", evaluator)
+    try:
+        proposal, result, session = _run([_accept_tx(offer)], lifecycle)
+    finally:
+        sender_policy.set_evaluator("apply", None)
+
+    _assert_accept_left_nothing_behind(lifecycle, offer, result)
+    assert evaluator.validate_calls, "the clause was never built, so this proves nothing"
+
+
+def test_an_accept_rejected_on_its_fee_leaves_the_offer_book_untouched(temp_database):
+    """The decision is recorded on a clone, so a rejection after it took effect
+    on the clone takes nothing with it."""
+    lifecycle = _lifecycle()
+    offer = _offer()
+    _run([_offer_tx(offer, fee_limit="10000")], lifecycle)
+
+    proposal, result, session = _run([_accept_tx(offer, fee_limit="1")], lifecycle)
+
+    _assert_accept_left_nothing_behind(lifecycle, offer, result)
 
 
 def test_an_accepted_offer_still_registers_its_clause(temp_database):

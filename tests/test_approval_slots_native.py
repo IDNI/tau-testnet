@@ -18,10 +18,6 @@ schema was frozen, and two of them contradicted the first draft of the plan.
    process restarts. This is why the clause screen is reject-unless-annotated
    rather than reject-on-mismatch.
 
-4. THE COST CEILING IS REAL. Two policy authors build inside COMM_TIMEOUT; four
-   do not (measured ~110s against a 60s timeout with a watchdog kill past it).
-   MAX_TIER_AUTHORS = 2 comes from this measurement, not from taste.
-
 Run these individually: the full native suite has a pre-existing teardown crash.
 Set TAU_NATIVE_PYTHON when the venv and the built `tau.cpython-3XX-*.so` disagree
 on ABI, or every case silently skips.
@@ -137,7 +133,7 @@ def cascade_tier(auth=AUTH, scan=SCAN, partner=PARTNER, t1=T1, t2=T2, t3=T3):
 
 
 def compose(clauses):
-    """Mirror consensus.rule_offers.compose_stream_rule: sorted by raw key."""
+    """A sender-guarded ?: chain over i12, sorted by raw key."""
     expr = o5(1)
     for pk, body in sorted(clauses.items(), reverse=True):
         expr = "(" + guard(pk) + " ? ( " + body + " ) : " + expr + ")"
@@ -375,66 +371,8 @@ emit(res)
 
 
 # ---------------------------------------------------------------------------
-# 3. The cost ceiling that sets MAX_TIER_AUTHORS
+# 3. The slot block
 # ---------------------------------------------------------------------------
-
-@requires_native
-def test_two_policy_authors_stay_isolated_and_the_build_cost_stays_bounded(tmp_path):
-    """Two guards in one child, because the build is the expensive part.
-
-    ISOLATION is the strict assertion: both authors' policies must still be in
-    force. A composite that loses one author is the exact regression it exists to
-    prevent, and it is what a second appended rule unit would cause.
-
-    COST is asserted loosely, and deliberately so. These children run with
-    `TAU_SHRINK_ENABLED=false`, which makes the build roughly SIX TIMES dearer
-    than production: tau_shrink interns the bv[384] pubkey literals down to
-    bv[8], and two authors measured 13-22s with shrink on versus ~122s with it
-    off. So the production headroom against the 60s COMM_TIMEOUT cannot be
-    checked from here; what can be checked is that nobody has made a clause
-    dramatically dearer -- reintroducing the nested cascade, for instance, was
-    ~2.5x the flat form. The ceiling below is that regression alarm, not a
-    production budget.
-    """
-    proc, parsed = _run_child(tmp_path, "cost_two_authors", r'''
-res = {}
-authors = {ALICE: flat_tier(), BOB: flat_tier(auth=SCAN, scan=PARTNER, partner=AUTH)}
-iface, build_s = iface_from(BASE, compose(authors))
-res["build_s"] = build_s
-res["alice_blocked"] = str(step(iface, ALICE, 1001, {}).get(5))
-res["alice_allowed"] = str(step(iface, ALICE, 1001, {18: AUTH}).get(5))
-res["bob_blocked"] = str(step(iface, BOB, 1001, {}).get(5))
-res["bob_allowed"] = str(step(iface, BOB, 1001, {18: SCAN}).get(5))
-emit(res)
-''')
-    _assert_ok(proc, parsed)
-
-    assert parsed["alice_blocked"] == "0" and parsed["alice_allowed"] == "1", parsed
-    assert parsed["bob_blocked"] == "0" and parsed["bob_allowed"] == "1", (
-        "the second author's policy is not in force; a composite that loses one "
-        f"author is the regression it exists to prevent: {parsed}"
-    )
-
-    # Shrink-off reference: ~122s measured 2026-09-01 for two flat-form authors.
-    # Production (shrink on) was 13-22s for the same shape.
-    SHRINK_OFF_CEILING = 300
-    assert parsed["build_s"] < SHRINK_OFF_CEILING, (
-        f"two authors took {parsed['build_s']}s to build with shrink off, over "
-        f"the {SHRINK_OFF_CEILING}s regression ceiling (reference: ~122s). A "
-        f"clause shape has become much dearer; re-measure with shrink ON before "
-        f"trusting MAX_TIER_AUTHORS."
-    )
-
-
-def test_the_cap_matches_what_the_measurement_supports():
-    """Pure unit: a cap above 2 has never been measured as safe."""
-    from consensus.approvals import MAX_TIER_AUTHORS
-
-    assert MAX_TIER_AUTHORS <= 2, (
-        "raising MAX_TIER_AUTHORS needs a fresh measurement: four authors was "
-        "~110s against a 60s COMM_TIMEOUT"
-    )
-
 
 def test_the_slot_block_is_what_the_native_cases_assume():
     """The children hardcode i18/i19/i20, so a moved slot base must fail here

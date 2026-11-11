@@ -6,10 +6,10 @@ a live node over its TCP RPC with the NATIVE engine, so it exercises the parts
 that only exist at runtime: real rule compilation, the live interpreter, the
 restore plan on restart, and actual transfer admission under an accepted policy.
 
-It found the accumulation bug that the mocked test could not see: composites
-were appended to the application-rules spec instead of being derived from the
-clause registry, so the spec grew one composite per acceptance and the net
-policy depended on replay order.
+It found the accumulation bug that the mocked test could not see: clauses
+were appended to the application-rules spec instead of being held in the
+clause registry, so the spec grew with every acceptance and the net policy
+depended on replay order.
 
 USAGE
     # 1. Provision an isolated node directory (its own data/, keys, genesis)
@@ -249,8 +249,8 @@ def scenario_offer_accept_isolation(n: Node):
     n.decide("bob", oid, True, BLOCK_RULE)
     n.mine()
     check("bob has one clause", len(n.clauses("bob")) == 1)
-    # The composite is derived from the registry, never appended.
-    check("accumulation carries no composite",
+    # A registered clause lives in the registry, never in the accumulation.
+    check("accumulation carries no clause",
           not any("i12" in u for u in n.spec_units()),
           f"{len(n.spec_units())} units")
 
@@ -264,7 +264,7 @@ def scenario_offer_accept_isolation(n: Node):
 def scenario_second_acceptor(n: Node):
     say("== a second acceptor must not disturb the first ==")
     n.offer_and_accept("alice", "carol", BLOCK_RULE)
-    check("accumulation still carries no composite",
+    check("accumulation still carries no clause",
           not any("i12" in u for u in n.spec_units()), f"{len(n.spec_units())} units")
     check("bob has one clause", len(n.clauses("bob")) == 1)
     check("carol has one clause", len(n.clauses("carol")) == 1)
@@ -312,7 +312,7 @@ def snapshot(n: Node, path):
 
 
 def scenario_after_restart(n: Node, path):
-    say("== after restart: the composite must be rebuilt from the registry ==")
+    say("== after restart: the clauses must be restored from the registry ==")
     snap = json.load(open(path))
     blocks = n.rpc("getblocks")["data"]["blocks"]
     tip = max(blocks, key=lambda b: int(b["header"]["block_number"]))

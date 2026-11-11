@@ -215,8 +215,55 @@ def test_conflict_report_is_advisory_and_layered(container):
     assert layers["shape"]["status"] == "ok"
     assert layers["reserved_domains"]["status"] == "ok"
     assert layers["bv_widths"]["status"] == "ok"
-    # The composed rule is what would actually enter the specification.
-    assert data["composed_rule"] and B in data["composed_rule"]
+    assert layers["compile"]["status"] == "ok"
+    assert set(data) == {
+        "offer_id", "acceptor_pubkey", "target_stream", "status", "verdict",
+        "advisory", "layers", "supported_target_streams",
+    }
+
+
+@pytest.fixture
+def admission_evaluator():
+    from consensus import sender_policy
+    from consensus.policy_mock import MockPolicyEvaluator
+
+    evaluator = MockPolicyEvaluator(pool="admission")
+    sender_policy.set_evaluator("admission", evaluator)
+    getruleconflict._CACHE.clear()
+    yield evaluator
+    sender_policy.set_evaluator("admission", None)
+    getruleconflict._CACHE.clear()
+
+
+def test_conflict_report_builds_the_offered_clause_once(container, admission_evaluator):
+    _seed(offers=[_offer_row()])
+    _call(getruleconflict, f"getruleconflict {_offer_id()}", container)
+    assert admission_evaluator.validate_calls == [clause_body_v1(RULE)]
+
+
+def test_conflict_report_flags_a_clause_that_does_not_build(container, admission_evaluator):
+    admission_evaluator.fail_build(clause_body_v1(RULE), "Incompatible type information")
+    _seed(offers=[_offer_row()])
+    data = _call(getruleconflict, f"getruleconflict {_offer_id()}", container)["data"]
+    layer = _layers(data)["compile"]
+    assert layer["status"] == "conflict"
+    assert "Incompatible type information" in layer["detail"]
+    assert data["verdict"] == "conflict"
+
+
+@pytest.mark.parametrize("name", ["WorkerTimeout", "WorkerLost"])
+def test_conflict_report_is_unknown_when_the_evaluator_is_unavailable(
+        container, admission_evaluator, name):
+    import tau_speculation
+
+    def _fail(body, *, timeout=None):
+        raise getattr(tau_speculation, name)("gone")
+
+    admission_evaluator.validate = _fail
+    _seed(offers=[_offer_row()])
+    data = _call(getruleconflict, f"getruleconflict {_offer_id()}", container)["data"]
+    assert _layers(data)["compile"]["status"] == "unknown"
+    assert data["verdict"] == "warn"
 
 
 def test_conflict_report_never_claims_satisfiability(container):
@@ -274,8 +321,6 @@ def test_conflict_report_lists_other_acceptors(container):
     data = _call(getruleconflict, f"getruleconflict {_offer_id()}", container)["data"]
     layer = _layers(data)["registry_collision"]
     assert layer["other_acceptors"] == [C]
-    # The composite must retain the other acceptor.
-    assert C in data["composed_rule"] and B in data["composed_rule"]
 
 
 def test_conflict_report_detects_a_width_clash_statically(container):

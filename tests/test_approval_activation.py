@@ -277,8 +277,8 @@ def test_a_slot_named_only_in_a_comment_is_not_a_collision():
 
 
 def test_a_legacy_raw_o5_writer_blocks_activation():
-    """The first derived composite would be a second total-form unit on o5
-    beside it, and two of those either fail to conjoin or supersede each other."""
+    """A raw o5 rule keeps writing o5 on the main interpreter beside the
+    per-account clauses, so activation is refused."""
     texts = [("application_rules",
               "always ( (i12[t]:bv[384] = { #x" + A + " }:bv[384]) -> "
               "(o5[t]:bv[24] = { #x000000 }:bv[24]) ).")]

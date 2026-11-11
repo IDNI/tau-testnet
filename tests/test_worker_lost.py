@@ -25,7 +25,7 @@ import tau_reconstruction as tr
 import tau_session
 import tau_speculation as spec
 from bls_keys import SK_ALICE, pubkey_hex, sign_tx
-from consensus.engine import TauConsensusEngine, _apply_composite_rule
+from consensus.engine import TauConsensusEngine
 from consensus.state import TauStateSnapshot
 from errors import EvaluatorLost, TauTestnetError
 
@@ -201,18 +201,6 @@ def test_an_ordinary_failure_at_the_same_call_is_still_a_rejection(
     proposal = _proposal(session)
     result = _apply(session, proposal, tx())
     assert result.rejected_transactions, result
-
-
-def test_a_composite_rule_does_not_report_a_lost_worker_as_a_refusal():
-    session = _LostSession("apply_rule")
-    with pytest.raises(spec.WorkerLost):
-        _apply_composite_rule(RULE, {"logs": []}, session=session)
-
-
-def test_a_composite_rule_still_reports_an_ordinary_failure_as_a_refusal():
-    session = _LostSession("apply_rule", failure=lambda: RuntimeError("boom"))
-    ok, detail = _apply_composite_rule(RULE, {"logs": []}, session=session)
-    assert (ok, detail) == (False, "boom")
 
 
 def test_a_healthy_session_gives_the_same_verdicts(temp_database):

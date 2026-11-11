@@ -2,8 +2,8 @@
 
     A  accepted rule transaction
     B  changes policy, lifecycle, allocator and evaluator -- then is rejected
-    C  accepted, and SENSITIVE to B: its composite is composed from the clause
-       registry, so a surviving B clause changes the very text C installs
+    C  accepted, and SENSITIVE to B: a surviving B clause in the registry, or a
+       dirty evaluator left by B's fee step, would change C's outcome
     D  accepted lifecycle operation (a rule offer)
 
 The control block is A, C, D with B never submitted. Every observable is
@@ -12,8 +12,8 @@ clause registry, the offer book, the approval book, application-rule state, the
 journal head, the allocator delta, and the evaluator's own counters.
 
 B is a genuine contaminant rather than a no-op. It registers a clause (lifecycle
-+ registry), interns its own pubkey (allocator), installs a recomposed composite
-(evaluator), and only then fails fee settlement.
++ registry), interns its own pubkey (allocator), builds its clause in the policy
+evaluator, steps the main evaluator for its fee, and only then fails settlement.
 """
 import os
 
@@ -256,9 +256,6 @@ def test_b_really_did_contaminate_before_it_was_rejected(temp_database):
         logs = " ".join(result.receipts["B"]["logs"])
         assert "o5 clause registered" in logs, (
             f"B never registered its clause, so it contaminated nothing: {logs}"
-        )
-        assert "Tau(composite)" in logs, (
-            f"B never installed a composite, so the evaluator was untouched: {logs}"
         )
         # The evaluator was rebuilt: C's branch found the proposal dirty on its
         # way in and reconstructed before running. `dirty` is therefore already

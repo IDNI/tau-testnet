@@ -1,10 +1,10 @@
-"""A block that revised a policy composite ends with the evaluator collapsed.
+"""A block that activated a governance revision ends with the evaluator collapsed.
 
-The engine keeps every regenerated o5 composite as an extra alternative, so apply
-and step cost grow with each replacement unless the proposal's evaluator is
-rebuilt from the restore plan once the block's transactions are done. The
-collapse is recorded as a RESET, so a reconstruction collapses at the same point,
-and the advisory mirror follows it instead of layering composites.
+An activation layers through i0 on top of the hashed state, so apply and step
+cost would grow unless the proposal's evaluator is rebuilt from the restore plan
+once the block's transactions are done. The collapse is recorded as a RESET, so
+a reconstruction collapses at the same point, and the advisory mirror follows it.
+Registering a clause touches no evaluator, so it triggers no collapse.
 """
 import hashlib
 import itertools
@@ -19,10 +19,12 @@ import tau_journal as tj
 import tau_proposal as tp
 import tau_reconstruction as tr
 from block import Block
+from consensus import sender_policy
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.fees import FeeRuleError
 from consensus.governance import ConsensusLifecycleManager, ConsensusRuleUpdate
-from consensus.rule_offers import RuleOffer
+from consensus.policy_mock import MockPolicyEvaluator
+from consensus.rule_offers import RuleOffer, clause_body_v1
 from consensus.state import TauStateSnapshot
 from consensus.tx_signing import signing_message_bytes
 
@@ -229,68 +231,33 @@ def _expected_units(result):
     plan = chain_state.restore_plan_for(
         meta["consensus_rules_state"],
         result.next_snapshot.tau_bytes.decode("utf-8"),
-        lifecycle=meta["lifecycle_manager"],
     )
     return [(str(u["text"]), bool(u["persist"])) for u in plan if str(u["text"]).strip()]
 
 
 # --- the collapse -------------------------------------------------------------
 
-def test_an_accepted_offer_composite_ends_the_block_with_one_reset(temp_database):
-    proposal, session, result = _run(_accepted_offer_txs())
+def test_an_activation_ends_the_block_with_one_reset(temp_database):
+    proposal, session, result = _run([], lm=_lifecycle(update=_update()))
 
-    assert len(result.accepted_tx_ids) == 2, result.outcomes
-    entries = proposal.journal.entries()
-    assert [e.kind for e in entries].count(tj.RESET) == 1, [e.kind for e in entries]
-    assert entries[-1].kind == tj.RESET
-    assert any(e.kind == tj.REVISION and not e.accumulate for e in entries[:-1]), (
-        "the composite never reached the proposal journal, so nothing triggered the collapse"
-    )
-
-    lm = result.next_snapshot.metadata["lifecycle_manager"]
-    composite = lm.rule_offers.composite_for_stream(tau_defs.USER_POLICY_STREAM_INDEX)
-    units = list(entries[-1].units)
-    assert units == _expected_units(result)
-    assert composite in [text for text, _ in units], (
-        "the collapsed evaluator does not carry the registry composite"
-    )
+    resets = _resets(proposal)
+    assert len(resets) == 1, [e.kind for e in proposal.journal.entries()]
+    assert proposal.journal.entries()[-1].kind == tj.RESET
+    texts = [text for text, _ in resets[0].units]
+    assert any("o9" in text for text in texts), "the activated rule is missing"
+    assert list(resets[0].units) == _expected_units(result)
     assert proposal.session is not session, "the evaluator was not re-initialized"
 
 
-def test_a_routed_o5_clause_ends_the_block_with_one_reset(temp_database):
-    proposal, session, result = _run([_routed_o5_tx()], lm=_lifecycle(slots=True))
-
-    assert result.accepted_tx_ids, result.outcomes
-    assert len(_resets(proposal)) == 1
-    assert proposal.journal.entries()[-1].kind == tj.RESET
-    assert proposal.session is not session
-
-
-def test_several_composites_in_one_block_collapse_once(temp_database):
-    txs = (_accepted_offer_txs(recipient=BOB, sk=SK_BOB, offerer_seq=0)
-           + _accepted_offer_txs(recipient=CAROL, sk=SK_CAROL, offerer_seq=1))
-    proposal, session, result = _run(txs)
-
-    assert len(result.accepted_tx_ids) == 4, result.outcomes
-    entries = proposal.journal.entries()
-    composites = [e for e in entries if e.kind == tj.REVISION and not e.accumulate]
-    assert len(composites) == 2
-    assert len(_resets(proposal)) == 1
-    assert entries[-1].kind == tj.RESET
-
-
-def test_the_collapse_covers_both_the_activation_and_a_composite(temp_database):
+def test_the_collapse_after_an_activation_carries_no_clause(temp_database):
     proposal, session, result = _run(
         _accepted_offer_txs(), lm=_lifecycle(update=_update()),
     )
 
     assert len(result.accepted_tx_ids) == 2, result.outcomes
     resets = _resets(proposal)
-    assert len(resets) == 1, [e.kind for e in proposal.journal.entries()]
-    assert proposal.journal.entries()[-1].kind == tj.RESET
-    texts = [text for text, _ in resets[0].units]
-    assert any("o9" in text for text in texts), "the activated rule is missing"
-    assert any("i12" in text for text in texts), "the registry composite is missing"
+    assert len(resets) == 1
+    assert not any("i12" in text for text, _ in resets[0].units)
     assert list(resets[0].units) == _expected_units(result)
 
 
@@ -314,25 +281,43 @@ def test_an_empty_block_leaves_the_evaluator_alone(temp_database):
     assert proposal.session is session
 
 
-def test_a_rejected_composite_leaves_the_evaluator_alone(temp_database):
-    proposal, session, result = _run(_accepted_offer_txs(), rule_accepted=False)
+def test_an_accepted_offer_leaves_the_evaluator_alone(temp_database):
+    proposal, session, result = _run(_accepted_offer_txs())
 
-    assert result.invalid_tx_ids, "a refused composite must hard-reject"
-    assert any(not accumulate for _, accumulate in session.rules_seen), (
-        "the composite was never evaluated, so this proves nothing"
-    )
-    assert proposal.journal.entries() == [], (
-        "a rejected transaction's execution is part of the accepted journal"
-    )
+    assert len(result.accepted_tx_ids) == 2, result.outcomes
+    lm = result.next_snapshot.metadata["lifecycle_manager"]
+    assert lm.rule_offers.clause_for(BOB, tau_defs.USER_POLICY_STREAM_INDEX) is not None
+    assert session.rules_seen == []
+    assert proposal.journal.entries() == []
+    assert proposal.session is session
+
+
+def test_a_routed_o5_clause_leaves_the_evaluator_alone(temp_database):
+    proposal, session, result = _run([_routed_o5_tx()], lm=_lifecycle(slots=True))
+
+    assert result.accepted_tx_ids, result.outcomes
+    assert session.rules_seen == []
+    assert proposal.journal.entries() == []
+    assert proposal.session is session
+
+
+def test_a_clause_that_does_not_build_is_rejected_and_leaves_the_evaluator_alone(
+        temp_database):
+    evaluator = MockPolicyEvaluator(pool="apply")
+    evaluator.fail_build(clause_body_v1(OFFER_RULE), "Syntax Error")
+    sender_policy.set_evaluator("apply", evaluator)
+    try:
+        proposal, session, result = _run(_accepted_offer_txs())
+    finally:
+        sender_policy.set_evaluator("apply", None)
+
+    assert result.invalid_tx_ids, "a clause that does not build must hard-reject"
+    assert evaluator.validate_calls, "the clause was never built, so this proves nothing"
+    assert proposal.journal.entries() == []
     assert proposal.session is session
 
 
 # --- a refused collapse -------------------------------------------------------
-
-def test_a_refused_collapse_after_a_composite_fails_the_block(temp_database):
-    with pytest.raises(FeeRuleError, match="policy revision"):
-        _run(_accepted_offer_txs(), reset_accepted=False)
-
 
 def test_a_refused_collapse_after_an_activation_fails_the_block(temp_database):
     with pytest.raises(FeeRuleError, match="governance activation"):

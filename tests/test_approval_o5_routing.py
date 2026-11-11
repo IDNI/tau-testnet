@@ -6,13 +6,13 @@ WHY
 measured what that does on a shared stream: two guarded total-form rules on o5
 conjoin to unsatisfiable, and fed sequentially through i0 the later silently
 supersedes the earlier. So the second user to deploy a policy rule knocks out the
-first. The accepted-clause registry and its derived composite exist to fix that,
+first. The accepted-clause registry exists to fix that,
 but the only door in was someone else offering you a rule. Routing is the missing
 self-service door.
 
 The inversion worth noticing: an accumulated rule MUST carry an `i12` sender
 guard (or it applies to everyone), while a registered clause must NOT (the
-composite supplies the guard). So the screens swap over at activation, and the
+node supplies the guard). So the screens swap over at activation, and the
 error message has to say which form is wanted.
 """
 import pytest
@@ -24,7 +24,6 @@ from consensus.admission import (
     validate_o5_clause_routing,
     validate_user_tx_reserved_domains,
 )
-from consensus.approvals import MAX_TIER_AUTHORS
 from consensus.rule_offers import NEUTRAL_O5_CLAUSE_BODY
 
 A = "1a" * 48
@@ -59,7 +58,6 @@ def tip_view():
     view.eligibility_mode = ""
     view.approval_slots_active = True
     view.clause_for.return_value = None
-    view.clause_author_count.return_value = 0
     return view
 
 
@@ -145,7 +143,7 @@ def test_an_untyped_slot_is_refused(tip_view):
     assert result.is_valid is False
 
 
-# --- revocation and the author cap ------------------------------------------
+# --- revocation ------------------------------------------
 
 def test_the_neutral_body_revokes(tip_view):
     result = _route(_tx(NEUTRAL_RULE), tip_view)
@@ -153,29 +151,20 @@ def test_the_neutral_body_revokes(tip_view):
     assert result.data["o5_clause_action"] == "revoke"
 
 
-def test_a_new_author_is_refused_when_the_registry_is_full(tip_view):
-    tip_view.clause_author_count.return_value = MAX_TIER_AUTHORS
-    result = _route(_tx(TIER_RULE), tip_view)
-    assert result.is_valid is False and result.code == "CLAUSE_REGISTRY_FULL"
-    assert "MEASURED" in result.error, "the cap is a measurement, say so"
-    assert NEUTRAL_O5_CLAUSE_BODY in result.error, "tell them how to free a slot"
-
-
-def test_an_existing_author_may_replace_their_clause_when_full(tip_view):
-    """Replacing does not grow the composite, so the cap must not block it."""
-    tip_view.clause_author_count.return_value = MAX_TIER_AUTHORS
+def test_an_existing_author_may_replace_their_clause(tip_view):
     tip_view.clause_for.return_value = EXISTING_CLAUSE
     result = _route(_tx(TIER_RULE), tip_view)
     assert result.is_valid is True
     assert result.data["o5_clause_action"] == "declare"
 
 
-def test_revocation_is_never_capped(tip_view):
-    """Otherwise the cap becomes a permanent land-grab by the first authors."""
-    tip_view.clause_author_count.return_value = MAX_TIER_AUTHORS
-    result = _route(_tx(NEUTRAL_RULE), tip_view)
+def test_a_new_author_is_admitted_however_many_clauses_exist(tip_view):
+    tip_view.clauses_for_stream.return_value = {
+        format(i, "096x"): EXISTING_CLAUSE for i in range(200)
+    }
+    result = _route(_tx(TIER_RULE), tip_view)
     assert result.is_valid is True
-    assert result.data["o5_clause_action"] == "revoke"
+    assert result.data["o5_clause_action"] == "declare"
 
 
 # --- the per-block budget ---------------------------------------------------

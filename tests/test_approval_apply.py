@@ -482,7 +482,7 @@ def rule_tx(rule, sk=SK_ALICE, sender=None, seq=0):
     return _sign(tx, sk)
 
 
-def _composite_feeds():
+def _clause_units_fed():
     return [c for c in _apply.single_calls if "always" in str(c.get("rule_text", ""))]
 
 
@@ -494,16 +494,9 @@ def test_an_o5_rule_registers_a_clause_instead_of_accumulating():
     assert "Rule applied" not in logs, "it must not take the accumulation path"
 
 
-def test_the_registered_clause_is_composed_with_the_sender_guard():
+def test_registering_a_clause_feeds_nothing_to_the_main_interpreter():
     _apply([rule_tx(UNGUARDED_RULE)])
-    feeds = _composite_feeds()
-    assert feeds, "a composite must be fed"
-    text = str(feeds[-1]["rule_text"])
-    assert ALICE in text, "the node supplies the i12 guard"
-    assert "i18[t]:bv[384]" in text
-    # Never accumulated: save_effective_tau_spec dedups exact units only, so
-    # appending regenerated composites would leave every earlier one in place.
-    assert feeds[-1].get("apply_rules_update") is False
+    assert not _clause_units_fed()
 
 
 def test_the_old_guarded_form_is_ignored_softly():
@@ -512,17 +505,12 @@ def test_the_old_guarded_form_is_ignored_softly():
     assert "o5 clause ignored" in _logs(result)
 
 
-def test_revocation_removes_the_clause_and_feeds_a_neutral_composite():
-    """Feeding nothing would leave the previous composite in force on a running
-    interpreter while a restarted node allowed the transfer -- one block, two
-    verdicts."""
+def test_revocation_removes_the_clause_and_feeds_nothing():
     lm = _lm()
     result, post, _ = _apply([rule_tx(UNGUARDED_RULE), rule_tx(NEUTRAL_RULE, seq=1)], lm=lm)
     assert post.rule_offers.clause_for(ALICE, 5) is None
     assert "o5 clause revoked" in _logs(result)
-    text = str(_composite_feeds()[-1]["rule_text"])
-    assert "o5[t]:bv[24] = { #x000001 }:bv[24]" in text
-    assert ALICE not in text, "nobody is guarded any more"
+    assert not _clause_units_fed()
 
 
 def test_revoking_nothing_is_a_no_op():
@@ -551,24 +539,9 @@ def test_another_senders_requests_are_untouched_by_a_policy_change():
     assert post.approval_requests.get_request(mine.request_id) is not None
 
 
-def test_the_author_cap_is_enforced_at_apply():
-    from consensus.approvals import MAX_TIER_AUTHORS
-
-    lm = _lm()
-    for i in range(MAX_TIER_AUTHORS):
-        lm.rule_offers.accepted_clauses[(("%02x" % (i + 1)) * 48, 5)] = TIER_CLAUSE_BODY
-    result, post, _ = _apply([rule_tx(UNGUARDED_RULE)], lm=lm)
-    assert post.rule_offers.clause_for(ALICE, 5) is None
-    assert "registry full" in _logs(result)
-
-
-def test_an_existing_author_may_replace_when_full():
-    from consensus.approvals import MAX_TIER_AUTHORS
-
+def test_an_author_replaces_their_own_clause():
     lm = _lm()
     lm.rule_offers.accepted_clauses[(ALICE, 5)] = "(o5[t]:bv[24] = { #x000000 }:bv[24])"
-    for i in range(MAX_TIER_AUTHORS - 1):
-        lm.rule_offers.accepted_clauses[(("%02x" % (i + 1)) * 48, 5)] = TIER_CLAUSE_BODY
     result, post, _ = _apply([rule_tx(UNGUARDED_RULE)], lm=lm)
     assert post.rule_offers.clause_for(ALICE, 5) == TIER_CLAUSE_BODY
 

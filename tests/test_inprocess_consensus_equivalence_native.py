@@ -2,7 +2,7 @@
 
 Under worker-backed authority that interpreter only carries the consensus unit;
 this pins that its header/eligibility answers equal those of an interpreter that
-also replayed the builtin rules and an o5 composite. Each phase runs in its own
+also replayed the builtin rules and a sender-guarded o5 rule. Each phase runs in its own
 process: stream typing is process-global in the native engine.
 """
 import json
@@ -40,7 +40,6 @@ db._db_conn = None
 db.init_db()
 import chain_state, tau_manager, tau_native, tau_shrink
 from consensus.engine import TauConsensusEngine
-from consensus.rule_offers import compose_stream_rule
 
 def bv24(n): return "{ #x" + format(n, "06x") + " }:bv[24]"
 def bv384(h): return "{ #x" + h + " }:bv[384]"
@@ -54,12 +53,15 @@ def tier(i):
 
 with open(os.path.join(os.environ["REPO"], "data", "genesis.json")) as fh:
     cons = json.load(fh)["consensus_rules"]
-plan = chain_state.restore_plan_for(cons, "", lifecycle=None)
+plan = chain_state.restore_plan_for(cons, "")
 if mode == "cons":
     plan = [e for e in plan if e["label"] == "consensus_rules"]
 else:
-    plan.append({"label": "rule_composite_o5", "persist": False,
-                 "text": compose_stream_rule(5, {key("ab", i): tier(i) for i in (1, 2, 3)})})
+    chain = "(o5[t]:bv[24] = " + bv24(1) + ")"
+    for i in (3, 2, 1):
+        chain = "((i12[t]:bv[384] = " + bv384(key("ab", i)) + ") ? ( " + tier(i) + " ) : " + chain + ")"
+    plan.append({"label": "application_rule_1", "persist": False,
+                 "text": "always ( " + chain + " )."})
 tau_manager._print_tau_send = lambda *a, **k: None
 tau_manager.tau_direct_interface = tau_native.TauInterface(config.TAU_PROGRAM_FILE)
 if getattr(config, "TAU_SHRINK_ENABLED", False):

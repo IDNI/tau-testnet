@@ -1,7 +1,7 @@
 """Fast/slow transaction lanes: selection, quotas, eviction, block budget.
 
 Rule-bearing transactions cost orders of magnitude more to apply than coin
-transfers (applying a rule recompiles a composite; a transfer is one cheap
+transfers (applying a rule builds an engine unit; a transfer is one cheap
 step), and both used to share a single ordering key. A burst of rule work
 therefore delayed every queued transfer behind it.
 
