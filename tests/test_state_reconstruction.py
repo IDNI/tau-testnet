@@ -360,8 +360,9 @@ class TestStateReconstruction(unittest.TestCase):
         self.assertEqual(get_balance(self.addr2), 5)
         self.assertEqual(get_balance(self.addr3), 0)  # Invalid transfers should be ignored
         
-        # All sequence numbers should be incremented (even for failed transactions)
-        self.assertEqual(get_sequence_number(self.addr1), 3)  # All 3 transactions attempted
+        # The failed transfer uses its sequence number. Apply refuses the
+        # transaction with the malformed amount, so that one uses none.
+        self.assertEqual(get_sequence_number(self.addr1), 2)
     
     def test_reconstruction_preserves_state_consistency(self):
         """Test that reconstruction produces the same state as live processing."""

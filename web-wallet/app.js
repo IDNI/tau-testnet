@@ -909,17 +909,26 @@ async function onSendTransaction() {
     }
 }
 
+// json.dumps escapes every UTF-16 unit outside 0x20..0x7E, and JSON.stringify does not.
+function asciiJson(value) {
+    return JSON.stringify(value).replace(/[\u007f-\uffff]/g,
+        (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+}
+
 // Helper to match Python's json.dumps(sort_keys=True, separators=(',', ':'))
 function canonicalize(obj) {
-    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
-        return JSON.stringify(obj);
+    if (Array.isArray(obj)) {
+        return '[' + obj.map((v) => (v === undefined ? 'null' : canonicalize(v))).join(',') + ']';
+    }
+    if (obj === null || typeof obj !== 'object') {
+        return asciiJson(obj);
     }
     const keys = Object.keys(obj).sort();
     let str = '{';
     for (let i = 0; i < keys.length; i++) {
         const key = keys[i];
         if (i > 0) str += ',';
-        str += JSON.stringify(key) + ':' + canonicalize(obj[key]);
+        str += asciiJson(key) + ':' + canonicalize(obj[key]);
     }
     str += '}';
     return str;

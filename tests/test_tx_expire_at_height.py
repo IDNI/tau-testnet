@@ -196,7 +196,7 @@ class TestApplyRejectsAnExpiredHeight:
     which the proposer sets. The height gate is the one it cannot move."""
 
     SENDER = pubkey_hex(SK_ALICE)
-    RECIPIENT = "b" * 96
+    RECIPIENT = pubkey_hex(0xB96)  # unique to this file: apply reads other balances from chain_state
 
     @pytest.fixture(autouse=True)
     def engine(self):

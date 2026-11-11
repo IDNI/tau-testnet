@@ -18,6 +18,7 @@ import pytest
 from py_ecc.bls import G2Basic as bls
 from unittest.mock import patch
 
+from bls_keys import SK_CAROL, pubkey_hex
 import chain_state
 import db
 import tau_authority as auth
@@ -31,6 +32,7 @@ from consensus.engine import TauConsensusEngine
 
 REAL_VERIFY = TauConsensusEngine.verify_block_header
 
+TRANSFER_PEER = pubkey_hex(SK_CAROL)
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -96,7 +98,7 @@ def chain(node_state, monkeypatch):
     (sk_a, pk_a), (sk_b, pk_b) = senders
     assert _submit(sk_a, pk_a, {"0": HISTORY_RULE}).get("ok")
     _mine()
-    assert _submit(sk_b, pk_b, {"1": [[pk_b, "aa" * 48, "4"]]}).get("ok")
+    assert _submit(sk_b, pk_b, {"1": [[pk_b, TRANSFER_PEER, "4"]]}).get("ok")
     _mine()
     yield {"owner": owner, "continuation": _continue(owner.current()),
            "head": db.get_canonical_head()["block_hash"]}

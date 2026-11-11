@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from typing import Optional, Set
 
 import config
@@ -341,6 +342,13 @@ class TipAdmissionView:
             return int(head["header"]["timestamp"]) if head else 0
         except Exception:
             return 0
+
+    @property
+    def next_block_timestamp(self) -> int:
+        """Best guess of the next block's timestamp, for admission checks only."""
+        # The tip lags the next block, and the genesis tip has timestamp 0.
+        # Apply judges on the real block timestamp, so the clock cannot split nodes.
+        return max(self.tip_timestamp, int(time.time()))
 
     def _retractable_scalar(self, sql: str, params: tuple = ()) -> int:
         try:

@@ -32,7 +32,7 @@ from py_ecc.bls import G2Basic as _bls
 
 SK_SENDER = _bls.KeyGen(b"checktx_sender")
 SENDER = _bls.SkToPk(SK_SENDER).hex()
-RECIPIENT = "c" * 96
+RECIPIENT = _bls.SkToPk(_bls.KeyGen(b"checktx_recipient")).hex()
 
 
 def _mock_tau_multi_ok(*args, **kwargs):
@@ -54,7 +54,7 @@ class TestChecktx(unittest.TestCase):
         db.init_db()
         chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
+        patch("commands.sendtx.validate_bls_pubkey", return_value=None).start()
         patch("commands.sendtx.tau_manager.communicate_with_tau_multi", _mock_tau_multi_ok).start()
         chain_state._balances[SENDER] = 1000
 

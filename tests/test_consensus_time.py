@@ -11,7 +11,7 @@ import config
 from commands import sendtx, createblock
 from consensus.engine import TauConsensusEngine
 import chain_state, db, block, tau_defs
-from bls_keys import SK_ALICE, pubkey_hex, sign_payload, sign_tx
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_payload, sign_tx
 
 SENDER = pubkey_hex(SK_ALICE)
 
@@ -32,9 +32,8 @@ class TestConsensusTime(unittest.TestCase):
         db.init_db()
         chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
-        patch('commands.sendtx._validate_bls12_381_pubkey', return_value=(True, None)).start()
+        patch('commands.sendtx.validate_bls_pubkey', return_value=None).start()
         patch('commands.createblock._BLS_AVAILABLE', True).start()
-        patch('commands.createblock._validate_signature', return_value=True).start()
         patch('block.bls_signing_available', return_value=True).start()
         patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True).start()
 
@@ -67,14 +66,15 @@ class TestConsensusTime(unittest.TestCase):
     @patch('tau_manager.communicate_with_tau_multi')
     @patch('tau_manager.tau_ready')
     def test_admission_injects_advisory_i5(self, mock_ready, mock_multi, mock_force):
-        """queue_transaction feeds the advisory tip timestamp on i5 per transfer
+        """queue_transaction feeds the advisory next-block timestamp on i5 per transfer
         so time-lock o5 rules can pre-check at admission (apply is authoritative)."""
         mock_ready.is_set.return_value = True
         mock_multi.return_value = {1: "1", 5: "1"}  # o1 success flag, o5 allow
         chain_state._balances[SENDER] = 100000
 
         tip = db.get_canonical_head_block()["header"]["timestamp"]
-        recipient = "ab" * 48
+        clock = tip + 1000
+        recipient = pubkey_hex(SK_BOB)
         tx = {
             "sender_pubkey": SENDER,
             "sequence_number": chain_state.get_sequence_number(SENDER),
@@ -83,7 +83,8 @@ class TestConsensusTime(unittest.TestCase):
             "operations": {"1": [[SENDER, recipient, "1"]]},
             "fee_limit": "1000",
         }
-        res = sendtx.queue_transaction(json.dumps(sign_payload(tx, SK_ALICE)))
+        with patch("consensus.facade.time", MagicMock(time=MagicMock(return_value=clock))):
+            res = sendtx.queue_transaction(json.dumps(sign_payload(tx, SK_ALICE)))
         self.assertTrue(res["ok"], f"queue failed: {res}")
 
         transfer_inputs = [
@@ -93,7 +94,56 @@ class TestConsensusTime(unittest.TestCase):
         ]
         self.assertTrue(transfer_inputs, "no per-transfer Tau call captured")
         self.assertIn(5, transfer_inputs[0], "i5 not injected at admission")
-        self.assertEqual(transfer_inputs[0][5], str(tip))
+        self.assertEqual(transfer_inputs[0][5], str(max(tip, clock)))
+
+    def _queue_transfer_less_tx_at(self, clock):
+        chain_state._balances[SENDER] = 100000
+        tx = {
+            "sender_pubkey": SENDER,
+            "sequence_number": chain_state.get_sequence_number(SENDER),
+            "expiration_time": int(time.time()) + 1000,
+            "expire_at_height": 5000,
+            "operations": {"20": "custom_data"},
+            "fee_limit": "1000",
+        }
+        with patch("consensus.facade.time", MagicMock(time=MagicMock(return_value=clock))):
+            res = sendtx.queue_transaction(json.dumps(sign_payload(tx, SK_ALICE)))
+        self.assertTrue(res["ok"], f"queue failed: {res}")
+
+    @patch('tau_manager.is_force_test_enabled', return_value=False)
+    @patch('tau_manager.communicate_with_tau_multi', return_value={9: "0"})
+    @patch('tau_manager.communicate_with_tau', return_value="ok")
+    @patch('tau_manager.tau_ready')
+    def test_fee_estimate_i5_takes_admission_clock(self, mock_ready, mock_tau, mock_multi, mock_force):
+        mock_ready.is_set.return_value = True
+        tip = db.get_canonical_head_block()["header"]["timestamp"]
+        clock = tip + 1000
+        self._queue_transfer_less_tx_at(clock)
+
+        fee_inputs = [
+            c.kwargs.get("input_stream_values", {})
+            for c in mock_multi.call_args_list
+            if 12 in c.kwargs.get("input_stream_values", {})
+        ]
+        self.assertEqual(len(fee_inputs), 1, "no fee-query Tau call captured")
+        self.assertEqual(fee_inputs[0][5], str(clock))
+
+    @patch('tau_manager.is_force_test_enabled', return_value=False)
+    @patch('tau_admission.open_context')
+    @patch('tau_admission.enabled', return_value=True)
+    def test_unified_context_i5_takes_admission_clock(self, mock_enabled, mock_open, mock_force):
+        context = mock_open.return_value
+        context.step.return_value = {9: "0"}
+        tip = db.get_canonical_head_block()["header"]["timestamp"]
+        clock = tip + 1000
+        self._queue_transfer_less_tx_at(clock)
+
+        unified_inputs = [
+            c.args[0] for c in context.step.call_args_list if 12 not in c.args[0]
+        ]
+        self.assertEqual(len(unified_inputs), 1, "no unified custom step captured")
+        self.assertIn(20, unified_inputs[0])
+        self.assertEqual(unified_inputs[0][5], str(clock))
 
     @patch('tau_manager.communicate_with_tau_multi')
     @patch('tau_manager.communicate_with_tau')
@@ -112,7 +162,7 @@ class TestConsensusTime(unittest.TestCase):
             "expiration_time": int(time.time()) + 1000,
             "expire_at_height": 5000,
             "operations": {
-                "1": [[sender, "some_addr", "1"]],
+                "1": [[sender, pubkey_hex(SK_BOB), "1"]],
                 "20": "custom_data"
             },
             "fee_limit": "0",
@@ -154,7 +204,7 @@ class TestConsensusTime(unittest.TestCase):
             "sender_pubkey": sender,
             "sequence_number": chain_state.get_sequence_number(sender),
             "operations": {
-                "1": [[sender, "some_addr", "1"]],
+                "1": [[sender, pubkey_hex(SK_BOB), "1"]],
                 "20": "custom_data"
             },
         }, SK_ALICE)

@@ -17,7 +17,7 @@ import chain_state
 import db
 import tau_defs
 import consensus.retractable as retractable
-from bls_keys import SK_ALICE, pubkey_hex, sign_payload
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_payload
 from consensus.admission import (
     TipAdmissionView,
     validate_mempool_admission,
@@ -33,9 +33,9 @@ from consensus.retractable import (
     parse_retractable_transfer,
 )
 
-A = "1a" * 48
-B = "2b" * 48
-C = "3c" * 48
+A = pubkey_hex(0x1A)
+B = pubkey_hex(0x2B)
+C = pubkey_hex(0x3C)
 NEXT_HEIGHT = 50
 TIP_TS = 1_700_000_000
 FAR = 9_999_999_999
@@ -46,6 +46,7 @@ def tip_view():
     view = MagicMock(spec=TipAdmissionView)
     view.next_block_height = NEXT_HEIGHT
     view.tip_timestamp = TIP_TS
+    view.next_block_timestamp = TIP_TS
     view.get_retractable.return_value = None
     view.open_retractable_count_for_sender.return_value = 0
     view.open_retractable_count.return_value = 0
@@ -267,7 +268,7 @@ def test_a_malformed_retractable_id_is_refused(tip_view, rid):
 # --- queue_transaction flows -------------------------------------------------
 
 SENDER = pubkey_hex(SK_ALICE)
-RECIPIENT = "c" * 96
+RECIPIENT = pubkey_hex(SK_BOB)
 
 
 @pytest.fixture
@@ -292,7 +293,7 @@ def node(temp_database, monkeypatch):
         patch("tau_manager.communicate_with_tau", return_value="x1001"),
         patch("tau_manager.communicate_with_tau_multi", side_effect=multi),
         patch("commands.sendtx.chain_state.get_sequence_number", return_value=1),
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)),
+        patch("commands.sendtx.validate_bls_pubkey", return_value=None),
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}),
     ]
     mocks = [p.start() for p in patches]
@@ -302,10 +303,13 @@ def node(temp_database, monkeypatch):
                           new_callable=PropertyMock, return_value=NEXT_HEIGHT)
     ts = patch.object(TipAdmissionView, "tip_timestamp",
                       new_callable=PropertyMock, return_value=TIP_TS)
+    next_ts = patch.object(TipAdmissionView, "next_block_timestamp",
+                           new_callable=PropertyMock, return_value=TIP_TS)
     height.start()
     ts.start()
+    next_ts.start()
     yield sendtx, script
-    for p in reversed(patches + [height, ts]):
+    for p in reversed(patches + [height, ts, next_ts]):
         p.stop()
 
 
@@ -537,6 +541,7 @@ def _admission_verdict(tx, sender_height, ts, *, existing=None, sender_open=0, t
     view = MagicMock(spec=TipAdmissionView)
     view.next_block_height = sender_height
     view.tip_timestamp = ts
+    view.next_block_timestamp = ts
     view.get_retractable.return_value = existing
     view.open_retractable_count_for_sender.return_value = sender_open
     view.open_retractable_count.return_value = total_open
@@ -620,6 +625,7 @@ def test_admission_and_apply_agree_on_retract_timing():
         view = MagicMock(spec=TipAdmissionView)
         view.next_block_height = height
         view.tip_timestamp = TS
+        view.next_block_timestamp = TS
         view.get_retractable.return_value = row
         admitted = validate_retract_transfer_payload(tx, view).is_valid
         assert admitted == retracted, f"height {height}: admission={admitted} apply={retracted}"

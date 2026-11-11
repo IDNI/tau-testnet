@@ -32,6 +32,7 @@ from block import Block, compute_tx_hash
 from commands import gettxstatus, sendtx
 from consensus.lanes import LANE_FAST, LANE_SLOW
 from consensus.tx_signing import signing_message_bytes
+from bls_keys import ZERO_PUBKEY
 
 BASE_TS = 1_700_000_000
 
@@ -335,6 +336,18 @@ class TestOrphanedTransactionsAreReadmitted(ReorgRestoreTestCase):
 
 class TestReadmitDirectly(ReorgRestoreTestCase):
     """The function `reorg_to` calls, with no fork around it."""
+
+    def test_restore_drops_transfer_with_invalid_recipient_key(self):
+        bad = transfer(SK_ALICE, ZERO_PUBKEY, 1, 0)
+        good = transfer(SK_BOB, CAROL, 1, 0)
+        result = sendtx.readmit_orphaned_transactions([bad, good])
+        bad_hash = compute_tx_hash(bad)
+        good_hash = compute_tx_hash(good)
+        self.assertIn(bad_hash, result["dropped"])
+        self.assertEqual(result["dropped"][bad_hash], "TX_INVALID")
+        self.assertIn(good_hash, result["restored"])
+        self.assertFalse(self.in_mempool(bad))
+        self.assertTrue(self.in_mempool(good))
 
     def test_restored_rows_keep_their_fee_limit_and_lane(self):
         plain = transfer(SK_ALICE, CAROL, 1, 0, fee_limit="7")

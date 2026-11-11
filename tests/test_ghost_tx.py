@@ -129,8 +129,7 @@ class TestGhostTxIntegration(unittest.TestCase):
         config.MINER_PRIVKEY = self.original_privkey
 
     @patch('commands.createblock.tau_manager')
-    @patch('commands.createblock._validate_signature')
-    def test_rule_change_and_rejection(self, mock_sig, mock_tau):
+    def test_rule_change_and_rejection(self, mock_tau):
         # Mock Tau Manager
         mock_tau.tau_ready.is_set.return_value = True
         # Side effect to simulate Tau returning a spec update or createblock capturing it
@@ -162,8 +161,6 @@ class TestGhostTxIntegration(unittest.TestCase):
              patch('consensus.engine.tau_manager.communicate_with_tau', side_effect=tau_side_effect), \
              patch('consensus.engine.tau_manager.communicate_with_tau_multi', return_value={}), \
              patch('chain_state.tau_manager.tau_ready.wait', return_value=True):
-             # Mock Sig Validation (Always valid for this test)
-             mock_sig.return_value = True
              
              print("\n[TEST] Verifying Rule Changes & Rejection Logic (Integration)...")
             

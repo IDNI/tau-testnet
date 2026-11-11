@@ -272,8 +272,10 @@ def test_submit_decision_below_the_tier_cap_registers_once_active():
 
 # --- admission: one registry, both doors -------------------------------------
 
-A = "aa" * 48          # offerer
-B = "bb" * 48          # recipient / acceptor
+from bls_keys import pubkey_hex
+
+A = pubkey_hex(0xAA)          # offerer
+B = pubkey_hex(0xBB)          # recipient / acceptor
 NEXT_HEIGHT = 50
 
 

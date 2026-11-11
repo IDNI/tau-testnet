@@ -81,6 +81,26 @@ def _g2_encoding_canonical(data: bytes) -> bool:
     return body < _FIELD_MODULUS and z2 < _FIELD_MODULUS
 
 
+def decode_pubkey(pk: bytes):
+    """The G1 point of a 48-byte public key, or None when the key is not valid. Never raises.
+
+    The same verdict as py_ecc G2Basic.KeyValidate: a canonical encoding, a point
+    in the subgroup, and not the identity.
+    """
+    try:
+        if not (isinstance(pk, bytes) and len(pk) == 48 and _g1_encoding_canonical(pk)):
+            return None
+        pk_point = G1Point.from_compressed_bytes(pk)
+        # Identity pk with identity sig satisfies the pairing equation for any message.
+        if pk_point == _G1_IDENTITY:
+            return None
+        return pk_point
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException:  # pyo3 panics derive from BaseException, not Exception
+        return None
+
+
 def _bls_verify(pk: bytes, msg: bytes, sig: bytes) -> bool:
     """BLS12-381 G2Basic verify, pk in G1 (48 bytes), sig in G2 (96 bytes). Never raises."""
     try:
@@ -90,11 +110,10 @@ def _bls_verify(pk: bytes, msg: bytes, sig: bytes) -> bool:
             return False
         if not (isinstance(sig, bytes) and len(sig) == 96):
             return False
-        if not (_g1_encoding_canonical(pk) and _g2_encoding_canonical(sig)):
+        if not _g2_encoding_canonical(sig):
             return False
-        pk_point = G1Point.from_compressed_bytes(pk)
-        # Identity pk with identity sig satisfies the pairing equation for any message.
-        if pk_point == _G1_IDENTITY:
+        pk_point = decode_pubkey(pk)
+        if pk_point is None:
             return False
         sig_point = G2Point.from_compressed_bytes(sig)
         msg_point = G2Point.hash_to_curve(msg, DST)

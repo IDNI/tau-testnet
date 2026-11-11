@@ -20,7 +20,7 @@ import config
 import chain_state
 import db
 import tau_defs
-from bls_keys import SK_ALICE, pubkey_hex, sign_payload, sign_tx
+from bls_keys import SK_ALICE, SK_CAROL, pubkey_hex, sign_payload, sign_tx
 from consensus import fees
 from consensus.engine import TauConsensusEngine
 from consensus.fees import FeeRuleError
@@ -28,7 +28,7 @@ from consensus.governance import ConsensusLifecycleManager, ConsensusRuleUpdate
 from consensus.state import TauStateSnapshot
 
 SENDER = pubkey_hex(SK_ALICE)
-RECIPIENT = "c" * 96
+RECIPIENT = pubkey_hex(SK_CAROL)
 PROPOSER = "b" * 96
 
 
@@ -434,7 +434,7 @@ class TestAdmissionFees(unittest.TestCase):
         _cs._balances[SENDER] = 1_000_000
 
         self.pub_patcher = patch(
-            "commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)
+            "commands.sendtx.validate_bls_pubkey", return_value=None
         )
         self.pub_patcher.start()
         self.addCleanup(self.pub_patcher.stop)

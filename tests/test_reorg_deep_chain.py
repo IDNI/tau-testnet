@@ -37,10 +37,10 @@ import tau_manager
 import tau_authority
 from chain_state import GENESIS_BALANCE
 from block import Block, compute_tx_hash
-from bls_keys import SK_ALICE, pubkey_hex, sign_payload
+from bls_keys import SK_ALICE, SK_CAROL, pubkey_hex, sign_payload
 
 ADDR2 = "893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2"
-ADDR3 = "aabbccddee1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678"
+ADDR3 = pubkey_hex(SK_CAROL)
 
 LEGACY_MAX_DEPTH = 2000
 DEEP = LEGACY_MAX_DEPTH + 100

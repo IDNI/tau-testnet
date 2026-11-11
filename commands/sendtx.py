@@ -17,6 +17,7 @@ from errors import TauCommunicationError
 from consensus import fees
 from consensus.fees import FeeRuleError
 from consensus.lanes import classify_lane
+from consensus.tx_checks import check_transfer, validate_bls_pubkey
 from consensus.tx_signing import signing_message_bytes, verify_tx_signature
 from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
@@ -127,38 +128,6 @@ except Exception as e:
     logger.warning("Error importing py_ecc.bls (%s). Skipping BLS public key validation.", e)
 
 
-def _validate_bls12_381_pubkey(key_hex: str, key_name: str) -> tuple[bool, str | None]:
-    """
-    Validates a 48-byte BLS12-381 public key.
-    Checks for 96-character hex format and, if py_ecc is available, cryptographic validity.
-    Args:
-        key_hex: The public key as a hexadecimal string.
-        key_name: Descriptive name for the key (e.g., "sender_pubkey") for error messages.
-    Returns:
-        A tuple (is_valid, error_message). error_message is None if is_valid is True.
-    """
-    if not (isinstance(key_hex, str) and len(key_hex) == 96):
-        return False, f"Invalid {key_name}: Must be a 96-character hex string representing 48 bytes, got length {len(key_hex)}."
-
-    try:
-        key_bytes = bytes.fromhex(key_hex)
-        if len(key_bytes) != 48:
-             return False, f"Invalid {key_name}: Hex string decodes to {len(key_bytes)} bytes, expected 48."
-    except ValueError:
-        return False, f"Invalid {key_name}: Not a valid hexadecimal string."
-
-    if not all(c in '0123456789abcdefABCDEF' for c in key_hex):
-        return False, f"Invalid {key_name}: Contains non-hexadecimal characters."
-
-    if _PY_ECC_AVAILABLE:
-        try:
-            G2Basic.KeyValidate(key_bytes)
-        except Exception as e:
-            return False, f"Invalid {key_name} (cryptographic validation failed): {e}. Key: {key_hex[:10]}..."
-
-    return True, None
-
-
 def _parse_bitvector_string(bv_str: str) -> int:
     """Helper to parse a bitvector string from Tau's output (#b, #x, or decimal)."""
     bv_str = bv_str.strip()
@@ -170,29 +139,12 @@ def _parse_bitvector_string(bv_str: str) -> int:
         return int(bv_str)
 
 
-def _prepare_transfer_inputs(transfer_entry, sender_balance: int) -> dict:
-    """
-    Prepares a dictionary of integer inputs for a single transfer for Tau validation.
-    Amounts and balances can be large (up to 32 bytes).
-    """
-    if not (isinstance(transfer_entry, (list, tuple)) and len(transfer_entry) == 3):
-        raise ValueError(f"Invalid transfer entry format: {transfer_entry}")
-    from_addr_key, to_addr_key, amount_decimal_str = map(str, transfer_entry)
-
-    # Basic inline format check to catch obvious errors even if cryptographic
-    # validation is patched in tests
-    hex_chars = set('0123456789abcdefABCDEF')
-    if not (isinstance(from_addr_key, str) and len(from_addr_key) == 96 and all(c in hex_chars for c in from_addr_key)):
-        raise ValueError("Invalid 'from' address: Must be a 96-character hex BLS12-381 public key")
-    if not (isinstance(to_addr_key, str) and len(to_addr_key) == 96 and all(c in hex_chars for c in to_addr_key)):
-        raise ValueError("Invalid 'to' address: Must be a 96-character hex BLS12-381 public key")
-
-    is_valid_from, err_from = _validate_bls12_381_pubkey(from_addr_key, "'from' address")
-    if not is_valid_from:
-        raise ValueError(err_from)
-    is_valid_to, err_to = _validate_bls12_381_pubkey(to_addr_key, "'to' address")
-    if not is_valid_to:
-        raise ValueError(err_to)
+def _prepare_transfer_inputs(transfer_entry, sender_pubkey, sender_balance: int) -> dict:
+    """Tau inputs for one transfer. Raises ValueError for a transfer that block apply refuses."""
+    transfer_error = check_transfer(transfer_entry, sender_pubkey)
+    if transfer_error:
+        raise ValueError(transfer_error)
+    from_addr_key, to_addr_key, amount_value = transfer_entry
 
     # i3/i4 now carry the FULL 384-bit pubkey (lowercase hex). The bv-shrink layer
     # interns equality-only address streams to a small bv automatically -- no
@@ -200,13 +152,7 @@ def _prepare_transfer_inputs(transfer_entry, sender_balance: int) -> dict:
     from_addr_hex = from_addr_key.lower()
     to_addr_hex = to_addr_key.lower()
 
-    try:
-        # Amount is now a 32-byte (256-bit) integer, represented as a string.
-        amount = int(amount_decimal_str)
-        if not (0 <= amount < (1 << 256)):
-            raise ValueError("Amount must be a positive 256-bit integer.")
-    except ValueError:
-        raise ValueError(f"Invalid amount: '{amount_decimal_str}' is not a valid large integer.")
+    amount = int(amount_value)
     _validate_tau_bv_range(amount, "Amount")
 
     if not isinstance(sender_balance, int) or sender_balance < 0:
@@ -289,26 +235,19 @@ def _process_transfers_operation(transfers, sender_pubkey):
     logger.info("Processing %s transfers...", len(transfers))
     for i, transfer_entry in enumerate(transfers):
         logger.debug("Processing transfer #%s: %s", i + 1, transfer_entry)
-        if not (isinstance(transfer_entry, (list, tuple)) and len(transfer_entry) == 3):
-            return False, None, f"Transfer #{i+1} has invalid format: {transfer_entry}"
-            
-        from_addr_key, to_addr_key, amount_decimal_str = map(str, transfer_entry)
-
-        if from_addr_key != sender_pubkey:
-            return False, None, f"Transfer #{i+1} 'from' address does not match sender_pubkey."
-
-        if from_addr_key not in remaining_balances:
-            remaining_balances[from_addr_key] = chain_state.get_balance(from_addr_key)
-        available_balance = remaining_balances[from_addr_key]
-        logger.debug("Available balance for %s: %s", from_addr_key, available_balance)
+        if sender_pubkey not in remaining_balances:
+            remaining_balances[sender_pubkey] = chain_state.get_balance(sender_pubkey)
+        available_balance = remaining_balances[sender_pubkey]
+        logger.debug("Available balance for %s: %s", sender_pubkey, available_balance)
         try:
-            transfer_input_dict = _prepare_transfer_inputs(transfer_entry, available_balance)
+            transfer_input_dict = _prepare_transfer_inputs(
+                transfer_entry, sender_pubkey, available_balance)
             logger.debug("Transfer input dictionary: %s", transfer_input_dict)
             # Store the full integer amount for post-validation balance updates
             amount_int = transfer_input_dict['amount']
-            validated_transfers.append((from_addr_key, to_addr_key, amount_int))
+            validated_transfers.append((sender_pubkey, transfer_entry[1], amount_int))
             tau_inputs.append(transfer_input_dict)
-            remaining_balances[from_addr_key] = max(available_balance - amount_int, 0)
+            remaining_balances[sender_pubkey] = max(available_balance - amount_int, 0)
         except ValueError as e:
             return False, None, f"Error processing transfer #{i+1}: {e}"
         except Exception as e:
@@ -455,18 +394,11 @@ def _admission_timestamp() -> int:
 
     Apply re-checks against the AUTHORITATIVE block timestamp, so this is a soft
     pre-check only: a tx may pass admission yet be rejected at inclusion near a
-    time threshold (and vice versa). The chain tip's timestamp (deterministic
-    across this node's view, no wall-clock skew); wall clock if unavailable.
+    time threshold (and vice versa).
     """
-    try:
-        head = db.get_canonical_head_block()
-        if isinstance(head, dict):
-            header = head.get("header")
-            if isinstance(header, dict) and header.get("timestamp") is not None:
-                return int(header.get("timestamp"))
-    except Exception:
-        pass
-    return int(time.time())
+    from consensus.facade import TipAdmissionView
+
+    return TipAdmissionView().next_block_timestamp
 
 
 class _AdmissionTau:
@@ -580,8 +512,8 @@ def _check_tx_envelope(payload: dict) -> dict | None:
     if 'sender_pubkey' not in payload:
         return _qt_err("INVALID_PARAMS", "Missing 'sender_pubkey' in transaction.")
     sender_pubkey = payload['sender_pubkey']
-    is_valid_sender, err_sender = _validate_bls12_381_pubkey(sender_pubkey, "sender_pubkey")
-    if not is_valid_sender:
+    err_sender = validate_bls_pubkey(sender_pubkey, "sender_pubkey")
+    if err_sender:
         return _qt_err("TX_INVALID", f"Transaction invalid. {err_sender}")
 
     if 'sequence_number' not in payload:
