@@ -55,6 +55,20 @@ def block_byte_cap_reason(block: "Block | Dict") -> Optional[str]:
     )
 
 
+def block_number_reason(block: "Block | Dict") -> Optional[str]:
+    """None when every number of the block is a valid integer, else a short reason."""
+    from consensus.json_numbers import number_error
+
+    payload = block.to_dict() if isinstance(block, Block) else block
+    reason = number_error(payload)
+    return f"block {reason}" if reason else None
+
+
+def block_validity_reason(block: "Block | Dict") -> Optional[str]:
+    """The number rule first: the byte count is defined only for integer numbers."""
+    return block_number_reason(block) or block_byte_cap_reason(block)
+
+
 def transaction_json_bytes_in_block(tx: Dict, *, first: bool) -> int:
     """Bytes that one transaction and its ``tx_ids`` entry add to the block JSON."""
     # A tx_ids entry is 64 hex digits and 2 quotes. After the first entry, each
@@ -177,6 +191,10 @@ class Block:
 
     @classmethod
     def from_dict(cls, payload: Dict) -> "Block":
+        # The header fields go through int() below, so check the raw payload.
+        number_reason = block_number_reason(payload) if isinstance(payload, dict) else None
+        if number_reason:
+            raise ValueError(number_reason)
         header_payload = payload.get("header", {}) if isinstance(payload, dict) else {}
         header = BlockHeader(
             block_number=int(header_payload.get("block_number") or 0),

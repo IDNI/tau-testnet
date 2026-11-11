@@ -17,7 +17,7 @@ from consensus.clause_registry import ClauseRegistry
 from consensus import faucet
 from consensus.fees import FeeRuleError
 from errors import DatabaseError
-from block import Block, block_byte_cap_reason
+from block import Block, block_validity_reason
 import hashlib
 from consensus.state import compute_state_hash as compute_rules_hash, compute_consensus_state_hash
 
@@ -715,12 +715,12 @@ def _process_new_block_locked(block: Block) -> bool:
             )
             return False
 
-        cap_reason = block_byte_cap_reason(block)
-        if cap_reason:
+        invalid_reason = block_validity_reason(block)
+        if invalid_reason:
             logger.error(
                 "[BLOCKCHAIN] Block #%s rejected: %s",
                 block.header.block_number,
-                cap_reason,
+                invalid_reason,
             )
             return False
 
@@ -1269,11 +1269,11 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             
             print(f"[INFO][chain_state] Processing block #{block_number} ({block_hash}) with {len(block_data.get('transactions', []))} transactions")
             
+            invalid_reason = block_validity_reason(block_data)
+            if invalid_reason:
+                print(f"[ERROR][chain_state] Block #{block_number} rejected: {invalid_reason}. Aborting rebuild!")
+                return RebuildResult(ok=False, stopped_at_block=block_number, reason=invalid_reason)
             block = Block.from_dict(block_data)
-            cap_reason = block_byte_cap_reason(block)
-            if cap_reason:
-                print(f"[ERROR][chain_state] Block #{block_number} rejected: {cap_reason}. Aborting rebuild!")
-                return RebuildResult(ok=False, stopped_at_block=block_number, reason=cap_reason)
             engine = TauConsensusEngine()
             
             # 1. Load Parent Snapshot
@@ -2692,13 +2692,13 @@ def ingest_block(block: Block) -> IngestResult:
         )
         return IngestResult('invalid', "Block consensus proof verification failed")
     # A stored block ranks in fork choice, and every head update would try it again.
-    cap_reason = block_byte_cap_reason(block)
-    if cap_reason:
+    invalid_reason = block_validity_reason(block)
+    if invalid_reason:
         logger.error(
             "[chain_state] Block #%s %s... not ingested: %s",
-            block.header.block_number, block.block_hash[:16], cap_reason,
+            block.header.block_number, block.block_hash[:16], invalid_reason,
         )
-        return IngestResult('invalid', cap_reason)
+        return IngestResult('invalid', invalid_reason)
     engine = TauConsensusEngine()
     # NOTE: legacy verify signature (no active_view): membership/stake gates and
     # the parent-state stake input do NOT run here. This pre-filter only checks
