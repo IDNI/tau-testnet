@@ -728,7 +728,39 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
     overflow re-exec the process. An unauthenticated, fee-free RPC must not
     reach them. The rule-compile step is unaffected: it already runs in a
     SIGKILL-able subprocess and is genuinely pure.
+
+    During a reorg the state is at a lower height than the head, so every
+    verdict that reads it is refused with REORG_IN_PROGRESS.
     """
+    reorg_seen = chain_state.reorg_counter()
+    if reorg_seen % 2:
+        return _reorg_refusal()
+    progress = _AdmissionProgress()
+    result = _admit_transaction(json_blob, propagate, dry_run, skip_tau_eval, reorg_seen, progress)
+    # A rejection after the insert keeps its code: the transaction is in the mempool.
+    if (not result.get("ok") and not progress.queued
+            and chain_state.reorg_counter() != reorg_seen):
+        return _reorg_refusal()
+    return result
+
+
+class _AdmissionProgress:
+    __slots__ = ("queued",)
+
+    def __init__(self) -> None:
+        self.queued = False
+
+
+def _reorg_refusal() -> dict:
+    return _qt_err(
+        "REORG_IN_PROGRESS",
+        "The node is replaying the chain for a reorg. Send the transaction again.",
+    )
+
+
+def _admit_transaction(json_blob: str, propagate: bool, dry_run: bool,
+                       skip_tau_eval: bool, reorg_seen: int,
+                       progress: _AdmissionProgress) -> dict:
     blob = json_blob.strip()
     if len(blob) >= 2 and ((blob[0] == '"' and blob[-1] == '"') or (blob[0] == "'" and blob[-1] == "'")):
         blob = blob[1:-1]
@@ -1364,6 +1396,9 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
 
         tx_message_id, tx_canonical_blob = _compute_transaction_message_id(payload)
 
+        if chain_state.reorg_counter() != reorg_seen:
+            return _reorg_refusal()
+
         # --- Evaluation ends here; everything below mutates state. -----------
         # A dry run returns the verdict now: before the mempool-capacity check
         # (a capacity fact about the node, not a verdict about this tx) and
@@ -1400,6 +1435,7 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
             estimated_fee=estimated_fee_total if tx_type in FEE_BEARING_TX_TYPES else 0,
             lane=classify_lane(payload),
         )
+        progress.queued = True
         logger.info("Transaction successfully queued in mempool.")
         if propagate:
             if network_bus is not None:

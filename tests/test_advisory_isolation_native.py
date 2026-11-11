@@ -220,7 +220,7 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
         ("chain_state.py", "tick_governance"),
         ("consensus/engine.py", "_apply_block"),
         ("commands/createblock.py", "execute_batch"),
-        ("commands/sendtx.py", "queue_transaction"),
+        ("commands/sendtx.py", "_admit_transaction"),
         ("commands/sendtx.py", "step_multi"),
         ("commands/getapprovalpreview.py", "_step"),
         # the in-process session the not-enabled engine path uses
@@ -233,7 +233,7 @@ def test_every_in_process_stepping_site_in_the_node_is_classified():
     legacy_guarded = {
         ("chain_state.py", "tick_governance"): "tau_authority.owner().enabled",
         ("consensus/engine.py", "_apply_block"): "proposal",
-        ("commands/sendtx.py", "queue_transaction"): "admission_tau.isolated",
+        ("commands/sendtx.py", "_admit_transaction"): "admission_tau.isolated",
         ("commands/sendtx.py", "step_multi"): "if not self.isolated",
         ("commands/getapprovalpreview.py", "_step"): "tau_admission.enabled()",
     }

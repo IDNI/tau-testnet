@@ -28,6 +28,8 @@ DEFAULT_EXPIRY_SECONDS = 600
 # tau_defs.DEFAULT_TX_EXPIRY_BLOCKS, kept here so the CLI has no import of the
 # node package.
 DEFAULT_EXPIRY_BLOCKS = 1_000
+# Seconds between attempts. A replay gets longer with the chain.
+REORG_RETRY_DELAYS = (1, 2, 4, 8)
 
 
 def _check_expire_at_height(expire_at_height: Any) -> int:
@@ -254,11 +256,30 @@ def submit_tx(
     port: int,
     timeout: float = rpc_mod.DEFAULT_TIMEOUT,
 ) -> str:
-    """Send ``sendtx '<payload>'`` to the node and return the raw response."""
+    """Send ``sendtx '<payload>'`` to the node and return the raw response.
+
+    Sends again while the node answers REORG_IN_PROGRESS. The node did not
+    queue a refused transaction, so the same signed payload is safe to send.
+    """
     blob = json.dumps(payload, separators=(",", ":"))
-    return rpc_mod.send_command(
-        f"sendtx '{blob}'", host, port, timeout=timeout
-    )
+    command = f"sendtx '{blob}'"
+    for delay in REORG_RETRY_DELAYS:
+        response = rpc_mod.send_command(command, host, port, timeout=timeout)
+        if not _is_reorg_refusal(response):
+            return response
+        time.sleep(delay)
+    return rpc_mod.send_command(command, host, port, timeout=timeout)
+
+
+def _is_reorg_refusal(response: str) -> bool:
+    try:
+        parsed = json.loads(response)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    error = parsed.get("error")
+    return isinstance(error, dict) and error.get("code") == "REORG_IN_PROGRESS"
 
 
 def build_rule_offer_tx(

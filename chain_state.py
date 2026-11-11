@@ -1,3 +1,4 @@
+import contextlib
 import threading
 import json
 import logging
@@ -104,6 +105,25 @@ class _ChainWriteLock:
         if self._acquired:
             _chain_lock.release()
         return False
+
+# Odd while reorg_to replays. Written only under `_chain_lock`.
+_reorg_counter = 0
+
+
+def reorg_counter() -> int:
+    """An odd value means that the state is at a lower height than the head."""
+    return _reorg_counter
+
+
+@contextlib.contextmanager
+def _reorg_replay():
+    global _reorg_counter
+    _reorg_counter += 1
+    try:
+        yield
+    finally:
+        _reorg_counter += 1
+
 
 # Lock for thread-safe access to balances
 _balance_lock = threading.Lock()
@@ -2806,6 +2826,18 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
     new_path = shared + new_suffix
     old_path = shared + old_suffix
 
+    with _reorg_replay():
+        if not _replay_and_commit_head(new_head_hash, old_head_hash, new_path, old_path):
+            return False
+
+    _restore_mempool_after_reorg(old_txs, new_txs)
+    return True
+
+
+def _replay_and_commit_head(new_head_hash, old_head_hash, new_path, old_path) -> bool:
+    """Replay `new_path` and commit its head. On a failure, restore the prior head."""
+    import db
+
     rebuild = _rebuild_state_from_blockchain_internal(0, path_hashes=new_path)
 
     # Phase 3b: Abort guard (Bug B). If the replay failed, the in-memory state
@@ -2884,7 +2916,13 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
         _restore_prior_head(old_path, old_head_hash)
         return False
 
+    return True
+
+
+def _restore_mempool_after_reorg(old_txs, new_txs) -> None:
     # Phase 5: Mempool Restore
+    import db
+
     if new_txs:
         db.remove_mempool_by_hashes(list(new_txs))
 
@@ -2895,6 +2933,4 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
             sendtx.readmit_orphaned_transactions(orphaned)
         except Exception as e:
             logger.error(f"[chain_state] Failed to restore orphaned txs to mempool: {e}")
-
-    return True
 
