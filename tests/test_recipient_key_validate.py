@@ -98,27 +98,7 @@ def test_user_tx_admission_accepts_real_from_and_to():
     assert res.is_valid is True, res.error
 
 
-def test_sendtx_bls_unavailable_with_valid_sender_shape(monkeypatch):
-    tx_json = json.dumps({
-        "tx_type": "user_tx",
-        "sender_pubkey": SENDER,
-        "sequence_number": 0,
-        "expiration_time": 9_999_999_999,
-        "expire_at_height": EXPIRE,
-        "operations": {"1": [[SENDER, REAL, "1"]]},
-        "fee_limit": "0",
-        "signature": "00" * 96,
-    })
-    monkeypatch.setattr(sendtx, "_PY_ECC_AVAILABLE", False)
-    monkeypatch.setattr(sendtx, "_PY_ECC_BLS", None)
-    result = sendtx.queue_transaction(tx_json)
-    assert result["ok"] is False
-    assert result["code"] == "BLS_UNAVAILABLE"
-
-
-def test_sendtx_malformed_sender_tx_invalid_without_py_ecc(monkeypatch):
-    monkeypatch.setattr(sendtx, "_PY_ECC_AVAILABLE", False)
-    monkeypatch.setattr(sendtx, "_PY_ECC_BLS", None)
+def test_sendtx_malformed_sender_is_tx_invalid():
     result = sendtx.queue_transaction(json.dumps({
         "tx_type": "user_tx",
         "sender_pubkey": "not-a-key",

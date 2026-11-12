@@ -15,9 +15,10 @@ happen.
 
 INJECTION POINT
 ---------------
-Tests that need to control the verdict patch `consensus.tx_signing._bls_verify`.
-The backend's verdicts must equal py_ecc G2Basic.Verify's on every input, or
-nodes running different backends split on which transactions apply.
+Tests that need to control the verdict patch `consensus.bls.verify`, which also
+decides block header proofs. The backend's verdicts must equal py_ecc
+G2Basic.Verify's on every input, or nodes running different backends split on
+which transactions apply.
 """
 from __future__ import annotations
 
@@ -25,8 +26,7 @@ import hashlib
 import json
 from typing import Any, Dict, Tuple
 
-from py_arkworks_bls12381 import G1Point, G2Point, GT
-
+from consensus import bls
 from consensus.approvals import (
     TX_TYPE_APPROVAL_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
@@ -40,89 +40,6 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_ACCEPT,
     TX_TYPE_RULE_OFFER_REJECT,
 )
-
-DST = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_"
-
-_FIELD_MODULUS = int(
-    "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab",
-    16,
-)
-_MASK_381 = (1 << 381) - 1
-_G1_GENERATOR = G1Point()
-_G1_IDENTITY = G1Point.identity()
-
-
-def _g1_encoding_canonical(data: bytes) -> bool:
-    # arkworks decodes any infinity-flagged input as the identity, ignoring body and sort flag.
-    z = int.from_bytes(data, "big")
-    if not (z >> 383) & 1:
-        return False
-    body = z & _MASK_381
-    is_infinity = body == 0
-    if bool((z >> 382) & 1) != is_infinity:
-        return False
-    if is_infinity:
-        return not (z >> 381) & 1
-    return body < _FIELD_MODULUS
-
-
-def _g2_encoding_canonical(data: bytes) -> bool:
-    # py_ecc gives the second 48-byte half no flags: any set top bit exceeds the modulus.
-    z1 = int.from_bytes(data[:48], "big")
-    z2 = int.from_bytes(data[48:], "big")
-    if not (z1 >> 383) & 1:
-        return False
-    body = z1 & _MASK_381
-    is_infinity = body == 0 and z2 == 0
-    if bool((z1 >> 382) & 1) != is_infinity:
-        return False
-    if is_infinity:
-        return not (z1 >> 381) & 1
-    return body < _FIELD_MODULUS and z2 < _FIELD_MODULUS
-
-
-def decode_pubkey(pk: bytes):
-    """The G1 point of a 48-byte public key, or None when the key is not valid. Never raises.
-
-    The same verdict as py_ecc G2Basic.KeyValidate: a canonical encoding, a point
-    in the subgroup, and not the identity.
-    """
-    try:
-        if not (isinstance(pk, bytes) and len(pk) == 48 and _g1_encoding_canonical(pk)):
-            return None
-        pk_point = G1Point.from_compressed_bytes(pk)
-        # Identity pk with identity sig satisfies the pairing equation for any message.
-        if pk_point == _G1_IDENTITY:
-            return None
-        return pk_point
-    except (KeyboardInterrupt, SystemExit, GeneratorExit):
-        raise
-    except BaseException:  # pyo3 panics derive from BaseException, not Exception
-        return None
-
-
-def _bls_verify(pk: bytes, msg: bytes, sig: bytes) -> bool:
-    """BLS12-381 G2Basic verify, pk in G1 (48 bytes), sig in G2 (96 bytes). Never raises."""
-    try:
-        if not (isinstance(pk, bytes) and len(pk) == 48):
-            return False
-        if not isinstance(msg, bytes):
-            return False
-        if not (isinstance(sig, bytes) and len(sig) == 96):
-            return False
-        if not _g2_encoding_canonical(sig):
-            return False
-        pk_point = decode_pubkey(pk)
-        if pk_point is None:
-            return False
-        sig_point = G2Point.from_compressed_bytes(sig)
-        msg_point = G2Point.hash_to_curve(msg, DST)
-        return bool(GT.pairing_check([_G1_GENERATOR, -pk_point], [sig_point, msg_point]))
-    except (KeyboardInterrupt, SystemExit, GeneratorExit):
-        raise
-    except BaseException:  # pyo3 panics derive from BaseException, not Exception
-        return False
-
 
 def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
     """CONSENSUS-FROZEN. Canonical bytes over the signed fields of a transaction.
@@ -224,7 +141,7 @@ def verify_tx_signature(payload: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "signature or sender_pubkey is not valid hex"
 
     try:
-        if not _bls_verify(pubkey_bytes, msg_hash, sig_bytes):
+        if not bls.verify(pubkey_bytes, msg_hash, sig_bytes):
             return False, "signature does not verify against sender_pubkey"
     except Exception as exc:
         return False, f"cryptographic error during verification: {exc}"

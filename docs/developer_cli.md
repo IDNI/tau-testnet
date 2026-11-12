@@ -63,7 +63,7 @@ Error codes emitted by the node, by origin:
 |---|---|
 | Server dispatch (`server.py`) | `UNKNOWN_COMMAND`, `RATE_LIMITED`, `FORBIDDEN`, `TIMEOUT`, `INTERNAL_ERROR` |
 | Argument / payload parsing (every command) | `INVALID_PARAMS`, `PARSE_ERROR` |
-| `sendtx` / `checktx` structural | `TX_INVALID`, `TX_EXPIRED`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `BLS_UNAVAILABLE`, `TX_REJECTED` |
+| `sendtx` / `checktx` structural | `TX_INVALID`, `TX_EXPIRED`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_REJECTED` |
 | `sendtx` fees & capacity | `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `MEMPOOL_FULL`, `ESTIMATE_BUSY` (`checktx estimate` only) |
 | `sendtx` approval request | `APPROVAL_NOT_NEEDED`: the policy of the sender allows the transfer with no votes, so send it as an ordinary transfer. Only admission gives it, because block apply drops such a request. |
 | Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `CLAUSE_REGISTRY_FULL`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED` |

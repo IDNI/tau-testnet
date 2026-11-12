@@ -17,7 +17,7 @@ import config
 import chain_state
 import db
 from block import Block, compute_tx_hash
-from bls_keys import sign_payload, pubkey_hex
+from bls_keys import SK_BOB, pubkey_hex, sign_payload, signed_block
 from test_reorg_deep_chain import ADDR2, BASE_TS, FUNDED_ACCOUNT, DeepChainTestCase, _tx, quiet
 
 SK = 4242
@@ -25,7 +25,7 @@ SENDER = pubkey_hex(SK)
 FUNDED = 1000
 AMOUNT = 40
 RELEASE_TIME = BASE_TS + 1000
-PROPOSER = "a" * 96
+PROPOSER_SK = SK_BOB
 
 
 def _sign(tx):
@@ -76,9 +76,8 @@ class RetractableReorgTestCase(DeepChainTestCase):
         prev_hash = parent.block_hash if isinstance(parent, Block) else parent
         for offset, txs in specs:
             number += 1
-            blk = Block.create(block_number=number, previous_hash=prev_hash,
-                               transactions=txs, proposer_pubkey=PROPOSER,
-                               timestamp=BASE_TS + offset)
+            blk = signed_block(PROPOSER_SK, block_number=number, previous_hash=prev_hash,
+                               transactions=txs, timestamp=BASE_TS + offset)
             out.append(blk)
             prev_hash = blk.block_hash
         return out

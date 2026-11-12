@@ -69,7 +69,8 @@ def authority(node_state):
 @pytest.fixture(autouse=True)
 def _mining_allowed():
     with patch.object(TauConsensusEngine, "query_eligibility", lambda *a, **k: True), \
-         patch.object(TauConsensusEngine, "verify_block_header", lambda *a, **k: True):
+         patch.object(TauConsensusEngine, "verify_block_header", lambda *a, **k: True), \
+         patch("consensus.bls.verify", lambda *a, **k: True):
         yield
 
 

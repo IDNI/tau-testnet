@@ -23,7 +23,7 @@ if tests_dir not in sys.path:
 import config
 import db
 import chain_state
-from bls_keys import SK_BOB, pubkey_hex
+from bls_keys import SK_BOB, SK_CAROL, pubkey_hex
 from chain_state import GENESIS_BALANCE
 from consensus.engine import TauConsensusEngine
 from consensus.fees import FeeRuleError
@@ -108,9 +108,9 @@ class TransferTsReorgTests(DeepChainTestCase):
         """A transfer that exists only on the losing suffix does not keep its stamp."""
         prefix = self.extend(self.genesis_hash, 0, 6)
         losing_tx = _tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, ADDR2, "5"]])
-        losing = self.extend(prefix[-1].block_hash, 6, 3, proposer="b" * 96,
+        losing = self.extend(prefix[-1].block_hash, 6, 3, proposer=SK_BOB,
                              txs={8: [losing_tx]})
-        winning = self.extend(prefix[-1].block_hash, 6, 5, proposer="c" * 96)
+        winning = self.extend(prefix[-1].block_hash, 6, 5, proposer=SK_CAROL)
         self.adopt(prefix + losing)
         self.assertEqual(
             chain_state._last_transfer_ts.get(FUNDED_ACCOUNT), BASE_TS + 8)
@@ -123,10 +123,10 @@ class TransferTsReorgTests(DeepChainTestCase):
         """When both forks transfer, the stamp is the winner's block time."""
         prefix = self.extend(self.genesis_hash, 0, 6)
         losing = self.extend(
-            prefix[-1].block_hash, 6, 3, proposer="b" * 96,
+            prefix[-1].block_hash, 6, 3, proposer=SK_BOB,
             txs={8: [_tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, ADDR2, "5"]])]})
         winning = self.extend(
-            prefix[-1].block_hash, 6, 5, proposer="c" * 96,
+            prefix[-1].block_hash, 6, 5, proposer=SK_CAROL,
             txs={9: [_tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, ADDR3, "7"]])]})
         self.adopt(prefix + losing)
         self.adopt(winning)
@@ -141,9 +141,9 @@ class TransferTsReorgTests(DeepChainTestCase):
         prefix = self.extend(self.genesis_hash, 0, 6)
         fund = _tx(FUNDED_ACCOUNT, 0, [[FUNDED_ACCOUNT, KEYED, "100"]])
         send = _tx(KEYED, 0, [[KEYED, ADDR2, "5"]], sk=SK_BOB)
-        losing = self.extend(prefix[-1].block_hash, 6, 3, proposer="b" * 96,
+        losing = self.extend(prefix[-1].block_hash, 6, 3, proposer=SK_BOB,
                              txs={7: [fund], 8: [send]})
-        winning = self.extend(prefix[-1].block_hash, 6, 5, proposer="c" * 96)
+        winning = self.extend(prefix[-1].block_hash, 6, 5, proposer=SK_CAROL)
         self.adopt(prefix + losing)
         self.assertIn(KEYED, chain_state._last_transfer_ts)
 
@@ -163,7 +163,7 @@ class TransferTsReorgTests(DeepChainTestCase):
         self.assertNotIn(KEYED, prior)
 
         winner = self.extend(
-            shared[-1].block_hash, 4, 3, proposer="b" * 96,
+            shared[-1].block_hash, 4, 3, proposer=SK_BOB,
             txs={
                 5: [_tx(FUNDED_ACCOUNT, 1, [[FUNDED_ACCOUNT, KEYED, "100"]])],
                 6: [_tx(KEYED, 0, [[KEYED, ADDR2, "5"]], sk=SK_BOB)],

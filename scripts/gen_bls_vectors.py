@@ -1,9 +1,14 @@
 #!/usr/bin/env python
-"""Regenerate tests/fixtures/bls_g2basic_vectors.json.
+"""Regenerate the BLS differential fixtures under tests/fixtures/.
 
-Each entry's `expected` is py_ecc's G2Basic.Verify, the reference the consensus
-verifier must match on every input. Inputs are built with arkworks (byte-identical
-to py_ecc, far faster) and are fully determined by SEED.
+bls_g2basic_vectors.json: `expected` is py_ecc's G2Basic.Verify on (pk, msg, sig).
+bls_header_vectors.json: `expected` is G2Basic.Verify on a block header's proposer,
+proof and header digest.
+bls_keyvalidate_vectors.json: `expected` is G2Basic.KeyValidate on a 48-byte key.
+
+py_ecc is the reference the consensus verifier must match on every input. Inputs
+are built with arkworks (byte-identical to py_ecc, far faster) and are fully
+determined by SEED.
 
     venv/bin/python scripts/gen_bls_vectors.py [--out PATH]
 """
@@ -40,10 +45,17 @@ from py_ecc.optimized_bls12_381 import (  # noqa: E402
 )
 from py_ecc.optimized_bls12_381 import field_modulus as Q  # noqa: E402
 
-from bls_keys import pubkey_hex, sign_message  # noqa: E402
+from block import BlockHeader  # noqa: E402
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_message  # noqa: E402
 
 SEED = 20261102
 DEFAULT_OUT = ROOT / "tests" / "fixtures" / "bls_g2basic_vectors.json"
+HEADER_OUT = ROOT / "tests" / "fixtures" / "bls_header_vectors.json"
+KEYVALIDATE_OUT = ROOT / "tests" / "fixtures" / "bls_keyvalidate_vectors.json"
+N_HEADER_VALID = 30
+N_KEYS_VALID = 40
+N_KEYS_OFFCURVE = 40
+N_KEYS_RANDOM = 40
 N_VALID = 50
 N_MUTANT_PK = 100
 N_MUTANT_SIG = 100
@@ -347,9 +359,235 @@ def build():
     return c.cases
 
 
+def edge_pubkeys(rng, pk0):
+    """Distinct 48-byte keys that stress canonical-encoding, subgroup and flag handling."""
+    out = []
+    for first in (0xC0, 0xE0, 0x80, 0x40, 0xA0, 0x00, 0x20, 0x60):
+        out.append(("identity_variant", bytes([first]) + bytes(47)))
+    out.append(("flags:inf_with_sort", g1_enc(1, 1, 1, 0)))
+    out.append(("flags:zero_body_no_inf_flag", g1_enc(1, 0, 0, 0)))
+    out.append(("flags:zero_body_no_inf_flag_a", g1_enc(1, 0, 1, 0)))
+    out.append(("flags:inf_flag_tiny_body", g1_enc(1, 1, 0, 1)))
+    cc, bf, a, xb = split_g1(pk0)
+    out.append(("flags:inf_flag_nonzero_body", g1_enc(1, 1, a, xb)))
+    out.append(("flags:compression_cleared", g1_enc(0, bf, a, xb)))
+    out.append(("flags:sort_flipped", flip_sort(pk0)))
+    for c_bit in (0, 1):
+        for b_bit in (0, 1):
+            for a_bit in (0, 1):
+                out.append(("flags:all_combos", g1_enc(c_bit, b_bit, a_bit, xb)))
+    for v in (Q, Q + 1, Q + 5, P381 - 1):
+        out.append(("noncanon:body_ge_p", g1_enc(cc, bf, a, v)))
+    room = P381 - Q
+    for _ in range(4):
+        while True:
+            pk = pk_of(rand_sk(rng))
+            _, b_, a_, x = split_g1(pk)
+            if x < room:
+                break
+        out.append(("noncanon:x_plus_p", g1_enc(1, b_, a_, x + Q)))
+        out.append(("noncanon:x_plus_p_flipsort", g1_enc(1, b_, 1 - a_, x + Q)))
+    for _ in range(5):
+        p = rand_g1_curve_point(rng)
+        assert not is_inf(multiply(p, curve_order))
+        out.append(("nonsubgroup:coset_point", G1_to_pubkey(p)))
+        for t in small_order_points(p, H1, [3, 11, 10177, 859267, 52437899])[:3]:
+            out.append(("nonsubgroup:torsion_point", G1_to_pubkey(t)))
+            out.append(("nonsubgroup:valid_plus_torsion", G1_to_pubkey(add(pubkey_to_G1(pk0), t))))
+    t3 = (FQ(0), FQ(2), FQ(1))
+    assert is_on_curve(t3, b)
+    out.append(("nonsubgroup:3torsion_x0", G1_to_pubkey(t3)))
+    out.append(("nonsubgroup:valid_plus_3torsion_x0", G1_to_pubkey(add(pubkey_to_G1(pk0), t3))))
+    for label, enc in list(out):
+        if label.startswith("nonsubgroup"):
+            out.append((label + "_flipsort", flip_sort(enc)))
+    return out
+
+
+def off_curve_pubkeys(rng, count):
+    """Well-formed compressed encodings whose x has no curve point."""
+    out = []
+    while len(out) < count:
+        x = rng.randrange(Q)
+        if pow((x**3 + 4) % Q, (Q - 1) // 2, Q) != 1:
+            out.append(("offcurve", g1_enc(1, 0, rng.randrange(2), x)))
+    return out
+
+
+def dedupe(cases):
+    seen = set()
+    out = []
+    for label, key in cases:
+        if key not in seen:
+            seen.add(key)
+            out.append((label, key))
+    return out
+
+
+def build_keyvalidate():
+    rng = random.Random(SEED + 2)
+    pk0 = pk_of(rand_sk(rng))
+    cases = []
+    for _ in range(N_KEYS_VALID):
+        pk = pk_of(rand_sk(rng))
+        cases.append(("valid", pk))
+        cases.append(("valid_sort_flipped", flip_sort(pk)))
+    cases += edge_pubkeys(rng, pk0)
+    cases += off_curve_pubkeys(rng, N_KEYS_OFFCURVE)
+    for v in rng.sample(range(256), 64):
+        cases.append(("sweep:first_byte", bytes([v]) + pk0[1:]))
+    for _ in range(N_KEYS_RANDOM):
+        cases.append(("random_bytes", rng.randbytes(48)))
+        cases.append(("mutant", mutate(rng, pk0)))
+    return dedupe(cases)
+
+
+def edge_proofs(rng, sig0):
+    """96-byte proofs that stress canonical-encoding, subgroup and flag handling."""
+    out = []
+    for first in (0xC0, 0xE0, 0x80, 0x40, 0xA0, 0x00, 0x20, 0x60):
+        out.append(("identity_variant", bytes([first]) + bytes(95)))
+    out.append(("flags:inf_with_sort", g2_enc(1, 1, 1, 0, 0)))
+    out.append(("flags:zero_body_no_inf_flag", g2_enc(1, 0, 0, 0, 0)))
+    cc, bf, a, x1, x2 = split_g2(sig0)
+    out.append(("flags:compression_cleared", g2_enc(0, 0, a, x1, x2)))
+    out.append(("flags:sort_flipped", flip_sort(sig0)))
+    out.append(("flags:inf_flag_nonzero_c1", g2_enc(1, 1, 0, x1, 0)))
+    out.append(("flags:inf_flag_nonzero_c0", g2_enc(1, 1, 0, 0, x2)))
+    out.append(("flags:inf_flag_tiny_c0", g2_enc(1, 1, 0, 0, 1)))
+    for top in range(1, 8):
+        out.append(("flags:second_half_flags", sig0[:48] + be(x2 | (top << 381), 48)))
+    for c_bit in (0, 1):
+        for b_bit in (0, 1):
+            for a_bit in (0, 1):
+                out.append(("flags:all_combos", g2_enc(c_bit, b_bit, a_bit, x1, x2)))
+    for v in (Q, Q + 1, P381 - 1):
+        out.append(("noncanon:c1_ge_p", g2_enc(cc, bf, a, v, x2)))
+        out.append(("noncanon:c0_ge_p", g2_enc(cc, bf, a, x1, v)))
+    room = P381 - Q
+    for _ in range(3):
+        while True:
+            sig = sign_message(rand_sk(rng), rand_msg(rng))
+            _, b_, a_, y1, y2 = split_g2(sig)
+            if y1 < room and y2 < room:
+                break
+        out.append(("noncanon:c1_plus_p", g2_enc(1, b_, a_, y1 + Q, y2)))
+        out.append(("noncanon:c0_plus_p", g2_enc(1, b_, a_, y1, y2 + Q)))
+        out.append(("noncanon:both_plus_p", g2_enc(1, b_, a_, y1 + Q, y2 + Q)))
+    for _ in range(5):
+        p = rand_g2_curve_point(rng)
+        assert not is_inf(multiply(p, curve_order))
+        out.append(("nonsubgroup:coset_point", G2_to_signature(p)))
+        for t in small_order_points(p, H2, [13, 23, 2713, 11953, 262069])[:3]:
+            out.append(("nonsubgroup:torsion_point", G2_to_signature(t)))
+            out.append(("nonsubgroup:valid_plus_torsion", G2_to_signature(add(signature_to_G2(sig0), t))))
+    for label, enc in list(out):
+        if label.startswith("nonsubgroup"):
+            out.append((label + "_flipsort", flip_sort(enc)))
+    return dedupe(out)
+
+
+def header_digest(h):
+    return hashlib.sha256(h.canonical_bytes()).digest()
+
+
+def build_headers():
+    """(label, header fields, proof bytes) cases; `expected` is added from py_ecc."""
+    rng = random.Random(SEED + 1)
+    proposers = [SK_ALICE, SK_BOB, SK_CAROL]
+
+    def rand_header(sk):
+        return BlockHeader(
+            block_number=rng.randrange(1, 1 << 40),
+            previous_hash=rng.randbytes(32).hex(),
+            timestamp=rng.randrange(1, 1 << 40),
+            merkle_root=rng.randbytes(32).hex(),
+            proposer_pubkey=pubkey_hex(sk),
+            state_hash=rng.randbytes(32).hex(),
+        )
+
+    def signed(h, sk):
+        return sign_message(sk, header_digest(h))
+
+    def with_field(h, **over):
+        d = {
+            "block_number": h.block_number,
+            "previous_hash": h.previous_hash,
+            "timestamp": h.timestamp,
+            "merkle_root": h.merkle_root,
+            "proposer_pubkey": h.proposer_pubkey,
+            "state_hash": h.state_hash,
+        }
+        d.update(over)
+        return BlockHeader(**d)
+
+    cases = []
+
+    def add(label, h, proof):
+        assert isinstance(proof, bytes), label
+        cases.append((label, h, proof))
+
+    for i in range(N_HEADER_VALID):
+        sk = proposers[i % 3]
+        h = rand_header(sk)
+        add("valid", h, signed(h, sk))
+
+    sk0 = SK_ALICE
+    base = rand_header(sk0)
+    base_proof = signed(base, sk0)
+    add("valid_baseline", base, base_proof)
+    for _ in range(3):
+        sk = rng.choice(proposers)
+        h = rand_header(sk)
+        proof = signed(h, sk)
+        tampers = {
+            "block_number": with_field(h, block_number=h.block_number + 1),
+            "previous_hash": with_field(h, previous_hash=rng.randbytes(32).hex()),
+            "timestamp": with_field(h, timestamp=h.timestamp + 1),
+            "merkle_root": with_field(h, merkle_root=rng.randbytes(32).hex()),
+            "state_hash": with_field(h, state_hash=rng.randbytes(32).hex()),
+        }
+        for name, t in tampers.items():
+            add(f"tampered:{name}", t, proof)
+
+    for _ in range(4):
+        h = rand_header(SK_ALICE)
+        proof = signed(h, SK_ALICE)
+        add("swapped_proposer", with_field(h, proposer_pubkey=pubkey_hex(SK_BOB)), proof)
+        add("sig_by_other_key", h, signed(h, SK_BOB))
+        add("sig_over_other_header", h, signed(rand_header(SK_ALICE), SK_ALICE))
+        # Proposer named after signing, with the digest recomputed for the new name.
+        swapped = with_field(h, proposer_pubkey=pubkey_hex(SK_CAROL))
+        add("sig_over_swapped_header_by_original_key", swapped, signed(swapped, SK_ALICE))
+
+    pk0 = bytes.fromhex(pubkey_hex(SK_ALICE))
+    for label, key in dedupe(edge_pubkeys(rng, pk0)):
+        h = with_field(base, proposer_pubkey=key.hex())
+        add(f"edge_pubkey:{label}", h, signed(h, SK_ALICE))
+        add(f"edge_pubkey_base_proof:{label}", h, base_proof)
+
+    for label, enc in edge_proofs(rng, base_proof):
+        add(f"edge_proof:{label}", base, enc)
+    return cases
+
+
+def write_fixture(path, seed_label, rows):
+    body = ",\n".join(json.dumps(v, sort_keys=True) for v in rows)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'{{\n"seed": {seed_label},\n"vectors": [\n{body}\n]\n}}\n')
+    accepted = sum(v["expected"] for v in rows)
+    print(f"wrote {len(rows)} vectors ({accepted} accepted) to {path}")
+
+
+def verify_oracle(pk, digest, sig):
+    return bool(G2Basic.Verify(pk, digest, sig))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--header-out", type=Path, default=HEADER_OUT)
+    ap.add_argument("--keyvalidate-out", type=Path, default=KEYVALIDATE_OUT)
     args = ap.parse_args()
 
     vectors = []
@@ -360,14 +598,36 @@ def main():
                 "pk": pk.hex(),
                 "msg": msg.hex(),
                 "sig": sig.hex(),
-                "expected": bool(G2Basic.Verify(pk, msg, sig)),
+                "expected": verify_oracle(pk, msg, sig),
             }
         )
-    body = ",\n".join(json.dumps(v, sort_keys=True) for v in vectors)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(f'{{\n"seed": {SEED},\n"vectors": [\n{body}\n]\n}}\n')
-    accepted = sum(v["expected"] for v in vectors)
-    print(f"wrote {len(vectors)} vectors ({accepted} accepted) to {args.out}")
+    write_fixture(args.out, SEED, vectors)
+
+    headers = []
+    for label, h, proof in build_headers():
+        digest = header_digest(h)
+        headers.append(
+            {
+                "label": label,
+                "header": {
+                    "block_number": h.block_number,
+                    "previous_hash": h.previous_hash,
+                    "timestamp": h.timestamp,
+                    "merkle_root": h.merkle_root,
+                    "state_hash": h.state_hash,
+                },
+                "proposer": h.proposer_pubkey,
+                "proof": proof.hex(),
+                "expected": verify_oracle(bytes.fromhex(h.proposer_pubkey), digest, proof),
+            }
+        )
+    write_fixture(args.header_out, SEED + 1, headers)
+
+    keys = [
+        {"label": label, "pk": pk.hex(), "expected": bool(G2Basic.KeyValidate(pk))}
+        for label, pk in build_keyvalidate()
+    ]
+    write_fixture(args.keyvalidate_out, SEED + 2, keys)
 
 
 if __name__ == "__main__":

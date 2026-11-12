@@ -54,9 +54,9 @@ class TestMiningLoopIntegration(unittest.TestCase):
         # createblock.py imports _BLS_AVAILABLE. We can patch it.
         createblock._BLS_AVAILABLE = True
 
-        from py_ecc.bls import G2Basic
-        self.original_verify = G2Basic.Verify
-        G2Basic.Verify = lambda *args, **kwargs: True
+        from consensus import bls
+        self.original_verify = bls.verify
+        bls.verify = lambda *args, **kwargs: True
 
         from consensus.engine import TauConsensusEngine
         self.original_query = TauConsensusEngine.query_eligibility
@@ -79,8 +79,8 @@ class TestMiningLoopIntegration(unittest.TestCase):
         from consensus.engine import TauConsensusEngine
         TauConsensusEngine.query_eligibility = self.original_query
 
-        from py_ecc.bls import G2Basic
-        G2Basic.Verify = self.original_verify
+        from consensus import bls
+        bls.verify = self.original_verify
 
         shutil.rmtree(self._tmpdir, ignore_errors=True)
         config.MINER_PRIVKEY = self.original_key

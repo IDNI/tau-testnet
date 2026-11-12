@@ -112,21 +112,6 @@ def _compute_transaction_message_id(payload: dict) -> tuple[str, str]:
     tx_hash = block_module.compute_tx_hash(payload)
     return tx_hash, canonical
 
-_PY_ECC_AVAILABLE = False
-_PY_ECC_BLS = None
-try:
-    import py_ecc.bls as _bls_mod
-    from py_ecc.bls import G2Basic
-    _PY_ECC_BLS = _bls_mod
-    _PY_ECC_AVAILABLE = True
-    logger.info("py_ecc.bls module loaded. BLS public key validation enabled.")
-except ModuleNotFoundError:
-    logger.warning(
-        "py_ecc.bls module not found. BLS public key validation will be skipped; only format checks run."
-    )
-except Exception as e:
-    logger.warning("Error importing py_ecc.bls (%s). Skipping BLS public key validation.", e)
-
 
 def _parse_bitvector_string(bv_str: str) -> int:
     """Helper to parse a bitvector string from Tau's output (#b, #x, or decimal)."""
@@ -623,9 +608,6 @@ def _check_tx_envelope(payload: dict) -> dict | None:
     if not isinstance(payload.get('signature'), str):
         return _qt_err("INVALID_PARAMS", "Missing or invalid 'signature' in transaction.")
     signature = payload['signature']
-
-    if not (_PY_ECC_AVAILABLE and _PY_ECC_BLS):
-        return _qt_err("BLS_UNAVAILABLE", "BLS signatures are required but py_ecc is missing.")
 
     # One verifier, shared with block apply (consensus/tx_signing.py).
     sig_ok, sig_reason = verify_tx_signature(payload)
@@ -1406,8 +1388,6 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
         # --- Post-Tau Processing ---
         # Note: We do NOT increment sequence number or update balances here anymore.
         # This is now an ingestion-only phase. State mutation happens during mining.
-        # if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
-        #     chain_state.increment_sequence_number(sender_pubkey)
 
         if all_validated_transfers:
             logger.info(
@@ -1555,14 +1535,6 @@ def execute(raw_command: str, container):
             "sendtx",
             "Invalid sendtx format. Use sendtx '{\"0\":...}'.",
             "INVALID_PARAMS",
-        )
-
-    if not _PY_ECC_AVAILABLE:
-        logger.error("BLS library not available. Transaction rejected.")
-        return api_response.error_response(
-            "sendtx",
-            "BLS signatures are required but py_ecc is missing.",
-            "BLS_UNAVAILABLE",
         )
 
     json_blob = raw_command[len(prefix):].strip()
