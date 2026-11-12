@@ -55,7 +55,6 @@ _CHILD = r'''
 import json, os, re, tempfile
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "true"   # opt in (OFF by default)
 import config
 config.set_database_path(os.environ["SHRINK_DB"])
 import db; db.init_db()

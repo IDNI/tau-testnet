@@ -112,6 +112,17 @@ def test_overflow_raises_widthoverflow(temp_database, monkeypatch):
         ts.intern_value(HEX96, 384)
 
 
+def test_the_planner_lets_a_width_overflow_reach_its_caller(temp_database, monkeypatch):
+    # A committed id beyond this process width means a re-exec, not a plain stream.
+    import tau_reconstruction
+
+    monkeypatch.setattr(ts, "_current_shrink_width", ts.DEFAULT_SHRINK_WIDTH)
+    monkeypatch.setattr(db, "lookup_shrink_id", lambda key: 9999)
+    rule = _rule(f"i4[t]:bv[384] = {{ #x{HEX96} }}:bv[384]")
+    with pytest.raises(ts.ShrinkWidthOverflow):
+        tau_reconstruction.plan_representation(candidate_rules=[rule])
+
+
 # --- classifier: positives ----------------------------------------------------
 
 def test_eq_stream_then_literal(temp_database):
@@ -168,9 +179,9 @@ def test_stream_disqualified_if_any_arithmetic_use(temp_database):
 
 
 def test_unannotated_stream_not_shrunk(temp_database):
-    # i12 used equality-only but with no/ambiguous bv width -> refuse.
-    p = ts.prepare_rule(_rule(f"i12[t] = {{ #x{HEX96} }}:bv[384]"))
-    assert 12 not in p.shrunk_streams
+    # i13 has no canonical width, and nothing else gives one -> refuse.
+    p = ts.prepare_rule(_rule("i13[t] != 0"))
+    assert 13 not in p.shrunk_streams
 
 
 def test_bare_zero_in_arithmetic_untouched(temp_database):
