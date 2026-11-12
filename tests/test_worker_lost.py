@@ -24,14 +24,14 @@ import tau_proposal as tp
 import tau_reconstruction as tr
 import tau_session
 import tau_speculation as spec
-from bls_keys import SK_ALICE, pubkey_hex, sign_tx
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_tx
 from consensus.engine import TauConsensusEngine
 from consensus.state import TauStateSnapshot
 from errors import EvaluatorLost, TauTestnetError
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SENDER = pubkey_hex(SK_ALICE)
-RECIPIENT = "cc" * 48
+RECIPIENT = pubkey_hex(SK_BOB)
 PROPOSER = "bb" * 48
 RULE = "always ( o13[t]:bv[24] = { #x000002 }:bv[24] )."
 LOST = "worker closed the result channel"

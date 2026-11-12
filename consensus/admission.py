@@ -54,6 +54,7 @@ from consensus.retractable import (
     parse_retractable_transfer,
     validate_park_shape,
 )
+from consensus.tx_checks import check_transfer, validate_bls_pubkey
 from consensus.governance import (
     normalize_validator_delta,
     normalize_validator_set,
@@ -334,6 +335,14 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
     transfers = operations.get("1")
     if isinstance(transfers, list) and len(transfers) > MAX_TRANSFERS_PER_TX:
         return format_error(f"user_tx exceeds MAX_TRANSFERS_PER_TX ({len(transfers)} > {MAX_TRANSFERS_PER_TX}).")
+    if isinstance(transfers, list):
+        for index, transfer_entry in enumerate(transfers):
+            err = check_transfer(transfer_entry, tx.get("sender_pubkey"))
+            if err:
+                return format_error(
+                    f"Transaction invalid. Transfer #{index + 1}: {err}",
+                    code="TX_INVALID",
+                )
     custom_stream_count = sum(1 for k in operations if str(k).isdigit() and int(k) not in (0, 1))
     if custom_stream_count > MAX_CUSTOM_INPUT_STREAMS:
         return format_error(
@@ -858,6 +867,10 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
     if offer.offerer_pubkey == offer.recipient_pubkey:
         return format_error("rule_offer recipient must differ from the offerer.")
 
+    err = validate_bls_pubkey(offer.recipient_pubkey, "recipient_pubkey")
+    if err:
+        return format_error(err)
+
     rule_bytes = len(offer.rule_text.encode("utf-8"))
     if rule_bytes > MAX_OFFER_RULE_BYTES:
         return format_error(
@@ -1159,6 +1172,14 @@ def validate_approval_request_payload(
     if not isinstance(sender, str) or sender.strip().lower() != request.sender_pubkey:
         return format_error("approval_request sender_pubkey must match the signer.")
 
+    err = validate_bls_pubkey(request.recipient_pubkey, "recipient_pubkey")
+    if err:
+        return format_error(f"approval_request rejected: {err}")
+    for approver in request.approvers.values():
+        err = validate_bls_pubkey(approver, "approver")
+        if err:
+            return format_error(f"approval_request rejected: {err}")
+
     # Stateless shape, byte-identical to what block apply applies.
     shape_error = validate_request_shape(request, tip_view.next_block_height)
     if shape_error:
@@ -1279,6 +1300,10 @@ def validate_retractable_transfer_payload(
     sender = tx.get("sender_pubkey")
     if not isinstance(sender, str) or sender != park.sender_pubkey:
         return format_error("retractable_transfer sender_pubkey must match the signer.")
+
+    err = validate_bls_pubkey(park.recipient_pubkey, "recipient_pubkey")
+    if err:
+        return format_error(f"retractable_transfer rejected: {err}")
 
     shape_error = validate_park_shape(park, tip_view.next_block_height, tip_view.next_block_timestamp)
     if shape_error:

@@ -76,6 +76,7 @@ _LIFECYCLE_TX_TYPES = frozenset(
     | set(RULE_OFFER_TX_TYPES)
     | set(APPROVAL_TX_TYPES)
 )
+from consensus.tx_checks import apply_tx_error
 from consensus.tx_signing import verify_tx_signature
 import tau_native
 import tau_advisory
@@ -1448,7 +1449,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             # Every branch and every account-scoped policy below trusts sender_pubkey.
             # Replay rejects too: the state hash binds the tx as rejected.
-            signature_rejected = False
+            precheck_rejected = False
             if not hard_reject:
                 sig_ok, sig_reason = verify_tx_signature(tx)
                 if not sig_ok:
@@ -1456,10 +1457,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     accepted_in_block = False
                     hard_reject = True
                     execution_success = False
-                    signature_rejected = True
+                    precheck_rejected = True
                     operations = {}
                     tx_receipt["reason"] = "invalid_signature"
                     tx_receipt["logs"].append(f"Transaction signature invalid: {sig_reason}")
+
+            # The admission checks of transfers and recipient keys, again: a
+            # proposer can put a transaction into a block that never passed admission.
+            if not hard_reject:
+                tx_error = apply_tx_error(tx)
+                if tx_error is not None:
+                    logger.error("Tx %s rejected at apply: %s", tx_id, tx_error[1])
+                    accepted_in_block = False
+                    hard_reject = True
+                    execution_success = False
+                    precheck_rejected = True
+                    operations = {}
+                    tx_receipt["reason"], detail = tx_error
+                    tx_receipt["logs"].append(f"Error: {detail}")
 
             # Process operations
             # Parse operations first to establish deterministic order:
@@ -1477,7 +1492,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # fee-query step below covers them.
             charge_fee = (
                 fees_enabled and tx_type in FEE_BEARING_TX_TYPES
-                and not signature_rejected
+                and not precheck_rejected
             )
             fee_limit_int: Optional[int] = None
             fee_components: List[int] = []

@@ -24,9 +24,11 @@ from consensus.rule_offers import (
     clause_body_v1,
 )
 
-A = "aa" * 48          # offerer
-B = "bb" * 48          # recipient
-C = "cc" * 48          # unrelated
+from bls_keys import pubkey_hex
+
+A = pubkey_hex(0xAA)          # offerer
+B = pubkey_hex(0xBB)          # recipient
+C = pubkey_hex(0xCC)          # unrelated
 BLOCK_RULE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
 ALLOW_RULE = "always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."
 TARGET = 5

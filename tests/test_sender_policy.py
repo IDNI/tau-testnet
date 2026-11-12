@@ -16,7 +16,7 @@ import db
 import tau_admission
 import tau_defs
 import tau_policy
-from bls_keys import SK_ALICE, pubkey_hex, sign_payload
+from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_payload
 from commands import getapprovalpreview, sendtx
 from consensus import sender_policy
 from consensus.policy_mock import MockPolicyEvaluator
@@ -320,7 +320,7 @@ def test_a_parked_request_without_a_clause_is_still_refused_as_ungated():
 # --- admission --------------------------------------------------------------
 
 SENDER = pubkey_hex(SK_ALICE)
-RECIPIENT = "ab" * 48
+RECIPIENT = pubkey_hex(SK_BOB)
 ADMISSION_CLAUSE_VIEW = "consensus.facade.TipAdmissionView.clause_for"
 
 
@@ -333,7 +333,7 @@ def admission(temp_database):
     chain_state._balances[SENDER] = 100000
     with ExitStack() as stack:
         for target, kwargs in (
-            ("commands.sendtx._validate_bls12_381_pubkey", {"return_value": (True, None)}),
+            ("commands.sendtx.validate_bls_pubkey", {"return_value": None}),
             ("tau_manager.is_force_test_enabled", {"return_value": False}),
             ("tau_manager.communicate_with_tau_multi", {"return_value": {1: "1", 5: "1"}}),
         ):

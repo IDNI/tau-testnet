@@ -343,7 +343,7 @@ def node(temp_database):
     db.set_chain_state_value("approval_slots_active", "1")
     with ExitStack() as stack:
         for target, kwargs in (
-            ("commands.sendtx._validate_bls12_381_pubkey", {"return_value": (True, None)}),
+            ("commands.sendtx.validate_bls_pubkey", {"return_value": None}),
             ("tau_manager.is_force_test_enabled", {"return_value": False}),
             ("tau_manager.communicate_with_tau_multi", {"return_value": {1: "1", 5: "1"}}),
         ):

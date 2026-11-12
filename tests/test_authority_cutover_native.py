@@ -16,6 +16,7 @@ import pytest
 from py_ecc.bls import G2Basic as bls
 from unittest.mock import patch
 
+from bls_keys import SK_CAROL, pubkey_hex
 import chain_state
 import db
 import tau_authority as auth
@@ -24,6 +25,7 @@ from commands import createblock, sendtx
 from commands.sendtx import _get_signing_message_bytes
 from consensus.engine import TauConsensusEngine
 
+TRANSFER_PEER = pubkey_hex(SK_CAROL)
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -211,7 +213,7 @@ def test_the_next_block_runs_on_the_lent_authority(authority):
     _history_block("lend_a")
     before = authority.current()
     sk, pk = _sender("lend_b")
-    assert _submit(sk, pk, {"1": [[pk, "aa" * 48, "5"]]}).get("ok")
+    assert _submit(sk, pk, {"1": [[pk, TRANSFER_PEER, "5"]]}).get("ok")
 
     spawned = []
     import tau_session as ts
@@ -257,7 +259,7 @@ def test_a_block_without_a_local_artifact_takes_the_same_protocol(authority):
 def test_a_restart_rebuilds_the_same_evaluator_from_the_journal(authority):
     _history_block("restart_a")
     sk, pk = _sender("restart_b")
-    assert _submit(sk, pk, {"1": [[pk, "aa" * 48, "7"]]}).get("ok")
+    assert _submit(sk, pk, {"1": [[pk, TRANSFER_PEER, "7"]]}).get("ok")
     _mine()
 
     promoted = authority.current()
@@ -329,7 +331,7 @@ def test_a_failed_promotion_leaves_the_block_committed_and_nothing_served(author
 
 def test_reprocessing_the_same_block_applies_nothing_twice(authority):
     sk, pk = _sender("idem")
-    assert _submit(sk, pk, {"1": [[pk, "aa" * 48, "9"]]}).get("ok")
+    assert _submit(sk, pk, {"1": [[pk, TRANSFER_PEER, "9"]]}).get("ok")
     _mine()
     head = db.get_canonical_head()
     def _observe():
@@ -408,7 +410,7 @@ def test_the_outcome_of_a_crash_is_decided_by_durable_state_alone(
     pre_head = db.get_canonical_head()["block_hash"]
 
     sk, pk = _sender(f"death_{point[:10]}")
-    assert _submit(sk, pk, {"1": [[pk, "aa" * 48, "3"]]}).get("ok")
+    assert _submit(sk, pk, {"1": [[pk, TRANSFER_PEER, "3"]]}).get("ok")
 
     post = {}
     real_freeze = tc.PreparedBlockCommit.freeze.__func__
@@ -483,7 +485,7 @@ def test_a_lost_journal_is_rebuilt_from_the_stored_blocks(authority, monkeypatch
     sk, pk = _genesis_sender("rebuild_b")
     assert _submit(sk_a, pk_a, {"0": HISTORY_RULE}).get("ok")
     _mine()
-    assert _submit(sk, pk, {"1": [[pk, "aa" * 48, "4"]]}).get("ok")
+    assert _submit(sk, pk, {"1": [[pk, TRANSFER_PEER, "4"]]}).get("ok")
     _mine()
     before = authority.current()._spec.state()
     head_before = db.get_canonical_head()["block_hash"]

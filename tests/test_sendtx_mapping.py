@@ -61,7 +61,7 @@ class TestSendTxMapping(unittest.TestCase):
         db.init_db()
         chain_state.load_genesis("data/genesis.json")
         db.clear_mempool()
-        patch("commands.sendtx._validate_bls12_381_pubkey", return_value=(True, None)).start()
+        patch("commands.sendtx.validate_bls_pubkey", return_value=None).start()
         patch("commands.sendtx.tau_manager.communicate_with_tau", _mock_tau_ok).start()
         patch("commands.sendtx.tau_manager.communicate_with_tau_multi", _mock_tau_multi_ok).start()
         # Signatures are verified for real; fund the signing sender.

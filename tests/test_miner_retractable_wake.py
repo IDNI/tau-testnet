@@ -43,7 +43,6 @@ def node(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "MINER_PRIVKEY", "1" * 64)
     monkeypatch.setattr(tau_manager, "communicate_with_tau", lambda **kw: "require_bls_sig")
     monkeypatch.setattr(tau_manager, "communicate_with_tau_multi", lambda **kw: {})
-    monkeypatch.setattr(createblock, "_validate_signature", lambda p: True)
     monkeypatch.setattr(createblock, "_BLS_AVAILABLE", True)
     monkeypatch.setattr(G2Basic, "Verify", lambda *a, **k: True)
     monkeypatch.setattr(TauConsensusEngine, "query_eligibility", lambda self, *a, **k: True)

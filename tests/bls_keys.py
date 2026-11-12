@@ -50,3 +50,16 @@ def sign_tx(tx: Dict[str, Any], sk: int = SK_ALICE) -> Dict[str, Any]:
     tx.setdefault("expiration_time", FAR_FUTURE)
     tx.setdefault("fee_limit", "0")
     return sign_payload(tx, sk)
+
+# Keys that py_ecc G2Basic.KeyValidate refuses.
+ZERO_PUBKEY = "00" * 48
+NOT_IN_SUBGROUP_PUBKEY = "8" + "0" * 94 + "5"
+OFF_CURVE_PUBKEY = "8" + "0" * 94 + "1"
+INFINITY_PUBKEY = "c0" + "00" * 47
+
+INVALID_PUBKEYS = (
+    ("zero", ZERO_PUBKEY),
+    ("not_in_subgroup", NOT_IN_SUBGROUP_PUBKEY),
+    ("off_curve", OFF_CURVE_PUBKEY),
+    ("infinity", INFINITY_PUBKEY),
+)
