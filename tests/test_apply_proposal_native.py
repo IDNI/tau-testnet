@@ -54,8 +54,9 @@ def _router():
 
 
 def _allow(sender):
+    """A sender-scoped fee rule: o5 rules are per-account clauses, not accumulated."""
     return (f"always ( i12[t]:bv[384] = {{ #x{sender} }}:bv[384] -> "
-            f"o5[t]:bv[24] = {{ #x000001 }}:bv[24] ).")
+            f"o8[t]:bv[24] = {{ #x000001 }}:bv[24] ).")
 
 
 def _tx(tx_id, sender, rule=None, fee_limit="1000", transfer=None):

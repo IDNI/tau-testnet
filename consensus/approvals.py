@@ -262,30 +262,38 @@ def screen_policy_widths(text: str) -> Optional[str]:
     return None
 
 
-def screen_unsatisfiable_sender_conjunction(text: str) -> Optional[str]:
-    """Refuse a top-level `i12 = me && …` total-form unit (routing off only).
+_STREAM_MENTION_RE = re.compile(r"\b([io])(\d+)\b")
+_STREAM_TYPED_TAIL_RE = re.compile(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*(\d+)\s*\]")
 
-    That shape is unsatisfiable for every other sender: Tau conjoins every
-    deployed o5 unit, so `always (i12 = A && o5 = 0)` cannot hold when the
-    current sender is not A. Implication (`->`) and ternary (`? :`) are the
-    documented guards and are left alone. Cheap heuristic, not a proof of
-    scoping; unused once o5 is routed into the clause registry.
+
+def screen_stream_widths(body: str) -> Optional[str]:
+    """None when every input/output mention carries one explicit width, else the reason.
+
+    Stream typing is process-global and sticky, so an inferred width could make a
+    clause's build depend on what else a process has built.
     """
     from consensus.rule_offers import strip_clause_comments
 
-    scrubbed = strip_clause_comments(text or "")
-    if not re.search(r"\bo5\b", scrubbed):
-        return None
-    if not re.search(r"\bi12\b", scrubbed):
-        return None
-    if "->" in scrubbed or "?" in scrubbed:
-        return None
-    if "&&" not in scrubbed:
-        return None
-    return (
-        "top-level i12 conjunction (i12 = me && …) is unsatisfiable for every "
-        "other sender; guard with -> or ? : instead of &&"
-    )
+    scrubbed = strip_clause_comments(body or "")
+    widths: Dict[str, Set[int]] = {}
+    for match in _STREAM_MENTION_RE.finditer(scrubbed):
+        name = f"{match.group(1)}{match.group(2)}"
+        typed = _STREAM_TYPED_TAIL_RE.match(scrubbed, match.end())
+        if typed is None:
+            return (
+                f"every mention of stream {name} must be written "
+                f"{name}[t]:bv[<width>] with an explicit width; an untyped "
+                f"mention lets the engine infer a conflicting width"
+            )
+        widths.setdefault(name, set()).add(int(typed.group(1)))
+    for name, seen in widths.items():
+        if len(seen) > 1:
+            listed = ", ".join(f"bv[{w}]" for w in sorted(seen))
+            return (
+                f"stream {name} is written at several widths ({listed}); "
+                f"use one width for every mention"
+            )
+    return None
 
 
 # --- Activation audit -------------------------------------------------------

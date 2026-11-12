@@ -38,8 +38,6 @@ def _cond(condition):
 
 # Each body is a well-formed o5 clause that admission refuses on one domain screen.
 BAD_BODIES = {
-    "i2_read": _cond("i2[t]:bv[24] > { #x000064 }:bv[24]"),
-    "i2_bv16": _cond("i2[t]:bv[16] > { #x0064 }:bv[16]"),
     "i13": _cond("i13[t]:bv[24] = { #x000001 }:bv[24]"),
     "i14": _cond("i14[t]:bv[24] = { #x000001 }:bv[24]"),
     "i15": _cond("i15[t]:bv[24] = { #x000001 }:bv[24]"),
@@ -52,8 +50,6 @@ BAD_BODIES = {
 # Only the o5/o8 width errors carry a WIDTH_MISMATCH payload; the other screens
 # are plain rejections at admission and "rule_not_applied" at apply.
 EXPECTED_REASON = {
-    "i2_read": NOT_APPLIED,
-    "i2_bv16": NOT_APPLIED,
     "i13": NOT_APPLIED,
     "i14": NOT_APPLIED,
     "i15": NOT_APPLIED,
@@ -65,6 +61,7 @@ EXPECTED_REASON = {
 
 TEMPORAL_BODY = "always ( o5[t]:bv[24] = i1[t-1]:bv[24] )."
 CONTROL_I1 = _cond("i1[t]:bv[24] > { #x000064 }:bv[24]")
+CONTROL_I2 = _cond("i2[t]:bv[24] > { #x000064 }:bv[24]")
 CONTROL_SLOT = _cond("i18[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]")
 
 
@@ -75,7 +72,7 @@ def test_the_expected_reason_follows_the_admission_screen(name):
     assert bool(_width_mismatch_details(error)) == (EXPECTED_REASON[name] == WIDTH_MISMATCH)
 
 
-@pytest.mark.parametrize("body", [CONTROL_I1, CONTROL_SLOT])
+@pytest.mark.parametrize("body", [CONTROL_I1, CONTROL_I2, CONTROL_SLOT])
 def test_the_controls_pass_the_screen(body):
     assert _screen_clause_domains(body) is None
 
@@ -279,7 +276,8 @@ _APPLY_DOOR = {
     "accept": ("accept", _accept_tx),
 }
 
-PARITY_BODIES = {**BAD_BODIES, "temporal": TEMPORAL_BODY, "control_i1": CONTROL_I1}
+PARITY_BODIES = {**BAD_BODIES, "temporal": TEMPORAL_BODY, "control_i1": CONTROL_I1,
+                 "control_i2": CONTROL_I2}
 
 
 @pytest.mark.parametrize("door", list(_APPLY_DOOR))
@@ -301,14 +299,16 @@ def test_admission_and_apply_reach_the_same_verdict(tip_view, door, name):
 
 # --- clean bodies still land --------------------------------------------------
 
-@pytest.mark.parametrize("body", [CONTROL_I1, CONTROL_SLOT], ids=["i1", "slot_bv384"])
+@pytest.mark.parametrize("body", [CONTROL_I1, CONTROL_I2, CONTROL_SLOT],
+                         ids=["i1", "i2", "slot_bv384"])
 def test_apply_keeps_a_clean_offer(body):
     result, post, _ = _apply(_offer_tx(body), _lifecycle(slots=True))
     assert result.accepted_tx_ids == ["offer"]
     assert post.rule_offers.get_offer(_offer(body).offer_id) is not None
 
 
-@pytest.mark.parametrize("body", [CONTROL_I1, CONTROL_SLOT], ids=["i1", "slot_bv384"])
+@pytest.mark.parametrize("body", [CONTROL_I1, CONTROL_I2, CONTROL_SLOT],
+                         ids=["i1", "i2", "slot_bv384"])
 def test_apply_keeps_a_clean_accept(body):
     result, post, fed = _apply(_accept_tx(body), _lifecycle(slots=True, open_offer=body))
     assert result.accepted_tx_ids == ["accept"]

@@ -61,6 +61,10 @@ class _InterpreterCache:
     def is_pinned(self, key) -> bool:
         return key in self._pinned
 
+    def discard(self, key) -> None:
+        self._items.pop(key, None)
+        self._pinned.discard(key)
+
     def get(self, key):
         if key not in self._items:
             return None
@@ -140,11 +144,32 @@ class _PolicyWorker:
         self.cache.put(key, itp, pinned=pinned)
         return itp, info
 
-    def build(self, key: str, text: str) -> dict:
+    def _step_interpreter(self, itp, inputs: dict, reports: list):
+        """(outputs, asked slots); outputs is None when the engine refuses the step."""
+        asked, prep = _unwrap(self.tau.get_inputs_for_step(itp))
+        reports.append(prep)
+        if asked is None:
+            return None, []
+        vals = {slot: str(inputs.get(slot.name, "0")) for slot in asked}
+        outs, srep = _unwrap(self.tau.step(itp, vals))
+        reports.append(srep)
+        return outs, list(asked)
+
+    def build(self, key: str, text: str, probe: bool = False) -> dict:
         self.state_revision += 1
         itp, info = self._build(key, text)
         if itp is None:
             return {"ok": False, "phase": "build", **info}
+        if probe:
+            reports = []
+            with _Capture() as cap:
+                outs, asked = self._step_interpreter(itp, {}, reports)
+            if outs is None:
+                self.cache.discard(key)
+                detail = _diag(cap.text, *reports)[:_ERROR_LIMIT]
+                reason = ("clause cannot be evaluated: it reads no input stream"
+                          if not asked else detail or "clause cannot be evaluated")
+                return {"ok": False, "phase": "build", **info, "error": reason}
         return {"ok": True, "phase": "build", **info}
 
     def step(self, key: str, text: str, inputs: dict) -> dict:
@@ -153,17 +178,10 @@ class _PolicyWorker:
         if itp is None:
             return {"ok": False, "phase": "build", "o5": None, "asked": [], **info}
         reports = []
-        outs = None
-        asked = None
         with _Capture() as cap:
-            asked, prep = _unwrap(self.tau.get_inputs_for_step(itp))
-            reports.append(prep)
-            if asked is not None:
-                vals = {slot: str(inputs.get(slot.name, "0")) for slot in asked}
-                outs, srep = _unwrap(self.tau.step(itp, vals))
-                reports.append(srep)
+            outs, asked = self._step_interpreter(itp, inputs, reports)
         self.steps += 1
-        names = [s.name for s in (asked or [])]
+        names = [s.name for s in asked]
         info["diagnostics"] = _diag(cap.text, *reports)
         info["report"] = _report_summary(*reports)
         info["capture_complete"] = bool(info["capture_complete"] and cap.complete)
@@ -210,7 +228,8 @@ def main(argv=None) -> int:
         rid = req.get("request_id")
         try:
             if op == "build":
-                body = worker.build(req.get("key", ""), req.get("text", ""))
+                body = worker.build(req.get("key", ""), req.get("text", ""),
+                                    bool(req.get("probe")))
             elif op == "step":
                 body = worker.step(req.get("key", ""), req.get("text", ""),
                                    req.get("inputs") or {})

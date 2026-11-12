@@ -109,6 +109,14 @@ def test_a_clause_that_does_not_build_blocks():
     assert blocked is True and "no good" in detail
 
 
+def test_a_clause_the_engine_refuses_to_step_blocks():
+    ev = MockPolicyEvaluator()
+    ev.fail_step(CLAUSE, "engine says no")
+    sender_policy.set_evaluator("apply", ev)
+    blocked, detail = sender_policy.clause_blocks(CLAUSE, {}, pool="apply")
+    assert blocked is True and detail == tau_policy.PolicyStepError.MESSAGE
+
+
 @pytest.mark.parametrize("exc", [WorkerLost("gone"), WorkerTimeout("slow")])
 def test_loss_of_the_evaluator_propagates(exc):
     class _Lost:
@@ -210,6 +218,16 @@ def test_apply_rejects_a_transfer_the_senders_clause_blocks():
     assert ap._balances(result)[ap.ALICE] == 100000
     assert "sender's own policy clause" in ap._logs(result)
     assert ev.verdict_calls, "the clause must be consulted"
+
+
+def test_apply_rejects_a_transfer_whose_clause_the_engine_refuses_to_step():
+    ev = MockPolicyEvaluator()
+    ev.fail_step(CLAUSE, "engine says no")
+    sender_policy.set_evaluator("apply", ev)
+    tx = _transfer_tx(500)
+    result, _lm, _calls = ap._apply([tx], lm=_registered())
+    assert tx["tx_id"] in result.invalid_tx_ids
+    assert _reason(result, tx) == "user_policy_block"
 
 
 def test_apply_lets_a_transfer_through_when_the_clause_allows():
@@ -346,6 +364,17 @@ def test_admission_rejects_a_transfer_the_senders_clause_blocks(admission):
     assert "sender's own policy clause" in res["message"] and "#1" in res["message"]
     body, inputs = ev.verdict_calls[-1]
     assert body == CLAUSE and inputs["i1"] == "1" and inputs["i12"] == "#x" + SENDER
+
+
+def test_admission_rejects_a_transfer_whose_clause_the_engine_refuses_to_step(admission):
+    ev = MockPolicyEvaluator(pool="admission")
+    ev.fail_step(CLAUSE, "engine says no")
+    sender_policy.set_evaluator("admission", ev)
+    with patch(ADMISSION_CLAUSE_VIEW, return_value=CLAUSE):
+        res = _queue()
+    assert res["ok"] is False and res["code"] == "TX_REJECTED"
+    assert tau_policy.PolicyStepError.MESSAGE in res["message"]
+    assert db.get_mempool_txs() == []
 
 
 def test_admission_accepts_when_the_clause_allows(admission):

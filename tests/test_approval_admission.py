@@ -451,17 +451,14 @@ def test_every_vote_field_is_signed():
 
 # --- o5/o8 reject-unless-annotated bv[24] -----------------------------------
 
-SCOPE = "i12[t]:bv[384] = { #x" + A + " }:bv[384]"
-
-
-def _scoped(body):
-    return f"always (({SCOPE}) -> ({body}))."
+def _unit(body):
+    return f"always ( {body} )."
 
 
 def test_bv16_policy_rule_is_refused_at_admission(tip_view):
     tip_view.approval_slots_active = False
     result = validate_user_tx_reserved_domains(
-        _user_tx(operations={"0": _scoped("o5[t]:bv[16] = { #x000001 }:bv[16]")}),
+        _user_tx(operations={"0": _unit("o5[t]:bv[16] = { #x000001 }:bv[16]")}),
         tip_view,
     )
     assert result.is_valid is False
@@ -474,16 +471,16 @@ def test_bv16_policy_rule_is_refused_at_admission(tip_view):
 def test_untyped_o5_is_refused_at_admission(tip_view):
     tip_view.approval_slots_active = False
     result = validate_user_tx_reserved_domains(
-        _user_tx(operations={"0": _scoped("o5[t] = 1")}), tip_view)
+        _user_tx(operations={"0": _unit("o5[t] = 1")}), tip_view)
     assert result.is_valid is False
     assert result.code == "WIDTH_MISMATCH"
     assert result.details["found"] == "untyped"
 
 
-def test_bv24_scoped_unit_is_admitted(tip_view):
+def test_bv24_unit_is_admitted(tip_view):
     tip_view.approval_slots_active = False
     result = validate_user_tx_reserved_domains(
-        _user_tx(operations={"0": _scoped("o5[t]:bv[24] = { #x000001 }:bv[24]")}),
+        _user_tx(operations={"0": _unit("o5[t]:bv[24] = { #x000001 }:bv[24]")}),
         tip_view,
     )
     assert result.is_valid is True, result.error

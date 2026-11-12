@@ -546,10 +546,26 @@ def test_an_author_replaces_their_own_clause():
     assert post.rule_offers.clause_for(ALICE, 5) == TIER_CLAUSE_BODY
 
 
-def test_routing_is_inactive_before_activation():
+LIMIT_CLAUSE_BODY = (
+    "(i1[t]:bv[24] > { #x0003e8 }:bv[24]) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
+    ": (o5[t]:bv[24] = { #x000001 }:bv[24])"
+)
+
+
+def test_an_o5_rule_registers_a_clause_before_activation_too():
+    result, lm, _ = _apply([rule_tx("always ( %s )." % LIMIT_CLAUSE_BODY)], lm=_lm(active=False))
+    assert lm.rule_offers.clause_for(ALICE, 5) == LIMIT_CLAUSE_BODY
+    assert "Rule applied" not in _logs(result)
+    assert not _clause_units_fed()
+
+
+def test_a_guarded_o5_rule_is_never_accumulated_before_activation():
     result, lm, _ = _apply([rule_tx(GUARDED_RULE)], lm=_lm(active=False))
     assert lm.rule_offers.clause_for(ALICE, 5) is None
-    assert "Rule applied" in _logs(result), "the ordinary accumulation path runs"
+    assert "o5 clause ignored" in _logs(result)
+    assert "Rule applied" not in _logs(result)
+    assert not _clause_units_fed()
 
 
 def test_slot_values_are_fed_as_wrapped_bv384_literals():

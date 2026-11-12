@@ -10,6 +10,7 @@ another step is not recorded at apply, since activation would reset the
 evaluator into a spec with lookback.
 """
 import hashlib
+import inspect
 
 import pytest
 from py_ecc.bls import G2Basic
@@ -92,6 +93,10 @@ def test_the_clause_screen_carries_the_same_check():
     assert _screen_clause_domains("o5[t]:bv[24] = i1[t]:bv[24]") is None
 
 
+def test_the_clause_screen_takes_the_body_and_nothing_else():
+    assert list(inspect.signature(_screen_clause_domains).parameters) == ["body"]
+
+
 # --- admission ----------------------------------------------------------------
 
 @pytest.fixture
@@ -172,14 +177,13 @@ def test_admission_keeps_current_step_rules(tip_view, kind):
     assert result.is_valid is True, (result.code, result.error)
 
 
-def test_admission_refuses_a_sender_guarded_history_policy(tip_view):
-    rule = (
-        f"always ((i12[t]:bv[384] = {{ #x{ALICE} }}:bv[384]) ? "
-        f"(o5[t]:bv[24] = i1[t-1]:bv[24]) : (o5[t]:bv[24] = {{ #x000001 }}:bv[24]))."
-    )
-    result = validate_mempool_admission(_user_tx(rule), tip_view)
+@pytest.mark.parametrize("slots", [False, True])
+@pytest.mark.parametrize("ref", TEMPORAL_REFS)
+def test_admission_refuses_an_o5_rule_reading_another_step_either_way(tip_view, ref, slots):
+    tip_view.approval_slots_active = slots
+    result = validate_mempool_admission(_user_tx(_policy(ref)), tip_view)
     assert result.is_valid is False
-    assert result.code == TEMPORAL_REFERENCE_CODE
+    assert result.code == TEMPORAL_REFERENCE_CODE, result.error
 
 
 def test_admission_refuses_a_history_rule_on_a_fee_stream(tip_view):
@@ -311,10 +315,11 @@ def test_apply_hard_rejects_an_op0_rule_reading_another_step(ref, slots, replay_
     assert _never_fed(fed, ref, FREE_STREAM)
 
 
+@pytest.mark.parametrize("slots", [False, True])
 @pytest.mark.parametrize("replay_mode", [False, True])
 @pytest.mark.parametrize("ref", TEMPORAL_REFS)
-def test_apply_hard_rejects_a_routed_o5_clause_reading_another_step(ref, replay_mode):
-    lm = _lifecycle(slots=True)
+def test_apply_hard_rejects_a_routed_o5_clause_reading_another_step(ref, replay_mode, slots):
+    lm = _lifecycle(slots=slots)
     result, post, fed = _apply(_rule_tx(_policy(ref)), lm, replay_mode=replay_mode)
     assert "rule" in result.invalid_tx_ids
     assert _outcome(result, "rule").reason == REASON

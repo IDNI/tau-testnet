@@ -163,10 +163,10 @@ class TestChecktx(unittest.TestCase):
         self.assertIsNotNone(c, "reserved stream was admitted")
         self.assertEqual(c, s)
 
-    def test_parity_unscoped_policy_rule(self):
-        """The #24 sender-scope screen reaches checktx too, so a wallet learns
+    def test_parity_unscoped_fee_rule(self):
+        """The sender-scope screen reaches checktx too, so a wallet learns
         before signing rather than at submit."""
-        tx = self._tx(operations={"0": "always (o5[t]:bv[24] = { #x000000 }:bv[24])."})
+        tx = self._tx(operations={"0": "always (o8[t]:bv[24] = { #x000003 }:bv[24])."})
         c, s = self._codes_for(tx)
         self.assertEqual(c, "UNSCOPED_USER_RULE")
         self.assertEqual(c, s)

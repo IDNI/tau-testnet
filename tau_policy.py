@@ -45,6 +45,17 @@ class PolicyBuildError(SpeculationError):
         self.error = error
 
 
+class PolicyStepError(SpeculationError):
+    """A clause built but the engine refused to step it. The message is fixed;
+    the engine's diagnostics stay on `.error`."""
+
+    MESSAGE = "policy clause cannot be evaluated on these inputs"
+
+    def __init__(self, error: str):
+        super().__init__(self.MESSAGE)
+        self.error = error
+
+
 @dataclass(frozen=True)
 class PolicyBuild:
     ok: bool
@@ -140,7 +151,8 @@ class PolicyEvaluator:
 
     def validate(self, body: str, *, timeout=_SESSION_DEFAULT) -> PolicyBuild:
         resp = self._run(
-            {"op": "build", "key": clause_key(body), "text": body}, timeout
+            {"op": "build", "key": clause_key(body), "text": body, "probe": True},
+            timeout,
         )
         if resp.get("ok"):
             return PolicyBuild(
@@ -162,6 +174,8 @@ class PolicyEvaluator:
         if not resp.get("ok"):
             if resp.get("phase") == "build":
                 raise PolicyBuildError(str(resp.get("error") or ""))
+            if resp.get("phase") == "step":
+                raise PolicyStepError(str(resp.get("error") or ""))
             raise SpeculationError(f"policy step failed: {_failure_text(resp)}")
         o5 = resp.get("o5")
         value = parse_o5(o5)

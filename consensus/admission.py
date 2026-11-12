@@ -24,6 +24,7 @@ from consensus.rule_offers import (
     parse_rule_offer,
     parse_rule_offer_accept,
     parse_rule_offer_reject,
+    screen_clause_structure,
 )
 from consensus.facade import TipAdmissionView
 from consensus.approvals import (
@@ -39,7 +40,7 @@ from consensus.approvals import (
     parse_transfer_vote,
     screen_policy_widths,
     screen_slot_widths,
-    screen_unsatisfiable_sender_conjunction,
+    screen_stream_widths,
     validate_request_shape,
 )
 from consensus.retractable import (
@@ -288,9 +289,9 @@ def screen_user_rule_text(
             "TX_REJECTED",
         )
 
-    # o5/o8 are shared across senders, so an unscoped write freezes transfers or taxes fees for all.
+    # o8 is shared across senders, so an unscoped write taxes fees for all.
     # A reference is not proof of gating; this catches the accidental global rule only.
-    policy_out = _streams_referenced(rule_text, ("o5", "o8"))
+    policy_out = _streams_referenced(rule_text, ("o8",))
     if policy_out and not _streams_referenced(rule_text, ("i12", "i3")):
         return UserRuleRejection(
             f"user_tx rule text writes shared policy stream '{policy_out[0]}' "
@@ -314,15 +315,6 @@ def screen_user_rule_text(
             "WIDTH_MISMATCH",
             _width_mismatch_details(width_error) or {},
         )
-
-    # While o5 accumulates, a top-level i12 conjunction is unsatisfiable for every
-    # other sender; a registered clause must not carry i12 at all.
-    if not slots_active:
-        conj_error = screen_unsatisfiable_sender_conjunction(rule_text)
-        if conj_error:
-            return UserRuleRejection(
-                conj_error, "unsatisfiable_sender_conjunction", "TX_REJECTED"
-            )
 
     return None
 
@@ -388,9 +380,9 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
 
     rule_text = operations.get("0")
     if isinstance(rule_text, str) and rule_text:
-        # DECIDED FIRST, before any user-rule screen: once approval slots are
-        # active an o5 rule is a registered clause, and the user and clause
-        # contexts screen it by opposite rules (slot reads, i12 guard).
+        # DECIDED FIRST, before any user-rule screen: an o5 rule is a registered
+        # clause, and the user and clause contexts screen it by opposite rules
+        # (slot reads, i12 guard).
         routing = validate_o5_clause_routing(tx, tip_view, rule_text)
         if routing is not None:
             return routing
@@ -903,9 +895,9 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
 def _screen_clause_domains(body: str) -> Optional[str]:
     """Reserved-domain screens for a clause body, shared by offer and accept.
 
-    Same screens as a user_tx rule op: a clause must not write the
-    consensus-owned verdict/fee streams, must not read an input the apply path
-    mocks, must not type a reserved input stream, and may reference [t] only.
+    A clause must not write the consensus-owned verdict/fee streams, must not
+    type a reserved input stream, and may reference [t] only. It may read i2:
+    the policy evaluator is fed the parent-block balance at admission and apply.
     """
     temporal_error = screen_temporal_rule(body)
     if temporal_error:
@@ -918,16 +910,8 @@ def _screen_clause_domains(body: str) -> Optional[str]:
             + ", ".join(writes)
         )
 
-    mocked = _streams_referenced(body, APPLY_MOCKED_INPUT_STREAMS)
-    if mocked:
-        return (
-            "Shared rules may not read apply-time-mocked streams: "
-            + ", ".join(mocked)
-            + " (its value differs between admission and block apply)"
-        )
-
-    # i12 is excluded: the node supplies the sender guard, and clause_body_v1
-    # already rejects a clause that references it itself. Approval slots are
+    # i12 is excluded: clause_body_v1 already rejects a clause that references
+    # it, since a clause is evaluated only for its owner. Approval slots are
     # excluded too -- reading them is the whole point of a co-signature policy --
     # but they get a stricter width check instead, below.
     #
@@ -963,6 +947,14 @@ def _screen_clause_domains(body: str) -> Optional[str]:
     policy_error = screen_policy_widths(body)
     if policy_error:
         return "Shared rules: " + policy_error
+
+    width_error = screen_stream_widths(body)
+    if width_error:
+        return "Shared rules: " + width_error
+
+    structure_error = screen_clause_structure(body)
+    if structure_error:
+        return "Shared rules: " + structure_error
     return None
 
 
@@ -1065,26 +1057,11 @@ def routed_rule_conflict(rule_text: str, operations: Dict) -> Optional[UserRuleR
 def validate_o5_clause_routing(
     tx: Dict, tip_view: TipAdmissionView, rule_text: str
 ) -> Optional[AdmissionResult]:
-    """Screens for a user rule that writes o5, once approval slots are active.
+    """Screens for a user rule that writes o5, which is always a clause registration.
 
-    Returns None when the rule is not an o5 policy rule, so it takes the ordinary
-    accumulation path unchanged. Otherwise returns the verdict, and on success
-    the clause body the apply path should register.
-
-    WHY ROUTE AT ALL
-    ----------------
-    `operations["0"]` rules are appended into one accumulated spec. Rule sharing
-    measured what that does on a shared stream: two guarded total-form rules on
-    o5 conjoin to unsatisfiable, and fed sequentially through i0 the later one
-    silently supersedes the earlier. So the second user to deploy a policy rule
-    knocks out the first. The accepted-clause registry exists to fix exactly that,
-    but its only door was someone else offering you a rule. This is the missing self-service door: the sender still sends an
-    ordinary user rule, and "user rules are automatically scoped by user and
-    added to the state" becomes literally true instead of approximately true.
+    Returns None for any other rule, which accumulates. Otherwise returns the
+    verdict and, on success, the clause body and action the apply path registers.
     """
-    if not approval_slots_active(tip_view):
-        return None
-
     streams = clause_output_streams(rule_text)
     if tau_defs.USER_POLICY_STREAM_INDEX not in streams:
         return None
@@ -1097,8 +1074,8 @@ def validate_o5_clause_routing(
         body = clause_body_v1(rule_text)
     except RuleOfferShapeError as exc:
         return format_error(
-            f"o5 policy rule cannot be registered as a clause: {exc}. The node "
-            f"supplies the sender guard when composing, so submit the body "
+            f"o5 policy rule cannot be registered as a clause: {exc}. A clause "
+            f"is evaluated only for its owner, so submit the body "
             f"UNGUARDED — drop the `i12 = <your pubkey>` wrapper and write only "
             f"the policy itself.",
             code="CLAUSE_SHAPE",

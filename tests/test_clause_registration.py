@@ -233,6 +233,33 @@ def test_seventy_authors_register_and_each_is_judged_by_its_own_clause():
         "a sender with no clause was sent to the evaluator"
 
 
+def test_a_clause_that_reads_the_balance_is_fed_the_parent_balance():
+    floor_rule = (
+        "always ( ((i2[t]:bv[24] - i1[t]:bv[24]) < { #x0003e8 }:bv[24]) "
+        "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
+    )
+    body = clause_body_v1(floor_rule)
+    sk, pk = 7500, pubkey_hex(7500)
+    chain = Chain([(sk, pk)])
+    chain.snapshot.metadata["balances"][pk] = 5000
+    evaluator = MockPolicyEvaluator(pool="apply")
+    evaluator.set_verdict(
+        body, lambda inputs: "0" if int(inputs["i2"]) - int(inputs["i1"]) < 1000 else "1")
+    sender_policy.set_evaluator("apply", evaluator)
+
+    (result,) = chain.apply_in_budget([routed_tx(sk, pk, floor_rule)])
+    assert not result.invalid_tx_ids
+    assert chain.clause(pk) == body
+
+    evaluator.verdict_calls.clear()
+    keeps = transfer_tx(sk, pk, 3000, seq=1)
+    drains = transfer_tx(sk, pk, 4500, seq=2)
+    result = chain.apply([keeps, drains])
+
+    assert [inputs["i2"] for _, inputs in evaluator.verdict_calls] == ["5000", "5000"]
+    assert result.invalid_tx_ids == [drains["tx_id"]]
+
+
 # --- 2. apply: one build per registration, hard reject when it fails -------------
 
 def _open_request_lifecycle():

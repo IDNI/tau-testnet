@@ -5,9 +5,9 @@ the unit's complexity, so an unbounded count lets a proposer
 author a block that every validator times out on -- COMM_TIMEOUT, then a
 watchdog kill. The budget is therefore block validity, not local policy.
 
-It counts ONLY the rule-sharing transaction types. Legacy operations["0"]
-user_tx rules are excluded on purpose: existing chains may already contain
-blocks carrying many of them, and counting those would break replay of history.
+It counts the rule-sharing transaction types and every user_tx whose
+operations["0"] rule writes o5, because each of those builds a clause. Rules on
+other streams accumulate and are not counted.
 """
 import pytest
 from unittest.mock import patch
@@ -22,6 +22,7 @@ from consensus.governance import (
 
 A = "aa" * 48
 RULE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
+OTHER_STREAM_RULE = "always ( o13[t]:bv[24] = { #x000000 }:bv[24] )."
 
 
 def _view(budget=None, omit=False):
@@ -61,12 +62,12 @@ def _offer_tx(i):
     }
 
 
-def _legacy_rule_tx(i):
+def _rule_tx(i, rule):
     return {
-        "tx_id": f"legacy-{i}",
+        "tx_id": f"rule-{i}",
         "tx_type": "user_tx",
         "sender_pubkey": A,
-        "operations": {"0": RULE},
+        "operations": {"0": rule},
     }
 
 
@@ -105,10 +106,15 @@ def test_malformed_budget_skips_the_check_rather_than_failing_closed():
     assert _verify(_block([_offer_tx(i) for i in range(50)]), _view(budget=0)) is True
 
 
-def test_legacy_operation_zero_rules_are_not_counted():
-    """Counting them would invalidate historical blocks on replay."""
-    many = [_legacy_rule_tx(i) for i in range(50)]
+def test_operation_zero_rules_on_other_streams_are_not_counted():
+    many = [_rule_tx(i, OTHER_STREAM_RULE) for i in range(50)]
     assert _verify(_block(many), _view(budget=1)) is True
+
+
+def test_operation_zero_o5_rules_count_toward_the_budget():
+    rules = [_rule_tx(i, RULE) for i in range(4)]
+    assert _verify(_block(rules), _view(budget=4)) is True
+    assert _verify(_block(rules), _view(budget=3)) is False
 
 
 def test_accepts_and_rejects_count_toward_the_budget():

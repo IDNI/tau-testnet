@@ -520,16 +520,21 @@ class TestAdmissionFees(unittest.TestCase):
             self.assertFalse(result["ok"], msg=f"stream {stream} not screened")
             self.assertIn(stream, result["message"])
 
-    # o5/o8 rule text must carry a sender scope (#24 ask 3). These tests target
-    # the other screens, so they wrap their body in the guard; the unscoped form
-    # is covered by TestUserRuleSenderScope in test_launch_hardening.py.
+    # o8 rule text must carry a sender scope. These tests target the other
+    # screens, so they wrap their body in the guard; the unscoped form is covered
+    # by TestUserRuleSenderScope in test_launch_hardening.py.
     _SCOPE = "i12[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]"
 
     def _scoped(self, body: str) -> str:
         return f"always (({self._SCOPE}) -> ({body}))."
 
     def test_benign_rule_text_passes_screen(self):
-        rule = self._scoped("o5[t]:bv[24] = { #x000001 }:bv[24]")
+        from consensus import sender_policy
+        from consensus.policy_mock import MockPolicyEvaluator
+
+        sender_policy.set_evaluator("admission", MockPolicyEvaluator(pool="admission"))
+        self.addCleanup(sender_policy.set_evaluator, "admission", None)
+        rule = "always (o5[t]:bv[24] = i1[t]:bv[24])."
         result, _ = self.queue(self.payload(operations={"0": rule}))
         self.assertTrue(result["ok"], msg=f"benign rule rejected: {result}")
 

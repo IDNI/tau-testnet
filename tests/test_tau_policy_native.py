@@ -118,3 +118,94 @@ def test_recycling_preserves_verdicts():
         assert ev.stats()["recycles"] > 0
     finally:
         ev.close()
+
+
+def _threshold(width, literal):
+    return (f"( i1[t]:bv[{width}] > {{ {literal} }}:bv[{width}] ) "
+            "? ( o5[t]:bv[24] = { #x000000 }:bv[24] ) : ( o5[t]:bv[24] = { #x000001 }:bv[24] )")
+
+
+CONSTANT = "o5[t]:bv[24] = { #x000000 }:bv[24]"
+
+
+def test_a_clause_that_reads_no_input_is_refused_at_registration(evaluator):
+    refused = evaluator.validate(CONSTANT)
+    assert not refused.ok
+    assert refused.error == "clause cannot be evaluated: it reads no input stream"
+    assert evaluator.validate(_threshold(24, "#x0003e8")).ok
+
+
+def test_the_refusal_is_the_same_in_a_warm_and_a_fresh_worker(evaluator):
+    assert evaluator.validate(_threshold(24, "#x0003e8")).ok
+    warm = evaluator.validate(CONSTANT)
+    with tau_policy.PolicyEvaluator(cwd=REPO, env=_env(), timeout=TIMEOUT) as fresh:
+        cold = fresh.validate(CONSTANT)
+    assert warm.error == cold.error and not warm.ok
+    assert evaluator.stats()["fresh_fallbacks"] == 1
+
+
+def test_a_probed_clause_still_gives_the_right_verdicts(evaluator):
+    body = _threshold(24, "#x0003e8")
+    assert evaluator.validate(body).ok
+    assert evaluator.validate(body).ok
+    assert evaluator.verdict(body, {"i1": "#x0007d0"}).blocked
+    assert not evaluator.verdict(body, {"i1": "#x0003e8"}).blocked
+    assert not evaluator.verdict(body, {"i1": "#x000001"}).blocked
+
+
+NARROW = _threshold(8, "#x64")
+
+
+def _refusal(ev, inputs):
+    with pytest.raises(tau_policy.PolicyStepError) as info:
+        ev.verdict(NARROW, inputs)
+    return info.value
+
+
+def test_a_value_wider_than_the_clauses_input_type_is_a_blocked_verdict(evaluator):
+    from consensus import sender_policy
+
+    fixed = "policy clause cannot be evaluated on these inputs"
+    assert evaluator.validate(NARROW).ok
+    assert not evaluator.verdict(NARROW, {"i1": "50"}).blocked
+    width_text = "does not fit in the width (width=8)"
+    for _ in range(2):
+        warm = _refusal(evaluator, {"i1": "2000"})
+        assert str(warm) == fixed
+        assert width_text in warm.error
+    with tau_policy.PolicyEvaluator(cwd=REPO, env=_env(), timeout=TIMEOUT) as fresh:
+        refused = _refusal(fresh, {"i1": "2000"})
+    assert str(refused) == fixed
+    assert width_text in refused.error
+
+    sender_policy.set_evaluator("apply", evaluator)
+    try:
+        blocked, reason = sender_policy.clause_blocks(NARROW, {1: "2000"}, pool="apply")
+        assert blocked is True and reason == fixed
+        assert sender_policy.clause_blocks(NARROW, {1: "50"}, pool="apply")[0] is False
+    finally:
+        sender_policy.set_evaluator("apply", None)
+
+
+def test_a_refused_step_in_a_warm_worker_keeps_the_worker(evaluator):
+    assert evaluator.validate(NARROW).ok
+    assert not evaluator.verdict(NARROW, {"i1": "50"}).blocked
+    warm = evaluator.worker_pid()
+    before = evaluator.stats()["fresh_fallbacks"]
+    _refusal(evaluator, {"i1": "2000"})
+    assert evaluator.stats()["fresh_fallbacks"] == before
+    assert evaluator.worker_pid() == warm
+
+
+BALANCE_FLOOR = (
+    "((i2[t]:bv[24] - i1[t]:bv[24]) < { #x0003e8 }:bv[24]) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
+)
+
+
+def test_a_balance_floor_clause_judges_both_sides_of_the_floor(evaluator):
+    assert evaluator.validate(BALANCE_FLOOR).ok
+    assert not evaluator.verdict(BALANCE_FLOOR, {"i1": "3000", "i2": "5000"}).blocked
+    assert not evaluator.verdict(BALANCE_FLOOR, {"i1": "4000", "i2": "5000"}).blocked
+    assert evaluator.verdict(BALANCE_FLOOR, {"i1": "4001", "i2": "5000"}).blocked
+    assert evaluator.verdict(BALANCE_FLOOR, {"i1": "5000", "i2": "5000"}).blocked

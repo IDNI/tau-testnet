@@ -42,6 +42,9 @@ MAX_OFFER_RULE_BYTES = 8192
 MAX_PENDING_OFFERS_PER_RECIPIENT = 32
 MAX_PENDING_OFFERS_PER_OFFERER = 16
 MAX_OFFER_WINDOW_BLOCKS = 100_000
+# Bound the build cost of one clause.
+MAX_CLAUSE_COMPARISONS = 32
+MAX_CLAUSE_DEPTH = 32
 # Output streams an offered clause may target. o5 is the user-policy stream:
 # 1 = allow, 0 = block, absent = allow.
 ALLOWED_TARGET_STREAMS: Dict[int, Dict[str, Any]] = {
@@ -134,6 +137,43 @@ def _parens_balanced(text: str) -> bool:
     return depth == 0
 
 
+_COMPARISON_RE = re.compile(r"!=|<=|>=|(?<![-<])>|<(?!-)|=")
+
+
+def clause_comparison_count(body: str) -> int:
+    """Comparison operators in the comment-stripped body, each counted once."""
+    return len(_COMPARISON_RE.findall(strip_clause_comments(body)))
+
+
+def clause_paren_depth(body: str) -> int:
+    """Deepest parenthesis nesting in the comment-stripped body."""
+    depth = deepest = 0
+    for ch in strip_clause_comments(body):
+        if ch == "(":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif ch == ")":
+            depth = max(depth - 1, 0)
+    return deepest
+
+
+def screen_clause_structure(body: str) -> Optional[str]:
+    """None when the body is within the comparison and nesting limits."""
+    comparisons = clause_comparison_count(body)
+    if comparisons > MAX_CLAUSE_COMPARISONS:
+        return (
+            f"clause has {comparisons} comparisons; the limit is "
+            f"{MAX_CLAUSE_COMPARISONS}"
+        )
+    depth = clause_paren_depth(body)
+    if depth > MAX_CLAUSE_DEPTH:
+        return (
+            f"clause nests parentheses {depth} deep; the limit is "
+            f"{MAX_CLAUSE_DEPTH}"
+        )
+    return None
+
+
 def clause_output_streams(body: str) -> List[int]:
     """Output stream indices the body writes, comment-stripped, deduplicated."""
     scrubbed = strip_clause_comments(body)
@@ -172,8 +212,8 @@ def clause_body_v1(rule_text: str) -> str:
         )
     if re.search(rf"\b{SENDER_STREAM}\b", strip_clause_comments(body)):
         raise RuleOfferShapeError(
-            f"rule must not reference {SENDER_STREAM}; the node supplies the "
-            "sender guard when composing"
+            f"rule must not reference {SENDER_STREAM}; a clause is evaluated "
+            "only for its owner, so it must not carry a sender guard"
         )
     return body
 

@@ -449,30 +449,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             return None
         return value
 
-    @staticmethod
-    def _view_approval_slots_active(active_view) -> bool:
-        meta = getattr(active_view, "mechanism_specific_metadata", None) or {}
-        return meta.get("approval_slots_active") is True
-
     @classmethod
-    def _counts_against_rule_budget(cls, tx: dict, slots_active: bool) -> bool:
+    def _counts_against_rule_budget(cls, tx: dict) -> bool:
         """Whether this transaction costs a clause build.
 
-        The rule-sharing types always do. A user_tx carrying an o5 policy rule
-        does too ONCE routing is active, because it builds the clause --
-        and not counting it would leave the flood vector wide open on the one
-        path this feature adds.
-
-        Legacy `operations["0"]` rules stay excluded, for the reason the comment
-        at the call site gives: existing chains already contain blocks carrying
-        many of them, and counting those retroactively would break replay of
-        history. Post-activation routed rules are new, so counting them breaks
-        nothing.
+        The rule-sharing types always do, and so does a user_tx carrying an o5
+        policy rule, because every such rule registers a clause.
         """
         tx_type = tx.get("tx_type", "user_tx")
         if tx_type in RULE_OFFER_TX_TYPES:
             return True
-        if not slots_active or tx_type != "user_tx":
+        if tx_type != "user_tx":
             return False
         operations = tx.get("operations")
         if not isinstance(operations, dict):
@@ -539,18 +526,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # on (COMM_TIMEOUT, then a watchdog kill).
         # This is consensus, not policy: over-budget blocks are invalid.
         #
-        # Counts ONLY the rule-sharing types. Legacy operations["0"] user_tx
-        # rules are deliberately excluded, because existing chains may already
-        # contain blocks carrying many of them and counting those would break
-        # replay of history. That flood vector is pre-existing and separate.
+        # Counts the rule-sharing types and every user_tx carrying an o5 rule:
+        # each one builds a clause.
         if block is not None and active_view is not None:
             budget = self._view_rule_tx_budget(active_view)
             if budget is not None:
-                slots_active = self._view_approval_slots_active(active_view)
                 rule_txs = sum(
                     1 for tx in (getattr(block, "transactions", None) or [])
                     if isinstance(tx, dict)
-                    and self._counts_against_rule_budget(tx, slots_active)
+                    and self._counts_against_rule_budget(tx)
                 )
                 if rule_txs > budget:
                     logger.warning(
@@ -1518,8 +1502,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             def _apply_o5_clause_routing(rule_text):
                 """Register or revoke the sender's o5 clause. True when handled.
 
-                False means "not an o5 policy rule, or routing is inactive", and
-                the caller takes the ordinary accumulation path unchanged.
+                False means "not an o5 policy rule", and the caller takes the
+                ordinary accumulation path.
 
                 Mirrors admission.validate_o5_clause_routing. A clause that does
                 not land is hard-rejected: a soft no-op would let a rule-only
@@ -1535,8 +1519,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     execution_success = False
                     tx_receipt["reason"] = reason
 
-                if not approval_slots_on:
-                    return False
                 if tau_defs.USER_POLICY_STREAM_INDEX not in clause_output_streams(rule_text):
                     return False
 

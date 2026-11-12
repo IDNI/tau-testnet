@@ -103,9 +103,10 @@ def _submit(sk, pk, ops, seq=0, fee_limit="100000"):
 
 
 def _scoped_rule(pk, value="000001"):
-    """Admission requires an o5 rule to be scoped to its sender."""
-    return (f"always ( (i12[t]:bv[384] = {{ #x{pk} }}:bv[384]) -> "
-            f"o5[t]:bv[24] = {{ #x{value} }}:bv[24] ).")
+    """Admission requires an o8 fee rule to be scoped to its sender."""
+    return (f"always ( (i12[t]:bv[384] = {{ #x{pk} }}:bv[384]) ? "
+            f"(o8[t]:bv[24] = {{ #x{value} }}:bv[24]) : "
+            f"(o8[t]:bv[24] = {{ #x000001 }}:bv[24]) ).")
 
 
 def test_a_mined_block_commits_through_one_protocol_and_promotes_its_worker(authority):

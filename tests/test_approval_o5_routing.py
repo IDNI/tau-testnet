@@ -1,19 +1,9 @@
-"""An o5 policy rule becomes a registered clause instead of raw accumulated text.
+"""An o5 policy rule is always a registered clause, never accumulated text.
 
-WHY
----
-`operations["0"]` rules are appended into one accumulated spec, and rule sharing
-measured what that does on a shared stream: two guarded total-form rules on o5
-conjoin to unsatisfiable, and fed sequentially through i0 the later silently
-supersedes the earlier. So the second user to deploy a policy rule knocks out the
-first. The accepted-clause registry exists to fix that,
-but the only door in was someone else offering you a rule. Routing is the missing
-self-service door.
-
-The inversion worth noticing: an accumulated rule MUST carry an `i12` sender
-guard (or it applies to everyone), while a registered clause must NOT (the
-node supplies the guard). So the screens swap over at activation, and the
-error message has to say which form is wanted.
+Accumulated rules share one spec, and two rules on a shared stream either
+conjoin to unsatisfiable or let the second one supersede the first. A clause is
+evaluated only for its owner, so it carries no `i12` guard and the error for a
+guarded rule has to say so.
 """
 import pytest
 from unittest.mock import MagicMock
@@ -39,6 +29,11 @@ TIER_RULE = (
 )
 GUARDED_RULE = (
     "always ( (i12[t]:bv[384] = { #x" + A + " }:bv[384]) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
+    ": (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
+)
+UNGUARDED_RULE = (
+    "always ( (i1[t]:bv[24] > { #x0003e8 }:bv[24]) "
     "? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
     ": (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
 )
@@ -74,10 +69,12 @@ def _route(tx, tip_view):
 
 # --- when routing does and does not apply ------------------------------------
 
-def test_inactive_chain_does_not_route(tip_view):
-    """Pre-activation behaviour is untouched, which is what makes the cut safe."""
-    tip_view.approval_slots_active = False
-    assert _route(_tx(TIER_RULE), tip_view) is None
+@pytest.mark.parametrize("slots", [False, True])
+def test_routing_does_not_depend_on_approval_slots(tip_view, slots):
+    tip_view.approval_slots_active = slots
+    result = _route(_tx(UNGUARDED_RULE), tip_view)
+    assert result is not None and result.is_valid is True, getattr(result, "error", None)
+    assert result.data["o5_clause_action"] == "declare"
 
 
 def test_a_non_policy_rule_is_not_routed(tip_view):
@@ -102,13 +99,12 @@ def test_the_old_guarded_form_is_refused_with_guidance(tip_view):
     assert "i12" in result.error, "the error must name what to remove"
 
 
-def test_an_unguarded_rule_would_be_refused_before_activation(tip_view):
-    """The screens really do swap: the same text that is required after
-    activation is rejected before it, and vice versa."""
-    tip_view.approval_slots_active = False
-    result = validate_user_tx_reserved_domains(_tx(TIER_RULE), tip_view)
+@pytest.mark.parametrize("slots", [False, True])
+def test_a_guarded_rule_is_refused_whatever_the_slot_setting(tip_view, slots):
+    tip_view.approval_slots_active = slots
+    result = validate_user_tx_reserved_domains(_tx(GUARDED_RULE), tip_view)
     assert result.is_valid is False
-    assert result.code == "UNSCOPED_USER_RULE"
+    assert result.code == "CLAUSE_SHAPE"
 
 
 # --- shapes a clause cannot have --------------------------------------------
@@ -170,31 +166,26 @@ def test_a_new_author_is_admitted_however_many_clauses_exist(tip_view):
 # --- the per-block budget ---------------------------------------------------
 
 def test_a_routed_rule_counts_against_the_block_budget():
-    """Not counting it would leave the interpreter flood vector wide open on the
-    one path this feature adds."""
+    """Each o5 rule builds a clause, so it costs what an offer costs."""
     from consensus.engine import TauConsensusEngine as E
 
-    routed = _tx(TIER_RULE)
-    legacy = _tx(GUARDED_RULE)
     plain = {"tx_type": "user_tx", "operations": {"1": [[A, B, "5"]]}}
+    other_stream = _tx(NON_POLICY_RULE)
     offer = {"tx_type": "rule_offer"}
 
-    assert E._counts_against_rule_budget(routed, True) is True
-    assert E._counts_against_rule_budget(offer, False) is True, "always counted"
-    assert E._counts_against_rule_budget(plain, True) is False
-
-    # Before activation nothing about user_tx counting changes: existing chains
-    # contain blocks carrying many legacy rules and counting them retroactively
-    # would break replay of history.
-    assert E._counts_against_rule_budget(routed, False) is False
-    assert E._counts_against_rule_budget(legacy, False) is False
+    assert E._counts_against_rule_budget(_tx(TIER_RULE)) is True
+    assert E._counts_against_rule_budget(_tx(UNGUARDED_RULE)) is True
+    assert E._counts_against_rule_budget(_tx(NEUTRAL_RULE)) is True
+    assert E._counts_against_rule_budget(offer) is True, "always counted"
+    assert E._counts_against_rule_budget(plain) is False
+    assert E._counts_against_rule_budget(other_stream) is False
 
 
 def test_a_whitespace_only_rule_does_not_count():
     from consensus.engine import TauConsensusEngine as E
 
     assert E._counts_against_rule_budget(
-        {"tx_type": "user_tx", "operations": {"0": "   "}}, True) is False
+        {"tx_type": "user_tx", "operations": {"0": "   "}}) is False
 
 
 # --- the duplicated fee-bearing constant ------------------------------------

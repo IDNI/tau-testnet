@@ -3,7 +3,13 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
-from tau_policy import PolicyBuild, PolicyBuildError, PolicyVerdict, parse_o5
+from tau_policy import (
+    PolicyBuild,
+    PolicyBuildError,
+    PolicyStepError,
+    PolicyVerdict,
+    parse_o5,
+)
 
 
 class MockPolicyEvaluator:
@@ -15,6 +21,7 @@ class MockPolicyEvaluator:
         self.pool = pool
         self._decide = decide or (lambda body, inputs: None)
         self._failing: dict = {}
+        self._refused: dict = {}
         self._by_body: dict = {}
         self.validate_calls: list = []
         self.verdict_calls: list = []
@@ -22,6 +29,10 @@ class MockPolicyEvaluator:
 
     def fail_build(self, body: str, error: str = "mock build failure") -> None:
         self._failing[body] = error
+
+    def fail_step(self, body: str, error: str = "mock step failure") -> None:
+        """The clause builds but the engine refuses to step it."""
+        self._refused[body] = error
 
     def set_verdict(self, body: str, decide) -> None:
         """`decide` is a constant o5 value (or None) or a callable (inputs) -> o5."""
@@ -39,6 +50,8 @@ class MockPolicyEvaluator:
         error = self._build_error(body)
         if error:
             raise PolicyBuildError(error)
+        if body in self._refused:
+            raise PolicyStepError(self._refused[body])
         rule = self._by_body.get(body, self._decide)
         if callable(rule):
             value = rule(inputs) if body in self._by_body else rule(body, inputs)

@@ -11,7 +11,7 @@ import threading
 import tau_manager
 import tau_policy
 from consensus.policy_mock import MockPolicyEvaluator
-from tau_policy import PolicyBuildError
+from tau_policy import PolicyBuildError, PolicyStepError
 from tau_session import WorkerSession
 from tau_speculation import _SESSION_DEFAULT
 
@@ -60,7 +60,8 @@ def clause_blocks(body, values: dict, *, pool: str,
                   timeout=_SESSION_DEFAULT) -> tuple[bool, str]:
     """(blocked, detail) for `body` against one transfer's inputs.
 
-    A clause that does not build blocks: every node reaches the same result.
+    A clause that does not build, or that the engine refuses to step, blocks:
+    every node reaches the same result.
     Loss of the evaluator propagates, because it says nothing about the transfer.
     """
     if not body:
@@ -69,7 +70,7 @@ def clause_blocks(body, values: dict, *, pool: str,
         verdict = evaluator(pool).verdict(
             body, clause_inputs(values), timeout=timeout
         )
-    except PolicyBuildError as exc:
+    except (PolicyBuildError, PolicyStepError) as exc:
         return True, str(exc)
     return verdict.blocked, str(verdict.o5)
 

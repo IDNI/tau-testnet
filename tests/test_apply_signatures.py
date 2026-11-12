@@ -417,10 +417,10 @@ SCENARIOS = [
         SK_ALICE,
     ),
     Scenario(
-        "rule-before-activation",
+        "routed-o5-register-before-activation",
         lambda: _lifecycle(active=False),
         lambda: [],
-        lambda sk: rule_tx(GUARDED_RULE, sk),
+        lambda sk: rule_tx("always ( %s )." % tier_body(AUTH), sk),
         SK_ALICE,
     ),
 ]

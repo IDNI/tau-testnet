@@ -58,7 +58,14 @@ FAKE = textwrap.dedent('''
             key = req["key"]
             hit = key in built
             failed = "FAIL_ALWAYS" in text or ("FAIL_WARM" in text and len(built) > 0)
-            if not hit and failed:
+            probe_failed = op == "build" and req.get("probe") and (
+                "NOINPUT" in text and "NOINPUT_WARM" not in text
+                or ("NOINPUT_WARM" in text and len(built) > 0))
+            if probe_failed:
+                out = {"ok": False, "phase": "build", "built": True,
+                       "error": "clause cannot be evaluated: it reads no input stream",
+                       "pid": os.getpid()}
+            elif not hit and failed:
                 out = {"ok": False, "phase": "build", "error": "fake build failure",
                        "built": False, "pid": os.getpid()}
             else:
@@ -168,9 +175,12 @@ def test_verdict_blocked_allowed_and_absent(make):
 
 def test_step_failure_is_not_a_build_error(make):
     ev = make()
-    with pytest.raises(SpeculationError) as info:
+    with pytest.raises(tau_policy.PolicyStepError) as info:
         ev.verdict("STEPFAIL", {})
     assert not isinstance(info.value, tau_policy.PolicyBuildError)
+    assert isinstance(info.value, SpeculationError)
+    assert info.value.error == "fake step failure"
+    assert str(info.value) == "policy clause cannot be evaluated on these inputs"
 
 
 def test_validate_reports_build_failure_without_raising(make):
@@ -307,6 +317,47 @@ def test_warm_build_failure_that_fails_fresh_is_the_answer(make):
     assert stats["fresh_fallbacks"] == 1 and stats["spawns"] == 2
 
 
+def test_refused_step_in_a_warm_worker_is_answered_at_once(make):
+    ev = make()
+    ev.verdict("PASS", {})
+    warm = ev.worker_pid()
+    with pytest.raises(tau_policy.PolicyStepError):
+        ev.verdict("STEPFAIL", {})
+    assert ev.worker_pid() == warm
+    stats = ev.stats()
+    assert stats["fresh_fallbacks"] == 0 and stats["spawns"] == 1
+    assert ev.verdict("BLOCK", {}).blocked
+    assert ev.worker_pid() == warm
+
+
+def test_refused_step_in_a_fresh_worker_is_not_retried(make):
+    ev = make()
+    with pytest.raises(tau_policy.PolicyStepError):
+        ev.verdict("STEPFAIL", {})
+    stats = ev.stats()
+    assert stats["fresh_fallbacks"] == 0 and stats["spawns"] == 1
+
+
+def test_validate_refuses_a_clause_that_cannot_be_stepped(make):
+    ev = make()
+    bad = ev.validate("NOINPUT")
+    assert not bad.ok
+    assert bad.error == "clause cannot be evaluated: it reads no input stream"
+    assert ev.stats()["fresh_fallbacks"] == 0
+
+
+def test_a_clause_that_is_not_probed_still_gives_verdicts(make):
+    ev = make()
+    assert not ev.verdict("NOINPUT PASS", {}).blocked
+
+
+def test_probe_failure_in_a_warm_worker_is_retried_fresh(make):
+    ev = make()
+    ev.validate("PASS")
+    assert ev.validate("NOINPUT_WARM").ok
+    assert ev.stats()["fresh_fallbacks"] == 1
+
+
 def test_validate_falls_back_to_a_fresh_worker(make):
     ev = make()
     ev.validate("PASS")
@@ -372,5 +423,9 @@ def test_mock_behaviour():
     assert not mock.verdict("y", {"i1": "8"}).blocked
     assert mock.verdict_calls[1] == ("x", {"i1": "1"})
     assert set(mock.stats()) >= {"pool", "spawns", "recycles", "retries", "fresh_fallbacks"}
+    mock.fail_step("refused", "engine says no")
+    with pytest.raises(tau_policy.PolicyStepError):
+        mock.verdict("refused", {})
+    assert mock.validate("refused").ok
     mock.close()
     assert mock.closed

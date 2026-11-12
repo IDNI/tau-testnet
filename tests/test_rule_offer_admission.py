@@ -215,7 +215,6 @@ def test_inbox_and_outbox_caps(tip_view):
     ("always ( o9[t]:bv[24] = { #x000001 }:bv[24] ).", "reserved"),
     ("always ( o7[t]:bv[16] = { #x0001 }:bv[16] ).", "reserved"),
     ("always ( o6[t]:bv[16] = { #x0001 }:bv[16] ).", "reserved"),
-    ("always ( o5[t]:bv[24] = i2[t]:bv[24] ).", "mocked"),
     ("always ( o5[t]:bv[24] = i14[t]:bv[24] ).", "reserved input"),
     ("always ( o5[t]:bv[24] = i15[t]:bv[24] ).", "reserved input"),
     ("always ( o5[t]:bv[24] = i13[t]:bv[24] ).", "reserved input"),
@@ -358,7 +357,6 @@ def test_offer_and_accept_screens_agree(tip_view):
     without ever passing the offer screens."""
     bad_rules = [
         "always ( o9[t]:bv[24] = { #x000001 }:bv[24] ).",
-        "always ( o5[t]:bv[24] = i2[t]:bv[24] ).",
         "always ( o5[t]:bv[24] = i14[t]:bv[24] ).",
         "always ( o12[t]:bv[24] = { #x000001 }:bv[24] ).",
         "always ( always ( o5[t] = 1 ) ).",
