@@ -17,11 +17,19 @@ a state hash every follower's replay rejected (rebuild abort -> frozen head).
 These tests pin the fix: the sequence-only account round-trips, and the
 accounts_hash is byte-identical before commit and after reload.
 """
+import pytest
+
 import chain_state
 from consensus.governance import ConsensusLifecycleManager
 
 FUNDED = "8c" * 48       # 96-hex, has a balance
 GOV_SENDER = "b5" * 48   # 96-hex, balance 0 but seq incremented (governance tx sender)
+
+
+@pytest.fixture(autouse=True)
+def no_leftover_transfer_stamps(isolated_chain_state):
+    # The save writes a row for each stamped address, so a stamp of an earlier test adds an account.
+    chain_state._last_transfer_ts.clear()
 
 
 def test_sequence_only_account_survives_commit_reload(temp_database):
