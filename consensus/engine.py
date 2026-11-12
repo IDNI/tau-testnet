@@ -68,10 +68,9 @@ FEE_BEARING_TX_TYPES = frozenset(
     | set(RULE_OFFER_TX_TYPES)
 )
 
-# Branches that mutate the lifecycle manager in place. Once the envelope
-# checks have already rejected the transaction, entering them records a
-# governance update, offer, accept or vote that only proposal mode discards.
-# `withdraw_request` still covers a request rejected later, at fee settlement.
+# Branches that mutate the lifecycle manager in place. They write only to the
+# fork of the tx, which both apply paths drop on a rejection. A tx that is
+# already rejected skips them, so it never reaches the evaluator.
 _LIFECYCLE_TX_TYPES = frozenset(
     {"consensus_rule_update", "consensus_rule_vote"}
     | set(RULE_OFFER_TX_TYPES)
@@ -1270,10 +1269,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             else chain_state._lifecycle_manager
         )
         if proposal is not None:
-            # The proposal owns it from here. Identity is kept deliberately: the
-            # block builder holds this same object and hashes it after apply
-            # returns, so the proposal adopts a transaction's clone INTO it
-            # rather than swapping in a different manager.
             proposal.lifecycle = _block_lifecycle
         lifecycle_mgr = _block_lifecycle
         # The evaluator this apply drives. The default binds to THIS module's
@@ -1455,6 +1450,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # would wrap to a huge bv value and silently satisfy the cooldown).
             return str(max(0, min(elapsed, tau_defs.COOLDOWN_NEVER_SENT)))
 
+        def _lifecycle_for_write():
+            """This transaction's fork of the block lifecycle, made on the first write.
+
+            Every lifecycle write goes through here, on both apply paths, so a
+            plain transfer pays no copy.
+            """
+            nonlocal lifecycle_mgr
+            if lifecycle_mgr is _block_lifecycle and _block_lifecycle is not None:
+                lifecycle_mgr = (
+                    _branch.lifecycle if _branch is not None
+                    else _block_lifecycle.fork()
+                )
+            return lifecycle_mgr
+
         for i, tx in enumerate(transactions):
             # One branch per transaction. Its journal child, allocator child and
             # state delta resolve together; a rejection that already stepped the
@@ -1466,14 +1475,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     str(tx.get("tx_id") or tx.get("tx_hash") or f"tx{i}")
                 )
                 _session = proposal.session
-                # Lifecycle state is branched like everything else. The routed
-                # o5 path resolves the sender's open approval requests and
-                # replaces their registered clause BEFORE the composite is even
-                # evaluated, and the offer path does the same on accept -- both
-                # mutate in place, with no inverse worth trusting. So the
-                # transaction mutates a clone, derives its composite from THAT
-                # clone, and the proposal adopts it only on acceptance.
-                lifecycle_mgr = _branch.lifecycle
             tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
             # operations is signed only for user_tx.
             operations = tx.get('operations', {}) if tx.get('tx_type', 'user_tx') == 'user_tx' else {}
@@ -1593,13 +1594,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # the generic transfer-less fee-query step (which feeds the canonical
             # mocked i1=i2=i3=i4=0) must not run for it as well and charge twice.
             fee_already_measured = False
-            # Set when this tx parked an approval request. Parking is committed
-            # in the apply branch below, but the fee is settled afterwards and
-            # can still hard-reject the tx -- and hard_reject suppresses staged
-            # balances and nonces without rolling lifecycle mutations back. A
-            # request whose tx paid nothing must not stay parked, so it is
-            # withdrawn after settlement. Deterministic: every node measures the
-            # same fee against the same signed fee_limit and balance.
+            # Set when this tx parked an approval request. The fee settles after
+            # the park and can still reject the tx, so the request is withdrawn below.
             parked_request_id: Optional[bytes] = None
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
@@ -1649,7 +1645,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return True
 
                 offers = lifecycle_mgr.rule_offers
-                approvals_mgr = lifecycle_mgr.approval_requests
                 sender_n = sender.lower()
                 stream = tau_defs.USER_POLICY_STREAM_INDEX
 
@@ -1688,7 +1683,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # clause, so changing the clause under an open request would
                 # silently change what its recorded votes mean, or strand it
                 # until expiry. Resolve them first, in canonical id order.
-                doomed = approvals_mgr.resolve_all_for_sender(sender_n, STATUS_FAILED)
+                lifecycle = _lifecycle_for_write()
+                offers = lifecycle.rule_offers
+                doomed = lifecycle.approval_requests.resolve_all_for_sender(
+                    sender_n, STATUS_FAILED
+                )
                 if doomed:
                     tx_receipt["logs"].append(
                         "Policy change failed %d open approval request(s)" % len(doomed))
@@ -1977,8 +1976,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             from consensus.governance import parse_consensus_rule_update, parse_consensus_rule_vote
 
+            if tx_type in _LIFECYCLE_TX_TYPES and accepted_in_block and not hard_reject:
+                _lifecycle_for_write()
             if tx_type in _LIFECYCLE_TX_TYPES and not (accepted_in_block and not hard_reject):
-                # Already rejected: lifecycle mutations are only rolled back in proposal mode.
+                # Already rejected: the lifecycle branches below must not run.
                 tx_receipt["logs"].append(
                     "Lifecycle action skipped: transaction already rejected"
                 )
@@ -2247,11 +2248,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 accepted_in_block = False
                             else:
                                 entry = approvals.get_request(vote.request_id)
-                                # PROSPECTIVE first, commit after. hard_reject
-                                # suppresses staged balances and nonces but does
-                                # NOT roll back lifecycle mutations, so a Tau
-                                # failure here must not leave a recorded vote
-                                # behind.
+                                # PROSPECTIVE first, commit after: a failed
+                                # measurement leaves no recorded vote.
                                 # The manager returns raw pubkeys (the right
                                 # domain value); _approval_slot_values formats
                                 # them for the wire as `{ #x.. }:bv[384]`, which
@@ -2930,21 +2928,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         )
 
             if parked_request_id is not None and not accepted_in_block:
-                # The tx did not survive settlement (fee_limit_exceeded or
-                # insufficient_funds_for_fee, both of which also set
-                # hard_reject). Un-park it: otherwise the request stays in
-                # consensus state having paid nothing, and a later vote releases
-                # the transfer for free. Replay is unaffected -- it logs and
-                # skips the fee without clearing accepted_in_block, so a request
-                # parked on the mined chain stays parked.
-                if lifecycle_mgr.approval_requests.withdraw_request(parked_request_id):
+                # A request whose tx paid no fee must not stay parked. Replay
+                # keeps accepted_in_block, so a request parked on the mined chain
+                # stays parked.
+                if _lifecycle_for_write().approval_requests.withdraw_request(parked_request_id):
                     tx_receipt["logs"].append(
                         "Approval request un-parked (its fee was not paid)"
                     )
 
             stamp_retractable_park = False
             if accepted_in_block and not hard_reject:
-                book = lifecycle_mgr.retractable_transfers
+                if pending_retractable_park is not None or pending_retract_id is not None:
+                    book = _lifecycle_for_write().retractable_transfers
                 if pending_retractable_park is not None:
                     tx_receipt["retractable_event"] = (
                         pending_retractable_park.retractable_id.hex(), "parked"
@@ -3039,6 +3034,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     if _rule_touched_canonical:
                         _set_rules_state(_rule_prior_rules_state or "")
                         current_tau_bytes = _rule_prior_tau_bytes
+            elif (lifecycle_mgr is not _block_lifecycle
+                    and accepted_in_block and not hard_reject):
+                _block_lifecycle.adopt(lifecycle_mgr)
 
             if accepted_in_block and not hard_reject:
                 accepted_txs.append(tx)

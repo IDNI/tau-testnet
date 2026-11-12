@@ -24,6 +24,7 @@ from bls_keys import SK_ALICE, SK_CAROL, pubkey_hex, sign_payload, sign_tx
 from consensus import fees
 from consensus.engine import TauConsensusEngine
 from consensus.fees import FeeRuleError
+from consensus.governance import ConsensusLifecycleManager, ConsensusRuleUpdate
 from consensus.state import TauStateSnapshot
 
 SENDER = pubkey_hex(SK_ALICE)
@@ -246,16 +247,20 @@ class TestEngineFeeCharging(EngineFeeBase):
 
     def test_governance_tx_exempt(self):
         self.mock_multi.return_value = {1: "1", 9: "10"}
-        lifecycle = MagicMock()
-        lifecycle.can_admit_vote.return_value = True
-        lifecycle.submit_vote.return_value = True
+        lifecycle = ConsensusLifecycleManager(active_validators=[SENDER])
+        update = ConsensusRuleUpdate(
+            rule_revisions=["always ( o6[t]:bv[16] = { 0 }:bv[16] )."],
+            activate_at_height=100,
+            proposer_pubkey=SENDER,
+        )
+        self.assertTrue(lifecycle.submit_update(update))
         balances = {}  # zero-balance validator
         tx = sign_tx({
             "tx_id": "gov1",
             "tx_type": "consensus_rule_vote",
             "sender_pubkey": SENDER,
             "fee_limit": "0",
-            "update_id": "ab" * 32,
+            "update_id": update.update_id_hex,
             "approve": True,
         })
         result = self.engine.apply(
@@ -267,6 +272,10 @@ class TestEngineFeeCharging(EngineFeeBase):
             block_height=1,
         )
         self.assertEqual(len(result.accepted_transactions), 1)
+        self.assertIn(
+            "Vote accepted for update " + update.update_id_hex,
+            result.receipts["gov1"]["logs"],
+        )
         self.assertEqual(balances, {})  # no fee writes
 
     def test_sender_equals_proposer_nets_zero(self):
