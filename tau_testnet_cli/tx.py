@@ -262,7 +262,11 @@ def submit_tx(
     queue a refused transaction, so the same signed payload is safe to send.
     """
     blob = json.dumps(payload, separators=(",", ":"))
-    command = f"sendtx '{blob}'"
+    return _send_during_reorg(f"sendtx '{blob}'", host, port, timeout)
+
+
+def _send_during_reorg(command: str, host: str, port: int, timeout: float) -> str:
+    """Send ``command`` again while the node answers REORG_IN_PROGRESS."""
     for delay in REORG_RETRY_DELAYS:
         response = rpc_mod.send_command(command, host, port, timeout=timeout)
         if not _is_reorg_refusal(response):
@@ -297,13 +301,14 @@ def estimate_fee(
 ) -> str:
     """The node's fee estimate for a signed draft, from ``checktx estimate``.
 
+    Asks again after ESTIMATE_BUSY and while a reorg replays the chain.
     Raises RuntimeError with the node's own code and message when the node
     gives no estimate.
     """
     blob = json.dumps(payload, separators=(",", ":"))
     for delay in (*backoff, None):
-        response = rpc_mod.send_command(
-            f"checktx estimate '{blob}'", host, port, timeout=timeout
+        response = _send_during_reorg(
+            f"checktx estimate '{blob}'", host, port, timeout
         )
         try:
             parsed = json.loads(response)

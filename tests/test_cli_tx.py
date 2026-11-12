@@ -445,3 +445,41 @@ def test_tx_send_retries_a_busy_estimate_with_a_backoff(tmp_path, monkeypatch):
     assert rc == 0, err
     assert waits == list(tx_mod.ESTIMATE_BUSY_BACKOFF[:2])
     assert json.loads(recorded[-1][len("sendtx '") : -1])["fee_limit"] == "12"
+
+
+REORG = '{"status":"error","command":"checktx","error":{"code":"REORG_IN_PROGRESS","message":"A reorg replays the chain; please retry."}}'
+
+
+def _estimate(monkeypatch, answers):
+    waits = []
+    monkeypatch.setattr(tx_mod.time, "sleep", waits.append)
+    sent = []
+
+    def fake_send(command, host, port, timeout=None):
+        sent.append(command)
+        return answers[len(sent) - 1]
+
+    monkeypatch.setattr(tx_mod.rpc_mod, "send_command", fake_send)
+    return lambda: tx_mod.estimate_fee({"a": 1}, host="h", port=1), sent, waits
+
+
+def test_estimate_fee_retries_a_reorg_refusal(monkeypatch):
+    estimate, sent, waits = _estimate(monkeypatch, [REORG, ESTIMATE])
+    assert estimate() == "12"
+    assert len(sent) == 2 and sent[0] == sent[1]
+    assert waits == [tx_mod.REORG_RETRY_DELAYS[0]]
+
+
+def test_estimate_fee_gives_up_after_the_reorg_retries(monkeypatch):
+    attempts = len(tx_mod.REORG_RETRY_DELAYS) + 1
+    estimate, sent, waits = _estimate(monkeypatch, [REORG] * attempts)
+    with pytest.raises(RuntimeError, match="REORG_IN_PROGRESS"):
+        estimate()
+    assert len(sent) == attempts
+    assert waits == list(tx_mod.REORG_RETRY_DELAYS)
+
+
+def test_estimate_fee_retries_busy_and_reorg_on_their_own_delays(monkeypatch):
+    estimate, _sent, waits = _estimate(monkeypatch, [BUSY, REORG, ESTIMATE])
+    assert estimate() == "12"
+    assert waits == [tx_mod.ESTIMATE_BUSY_BACKOFF[0], tx_mod.REORG_RETRY_DELAYS[0]]
