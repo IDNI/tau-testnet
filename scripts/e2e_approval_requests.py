@@ -224,7 +224,7 @@ class Node:
     # -- the policy ---------------------------------------------------------
 
     def tier_clause(self):
-        """Alice's policy, in the flat disjunction form the node composes."""
+        """Alice's policy: one flat disjunction, registered as her own clause."""
         def bv24(n):
             return "{ #x%s }:bv[24]" % format(n, "06x")
 
@@ -247,16 +247,17 @@ class Node:
         return self.submit("alice", {"tx_type": "user_tx",
                                      "operations": {"0": self.tier_clause()}})
 
-    def request(self, amount, approvers, expire_in=500, customs=None):
+    def request(self, amount, approvers, expire_in=500, customs=None,
+                sender="alice", recipient="bob"):
         payload = {
             "tx_type": "approval_request",
-            "recipient_pubkey": self.pk("bob"),
+            "recipient_pubkey": self.pk(recipient),
             "amount": amount,
             "expire_at_height": self.height() + expire_in,
             "approvers": {str(k): v for k, v in approvers.items()},
             "custom_inputs": customs or {},
         }
-        res = self.submit("alice", payload)
+        res = self.submit(sender, payload)
         return res, payload
 
     def vote(self, name, request_id, approve=True, reason=""):
@@ -266,12 +267,21 @@ class Node:
             payload["reason"] = reason
         return self.submit(name, payload)
 
-    def transfer(self, amount, expect_ok=False):
+    def transfer(self, amount, expect_ok=False, sender="alice", recipient="bob"):
         """A PLAIN transfer, to prove the policy gates it without votes."""
-        return self.submit("alice", {
+        return self.submit(sender, {
             "tx_type": "user_tx",
-            "operations": {"1": [[self.pk("alice"), self.pk("bob"), str(amount)]]},
+            "operations": {"1": [[self.pk(sender), self.pk(recipient), str(amount)]]},
         }, expect_ok=expect_ok)
+
+    def bob_clause(self):
+        """Bob's own policy: above 5000 the partner must have signed."""
+        return (
+            "always ( ( i1[t]:bv[24] > { #x001388 }:bv[24]"
+            " && !(i18[t]:bv[384] = { #x%s }:bv[384]) )"
+            " ? (o5[t]:bv[24] = { #x000000 }:bv[24])"
+            " : (o5[t]:bv[24] = { #x000001 }:bv[24]) )." % self.pk("partner")
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -428,9 +438,9 @@ def scenario_preview(node):
               json.dumps(data)[:200])
 
 
-def _request_id(node, payload):
+def _request_id(node, payload, sender="alice"):
     return node.rpc("getrequestid '" + json.dumps({
-        "sender_pubkey": node.pk("alice"),
+        "sender_pubkey": node.pk(sender),
         "recipient_pubkey": payload["recipient_pubkey"],
         "amount": payload["amount"],
         "sequence_number": payload["sequence_number"],
@@ -440,6 +450,102 @@ def _request_id(node, payload):
     }) + "'")["data"]["request_id"]
 
 
+def scenario_clause_scope(node):
+    say("A clause governs its author only")
+    guarded = ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) && "
+               "o5[t]:bv[24] = { #x000001 }:bv[24] )." % node.pk("alice"))
+    res = node.submit("alice", {"tx_type": "user_tx", "operations": {"0": guarded}},
+                      expect_ok=False)
+    check("a clause guarded on the sender's key is refused",
+          (res.get("error") or {}).get("code") == "CLAUSE_SHAPE", json.dumps(res)[:200])
+    res = node.transfer(TIER_1 + 1000, sender="bob", recipient="alice", expect_ok=False)
+    check("bob has no clause: the same amount is admitted for him",
+          res.get("status") == "ok", json.dumps(res)[:200])
+    node.await_mempool_drain()
+
+
+def scenario_second_author(node):
+    say("A second author's clause names a different approver")
+    res = node.submit("bob", {"tx_type": "user_tx",
+                              "operations": {"0": node.bob_clause()}}, expect_ok=False)
+    check("bob's clause is admitted", res.get("status") == "ok", json.dumps(res)[:200])
+    node.wait_for(lambda: node.rpc(
+        f"getapprovalslots {node.pk('bob')}")["data"].get("has_clause") is True,
+        "bob's clause to register")
+    slots = node.rpc(f"getapprovalslots {node.pk('bob')}")["data"].get("slots", {})
+    check("bob's slots are his own: 18=partner only",
+          slots == {"18": node.pk("partner")}, json.dumps(slots))
+    check("alice's slots are unchanged",
+          node.clauses().get("slots", {}).get("18") == node.pk("authbot"), node.clauses())
+    blocked = node.transfer(6000, sender="bob", recipient="alice", expect_ok=False)
+    check("bob's plain transfer over his limit is refused",
+          blocked.get("status") == "error", json.dumps(blocked)[:200])
+    ok_small = node.transfer(4000, sender="bob", recipient="alice", expect_ok=False)
+    check("below his limit it is admitted", ok_small.get("status") == "ok",
+          json.dumps(ok_small)[:200])
+    node.await_mempool_drain()
+    before_auth = len(node.inbox("authbot"))
+    _res, payload = node.request(6000, {18: node.pk("partner")},
+                                 sender="bob", recipient="alice")
+    node.await_mempool_drain()
+    rid = _request_id(node, payload, sender="bob")
+    check("the partner is notified of bob's request", len(node.inbox("partner")) >= 1)
+    check("alice's approver is not asked about bob's request",
+          len(node.inbox("authbot")) == before_auth)
+    node.vote("partner", rid, approve=True)
+    node.await_status(rid, "executed")
+    row = node.request_row(rid)
+    check("bob's request is released by his approver",
+          (row or {}).get("status") == "executed", json.dumps(row)[:300])
+
+
+def scenario_revoke(node):
+    say("Revoking removes only the author's clause")
+    res = node.submit("bob", {"tx_type": "user_tx", "operations": {
+        "0": "always ( (o5[t]:bv[24] = { #x000001 }:bv[24]) )."}}, expect_ok=False)
+    check("the neutral clause is admitted", res.get("status") == "ok", json.dumps(res)[:200])
+    node.wait_for(lambda: node.rpc(
+        f"getapprovalslots {node.pk('bob')}")["data"].get("has_clause") is False,
+        "bob's clause to be removed")
+    check("bob's clause is gone", node.rpc(
+        f"getapprovalslots {node.pk('bob')}")["data"].get("has_clause") is False)
+    check("alice's clause is untouched", node.clauses().get("has_clause") is True)
+    res = node.transfer(6000, sender="bob", recipient="alice", expect_ok=False)
+    check("bob's large transfer is admitted again", res.get("status") == "ok",
+          json.dumps(res)[:200])
+    node.await_mempool_drain()
+    res = node.transfer(TIER_1 + 1000, expect_ok=False)
+    check("alice is still gated", res.get("status") == "error", json.dumps(res)[:200])
+
+
+def _verdicts(node):
+    """What each author's clause says now, without queueing anything: a fee
+    limit too low to queue still reports a policy block first."""
+    def policy_blocked(sender, recipient, amount):
+        res = node.submit(sender, {
+            "tx_type": "user_tx", "fee_limit": "1",
+            "operations": {"1": [[node.pk(sender), node.pk(recipient), str(amount)]]},
+        }, expect_ok=False)
+        return "policy clause blocked" in json.dumps(res)
+    return {"alice over tier 1": policy_blocked("alice", "bob", TIER_1 + 1000),
+            "alice below tier 1": policy_blocked("alice", "bob", TIER_1 - 500),
+            "bob over 5000": policy_blocked("bob", "alice", 6000)}
+
+
+def _preview_sets(node):
+    out = {}
+    for amount in (TIER_1 - 500, TIER_1 + 1, TIER_2 + 1):
+        draft = json.dumps({
+            "sender_pubkey": node.pk("alice"), "recipient_pubkey": node.pk("bob"),
+            "amount": amount,
+            "approvers": {"18": node.pk("authbot"), "19": node.pk("scanbot"),
+                          "20": node.pk("partner")},
+        })
+        data = node.rpc("getapprovalpreview '" + draft + "'").get("data") or {}
+        out[str(amount)] = sorted(str(x) for x in (data.get("required_slots") or []))
+    return out
+
+
 def snapshot(node, path):
     state = {
         "height": node.height(),
@@ -447,6 +553,9 @@ def snapshot(node, path):
         "alice_out": node.rpc(
             f"getapprovalrequests {node.pk('alice')} out")["data"].get("outgoing"),
         "spec_units": node.rpc("gettaustate")["data"].get("rules", "").count("always"),
+        "bob_slots": node.rpc(f"getapprovalslots {node.pk('bob')}")["data"],
+        "verdicts": _verdicts(node),
+        "preview": _preview_sets(node),
     }
     json.dump(state, open(path, "w"), indent=2)
     say(f"Snapshot written to {path}; restart the node, then run `after-restart`.")
@@ -463,6 +572,13 @@ def scenario_after_restart(node, path):
     after_out = node.rpc(
         f"getapprovalrequests {node.pk('alice')} out")["data"].get("outgoing")
     check("request history survived", after_out == before["alice_out"])
+    check("the second author's slots are as before",
+          node.rpc(f"getapprovalslots {node.pk('bob')}")["data"] == before["bob_slots"])
+    check("every author's verdict is as before the restart",
+          _verdicts(node) == before["verdicts"], json.dumps(_verdicts(node)))
+    check("the advisory preview is as before the restart",
+          _preview_sets(node) == before["preview"])
+    scenario_revoke(node)
     return 0
 
 
@@ -496,6 +612,8 @@ def main(argv=None):
     scenario_over_declared_approver_cannot_veto(node)
     scenario_custom_input_reaches_the_approver(node)
     scenario_preview(node)
+    scenario_clause_scope(node)
+    scenario_second_author(node)
 
     say("")
     if FAILED:

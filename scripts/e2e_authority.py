@@ -9,7 +9,9 @@ other node's state, and cleanup stops exactly the processes started here.
     python scripts/e2e_authority.py run --dir <scratch>/e2e
     python scripts/e2e_authority.py unpatched --dir <scratch>/e2e-main --ref main
 
-`run` drives the fifteen-step acceptance sequence; `unpatched` reproduces the
+`run` drives the fifteen-step acceptance sequence with every o5 policy written
+as the sender's own per-account clause (four authors, revocation, restart and
+journal rebuild with the registry populated); `unpatched` reproduces the
 original incident on a tree without the fix, for the before/after record. Both
 write `report.json` in --dir. Node A runs through scripts/e2e_authority_node.py
 -- the production server with failures injectable from outside.
@@ -73,27 +75,47 @@ def make_keys():
 
 
 def pin_rule(pk):
-    """Total form on o5 for everyone, mentioning i12 with a literal -- the shape
-    that pinned i12 narrow in the incident's process."""
+    """An o5 rule guarded on the sender's key: a clause is evaluated for its
+    author only, so the registry refuses a body that mentions i12."""
     return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) ? "
             "( o5[t]:bv[24] = { #x000001 }:bv[24] ) : "
             "( o5[t]:bv[24] = { #x000001 }:bv[24] ) )." % pk)
 
 
 def incident_rule(pk):
-    """The original shape: an UNPARENTHESIZED implication on an i12 comparison.
-    Satisfiable, and it means one thing: `pk` is blocked."""
+    """An unparenthesized implication on an i12 comparison: `pk` is blocked."""
     return ("always ( i12[t]:bv[384] = { #x%s }:bv[384] -> "
             "( o5[t]:bv[24] = { #x000000 }:bv[24] ) )." % pk)
 
 
-def history_policy_total(pk, previous="00005a"):
-    """`pk` is blocked right after a step whose amount was 90 (0x5a); everyone
-    else is allowed. TOTAL on every branch: the only o5 rule on its chain."""
+def spend_limit_clause(limit):
+    """Blocks a transfer of more than `limit`; allows everything else."""
+    return ("always ( (i1[t]:bv[24] > { #x%06x }:bv[24]) ? "
+            "( o5[t]:bv[24] = { #x000000 }:bv[24] ) : "
+            "( o5[t]:bv[24] = { #x000001 }:bv[24] ) )." % limit)
+
+
+def block_all_clause():
+    """An unparenthesized implication on an input comparison: every transfer
+    with a positive amount is blocked."""
+    return ("always ( i1[t]:bv[24] > { #x000000 }:bv[24] -> "
+            "( o5[t]:bv[24] = { #x000000 }:bv[24] ) ).")
+
+
+REVOKE_CLAUSE = "always ( (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
+
+
+def history_policy_guarded(pk, previous="00005a"):
     return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) ? "
             "((i1[t-1]:bv[24] = { #x%s }:bv[24]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
             ": (o5[t]:bv[24] = { #x000001 }:bv[24])) "
             ": (o5[t]:bv[24] = { #x000001 }:bv[24]) )." % (pk, previous))
+
+
+def history_policy_total(previous="00005a"):
+    """Blocked right after a step whose amount was 90 (0x5a): reads `[t-1]`."""
+    return ("always ( (i1[t-1]:bv[24] = { #x%s }:bv[24]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
+            ": (o5[t]:bv[24] = { #x000001 }:bv[24]) )." % previous)
 
 
 def sender_fee(dave, carol):
@@ -472,6 +494,64 @@ def step_amounts(rows):
     return out
 
 
+def blocked_by_policy(res):
+    return (not ok(res) and err(res).get("code") == "TX_REJECTED"
+            and "own policy clause blocked" in err(res).get("message", ""))
+
+
+def verdict(chain, node, who, amount):
+    """"allowed" / "blocked" for a transfer of `amount` from `who`, asked with a
+    fee limit too low to queue: nothing is queued, charged or sequenced."""
+    res = chain.transfer(node, who, fresh_address("verdict"), amount, fee_limit="1")
+    if blocked_by_policy(res):
+        return "blocked"
+    return "allowed" if err(res).get("code") == "FEE_LIMIT_TOO_LOW" else f"other:{res}"
+
+
+def clause_texts(node, who):
+    """The author's registered clause bodies, as the node reports them."""
+    rows = node.rpc(f"getruleoffers {node.keys[who]['pk']}")["data"]["accepted_clauses"]
+    return [r["clause_body"] for r in rows]
+
+
+def registry_view(node, authors):
+    return {who: clause_texts(node, who) for who in authors}
+
+
+def spec_units(node):
+    return node.rpc("gettaustate")["data"]["rules_state"].count("always")
+
+
+def node_workers(node, grace=0.0, prefix="tau_"):
+    """Worker processes whose command line lives in this node's tree; waits up
+    to `grace` seconds for them to leave."""
+    deadline = time.time() + grace
+    while True:
+        out = subprocess.run(["pgrep", "-fl", os.path.join(node.tree, prefix)],
+                             capture_output=True, text=True).stdout.splitlines()
+        found = [line.split(None, 1)[1].rsplit("/", 1)[-1] + f" pid {line.split()[0]}"
+                 for line in out]
+        if not found or time.time() >= deadline:
+            return found
+        time.sleep(0.5)
+
+
+CLAUSE_AUTHORS = ("alice", "bob", "dave", "erin")
+
+
+def verdict_table(chain, node):
+    """The verdict of every author's clause at the boundary, plus an author with
+    no clause."""
+    return {
+        "alice 5": verdict(chain, node, "alice", 5),
+        "alice 20001": verdict(chain, node, "alice", 20001),
+        "bob 5": verdict(chain, node, "bob", 5),
+        "dave 90": verdict(chain, node, "dave", 90),
+        "dave 501": verdict(chain, node, "dave", 501),
+        "carol 70000": verdict(chain, node, "carol", 70000),
+    }
+
+
 # --- the run ------------------------------------------------------------------------
 
 def run(args):
@@ -563,32 +643,57 @@ def _run(root, keys, chain, nodes, args):
         return ok_
 
     # ---------------------------------------------------------------- 3, 4
-    say("== 3-4: the original unparenthesized implication, end to end ==")
+    say("== 3-4: o5 policies are per-account clauses; three authors, one verdict each ==")
+    units0 = spec_units(a)
     r = chain.send(a, "alice", {"0": pin_rule(pk["alice"])})
-    check(3, "i12-pinning rule admitted", ok(r), r)
+    check(3, "an o5 rule guarded on i12 is refused: a clause carries no sender guard",
+          not ok(r) and err(r).get("code") == "CLAUSE_SHAPE", r)
+    r = chain.send(a, "alice", {"0": spend_limit_clause(20000)})
+    check(3, "alice's spend-limit clause admitted", ok(r), r)
     _mine(chain, a)
     check(3, "and included", tx_hash(r) in block_txs(a))
-    rule = incident_rule(pk["bob"])
+    check(3, "registered as alice's own clause",
+          len(clause_texts(a, "alice")) == 1 and "#x004e20" in clause_texts(a, "alice")[0].lower(),
+          clause_texts(a, "alice"))
+    rule = block_all_clause()
     EVIDENCE["incident_rule"] = rule
     r = chain.send(a, "bob", {"0": rule})
-    check(4, "incident rule: sendtx accepted", ok(r), r)
+    check(4, "bob's blocking clause (unparenthesized implication): sendtx accepted", ok(r), r)
     height0 = a.height()
     _mine(chain, a)
-    check(4, "incident rule: included in a durable block",
+    check(4, "included in a durable block",
           tx_hash(r) in block_txs(a) and a.height() == height0 + 1)
     check(4, "the block has a commit record naming it", a.commits()[-1][1] == a.head()["block_hash"])
-    check(4, "the rule is present in canonical state",
-          rule in a.rpc("gettaustate")["data"]["rules_state"])
+    check(4, "registered as bob's clause", len(clause_texts(a, "bob")) == 1, clause_texts(a, "bob"))
+    r = chain.send(a, "dave", {"0": spend_limit_clause(500)})
+    check(4, "a third author (dave) registers a clause", ok(r), r)
+    _mine(chain, a)
+    check(4, "and it is included", tx_hash(r) in block_txs(a))
+    check(4, "three authors, three clauses, each under its own key",
+          {w: len(clause_texts(a, w)) for w in ("alice", "bob", "dave", "carol")}
+          == {"alice": 1, "bob": 1, "dave": 1, "carol": 0},
+          registry_view(a, ("alice", "bob", "dave", "carol")))
+    check(4, "the shared interpreter accumulated none of them",
+          rule not in a.rpc("gettaustate")["data"]["rules_state"]
+          and spec_units(a) == units0, (units0, spec_units(a)))
     r_bob = chain.transfer(a, "bob", pk["alice"], 5)
-    check(4, "policy verdict: bob is blocked",
-          not ok(r_bob) and "user policy" in err(r_bob).get("message", ""), r_bob)
+    check(4, "policy verdict: bob is blocked by his own clause", blocked_by_policy(r_bob), r_bob)
     r_carol = chain.transfer(a, "carol", pk["alice"], 5)
-    check(4, "policy verdict: carol is allowed", ok(r_carol), r_carol)
+    check(4, "policy verdict: carol, with no clause, is allowed", ok(r_carol), r_carol)
+    check(4, "alice: below her limit allowed, above it blocked",
+          (verdict(chain, a, "alice", 5), verdict(chain, a, "alice", 20001))
+          == ("allowed", "blocked"))
+    check(4, "dave: 90 allowed, 501 blocked",
+          (verdict(chain, a, "dave", 90), verdict(chain, a, "dave", 501))
+          == ("allowed", "blocked"))
     _mine(chain, a)
     check(4, "the node keeps mining: carol's transfer lands", tx_hash(r_carol) in block_txs(a))
-    check(4, "no crash artifact from the incident sequence", a.crash_dumps() == dumps_a0,
+    check(4, "no crash artifact from the clause sequence", a.crash_dumps() == dumps_a0,
           a.crash_dumps())
-    follow("after the incident")
+    check(4, "the node evaluates clauses in policy worker processes",
+          len(node_workers(a, prefix="tau_policy_worker")) > 0,
+          node_workers(a, prefix="tau_policy_worker"))
+    follow("after the clauses")
 
     # ---------------------------------------------------------------- 5, 6, 7
     say("== 5-7: A/B/C/D -- B steps the evaluator and allocates, then is rejected ==")
@@ -656,7 +761,15 @@ def _run(root, keys, chain, nodes, args):
     check(8, "admission quotes each sender from its own amount: dave 10 + 7, carol 10 + 26, alice 10",
           before == EXPECTED_QUOTES, before)
     journal_before = a.journal()
+    registry_before = registry_view(a, CLAUSE_AUTHORS)
+    verdicts_before = verdict_table(chain, a)
+    check(8, "before the restart: every clause judges as registered",
+          verdicts_before == {"alice 5": "allowed", "alice 20001": "blocked",
+                              "bob 5": "blocked", "dave 90": "allowed",
+                              "dave 501": "blocked", "carol 70000": "allowed"},
+          verdicts_before)
     a.stop()
+    check(8, "the node's worker processes exit with it", node_workers(a, 15) == [], node_workers(a))
     a.start()
     check(8, "A restarts", a.wait_ready())
     check(8, "the authority was rebuilt from the committed journal",
@@ -675,8 +788,12 @@ def _run(root, keys, chain, nodes, args):
     check(8, "and carol 70 + 10 + 6",
           carol0 - a.balance("carol") == 70 + fee_for("carol", 70), carol0 - a.balance("carol"))
     r_bob = chain.transfer(a, "bob", pk["alice"], 5)
-    check(8, "the incident policy survives restart: bob still blocked",
-          not ok(r_bob) and "user policy" in err(r_bob).get("message", ""), r_bob)
+    check(8, "the clause registry survives restart: bob still blocked",
+          blocked_by_policy(r_bob), r_bob)
+    check(8, "every author's clause is as before the restart",
+          registry_view(a, CLAUSE_AUTHORS) == registry_before)
+    check(8, "and every verdict is as before the restart",
+          verdict_table(chain, a) == verdicts_before)
 
     # ---------------------------------------------------------------- 9
     say("== 9: the promoted worker is reused, not replayed ==")
@@ -720,28 +837,48 @@ def _run(root, keys, chain, nodes, args):
     check(10, "and charges by the tx's own amount: dave pays 1 + 10 + 1",
           dave0 - a.balance("dave") == 1 + fee_for("dave", 1), dave0 - a.balance("dave"))
     journal_before = a.journal()
+    registry_before, verdicts_before = registry_view(a, CLAUSE_AUTHORS), verdict_table(chain, a)
     a.stop()
+    check(10, "the node's worker processes exit with it", node_workers(a, 15) == [], node_workers(a))
     a.start()
     check(10, "restart after the failure", a.wait_ready())
+    check(10, "the registry and every verdict survive the recovery restart",
+          registry_view(a, CLAUSE_AUTHORS) == registry_before
+          and verdict_table(chain, a) == verdicts_before, verdict_table(chain, a))
     check(10, "the restart left the committed journal as it was",
           a.journal()[:len(journal_before)] == journal_before)
     check(10, "the same quotes after restart",
           quotes(chain, a, pk["bob"]) == EXPECTED_QUOTES)
     plan = json.loads(a.commits()[-1][3] or "{}")
     EVIDENCE["plan_after_recovery"] = plan
-    rule2 = incident_rule(pk["erin"])
-    r = chain.send(a, "erin", {"0": rule2})
-    check(3, "the incident shape again, after the recovery replanned "
-             f"(i12 {'interned' if 12 in plan.get('interned', []) else 'plain'}): admitted",
+    r = chain.send(a, "erin", {"0": block_all_clause()})
+    check(3, "a fourth author (erin) registers a clause after the recovery replanned "
+             f"(i12 {'interned' if 12 in plan.get('interned', []) else 'plain'})",
           ok(r), {"plan": plan, "res": r})
     _mine(chain, a)
     check(3, "included", tx_hash(r) in block_txs(a))
     r_erin = chain.transfer(a, "erin", pk["alice"], 1)
     r_alice = chain.transfer(a, "alice", pk["erin"], 1)
     check(3, "and it means what it says: erin blocked, alice allowed",
-          not ok(r_erin) and "user policy" in err(r_erin).get("message", "") and ok(r_alice),
-          [r_erin, r_alice])
+          blocked_by_policy(r_erin) and ok(r_alice), [r_erin, r_alice])
     _mine(chain, a)
+    # Revocation: the neutral clause removes the author's clause.
+    check(3, "before revocation bob is blocked", verdict(chain, a, "bob", 5) == "blocked")
+    r = chain.send(a, "bob", {"0": REVOKE_CLAUSE})
+    check(3, "bob revokes his clause with the neutral clause: admitted", ok(r), r)
+    _mine(chain, a)
+    check(3, "included, and bob's clause is gone", tx_hash(r) in block_txs(a)
+          and clause_texts(a, "bob") == [], clause_texts(a, "bob"))
+    check(3, "bob can transfer again; the other authors' clauses are untouched",
+          verdict_table(chain, a) == {
+              "alice 5": "allowed", "alice 20001": "blocked", "bob 5": "allowed",
+              "dave 90": "allowed", "dave 501": "blocked", "carol 70000": "allowed"}
+          and verdict(chain, a, "erin", 5) == "blocked", verdict_table(chain, a))
+    r = chain.send(a, "bob", {"0": REVOKE_CLAUSE})
+    check(3, "revoking again, with no clause registered, is refused at admission or at apply",
+          not ok(r) or (_mine(chain, a) and
+                        a.rpc(f"gettxstatus {tx_hash(r)}")["data"].get("status") == "rejected"), r)
+    chain.mined()
     check(3, "no crash artifact at any point", a.crash_dumps() == dumps_a0, a.crash_dumps())
     follow("after the promotion failure")
 
@@ -794,9 +931,14 @@ def _run(root, keys, chain, nodes, args):
 
     # ---------------------------------------------------------------- 14 + migration
     say("== 14: rebuild the journal explicitly from the stored blocks ==")
+    registry_a, verdicts_a = registry_view(a, CLAUSE_AUTHORS), verdict_table(chain, a)
+    check(13, "B holds the same registry and verdicts as A: clauses travel with the blocks",
+          registry_view(b, CLAUSE_AUTHORS) == registry_a
+          and verdict_table(chain, b) == verdicts_a, verdict_table(chain, b))
     b.stop()
     head_a, journal_a = a.head(), a.journal()
     quote_a = quotes(chain, a, pk["bob"])
+    check(14, "node B's worker processes exit with it", node_workers(b, 15) == [], node_workers(b))
     tree_r = os.path.join(root, "nodeR")
     shutil.copytree(tree_b, tree_r, ignore=shutil.ignore_patterns("e2e-control", "node.log", "logs"))
     db_r = os.path.join(tree_r, "data", "node.db")
@@ -822,6 +964,9 @@ def _run(root, keys, chain, nodes, args):
     check(14, "the rebuilt journal means what A's means, entry for entry",
           semantic_journal(journal_r) == semantic_journal(journal_a),
           {"A": len(journal_a), "rebuilt": len(journal_r)})
+    check(14, "the rebuilt node holds the same clause registry and the same verdicts",
+          registry_view(rn, CLAUSE_AUTHORS) == registry_a
+          and verdict_table(chain, rn) == verdicts_a, verdict_table(chain, rn))
     EVIDENCE["rebuild_links_identical"] = [x[7] for x in journal_r] == [x[7] for x in journal_a]
     check(14, "the rebuilt evaluator quotes every sender identically",
           quote_a == EXPECTED_QUOTES and quotes(chain, rn, pk["bob"]) == quote_a, quote_a)
@@ -848,6 +993,9 @@ def _run(root, keys, chain, nodes, args):
           == semantic_journal(journal_a) and rn.head()["block_hash"] == head_a["block_hash"])
     rn.stop()
     a.stop()
+    check(14, "no worker process of any node outlives its node",
+          not (node_workers(a, 15) or node_workers(b, 15) or node_workers(rn, 15)),
+          [node_workers(a), node_workers(b), node_workers(rn)])
     check(7, "no crash artifact on any node",
           a.crash_dumps() == dumps_a0 and b.crash_dumps() == dumps_b0 and not rn.crash_dumps(),
           [a.crash_dumps(), b.crash_dumps(), rn.crash_dumps()])
@@ -876,7 +1024,7 @@ def step15(root, keys, chain, nodes, *, patched):
     node.start()
     check(tag, "a fresh node for the policy", node.wait_ready())
     chain.pending.clear()
-    r = chain.send(node, "dave", {"0": history_policy_total(pk["dave"])})
+    r = chain.send(node, "dave", {"0": history_policy_total() if patched else history_policy_guarded(pk["dave"])})
     if patched:
         check(tag, "dave's [t-1] policy is refused at admission, with its reason",
               not ok(r) and err(r).get("code") == "TEMPORAL_REFERENCE", r)
@@ -887,6 +1035,8 @@ def step15(root, keys, chain, nodes, *, patched):
               tx_hash(rt) in block_txs(node))
         check(tag, "no crash artifact", not node.crash_dumps())
         node.stop()
+        check(tag, "the node's worker processes exit with it", node_workers(node, 15) == [],
+              node_workers(node))
         return
     check(tag, "dave's [t-1] policy admitted", ok(r), r)
     _mine(chain, node)
