@@ -985,6 +985,8 @@ def commit_prepared_block(*, execution_id, tip, parent, journal_entries,
                  int(timestamp if timestamp is not None else _time.time())),
             )
 
+        _confirm_rule_clauses(canonical)
+
     return {"committed": True, "execution_id": execution_id, "tip": tip,
             "journal_head": journal_head, "allocator_digest": allocator_digest}
 
@@ -1005,6 +1007,7 @@ def commit_block_and_canonical_state(block, canonical: dict) -> None:
         with _db_conn:
             _write_block_rows(_db_conn.cursor(), block)
             _write_canonical_state_rows(**canonical)
+        _confirm_rule_clauses(canonical)
 
 
 def publish_shrink_ids(delta: dict, expected_epoch: str) -> None:
@@ -2257,6 +2260,67 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 approval_slots_active=approval_slots_active,
                 retractable_transfers=retractable_transfers,
             )
+        _confirm_rule_clauses({'rule_clauses': rule_clauses})
+
+
+_CLAUSE_TOKEN_KEY = 'rule_clauses_token'
+
+
+def _read_rule_clauses_token() -> str | None:
+    row = _db_conn.execute(
+        'SELECT value FROM chain_state WHERE key = ?', (_CLAUSE_TOKEN_KEY,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _insert_clause_rows(rows: List[Dict]) -> None:
+    _db_conn.executemany(
+        'INSERT OR REPLACE INTO rule_clauses_v1 '
+        '(acceptor_pubkey, target_stream, clause_body) VALUES (?, ?, ?)',
+        [(r['acceptor_pubkey'], int(r['target_stream']), r['clause_body']) for r in rows],
+    )
+
+
+def _write_rule_clauses(rule_clauses) -> None:
+    """Write the registry rows inside the caller's transaction.
+
+    A plan whose token matches the one stored in the same transaction as the
+    table writes only its changed keys; anything else rewrites the table. The
+    stored token is part of the transaction, so a rollback leaves both alone.
+    """
+    if isinstance(rule_clauses, list):
+        _db_conn.execute('DELETE FROM rule_clauses_v1')
+        _insert_clause_rows(rule_clauses)
+        _db_conn.execute('DELETE FROM chain_state WHERE key = ?', (_CLAUSE_TOKEN_KEY,))
+        return
+    plan = rule_clauses
+    if plan.token is not None and plan.token == _read_rule_clauses_token():
+        for (acceptor, stream), body in plan.changes:
+            if body is None:
+                _db_conn.execute(
+                    'DELETE FROM rule_clauses_v1 '
+                    'WHERE acceptor_pubkey = ? AND target_stream = ?',
+                    (acceptor, int(stream)),
+                )
+            else:
+                _db_conn.execute(
+                    'INSERT OR REPLACE INTO rule_clauses_v1 '
+                    '(acceptor_pubkey, target_stream, clause_body) VALUES (?, ?, ?)',
+                    (acceptor, int(stream), body),
+                )
+    else:
+        _db_conn.execute('DELETE FROM rule_clauses_v1')
+        _insert_clause_rows(plan.full_rows())
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        (_CLAUSE_TOKEN_KEY, plan.new_token),
+    )
+
+
+def _confirm_rule_clauses(canonical) -> None:
+    plan = (canonical or {}).get('rule_clauses')
+    if plan is not None and not isinstance(plan, list):
+        plan.confirm()
 
 
 def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None):
@@ -2401,17 +2465,7 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
             )
 
     if rule_clauses is not None:
-        _db_conn.execute('DELETE FROM rule_clauses_v1')
-        for clause in rule_clauses:
-            _db_conn.execute(
-                'INSERT OR REPLACE INTO rule_clauses_v1 '
-                '(acceptor_pubkey, target_stream, clause_body) VALUES (?, ?, ?)',
-                (
-                    clause['acceptor_pubkey'],
-                    int(clause['target_stream']),
-                    clause['clause_body'],
-                )
-            )
+        _write_rule_clauses(rule_clauses)
 
     # Approval requests, same full-replace semantics and same
     # transaction as accounts, for the same reason: the request book root
@@ -2682,6 +2736,14 @@ def load_rule_clauses() -> List[Dict]:
             }
             for row in cur.fetchall()
         ]
+
+def load_rule_clauses_token() -> str | None:
+    """Token naming the registry state the clause table currently holds."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        return _read_rule_clauses_token()
+
 
 def get_candidate_heads() -> List[tuple[str, int]]:
     """

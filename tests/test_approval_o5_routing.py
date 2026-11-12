@@ -155,9 +155,6 @@ def test_an_existing_author_may_replace_their_clause(tip_view):
 
 
 def test_a_new_author_is_admitted_however_many_clauses_exist(tip_view):
-    tip_view.clauses_for_stream.return_value = {
-        format(i, "096x"): EXISTING_CLAUSE for i in range(200)
-    }
     result = _route(_tx(TIER_RULE), tip_view)
     assert result.is_valid is True
     assert result.data["o5_clause_action"] == "declare"

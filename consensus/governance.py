@@ -628,7 +628,8 @@ class ConsensusLifecycleManager:
             # application-rules accumulation, the clause registry), so every node
             # computes the same findings and the flag -- which IS hash-bound --
             # stays False on all of them identically.
-            findings = audit_stream_collisions(effective_spec_texts or ())
+            corpus = effective_spec_texts() if callable(effective_spec_texts) else effective_spec_texts
+            findings = audit_stream_collisions(corpus or ())
             if findings:
                 logger.error(
                     "approval_slots_active activation REFUSED at this height; the "

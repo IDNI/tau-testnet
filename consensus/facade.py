@@ -177,17 +177,6 @@ class TipAdmissionView:
             row = cur.fetchone()
         return row[0] if row else None
 
-    def clauses_for_stream(self, target_stream: int) -> dict:
-        """acceptor pubkey -> clause body, for composing a stream's rule."""
-        with db._db_lock:
-            cur = db._db_conn.cursor()
-            cur.execute(
-                "SELECT acceptor_pubkey, clause_body FROM rule_clauses_v1 "
-                "WHERE target_stream = ?",
-                (int(target_stream),),
-            )
-            return {row[0]: row[1] for row in cur.fetchall()}
-
     # --- Co-signature approvals -------------------------------------------
     #
     # Read from the persisted tables and chain_state values rather than the

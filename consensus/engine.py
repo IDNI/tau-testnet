@@ -824,23 +824,27 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # rules are consensus-visible changes, and a rule already typing a slot
         # (or a legacy raw o5 writer) would poison process-global stream typing.
         # Everything in this corpus is hash-bound state, so every node computes
-        # the same verdict.
-        effective_spec_texts = [
-            ("consensus_rules", active_view.consensus_rules or ""),
-            ("application_rules", next_app_rules or ""),
-        ]
-        try:
-            effective_spec_texts.extend(
-                ("builtin_rule_%d" % n, text)
-                for n, text in enumerate(chain_state.load_builtin_rules_from_disk() or [])
+        # the same verdict. Passed as a callable: it walks the whole registry,
+        # so it is built only when an audit runs.
+        def effective_spec_texts():
+            texts = [
+                ("consensus_rules", active_view.consensus_rules or ""),
+                ("application_rules", next_app_rules or ""),
+            ]
+            try:
+                texts.extend(
+                    ("builtin_rule_%d" % n, text)
+                    for n, text in enumerate(chain_state.load_builtin_rules_from_disk() or [])
+                )
+            except Exception:  # noqa: BLE001 - the audit is best-effort on disk reads
+                logger.warning("Could not read builtin rules for the activation audit")
+            texts.extend(
+                ("clause_%s_o%d" % (acceptor[:10], stream), body)
+                for (acceptor, stream), body in
+                sorted(getattr(lm.rule_offers, "accepted_clauses", {}).items())
             )
-        except Exception:  # noqa: BLE001 - the audit is best-effort on disk reads
-            logger.warning("Could not read builtin rules for the activation audit")
-        effective_spec_texts.extend(
-            ("clause_%s_o%d" % (acceptor[:10], stream), body)
-            for (acceptor, stream), body in
-            sorted(getattr(lm.rule_offers, "accepted_clauses", {}).items())
-        )
+            return texts
+
         newly_active = lm.process_height_transitions(
             block.header.block_number, effective_spec_texts=effective_spec_texts
         )

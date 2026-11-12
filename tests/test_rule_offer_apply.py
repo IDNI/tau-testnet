@@ -281,7 +281,7 @@ def test_accepting_again_replaces_the_acceptors_own_clause():
     ])
 
     assert lm.rule_offers.clause_for(B, TARGET) == clause_body_v1(ALLOW_RULE)
-    assert len(lm.rule_offers.clauses_for_stream(TARGET)) == 1
+    assert len(lm.rule_offers.accepted_clauses) == 1
 
 
 def test_a_clause_that_does_not_build_hard_rejects(policy):

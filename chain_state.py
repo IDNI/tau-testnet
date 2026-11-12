@@ -13,6 +13,7 @@ import config
 import tau_native
 from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
 from consensus.lanes import TAU_EVALUATING_TX_TYPES
+from consensus.clause_registry import ClauseRegistry
 from consensus.fees import FeeRuleError
 from errors import DatabaseError
 from block import Block
@@ -598,7 +599,7 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         # tables holding the previous block's rows while memory moved on.
         quorum_policy=lm.quorum_policy,
         rule_offers=lm.rule_offers.snapshot_offers(),
-        rule_clauses=lm.rule_offers.snapshot_clauses(),
+        rule_clauses=lm.rule_offers.clause_plan(),
         max_rule_txs_per_block=lm.max_rule_txs_per_block,
         approval_requests=lm.approval_requests.snapshot_requests(),
         approval_slots_active=lm.approval_slots_active,
@@ -2057,9 +2058,11 @@ def _restore_rule_offers(lm) -> None:
         else:
             resolved.add(offer_id)
 
-    clauses = {}
-    for row in db.load_rule_clauses():
-        clauses[(row["acceptor_pubkey"], int(row["target_stream"]))] = row["clause_body"]
+    clauses = ClauseRegistry({
+        (row["acceptor_pubkey"], int(row["target_stream"])): row["clause_body"]
+        for row in db.load_rule_clauses()
+    })
+    clauses.adopt_stored_token(db.load_rule_clauses_token())
 
     lm.rule_offers.offered = offered
     lm.rule_offers.resolved = resolved
@@ -2333,7 +2336,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         # write as accounts: a node whose reloaded managers disagree with disk
         # computes a different state hash than a peer replaying from genesis.
         rule_offers_list = _lifecycle_manager.rule_offers.snapshot_offers()
-        rule_clauses_list = _lifecycle_manager.rule_offers.snapshot_clauses()
+        rule_clauses_list = _lifecycle_manager.rule_offers.clause_plan()
         max_rule_txs_snapshot = _lifecycle_manager.max_rule_txs_per_block
         approval_requests_list = _lifecycle_manager.approval_requests.snapshot_requests()
         approval_slots_active_snapshot = _lifecycle_manager.approval_slots_active
@@ -2817,7 +2820,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
             archival_list = [uid.hex() if isinstance(uid, bytes) else uid for uid in _lifecycle_manager.archival_updates]
             active_validators_list = sorted(normalize_validator_set(_lifecycle_manager.active_validators))
             rule_offers_list = _lifecycle_manager.rule_offers.snapshot_offers()
-            rule_clauses_list = _lifecycle_manager.rule_offers.snapshot_clauses()
+            rule_clauses_list = _lifecycle_manager.rule_offers.clause_plan()
             head_num = db.get_block_by_hash(new_head_hash)['header']['block_number']
             db.save_canonical_state_atomically(
                 new_head_hash,

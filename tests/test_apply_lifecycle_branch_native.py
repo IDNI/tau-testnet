@@ -79,7 +79,7 @@ class _Lifecycle:
     """The parts of the lifecycle manager the routed path touches, for real.
 
     Real `RuleOfferLifecycleManager` and `ApprovalRequestLifecycleManager`, so
-    `resolve_all_for_sender` and `clauses_for_stream` behave as they do in
+    `resolve_all_for_sender` and the clause registry behave as they do in
     production; the governance queues around them are not what this exercises.
     """
 

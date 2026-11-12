@@ -46,7 +46,6 @@ def tip_view():
     view.pending_offers_for_recipient.return_value = 0
     view.pending_offers_for_offerer.return_value = 0
     view.clause_for.return_value = None
-    view.clauses_for_stream.return_value = {}
     return view
 
 
@@ -242,9 +241,6 @@ def test_reserved_input_screen_is_mode_independent(tip_view):
 
 
 def test_offer_is_admitted_whatever_the_registry_holds(tip_view):
-    tip_view.clauses_for_stream.return_value = {
-        format(i, "096x"): "o5[t] = 1" for i in range(200)
-    }
     res = validate_mempool_admission(offer_tx(), tip_view)
     assert res.is_valid, res.error
 
@@ -301,9 +297,6 @@ def test_accept_without_text_rejected(tip_view):
 
 
 def test_accept_is_admitted_whatever_the_registry_holds(tip_view):
-    tip_view.clauses_for_stream.return_value = {
-        format(i, "096x"): "o5[t] = 1" for i in range(200)
-    }
     tip_view.get_offer.return_value = _offer_row()
     res = validate_mempool_admission(accept_tx(), tip_view)
     assert res.is_valid, res.error

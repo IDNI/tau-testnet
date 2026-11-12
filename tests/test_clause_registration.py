@@ -202,9 +202,9 @@ def test_seventy_authors_register_and_each_is_judged_by_its_own_clause():
     for result in chain.apply_in_budget(registrations):
         assert not result.invalid_tx_ids, result.outcomes
 
-    registry = chain.lifecycle.rule_offers.clauses_for_stream(STREAM)
+    registry = chain.lifecycle.rule_offers.accepted_clauses
     assert len(registry) == AUTHORS
-    assert {pk: registry[pk] for _, pk in keys} == {
+    assert {pk: registry[(pk, STREAM)] for _, pk in keys} == {
         pk: clause_body_v1(rule) for pk, rule in rules.items()}
     assert evaluator.validate_calls.count(BLOCK_BODY) + \
         evaluator.validate_calls.count(LIMIT_BODY) + \

@@ -345,7 +345,7 @@ def test_reject_resolves_without_a_clause(mgr):
     assert mgr.submit_decision(decision) is None
     assert mgr.terminal_status[offer.offer_id] == STATUS_REJECTED
     assert mgr.clause_for(B, TARGET) is None
-    assert mgr.clauses_for_stream(TARGET) == {}
+    assert mgr.accepted_clauses == {}
 
 
 def test_only_the_recipient_may_decide(mgr):
@@ -406,7 +406,7 @@ def test_accepting_a_second_offer_replaces_the_acceptor_clause(mgr):
     mgr.submit_decision(RuleOfferDecision(
         offer_id=second.offer_id, actor_pubkey=B, accept=True, rule_text=ALLOW_RULE))
     assert mgr.clause_for(B, TARGET) == clause_body_v1(ALLOW_RULE)
-    assert len(mgr.clauses_for_stream(TARGET)) == 1
+    assert len(mgr.accepted_clauses) == 1
 
 
 def test_two_acceptors_both_keep_their_clauses(mgr):
@@ -422,7 +422,7 @@ def test_two_acceptors_both_keep_their_clauses(mgr):
 
     assert mgr.clause_for(B, TARGET) is not None
     assert mgr.clause_for(C, TARGET) is not None
-    assert set(mgr.clauses_for_stream(TARGET)) == {B, C}
+    assert set(mgr.accepted_clauses) == {(B, TARGET), (C, TARGET)}
 
 
 def test_expiry_resolves_only_closed_windows(mgr):
@@ -451,9 +451,10 @@ def test_snapshots_cover_offered_and_resolved(mgr):
         offer_id=offer.offer_id, actor_pubkey=B, accept=True, rule_text=BLOCK_RULE))
     rows = mgr.snapshot_offers()
     assert len(rows) == 1 and rows[0]["status"] == STATUS_ACCEPTED
-    clauses = mgr.snapshot_clauses()
-    assert clauses == [{"acceptor_pubkey": B, "target_stream": TARGET,
-                        "clause_body": clause_body_v1(BLOCK_RULE)}]
+    assert dict(mgr.accepted_clauses) == {(B, TARGET): clause_body_v1(BLOCK_RULE)}
+    assert mgr.clause_plan().full_rows() == [
+        {"acceptor_pubkey": B, "target_stream": TARGET,
+         "clause_body": clause_body_v1(BLOCK_RULE)}]
 
 
 def test_the_registry_has_no_author_limit(mgr):
@@ -465,4 +466,4 @@ def test_the_registry_has_no_author_limit(mgr):
         mgr.submit_decision(RuleOfferDecision(
             offer_id=offer.offer_id, actor_pubkey=author, accept=True,
             rule_text=BLOCK_RULE))
-    assert len(mgr.clauses_for_stream(TARGET)) == 100
+    assert len(mgr.accepted_clauses) == 100

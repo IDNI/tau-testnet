@@ -28,9 +28,6 @@ class _Offers:
     def __init__(self):
         self.accepted_clauses = {(SENDER.lower(), STREAM): "PREVIOUS POLICY"}
 
-    def clauses_for_stream(self, stream):
-        return {k: v for k, v in self.accepted_clauses.items() if k[1] == stream}
-
 
 class _Approvals:
     def __init__(self):

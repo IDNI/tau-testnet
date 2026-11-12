@@ -426,33 +426,60 @@ def compute_rule_offer_book_root(
     return blake3(encode_rule_offer_book(offered, resolved)).digest()
 
 
-def encode_clause_registry(clauses: Dict[tuple, str]) -> bytes:
-    """Canonical serialization of the accepted-clause registry.
+DOMAIN_CLAUSE_ENTRY_V1 = b"tau.clause.entry.v1"
+DOMAIN_CLAUSE_ROOT_V1 = b"tau.clause.root.v1"
 
-    `clauses` maps (acceptor_pubkey_hex, target_output_stream) -> clause body.
-    Sorted by raw public-key bytes then stream index, so the root does not depend
-    on insertion order.
-    """
-    items = sorted(
-        (
-            _coerce_fixed_bytes(acceptor, 48, "acceptor_pubkey"),
-            int(stream),
-            body,
-        )
-        for (acceptor, stream), body in clauses.items()
+# Multiset hash: each entry becomes 1024 lanes of 16 bits, summed per lane
+# modulo 2**16 and bound with the count, so one change is one vector update.
+CLAUSE_LANES = 1024
+CLAUSE_LANE_BITS = 16
+CLAUSE_STATE_BYTES = CLAUSE_LANES * 4
+CLAUSE_LANE_MASK = int.from_bytes(b"\xff\xff\x00\x00" * CLAUSE_LANES, "little")
+# One bit above every lane, so a lane can be subtracted without borrowing.
+CLAUSE_LANE_BIAS = int.from_bytes(b"\x00\x00\x01\x00" * CLAUSE_LANES, "little")
+
+
+def encode_clause_entry(acceptor: Any, stream: int, body: str) -> bytes:
+    """Canonical bytes of one registry entry."""
+    return (
+        DOMAIN_CLAUSE_ENTRY_V1
+        + encode_pubkey48(acceptor)
+        + encode_uint32(int(stream))
+        + encode_string(body)
     )
-    out = bytearray()
-    out.extend(encode_uint32(len(items)))
-    for acceptor, stream, body in items:
-        out.extend(encode_pubkey48(acceptor))
-        out.extend(encode_uint32(stream))
-        out.extend(encode_string(body))
-    return bytes(out)
+
+
+def clause_entry_vector(acceptor: Any, stream: int, body: str) -> int:
+    """The entry's lane vector as one little-endian integer."""
+    digest = blake3(encode_clause_entry(acceptor, stream, body)).digest(
+        length=CLAUSE_STATE_BYTES
+    )
+    return int.from_bytes(digest, "little") & CLAUSE_LANE_MASK
+
+
+def clause_state_add(state: int, vector: int) -> int:
+    return (state + vector) & CLAUSE_LANE_MASK
+
+
+def clause_state_remove(state: int, vector: int) -> int:
+    return (state + CLAUSE_LANE_BIAS - vector) & CLAUSE_LANE_MASK
+
+
+def clause_root_from_state(count: int, state: int) -> bytes:
+    """32-byte registry root from the entry count and the lane sum."""
+    return blake3(
+        DOMAIN_CLAUSE_ROOT_V1
+        + encode_uint64(count)
+        + state.to_bytes(CLAUSE_STATE_BYTES, "little")
+    ).digest()
 
 
 def compute_clause_registry_root(clauses: Dict[tuple, str]) -> bytes:
-    """BLAKE3 of the canonical clause registry. Returns 32 bytes."""
-    return blake3(encode_clause_registry(clauses)).digest()
+    """Root of a whole registry, computed by adding every entry."""
+    state = 0
+    for (acceptor, stream), body in clauses.items():
+        state = clause_state_add(state, clause_entry_vector(acceptor, stream, body))
+    return clause_root_from_state(len(clauses), state)
 
 
 # --- Co-signature approval requests ------------------------------------------

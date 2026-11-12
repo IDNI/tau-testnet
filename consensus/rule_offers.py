@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import tau_defs
+from consensus.clause_registry import ClausePlan, ClauseRegistry
 from consensus.serialization import (
     compute_offer_id,
-    compute_clause_registry_root,
     compute_rule_offer_book_root,
 )
 
@@ -418,16 +418,26 @@ class RuleOfferLifecycleManager:
         self,
         offered: Optional[Dict[bytes, OfferEntry]] = None,
         resolved: Optional[Iterable[bytes]] = None,
-        accepted_clauses: Optional[Dict[Tuple[str, int], str]] = None,
+        accepted_clauses: Optional[Mapping[Tuple[str, int], str]] = None,
     ) -> None:
         self.offered: Dict[bytes, OfferEntry] = dict(offered or {})
         self.resolved: Set[bytes] = set(resolved or ())
         # (acceptor pubkey, target stream) -> canonical clause body.
-        self.accepted_clauses: Dict[Tuple[str, int], str] = dict(accepted_clauses or {})
+        self._accepted_clauses = ClauseRegistry(accepted_clauses)
         # Node-local only: never hashed, re-derivable by replay. Kept for the
         # RPC surface so a wallet can show what an offer actually said.
         self.terminal_status: Dict[bytes, str] = {}
         self.offer_payloads: Dict[bytes, str] = {}
+
+    @property
+    def accepted_clauses(self) -> ClauseRegistry:
+        return self._accepted_clauses
+
+    @accepted_clauses.setter
+    def accepted_clauses(self, clauses: Mapping[Tuple[str, int], str]) -> None:
+        self._accepted_clauses = (
+            clauses if isinstance(clauses, ClauseRegistry) else ClauseRegistry(clauses)
+        )
 
     # -- hashing ------------------------------------------------------------
 
@@ -457,7 +467,7 @@ class RuleOfferLifecycleManager:
         )
 
     def clauses_root(self) -> bytes:
-        return compute_clause_registry_root(self.accepted_clauses)
+        return self._accepted_clauses.root()
 
     # -- queries ------------------------------------------------------------
 
@@ -479,13 +489,6 @@ class RuleOfferLifecycleManager:
         return self.accepted_clauses.get(
             (normalize_acceptor_pubkey(acceptor_pubkey), stream_index)
         )
-
-    def clauses_for_stream(self, stream_index: int) -> Dict[str, str]:
-        return {
-            acceptor: body
-            for (acceptor, stream), body in self.accepted_clauses.items()
-            if stream == stream_index
-        }
 
     # -- transitions --------------------------------------------------------
 
@@ -618,8 +621,6 @@ class RuleOfferLifecycleManager:
             })
         return rows
 
-    def snapshot_clauses(self) -> List[Dict[str, Any]]:
-        return [
-            {"acceptor_pubkey": acceptor, "target_stream": stream, "clause_body": body}
-            for (acceptor, stream), body in sorted(self.accepted_clauses.items())
-        ]
+    def clause_plan(self) -> ClausePlan:
+        """The registry writes for one state save; confirm it after the commit."""
+        return self._accepted_clauses.storage_plan()
