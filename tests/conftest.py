@@ -81,6 +81,15 @@ def reset_tau_stream_types() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def reset_estimate_limits() -> Iterator[None]:
+    """The estimate budget of each sender key is process-global."""
+    sendtx = sys.modules.get("commands.sendtx")
+    if sendtx is not None:
+        sendtx.reset_estimate_limits()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def restore_lifecycle_manager() -> Iterator[None]:
     """Keep the validator set of one test out of later tests.
 

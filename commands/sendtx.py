@@ -58,9 +58,23 @@ FEE_BEARING_TX_TYPES = frozenset(
 from db import add_mempool_tx
 from network import bus as network_bus
 import api_response
+from rate_limit import KeyedBuckets
 
 
 logger = logging.getLogger(__name__)
+
+# The connection limiter does not stop one key that opens a new connection for
+# each estimate. The bucket holds seconds of slot time, so one key holds the
+# estimate slot for at most about a quarter of the time on any chain length.
+_ESTIMATE_SLOT_SECONDS_PER_SEC = 0.25
+_ESTIMATE_SLOT_SECONDS_BURST = 0.5
+_ESTIMATE_MAX_KEYS = 4096
+_estimate_buckets = KeyedBuckets(_ESTIMATE_SLOT_SECONDS_BURST,
+                                 _ESTIMATE_SLOT_SECONDS_PER_SEC, _ESTIMATE_MAX_KEYS)
+
+
+def reset_estimate_limits() -> None:
+    _estimate_buckets.clear()
 
 
 def _qt_ok(tx_hash: str, message: str = "Transaction queued.", **extra) -> dict:
@@ -79,6 +93,10 @@ def _qt_err(code: str, message: str, **details) -> dict:
 # the 64 the host used to check against — a value in between was accepted here
 # and then truncated mod 2^24 inside Tau. See tau_defs.TRANSFER_VALUE_BV_WIDTH.
 _MAX_TAU_BV_VALUE = tau_defs.MAX_TRANSFER_VALUE
+
+
+def _estimate_busy(message: str = "Another fee estimate is running on this node; please retry.") -> dict:
+    return _qt_err("ESTIMATE_BUSY", message)
 
 
 def _admission_i2(address: str) -> str:
@@ -998,6 +1016,11 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                 balance=sender_balance,
                 required=floor,
             )
+    estimate_started = None
+    if estimate:
+        if not _estimate_buckets.admit(sender_pubkey):
+            return _estimate_busy("This sender used its share of fee estimates; please retry.")
+        estimate_started = _estimate_buckets.clock()
     admission_tau = _AdmissionTau(
         candidate_rules=(admission_candidate,) if admission_candidate else (),
         estimate=estimate, facts=facts,
@@ -1506,10 +1529,9 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
         return _qt_err("TX_REJECTED", f"Transaction rejected by Tau. {e}")
     except tau_admission.EstimateBusy as e:
         logger.info("Fee estimate refused: %s", e)
-        return _qt_err(
-            "ESTIMATE_BUSY",
-            "Another fee estimate is running on this node; please retry.",
-        )
+        # The sender did not get the slot, so its retry costs it nothing.
+        estimate_started = None
+        return _estimate_busy()
     except tau_admission.AdmissionTimeout as e:
         logger.warning("Admission evaluation timed out: %s", e)
         return _qt_err(
@@ -1531,6 +1553,9 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
         return _qt_err("INTERNAL_ERROR", "An unexpected server error occurred.")
     finally:
         admission_tau.close()
+        if estimate_started is not None:
+            _estimate_buckets.charge(sender_pubkey,
+                                     _estimate_buckets.clock() - estimate_started)
 
 
 def execute(raw_command: str, container):

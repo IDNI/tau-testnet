@@ -210,6 +210,11 @@ in an isolated admission context on its own single slot.
 - It never uses the in-process path. A node with no isolated context gives
   `ADMISSION_UNAVAILABLE`.
 - When another estimate runs, it gives `ESTIMATE_BUSY` at once.
+- Each sender key has a budget of slot time: 0.5 seconds at most, and 0.25 seconds more each second.
+  The node deducts the time of each estimate from the budget of its key, so one key holds the
+  slot for at most about a quarter of the time. A key with no budget left gets `ESTIMATE_BUSY`
+  before the node takes the slot. An estimate that finds the slot busy costs nothing.
+  Many funded keys can still share the slot, but each of them needs funds.
 - It gives `estimated_fee` for every fee-bearing type. The `fee_limit` of the
   payload does not change the estimate. A wallet can sign a draft with any
   `fee_limit`, ask, and sign again with the estimate.
