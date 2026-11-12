@@ -25,10 +25,12 @@ python wallet.py history --privkey <private_key>
 
 ### Pending-aware account state and tx status
 
-`getbalance` returns only the confirmed chain balance. Two additive node
-commands give a wallet the mempool view:
+`getbalance` returns only the confirmed chain balance. `balance` is what the
+account can spend: for an account with no record on the chain yet, it includes
+the faucet grant of the genesis, and `faucet_pending` is `true`. Two additive
+node commands give a wallet the mempool view:
 
-- `getaccountstate <address>` — `chain_balance`, `pending_outgoing`,
+- `getaccountstate <address>` — `chain_balance`, `faucet_pending`, `pending_outgoing`,
   `pending_incoming`, `pending_fees`, `available_balance`, and a `pending_txs`
   list. `pending_outgoing` is the transfer total only; the sender's admission fee
   estimate is reported separately in `pending_fees`. `available_balance = max(0,
@@ -161,6 +163,15 @@ Sending the transfer with `--operation "13:0x2A"` yields `o5=1` (allow); a wrong
 or absent `i13` yields `o5=0` and the transfer is rejected at `sendtx`, not just
 at apply. The same holds for 2FA flags, escrow conditions, and multi-party
 approval keyed on i13+.
+
+**Pubkeys in custom streams.** Write a custom stream (`i13` and up) that holds
+a pubkey as `iN[t]:bv[384]` at every reference, for example
+`i13[t]:bv[384] = { #x… }:bv[384]`. The node runs pubkey streams at a smaller
+internal width. A bare `i13[t]` takes its width from the rule text around it,
+so it can conflict with another rule that uses the same stream. The node then
+refuses the rule, and the error tells you to write `i13[t]:bv[384]`. The bare
+form is correct for `i3`, `i4`, `i12` and the approval slots `i18` to `i25`,
+because the node knows their width.
 
 ### User Policy Rules (`o5`)
 

@@ -495,3 +495,34 @@ def test_the_approval_preview_sees_the_authoritys_policy(authority):
         small, large = preview(500), preview(5000)
     assert small["needs_no_approval"] is True, small
     assert large["required_slots"] == [18] and large["satisfiable"] is True, large
+
+
+def _approval_request(sk, pk, amount, approver):
+    tx = {"tx_type": "approval_request", "sender_pubkey": pk,
+          "sequence_number": chain_state.get_sequence_number(pk),
+          "expiration_time": int(time.time()) + 3600, "expire_at_height": 500,
+          "fee_limit": "100000", "recipient_pubkey": _recipient("req_to"),
+          "amount": amount, "approvers": {"18": approver}, "custom_inputs": {}}
+    tx["signature"] = bls.Sign(sk, hashlib.sha256(
+        _get_signing_message_bytes(tx)).digest()).hex()
+    return sendtx.queue_transaction(json.dumps(tx), propagate=False)
+
+
+def test_admission_refuses_a_request_the_policy_does_not_gate(authority):
+    """Apply drops such a request, so admission must not queue it for free."""
+    sk, pk = _sender("request_owner")
+    approver = "ab" * 48
+    db.set_chain_state_value("approval_slots_active", "1")
+    chain_state._lifecycle_manager.activate_approval_slots()
+    assert _submit(sk, pk, {"0": _tiered_policy(approver)}).get("ok")
+    _mine()
+    db.set_chain_state_value("approval_slots_active", "1")
+
+    with patch.object(tau_manager, "communicate_with_tau_multi",
+                      side_effect=AssertionError("in-process interpreter stepped")):
+        small = _approval_request(sk, pk, 500, approver)
+        large = _approval_request(sk, pk, 5000, approver)
+    assert small.get("code") == "APPROVAL_NOT_NEEDED", small
+    assert small["details"]["request_id"]
+    assert large.get("ok"), large
+    assert db.count_mempool_txs() == 1

@@ -1,4 +1,3 @@
-import importlib
 import json
 import os
 import threading
@@ -15,53 +14,7 @@ from commands import sendtx
 import config
 
 
-pytestmark = pytest.mark.trio
-
-
-@pytest.fixture(autouse=True)
-def isolate_db(tmp_path):
-    """Isolate the SQLite DB per test to avoid cross-test interference."""
-    orig_env = os.environ.get("TAU_DB_PATH")
-    db_file = tmp_path / "p2p_test.db"
-    os.environ["TAU_DB_PATH"] = str(db_file)
-    import config as config_module
-    import db as db_module
-    
-    # Close any existing connection before reloading to avoid leaks
-    if getattr(db_module, "_db_conn", None):
-        try:
-            db_module._db_conn.close()
-        except Exception:
-            pass
-
-    importlib.reload(config_module)
-    importlib.reload(db_module)
-    
-    import chain_state as chain_state_module
-    importlib.reload(chain_state_module)
-    import block as block_module
-    
-    db_module.init_db()
-    chain_state_module.load_genesis("data/genesis.json")
-    
-    genesis_hash = db_module.get_genesis_hash()
-    db_module.save_canonical_state_atomically(genesis_hash, 0, {}, {}, "", "", "", [], [], [], [])
-    chain_state_module._canonical_head_hash = genesis_hash
-    yield
-    
-    # Close our test connection before restoring
-    if getattr(db_module, "_db_conn", None):
-        try:
-            db_module._db_conn.close()
-        except Exception:
-            pass
-
-    if orig_env is None:
-        os.environ.pop("TAU_DB_PATH", None)
-    else:
-        os.environ["TAU_DB_PATH"] = orig_env
-    importlib.reload(config_module)
-    importlib.reload(db_module)
+pytestmark = [pytest.mark.trio, pytest.mark.usefixtures("isolate_db")]
 
 
 # Listen-addr helper lives in tests/conftest.py — single source.
@@ -547,6 +500,82 @@ async def test_large_header_response_read_until_eof(two_nodes, monkeypatch):
     assert len(raw) > 64 * 1024
     resp = json.loads(raw.decode())
     assert len(resp["headers"]) == 2000
+
+
+@pytest.fixture
+async def service_and_plain_host():
+    from libp2p import new_host
+    from network.config import NetworkConfig
+    from network.service import NetworkService
+
+    listen = [multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")]
+    server = new_host(listen_addrs=listen)
+    cfg = NetworkConfig(
+        network_id="testnet",
+        listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
+    )
+    svc = NetworkService(cfg, tx_submitter=lambda payload: "queued")
+    async with server.run(listen):
+        await _wait_for_addrs(server)
+        await svc.start()
+        await _wait_for_addrs(svc.host)
+        try:
+            yield svc, server
+        finally:
+            await svc.stop()
+
+
+async def test_block_sync_path_reads_reply_over_64k(service_and_plain_host, monkeypatch):
+    from conftest import connect_peers
+    from network.libp2p_compat import bounded_stream_read
+    from network.protocols import TAU_PROTOCOL_BLOCKS, TAU_PROTOCOL_SYNC
+    from network.service import NetworkService
+
+    svc, server = service_and_plain_host
+    block_count = 100
+    hashes = [f"{i + 1:064x}" for i in range(block_count)]
+    blocks_reply_sizes: List[int] = []
+
+    async def sync_handler(stream):
+        await bounded_stream_read(stream, 65535)
+        headers = [{"block_hash": bh, "block_number": i + 1} for i, bh in enumerate(hashes)]
+        await stream.write(json.dumps({"headers": headers, "tip_number": block_count}).encode())
+        await stream.close()
+
+    async def blocks_handler(stream):
+        req = json.loads((await bounded_stream_read(stream, 65535)).decode())
+        blocks = [
+            {
+                "block_hash": bh,
+                "header": {"block_number": int(bh, 16), "block_hash": bh},
+                "transactions": ["t" * 2048],
+            }
+            for bh in req["hashes"]
+        ]
+        reply = json.dumps({"blocks": blocks}).encode()
+        blocks_reply_sizes.append(len(reply))
+        await stream.write(reply)
+        await stream.close()
+
+    server.set_stream_handler(TAU_PROTOCOL_SYNC, sync_handler)
+    server.set_stream_handler(TAU_PROTOCOL_BLOCKS, blocks_handler)
+
+    ingested_batches: List[int] = []
+
+    def record_ingest(sorted_blocks, peer_id):
+        ingested_batches.append(len(sorted_blocks))
+        return len(sorted_blocks)
+
+    monkeypatch.setattr(NetworkService, "_ingest_blocks", staticmethod(record_ingest))
+
+    await connect_peers(svc.host, server)
+    ingested = await svc._sync_and_ingest_from_peer(
+        str(server.get_id()), [svc._genesis_hash], limit=block_count
+    )
+    assert len(blocks_reply_sizes) == 1
+    assert blocks_reply_sizes[0] > 2 * 65536
+    assert ingested_batches == [block_count]
+    assert ingested == block_count
 
 
 async def test_block_gossip_triggers_sync(two_nodes, monkeypatch):

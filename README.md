@@ -199,7 +199,7 @@ tau-testnet --host localhost status      # node started via Docker (CLI installe
 
 > The Docker image ships only the node, not the `tau-testnet` CLI. To query a Docker node, install the client on the host with `pip install -e .` (no `tau-lang` build needed — the CLI is a thin RPC client), or just read the container's foreground logs.
 
-A rising `head_number` means you are syncing. If it stays at 0, the handshake was rejected — confirm `TAU_NETWORK_ID=tau-testnet-v2` and that `data/genesis.json` matches the committed profile (`block_0.hash` = `35faee3b…f1a7`). The node logs the exact reason for any mismatch.
+A rising `head_number` means you are syncing. If it stays at 0, the handshake was rejected — confirm `TAU_NETWORK_ID=tau-testnet-v2` and that `data/genesis.json` matches the committed profile (`block_0.hash` = `359fa1bd…0891`). The node logs the exact reason for any mismatch.
 
 ### Run as a validator
 
@@ -260,11 +260,14 @@ tau-testnet blocks --limit 10
 tau-testnet mempool
 tau-testnet governance
 
-# send a transfer (default fee 10, expiry 600s)
+# send a transfer (expiry 600s). Without --fee the CLI signs a draft, asks the
+# node with `checktx estimate`, and signs again with the estimate as fee_limit.
+# This applies to every fee-bearing command (tx, rule, approval request,
+# retractable send). With no estimate the CLI stops and asks for --fee.
 tau-testnet tx send --key alice --to <recipient_pubkey> --amount 10
 tau-testnet tx send --key alice --transfer <pk1>:5 --transfer <pk2>:3 --fee 10
 
-# governance (sender must be an active validator; default fee 0)
+# governance (sender must be an active validator; fee-exempt, no --fee)
 tau-testnet gov propose --key alice --file consensus_update.json
 tau-testnet gov vote --key alice --update-id <update_id_hex>
 
@@ -317,13 +320,33 @@ python scripts/gen_genesis.py \
   --account <addr1>:1000000 --account <addr2>:500000 \
   --network-id tau-testnet-v2 \
   --base-fee 10 \
+  --faucet-amount 100000 \
   --genesis-rules-path genesis.tau \
   --genesis-consensus-path genesis_consensus.tau \
   --out data/genesis.json
 ```
 
+The command below builds `networks/tau-testnet-v2/genesis.json` again, byte for byte:
+
+```bash
+python scripts/gen_genesis.py \
+  --validator-key a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b \
+  --account 838d089401687e4ba5fe844f1241b2f6cf63cf73a7f8fb6aa0e45b3c6b85454f4e7ca19960b71d847655486495b64cb4:100000 \
+  --account 93da919aed3b83e517190b8362528b35cbd51beb754289c5d99db12a306ac7f4980fbb96108a9cb812a46aede0c5f9ca:100000 \
+  --account 8a39b9d9498535492290c52b44959b5a6e9177dc85ae6a1d97f54462f03c15a38052a85c7ace5cd81858e343a3b789d0:100000 \
+  --account b1337fcdf8d713a53518f0d6289c70bec2a09a7d6ec84548aac208988391cd66a9b627d03c07d922cd6ad15ebecf3ad7:100000 \
+  --account b3566dd294833030380d74b39fdb0bf214e9c64906b175f8822c3d4386602b1a9340231e553f9c299d6d8a82b9d441da:100000 \
+  --account af1d997703d7c0a86a5988762bb9ac2642890b5f0599f9821372684487d580a5f211ec160c038c073cda604c3c646487:100000 \
+  --account 9689f5f8ffe6b73bb549e4058e54a3fc6a96ef2e784c415adeffd83d9488c9b435f075b59a778308f86226074f8b09b0:100000 \
+  --account 916b92be0561ee21d042d033cabdf58d1c2f9ed110b2e173ab9cdd2a585442bec6232ffe0d97b779976a1dfd6a9d38fc:100000 \
+  --account b9e4b8fbe06a12f4702617f71ef031206426c4205ca0bc3436d2e0cb047fd18473ad125ceefc7ef18b851a19af2f370b:100000 \
+  --account 8df32da800ad4b0657e333774889e6b08f768ab055ffb964d5935bbc8460aa8f91fa60a6a042f64ec144c7ec18ae02a3:100000 \
+  --approval-slots --base-fee 10 --faucet-amount 100000 \
+  --out data/genesis.json
+```
+
 - Validator and account addresses are **96 lowercase hex chars** (48-byte BLS pubkeys, no `0x`). Private keys are 64 hex chars (32 bytes). Use `--validator-privkey` to derive the pubkey automatically.
-- **No auto-faucet** — unknown accounts have balance 0. Fund accounts at genesis with repeatable `--account ADDR:BALANCE`, or by transfer afterward.
+- **Faucet** — `--faucet-amount N` puts the faucet amount into the genesis. Each new account gets N one time, at the first applied transaction that touches it, as sender or as recipient. An account that spends down to 0 gets nothing more. The amount is fixed for the life of the network. No node setting and no vote changes it. The default 0 turns the faucet off. `tau-testnet-v2` uses 100000. A node ignores the old `TAU_AUTO_FAUCET` and `TAU_AUTO_FAUCET_AMOUNT` settings. You can also fund accounts at genesis with repeatable `--account ADDR:BALANCE`, or by transfer afterward.
 - Transfer amounts are `bv[24]` → capped at **16,777,215** per step; `--base-fee` likewise (0–16777215).
 - **Adding a validator after launch:** an existing validator proposes a `consensus_rule_update` with `host_contract_patch.validator_additions`; once it reaches the vote quorum (`supermajority` = ⌈2N/3⌉ by default, or `majority`) it activates. Removal works symmetrically.
 
@@ -652,13 +675,13 @@ The libp2p DHT layer exposes runtime knobs through `NetworkConfig`:
 Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSocket emits it raw):
 
 ```json
-{"status":"ok","command":"getbalance","data":{"address":"a63b...ea73","balance":"1000"}}
+{"status":"ok","command":"getbalance","data":{"address":"a63b...ea73","balance":"1000","faucet_pending":false}}
 {"status":"error","command":"sendtx","error":{"code":"INVALID_SEQUENCE","message":"Invalid sequence number: expected 5, got 4.","details":{"expected":5,"received":4}}}
 ```
 
 - `status` is `"ok"` or `"error"`; `command` echoes the request; `data` on success, `error.code`/`error.message`(+`details`) on failure.
 - Types: addresses/hashes/IDs and token amounts are **strings** (overflow-safe); counts/heights/sequence numbers are integers; timestamps are ISO 8601 strings.
-- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `DUPLICATE_UPDATE`, `UNSCOPED_USER_RULE`, `TEMPORAL_REFERENCE`, `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
+- Error codes: `INVALID_PARAMS`, `PARSE_ERROR`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_EXPIRED`, `TX_REJECTED`, `TX_INVALID`, `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `DUPLICATE_UPDATE`, `UNSCOPED_USER_RULE`, `TEMPORAL_REFERENCE`, `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `ESTIMATE_BUSY`, `APPROVAL_NOT_NEEDED`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MEMPOOL_EMPTY`, `MEMPOOL_FULL`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED`, `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `FORBIDDEN`, `COMM_TIMEOUT`, `TIMEOUT`, `UNKNOWN_COMMAND`, `RATE_LIMITED`, `INTERNAL_ERROR`.
 - `DUPLICATE_UPDATE` carries `details.update_id` and `details.lifecycle_state`, so a
   wallet retrying a `consensus_rule_update` can tell "already landed" from a real
   rejection. `ADMISSION_TIMEOUT` / `ADMISSION_UNAVAILABLE` mean the isolated rule
@@ -675,14 +698,19 @@ governance activation boundary. Tune the waits with `TAU_BLOCK_PRODUCTION_LOCK_T
 
 ### Pending-aware wallet queries
 
-`getbalance <address>` returns only the confirmed chain balance. For a wallet
-view that accounts for queued sends, use the additive commands (both read-only):
+`getbalance <address>` returns only the confirmed chain balance. `balance` is
+what the account can spend. For an account with no record on the chain yet, it
+includes the faucet grant of the genesis, and `faucet_pending` is `true`. The
+first transaction that touches the account writes the grant into the chain.
+For a wallet view that accounts for queued sends, use the additive commands
+(both read-only):
 
 - **`getaccountstate <address>`** — confirmed balance plus the mempool view:
 
   ```json
   {"status":"ok","command":"getaccountstate","data":{
-    "address":"a63b...ea73","chain_balance":"1000","pending_outgoing":"101",
+    "address":"a63b...ea73","chain_balance":"1000","faucet_pending":false,
+    "pending_outgoing":"101",
     "pending_incoming":"0","pending_fees":"2","available_balance":"897",
     "pending_txs":[{"hash":"…","direction":"outgoing","amount":"101","fee":"2",
                     "status":"queued","sequence_number":3,"tx_type":"user_tx",
@@ -711,10 +739,28 @@ poll `gettxstatus` immediately after queuing.
   accept this? Nothing enters the mempool, nothing is broadcast, nothing is
   charged. Rejections carry the identical `code`/`details` `sendtx` would have
   returned. Tau evaluation is **not** performed (`tau_evaluated: false`), so
-  there is no `estimated_fee` and no `o5` policy verdict — those steps mutate
-  interpreter and intern state, which a free unauthenticated RPC must not do.
+  there is no `estimated_fee` and no `o5` policy verdict. A success answer has
+  `admissible: null` and `fee_checked: false`, `checks_skipped` names
+  `tau_eval` and `fee_limit`, and `note` says that the fee check was skipped.
   Use it as the pre-flight before asking a user to sign; `gettxstatus` is the
   post-flight.
+- **`checktx estimate <json_payload>`** — the same dry-run with the Tau steps,
+  in an isolated admission context. It returns `estimated_fee` for every
+  fee-bearing type, whatever `fee_limit` the payload carries, and `admissible`
+  is true only when that `fee_limit` covers the estimate. The flags say what
+  really ran: `tau_evaluated` is true only when a Tau step ran, and
+  `fee_checked` only when the fee of a fee-bearing type was estimated. A
+  fee-exempt type (an approval vote, a retract, a governance vote) answers
+  `fee_checked: false`, names `fee_limit` in `checks_skipped`, and has a
+  `note` that starts with `fee_exempt`.
+  A rejection of either form adds `tau_evaluated`, `checks_skipped` and
+  `fee_checked` to the `details` of `sendtx`. Estimates run one at a
+  time: a second one gets `ESTIMATE_BUSY` at once. A sender whose balance
+  does not exceed its transfers gets `INSUFFICIENT_FUNDS` before the estimate
+  slot is taken. A node without isolated admission contexts answers
+  `ADMISSION_UNAVAILABLE`. The CLI signs a draft, asks for the estimate, and
+  signs again with it as `fee_limit`. On `ESTIMATE_BUSY` it asks again up to 3
+  times with a short wait.
 
 ## Block structure
 
@@ -748,7 +794,7 @@ CI builds tau-lang and runs the consensus suite against the real engine ([.githu
 - [ ] **Network id** — set a unique `TAU_NETWORK_ID` (the `tau-local` default is not rejected).
 - [ ] **Validator key** — supply your own `TAU_MINER_PRIVKEY(_PATH)` / `TAU_MINER_PUBKEY`; the shipped `data/test_miner.key` is **not** refused.
 - [ ] **RPC/WS bind** — keep `TAU_HOST=127.0.0.1` (default) or firewall it; `0.0.0.0` is accepted with no warning. In Docker, publish RPC/WS only on `127.0.0.1` (see quickstart).
-- [ ] **WS origins** — set `TAU_WS_ALLOWED_ORIGINS` explicitly. The check is **substring-based** and **always allows no-Origin clients and any `localhost`/`127.0.0.1` origin**.
+- [ ] **WS origins** — set `TAU_WS_ALLOWED_ORIGINS` explicitly. An entry with a scheme (`https://wallet.example.org`) must match the whole origin, and a bare entry (`wallet.example.org`) must match the host only (no port or path in the entry). The check **always allows no-Origin clients and the hosts `localhost`, `127.0.0.1` and `::1`**. `Origin: null` (a sandboxed frame or a `file:` page) is refused unless `TAU_WS_ALLOWED_ORIGINS` contains `null`. Set `TAU_WS_ALLOWED_ORIGINS` when the web wallet is served from a host that is not loopback.
 - [ ] **WSS** — set **both** `TAU_WS_CERT_PATH` and `TAU_WS_KEY_PATH`; a partial/invalid TLS config **silently downgrades to plaintext** WS.
 - [ ] **Governance** — keep `TAU_GOVERNANCE_OPEN_ADMISSION=false` (production only warns if it is on alongside bootstrap peers).
 - [ ] **Remote createblock** — leave `TAU_ALLOW_REMOTE_CREATEBLOCK=false`; the loopback gate is the only protection.

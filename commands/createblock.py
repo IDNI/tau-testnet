@@ -302,9 +302,10 @@ def _speculative_proposal(candidate_rules=()):
     import tau_proposal
     import tau_reconstruction
     try:
-        plan = tau_reconstruction.plan_representation(
-            history_rules=units, candidate_rules=list(candidate_rules),
-        )
+        with tau_manager.reexec_on_width_overflow():
+            plan = tau_reconstruction.plan_representation(
+                history_rules=units, candidate_rules=list(candidate_rules),
+            )
     except Exception as exc:
         logger.warning("createblock: could not plan a representation (%s); "
                        "simulating in-process", exc)
