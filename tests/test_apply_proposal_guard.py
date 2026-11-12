@@ -33,7 +33,7 @@ def _proposal(session):
         journal=tj.Journal(authoritative=False),
         allocator=alloc.Allocator(snapshot, width=plan.width, label="proposal"),
         plan=plan,
-        lifecycle=MagicMock(approval_slots_active=False),
+        lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
     )
 
 
@@ -135,7 +135,7 @@ def test_non_proposal_apply_installs_no_guard(temp_database):
             [_tx()], 1700000000,
             target_balances={SENDER: 1000},
             target_sequences={},
-            target_lifecycle=MagicMock(approval_slots_active=False),
+            target_lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
             proposer_pubkey=PROPOSER,
             block_height=1,
         )

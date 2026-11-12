@@ -199,7 +199,7 @@ tau-testnet --host localhost status      # node started via Docker (CLI installe
 
 > The Docker image ships only the node, not the `tau-testnet` CLI. To query a Docker node, install the client on the host with `pip install -e .` (no `tau-lang` build needed — the CLI is a thin RPC client), or just read the container's foreground logs.
 
-A rising `head_number` means you are syncing. If it stays at 0, the handshake was rejected — confirm `TAU_NETWORK_ID=tau-testnet-v2` and that `data/genesis.json` matches the committed profile (`block_0.hash` = `35faee3b…f1a7`). The node logs the exact reason for any mismatch.
+A rising `head_number` means you are syncing. If it stays at 0, the handshake was rejected — confirm `TAU_NETWORK_ID=tau-testnet-v2` and that `data/genesis.json` matches the committed profile (`block_0.hash` = `359fa1bd…0891`). The node logs the exact reason for any mismatch.
 
 ### Run as a validator
 
@@ -317,13 +317,33 @@ python scripts/gen_genesis.py \
   --account <addr1>:1000000 --account <addr2>:500000 \
   --network-id tau-testnet-v2 \
   --base-fee 10 \
+  --faucet-amount 100000 \
   --genesis-rules-path genesis.tau \
   --genesis-consensus-path genesis_consensus.tau \
   --out data/genesis.json
 ```
 
+The command below builds `networks/tau-testnet-v2/genesis.json` again, byte for byte:
+
+```bash
+python scripts/gen_genesis.py \
+  --validator-key a1fe40d5e4f155a1af7cb5804ec1ecba9ee3fb1f594e8a7b398b7ed69a6b0ccfd5bb6fd6d8ff965f8e1eb98d5abe7d2b \
+  --account 838d089401687e4ba5fe844f1241b2f6cf63cf73a7f8fb6aa0e45b3c6b85454f4e7ca19960b71d847655486495b64cb4:100000 \
+  --account 93da919aed3b83e517190b8362528b35cbd51beb754289c5d99db12a306ac7f4980fbb96108a9cb812a46aede0c5f9ca:100000 \
+  --account 8a39b9d9498535492290c52b44959b5a6e9177dc85ae6a1d97f54462f03c15a38052a85c7ace5cd81858e343a3b789d0:100000 \
+  --account b1337fcdf8d713a53518f0d6289c70bec2a09a7d6ec84548aac208988391cd66a9b627d03c07d922cd6ad15ebecf3ad7:100000 \
+  --account b3566dd294833030380d74b39fdb0bf214e9c64906b175f8822c3d4386602b1a9340231e553f9c299d6d8a82b9d441da:100000 \
+  --account af1d997703d7c0a86a5988762bb9ac2642890b5f0599f9821372684487d580a5f211ec160c038c073cda604c3c646487:100000 \
+  --account 9689f5f8ffe6b73bb549e4058e54a3fc6a96ef2e784c415adeffd83d9488c9b435f075b59a778308f86226074f8b09b0:100000 \
+  --account 916b92be0561ee21d042d033cabdf58d1c2f9ed110b2e173ab9cdd2a585442bec6232ffe0d97b779976a1dfd6a9d38fc:100000 \
+  --account b9e4b8fbe06a12f4702617f71ef031206426c4205ca0bc3436d2e0cb047fd18473ad125ceefc7ef18b851a19af2f370b:100000 \
+  --account 8df32da800ad4b0657e333774889e6b08f768ab055ffb964d5935bbc8460aa8f91fa60a6a042f64ec144c7ec18ae02a3:100000 \
+  --approval-slots --base-fee 10 --faucet-amount 100000 \
+  --out data/genesis.json
+```
+
 - Validator and account addresses are **96 lowercase hex chars** (48-byte BLS pubkeys, no `0x`). Private keys are 64 hex chars (32 bytes). Use `--validator-privkey` to derive the pubkey automatically.
-- **No auto-faucet** — unknown accounts have balance 0. Fund accounts at genesis with repeatable `--account ADDR:BALANCE`, or by transfer afterward.
+- **Faucet** — `--faucet-amount N` puts the faucet amount into the genesis. Each new account gets N one time, at the first applied transaction that touches it, as sender or as recipient. An account that spends down to 0 gets nothing more. The amount is fixed for the life of the network. No node setting and no vote changes it. The default 0 turns the faucet off. `tau-testnet-v2` uses 100000. A node ignores the old `TAU_AUTO_FAUCET` and `TAU_AUTO_FAUCET_AMOUNT` settings. You can also fund accounts at genesis with repeatable `--account ADDR:BALANCE`, or by transfer afterward.
 - Transfer amounts are `bv[24]` → capped at **16,777,215** per step; `--base-fee` likewise (0–16777215).
 - **Adding a validator after launch:** an existing validator proposes a `consensus_rule_update` with `host_contract_patch.validator_additions`; once it reaches the vote quorum (`supermajority` = ⌈2N/3⌉ by default, or `majority`) it activates. Removal works symmetrically.
 
@@ -652,7 +672,7 @@ The libp2p DHT layer exposes runtime knobs through `NetworkConfig`:
 Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSocket emits it raw):
 
 ```json
-{"status":"ok","command":"getbalance","data":{"address":"a63b...ea73","balance":"1000"}}
+{"status":"ok","command":"getbalance","data":{"address":"a63b...ea73","balance":"1000","faucet_pending":false}}
 {"status":"error","command":"sendtx","error":{"code":"INVALID_SEQUENCE","message":"Invalid sequence number: expected 5, got 4.","details":{"expected":5,"received":4}}}
 ```
 
@@ -675,14 +695,19 @@ governance activation boundary. Tune the waits with `TAU_BLOCK_PRODUCTION_LOCK_T
 
 ### Pending-aware wallet queries
 
-`getbalance <address>` returns only the confirmed chain balance. For a wallet
-view that accounts for queued sends, use the additive commands (both read-only):
+`getbalance <address>` returns only the confirmed chain balance. `balance` is
+what the account can spend. For an account with no record on the chain yet, it
+includes the faucet grant of the genesis, and `faucet_pending` is `true`. The
+first transaction that touches the account writes the grant into the chain.
+For a wallet view that accounts for queued sends, use the additive commands
+(both read-only):
 
 - **`getaccountstate <address>`** — confirmed balance plus the mempool view:
 
   ```json
   {"status":"ok","command":"getaccountstate","data":{
-    "address":"a63b...ea73","chain_balance":"1000","pending_outgoing":"101",
+    "address":"a63b...ea73","chain_balance":"1000","faucet_pending":false,
+    "pending_outgoing":"101",
     "pending_incoming":"0","pending_fees":"2","available_balance":"897",
     "pending_txs":[{"hash":"…","direction":"outgoing","amount":"101","fee":"2",
                     "status":"queued","sequence_number":3,"tx_type":"user_tx",

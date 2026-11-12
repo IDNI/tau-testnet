@@ -365,8 +365,6 @@ class ChainTestCase(unittest.TestCase):
         chain_state._genesis_accounts_state = {GENESIS_ADDRESS: GENESIS_BALANCE}
         chain_state._balances[GENESIS_ADDRESS] = GENESIS_BALANCE
 
-        self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
 
         self.verify_patch = patch(
             'consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
@@ -376,7 +374,6 @@ class ChainTestCase(unittest.TestCase):
         self.genesis_hash = db.get_genesis_hash()
 
     def tearDown(self):
-        config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
         self.wait_patch.stop()
         self.verify_patch.stop()
         config.set_database_path(self.original_db_path)

@@ -105,7 +105,7 @@ def _run(transactions, balances):
                 transactions, 1700000000,
                 target_balances=dict(balances),
                 target_sequences={},
-                target_lifecycle=MagicMock(approval_slots_active=False),
+                target_lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
                 proposer_pubkey=PROPOSER,
                 block_height=1,
                 proposal=ctx,
@@ -194,7 +194,7 @@ def test_proposal_mode_refuses_to_run_without_owned_state(temp_database):
                 [_tx("A", SENDER_A)], 1700000000,
                 target_balances=None,          # not owned
                 target_sequences={},
-                target_lifecycle=MagicMock(approval_slots_active=False),
+                target_lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
                 proposer_pubkey=PROPOSER, block_height=1,
                 proposal=ctx, session=ctx.session,
             )
@@ -213,7 +213,7 @@ def test_proposal_mode_does_not_commit_the_snapshot(temp_database):
             TauStateSnapshot(b"hash", b"rules", {}),
             [_tx("A", SENDER_A)], 1700000000,
             target_balances={SENDER_A: 1000}, target_sequences={},
-            target_lifecycle=MagicMock(approval_slots_active=False),
+            target_lifecycle=MagicMock(approval_slots_active=False, faucet_amount=0),
             proposer_pubkey=PROPOSER, block_height=1,
             proposal=ctx, session=ctx.session,
         )

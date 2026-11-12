@@ -54,6 +54,7 @@ class _LifecycleMock(MagicMock):
 def _lifecycle():
     mgr = _LifecycleMock()
     mgr.approval_slots_active = True
+    mgr.faucet_amount = 0
     mgr.rule_offers = _Offers()
     mgr.approval_requests = _Approvals()
     return mgr

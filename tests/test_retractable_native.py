@@ -82,7 +82,6 @@ subprocess.run(cmd, check=True, capture_output=True)
 
 import config
 config.set_database_path(os.path.join(WORK, "node.db"))
-config.TESTNET_AUTO_FAUCET = False
 config.MINER_PRIVKEY = format(KEYS["miner"]["sk"], "064x")
 config.MINER_PUBKEY = PK["miner"]
 config.MINER_PUBKEYS = [PK["miner"]]

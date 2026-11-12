@@ -25,10 +25,12 @@ python wallet.py history --privkey <private_key>
 
 ### Pending-aware account state and tx status
 
-`getbalance` returns only the confirmed chain balance. Two additive node
-commands give a wallet the mempool view:
+`getbalance` returns only the confirmed chain balance. `balance` is what the
+account can spend: for an account with no record on the chain yet, it includes
+the faucet grant of the genesis, and `faucet_pending` is `true`. Two additive
+node commands give a wallet the mempool view:
 
-- `getaccountstate <address>` — `chain_balance`, `pending_outgoing`,
+- `getaccountstate <address>` — `chain_balance`, `faucet_pending`, `pending_outgoing`,
   `pending_incoming`, `pending_fees`, `available_balance`, and a `pending_txs`
   list. `pending_outgoing` is the transfer total only; the sender's admission fee
   estimate is reported separately in `pending_fees`. `available_balance = max(0,
