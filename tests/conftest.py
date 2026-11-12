@@ -63,6 +63,60 @@ def test_environment(tmp_path_factory) -> Iterator[None]:
         os.environ["TAU_ENV"] = original_env
         config.reload_settings(env=original_env)
 
+
+def tau_manager_threads() -> List[threading.Thread]:
+    """Live threads that run `tau_manager.start_and_manage_tau_process`."""
+    return [
+        t for t in threading.enumerate()
+        if t.name.endswith("(start_and_manage_tau_process)")
+    ]
+
+
+def stop_tau_manager_thread(thread: threading.Thread, timeout: float = 30.0) -> bool:
+    """Stop and join one manager thread. Return True when it ended."""
+    import tau_manager
+
+    tau_manager.request_shutdown()
+    deadline = time.monotonic() + timeout
+    # The manager clears the stop flag when it starts, so set it until the thread ends.
+    while thread.is_alive() and time.monotonic() < deadline:
+        tau_manager.server_should_stop.set()
+        thread.join(0.1)
+    return not thread.is_alive()
+
+
+def _fail_on_new_tau_manager_threads(before: set, where: str) -> None:
+    leaked = [t for t in tau_manager_threads() if t not in before]
+    if not leaked:
+        return
+    stuck = [t.name for t in leaked if not stop_tau_manager_thread(t)]
+    pytest.fail(
+        f"{where} left Tau manager threads alive: {[t.name for t in leaked]}"
+        + (f"; these did not stop: {stuck}" if stuck else ""),
+        pytrace=False,
+    )
+
+
+@pytest.fixture(autouse=True)
+def no_leaked_tau_manager_thread(request) -> Iterator[None]:
+    """Fail a test that leaves a Tau manager thread alive.
+
+    A left-over manager reads the database that a later test closes, and
+    SQLite then crashes the whole process.
+    """
+    before = set(tau_manager_threads())
+    yield
+    _fail_on_new_tau_manager_threads(before, request.node.nodeid)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def no_leaked_tau_manager_thread_in_module(request) -> Iterator[None]:
+    """The same check for a manager that setUpClass or a module fixture starts."""
+    before = set(tau_manager_threads())
+    yield
+    _fail_on_new_tau_manager_threads(before, request.node.nodeid)
+
+
 @pytest.fixture(autouse=True)
 def reset_tau_stream_types() -> Iterator[None]:
     """Start every test from an engine that has typed no stream.
