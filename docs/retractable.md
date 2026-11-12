@@ -54,7 +54,9 @@ time that is already (almost) past, before signing anything.
 `send` prints the **retractable id** (`retractable id: <64 hex>`); with `--json`
 the line goes to stderr. Keep it: it is the handle for retracting and inspecting.
 The other transaction flags (`--fee`, `--expiry`, `--expire-in`,
-`--expire-at-height`) behave as for a normal transfer.
+`--expire-at-height`) behave as for a normal transfer. Without `--fee`, `send`
+takes the fee limit from the node's fee estimate (`checktx estimate`).
+`retract` has no `--fee`: a retract is fee-exempt.
 
 ### Deadline clamping
 
