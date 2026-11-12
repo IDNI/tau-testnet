@@ -748,7 +748,7 @@ CI builds tau-lang and runs the consensus suite against the real engine ([.githu
 - [ ] **Network id** — set a unique `TAU_NETWORK_ID` (the `tau-local` default is not rejected).
 - [ ] **Validator key** — supply your own `TAU_MINER_PRIVKEY(_PATH)` / `TAU_MINER_PUBKEY`; the shipped `data/test_miner.key` is **not** refused.
 - [ ] **RPC/WS bind** — keep `TAU_HOST=127.0.0.1` (default) or firewall it; `0.0.0.0` is accepted with no warning. In Docker, publish RPC/WS only on `127.0.0.1` (see quickstart).
-- [ ] **WS origins** — set `TAU_WS_ALLOWED_ORIGINS` explicitly. The check is **substring-based** and **always allows no-Origin clients and any `localhost`/`127.0.0.1` origin**.
+- [ ] **WS origins** — set `TAU_WS_ALLOWED_ORIGINS` explicitly. An entry with a scheme (`https://wallet.example.org`) must match the whole origin, and a bare entry (`wallet.example.org`) must match the host only (no port or path in the entry). The check **always allows no-Origin clients and the hosts `localhost`, `127.0.0.1` and `::1`**. `Origin: null` (a sandboxed frame or a `file:` page) is refused unless `TAU_WS_ALLOWED_ORIGINS` contains `null`. Set `TAU_WS_ALLOWED_ORIGINS` when the web wallet is served from a host that is not loopback.
 - [ ] **WSS** — set **both** `TAU_WS_CERT_PATH` and `TAU_WS_KEY_PATH`; a partial/invalid TLS config **silently downgrades to plaintext** WS.
 - [ ] **Governance** — keep `TAU_GOVERNANCE_OPEN_ADMISSION=false` (production only warns if it is on alongside bootstrap peers).
 - [ ] **Remote createblock** — leave `TAU_ALLOW_REMOTE_CREATEBLOCK=false`; the loopback gate is the only protection.

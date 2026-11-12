@@ -10,6 +10,7 @@ import trio
 import argparse
 import trio_websocket
 import subprocess
+import urllib.parse
 
 
 from app.container import ServiceContainer
@@ -426,6 +427,45 @@ def _await_network_listening(startup: _NetworkStartup, timeout: float = _NETWORK
 
 
 # --- WebSocket Server ---
+_WS_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_WS_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _ws_origin_key(value: str):
+    """(scheme, host, port) of an origin, or None when it does not parse."""
+    try:
+        parts = urllib.parse.urlsplit(value.strip())
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if not scheme or not parts.hostname:
+        return None
+    return scheme, parts.hostname, port or _WS_DEFAULT_PORTS.get(scheme)
+
+
+def _ws_origin_allowed(origin, allowed_entries) -> bool:
+    """An entry with a scheme must match the whole origin. A bare entry must match the host."""
+    if origin is None:
+        return True
+    if origin == "null":
+        return "null" in allowed_entries or "*" in allowed_entries
+    key = _ws_origin_key(origin)
+    if key is None:
+        return False
+    if key[1] in _WS_LOOPBACK_HOSTS:
+        return True
+    for entry in allowed_entries:
+        if entry == "*":
+            return True
+        if "://" in entry:
+            if _ws_origin_key(entry) == key:
+                return True
+        elif entry.lower() == key[1]:
+            return True
+    return False
+
+
 def _ws_peer_label(request, ws=None) -> str:
     remote = getattr(ws, "remote", None) if ws is not None else None
     if remote is None:
@@ -452,39 +492,26 @@ async def websocket_handler(request):
 
     client_label = _ws_peer_label(request)
     try:
-        ws = await request.accept()
-        client_label = _ws_peer_label(request, ws)
-
-        # Origin Check (Basic)
-        headers = dict(request.headers)
-        origin = headers.get("Origin") or headers.get("origin")
+        # trio-websocket gives the headers as (bytes, bytes) pairs with lower-case names.
+        origin = next(
+            (value.decode("latin-1") for name, value in request.headers if name.lower() == b"origin"),
+            None,
+        )
 
         # Parse allowed origins from environment (comma-separated, e.g. "https://domain1.com,https://domain2.com,*")
         allowed_env = os.environ.get("TAU_WS_ALLOWED_ORIGINS", "")
         allowed_domains = [d.strip() for d in allowed_env.split(",") if d.strip()]
 
-        # Allow missing origin (localhost tools) or localhost/file
-        allowed = False
-        if not origin or origin == "null":
-            allowed = True
-        elif "localhost" in origin or "127.0.0.1" in origin:
-            allowed = True
-        elif "*" in allowed_domains:
-            allowed = True
-        else:
-            for domain in allowed_domains:
-                if domain in origin:
-                    allowed = True
-                    break
-
-        if not allowed:
+        if not _ws_origin_allowed(origin, allowed_domains):
             logger.warning(
                 "Rejected WS connection from disallowed origin: %s. Use TAU_WS_ALLOWED_ORIGINS to allow it.",
                 origin,
             )
-            await ws.send_message("error disallowed_origin")
-            await ws.aclose()
+            await request.reject(403, body=b"error disallowed_origin")
             return
+
+        ws = await request.accept()
+        client_label = _ws_peer_label(request, ws)
 
         logger.info("WS Connection accepted: %s (Origin: %s)", client_label, origin)
 
