@@ -82,7 +82,7 @@ python wallet.py send --privkey <private_key> \
   --operation "13:custom_data" \
   --operation "100:more_data"
 ```
-*Note: Keys 2–12 are reserved (see Operation Types). Use keys 13 and above for custom application data.*
+*Note: Keys 2–12, 14 and 15 are always reserved, and further keys are reserved in some modes (see Operation Types). Use keys 26 and above for custom application data that a policy rule reads.*
 
 ### Complex Multi-Operation Transaction
 ```bash
@@ -90,7 +90,7 @@ python wallet.py send --privkey <private_key> \
   --rule "o12[t]=i1[t]" \
   --transfer "recipient_address:5" \
   --operation "13:custom_data" \
-  --operation "14:more_data"
+  --operation "26:more_data"
 ```
 
 ### Raw JSON Operations (Advanced)
@@ -139,53 +139,77 @@ An operation key `N` maps to Tau input stream `iN`. The wallet supports:
 | `i5` | block timestamp (consensus clock) |
 | `i6`–`i11` | consensus ABI (block height, ts, proposer, parent hash, proof, claims) |
 | `i12` | sender pubkey (`bv[384]`, set by the node) |
-| `i16` | seconds since the sender's previous transfer (`bv[64]`), for cooldown rules. Reserved **only while the network feeds it**; until then it is an ordinary custom stream. |
+| `i13` | proposer pubkey, reserved under the `tau_validator_set` eligibility mode |
+| `i14` / `i15` | consensus stake / eligibility-mode inputs |
+| `i16` | seconds since the sender's previous transfer (`bv[64]`). Reserved **only while the network feeds it**; until then it is an ordinary custom stream. While reserved, a policy clause may not read it. |
+| `i18`–`i25` | co-signature approval slots, reserved once the chain has activated approvals; only the node fills them |
 
-So user-controllable custom input streams start at **`i13`**. Attempting to set
-any reserved stream (`2`–`12`) as an operation key is rejected at admission (and
-at block apply), so a crafted `operations["12"]` cannot spoof the sender pubkey.
+So user-controllable custom input streams start at **`i13`**, and the streams
+above that are reserved as listed. Attempting to set a reserved stream as an
+operation key is rejected at admission (and at block apply), so a crafted
+`operations["12"]` cannot spoof the sender pubkey. Custom inputs read by an `o5`
+policy rule (see below) start at **`i26`**, above the approval slots.
 
 **Combining custom inputs with the transfer.** Custom streams are evaluated in
 the *same* Tau step as the transfer at both admission and apply, so a policy
 rule may gate a transfer on a custom input alongside the transfer fields. For
-example, a passphrase-confirmation gate on `o5` (block unless `i13` matches and a
+example, a passphrase-confirmation gate on `o5` (block unless `i26` matches and a
 non-zero amount is sent):
 
 ```
-always ( (i13[t] = { #x2A }:bv[16] && i1[t]:bv[24] != { #x000000 }:bv[24])
-         ? o5[t]:bv[24] = { #x000001 }:bv[24]
-         : o5[t]:bv[24] = { #x000000 }:bv[24] ).
+always ( (i26[t]:bv[24] = { #x00002a }:bv[24] && i1[t]:bv[24] != { #x000000 }:bv[24])
+         ? (o5[t]:bv[24] = { #x000001 }:bv[24])
+         : (o5[t]:bv[24] = { #x000000 }:bv[24]) ).
 ```
 
-Sending the transfer with `--operation "13:0x2A"` yields `o5=1` (allow); a wrong
-or absent `i13` yields `o5=0` and the transfer is rejected at `sendtx`, not just
+Sending the transfer with `--operation "26:0x2A"` yields `o5=1` (allow); a wrong
+or absent `i26` yields `o5=0` and the transfer is rejected at `sendtx`, not just
 at apply. The same holds for 2FA flags, escrow conditions, and multi-party
-approval keyed on i13+.
+approval keyed on i26+.
 
 ### User Policy Rules (`o5`)
 
-A rule written to operation `"0"` can emit the user-policy stream `o5`
-(`0` = block the transfer, `1`/absent = allow). **`o5` is consensus-enforced**:
-it is checked at mempool admission AND re-checked by every validator at block
-apply. A policy block on any transfer rejects the whole transaction (no partial
-execution); a malformed `o5` fails closed (treated as block).
+A rule written to operation `"0"` that writes the user-policy stream `o5`
+(`0` = block the transfer, `1`/absent = allow) is registered as **your own policy
+clause**. **`o5` is consensus-enforced**: it is checked at mempool admission AND
+re-checked by every validator at block apply. A policy block on any transfer
+rejects the whole transaction (no partial execution); a malformed `o5` fails
+closed (treated as block), and so does a registered clause the engine refuses to
+evaluate for the transfer's inputs.
 
-Rules scope on the sender (`i12` pubkey, or `i3`) and may read the recipient
-(`i4`), block time (`i5`), and amount (`i1`) — all real at both admission and
-apply. Rules must reference `[t]` only: `i1[t-1]` or `i1[0]` is refused with
-`TEMPORAL_REFERENCE`, because one unit that reads another step zeroes every
-output for the steps after each later revision, for all accounts. Examples
-expressible today:
+A clause is evaluated on its own, and only for transfers you send, so it carries
+**no sender guard** and must not reference `i12`. You hold one clause; submitting
+another replaces it. A transfer is blocked when the consensus rules or your
+clause yield `o5 = 0`. A policy rule cannot share a transaction with transfers
+(`RULE_WITH_TRANSFERS`): send the rule first, then the transfers.
 
-- **Recipient whitelist:** `always ( (i4[t] = {#x…}:bv[384]) ? o5[t]:bv[24] = { #x000001 }:bv[24] : o5[t]:bv[24] = { #x000000 }:bv[24] ).`
-- **Time-lock:** block transfers while `i5[t] < {unlock_ts}:bv[64]`.
+A clause may read the amount (`i1`), your balance (`i2`), sender and recipient
+(`i3`/`i4`), block time (`i5`), approval slots and custom inputs from `i26` up —
+all real at both admission and apply. It must:
+
+- be exactly one `always ( ... ).` unit;
+- write every stream mention as `xN[t]:bv[W]` with an explicit width (`o5` and
+  `i1` at `bv[24]`, `i5` at `bv[64]`, pubkey streams and approval slots at
+  `bv[384]`) and use one width per stream;
+- reference `[t]` only: `i1[t-1]` or `i1[0]` is refused with
+  `TEMPORAL_REFERENCE`, because one unit that reads another step zeroes every
+  output for the steps after each later revision, for all accounts;
+- read at least one input stream, and build and step in the engine: a constant
+  such as an unconditional block is refused. To block everything, test a
+  condition on an input, such as amount above zero;
+- stay within 32 comparisons and 32 levels of parentheses.
+
+Examples expressible today:
+
+- **Recipient whitelist:** `always ( (i4[t]:bv[384] = { #x<96-hex recipient pubkey> }:bv[384]) ? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24]) ).`
+- **Time-lock:** block transfers while `i5[t]:bv[64]` is below the unlock timestamp.
 - **Spending limit:** block when `i1[t]` exceeds a per-tier cap.
-- **Cooldown** (once the network enables `i16`): block when
-  `i16[t]:bv[64] < {900}:bv[64]` — at least 15 minutes between your sends. The
-  node computes the elapsed seconds, so the rule is one comparison and a
-  first-ever send always passes.
 
-Policy rules **may** read `i2` (balance): it is the sender's balance at the
+To remove your clause, submit the neutral clause
+`always ( (o5[t]:bv[24] = { #x000001 }:bv[24]) ).`. Changing or removing it fails
+your open approval requests.
+
+Policy clauses **may** read `i2` (balance): it is the sender's balance at the
 parent block, frozen for the whole block, so admission and apply agree. A
 min-balance floor is expressible:
 
@@ -194,13 +218,15 @@ min-balance floor is expressible:
 Note two transfers from the same sender in one block both see the same pre-block
 balance, so a floor does not compound within a block. **Fee** rules (`o8`) still
 may not read `i2`: admission estimates it against the current head, so the fee
-charged at inclusion could differ from the estimate quoted to the sender.
+charged at inclusion could differ from the estimate quoted to the sender. Fee
+rules, unlike clauses, accumulate in a shared specification and must reference
+`i12` or `i3` to scope themselves to you (`UNSCOPED_USER_RULE`).
 
 ## Sharing Rules With Another User
 
 Besides deploying a rule on your own transaction (operation `"0"`), you can
 **send a rule to someone else**, who reviews it and either accepts it into their
-own specification or rejects it.
+own policy clause or rejects it.
 
 ```bash
 # Alice offers Bob a policy rule (expires 1000 blocks from the current tip)
@@ -224,12 +250,16 @@ tau-testnet rule reject --key bob <offer_id>
 An offered rule must be exactly one `always ( ... ).` unit that writes exactly
 one permitted output stream — `o5` (user policy) today. It must not:
 
-- reference `i12` — the node supplies your sender guard when it composes the
-  rule, and a rule that guards itself does not actually isolate you (see below);
+- reference `i12` — the clause is evaluated only for you, so it needs no sender
+  guard;
 - write consensus-owned streams (`o0`–`o4`, `o6`–`o9`);
-- read `i2` (balance), which is mocked at apply time;
 - reference reserved input streams (`i13`–`i15`);
+- reference any step but `[t]`;
 - nest `always` / `sometimes`, or pack more than one unit.
+
+It must satisfy the clause rules in [User Policy Rules](#user-policy-rules-o5):
+explicit stream widths, at least one input read, and the comparison and nesting
+limits.
 
 Size and rate bounds are fixed by consensus, not configuration: 8 KiB per rule,
 32 pending offers per recipient, 16 per offerer, and a 100 000-block maximum
@@ -237,35 +267,28 @@ offer window.
 
 ### How acceptance actually works
 
-Accepted rules do not simply get appended. The node keeps a registry of
-`(acceptor, target stream) -> clause` and re-emits **one composite rule per
-stream**, with each acceptor's clause behind a guard on their own public key and
-a neutral value (for `o5`: allow) for everyone else.
-
-This is not a stylistic choice. On the real engine an output stream that no
-clause constrains for a given sender still materializes with an arbitrary value
-— observed as `0`, which for `o5` means **block**. So a rule of the form
-`always ( (i12 = you) -> (o5 = 1) ).` would grant you your policy and block
-every *other* user's transfers. And two independently guarded rules on one
-stream do not compose: conjoined they are unsatisfiable, and applied one after
-another the later silently supersedes the earlier. The composite is the only
-shape that keeps each acceptor's policy in force without affecting anyone else.
+The node keeps a registry of `(account, target stream) -> clause`. Accepting an
+offer registers the offered rule as **your** clause for that stream, exactly as if
+you had submitted it yourself, and nobody else's transfers are affected: a clause
+is evaluated only for its owner's transfers.
 
 Practical consequences:
 
-- **Accepting replaces your own clause** on that stream. There is no separate
-  retraction; to change an accepted rule, accept a different offer.
+- **Accepting replaces your own clause** on that stream. To change it, accept a
+  different offer or submit your own rule; to remove it, submit the neutral
+  clause.
 - An accept transaction repeats the offered `rule_text` **verbatim**. The node
   recomputes the offer id from it, so reformatting the text invalidates the
   accept. The CLI fetches the text from the node rather than retyping it.
+- An accepted clause must build and step in the engine; one that does not is
+  refused.
 - Offers and accepts are fee-bearing.
 
 ### Reading the conflict report
 
 `tau-testnet rule check <offer_id>` reports per layer: `shape`,
 `reserved_domains`, `registry_collision` (do you already have a clause on this
-stream, and who else does), `bv_widths`, and `compile` (does the *composed* rule
-parse and step).
+stream, and who else does), `bv_widths`, and `compile` (does the clause build).
 
 The report is **advisory and node-local** — it never gates a transaction. And
 satisfiability is **not** checked: tau-lang exposes `sat`/`unsat`/`valid` in C++
@@ -294,11 +317,12 @@ python wallet.py send \
   --rule "o12[t]=i1[t]" \
   --transfer "recipient1:5" \
   --operation "13:custom_asset_data" \
-  --operation "14:extra_input"
+  --operation "26:extra_input"
 ```
 
-This creates a transaction with operations 0, 1, 13, and 14. Custom inputs must
-use keys ≥ 13 (keys 2–12 are reserved; see Operation Types). Governance
+This creates a transaction with operations 0, 1, 13, and 26. Custom inputs must
+not use a reserved key (keys 2–12, 14 and 15, and others in some modes; see
+Operation Types). Governance
 (rule proposals/votes) is a separate transaction type restricted to active
 validators on the public testnet — it is not expressed via operation keys.
 

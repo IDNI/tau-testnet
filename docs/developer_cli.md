@@ -65,7 +65,7 @@ Error codes emitted by the node, by origin:
 | Argument / payload parsing (every command) | `INVALID_PARAMS`, `PARSE_ERROR` |
 | `sendtx` / `checktx` structural | `TX_INVALID`, `TX_EXPIRED`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `BLS_UNAVAILABLE`, `TX_REJECTED` |
 | `sendtx` fees & capacity | `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `MEMPOOL_FULL` |
-| Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `CLAUSE_REGISTRY_FULL`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED` |
+| Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED` |
 | `createblock` | `MEMPOOL_EMPTY`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED` |
 | Governance / rule / approval reads | `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `REQUEST_UNKNOWN`, `FEATURE_INACTIVE`, `TAU_UNAVAILABLE`, `TAU_ERROR` |
 
@@ -369,6 +369,11 @@ tau-testnet tx raw-sign --privkey 0xabc... --payload tx.json > signed_tx.json
 tau-testnet tx raw-submit --file signed_tx.json
 ```
 
+A rule that writes `o5` is registered as the sender's own policy clause, so it
+carries no `i12` guard and cannot share a transaction with transfers
+(`RULE_WITH_TRANSFERS`); send it on its own. Fee rules that write `o8` must
+reference `i12` or `i3` (`UNSCOPED_USER_RULE`).
+
 `tx send` exits `1` when the node returns a `{"status":"error",...}`
 envelope (any `error.code`, e.g. `INVALID_SIGNATURE`, `INVALID_SEQUENCE`,
 `TX_REJECTED`), `4` for bad amounts/empty operations/missing inputs, `3` on
@@ -377,14 +382,14 @@ connection/timeout errors.
 ## Rule sharing
 
 Send a Tau rule to another user; they check its conflict status and then accept
-it into their own specification or reject it.
+it as their own policy clause or reject it.
 
 ```bash
 # Offer a rule. --expire-in N gives it N blocks to land, counted from the next
 # block (expire_at_height = tip + 1 + N);
 # --expire-at-height sets an absolute height instead.
 tau-testnet rule offer --key alice --to <bob_pubkey> --rule-file policy.tau
-tau-testnet rule offer --key alice --to <bob_pubkey> --rule 'always ( o5[t]:bv[24] = { #x000000 }:bv[24] ).' \
+tau-testnet rule offer --key alice --to <bob_pubkey> --rule 'always ( (i1[t]:bv[24] > { #x002710 }:bv[24]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).' \
     --expire-at-height 5000
 
 # Inspect. `list` defaults to the --key owner's address; --role filters direction.
@@ -414,11 +419,13 @@ Underlying RPCs: `getruleoffers <address> [in|out|all]`, `getruleoffer <offer_id
 `getruleconflict <offer_id>`, `getofferid '<json>'`.
 
 The conflict report is **advisory and node-local** and never gates a
-transaction. It does not check satisfiability — tau-lang exposes
+transaction. Its layers are `shape`, `reserved_domains`, `registry_collision`,
+`bv_widths`, `compile` (whether the clause builds) and `unrealizable`. It does
+not check satisfiability — tau-lang exposes
 `sat`/`unsat`/`valid`/`unrealizable` in C++ but not through its Python
 bindings — so a clean result means no conflict was *observed*. See the
-[Rule sharing](../README.md#rule-sharing) section for the composite-rule model
-and why an accepted rule is composed rather than appended.
+[Rule sharing](../README.md#rule-sharing) section for the per-account clause
+registry and the screens a clause must pass.
 
 ## Retractable transfers
 

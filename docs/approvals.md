@@ -16,10 +16,10 @@ Protocol details and the raw command grammar: [developer_cli.md](developer_cli.m
 
 ## What the sender writes
 
-The policy is an ordinary user rule routed into the clause registry, so it is
-automatically scoped to its author. The body carries **no `i12` guard** — the
-node supplies the sender guard when composing the per-stream composite, and a
-body referencing `i12` is rejected.
+The policy is an ordinary user rule that writes `o5`. The node registers it as
+the sender's own policy clause in a per-account clause registry, and a clause is
+evaluated only for transfers sent by its author. The body therefore carries **no
+`i12` guard**, and a body referencing `i12` is rejected.
 
 ```tau
 always ( ( (i1[t]:bv[24] > { #x0186a0 }:bv[24] && !(i20[t]:bv[384] = { #x<PARTNER> }:bv[384]))
@@ -47,23 +47,23 @@ Notes that matter in practice:
   Tau syntax and leaves the rule unparseable as a single `always` unit.
 - **The rule must be exactly one `always ( … ).` unit.** `clause_body_v1`
   rejects anything else, including two units smuggled in via unbalanced
-  parentheses.
+  parentheses. See [What registration requires](#what-registration-requires)
+  for the other screens.
 - **Unfilled slots read `0`**, which never equals an approver pubkey, so a rule
   blocks until a real vote lands.
 
 ### Removing a policy
 
 Submitting a clause whose canonical body is exactly the neutral expression
-**removes** the author's clause rather than registering one, freeing an author
-slot:
+**removes** the author's clause rather than registering one:
 
 ```tau
 always ( (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
 ```
 
-This is sound because "always allow" and "no clause" are semantically identical,
-and it is the registry's release valve — without it the first `MAX_TIER_AUTHORS`
-accounts would occupy every slot permanently.
+This is sound because "always allow" and "no clause" are semantically identical.
+Revoking when no clause is registered is refused at block apply with the receipt
+reason `rule_not_applied`.
 
 **Replacing or removing a policy resolves all of that sender's open requests as
 `failed`, atomically, in the same block, before the replacement takes effect.**
@@ -80,7 +80,8 @@ tau-testnet tx send --key alice --to <pubkey> --amount 500
 
 Above a threshold the sender's own policy rejects an ordinary transfer at
 admission. There is no dedicated error code for this — it surfaces as
-`TX_REJECTED` with `Transaction rejected by user policy (o5) for transfer #N`.
+`TX_REJECTED` with `Transaction rejected: the sender's own policy clause blocked
+transfer #N`.
 Submit it as an approval request instead:
 
 ```bash
@@ -218,7 +219,7 @@ The scanner needs confirmed chain history, which no RPC serves today
 |---|---|---|
 | `i1` | `bv[24]` | transfer amount |
 | `i3` / `i4` | `bv[384]` | sender / recipient pubkey |
-| `i12` | `bv[384]` | sender pubkey — supplied by the composer, never by a clause body |
+| `i12` | `bv[384]` | sender pubkey — set by the node; a clause body must not reference it |
 | `i18`–`i25` | `bv[384]` | approval slots: node-written, clause-readable, `0` = no vote |
 | `i26`+ | — | sender custom inputs |
 | `o5` | `bv[24]` | user policy: `0` blocks, `1` or absent allows |
@@ -237,18 +238,59 @@ differ:
 | consensus revisions | forbidden, permanently |
 
 **Slot width is pinned at `bv[384]` by a strict reject-unless-annotated screen.**
-Per-stream bitvector typing is process-global and sticky: if one rule types
-`i18` as `bv[384]` and another as `bv[24]`, `get_interpreter` fails for
-everyone until the process restarts. An unannotated slot mention is therefore
-rejected outright, admission compiles offered rule text in an isolated
-subprocess before it can reach the live interpreter, and the engine fails closed
-if one ever got through.
+Per-stream bitvector typing is process-global and sticky, so an inferred width
+could make a clause's build depend on what else the process has built. An
+unannotated slot mention is therefore rejected outright, and every mention must
+carry the same explicit width. Clauses are built in separate policy worker
+processes, never in the interpreter that holds the consensus rules.
+
+## What registration requires
+
+The same screens run at admission and at block apply, for a clause submitted as
+the sender's own `o5` rule and for an offered or accepted one. A body must:
+
+- be exactly one `always ( … ).` unit with balanced parentheses and no nested
+  temporal operator, and not reference `i12`;
+- reference the current step `[t]` only (`TEMPORAL_REFERENCE` otherwise);
+- write every stream mention as `xN[t]:bv[W]` with an explicit width and use one
+  width per stream within the body; `o5` is `bv[24]` (`WIDTH_MISMATCH`
+  otherwise) and the approval slots are `bv[384]`;
+- write `o5` and no other output stream, and no consensus-owned stream;
+- not reference the reserved input streams `i13`–`i15`;
+- stay within `MAX_CLAUSE_COMPARISONS` comparisons, `MAX_CLAUSE_DEPTH` levels of
+  parentheses and `MAX_OFFER_RULE_BYTES` bytes.
+
+A clause may read `i1` (amount), `i2` (sender balance at the parent block),
+`i3`/`i4` (sender and recipient pubkeys), `i5` (block timestamp), the approval
+slots and custom inputs. Custom inputs for a clause start at `i26`.
+
+Registration also requires that the engine can build the clause and step it
+once. A clause that does not build, or that reads no input stream (a constant
+such as an unconditional block), is refused: `TX_REJECTED` at admission, and a
+hard reject with the receipt reason `rule_not_applied` at block apply. To block
+everything, write a condition on an input, such as amount above zero:
+
+```tau
+always ( (i1[t]:bv[24] > { #x000000 }:bv[24])
+    ? (o5[t]:bv[24] = { #x000000 }:bv[24])
+    : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
+```
+
+A registered clause judges a transfer together with the consensus rules: the
+transfer is blocked when the main interpreter yields `o5 = 0` or the sender's
+clause yields `o5 = 0` on the same inputs. An account with no clause adds
+nothing. The check runs at admission, at block apply (ordinary and parked
+transfers alike) and in the approval preview. If the engine refuses to evaluate
+a registered clause for particular inputs, for example a value that does not fit
+the width the clause declared for that stream, the transfer is blocked.
 
 ## Limits
 
 | Constant | Value | Notes |
 |---|---|---|
-| `MAX_TIER_AUTHORS` | `2` | Policy authors on `o5`, **network-wide**, counting clauses from both doors (self-service rules and accepted offers) once approval slots are active. A measured ceiling, not a quota — see below. |
+| `MAX_CLAUSE_COMPARISONS` | `32` | Comparison operators in one clause body. |
+| `MAX_CLAUSE_DEPTH` | `32` | Levels of parentheses in one clause body. |
+| `MAX_OFFER_RULE_BYTES` | `8192` | Size of a clause's rule text. |
 | `MAX_APPROVERS_PER_REQUEST` | `8` | Tiers use three; the rest are spare. |
 | `MAX_PENDING_REQUESTS_PER_SENDER` | `8` | |
 | `MAX_APPROVAL_WINDOW_BLOCKS` | `10_000` | CLI `--expire-in` defaults to `1000`. |
@@ -257,31 +299,29 @@ if one ever got through.
 | `MAX_VOTE_REASON_BYTES` | `256` | Signed and merkle-covered, but excluded from the approval-state root. |
 | `MAX_PREVIEW_SLOTS` | `6` | Above this, `getapprovalpreview` returns `unavailable`. |
 
-`MAX_TIER_AUTHORS = 2` is the load-bearing limit.
-Rebuilding the shared o5 composite grows dearer with every policy author and
-every policy change, and must stay inside the 60s `COMM_TIMEOUT`, past which the
-watchdog SIGKILLs. Raising the cap needs a fresh measurement.
+Nothing limits how many accounts hold a clause. The per-block rule budget
+(`max_rule_txs_per_block`) counts every rule-offer transaction and every user
+transaction carrying an `o5` rule.
 
-Width is not a lever **at apply**, where `tau_shrink` interns pubkey literals to
-`bv[8]`. It very much is a lever **at admission**, which does not shrink at all
-(`tau_compile_worker` calls `tau_native` directly): there the raw `bv[384]` slot
-comparisons cost about 3.7x their `bv[8]` equivalents. Measured against the 8s
-`admission_budget`, one author reading N approval slots: 1 slot 0.9s, 2 slots
-3.0s, 3 slots 6.4s, 4 slots over budget. **Three slots per clause is the
-admissible ceiling on x86-class hardware**, well below the eight slots `i18..i25`
-reserves, and the margin does not survive a slower host.
+### Cost
+
+Measured on the reference engine build, so approximate. A transfer from an
+account that has a clause costs one clause evaluation: about 3 ms for a small
+clause and about 10 ms at the 32-comparison limit. Building a clause on first use
+takes about 0.07 s at 8 comparisons and about 0.4 s at 32. None of these depends
+on how many accounts hold clauses.
 
 ## Error codes
 
 | Code | Cause |
 |---|---|
 | `FEATURE_INACTIVE` | The chain does not have approval slots activated. |
-| `CLAUSE_SHAPE` | The clause body references `i12`, writes more than one output stream, nests a temporal operator, or is not one `always` unit. |
+| `CLAUSE_SHAPE` | The rule is not exactly one `always ( … ).` unit, nests a temporal operator, or its body references `i12`. |
+| `WIDTH_MISMATCH` | `o5` (or an `o8` rule's `o8`) is untyped or typed at a width other than `bv[24]`. Other width violations in a clause are reported as `TX_REJECTED`. |
 | `TEMPORAL_REFERENCE` | The rule or clause body reads a step other than the current one (`i1[t-1]`, `i1[0]`). User rules reference `[t]` only. |
-| `UNSCOPED_USER_RULE` | An unguarded `o5` rule on a chain without activation, where the guarded form is still expected. |
+| `UNSCOPED_USER_RULE` | An `o8` fee rule that references neither `i12` nor `i3`. It does not apply to `o5` rules. |
 | `MIXED_OUTPUT_RULE` | The rule writes `o5` and something else. |
 | `RULE_WITH_TRANSFERS` | A routed `o5` rule shares a `user_tx` with transfers. Admission would judge those transfers against the policy being replaced. |
-| `CLAUSE_REGISTRY_FULL` | `MAX_TIER_AUTHORS` author slots are taken, counting clauses from both doors (self-service rules and accepted offers) once approval slots are active. Refused for a new author's rule, an offer to a recipient who holds no clause, and an accept by a new acceptor. An existing author frees one with the neutral clause. |
 | `TOO_MANY_REQUESTS` | `MAX_PENDING_REQUESTS_PER_SENDER` reached. |
 | `DUPLICATE_REQUEST` | A request with this id already exists. |
 | `NOT_AN_APPROVER` | The voter is not one of the request's declared approvers. |
@@ -307,8 +347,8 @@ simulation, rollback and reorg.
 Before activation the feature is invisible: both transaction types are rejected
 at admission and are no-ops at apply, the four state-reading RPCs return
 `FEATURE_INACTIVE` (`getrequestid` is exempt — it is a pure function of the
-request's content and reads no chain state), slots are neither reserved nor
-fed, and `o5` rules are appended exactly as before. State is byte-identical to a node without the feature.
+request's content and reads no chain state), and slots are neither reserved nor
+fed. `o5` rules register as clauses whether or not the feature is active.
 
 **A fresh genesis is the recommended path** — `scripts/gen_genesis.py` emits the
 flag and the slot reservation from block 0. Upgrading a live chain uses a
@@ -320,13 +360,12 @@ activation height the audit re-runs; failure records a hash-bound
 `activation_failed` outcome and leaves the field `False`. Every node computes the
 same outcome, the block stays valid, and the chain continues unactivated.
 
-The audit covers the **complete restore plan** from
-`chain_state.get_tau_restore_plan()` — consensus rules, genesis and builtin
-rules, application rules, stored clause bodies, and derived composites — because
-a stream-typing collision anywhere in the effective spec poisons the whole
-process. Legacy raw `o5` writers block activation rather than being
-grandfathered: the first derived composite would become a second total-form unit
-on `o5` beside them, which either fails to conjoin or silently supersedes.
+The audit covers the **complete effective spec** — consensus rules, builtin
+rules, application rules and stored clause bodies — because a stream-typing
+collision anywhere in it poisons the whole process. An `o5` rule in the
+accumulated application rules blocks activation: it would keep writing `o5` on
+the main interpreter beside the registered clauses, so a sender could be blocked
+by a rule the registry does not show.
 
 ## Signature verification
 
@@ -358,15 +397,16 @@ reaches that verdict from the block bytes alone.
 - **Weighted or threshold-of-N voting** ("any two of three") as a shipped
   template. The form itself works — a within-step disjunction of conjunctions
   over the slots expresses it, and does not need cross-step accumulation — but
-  it costs `C(M,N)` terms, so the admission compile bound and the 8192-byte
+  it costs `C(M,N)` terms, so the 32-comparison clause limit and the 8192-byte
   `TAU_MAX_USER_TX_BYTES` gossip cap put the practical ceiling near `M<=5` at
   `N=3`. Nothing ships to help you write one.
 - **Approvers attaching data**, beyond the decline reason.
 - **Real Google Identity / OAuth.** The bot is Google-Authenticator-compatible
   TOTP, which is the actual mechanism; no Google API is contacted.
 - **A confirmed-history RPC** for the scanner, which self-indexes instead.
-- **Migrating legacy raw `o5` writers.** The audit reports them and blocks
-  activation; clearing them is an operator action.
+- **Migrating raw `o5` rules.** The audit reports an `o5` rule in the
+  accumulated application rules and blocks activation; clearing it is an
+  operator action.
 
 Nothing here protects a stolen key: an attacker holding it can replace the policy
 and then send freely. This raises the bar on a single mistaken or coerced

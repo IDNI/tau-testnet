@@ -383,6 +383,8 @@ Real Tau evaluation is **enabled by default**. Setting `TAU_FORCE_TEST=1` bypass
 
 When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker), the node holds a single `tau::interpreter` instance and reads state updates from its output streams. The interpreter is process-global and Tau calls are serialized; a watchdog (`TAU_COMM_TIMEOUT`) kills a stalled in-process evaluation, while block evaluation runs in worker processes bounded per request by `TAU_MINING_BUDGET` and `TAU_VALIDATION_CEILING`. A native segfault inside a block-evaluation worker is contained: the worker is lost and the attempt is operational, never a verdict on a transaction or a block. The in-process interpreter, which holds the consensus rules and answers the header and eligibility fallbacks, can still take the node process down (see [Security & risk model](#security--risk-model)).
 
+Per-account `o5` policy clauses are evaluated in separate policy worker processes, one pool for block apply and one for admission. A worker is replaced after 500 builds or 20 000 steps, or once its memory passes 1 GiB, and a worker lost during a call is replaced and the call retried once.
+
 ---
 
 ## Consensus boundary
@@ -393,9 +395,10 @@ When native bindings are active (`TAU_USE_DIRECT_BINDINGS=1`, default in Docker)
 - `o6` — block validity. The genesis rule is `o6 = i10` — "valid iff the host's cryptographic proof check passed" (see below).
 - `o7` — proposer eligibility.
 - `o9` — consensus base fee (strict); `o8` — optional user fee (lenient).
-- `o5` — user policy on a transfer (`0` = block, `1`/absent = allow). User-deployed, sender-scoped rules; **consensus-enforced** at both admission and block apply. A block on any transfer rejects the whole `user_tx`. Lets users express recipient whitelists (`i4`), time-locks (`i5`), and spending limits (`i1`). See [WALLET_USAGE.md](WALLET_USAGE.md).
+- `o5` — user policy on a transfer (`0` = block, `1`/absent = allow). A user's `o5` rule is registered as that account's own policy clause and judges only that account's transfers; **consensus-enforced** at both admission and block apply. A block on any transfer rejects the whole `user_tx`. Lets users express recipient whitelists (`i4`), time-locks (`i5`), and spending limits (`i1`). See [WALLET_USAGE.md](WALLET_USAGE.md).
   Tiered co-signature approvals build on `o5`: a sender requires an approver's signature above an amount threshold, and the transfer parks on-chain until the rule is satisfied. See [docs/approvals.md](docs/approvals.md).
-  **Sender scope is enforced at admission and at block apply** (`UNSCOPED_USER_RULE`): `o5`/`o8` are shared streams composed across every deployed rule, so rule text writing them must reference `i12` (sender pubkey) or `i3` (from address). Without that, one `always (o5[t] = 0)` deploy would block every account on the network. The screen is textual — a reference is not proof the rule is genuinely gated by it.
+  **An `o5` rule is a per-account clause.** A user rule (`operations["0"]`) that writes `o5` is registered as the sender's clause in a per-account registry, replacing the one already registered, and never joins the shared specification. A clause carries no `i12` guard (a reference to `i12` is refused, `CLAUSE_SHAPE`): it is evaluated on its own, only for transfers sent by its owner. See [Rule sharing](#rule-sharing).
+  **Fee rules (`o8`) are scoped to the sender** (`UNSCOPED_USER_RULE`, enforced at admission and at block apply): `o8` rules accumulate in one shared specification, so rule text writing `o8` must reference `i12` (sender pubkey) or `i3` (from address). Without that, one unconditional `o8` rule would levy its fee on every account on the network. The screen is textual — a reference is not proof the rule is genuinely gated by it.
   **User rules reference `[t]` only** (`TEMPORAL_REFERENCE`): `i1[t-1]` or `i1[0]` is refused at admission and again at block apply, on every stream and for rules offered, accepted or routed as clauses. One unit that reads another step gives the whole evaluator a lookback, and every output is then 0 for the steps after each later revision or rebuild, for every account.
 
 **Python host enforces _before_ Tau** (the inputs Tau trusts):
@@ -477,11 +480,11 @@ state_hash = BLAKE3(
 Fees are sourced from the Tau consensus rules and votable by validators — no separate fee machinery.
 
 - **Consensus fee (`o9`, strict).** Active consensus rules emit the base fee on stream `o9` (genesis default `always (o9[t]:bv[24] = { #x00000a }:bv[24]).` → 10/step). Change it via a `consensus_rule_update` carrying the full new consensus spec, voted to its activation height. Absent `o9` → fee model inactive (0). A present-but-invalid `o9` is a consensus failure: proposers abort the round and validators defer the block rather than guess.
-- **User custom fee (`o8`, lenient).** User application rules may add a per-transfer fee on `o8`. Absent → 0 silently; invalid → 0 with a node-side warning. **Must be sender-scoped** (reference `i12` or `i3`), enforced at admission as `UNSCOPED_USER_RULE`: `o8` is composed across all deployed rules, so a flat unconditional `always (o8[t] = 3).` would levy a fee on every user_tx on the network, not just the author's.
+- **User custom fee (`o8`, lenient).** User application rules may add a per-transfer fee on `o8`. Absent → 0 silently; invalid → 0 with a node-side warning. **Must be sender-scoped** (reference `i12` or `i3`), enforced at admission as `UNSCOPED_USER_RULE`: `o8` rules accumulate in one shared specification, so a flat unconditional `always (o8[t] = 3).` would levy a fee on every user_tx on the network, not just the author's.
 - **Total:** `total_fee = Σ over the tx's Tau steps of (o9 + o8)` — one step per transfer; a transfer-less `user_tx` is charged one fee-query step. Multi-transfer txs pay N× by design.
 - **`fee_limit` is a cap.** Rejected (at admission and in-block) if `total_fee > fee_limit`; the sender pays `total_fee`, not the cap. Every tx carries a valid `fee_limit`; **only `user_tx` is charged** (validators never need funds to govern).
 - **Credited to** `block.header.proposer_pubkey`, or to a governance-set `fee_beneficiary` when one is active — a `host_contract_patch` carrying `"fee_beneficiary": "<96-hex>"` routes the levy to a fixed account (e.g. a treasury); `"proposer"` reverts to the default. Pinnable at genesis with `--fee-beneficiary`, readable from `getgovernance`. A patch activating at height H governs H+1 onward, because height transitions run after transactions execute. **Charge-on-inclusion:** a fee-rejected tx pays nothing (no writes, no nonce bump). Sender must cover `Σ transfers + total_fee`.
-- **Determinism note:** during block application the node feeds real values on `i1` (amount), `i3`/`i4` (from/to pubkeys `bv[384]`), `i5` (block timestamp), `i12` (sender pubkey) and the tx's custom inputs. **`i2` (balance) is the sender's balance at the parent block**, frozen for the whole block, so proposer and verifier agree and a balance-reading **policy** (`o5`) rule is deterministic — a min-balance floor is expressible (issue #20). Two transfers from one sender in a block see the same pre-block balance, so a floor does not compound within it. Admission evaluates `i2` against the current head, which is advisory in the same sense as `i5`; that drift only matters for fees, so rule text reading `i2` is rejected when it also writes `o8`, and consensus `o9` revisions reading `i2` stay rejected. `i3`/`i4`/`i5` are immutable-per-transfer / consensus-injected, hence identical at admission and apply, and may be read freely. Scope on `i12`/`i3`/`i4`, gate on `i5`, tier on `i1`. Admission error `FEE_LIMIT_TOO_LOW` returns the computed `required_fee`.
+- **Determinism note:** during block application the node feeds real values on `i1` (amount), `i3`/`i4` (from/to pubkeys `bv[384]`), `i5` (block timestamp), `i12` (sender pubkey) and the tx's custom inputs. **`i2` (balance) is the sender's balance at the parent block**, frozen for the whole block, so proposer and verifier agree and a balance-reading **policy** (`o5`) rule is deterministic — a min-balance floor is expressible (issue #20). Two transfers from one sender in a block see the same pre-block balance, so a floor does not compound within it. Admission evaluates `i2` against the current head, which is advisory in the same sense as `i5`; that drift only matters for fees, so rule text reading `i2` is rejected when it also writes `o8`, and consensus `o9` revisions reading `i2` stay rejected. `i3`/`i4`/`i5` are immutable-per-transfer / consensus-injected, hence identical at admission and apply, and may be read freely. A fee rule scopes on `i12`/`i3`; a policy clause needs no scope, so it gates on `i4`/`i5` and tiers on `i1`. Admission error `FEE_LIMIT_TOO_LOW` returns the computed `required_fee`.
 - **Mempool priority** is by admission-time estimate (`estimated_fee DESC, fee_limit DESC, received_at ASC`); inflating `fee_limit` does not buy priority.
 - **Limitations:** percentage fees are **not yet confirmed expressible** — flat fees and comparison-ladder tiers are what this node has actually exercised. The long-standing claim was that the deployed tau-lang does not verify multiplication, but `bf_mul`/`bf_div`/`bf_shl`/`bf_shr` are all in the grammar, so that premise is unverified rather than established. `tests/test_o9_arithmetic_probe_native.py` settles it against the real engine; it needs native bindings built for the interpreter running the suite. Note a computed `o9` needs no width change — the live rule is already `bv[24]`, and Tau arithmetic unifies operands within one bv family. User rule text referencing `o6`/`o7`/`o9` is rejected at admission, as is a **fee** rule reading `i2`.
 
@@ -506,7 +509,7 @@ submitted ──(quorum reached)──> scheduled ──(height ≥ activate_at_
 
 ## Rule sharing
 
-A user can send a Tau rule to another user, who reviews it and either accepts it into their own specification or rejects it. Three transaction types carry the lifecycle:
+A user can send a Tau rule to another user, who reviews it and either accepts it as their own policy clause or rejects it. Three transaction types carry the lifecycle:
 
 | type | fields beyond the common five | lane |
 |---|---|---|
@@ -526,27 +529,36 @@ Offer identity is `offer_id = BLAKE3(offerer, recipient, rule_text, expire_at_he
                        └──height ≥ expire_at_height──▶ expired ────┘
 ```
 
-### Whose specification does an accepted rule join?
+### Where an accepted rule lives
 
-There is no per-user specification in the engine: accepted rules land in one global rule accumulation. The documented convention was that a user "scopes" a rule by guarding it on their own sender identity (`i12`). **That convention does not hold**, and measurements on the real engine (pinned by `tests/test_rule_scoping_native.py`) say why:
+An accepted rule does not join the shared specification. The node keeps a registry `(account, target stream) -> clause body`; accepting an offer registers the offered rule as the acceptor's clause, and a user rule that writes `o5` (`operations["0"]`) is registered as the sender's clause in the same way. Each account holds one clause per stream, and a new one replaces the registered one. Nothing limits how many accounts hold a clause.
 
-1. An output stream that no clause constrains for a given input still **materializes**, with an arbitrary witness — observed as `0`, which for `o5` is exactly `USER_POLICY_BLOCK_VALUE`. So `always ( (i12 = A) -> (o5 = 1) ).` gives A its intended value and gives **everyone else** a materialized block. An implication guard is a network-wide transfer block, not isolation.
-2. Two total-form rules on the same stream do not compose: conjoined the spec is unsatisfiable and the interpreter fails to build; fed sequentially through `i0` the later one silently **supersedes** the earlier. So appending one guarded unit per user cannot work either.
-3. A single nested total-form unit does work, and applying it through `i0` is equivalent to building it conjoined — which is what makes a replaying node match a live one.
+A clause is judged on its own rather than guarded and appended to the shared specification, for two reasons measured on the real engine (pinned by `tests/test_rule_scoping_native.py`):
 
-So the **accepted-clause registry is the per-user specification**, and the node deterministically emits one composite rule unit per shared output stream:
+1. An output stream that no rule constrains for a given input still **materializes**, with an arbitrary witness — observed as `0`, which for `o5` is exactly `USER_POLICY_BLOCK_VALUE`. So `always ( (i12 = A) -> (o5 = 1) ).` gives A its intended value and gives **everyone else** a materialized block.
+2. Two total-form rules on the same stream do not compose: conjoined the spec is unsatisfiable and the interpreter fails to build; fed sequentially through `i0` the later one silently **supersedes** the earlier.
 
-```
-always ( (i12[t]:bv[384] = { #x<acceptor_1> }:bv[384]) ? ( <body_1> )
-       : ( (i12[t]:bv[384] = { #x<acceptor_2> }:bv[384]) ? ( <body_2> )
-       : ( o5[t]:bv[24] = { #x000001 }:bv[24] ) ) ).
-```
+**How a clause judges a transfer.** The clause is evaluated as `always ( <body> ).`, in a policy worker, and only for transfers sent by its owner, so it carries no sender guard. A transfer is blocked when the main interpreter yields `o5 = 0` (the consensus rules) or the sender's registered clause yields `o5 = 0` on the same transfer inputs; an account with no clause adds nothing. The check runs at admission, at block apply (ordinary and parked approval transfers alike) and in the approval preview. If the engine refuses to evaluate a registered clause for particular inputs — for example a value that does not fit the width the clause declared for that stream — the transfer is blocked.
 
-Acceptors are ordered by raw public-key bytes; the innermost else-branch is the stream's neutral value (`o5` → allow). Each composite **replaces** the previous one, so the live spec keeps exactly one unit per stream, and an empty registry emits nothing at all — so the stream is never mentioned and never materializes for anybody.
+**What a clause must satisfy.** The same screens run at admission and at block apply, for offered, accepted and self-submitted clauses:
 
-Offered rules must therefore be exactly one `always ( ... ).` unit, with balanced parentheses, no nested temporal operator, no reference to `i12` (the node supplies the guard), no reference to any step but `[t]`, and exactly one target output stream drawn from a permitted set (`o5` today). Consensus-owned streams (`o0`–`o4`, `o6`–`o9`), apply-time-mocked inputs (`i2`), and reserved input streams are refused.
+- exactly one `always ( ... ).` unit with balanced parentheses and no nested temporal operator;
+- no reference to `i12`;
+- no reference to any step but `[t]`;
+- every stream mention written `xN[t]:bv[W]` with an explicit width, and one width per stream within the body; `o5` at `bv[24]`, approval slots (`i18`–`i25`) at `bv[384]`;
+- writes `o5` and no other stream; consensus-owned streams (`o0`–`o4`, `o6`–`o9`) are refused;
+- no reference to the reserved input streams `i13`–`i15`;
+- at most 32 comparisons and 32 levels of parentheses, and at most 8 KiB of rule text.
 
-**Caveats.** There is no retraction: an acceptor changes an accepted rule by accepting a different offer on the same stream, which replaces their clause. Accepting is irreversible otherwise. Caps are frozen constants, not config, because a per-node value would let honest nodes disagree about admissibility: 8 KiB per rule, 32 pending offers per recipient, 16 per offerer, a 100 000-block maximum offer window, and 64 acceptors per stream. On `o5`, once approval slots are active, `MAX_TIER_AUTHORS` (2) authors bound both this door and self-service policy rules.
+A clause may read `i1` (amount), `i2` (sender balance at the parent block), `i3`/`i4` (from/to pubkeys), `i5` (block timestamp), the approval slots and custom inputs. Custom inputs for a clause start at `i26`; a parked approval request takes its custom inputs from key 26 up.
+
+Registration also needs the engine to build the clause and step it once. A clause that does not build, or that reads no input stream (a constant such as an unconditional block), is refused: `TX_REJECTED` at admission, a hard reject with receipt reason `rule_not_applied` at block apply. To block everything, test a condition on an input, such as amount above zero.
+
+**Revoking.** Submitting the neutral clause `always ( (o5[t]:bv[24] = { #x000001 }:bv[24]) ).` removes the sender's clause. An `o5` rule cannot share a transaction with transfers (`RULE_WITH_TRANSFERS`), and changing or revoking a policy fails the sender's open approval requests.
+
+**Cost.** Per transfer from an account that has a clause, one clause evaluation: about 3 ms for a small clause and about 10 ms at the 32-comparison limit. Building a clause on first use takes about 0.07 s at 8 comparisons and about 0.4 s at 32. These figures were measured on one reference engine build and do not depend on how many accounts hold clauses.
+
+**Caveats.** Offer caps are frozen constants, not config, because a per-node value would let honest nodes disagree about admissibility: 8 KiB per rule, 32 pending offers per recipient, 16 per offerer, and a 100 000-block maximum offer window. Rule transactions count against the per-block rule budget (see [Mempool policy](#mempool-policy)).
 
 ### Checking conflict status
 
@@ -558,18 +570,18 @@ Offered rules must therefore be exactly one `always ( ... ).` unit, with balance
 | `reserved_domains` | does not write consensus-owned streams, read mocked inputs, or touch reserved inputs |
 | `registry_collision` | whether you already hold a clause on this stream (accepting **replaces** it), and who else holds one |
 | `bv_widths` | the same stream declared at two bitvector widths, compared statically so the live interpreter's typing is never touched |
-| `compile` | the **composed** rule parses and steps, in a killable subprocess |
+| `compile` | the clause builds as `always ( <body> ).` in a policy worker |
 | `unrealizable` | **unavailable** — see below |
 
-Because each acceptor gets its own guarded branch of one composite, cross-user conflict is removed by construction, which is what makes `registry_collision` a decidable question rather than a guess.
+Because each account's clause is evaluated on its own, clauses of different accounts never conflict, which is what makes `registry_collision` a decidable question rather than a guess.
 
 **Satisfiability is not checked.** tau-lang exposes `sat`/`unsat`/`valid`/`unrealizable` in its C++ API but not through its Python bindings, so a logical contradiction cannot be detected at all. A clean report means *no conflict was observed*, never *no conflict exists*.
 
 ### State-hash binding
 
-The offer book and clause registry are folded into `consensus_meta.mechanism_specific_metadata` as `rule_offers_root` and `rule_clauses_root`, emitted **only while the book is non-empty** — the same hash-compat gate `eligibility_mode` uses. So genesis stays byte-identical and **no regenesis is required**; the first offer makes an un-upgraded node diverge loudly (state-hash mismatch, block rejected) rather than silently. The only coordination requirement is that nodes upgrade before the first offer lands. `rule_text` and an offer's terminal status are node-local durability for the read RPCs and are deliberately **not** hashed.
+The offer book and clause registry are folded into `consensus_meta.mechanism_specific_metadata` as `rule_offers_root` and `rule_clauses_root`, emitted **only while the book is non-empty** — the same hash-compat gate `eligibility_mode` uses. So genesis stays byte-identical and **no regenesis is required**; the first offer makes an un-upgraded node diverge loudly (state-hash mismatch, block rejected) rather than silently. The only coordination requirement is that nodes upgrade before the first offer lands. `rule_text` and an offer's terminal status are node-local durability for the read RPCs and are deliberately **not** hashed. The clause registry root is updated per change, so hashing it costs the same however many clauses are registered.
 
-Bounds and cap breaches at block apply are **soft no-ops** with a receipt log, so block validity stays a function of the block alone; only a Tau failure on the composed rule hard-rejects the transaction.
+Offer bounds and cap breaches at block apply are **soft no-ops** with a receipt log, so block validity stays a function of the block alone. A clause that fails a screen or does not build hard-rejects its transaction (receipt reason `rule_not_applied`) without invalidating the block.
 
 ## Retractable transfers
 
@@ -607,12 +619,12 @@ Timing caveats:
 
 ## Mempool policy
 
-- **Lanes** — every tx is classified `fast` (coin transfers) or `slow` (anything carrying Tau rule text: `rule_offer`, `rule_offer_accept`, `consensus_rule_update`, or a `user_tx` with a non-empty `operations["0"]`). A `user_tx` carrying both a rule and transfers is `slow` — the signature covers the whole payload, so it cannot be split. Applying a rule recompiles a composite, whose cost climbs steeply with specification complexity, while a transfer is one cheap step; without separation a burst of rule work delays every queued transfer. Fee priority cannot express the split, because a rule emits its own `o8` user fee and can therefore price itself to the front of the queue.
+- **Lanes** — every tx is classified `fast` (coin transfers) or `slow` (anything carrying Tau rule text: `rule_offer`, `rule_offer_accept`, `consensus_rule_update`, or a `user_tx` with a non-empty `operations["0"]`). A `user_tx` carrying both a rule and transfers is `slow` — the signature covers the whole payload, so it cannot be split. Applying a rule builds or recompiles Tau state, which costs far more than a transfer's one cheap step; without separation a burst of rule work delays every queued transfer. Fee priority cannot express the split, because a rule emits its own `o8` user fee and can therefore price itself to the front of the queue.
 - **Selection order** — the fast lane is filled first, then the slow lane up to a quota. Within each lane the order is unchanged: `estimated_fee DESC, fee_limit DESC, received_at ASC`. Inflating `fee_limit` does not outrank a higher estimate. Selection is proposer-local policy — validators replay the stored block body order — so lane ordering cannot fork.
 - **Sequences** — admission checks projected (confirmed + pending) state; a sender may stack contiguous sequences, but a **gap is rejected**. There is **no replacement / RBF** — a stuck low-fee tx must expire or be evicted, not be replaced.
 - **Duplicates** — a repeat `tx_id` is idempotently ignored.
 - **Capacity & eviction** — the cap is `TAU_MAX_MEMPOOL_TXS` (default 5000), enforced on both the soft admission pre-check and the DB-layer eviction, each counting pending rows only. Eviction is **quota-first**: the slow lane may hold at most `TAU_MEMPOOL_RULE_LANE_MAX_FRACTION` of the cap (default 0.1) and overflow inside it is evicted from its own rows, so a burst of rule transactions cannot evict queued fee-paying transfers. Otherwise the **oldest pending** tx is evicted (FIFO, fee-blind; reserved txs are never evicted).
-- **Per-block rule budget** — a block may carry at most `max_rule_txs_per_block` rule-sharing transactions (default 8, governance-patchable, bound into the state hash when non-default). This is **block validity**, not policy: without it a proposer could author a block every validator times out on. Legacy `operations["0"]` `user_tx` rules are deliberately not counted, so historical blocks still replay. A proposer may be more conservative via `TAU_BLOCK_MAX_RULE_TXS`, never more permissive.
+- **Per-block rule budget** — a block may carry at most `max_rule_txs_per_block` rule transactions (default 8, governance-patchable, bound into the state hash when non-default): every rule-sharing transaction, and every `user_tx` whose rule writes `o5`. This is **block validity**, not policy: without it a proposer could author a block every validator times out on. A proposer may be more conservative via `TAU_BLOCK_MAX_RULE_TXS`, never more permissive.
 - **Sequence contiguity under quotas** — lane quotas can leave a sender's lower-numbered tx behind while including a higher one. The engine hard-rejects such a gap and the tx would be disposed with the block, so the builder defers the whole sender instead and it waits for its predecessor.
 - **Expiry** — expired txs are pruned opportunistically on insert (no background reaper).
 - **Persistence** — the mempool survives restart (same SQLite file) and is not re-validated on boot.
