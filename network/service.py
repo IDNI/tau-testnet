@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import itertools
 from collections import OrderedDict
 import logging
 import sys
@@ -23,8 +24,72 @@ logger = logging.getLogger(__name__)
 MAX_HANDSHAKE_PROVIDERS = 50
 # Hard bound on header pages pulled in one sync call.
 MAX_SYNC_PAGES = 50
+# A peer that never closes a sync reply must not hold the sync forever.
+SYNC_READ_TIMEOUT = 120.0
+# A tx or gossip request is one write of at most 1 MiB, so it arrives in seconds.
+REQUEST_READ_TIMEOUT = 30.0
+# Handshake and ping payloads are small; a silent peer must not block forever.
+HANDSHAKE_READ_TIMEOUT = 30.0
+PING_READ_TIMEOUT = 10.0
+SYNC_BLOCKS_REPLY_CAP = 20 * 1024 * 1024
+SYNC_BLOCKS_CHUNK = 128
+BLOCKS_REQUEST_MAX_BYTES = 1024 * 1024
+BLOCKS_HASH_LIMIT = 2000
+# Sync clients open the stream before the request is ready; wait long enough
+# that a slow round trip still delivers the locator.
+SYNC_REQUEST_EMPTY_TIMEOUT = 10.0
 # Bound on remembered peers that failed the genesis gate.
 MAX_GENESIS_REJECTED_PEERS = 1024
+
+
+class BlockOverReplyCap(Exception):
+    """One block is larger than the get_blocks reply cap, so no request can fetch it."""
+
+    def __init__(self, block_hash: str, fetched: List[Dict[str, Any]]):
+        super().__init__(block_hash)
+        self.block_hash = block_hash
+        self.fetched = fetched
+
+
+def _capped_block_reply(
+    stored: Iterable[Optional[Dict[str, Any]]], reply_cap: int
+) -> List[Dict[str, Any]]:
+    """Collect blocks in order until the JSON reply would exceed the byte cap.
+
+    A first block over the cap stays in the reply, so the client can report it.
+    """
+    import json
+
+    blocks: List[Dict[str, Any]] = []
+    size = len(json.dumps({"blocks": []}).encode())
+    for blk in stored:
+        if not blk:
+            continue
+        extra = len(json.dumps(blk).encode()) + (2 if blocks else 0)
+        if blocks and size + extra > reply_cap:
+            break
+        blocks.append(blk)
+        size += extra
+    return blocks
+
+
+def _remaining_hashes_after_partial(
+    hashes: List[str], blocks: List[Dict[str, Any]]
+) -> List[str]:
+    """Hashes after the last block returned for a capped get_blocks reply."""
+    # An empty reply gives no progress, so asking again could never end.
+    if not blocks:
+        return []
+    bi = 0
+    hi = 0
+    while hi < len(hashes) and bi < len(blocks):
+        if blocks[bi].get("block_hash") == hashes[hi]:
+            bi += 1
+        hi += 1
+    if bi != len(blocks):
+        return []
+    return hashes[hi:]
+
 
 # Install the libp2p shims (QUIC cleanup race, AutoConnector backoff overflow) at
 # module load. Their bodies live in `network/libp2p_compat.py`; calling them here
@@ -202,14 +267,21 @@ class NetworkService:
 
     async def _handshake_once(self, peer_id: Any) -> None:
         from .protocols import TAU_PROTOCOL_HANDSHAKE
-        from .libp2p_compat import read_until_eof
+        from .libp2p_compat import (
+            close_stream_safely,
+            read_until_eof,
+            reset_stream_on_error,
+        )
         import json
+        stream = None
         try:
             stream = await self.host.new_stream(peer_id, [TAU_PROTOCOL_HANDSHAKE])
             payload = self._build_handshake_payload()
             await stream.write(json.dumps(payload).encode())
-            data = await read_until_eof(stream, 65535)
-            await stream.close()
+            async with reset_stream_on_error(stream):
+                data = await read_until_eof(
+                    stream, 65535, read_timeout=HANDSHAKE_READ_TIMEOUT
+                )
             
             # Process response
             if data:
@@ -326,6 +398,9 @@ class NetworkService:
                     logger.debug("Handshake-triggered sync failed to schedule", exc_info=True)
         except Exception:
             raise  # retry policy (backoff, attempt cap) lives in _perform_handshake
+        finally:
+            if stream is not None:
+                await close_stream_safely(stream)
 
     def _self_advertised_addrs(self) -> List[str]:
         """Addrs we tell peers to dial: configured announce addrs (NAT/public)
@@ -936,7 +1011,12 @@ class NetworkService:
         import json
         import multiaddr
         import db
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import (
+            StreamTooLarge,
+            close_stream_safely,
+            read_json_object,
+            reset_stream_on_error,
+        )
 
         # Prepare response (default)
         resp = {
@@ -959,7 +1039,16 @@ class NetworkService:
 
         try:
             # Read payload
-            data = await bounded_stream_read(stream, 65535)
+            data = b""
+            async with reset_stream_on_error(stream):
+                try:
+                    data = await read_json_object(
+                        stream, 65535, read_timeout=HANDSHAKE_READ_TIMEOUT
+                    )
+                except StreamTooLarge:
+                    raise
+                except ValueError:
+                    data = b""
             if logger.isEnabledFor(logging.DEBUG):
                  # Log length only to confirm receipt without flooding raw bytes
                  logger.debug("Handshake received %d bytes", len(data))
@@ -1106,9 +1195,16 @@ class NetworkService:
     async def _handle_ping(self, stream) -> None:
         import json
         import time
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import (
+            close_stream_safely,
+            read_json_object,
+            reset_stream_on_error,
+        )
         try:
-            data = await bounded_stream_read(stream, 65535)
+            async with reset_stream_on_error(stream):
+                data = await read_json_object(
+                    stream, 65535, read_timeout=PING_READ_TIMEOUT
+                )
             req = json.loads(data.decode())
             resp = {
                 "nonce": req.get("nonce"),
@@ -1127,8 +1223,10 @@ class NetworkService:
         try:
             # Some callers (tests/debug tools) may "send" an empty request by writing b"".
             # libp2p streams won't deliver that as data, so a naive read() would block forever.
-            # bounded_stream_read's empty_timeout returns b"" if no bytes arrive in 0.25s.
-            data = await bounded_stream_read(stream, 65535, empty_timeout=0.25)
+            # bounded_stream_read's empty_timeout returns b"" if no bytes arrive in time.
+            data = await bounded_stream_read(
+                stream, 65535, empty_timeout=SYNC_REQUEST_EMPTY_TIMEOUT
+            )
             req: Dict[str, Any] = {}
             if data:
                 if data.strip() == b"get_headers":
@@ -1209,9 +1307,25 @@ class NetworkService:
     async def _handle_blocks(self, stream) -> None:
         import json
         import db
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import (
+            StreamTooLarge,
+            close_stream_safely,
+            read_json_object,
+            reset_stream_on_error,
+        )
         try:
-            data = await bounded_stream_read(stream, 10 * 1024 * 1024)
+            data = b""
+            async with reset_stream_on_error(stream):
+                try:
+                    data = await read_json_object(
+                        stream,
+                        BLOCKS_REQUEST_MAX_BYTES,
+                        read_timeout=REQUEST_READ_TIMEOUT,
+                    )
+                except StreamTooLarge:
+                    raise
+                except ValueError:
+                    data = b""
             req: Dict[str, Any] = {}
             if data:
                 try:
@@ -1224,10 +1338,10 @@ class NetworkService:
             # Back-compat: older internal client used {"block_hashes":[...]}
             if isinstance(req, dict) and isinstance(req.get("block_hashes"), list):
                 hashes = [str(h) for h in req.get("block_hashes") if h]
-                for h in hashes:
-                    blk = db.get_block_by_hash(h)
-                    if blk:
-                        blocks.append(blk)
+                hashes = hashes[:BLOCKS_HASH_LIMIT]
+                blocks = _capped_block_reply(
+                    map(db.get_block_by_hash, hashes), SYNC_BLOCKS_REPLY_CAP
+                )
                 resp = {"blocks": blocks}
                 await stream.write(json.dumps(resp).encode())
                 return
@@ -1240,10 +1354,10 @@ class NetworkService:
             # By hashes
             if isinstance(req.get("hashes"), list):
                 hashes = [str(h) for h in req["hashes"] if h]
-                for h in hashes:
-                    blk = db.get_block_by_hash(h)
-                    if blk:
-                        blocks.append(blk)
+                hashes = hashes[:BLOCKS_HASH_LIMIT]
+                blocks = _capped_block_reply(
+                    map(db.get_block_by_hash, hashes), SYNC_BLOCKS_REPLY_CAP
+                )
                 resp = {"blocks": blocks}
                 await stream.write(json.dumps(resp).encode())
                 return
@@ -1265,10 +1379,12 @@ class NetworkService:
                     except Exception:
                         start_number = 0
 
-                for blk in db.get_canonical_blocks_at_or_after_height(start_number):
-                    blocks.append(blk)
-                    if len(blocks) >= limit:
-                        break
+                blocks = _capped_block_reply(
+                    itertools.islice(
+                        db.get_canonical_blocks_at_or_after_height(start_number), limit
+                    ),
+                    SYNC_BLOCKS_REPLY_CAP,
+                )
                 resp = {"blocks": blocks}
                 await stream.write(json.dumps(resp).encode())
                 return
@@ -1285,10 +1401,12 @@ class NetworkService:
                     limit = 1
                 limit = max(1, min(limit, 2000))
 
-                for blk in db.get_canonical_blocks_at_or_after_height(start_number):
-                    blocks.append(blk)
-                    if len(blocks) >= limit:
-                        break
+                blocks = _capped_block_reply(
+                    itertools.islice(
+                        db.get_canonical_blocks_at_or_after_height(start_number), limit
+                    ),
+                    SYNC_BLOCKS_REPLY_CAP,
+                )
                 resp = {"blocks": blocks}
                 await stream.write(json.dumps(resp).encode())
                 return
@@ -1302,9 +1420,13 @@ class NetworkService:
 
     async def _handle_tx(self, stream) -> None:
         import json
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import close_stream_safely, read_json_object, reset_stream_on_error
+        from .protocols import TAU_STREAM_REQUEST_MAX_BYTES
         try:
-            data = await bounded_stream_read(stream, 65535)
+            async with reset_stream_on_error(stream):
+                data = await read_json_object(
+                    stream, TAU_STREAM_REQUEST_MAX_BYTES, read_timeout=REQUEST_READ_TIMEOUT
+                )
             req = json.loads(data.decode())
             # Submit tx off the event loop -- see the note in
             # _process_gossip_payload; admission can block for seconds.
@@ -1320,9 +1442,13 @@ class NetworkService:
 
     async def _handle_gossip_stream(self, stream) -> None:
         import json
-        from .libp2p_compat import bounded_stream_read, close_stream_safely
+        from .libp2p_compat import close_stream_safely, read_json_object, reset_stream_on_error
+        from .protocols import TAU_STREAM_REQUEST_MAX_BYTES
         try:
-            data = await bounded_stream_read(stream, 65535)
+            async with reset_stream_on_error(stream):
+                data = await read_json_object(
+                    stream, TAU_STREAM_REQUEST_MAX_BYTES, read_timeout=REQUEST_READ_TIMEOUT
+                )
             req = json.loads((data or b"{}").decode())
 
             sender_pid = req.get("peer_id")
@@ -1854,8 +1980,8 @@ class NetworkService:
         self, pid_obj: Any, peer_id: Any, locator: List[str], stop: Optional[str], limit: int
     ) -> "tuple[int, bool]":
         """Fetch and ingest one header page. Returns (ingested, peer_may_have_more)."""
-        from .protocols import TAU_PROTOCOL_SYNC, TAU_PROTOCOL_BLOCKS
-        from .libp2p_compat import read_until_eof
+        from .protocols import TAU_PROTOCOL_SYNC
+        from .libp2p_compat import close_stream_safely, read_until_eof, reset_stream_on_error
         import json
         import db
 
@@ -1864,9 +1990,12 @@ class NetworkService:
         try:
             req = {"type": "get_headers", "locator": list(locator), "stop": stop, "limit": limit}
             stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_SYNC])
-            await stream.write(json.dumps(req).encode())
-            resp_raw = await read_until_eof(stream, 2 * 1024 * 1024)
-            await stream.close()
+            async with reset_stream_on_error(stream):
+                await stream.write(json.dumps(req).encode())
+                resp_raw = await read_until_eof(
+                    stream, 2 * 1024 * 1024, read_timeout=SYNC_READ_TIMEOUT
+                )
+            await close_stream_safely(stream)
             resp = json.loads((resp_raw or b"{}").decode())
             headers = resp.get("headers") or []
         except Exception:
@@ -1904,17 +2033,21 @@ class NetworkService:
 
         # 3) Fetch missing blocks by hash
         blocks: List[Dict[str, Any]] = []
-        chunk_size = 128
-        for i in range(0, len(missing_hashes), chunk_size):
-            chunk = missing_hashes[i : i + chunk_size]
+        for i in range(0, len(missing_hashes), SYNC_BLOCKS_CHUNK):
+            chunk = missing_hashes[i : i + SYNC_BLOCKS_CHUNK]
             try:
-                req = {"type": "get_blocks", "hashes": chunk}
-                stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_BLOCKS])
-                await stream.write(json.dumps(req).encode())
-                resp_raw = await read_until_eof(stream, 20 * 1024 * 1024)
-                await stream.close()
-                resp = json.loads((resp_raw or b"{}").decode())
-                blocks.extend(resp.get("blocks") or [])
+                blocks.extend(await self._fetch_block_chunk(pid_obj, chunk))
+            except BlockOverReplyCap as exc:
+                logger.error(
+                    "Block %s from %s is larger than the reply cap of %d bytes; "
+                    "the sync stops before this block",
+                    exc.block_hash,
+                    peer_id,
+                    SYNC_BLOCKS_REPLY_CAP,
+                )
+                blocks.extend(exc.fetched)
+                more = False
+                break
             except Exception:
                 logger.warning("Failed to fetch block bodies from %s", peer_id, exc_info=True)
                 break
@@ -1942,6 +2075,54 @@ class NetworkService:
         except Exception:
             logger.warning("Failed to ingest blocks from %s", peer_id, exc_info=True)
             return 0, False
+
+    async def _fetch_block_chunk(self, pid_obj: Any, hashes: List[str]) -> List[Dict[str, Any]]:
+        """Fetch `hashes` with get_blocks, in halves when a reply exceeds the cap.
+
+        Raises `BlockOverReplyCap` with the blocks fetched before the block
+        that no request can carry.
+        """
+        from .protocols import TAU_PROTOCOL_BLOCKS
+        from .libp2p_compat import (
+            StreamTooLarge,
+            close_stream_safely,
+            read_until_eof,
+            reset_stream_on_error,
+        )
+        import json
+
+        try:
+            req = {"type": "get_blocks", "hashes": hashes}
+            stream = await self.host.new_stream(pid_obj, [TAU_PROTOCOL_BLOCKS])
+            async with reset_stream_on_error(stream):
+                await stream.write(json.dumps(req).encode())
+                resp_raw = await read_until_eof(
+                    stream, SYNC_BLOCKS_REPLY_CAP, read_timeout=SYNC_READ_TIMEOUT
+                )
+            await close_stream_safely(stream)
+        except StreamTooLarge:
+            if len(hashes) == 1:
+                raise BlockOverReplyCap(hashes[0], [])
+        else:
+            resp = json.loads((resp_raw or b"{}").decode())
+            blocks = list(resp.get("blocks") or [])
+            remaining = _remaining_hashes_after_partial(hashes, blocks)
+            if remaining:
+                try:
+                    blocks.extend(await self._fetch_block_chunk(pid_obj, remaining))
+                except BlockOverReplyCap as exc:
+                    exc.fetched = blocks + exc.fetched
+                    raise
+            return blocks
+
+        half = len(hashes) // 2
+        first = await self._fetch_block_chunk(pid_obj, hashes[:half])
+        try:
+            second = await self._fetch_block_chunk(pid_obj, hashes[half:])
+        except BlockOverReplyCap as exc:
+            exc.fetched = first + exc.fetched
+            raise
+        return first + second
 
     @staticmethod
     def _ingest_blocks(sorted_blocks: List[Dict[str, Any]], peer_id: Any) -> int:
