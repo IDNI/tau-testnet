@@ -448,6 +448,7 @@ class WorkerSession(EvaluatorSession):
             runtime_text = prepared.runtime_text
             receipt = self._spec.revise(runtime_text, "apply",
                                         timeout=self.request_budget)
+        self._explain_untyped_shrunk(rule_text, receipt)
         self.last_outcome = receipt
         identity = tau_journal.candidate_identity(
             rule_text, mapping_epoch=self.allocation.epoch,
@@ -475,6 +476,20 @@ class WorkerSession(EvaluatorSession):
                                 result=receipt.get("outputs"),
                                 identity=identity, accumulate=accumulate)
         return "ok" if accepted else f"error: {outcome}"
+
+    def _explain_untyped_shrunk(self, rule_text, receipt):
+        """Put the author's fix first in a refusal caused by a bare reference to
+        a stream this plan interns. Only the message changes, never the verdict."""
+        if self.plan is None or getattr(receipt, "accepted", False):
+            return
+        report = receipt.get("report")
+        if not isinstance(report, dict):
+            return
+        import tau_shrink
+        hint = tau_shrink.untyped_shrunk_hint(rule_text, self.plan.interned,
+                                              report.get("codes"))
+        if hint is not None:
+            report["errors"] = [hint] + list(report.get("errors") or [])
 
     def _excluded_streams(self, rule_text):
         """Streams this rule must leave at full width under this session's plan.

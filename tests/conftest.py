@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import errno
 import contextlib
+import importlib
 import os
 import sys
 import threading
@@ -77,6 +78,22 @@ def reset_tau_stream_types() -> Iterator[None]:
     if reset is not None:
         reset()
     yield
+
+
+@pytest.fixture(autouse=True)
+def restore_lifecycle_manager() -> Iterator[None]:
+    """Keep the validator set of one test out of later tests.
+
+    Tests rebind the manager or assign its fields in place. A left-over set
+    without the local miner makes block production refuse to propose.
+    """
+    import chain_state
+
+    manager = chain_state._lifecycle_manager
+    fields = dict(vars(manager))
+    yield
+    vars(manager).update(fields)
+    chain_state._lifecycle_manager = manager
 
 
 @pytest.fixture(autouse=True)
@@ -320,6 +337,49 @@ def isolated_chain_state(monkeypatch) -> Iterator[None]:
     for d, contents in zip(shared_dicts, saved):
         d.clear()
         d.update(contents)
+
+
+@pytest.fixture
+def isolate_db(tmp_path) -> Iterator[None]:
+    """Give the test its own SQLite DB with the genesis state loaded."""
+    import chain_state as chain_state_module
+    import config as config_module
+    import db as db_module
+
+    orig_env = os.environ.get("TAU_DB_PATH")
+    os.environ["TAU_DB_PATH"] = str(tmp_path / "p2p_test.db")
+
+    # Close any existing connection before reloading to avoid leaks
+    if getattr(db_module, "_db_conn", None):
+        try:
+            db_module._db_conn.close()
+        except Exception:
+            pass
+
+    importlib.reload(config_module)
+    importlib.reload(db_module)
+    importlib.reload(chain_state_module)
+
+    db_module.init_db()
+    chain_state_module.load_genesis("data/genesis.json")
+
+    genesis_hash = db_module.get_genesis_hash()
+    db_module.save_canonical_state_atomically(genesis_hash, 0, {}, {}, "", "", "", [], [], [], [])
+    chain_state_module._canonical_head_hash = genesis_hash
+    yield
+
+    if getattr(db_module, "_db_conn", None):
+        try:
+            db_module._db_conn.close()
+        except Exception:
+            pass
+
+    if orig_env is None:
+        os.environ.pop("TAU_DB_PATH", None)
+    else:
+        os.environ["TAU_DB_PATH"] = orig_env
+    importlib.reload(config_module)
+    importlib.reload(db_module)
 
 
 # --------------------------------------------------------------------------

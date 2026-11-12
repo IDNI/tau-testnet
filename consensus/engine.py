@@ -15,7 +15,7 @@ from .governance import (
     normalize_validator_set,
     is_tau_authoritative_eligibility_mode,
 )
-from . import fees
+from . import faucet, fees
 from . import sender_policy
 from .fees import FeeRuleError
 from .approvals import (
@@ -67,10 +67,9 @@ FEE_BEARING_TX_TYPES = frozenset(
     | set(RULE_OFFER_TX_TYPES)
 )
 
-# Branches that mutate the lifecycle manager in place. Once the envelope
-# checks have already rejected the transaction, entering them records a
-# governance update, offer, accept or vote that only proposal mode discards.
-# `withdraw_request` still covers a request rejected later, at fee settlement.
+# Branches that mutate the lifecycle manager in place. They write only to the
+# fork of the tx, which both apply paths drop on a rejection. A tx that is
+# already rejected skips them, so it never reaches the evaluator.
 _LIFECYCLE_TX_TYPES = frozenset(
     {"consensus_rule_update", "consensus_rule_vote"}
     | set(RULE_OFFER_TX_TYPES)
@@ -218,16 +217,17 @@ def _escrow_total(lm) -> int:
     return book.escrow_total() if book is not None else 0
 
 
-def _release_due_retractables(lm, balances, height, timestamp) -> List[str]:
+def _release_due_retractables(lm, balances, sequences, height, timestamp) -> List[str]:
     """Pay every matured entry to its recipient; returns the released ids."""
     book = _retractable_book(lm)
     if book is None:
         return []
     released = book.release_due(int(height), int(timestamp))
+    grant = faucet.amount(lm)
     for entry in released:
-        balances[entry.recipient_pubkey] = (
-            int(balances.get(entry.recipient_pubkey, 0)) + entry.amount
-        )
+        balances[entry.recipient_pubkey] = faucet.spendable(
+            balances, sequences, entry.recipient_pubkey, grant
+        ) + entry.amount
     return [entry.retractable_id.hex() for entry in released]
 
 
@@ -561,6 +561,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         getattr(getattr(block, "header", None), "block_number", "?"),
                     )
                     return False
+                # Stake is consensus data: like get_committed_balance, it ignores a pending faucet grant.
                 proposer_stake = int(balances.get((block.header.proposer_pubkey or "").lower(), 0))
             tau_inputs = self._build_consensus_input_streams(
                 proposer_pubkey=block.header.proposer_pubkey,
@@ -731,7 +732,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             lm = copy.deepcopy(parent_lm)
         else:
             # Fallback if somehow not provided (tests, legacy)
+            import chain_state
             from consensus.governance import ConsensusLifecycleManager
+            if chain_state._genesis_faucet_amount:
+                raise BlockchainBug("no parent lifecycle on a network with a genesis faucet")
             lm = ConsensusLifecycleManager(active_validators=[bytes.fromhex(v) for v in self._validators])
         if proposal is not None:
             # The block's lifecycle IS the proposal's from here: transactions
@@ -758,6 +762,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # metadata['balances'] is the pre-block state; t_bals above is the
             # mutable copy apply() debits, and must NOT be used for i2.
             parent_balances=metadata.get('balances'),
+            parent_sequences=metadata.get('sequence_numbers'),
             parent_last_transfer_ts=metadata.get('last_transfer_ts'),
             session=session,
             target_last_transfer_ts=t_lts,
@@ -766,19 +771,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
         # Conservation invariant: the native fee model debits the sender and
         # credits the proposer through the same staged_writes pass, so total
-        # supply is preserved across a block (no mint, no burn). A mismatch is
-        # a consensus bug, not a recoverable error.
+        # supply moves only by the faucet grants of the block (no other mint, no
+        # burn). A mismatch is a consensus bug, not a recoverable error.
         # The sweep runs after the transaction loop, so a retract (strictly
         # before release) and a release can never both fire in one block.
         released_retractables = _release_due_retractables(
-            lm, t_bals, block.header.block_number, block.header.timestamp
+            lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
         )
 
+        minted = faucet.granted(
+            metadata.get('balances'), metadata.get('sequence_numbers'),
+            t_bals, t_seqs, faucet.amount(lm),
+        )
         post_total = sum(int(v) for v in t_bals.values()) + _escrow_total(lm)
-        if post_total != parent_total and not getattr(config, "TESTNET_AUTO_FAUCET", False):
+        if post_total != parent_total + minted:
             raise BlockchainBug(
                 f"Supply not conserved applying block #{block.header.block_number}: "
-                f"parent_total={parent_total} post_total={post_total}"
+                f"parent_total={parent_total} minted={minted} post_total={post_total}"
             )
 
         # Convert internal apply result into structural outcomes
@@ -1070,6 +1079,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         proposer_pubkey: Optional[str] = None,
         block_height: Optional[int] = None,
         parent_balances: Optional[Dict[str, int]] = None,
+        parent_sequences: Optional[Dict[str, int]] = None,
         parent_last_transfer_ts: Optional[Dict[str, int]] = None,
         target_last_transfer_ts: Optional[Dict[str, int]] = None,
         session=None,
@@ -1096,6 +1106,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             proposer_pubkey=proposer_pubkey,
             block_height=block_height,
             parent_balances=parent_balances,
+            parent_sequences=parent_sequences,
             parent_last_transfer_ts=parent_last_transfer_ts,
             target_last_transfer_ts=target_last_transfer_ts,
             session=session,
@@ -1130,6 +1141,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         proposer_pubkey: Optional[str] = None,
         block_height: Optional[int] = None,
         parent_balances: Optional[Dict[str, int]] = None,
+        parent_sequences: Optional[Dict[str, int]] = None,
         parent_last_transfer_ts: Optional[Dict[str, int]] = None,
         target_last_transfer_ts: Optional[Dict[str, int]] = None,
         session=None,
@@ -1179,10 +1191,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             else chain_state._lifecycle_manager
         )
         if proposal is not None:
-            # The proposal owns it from here. Identity is kept deliberately: the
-            # block builder holds this same object and hashes it after apply
-            # returns, so the proposal adopts a transaction's clone INTO it
-            # rather than swapping in a different manager.
             proposal.lifecycle = _block_lifecycle
         lifecycle_mgr = _block_lifecycle
         # The evaluator this apply drives. The default binds to THIS module's
@@ -1214,11 +1222,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 return int(target_sequences[address])
             return chain_state.get_sequence_number(address)
 
+        faucet_grant = faucet.amount(lifecycle_mgr)
+
         def _balance_of(address) -> int:
-            if proposal is not None:
-                return int(target_balances.get(address, 0))
-            if target_balances is not None and address in target_balances:
-                return target_balances[address]
+            # The overlay already holds the parent state: reading chain_state
+            # here would judge a block against the node's live head instead.
+            if target_balances is not None:
+                return faucet.spendable(
+                    target_balances, target_sequences, address, faucet_grant
+                )
             return chain_state.get_balance(address)
 
         def _commit_snapshot(snap):
@@ -1281,6 +1293,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # both see the same pre-block balance, so a min-balance floor does not
         # compound within a block. The block-build re-check remains the backstop.
         parent_bals = dict(parent_balances or {})
+        parent_seqs = dict(parent_sequences or {})
         if parent_balances is None and target_balances is not None:
             # Legacy direct-apply callers (tests) that never pass a parent map.
             # Feed 0 rather than guessing from the mutable overlay, which would
@@ -1290,20 +1303,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         def _parent_bal(addr: Optional[str]) -> str:
             """i2 for `addr`, clamped to the width the rules declare for it.
 
-            Applies the same TESTNET_AUTO_FAUCET substitution the debit path uses
-            further down. Without it Tau would see 0 for a faucet-funded account
-            while the transfer succeeded against a synthetic 100000, so a
-            min-balance rule would reject a send that then went through. This does
-            make i2 depend on a per-node flag — but that flag already has to match
-            network-wide (it also exempts the supply-conservation invariant), and
-            being inconsistent *within* one node is the worse, silent failure.
+            The parent's spendable balance, with the pending grant of an
+            account that has no record yet: the value the debit path spends, so
+            a min-balance rule judges the balance the transfer spends.
             """
+            if not addr or parent_balances is None:
+                return "0"
             try:
-                value = int(parent_bals.get(addr, 0)) if addr else 0
+                value = faucet.spendable(parent_bals, parent_seqs, addr, faucet_grant)
             except (TypeError, ValueError):
                 value = 0
-            if value == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                value = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
             return str(max(0, min(value, tau_defs.MAX_TRANSFER_VALUE)))
 
         # i16: seconds since this sender's previous transfer, read from the
@@ -1364,6 +1373,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # would wrap to a huge bv value and silently satisfy the cooldown).
             return str(max(0, min(elapsed, tau_defs.COOLDOWN_NEVER_SENT)))
 
+        def _lifecycle_for_write():
+            """This transaction's fork of the block lifecycle, made on the first write.
+
+            Every lifecycle write goes through here, on both apply paths, so a
+            plain transfer pays no copy.
+            """
+            nonlocal lifecycle_mgr
+            if lifecycle_mgr is _block_lifecycle and _block_lifecycle is not None:
+                lifecycle_mgr = (
+                    _branch.lifecycle if _branch is not None
+                    else _block_lifecycle.fork()
+                )
+            return lifecycle_mgr
+
         for i, tx in enumerate(transactions):
             # One branch per transaction. Its journal child, allocator child and
             # state delta resolve together; a rejection that already stepped the
@@ -1375,13 +1398,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     str(tx.get("tx_id") or tx.get("tx_hash") or f"tx{i}")
                 )
                 _session = proposal.session
-                # Lifecycle state is branched like everything else. The routed
-                # o5 path resolves the sender's open approval requests and
-                # replaces their registered clause, and the offer path does the same
-                # on accept -- both mutate in place, with no inverse worth
-                # trusting. So the transaction mutates a clone, and the proposal
-                # adopts it only on acceptance.
-                lifecycle_mgr = _branch.lifecycle
             tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
             # operations is signed only for user_tx.
             operations = tx.get('operations', {}) if tx.get('tx_type', 'user_tx') == 'user_tx' else {}
@@ -1501,13 +1517,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # the generic transfer-less fee-query step (which feeds the canonical
             # mocked i1=i2=i3=i4=0) must not run for it as well and charge twice.
             fee_already_measured = False
-            # Set when this tx parked an approval request. Parking is committed
-            # in the apply branch below, but the fee is settled afterwards and
-            # can still hard-reject the tx -- and hard_reject suppresses staged
-            # balances and nonces without rolling lifecycle mutations back. A
-            # request whose tx paid nothing must not stay parked, so it is
-            # withdrawn after settlement. Deterministic: every node measures the
-            # same fee against the same signed fee_limit and balance.
+            # Set when this tx parked an approval request. The fee settles after
+            # the park and can still reject the tx, so the request is withdrawn below.
             parked_request_id: Optional[bytes] = None
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
@@ -1555,7 +1566,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return True
 
                 offers = lifecycle_mgr.rule_offers
-                approvals_mgr = lifecycle_mgr.approval_requests
                 sender_n = sender.lower()
                 stream = tau_defs.USER_POLICY_STREAM_INDEX
 
@@ -1596,7 +1606,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # clause, so changing the clause under an open request would
                 # silently change what its recorded votes mean, or strand it
                 # until expiry. Resolve them first, in canonical id order.
-                doomed = approvals_mgr.resolve_all_for_sender(sender_n, STATUS_FAILED)
+                lifecycle = _lifecycle_for_write()
+                offers = lifecycle.rule_offers
+                doomed = lifecycle.approval_requests.resolve_all_for_sender(
+                    sender_n, STATUS_FAILED
+                )
                 if doomed:
                     tx_receipt["logs"].append(
                         "Policy change failed %d open approval request(s)" % len(doomed))
@@ -1833,8 +1847,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             return False
 
                     current_from = _read_bal(from_addr)
-                    if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                        current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
                     if current_from < amount:
                         logger.error(
                             "Insufficient funds for %s to send %s. Has: %s.",
@@ -1893,8 +1905,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             from consensus.governance import parse_consensus_rule_update, parse_consensus_rule_vote
 
+            if tx_type in _LIFECYCLE_TX_TYPES and accepted_in_block and not hard_reject:
+                _lifecycle_for_write()
             if tx_type in _LIFECYCLE_TX_TYPES and not (accepted_in_block and not hard_reject):
-                # Already rejected: lifecycle mutations are only rolled back in proposal mode.
+                # Already rejected: the lifecycle branches below must not run.
                 tx_receipt["logs"].append(
                     "Lifecycle action skipped: transaction already rejected"
                 )
@@ -2148,11 +2162,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 accepted_in_block = False
                             else:
                                 entry = approvals.get_request(vote.request_id)
-                                # PROSPECTIVE first, commit after. hard_reject
-                                # suppresses staged balances and nonces but does
-                                # NOT roll back lifecycle mutations, so a Tau
-                                # failure here must not leave a recorded vote
-                                # behind.
+                                # PROSPECTIVE first, commit after: a failed
+                                # measurement leaves no recorded vote.
                                 # The manager returns raw pubkeys (the right
                                 # domain value); _approval_slot_values formats
                                 # them for the wire as `{ #x.. }:bv[384]`, which
@@ -2650,13 +2661,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     
                                     if target_balances is not None:
                                         # Use isolated balance tracking
-                                        if from_addr in target_balances:
-                                            current_from = target_balances[from_addr]
-                                        else:
-                                            current_from = _balance_of(from_addr)
-
-                                        if current_from == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                                            current_from = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+                                        current_from = _balance_of(from_addr)
 
                                         if current_from < amount:
                                             logger.error("Insufficient funds for %s to send %s. Has: %s.", from_addr[:10], amount, current_from)
@@ -2784,15 +2789,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             f"Fee {total_fee} exceeds fee_limit {fee_limit_int}"
                         )
                 else:
-                    # Same faucet shim as the transfer debit and admission's
-                    # get_balance. Without it admission accepted a rule-only tx
-                    # from a fresh account (faucet-funded there) that apply
-                    # then refused as insufficient_funds_for_fee: a transfer
-                    # materializes the faucet balance before the fee, a rule
-                    # alone never did.
+                    # _read_bal gives a new sender its pending grant, as
+                    # admission's get_balance does, so a rule-only tx from a new
+                    # account pays its fee from the grant.
                     sender_bal = _read_bal(sender) if sender else 0
-                    if sender and sender_bal == 0 and getattr(config, "TESTNET_AUTO_FAUCET", False):
-                        sender_bal = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
                     if sender is None or sender_bal < total_fee:
                         if replay_mode:
                             logger.error(
@@ -2830,21 +2830,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         )
 
             if parked_request_id is not None and not accepted_in_block:
-                # The tx did not survive settlement (fee_limit_exceeded or
-                # insufficient_funds_for_fee, both of which also set
-                # hard_reject). Un-park it: otherwise the request stays in
-                # consensus state having paid nothing, and a later vote releases
-                # the transfer for free. Replay is unaffected -- it logs and
-                # skips the fee without clearing accepted_in_block, so a request
-                # parked on the mined chain stays parked.
-                if lifecycle_mgr.approval_requests.withdraw_request(parked_request_id):
+                # A request whose tx paid no fee must not stay parked. Replay
+                # keeps accepted_in_block, so a request parked on the mined chain
+                # stays parked.
+                if _lifecycle_for_write().approval_requests.withdraw_request(parked_request_id):
                     tx_receipt["logs"].append(
                         "Approval request un-parked (its fee was not paid)"
                     )
 
             stamp_retractable_park = False
             if accepted_in_block and not hard_reject:
-                book = lifecycle_mgr.retractable_transfers
+                if pending_retractable_park is not None or pending_retract_id is not None:
+                    book = _lifecycle_for_write().retractable_transfers
                 if pending_retractable_park is not None:
                     tx_receipt["retractable_event"] = (
                         pending_retractable_park.retractable_id.hex(), "parked"
@@ -2915,6 +2912,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if should_increment_seq and sender:
                     try:
                         if target_sequences is not None:
+                            # A record made by the nonce alone still gets the grant.
+                            if (faucet_grant and target_balances is not None
+                                    and not faucet.has_account(
+                                        target_balances, target_sequences, sender)):
+                                target_balances[sender] = faucet_grant
                             target_sequences[sender] = target_sequences.get(sender, 0) + 1
                         else:
                             if proposal is not None:
@@ -2939,6 +2941,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     if _rule_touched_canonical:
                         _set_rules_state(_rule_prior_rules_state or "")
                         current_tau_bytes = _rule_prior_tau_bytes
+            elif (lifecycle_mgr is not _block_lifecycle
+                    and accepted_in_block and not hard_reject):
+                _block_lifecycle.adopt(lifecycle_mgr)
 
             if accepted_in_block and not hard_reject:
                 accepted_txs.append(tx)

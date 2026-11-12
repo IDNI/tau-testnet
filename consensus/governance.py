@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Optional, Iterable, Union
+import copy
 import logging
 import re
 from dataclasses import dataclass
@@ -196,6 +197,7 @@ def build_mechanism_metadata(
     approval_requests_root: str = "",
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
+    faucet_amount: int = 0,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -234,6 +236,8 @@ def build_mechanism_metadata(
         mech["approval_slots_active"] = True
     if approval_requests_root:
         mech["approval_requests_root"] = approval_requests_root
+    if faucet_amount:
+        mech["faucet_amount"] = faucet_amount
     # Always present, unlike the keys above: the feature has no activation gate,
     # so the empty-book root is part of every chain's genesis hash.
     if retractable_transfers_root is None:
@@ -453,7 +457,21 @@ class ConsensusLifecycleManager:
         # rollback, reorg and competing branches. Read from the PARENT snapshot,
         # so an activation recorded in block H governs H+1 onward.
         self.approval_slots_active: bool = False
+        # Pinned by genesis for the life of the network: no patch sets it.
+        # Bound into the meta hash only when non-zero.
+        self.faucet_amount: int = 0
         self.recompute_approval_threshold()
+
+    def fork(self) -> "ConsensusLifecycleManager":
+        """A private copy for one transaction. Only an accepted one is adopted."""
+        return copy.deepcopy(self)
+
+    def adopt(self, fork: "ConsensusLifecycleManager") -> None:
+        """Take the state of an accepted fork, and keep this object for the block hash.
+
+        The sub-managers are replaced. No caller keeps one across an adopt.
+        """
+        self.__dict__ = dict(fork.__dict__)
 
     def effective_quorum_policy(self) -> str:
         """Deterministic resolved quorum policy: the genesis-pinned value, else
@@ -527,6 +545,7 @@ class ConsensusLifecycleManager:
             ),
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
+            faucet_amount=self.faucet_amount,
         )
         return compute_consensus_meta_hash(
             host_contract={},

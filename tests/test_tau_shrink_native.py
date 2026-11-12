@@ -35,7 +35,6 @@ _CHILD = r'''
 import os, tempfile
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "true"   # opt in (OFF by default)
 import config
 config.set_database_path(os.environ["SHRINK_DB"])
 import db; db.init_db()
@@ -102,7 +101,6 @@ _CHILD_SRC_EQ = r'''
 import os, tempfile
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "true"
 import config
 config.set_database_path(os.environ["SHRINK_DB"])
 import db; db.init_db()
@@ -144,7 +142,6 @@ print("SRC_EQ_RESULT", "/".join(str(s) for s in streams), same, diff)
 _CHILD_ACCUM = r'''
 import os, tempfile, json
 os.environ["TAU_ENV"] = "test"; os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "true"
 import config; config.set_database_path(os.environ["SHRINK_DB"])
 import db; db.init_db()
 import tau_native, tau_manager
@@ -206,7 +203,6 @@ def test_shrunk_set_accumulates_over_builtins_then_transfer(tmp_path):
 _CHILD_RESTORE = r'''
 import os, tempfile
 os.environ["TAU_ENV"] = "test"; os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "true"
 import config; config.set_database_path(os.environ["SHRINK_DB"])
 import db; db.init_db()
 import tau_native, tau_manager
@@ -306,7 +302,6 @@ _CHILD_INCIDENT = r'''
 import os, sys, tempfile
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "true"
 import config
 config.set_database_path(os.environ["SHRINK_DB"])
 import db; db.init_db()

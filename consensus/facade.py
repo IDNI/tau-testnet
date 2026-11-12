@@ -179,24 +179,19 @@ class TipAdmissionView:
 
     # --- Co-signature approvals -------------------------------------------
     #
-    # Read from the persisted tables and chain_state values rather than the
-    # in-memory lifecycle manager, for the same reason rule sharing does:
-    # admission runs on RPC/gossip threads while block apply mutates the
-    # manager, and the tip tables are the same view every node has.
+    # Request and vote rows come from the persisted tables, as rule sharing
+    # does: the tip tables are the same view every node has.
 
     @property
     def approval_slots_active(self) -> bool:
         """Whether i18..i25 are reserved and fed at the canonical tip.
 
-        Consensus state, never a module global: block apply deep-copies the
-        lifecycle manager per candidate block, so a global would leak across
-        candidate simulation, rollback and reorg.
+        Read from the canonical lifecycle manager, the source block apply reads,
+        so admission refuses what apply refuses. Apply mutates only a copy and
+        publishes it by swapping the reference, so this read sees one tip.
         """
-        try:
-            value = db.get_chain_state_value("approval_slots_active", "0")
-        except Exception:
-            return False
-        return str(value) == "1"
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        return getattr(lm, "approval_slots_active", False) is True
 
     def get_approval_request(self, request_id: str) -> Optional[dict]:
         """The full request row, or None. Includes the recorded votes."""

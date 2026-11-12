@@ -76,9 +76,8 @@ _PREAMBLE = r'''
 import json, os, sys, tempfile, time
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-os.environ["TAU_SHRINK_ENABLED"] = "false"
-# Deliberately no config/db import: with shrink off these cases exercise
-# TauInterface at the raw layer, which never reaches the intern table, so the
+# Deliberately no config/db import: these cases exercise TauInterface at the
+# raw layer, which never shrinks and never reaches the intern table, so the
 # child needs only the nanobind module on PYTHONPATH.
 import tau_native
 

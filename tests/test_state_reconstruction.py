@@ -84,9 +84,6 @@ class TestStateReconstruction(unittest.TestCase):
         chain_state._genesis_accounts_state = {self.addr1: GENESIS_BALANCE}
         chain_state._balances[self.addr1] = GENESIS_BALANCE
         
-        # Disable auto-faucet for these tests to ensure strict balance checks
-        self.original_auto_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
         
         from unittest.mock import patch
         self.verify_patch = patch('consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
@@ -94,8 +91,6 @@ class TestStateReconstruction(unittest.TestCase):
     
     def tearDown(self):
         """Clean up the temporary database."""
-        # Restore auto-faucet setting
-        config.TESTNET_AUTO_FAUCET = self.original_auto_faucet
         self.verify_patch.stop()
 
         # Ensure Tau process is stopped between tests

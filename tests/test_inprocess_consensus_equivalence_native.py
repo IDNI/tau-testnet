@@ -64,8 +64,7 @@ else:
                  "text": "always ( " + chain + " )."})
 tau_manager._print_tau_send = lambda *a, **k: None
 tau_manager.tau_direct_interface = tau_native.TauInterface(config.TAU_PROGRAM_FILE)
-if getattr(config, "TAU_SHRINK_ENABLED", False):
-    tau_shrink.set_shrink_width_from_db()
+tau_shrink.set_shrink_width_from_db()
 tau_manager.tau_test_mode = False
 tau_manager.tau_process_ready.set()
 chain_state.replay_tau_restore_plan(plan, source_prefix="startup")

@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import config
 import db
 import tau_allocator as alloc
 import tau_defs
@@ -80,8 +79,7 @@ def _tau_multi(fee):
 
 
 @pytest.fixture
-def engine(monkeypatch):
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False, raising=False)
+def engine():
     with patch("tau_manager.tau_ready") as ready, \
          patch("tau_manager.communicate_with_tau_multi", side_effect=_tau_multi(0)), \
          patch("tau_manager.communicate_with_tau", return_value="ok"):
@@ -158,8 +156,7 @@ def test_an_int_address_is_refused_and_a_restart_keeps_the_state_hash(engine, te
         compute_accounts_hash(balances, sequences)
 
 
-def test_a_refused_transfer_pays_no_fee_and_keeps_the_sequence(monkeypatch):
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False, raising=False)
+def test_a_refused_transfer_pays_no_fee_and_keeps_the_sequence():
     balances, sequences = {ALICE: 1000, MALLORY: 50}, {}
     steal = _transfer(MALLORY, SK_MALLORY, [[ALICE, MALLORY, "500"]], fee_limit="100")
     with patch("tau_manager.tau_ready") as ready, \
@@ -346,8 +343,7 @@ def _apply_block(*, proposal_mode):
     return result, sealed
 
 
-def test_proposal_and_direct_apply_give_the_same_block_hash(monkeypatch, temp_database):
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False, raising=False)
+def test_proposal_and_direct_apply_give_the_same_block_hash(temp_database):
     proposed, proposed_block = _apply_block(proposal_mode=True)
     direct, direct_block = _apply_block(proposal_mode=False)
 

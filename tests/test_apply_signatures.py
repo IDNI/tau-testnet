@@ -22,7 +22,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import config
 import tau_allocator as alloc
 import tau_defs
 import tau_journal as tj
@@ -64,11 +63,6 @@ GUARDED_RULE = (
 GOV_RULE = "always ( o6[t]:bv[16] = { 0 }:bv[16] )."
 
 _TX_SEQ = itertools.count()
-
-
-@pytest.fixture(autouse=True)
-def _no_faucet(monkeypatch):
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False)
 
 
 def tier_body(approver):

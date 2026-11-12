@@ -8,12 +8,12 @@
       "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
       "timestamp": 0,
       "merkle_root": "0000000000000000000000000000000000000000000000000000000000000000",
-      "state_hash": "43d1d0d330c541b1a1f62788e3f66de63f1ed96845c7152e36e06fbcc54b2fec",
+      "state_hash": "3580b4fd39ad852ec23def9fda827af7315757ac2671acf24ecf1d0738c0acd2",
       "proposer_pubkey": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
     },
     "transactions": [],
     "consensus_proof": {},
-    "hash": "1d8cad145da49a4e980d8d5f8e56b4dcf264edfb51ac11f285faaa3b91f4af6e"
+    "hash": "ebd27b9daabfbe16d7b6058e71b1e6d738c21a4aac2cd9b8ae17ab9c7331c096"
   },
   "consensus_rules": "# Tau-Driven Consensus v1 Interface\n#\n# i6: Block height\n# i7: Block timestamp\n# i8: Proposer identity (yid)\n# i9: Previous block hash (yid)\n# i10: Host proof validity (1 for valid, 0 for invalid)\n# i11: Claims summary (yid)\n#\n# o6: Block validity\n# o7: Proposer eligibility\n\n# Initial V1 Rule:\n# All authorized proposals handled by host PoA are considered eligible (o7 = 1)\n# Blocks are valid strictly if the host cryptographically verifies the proof (o6 = i10)\nalways (\n    o6[t]:bv[16] = i10[t]:bv[16] &&\n    o7[t]:bv[16] = { 1 }:bv[16]\n &&\n    o9[t]:bv[24] = { #x00000a }:bv[24]\n)\n",
   "application_rules": "((!(i0[t] = 0)) ? ( u[t] = i0[t] && o0[t] = 0 ) : o0[t] = 1)\n",
@@ -44,6 +44,7 @@
     "mechanism_specific_metadata": {
       "vote_quorum": "supermajority",
       "approval_slots_active": true,
+      "faucet_amount": 100000,
       "retractable_transfers_root": "227f3389139ae7138cc8900312e884a77597a0e22a8c8604a63305a4c92c6131"
     }
   }

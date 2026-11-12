@@ -28,6 +28,7 @@ import tau_session as ts
 from bls_keys import SK_BOB, SK_CAROL, pubkey_hex, sign_tx
 from consensus.approvals import ApprovalRequestEntry, ApprovalRequestLifecycleManager
 from consensus.engine import TauConsensusEngine
+from consensus.governance import ConsensusLifecycleManager
 from consensus.retractable import RetractableBook
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.state import TauStateSnapshot
@@ -86,6 +87,7 @@ class _Lifecycle:
     def __init__(self):
         self.approval_slots_active = True
         self.retractable_transfers = RetractableBook()
+        self.faucet_amount = 0
         self.rule_offers = RuleOfferLifecycleManager(
             accepted_clauses={(SENDER_B.lower(), STREAM): PREVIOUS_BODY}
         )
@@ -106,6 +108,9 @@ class _Lifecycle:
 
     def effective_eligibility_mode(self):
         return ""
+
+    fork = ConsensusLifecycleManager.fork
+    adopt = ConsensusLifecycleManager.adopt
 
 
 def _proposal(lifecycle):

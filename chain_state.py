@@ -14,6 +14,7 @@ import tau_native
 from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
 from consensus.lanes import TAU_EVALUATING_TX_TYPES
 from consensus.clause_registry import ClauseRegistry
+from consensus import faucet
 from consensus.fees import FeeRuleError
 from errors import DatabaseError
 from block import Block
@@ -493,6 +494,7 @@ _genesis_active_validators: list = []
 _genesis_vote_quorum: str = ""
 _genesis_eligibility_mode: str = ""
 _genesis_fee_beneficiary: str = ""
+_genesis_faucet_amount: int = 0
 # Genesis rule text, re-seeded on full rebuild so the replayed state hash
 # matches the mined chain (the reorg path replays only the new suffix, not
 # the genesis block, so its rules would otherwise be lost).
@@ -1154,6 +1156,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             _lifecycle_manager.quorum_policy = _genesis_vote_quorum
             _lifecycle_manager.eligibility_mode = _genesis_eligibility_mode
             _lifecycle_manager.fee_beneficiary = _genesis_fee_beneficiary
+            _lifecycle_manager.faucet_amount = _genesis_faucet_amount
             _lifecycle_manager.recompute_approval_threshold()
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
@@ -1495,7 +1498,7 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     # Remember the artifact's pre-funded accounts for rebuild/reorg seeding,
     # regardless of whether the DB is fresh or already provisioned.
     global _genesis_accounts_state, _genesis_active_validators, _genesis_vote_quorum
-    global _genesis_eligibility_mode, _genesis_fee_beneficiary
+    global _genesis_eligibility_mode, _genesis_fee_beneficiary, _genesis_faucet_amount
     global _genesis_application_rules, _genesis_consensus_rules
     _genesis_accounts_state = {
         k: int(v) for k, v in genesis_data.get("accounts_state", {}).items()
@@ -1505,6 +1508,13 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     _genesis_vote_quorum = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("vote_quorum", "")
     _genesis_eligibility_mode = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("eligibility_mode", "")
     _genesis_fee_beneficiary = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("fee_beneficiary", "")
+    from consensus.faucet import DEFAULT_FAUCET_AMOUNT, validate_faucet_amount
+    _faucet = (_gmeta.get("mechanism_specific_metadata", {}) or {}).get(
+        "faucet_amount", DEFAULT_FAUCET_AMOUNT)
+    _faucet_err = validate_faucet_amount(_faucet)
+    if _faucet_err:
+        raise ValueError(f"FATAL: genesis faucet_amount {_faucet_err}: {_faucet!r}")
+    _genesis_faucet_amount = _faucet
     _genesis_application_rules = genesis_data.get("application_rules", "")
     _genesis_consensus_rules = genesis_data.get("consensus_rules", "")
 
@@ -1553,16 +1563,14 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
             _lifecycle_manager.quorum_policy = meta.get("mechanism_specific_metadata", {}).get("vote_quorum", "")
             _lifecycle_manager.eligibility_mode = meta.get("mechanism_specific_metadata", {}).get("eligibility_mode", "")
             _lifecycle_manager.fee_beneficiary = meta.get("mechanism_specific_metadata", {}).get("fee_beneficiary", "")
+            _lifecycle_manager.faucet_amount = _genesis_faucet_amount
             # A fresh chain may ship with co-signature approval slots already
             # reserved (scripts/gen_genesis.py --approval-slots). One-way, so
             # this only ever turns it on.
             if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
                 _lifecycle_manager.activate_approval_slots()
-                # Persist immediately. TipAdmissionView reads this key, not the
-                # manager, so without it admission treats a genesis-activated
-                # chain as INACTIVE until the first block commits -- and rejects
-                # every co-signature policy in the meantime. Found by the
-                # live-node e2e.
+                # Persist immediately, so a restart before the first block
+                # still reads the flag back from the chain_state row.
                 try:
                     db.set_chain_state_value("approval_slots_active", "1")
                 except Exception:
@@ -1650,11 +1658,21 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
                 commit_state_to_db(_canonical_head_hash, good_num)
         
 def get_balance(address_hex: str) -> int:
-    """Returns the balance of the given address. Returns 0 if address not found."""
-    with _balance_lock:
-        if address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-            return int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
-        return _balances.get(address_hex, 0)
+    """The spendable balance: the stored balance, or the pending faucet grant
+    of an address with no account record."""
+    with _balance_lock, _sequence_lock:
+        return faucet.spendable(
+            _balances, _sequence_numbers, address_hex, faucet.amount(_lifecycle_manager)
+        )
+
+def get_balance_view(address_hex: str) -> tuple:
+    """(spendable balance, faucet_pending), read under one lock."""
+    with _balance_lock, _sequence_lock:
+        grant = faucet.amount(_lifecycle_manager)
+        return (
+            faucet.spendable(_balances, _sequence_numbers, address_hex, grant),
+            faucet.faucet_pending(_balances, _sequence_numbers, address_hex, grant),
+        )
 
 def get_committed_balance(address: str) -> int:
     """Raw committed balance lookup (no auto-faucet shim). Used for advisory
@@ -1673,18 +1691,18 @@ def update_balances_after_transfer(from_address_hex: str, to_address_hex: str, a
         print(f"[WARN][chain_state] Attempted to update balance with non-positive amount: {amount}")
         return False # Should have been caught by Tau
 
-    with _balance_lock:
-        current_from_balance = _balances.get(from_address_hex, 0)
-
-        if from_address_hex not in _balances and getattr(config, "TESTNET_AUTO_FAUCET", False):
-            current_from_balance = int(getattr(config, "TESTNET_AUTO_FAUCET_AMOUNT", 100000))
+    grant = faucet.amount(_lifecycle_manager)
+    with _balance_lock, _sequence_lock:
+        current_from_balance = faucet.spendable(
+            _balances, _sequence_numbers, from_address_hex, grant)
 
         # Enforce sufficient funds during balance updates to avoid negative balances
         if current_from_balance < amount:
             print(f"[ERROR][chain_state] Insufficient funds for {from_address_hex[:10]}... to send {amount}. Has: {current_from_balance}.")
             return False
 
-        current_to_balance = _balances.get(to_address_hex, 0)
+        current_to_balance = faucet.spendable(
+            _balances, _sequence_numbers, to_address_hex, grant)
         
         _balances[from_address_hex] = current_from_balance - amount
         _balances[to_address_hex] = current_to_balance + amount
@@ -1713,7 +1731,11 @@ def get_sequence_number(address_hex: str) -> int:
 
 def increment_sequence_number(address_hex: str):
     """Increments the sequence number for the given address."""
-    with _sequence_lock:
+    grant = faucet.amount(_lifecycle_manager)
+    with _balance_lock, _sequence_lock:
+        # A record made by the nonce alone still gets the grant.
+        if grant and not faucet.has_account(_balances, _sequence_numbers, address_hex):
+            _balances[address_hex] = grant
         _sequence_numbers[address_hex] = _sequence_numbers.get(address_hex, 0) + 1
 
 
@@ -2270,6 +2292,8 @@ def load_state_from_db() -> bool:
         _lifecycle_manager.fee_beneficiary = (
             _genesis_fee_beneficiary if persisted_beneficiary == _MISSING else persisted_beneficiary
         )
+        # Never persisted: the genesis is the only source, on every load.
+        _lifecycle_manager.faucet_amount = _genesis_faucet_amount
         persisted_budget = db.get_chain_state_value("max_rule_txs_per_block", _MISSING)
         if persisted_budget != _MISSING:
             try:

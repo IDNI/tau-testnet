@@ -6,7 +6,7 @@ node** or the P2P handshake rejects the peer (fork protection).
 
 | File | Purpose |
 |---|---|
-| `genesis.json` | pre-funded accounts, validator set, vote-quorum policy, base fee, block 0. `block_0.hash` = `1d8cad14…af6e`. |
+| `genesis.json` | pre-funded accounts, validator set, vote-quorum policy, base fee, faucet amount (100000), block 0. `block_0.hash` = `ebd27b9d…c096`. |
 | `env` | `TAU_NETWORK_ID` + bootnode multiaddr + listen address. Source it before running. |
 | `join.sh` | copies `genesis.json` into `data/`, loads `env`, starts the node. |
 

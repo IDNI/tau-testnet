@@ -83,8 +83,6 @@ class _NativeFeeE2EBase(unittest.TestCase):
 
         self.sender = pubkey_hex(SK_ALICE)
         chain_state._balances[self.sender] = 100000
-        self.original_faucet = getattr(config, "TESTNET_AUTO_FAUCET", False)
-        config.TESTNET_AUTO_FAUCET = False
         # The local miner proposes every block here, so it must be the (sole)
         # active validator: in-set for the W1 proposer gate, and the single
         # voter that reaches a 1-of-1 governance quorum in the fee-change tests.
@@ -119,7 +117,6 @@ class _NativeFeeE2EBase(unittest.TestCase):
         patch.stopall()
         tau_manager.tau_ready.clear()
         tau_manager.tau_direct_interface = None
-        config.TESTNET_AUTO_FAUCET = self.original_faucet
         if db._db_conn:
             db._db_conn.close()
             db._db_conn = None
