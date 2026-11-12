@@ -31,6 +31,8 @@ from consensus.rule_offers import STATUS_OFFERED, RuleOffer
 from consensus.state import TauStateSnapshot
 from consensus.tx_signing import signing_message_bytes
 
+pytestmark = pytest.mark.usefixtures("mock_policy_evaluators")
+
 HEIGHT = 20
 REASON = "temporal_reference"
 

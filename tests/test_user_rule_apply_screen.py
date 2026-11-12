@@ -16,6 +16,8 @@ from consensus.governance import ConsensusLifecycleManager
 from consensus.state import TauStateSnapshot
 from consensus.tx_signing import signing_message_bytes
 
+pytestmark = pytest.mark.usefixtures("mock_policy_evaluators")
+
 HEIGHT = 20
 TX_ID = "tx"
 FUNDS = 100000

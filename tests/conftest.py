@@ -7,6 +7,7 @@ import these instead of inlining their own listen-addr / connect / RPC helpers.
 from __future__ import annotations
 
 import errno
+import contextlib
 import os
 import sys
 import threading
@@ -68,7 +69,7 @@ def reset_tau_stream_types() -> Iterator[None]:
     Stream types are process-global and the first spec that types a stream
     pins it, so without this a test's outcome depends on which tests ran
     before it in the same process: one that types o5 as bv[16] leaves
-    genesis.tau (o5 pinned at bv[24]) uncompilable for the rest of the run.
+    every later bv[24] o5 spec uncompilable for the rest of the run.
     Interpreters already built keep their own streams. Tau builds that
     predate reset_definitions() are left as they are.
     """
@@ -249,6 +250,43 @@ def temp_database(tmp_path) -> Iterator[str]:
         db._db_conn.close()
         db._db_conn = None
     config.set_database_path(original_path)
+
+
+@pytest.fixture
+def mock_policy_evaluators() -> Iterator[None]:
+    """Serve o5 clause verdicts from the mock in both pools, whatever TAU_FORCE_TEST says."""
+    from consensus import sender_policy
+    from consensus.policy_mock import MockPolicyEvaluator
+
+    pools = ("apply", "admission")
+    for pool in pools:
+        sender_policy.set_evaluator(pool, MockPolicyEvaluator(pool=pool))
+    yield
+    for pool in pools:
+        sender_policy.set_evaluator(pool, None)
+
+
+@contextlib.contextmanager
+def chain_state_maps_restored() -> Iterator[None]:
+    """Put the shared balance, sequence and transfer-time maps back as they were."""
+    import chain_state
+
+    maps = [getattr(chain_state, name)
+            for name in ("_balances", "_sequence_numbers", "_last_transfer_ts")]
+    saved = [dict(m) for m in maps]
+    try:
+        yield
+    finally:
+        for m, contents in zip(maps, saved):
+            m.clear()
+            m.update(contents)
+
+
+@pytest.fixture(autouse=True)
+def restore_chain_state_maps() -> Iterator[None]:
+    """A test that credits an address directly must not change what a later test reads."""
+    with chain_state_maps_restored():
+        yield
 
 
 @pytest.fixture

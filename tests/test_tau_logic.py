@@ -58,6 +58,9 @@ class TestTauLogic(unittest.TestCase):
         cls.addClassCleanup(shutil.rmtree, cls._tmpdir, True)
         cls._db_path = os.path.join(cls._tmpdir, "test_tau_logic_db.sqlite")
         cls._orig_db_env = os.environ.get("TAU_DB_PATH")
+        cls._orig_force_test = os.environ.get("TAU_FORCE_TEST")
+        # Class cleanups run when setUpClass raises, where tearDownClass does not.
+        cls.addClassCleanup(cls._restore_environ)
         os.environ["TAU_DB_PATH"] = cls._db_path
         os.environ["TAU_FORCE_TEST"] = "0" # FORCE REAL ENGINE
         print("\n--- Starting Tau Manager for TestTauLogic ---")
@@ -140,6 +143,15 @@ class TestTauLogic(unittest.TestCase):
         print("[INFO] Rules loaded.")
 
     @classmethod
+    def _restore_environ(cls):
+        for name, original in (("TAU_FORCE_TEST", cls._orig_force_test),
+                               ("TAU_DB_PATH", cls._orig_db_env)):
+            if original is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = original
+
+    @classmethod
     def tearDownClass(cls):
         print("\n--- Stopping Tau Manager for TestTauLogic ---")
         if tau_manager.tau_direct_interface:
@@ -154,11 +166,6 @@ class TestTauLogic(unittest.TestCase):
         
         tau_manager.tau_ready.clear()
         tau_manager.server_should_stop.clear()
-        os.environ["TAU_FORCE_TEST"] = "1"
-        if cls._orig_db_env is None:
-            os.environ.pop("TAU_DB_PATH", None)
-        else:
-            os.environ["TAU_DB_PATH"] = cls._orig_db_env
 
     def _construct_stream_inputs(self, amount: int, balance: int, from_id_idx: int, to_id_idx: int) -> dict:
         """Construct input dictionary for i1, i2, i3, i4 (Amount, Bal, From, To)."""
