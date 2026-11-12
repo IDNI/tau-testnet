@@ -46,8 +46,9 @@ MAX_TRANSFER_VALUE = (1 << TRANSFER_VALUE_BV_WIDTH) - 1
 # o5 (user policy) and o8 (user custom fee) are the same width as the transfer
 # value streams. Per-stream bitvector typing is process-global and sticky: the
 # first unit that types o5 pins the interpreter, so a later bv[16] clause
-# leaves get_interpreter failing for everyone. Reject-unless-annotated
-# at admission and apply (consensus/approvals.py::screen_policy_widths).
+# leaves get_interpreter failing for everyone. User rules, clause bodies and
+# governance revisions are all reject-unless-annotated bv[24] at admission and
+# apply (consensus/approvals.py::screen_policy_widths).
 # o9 is pinned by the shipped genesis consensus rules; advertised here so
 # wallets stop scraping rule text for widths.
 USER_POLICY_BV_WIDTH = 24

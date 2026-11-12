@@ -565,6 +565,16 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
     return None
 
 
+def revision_policy_width_error(revisions) -> Optional[str]:
+    """Why a consensus revision cannot be accepted for o5/o8 typing, else None."""
+    for revision in revisions or []:
+        if isinstance(revision, str):
+            error = screen_policy_widths(revision)
+            if error:
+                return error
+    return None
+
+
 def _temporal_backreference(revisions):
     """The first stream reference whose time expression is not exactly `t`.
 
@@ -639,6 +649,14 @@ def validate_consensus_rule_update_payload(tx: Dict, tip_view: TipAdmissionView)
             "it cannot reproduce that history; such a revision is refused until "
             "verification replays the execution journal.",
             code="TEMPORAL_CONSENSUS_RULE",
+        )
+
+    width_error = revision_policy_width_error(tx["rule_revisions"])
+    if width_error:
+        return format_error(
+            f"consensus rule revision: {width_error}",
+            code="WIDTH_MISMATCH",
+            **(_width_mismatch_details(width_error) or {}),
         )
 
     h_activate = tx.get("activate_at_height")

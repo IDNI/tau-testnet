@@ -292,62 +292,32 @@ emit(res)
 
 
 # ---------------------------------------------------------------------------
-# 5. The genesis o5 type pin (issue #41)
+# 4. The genesis application rule leaves o5 to user policy rules
 # ---------------------------------------------------------------------------
 
 @requires_native
-def test_genesis_type_pin_holds_o5_at_bv24(tmp_path):
-    """`genesis.tau` carries `(o5[t]:bv[24] = o5[t]:bv[24])`, which pins the
-    policy stream's width without constraining its verdict.
-
-    Issue #41: the first accepted unit that mentions o5 used to type it for the
-    whole process, so one bv[16] wallet rule locked every documented bv[24]
-    rule out of the network. The genesis conjunct makes the width a property of
-    the chain instead of a race between wallets -- the ENGINE now rejects a
-    bv[16] unit, independently of the textual `screen_policy_widths` gate.
-
-    It has to be a tautology. A constraining form (`o5[t] = 1`) types the
-    stream too, but goes unsatisfiable against the first user policy rule --
-    pinned below so nobody "simplifies" the conjunct into one.
-
-    The subtle risk is section 2 above: a stream that any rule MENTIONS
-    materializes with an arbitrary witness, and for o5 that witness is 0 =
-    USER_POLICY_BLOCK_VALUE. The tautology normalizes away after type
-    inference, so o5 stays absent until a real policy rule lands. If that ever
-    changes, this test fails and every transfer on the network is blocked.
+def test_genesis_leaves_o5_absent_until_a_policy_rule_lands(tmp_path):
+    """The genesis rule composes with a typed o5 unit and does not itself emit
+    o5. An o5 that materialized from genesis alone would carry the arbitrary
+    witness 0 of section 2, which is USER_POLICY_BLOCK_VALUE and blocks every
+    transfer on the network.
     """
-    with open(os.path.join(REPO_ROOT, "genesis.tau"), encoding="utf-8") as fh:
-        genesis_tau = fh.read().strip()
-    assert "o5[t]:bv[24]" in genesis_tau, (
-        "genesis.tau no longer pins o5's width; issue #41 is re-opened"
-    )
-
-    proc, parsed = _run_child(tmp_path, "genesis_pin", r'''
+    proc, parsed = _run_child(tmp_path, "genesis_o5", r'''
 res = {}
 tau_mod = tau_native.load_tau_module()
 GENESIS = open(os.path.join(os.environ["REPO_ROOT"], "genesis.tau")).read().strip()
 
 def build(spec):
     itp = tau_mod.get_interpreter(tau_native.TauInterface.preprocess_spec_text(spec))
-    return bool(itp), tau_native.report_errors(itp.report)[:200]
+    return bool(itp)
 
 def user_unit(width, val):
     return ("(" + guard(A) + " -> (o5[t]:bv[" + str(width) + "] = { #x" + val
             + " }:bv[" + str(width) + "]))")
 
-# (a) Genesis alone, and against a correctly-typed and a bv[16] user unit.
-res["genesis_alone"], _ = build("always ( " + GENESIS + " ).")
-res["genesis_user24"], _ = build("always ( " + GENESIS + " && " + user_unit(24, "000000") + " ).")
-res["genesis_user16"], res["genesis_user16_err"] = build(
-    "always ( " + GENESIS + " && " + user_unit(16, "0000") + " ).")
+res["genesis_alone"] = build("always ( " + GENESIS + " ).")
+res["genesis_user24"] = build("always ( " + GENESIS + " && " + user_unit(24, "000000") + " ).")
 
-# (b) Why a tautology and not `o5[t] = 1`: the constraining form is unsat
-#     against the very first user policy rule.
-res["constraining_vs_user"], _ = build(
-    "always ( " + o5("000001") + " && " + user_unit(24, "000000") + " ).")
-
-# (c) o5 must NOT materialize from the genesis mention alone (section 2):
-#     a witness of 0 here would block every transfer on the network.
 def boot(extra=""):
     f = tempfile.NamedTemporaryFile("w", suffix=".tau", delete=False)
     f.write(GENESIS + extra + "\n"); f.close()
@@ -357,7 +327,6 @@ iface = boot()
 res["o5_before_any_rule"] = {who: str(sender_step(iface, pk).get(5))
                              for who, pk in (("A", A), ("B", B))}
 
-# (d) ...and once a real policy rule lands, isolation still works.
 iface2 = boot()
 iface2.communicate(
     rule_text="always ( (" + guard(A) + " ? " + o5("000000") + " : " + o5("000001") + ") ).",
@@ -372,24 +341,8 @@ emit(res)
     assert parsed["genesis_user24"] is True, (
         f"genesis no longer composes with a correctly typed policy rule: {parsed}"
     )
-
-    # The pin doing its job: the engine itself refuses the bv[16] unit.
-    assert parsed["genesis_user16"] is False, (
-        f"a bv[16] o5 unit still compiles against genesis; #41 is re-opened: {parsed}"
-    )
-    assert parsed["genesis_user16_err"], "the refusal carries no engine error text"
-
-    # Why it must stay a tautology.
-    assert parsed["constraining_vs_user"] is False, (
-        "a constraining genesis o5 unit now composes with a user policy rule; "
-        f"only then would `o5[t] = 1` be a safe genesis form: {parsed}"
-    )
-
-    # The network-blocking regression guard.
     assert parsed["o5_before_any_rule"] == {"A": "None", "B": "None"}, (
-        "o5 now materializes from the genesis mention alone -- an unconstrained "
+        "o5 materializes from the genesis rule alone -- an unconstrained "
         f"witness of 0 blocks every transfer on the network: {parsed}"
     )
-
-    # Isolation unchanged by the pin.
     assert parsed["o5_after_A_rule"] == {"A": "0", "B": "1"}, parsed

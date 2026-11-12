@@ -33,8 +33,8 @@ from consensus.governance import ConsensusLifecycleManager, normalize_validator_
 GENESIS_PATH = os.path.join(project_root, "networks", "tau-testnet-v2", "genesis.json")
 
 # ─── Golden Vectors (computed deterministically from data/genesis.json) ───
-EXPECTED_BLOCK_HASH = "35faee3b5652e30c9b5a9adb89bdf3c2312ff0cef833adf57ebd9566ceeaf1a7"
-EXPECTED_STATE_HASH = "aebbc5045c868c8a8aac7a2ab8765c2541a31edc25509efeaa0376810bcee105"
+EXPECTED_BLOCK_HASH = "1d8cad145da49a4e980d8d5f8e56b4dcf264edfb51ac11f285faaa3b91f4af6e"
+EXPECTED_STATE_HASH = "43d1d0d330c541b1a1f62788e3f66de63f1ed96845c7152e36e06fbcc54b2fec"
 EXPECTED_ACCOUNTS_HASH = "fa0b485d4a4cfd4a845226cd965cb996b9d0994764b64daca30459b99dd2b323"
 EXPECTED_META_HASH = "6e2c9124c55841f0bd61af7396fd627ecd296eb802ea10bd228b5def80fe9a77"
 

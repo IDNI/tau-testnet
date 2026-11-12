@@ -108,8 +108,8 @@ def test_a_changed_canonical_spec_reseeds_the_advisory_evaluator():
     try:
         advisor.evaluate(_router(), {1: "#x000001"}, target=5)
         first = advisor._fingerprint
-        other = _router().replace("o5[t]:bv[24] = o5[t]:bv[24]",
-                                  "o5[t]:bv[24] = o5[t]:bv[24] && o8[t]:bv[24] = o8[t]:bv[24]")
+        other = _router().replace("o0[t] = 1)",
+                                  "o0[t] = 1) && (o8[t]:bv[24] = o8[t]:bv[24])")
         advisor.evaluate(other, {1: "#x000001"}, target=5)
         assert advisor._fingerprint != first
     finally:
@@ -145,6 +145,7 @@ def test_every_evaluator_call_site_is_classified():
     `_apply_block` is listed because the governance activation drives the
     manager directly when no proposal owns the block -- the committed path.
     """
+    import ast
     import re
 
     source = open(os.path.join(REPO, "consensus", "engine.py")).read()
@@ -155,19 +156,21 @@ def test_every_evaluator_call_site_is_classified():
         if m:
             owners.append((i, m.group(1)))
 
-    def owner_of(idx):
-        found = None
-        for i, name in owners:
-            if i <= idx:
-                found = name
-            else:
-                break
-        return found
-
     direct = set()
-    for i, line in enumerate(lines):
-        if "tau_manager.communicate_with_tau" in line and not line.strip().startswith("#"):
-            direct.add(owner_of(i))
+
+    def visit(node, owner):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, child.name)
+                continue
+            if (isinstance(child, ast.Attribute)
+                    and isinstance(child.value, ast.Name)
+                    and child.value.id == "tau_manager"
+                    and child.attr.startswith("communicate_with_tau")):
+                direct.add(owner)
+            visit(child, owner)
+
+    visit(ast.parse(source), None)
 
     authoritative = {"_apply_block"}
     isolated_with_fallback = {"query_eligibility", "verify_block_header"}

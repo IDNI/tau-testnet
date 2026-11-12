@@ -24,7 +24,9 @@ reappear unnoticed.
 """
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -121,6 +123,42 @@ class TestGenesisApplicationRule(unittest.TestCase):
                 )
                 # Block.from_dict must agree too.
                 self.assertEqual(Block.from_dict(g["block_0"]).block_hash, g["block_0"]["hash"])
+
+    def test_shipped_artifact_equals_generator_output_for_its_own_settings(self):
+        """Rules, hashes and block 0 all follow from the rule files and the
+        artifact's own settings, so a hand-edit or a stale regeneration shows."""
+        shipped_path = TRACKED_GENESIS_JSON[0]
+        shipped = json.loads(Path(shipped_path).read_text(encoding="utf-8"))
+        meta = shipped["consensus_meta"]
+        mech = meta.get("mechanism_specific_metadata") or {}
+        default_addr = None
+        extra = []
+        for addr, bal in shipped["accounts_state"].items():
+            if default_addr is None:
+                default_addr = addr
+                default_bal = int(bal)
+            else:
+                extra += ["--account", f"{addr}:{bal}"]
+        cmd = [sys.executable, os.path.join(project_root, "scripts", "gen_genesis.py"),
+               "--genesis-address", default_addr,
+               "--genesis-balance", str(default_bal),
+               "--network-id", shipped["network_id"],
+               "--base-fee", "10",
+               "--vote-quorum", mech.get("vote_quorum", "supermajority"),
+               "--eligibility-mode", mech.get("eligibility_mode", "validator_set"),
+               "--fee-beneficiary", mech.get("fee_beneficiary") or "proposer"]
+        for key in meta["active_validators"]:
+            cmd += ["--validator-key", key]
+        if mech.get("approval_slots_active"):
+            cmd.append("--approval-slots")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "genesis.json")
+            subprocess.run(cmd + extra + ["--out", out], cwd=project_root,
+                           check=True, capture_output=True, timeout=120)
+            regenerated = json.loads(Path(out).read_text(encoding="utf-8"))
+        self.assertEqual(shipped["application_rules"], regenerated["application_rules"])
+        self.assertEqual(shipped["consensus_rules"], regenerated["consensus_rules"])
+        self.assertEqual(shipped, regenerated)
 
 
 if __name__ == "__main__":

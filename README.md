@@ -199,7 +199,7 @@ tau-testnet --host localhost status      # node started via Docker (CLI installe
 
 > The Docker image ships only the node, not the `tau-testnet` CLI. To query a Docker node, install the client on the host with `pip install -e .` (no `tau-lang` build needed — the CLI is a thin RPC client), or just read the container's foreground logs.
 
-A rising `head_number` means you are syncing. If it stays at 0, the handshake was rejected — confirm `TAU_NETWORK_ID=tau-testnet-v2` and that `data/genesis.json` matches the committed profile (`block_0.hash` = `35faee3b…f1a7`). The node logs the exact reason for any mismatch.
+A rising `head_number` means you are syncing. If it stays at 0, the handshake was rejected — confirm `TAU_NETWORK_ID=tau-testnet-v2` and that `data/genesis.json` matches the committed profile (`block_0.hash` = `1d8cad14…af6e`). The node logs the exact reason for any mismatch.
 
 ### Run as a validator
 
@@ -492,7 +492,7 @@ Fees are sourced from the Tau consensus rules and votable by validators — no s
 
 ## Governance
 
-Consensus rules and the validator set change **only** through on-chain governance. A `consensus_rule_update` carries the full new consensus spec (plus an optional `host_contract_patch` for validator add/remove); `consensus_rule_vote`s approve it. Update identity is `update_id = BLAKE3(rule_revisions, activate_at_height, host_contract_patch)` (signature / sequence / fee excluded), so the id is canonical and collision-resistant.
+Consensus rules and the validator set change **only** through on-chain governance. A `consensus_rule_update` carries the full new consensus spec (plus an optional `host_contract_patch` for validator add/remove); `consensus_rule_vote`s approve it. Update identity is `update_id = BLAKE3(rule_revisions, activate_at_height, host_contract_patch)` (signature / sequence / fee excluded), so the id is canonical and collision-resistant. A revision that mentions `o5` or `o8` must type every mention `bv[24]`; admission refuses it with `WIDTH_MISMATCH`, and block apply does not record it.
 
 **Lifecycle:**
 
