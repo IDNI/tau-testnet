@@ -10,7 +10,6 @@ from unittest.mock import PropertyMock, patch
 import pytest
 
 import chain_state
-import config
 import db
 import tau_admission
 from commands import checktx
@@ -67,7 +66,7 @@ class _Standby:
 
 
 @pytest.fixture
-def node(temp_database, monkeypatch):
+def node(temp_database, mock_policy_evaluators, monkeypatch):
     """Worker-backed admission with a fake worker, and a real database."""
     # o5 allows, except where a test needs a policy that asks for approval.
     script = {"steps": [], "revisions": [], "built": 0, "disposed": 0, "o5": "1"}
@@ -99,7 +98,6 @@ def node(temp_database, monkeypatch):
     ]
     mocks = [p.start() for p in patches]
     mocks[3].is_set.return_value = True
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False)
     monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
     monkeypatch.setitem(chain_state._balances, RECIPIENT, 1_000_000)
     yield script, standby

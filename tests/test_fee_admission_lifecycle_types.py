@@ -10,7 +10,6 @@ from unittest.mock import PropertyMock, patch
 import pytest
 
 import chain_state
-import config
 import db
 from consensus.admission import TipAdmissionView
 from consensus.rule_offers import RuleOffer
@@ -28,7 +27,7 @@ OFFER_RULE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
 
 
 @pytest.fixture
-def node(temp_database, monkeypatch):
+def node(temp_database, mock_policy_evaluators, monkeypatch):
     """A real database, real signatures, and a Tau with a flat fee."""
     from commands import sendtx
 
@@ -55,7 +54,6 @@ def node(temp_database, monkeypatch):
     ]
     mocks = [p.start() for p in patches]
     mocks[0].is_set.return_value = True
-    monkeypatch.setattr(config, "TESTNET_AUTO_FAUCET", False)
     monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
     monkeypatch.setitem(chain_state._balances, RECIPIENT, 1_000_000)
     yield sendtx, script

@@ -2,8 +2,7 @@
 
 Apply reads the flag of the lifecycle manager. The chain_state row of the
 database can differ from it, so admission must not read the row. The policy is
-an unguarded o5 rule: it is a routed clause while the slots are active, and an
-unscoped rule otherwise.
+an unguarded o5 rule: it is a routed clause whatever the slot flag says.
 """
 import pytest
 
@@ -61,7 +60,7 @@ def test_admission_and_apply_agree_on_an_unguarded_policy(tip_state, database, l
     accepted_at_apply = result.accepted_tx_ids == [TX_ID]
     assert admitted.is_valid == accepted_at_apply, (
         admitted.code, admitted.error, _outcome(result).reason)
-    assert admitted.is_valid == lifecycle
+    assert admitted.is_valid
 
 
 @pytest.mark.parametrize("database,lifecycle", STATES)

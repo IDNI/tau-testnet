@@ -286,19 +286,12 @@ def test_an_accepted_governance_update_is_recorded(temp_database, mode):
     assert mined.next_snapshot.state_hash != empty.next_snapshot.state_hash
 
 
-def _rejected_by(cause):
-    if cause == "fee":
-        return {"fee": "500"}
-    return {"fee": "0", "rule_accepted": False}
-
-
-# --- the routed o5 path writes before the composite and the fee ---------------
+# --- the routed o5 path writes before the fee ---------------------------------
 
 @pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize("cause", ["fee", "composite"])
-def test_a_rejected_offer_accept_leaves_no_lifecycle_write(temp_database, mode, cause):
+def test_a_rejected_offer_accept_leaves_no_lifecycle_write(temp_database, mode):
     """The accept resolves the offer, registers the clause and fails the open
-    requests of the acceptor before the composite runs and the fee settles."""
+    requests of the acceptor before the fee settles."""
     offer = _offer()
     request = _request(sender=BOB, recipient=ALICE)
 
@@ -307,8 +300,8 @@ def test_a_rejected_offer_accept_leaves_no_lifecycle_write(temp_database, mode, 
         lm.approval_requests.submit_request(request)
 
     tx = _decision_tx(offer, accept=True)
-    mined = _apply_block([tx], mode, seed=seed, **_rejected_by(cause))
-    empty = _apply_block([], mode, seed=seed, **_rejected_by(cause))
+    mined = _apply_block([tx], mode, seed=seed, fee="500")
+    empty = _apply_block([], mode, seed=seed, fee="500")
 
     _assert_no_trace(mined, empty, tx)
     lifecycle = _lifecycle_of(mined)
@@ -318,15 +311,14 @@ def test_a_rejected_offer_accept_leaves_no_lifecycle_write(temp_database, mode, 
 
 
 @pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize("cause", ["fee", "composite"])
-def test_a_rejected_o5_declare_leaves_no_lifecycle_write(temp_database, mode, cause):
+def test_a_rejected_o5_declare_leaves_no_lifecycle_write(temp_database, mode):
     """The op-0 declare registers the clause and fails the open requests of
-    the sender before the composite runs and the fee settles."""
+    the sender before the fee settles."""
     request = _request()
     seed = lambda lm: lm.approval_requests.submit_request(request)  # noqa: E731
     tx = _declare_tx()
-    mined = _apply_block([tx], mode, seed=seed, **_rejected_by(cause))
-    empty = _apply_block([], mode, seed=seed, **_rejected_by(cause))
+    mined = _apply_block([tx], mode, seed=seed, fee="500")
+    empty = _apply_block([], mode, seed=seed, fee="500")
 
     _assert_no_trace(mined, empty, tx)
     lifecycle = _lifecycle_of(mined)

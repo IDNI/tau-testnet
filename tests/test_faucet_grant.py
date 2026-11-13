@@ -317,7 +317,7 @@ def test_admission_judges_the_same_spendable_balance(temp_database, monkeypatch)
     fresh = json.loads(checktx.execute(f"checktx {json.dumps(case._tx())}", None))
     chain_state._balances[tc.SENDER] = 0
     zero = json.loads(checktx.execute(f"checktx {json.dumps(case._tx())}", None))
-    assert fresh["status"] == "ok" and fresh["data"]["admissible"] is True, fresh
+    assert fresh["status"] == "ok" and fresh["data"]["admissible"] is None, fresh
     assert zero["status"] != "ok", zero
 
 

@@ -146,7 +146,8 @@ class TestGenesisApplicationRule(unittest.TestCase):
                "--base-fee", "10",
                "--vote-quorum", mech.get("vote_quorum", "supermajority"),
                "--eligibility-mode", mech.get("eligibility_mode", "validator_set"),
-               "--fee-beneficiary", mech.get("fee_beneficiary") or "proposer"]
+               "--fee-beneficiary", mech.get("fee_beneficiary") or "proposer",
+               "--faucet-amount", str(mech.get("faucet_amount", 0))]
         for key in meta["active_validators"]:
             cmd += ["--validator-key", key]
         if mech.get("approval_slots_active"):
