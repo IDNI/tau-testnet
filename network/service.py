@@ -17,6 +17,7 @@ from .dht_manager import DHTManager
 from .discovery import DiscoveryManager
 from .gossip import GossipManager
 from commands import sendtx
+from consensus.json_numbers import loads_strict
 
 logger = logging.getLogger(__name__)
 
@@ -921,7 +922,7 @@ class NetworkService:
             
         # Stage 3: Lightweight Structural Check
         try:
-            p_dict = json.loads(payload_str)
+            p_dict = loads_strict(payload_str)
         except Exception:
             return
             
@@ -1996,7 +1997,7 @@ class NetworkService:
                     stream, 2 * 1024 * 1024, read_timeout=SYNC_READ_TIMEOUT
                 )
             await close_stream_safely(stream)
-            resp = json.loads((resp_raw or b"{}").decode())
+            resp = loads_strict((resp_raw or b"{}").decode())
             headers = resp.get("headers") or []
         except Exception:
             logger.warning("Failed to sync headers from %s", peer_id, exc_info=True)
@@ -2104,7 +2105,7 @@ class NetworkService:
             if len(hashes) == 1:
                 raise BlockOverReplyCap(hashes[0], [])
         else:
-            resp = json.loads((resp_raw or b"{}").decode())
+            resp = loads_strict((resp_raw or b"{}").decode())
             blocks = list(resp.get("blocks") or [])
             remaining = _remaining_hashes_after_partial(hashes, blocks)
             if remaining:

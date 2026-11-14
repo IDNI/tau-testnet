@@ -11,7 +11,8 @@ import db
 import block
 import chain_state
 import config
-from errors import EvaluatorLost
+from errors import BlockByteCapExceeded, BlockNumberInvalid, EvaluatorLost
+from consensus.json_numbers import loads_strict, number_error
 from consensus.state import compute_state_hash
 from consensus.lanes import TAU_EVALUATING_TX_TYPES
 
@@ -34,6 +35,43 @@ try:
     _BLS_AVAILABLE = True
 except ImportError:
     _BLS_AVAILABLE = False
+
+
+def _fit_transactions_to_byte_cap(
+    transactions: List[Dict],
+    execution_transactions: List[Dict],
+    filtered_reserved_ids: List[int],
+    *,
+    block_number: int,
+    previous_hash: str,
+    proposer_pubkey: str,
+    timestamp: int,
+) -> tuple[List[Dict], List[Dict], List[int]]:
+    """Longest prefix of transactions that fits ``MAX_BLOCK_BYTES``."""
+    state_hash_placeholder = block.EMPTY_STATE_HASH
+    total_bytes = block.block_storage_json_bytes(
+        block.Block.create(
+            block_number=block_number,
+            previous_hash=previous_hash,
+            transactions=[],
+            proposer_pubkey=proposer_pubkey,
+            timestamp=timestamp,
+            state_hash=state_hash_placeholder,
+            state_locator=f"{config.STATE_LOCATOR_NAMESPACE}:{state_hash_placeholder}",
+            consensus_proof="f" * 192,
+        )
+    )
+    kept_tx: List[Dict] = []
+    kept_exec: List[Dict] = []
+    kept_ids: List[int] = []
+    for tx, ex, rid in zip(transactions, execution_transactions, filtered_reserved_ids):
+        total_bytes += block.transaction_json_bytes_in_block(tx, first=not kept_tx)
+        if total_bytes > block.MAX_BLOCK_BYTES:
+            break
+        kept_tx.append(tx)
+        kept_exec.append(ex)
+        kept_ids.append(rid)
+    return kept_tx, kept_exec, kept_ids
 
 
 def execute_batch(transactions: List[Dict], reserved_ids: List[int], block_timestamp: int):
@@ -560,7 +598,10 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
             if clean_data.startswith("json:"):
                 clean_data = clean_data[5:]
             
-            tx = json.loads(clean_data)
+            tx = loads_strict(clean_data)
+            bad_number = number_error(tx)
+            if bad_number:
+                raise ValueError(f"transaction {bad_number}")
             # Ensure every tx has a stable identifier so the consensus engine can
             # report acceptance/rejection. Keep this synthetic ID out of the
             # persisted block body so tx_ids remains the canonical ID surface.
@@ -570,7 +611,7 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
             transactions.append(tx)
             execution_transactions.append(execution_tx)
             filtered_reserved_ids.append(r_id)
-        except json.JSONDecodeError as e:
+        except ValueError as e:
             print(f"[WARN][createblock] Skipping invalid JSON transaction #{i+1}: {e}")
             skipped_count += 1
             # Not added to the filtered lists, so they stay aligned. Disposal
@@ -581,7 +622,7 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
 
     # Drop the unparseable rows now. Unlike the engine's accept/reject verdicts
     # (which depend on the parent state and so do not survive a lost race), "this
-    # payload is not JSON" is final. Left in place they would sit `reserved`,
+    # payload is not valid JSON" is final. Left in place they would sit `reserved`,
     # recycle through the 60s stale sweep forever, and consume a slot in every
     # reservation batch. Record them first so gettxstatus reports `rejected`
     # rather than `unknown`.
@@ -595,6 +636,29 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
             db.record_dropped_txs(malformed_hashes, "rejected")
         db.remove_transactions(malformed_ids)
         reserved_ids = [i for i in reserved_ids if i not in _malformed]
+
+    ids_before_cap = filtered_reserved_ids
+    transactions, execution_transactions, filtered_reserved_ids = (
+        _fit_transactions_to_byte_cap(
+            transactions,
+            execution_transactions,
+            filtered_reserved_ids,
+            block_number=block_number,
+            previous_hash=previous_hash,
+            proposer_pubkey=config.MINER_PUBKEY,
+            timestamp=block_timestamp,
+        )
+    )
+    kept_after_cap = set(filtered_reserved_ids)
+    cap_dropped_ids = [i for i in ids_before_cap if i not in kept_after_cap]
+    if cap_dropped_ids:
+        print(
+            f"[INFO][createblock] Byte cap dropped {len(cap_dropped_ids)} "
+            f"transaction(s), kept {len(filtered_reserved_ids)}"
+        )
+        db.unreserve_mempool_txs(cap_dropped_ids)
+        cap_dropped = set(cap_dropped_ids)
+        reserved_ids = [i for i in reserved_ids if i not in cap_dropped]
 
     if not transactions and not empty_ok:
         msg = "Mempool is empty (no valid pending txs); no block produced."
@@ -755,10 +819,20 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
             # this the node would unwind over something node-local.
             with tau_proposal.boundary(sim_proposal, label="createblock"):
                 # Call the unified path
-                apply_result = engine.apply_block(
-                    active_view, candidate_block, parent_snapshot,
-                    session=sim_session, proposal=sim_proposal,
-                )
+                try:
+                    apply_result = engine.apply_block(
+                        active_view, candidate_block, parent_snapshot,
+                        session=sim_session, proposal=sim_proposal,
+                    )
+                except (BlockByteCapExceeded, BlockNumberInvalid) as exc:
+                    db.unreserve_mempool_txs(reserved_ids)
+                    if sim_proposal is not None:
+                        try:
+                            sim_proposal.dispose()
+                        except Exception:
+                            pass
+                    print(f"[ERROR][createblock] Block rejected: {exc}")
+                    return {"error": str(exc), "message": str(exc)}
         finally:
             # Deliberately NOT disposed here. The worker that evaluated this
             # block is what ingestion reuses instead of evaluating it again, so
@@ -855,6 +929,18 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
                     pass
             msg = f"Failed to sign block: {e}"
             return {"error": msg, "message": msg}
+
+        over = block.block_validity_reason(candidate_block)
+        if over:
+            import db as _db
+            _db.unreserve_mempool_txs(reserved_ids)
+            if sim_proposal is not None:
+                try:
+                    sim_proposal.dispose()
+                except Exception:
+                    pass
+            print(f"[ERROR][createblock] {over}")
+            return {"error": over, "message": over}
 
         # Hand the evaluated block to ingestion instead of making it evaluate the
         # block again. The artifact is keyed on the block AS IT WILL BE
