@@ -591,7 +591,8 @@ def test_an_unconsumed_candidate_is_incomplete_not_accepted(tmp_path):
 @pytest.mark.skipif(not _native_available(), reason="native tau module not built")
 def test_a_real_revision_past_its_deadline_is_a_timeout(tmp_path):
     """A sender-guarded chain over this many authors compiles for several
-    seconds, far past the one-second deadline."""
+    seconds, far past the one-second deadline (80 authors took 3.4 s and 20
+    only 0.75 s on a desktop in 2026-11)."""
     def bv24(n):
         return "{ #x" + format(n, "06x") + " }:bv[24]"
 
@@ -612,7 +613,7 @@ def test_a_real_revision_past_its_deadline_is_a_timeout(tmp_path):
 
     clauses = {
         key("ab", i): clause(key("ca", i), key("cb", i), key("cc", i))
-        for i in range(20)
+        for i in range(80)
     }
     chain = o5(1)
     for author in sorted(clauses, reverse=True):
