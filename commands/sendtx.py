@@ -1343,8 +1343,13 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                 if tx_type == TX_TYPE_APPROVAL_REQUEST:
                     from commands.getapprovalpreview import _o5_allows
 
-                    # Apply drops a request whose transfer the policy already allows.
-                    if _o5_allows(fee_outputs):
+                    # Apply drops a request whose transfer the policy already
+                    # allows: the o5 rules and the sender's own clause, which
+                    # the registry holds apart from the step.
+                    if _o5_allows(fee_outputs) and not _sender_clause_blocks(
+                        tip_view, sender_pubkey, fee_query_inputs,
+                        admission_tau.budget,
+                    )[0]:
                         return _qt_err(
                             "APPROVAL_NOT_NEEDED",
                             "The sender's policy allows this transfer with no votes. "
