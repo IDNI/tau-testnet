@@ -14,8 +14,10 @@ import json
 
 import api_response
 import db
+import tau_defs
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
+    RULE_CHANGE_TX_TYPES,
     STATUS_NAMES,
     STATUS_OPEN,
     ApprovalShapeError,
@@ -40,6 +42,7 @@ def _row_view(row: dict) -> dict:
     voted = row.get("voted") or {}
     declined = set(row.get("declined") or [])
     return {
+        "request_type": "transfer",
         "request_id": row["request_id"],
         "sender_pubkey": row["sender_pubkey"],
         "recipient_pubkey": row["recipient_pubkey"],
@@ -64,6 +67,58 @@ def _row_view(row: dict) -> dict:
     }
 
 
+KIND_NAMES = {
+    tau_defs.RULE_CHANGE_KIND_SET_POLICY: "set_policy",
+    tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY: "revoke_policy",
+    tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER: "accept_offer",
+    tau_defs.RULE_CHANGE_KIND_SET_GUARD: "set_guard",
+    tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD: "revoke_guard",
+}
+
+
+def _rule_change_view(row: dict) -> dict:
+    """One rule-change request, as a client wants to see it."""
+    from consensus.serialization import compute_rule_change_body_hash
+
+    approvers = row.get("approvers") or {}
+    voted = {int(k) for k in (row.get("voted") or {})}
+    declined = {int(d) for d in (row.get("declined") or [])}
+    kind = int(row["kind"])
+    created = int(row.get("created_height", 0))
+    return {
+        "request_type": "rule_change",
+        "request_id": row["request_id"],
+        "sender": row["sender_pubkey"],
+        "sender_pubkey": row["sender_pubkey"],
+        "kind": kind,
+        "kind_name": KIND_NAMES.get(kind, "unknown"),
+        # Kind 3 shows the exact raw offered text; kinds 1 and 4 the normalized body.
+        "body": row.get("body", ""),
+        "body_hash": compute_rule_change_body_hash(row.get("body", "")).hex(),
+        "offer_id": row.get("offer_id", ""),
+        "approvers": {
+            str(slot): {
+                "pubkey": pubkey,
+                "state": ("approved" if int(slot) in voted
+                          else "declined" if int(slot) in declined
+                          else "awaiting"),
+            }
+            for slot, pubkey in sorted(approvers.items())
+        },
+        "voted": sorted(voted),
+        "declined": sorted(declined),
+        "ready": bool(row.get("ready")),
+        "created_height": created,
+        "escape_height": created + tau_defs.RULE_CHANGE_DELAY_BLOCKS,
+        "expire_at_height": int(row.get("expire_at_height", 0)),
+        "status": STATUS_NAMES.get(int(row.get("status", 0)), "unknown"),
+    }
+
+
+def request_view(row: dict) -> dict:
+    return _rule_change_view(row) if "kind" in row else _row_view(row)
+
+
 def _mempool_requests(address: str) -> list:
     """Requests and votes from or about this address, queued but not yet mined."""
     pending = []
@@ -79,7 +134,9 @@ def _mempool_requests(address: str) -> list:
             tx = json.loads(text)
         except Exception:
             continue
-        if not isinstance(tx, dict) or tx.get("tx_type") not in APPROVAL_TX_TYPES:
+        if not isinstance(tx, dict) or tx.get("tx_type") not in (
+            APPROVAL_TX_TYPES | RULE_CHANGE_TX_TYPES
+        ):
             continue
         parties = {str(tx.get("sender_pubkey", "")).lower()}
         parties.update(str(v).lower() for v in (tx.get("approvers") or {}).values())
@@ -90,6 +147,7 @@ def _mempool_requests(address: str) -> list:
                 "request_id": tx.get("request_id"),
                 "amount": tx.get("amount"),
                 "approve": tx.get("approve"),
+                **({"kind": tx.get("kind")} if "kind" in tx else {}),
             })
     return pending
 
@@ -119,6 +177,7 @@ def execute(raw_command: str, container):
         return _inactive_response()
 
     incoming = [_row_view(r) for r in tip.open_requests_naming(address)]
+    incoming += [_rule_change_view(r) for r in tip.open_rule_changes_naming(address)]
 
     outgoing = []
     try:
@@ -128,6 +187,15 @@ def execute(raw_command: str, container):
             full = tip.get_approval_request(row["request_id"])
             if full:
                 outgoing.append(_row_view(full))
+    except Exception:
+        pass
+    try:
+        for row in db.load_rule_change_requests() or []:
+            if str(row.get("sender_pubkey", "")).lower() != address:
+                continue
+            full = tip.get_rule_change_request(row["request_id"])
+            if full:
+                outgoing.append(_rule_change_view(full))
     except Exception:
         pass
 

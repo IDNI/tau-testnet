@@ -132,17 +132,28 @@ def _recipient(tag):
     return bls.SkToPk(bls.KeyGen(tag.encode().ljust(32, b"_"))).hex()
 
 
-def _history_policy(pk, previous="000007"):
-    """`pk` is blocked when the PREVIOUS step's amount was `previous`.
+HIGH_FEE_LIMIT = "1000"
 
-    Total form on every branch: a bare `guard -> o5 = ...` leaves o5
-    unconstrained elsewhere, and an unconstrained o5 materializes as 0 --
-    BLOCK -- for every other sender on the network.
+
+def _history_policy(pk, previous="000007"):
+    """`pk` pays a fee above HIGH_FEE_LIMIT when the PREVIOUS step's amount was
+    `previous`, so its transfer with that fee limit is refused.
+
+    Total form on every branch: an unconstrained o8 materializes as 0 for every
+    other sender on the network.
     """
     return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) ? "
-            "((i1[t-1]:bv[24] = { #x%s }:bv[24]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
-            ": (o5[t]:bv[24] = { #x000001 }:bv[24])) "
-            ": (o5[t]:bv[24] = { #x000001 }:bv[24]) )." % (pk, previous))
+            "((i1[t-1]:bv[24] = { #x%s }:bv[24]) ? (o8[t]:bv[24] = { #x001388 }:bv[24]) "
+            ": (o8[t]:bv[24] = { #x000001 }:bv[24])) "
+            ": (o8[t]:bv[24] = { #x000001 }:bv[24]) )." % (pk, previous))
+
+
+def _submit_limited(sk, pk, ops):
+    return _submit(sk, pk, ops, fee_limit=HIGH_FEE_LIMIT)
+
+
+def _refused_by_history(out):
+    return not out.get("ok") and out.get("code") == "FEE_LIMIT_TOO_LOW"
 
 
 def _transfer(pk, to, amount):
@@ -176,7 +187,7 @@ def test_admission_requests_cannot_influence_one_another(authority):
     _influence(7)
     # committed history ends at amount 5, so S is allowed -- whatever was asked
     # in between
-    admitted = _submit(s_sk, s_pk, _transfer(s_pk, _recipient("s_target"), 3))
+    admitted = _submit_limited(s_sk, s_pk, _transfer(s_pk, _recipient("s_target"), 3))
     assert admitted.get("ok"), (
         "a valid transaction was refused because of what earlier, unrelated "
         f"admission requests fed: {admitted}"
@@ -208,11 +219,11 @@ def test_the_same_requests_through_one_shared_evaluator_do_contaminate(authority
     try:
         with patch.object(tau_admission, "open_context", _shared_open):
             _influence(7)
-            refused = _submit(s_sk, s_pk, _transfer(s_pk, _recipient("s_target"), 3))
+            refused = _submit_limited(s_sk, s_pk, _transfer(s_pk, _recipient("s_target"), 3))
     finally:
         if "ctx" in shared:
             shared["ctx"].dispose()
-    assert not refused.get("ok") and "user policy" in refused.get("message", ""), (
+    assert _refused_by_history(refused), (
         f"a shared evaluator should have carried i1=7 into S's request: {refused}"
     )
 
@@ -227,12 +238,13 @@ def test_admission_does_not_admit_what_inclusion_refuses(authority):
     assert _submit(t_sk, t_pk, _transfer(t_pk, _recipient("sink"), 7)).get("ok")
     _mine()
     _influence(5)
-    refused = _submit(s_sk, s_pk, _transfer(s_pk, _recipient("s_target"), 3))
-    assert not refused.get("ok") and "user policy" in refused.get("message", ""), refused
+    refused = _submit_limited(s_sk, s_pk, _transfer(s_pk, _recipient("s_target"), 3))
+    assert _refused_by_history(refused), refused
 
     # and inclusion agrees: the same transaction, bypassing admission, is refused
     tx_hash = _force_queue(s_sk, s_pk, _transfer(s_pk, _recipient("s_target"), 3),
-                           seq=chain_state.get_sequence_number(s_pk))
+                           seq=chain_state.get_sequence_number(s_pk),
+                           fee_limit=HIGH_FEE_LIMIT)
     _mine()
     assert not _included(tx_hash), "inclusion accepted what admission refused"
 
@@ -315,26 +327,27 @@ def test_a_rule_is_judged_against_the_committed_type_history(authority):
 
 # --- custom inputs reach the evaluator as values --------------------------------
 
-def _custom_policy(pk):
-    """`pk` is blocked when its own custom input i13 is 7."""
-    return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) ? "
-            "((i13[t]:bv[24] = { #x000007 }:bv[24]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
-            ": (o5[t]:bv[24] = { #x000001 }:bv[24])) "
-            ": (o5[t]:bv[24] = { #x000001 }:bv[24]) )." % pk)
+CUSTOM = "17"
+
+
+def _custom_policy():
+    """The sender is blocked when its own custom input i17 is 7."""
+    return ("always ( (i17[t]:bv[24] = { #x000007 }:bv[24]) "
+            "? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
+            ": (o5[t]:bv[24] = { #x000001 }:bv[24]) ).")
 
 
 def test_a_policy_on_custom_inputs_is_enforced_at_inclusion(authority):
-    """Custom inputs are lists by the time they reach an evaluator. The worker
-    session fed them as `['7']`, the engine refused the step, and the block went
-    on with NO outputs for it -- so the policy never ran and the blocked
-    transfer was included."""
+    """Custom inputs are lists by the time they reach an evaluator. A step fed
+    them as `['7']` is refused by the engine, and a refused step must never read
+    as "no outputs", so the policy runs and the blocked transfer stays out."""
     sk, pk = _sender("custom_policy")
-    assert _submit(sk, pk, {"0": _custom_policy(pk)}).get("ok")
+    assert _submit(sk, pk, {"0": _custom_policy()}).get("ok")
     _mine()
 
-    blocked = {**_transfer(pk, _recipient("c_to"), 2), "13": "7"}
+    blocked = {**_transfer(pk, _recipient("c_to"), 2), CUSTOM: "7"}
     refused = _submit(sk, pk, blocked)
-    assert not refused.get("ok") and "user policy" in refused.get("message", ""), refused
+    assert not refused.get("ok") and "own policy clause" in refused.get("message", ""), refused
 
     tx_hash = _force_queue(sk, pk, blocked, seq=chain_state.get_sequence_number(pk))
     _mine()
@@ -342,7 +355,7 @@ def test_a_policy_on_custom_inputs_is_enforced_at_inclusion(authority):
         "inclusion let through a transfer the sender's policy blocks"
     )
 
-    allowed = _submit(sk, pk, {**_transfer(pk, _recipient("c_to"), 2), "13": "5"})
+    allowed = _submit(sk, pk, {**_transfer(pk, _recipient("c_to"), 2), CUSTOM: "5"})
     assert allowed.get("ok"), allowed
     _mine()
     assert _included(allowed["tx_hash"])
@@ -397,7 +410,7 @@ def test_a_standby_is_used_once_and_never_after_a_commit(authority):
     assert tau_admission._standby._ready is not None, "no standby was built"
 
     hits = tau_admission.stats["standby_hits"]
-    assert _submit(s_sk, s_pk, _transfer(s_pk, _recipient("st1"), 3)).get("ok")
+    assert _submit_limited(s_sk, s_pk, _transfer(s_pk, _recipient("st1"), 3)).get("ok")
     assert tau_admission.stats["standby_hits"] == hits + 1
 
     # a block moves committed history to amount 7: a standby built before it
@@ -411,8 +424,8 @@ def test_a_standby_is_used_once_and_never_after_a_commit(authority):
     with patch.object(tau_admission._Standby, "committed", lambda self, **k: None):
         _mine()   # the commit hook is suppressed: only the anchor check remains
     assert tau_admission._standby._ready is stale
-    refused = _submit(s_sk, s_pk, _transfer(s_pk, _recipient("st2"), 3))
-    assert not refused.get("ok") and "user policy" in refused.get("message", ""), (
+    refused = _submit_limited(s_sk, s_pk, _transfer(s_pk, _recipient("st2"), 3))
+    assert _refused_by_history(refused), (
         f"a context built before the last commit answered for it: {refused}"
     )
 
@@ -445,9 +458,9 @@ def test_a_refused_step_is_never_read_as_no_outputs(authority):
     refuses the step; apply used to receive an empty output dict, read o5 as
     absent -- ALLOW -- and the fee as zero, and included the transfer."""
     sk, pk = _sender("refused_step")
-    assert _submit(sk, pk, {"0": _custom_policy(pk)}).get("ok")
+    assert _submit(sk, pk, {"0": _custom_policy()}).get("ok")
     _mine()
-    too_wide = {**_transfer(pk, _recipient("r_to"), 2), "13": "#xffffffffff"}
+    too_wide = {**_transfer(pk, _recipient("r_to"), 2), CUSTOM: "#xffffffffff"}
     refused = _submit(sk, pk, too_wide)
     assert not refused.get("ok") and refused.get("code") == "TX_REJECTED", refused
     tx_hash = _force_queue(sk, pk, too_wide, seq=chain_state.get_sequence_number(pk))

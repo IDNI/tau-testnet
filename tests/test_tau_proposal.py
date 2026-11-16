@@ -166,8 +166,8 @@ def test_a_reconstruction_mismatch_poisons_rather_than_continues():
 # --- representation conflict discovered during apply --------------------------
 
 def test_a_representation_conflict_replans_rather_than_rejecting():
-    """A rule discovered DURING apply -- a regenerated composite, an accepted
-    offer, an activated revision -- can need a representation the current worker
+    """A rule discovered DURING apply -- an accepted offer, an activated
+    revision -- can need a representation the current worker
     cannot express. That is not a transaction rejection."""
     rebuilds = []
     ctx = _context(rebuild=lambda j, p: rebuilds.append(p) or _FakeSession())

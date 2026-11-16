@@ -27,7 +27,7 @@ OFFER_RULE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
 
 
 @pytest.fixture
-def node(temp_database, monkeypatch):
+def node(temp_database, mock_policy_evaluators, monkeypatch):
     """A real database, real signatures, and a Tau with a flat fee."""
     from commands import sendtx
 

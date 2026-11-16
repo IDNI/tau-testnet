@@ -14,7 +14,7 @@ import tau_manager
 from tau_manager import parse_tau_output
 import utils
 from errors import TauCommunicationError
-from consensus import fees
+from consensus import fees, sender_policy
 from consensus.fees import FeeRuleError
 from consensus.lanes import classify_lane
 from consensus.tx_checks import check_transfer, validate_bls_pubkey
@@ -29,7 +29,9 @@ from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
+    RULE_CHANGE_TX_TYPES,
     TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
 
@@ -40,6 +42,7 @@ KNOWN_TX_TYPES = frozenset(
     {"user_tx", "consensus_rule_update", "consensus_rule_vote"}
     | set(RULE_OFFER_TX_TYPES)
     | set(APPROVAL_TX_TYPES)
+    | set(RULE_CHANGE_TX_TYPES)
     | set(RETRACTABLE_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
@@ -48,7 +51,8 @@ KNOWN_TX_TYPES = frozenset(
 # and a fee strategy, and the vote is bounded by the request's declared approver
 # set instead.
 FEE_BEARING_TX_TYPES = frozenset(
-    {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER}
+    {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
+     TX_TYPE_RULE_CHANGE_REQUEST}
     | set(RULE_OFFER_TX_TYPES)
 )
 from db import add_mempool_tx
@@ -478,25 +482,39 @@ class _AdmissionTau:
             context.dispose()
 
 
-def _routed_o5_composite(tip_view, sender_pubkey: str, action: str, body: str):
-    """The o5 composite apply feeds for a routed policy rule -- not the rule.
+def _policy_call(call):
+    """Run a policy-evaluator call, mapping its operational failures to the
+    admission exceptions the request handler turns into ADMISSION_* codes."""
+    from tau_speculation import SpeculationError, WorkerLost, WorkerTimeout
 
-    A routed rule never enters the specification as written: apply registers
-    (or revokes) the sender's clause and feeds the regenerated composite, the
-    neutral one when the registry ends up empty. Validating the raw text instead
-    would admit or refuse something apply never runs.
-    """
-    from consensus.rule_offers import NEUTRAL_O5_CLAUSE_BODY, compose_stream_rule
+    try:
+        return call()
+    except WorkerTimeout as exc:
+        raise tau_admission.AdmissionTimeout(str(exc)) from exc
+    except (WorkerLost, SpeculationError) as exc:
+        raise tau_admission.AdmissionUnavailable(str(exc)) from exc
 
-    stream = tau_defs.USER_POLICY_STREAM_INDEX
-    clauses = dict(tip_view.clauses_for_stream(stream))
-    key = str(sender_pubkey or "").lower()
-    if action == "revoke":
-        clauses.pop(key, None)
-    else:
-        clauses[key] = body
-    composite = compose_stream_rule(stream, clauses) if clauses else None
-    return composite or "always ( %s )." % NEUTRAL_O5_CLAUSE_BODY
+
+def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
+    """(blocked, detail) for the sender's own o5 clause on one transfer's inputs."""
+    body = tip_view.clause_for(sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX)
+    return _policy_call(lambda: sender_policy.clause_blocks(
+        body, values, pool="admission", timeout=budget
+    ))
+
+
+def _clause_build_refusal(body, budget):
+    """The rejection envelope when `body` does not build as a clause, or None."""
+    ok, error = _policy_call(lambda: sender_policy.clause_builds(
+        body, pool="admission", timeout=budget
+    ))
+    if ok:
+        return None
+    from tau_native import strip_ansi
+    return _qt_err(
+        "TX_REJECTED",
+        f"Transaction rejected by Tau (rule validation). {strip_ansi(str(error)).strip()}",
+    )
 
 
 def _revision_refusal(receipt: dict):
@@ -807,7 +825,17 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
     from consensus.facade import TipAdmissionView
     tip_view = TipAdmissionView()
     
-    admission_eval = validate_mempool_admission(payload, tip_view)
+    try:
+        admission_eval = validate_mempool_admission(payload, tip_view)
+    except tau_admission.AdmissionTimeout as e:
+        logger.warning("Admission evaluation timed out: %s", e)
+        return _qt_err("ADMISSION_TIMEOUT", "Transaction evaluation timed out and was rejected.")
+    except tau_admission.AdmissionUnavailable as e:
+        logger.warning("Admission evaluation unavailable: %s", e)
+        return _qt_err(
+            "ADMISSION_UNAVAILABLE",
+            "Transaction validation is temporarily unavailable; please resubmit.",
+        )
     if not admission_eval.is_valid:
         # Forward the admission layer's own code/details when it set them;
         # everything else still collapses to TX_REJECTED as before (issue #23).
@@ -927,19 +955,11 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
     try:
         if not tau_admission.enabled():
             pass
-        elif tx_type == TX_TYPE_RULE_OFFER_ACCEPT:
-            admission_candidate = (admission_eval.data or {}).get("composite_rule")
         elif tx_type == "user_tx" and has_rules:
             _rule_value = operations.get("0")
-            if isinstance(_rule_value, str) and _rule_value.strip():
-                _action = (admission_eval.data or {}).get("o5_clause_action")
-                admission_candidate = (
-                    _routed_o5_composite(
-                        tip_view, sender_pubkey, _action,
-                        (admission_eval.data or {}).get("o5_clause_body") or "",
-                    )
-                    if _action else _rule_value.strip()
-                )
+            if (isinstance(_rule_value, str) and _rule_value.strip()
+                    and not (admission_eval.data or {}).get("o5_clause_action")):
+                admission_candidate = _rule_value.strip()
     except Exception as e:
         logger.exception("Could not derive the admission candidate: %s", e)
         return _qt_err("INTERNAL_ERROR", "An unexpected server error occurred.")
@@ -971,72 +991,18 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
 
     try:
         if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RULE_OFFER_ACCEPT):
-            # Compile the COMPOSED rule, not the offered clause on its own.
-            # What actually enters the specification is the composite for the
-            # target stream with this acceptor's clause folded in, so that is
-            # the only text whose compilability tells us anything. Admission
-            # already built it (see consensus/admission._compose_with_clause).
-            composite_rule = (admission_eval.data or {}).get("composite_rule")
-            if (composite_rule and not tau_force_test and admission_tau.isolated
-                    and not skip_tau_eval and tx_type == TX_TYPE_RULE_OFFER_ACCEPT):
-                # Accepting folds the clause into the stream's composite, and
-                # apply feeds that composite to an evaluator carrying the
-                # committed type history. Validate it there -- a fresh process
-                # has none, and passes text the block then refuses.
-                refusal = _revision_refusal(admission_tau.revise(composite_rule))
+            refusal = _clause_build_refusal(
+                (admission_eval.data or {}).get("clause_body"), admission_tau.budget
+            )
+            if refusal is not None:
+                return refusal
+
+        elif tx_type == TX_TYPE_RULE_CHANGE_REQUEST:
+            clause_body = (admission_eval.data or {}).get("clause_body")
+            if clause_body:
+                refusal = _clause_build_refusal(clause_body, admission_tau.budget)
                 if refusal is not None:
                     return refusal
-                logger.info(
-                    "Rule offer composite validated for o%s (admission context).",
-                    (admission_eval.data or {}).get("target_stream"),
-                )
-            elif composite_rule and not tau_force_test:
-                if tau_manager.tau_ready.is_set() and not getattr(
-                    tau_manager, "tau_test_mode", False
-                ):
-                    import tau_native
-                    try:
-                        # Same killable-subprocess gate as the op-"0" path
-                        # below, and for the same reason: the in-process
-                        # compile can hang inside native Tau with no status
-                        # stamp for the watchdog (issue #24). apply_block
-                        # re-compiles deterministically, so a rare skip here
-                        # cannot let an invalid rule take effect.
-                        compile_err = tau_native.compile_revisions_isolated_subprocess(
-                            chain_state.get_rules_state(),
-                            [composite_rule],
-                            timeout=config.COMM_TIMEOUT,
-                        )
-                    except tau_native.RuleCompileTimeout as compile_exc:
-                        logger.warning(
-                            "Rule offer compile timed out at admission: %s", compile_exc
-                        )
-                        return _qt_err(
-                            "ADMISSION_TIMEOUT",
-                            (
-                                f"Rule validation timed out after "
-                                f"{config.COMM_TIMEOUT}s and was rejected."
-                            ),
-                            timeout_seconds=config.COMM_TIMEOUT,
-                        )
-                    except tau_native.NativeTauUnavailable as compile_exc:
-                        logger.warning(
-                            "Isolated rule offer compile unavailable; rejecting: %s",
-                            compile_exc,
-                        )
-                        return _qt_err(
-                            "ADMISSION_UNAVAILABLE",
-                            "Rule validation is temporarily unavailable; please resubmit.",
-                        )
-                    if compile_err:
-                        return _qt_err(
-                            "TX_REJECTED",
-                            f"Transaction rejected by Tau (rule validation). {compile_err}",
-                        )
-                    logger.info(
-                        "Rule offer composite validated for o%s (isolated compile).",
-                        (admission_eval.data or {}).get("target_stream"),
-                    )
 
         elif tx_type in ("user_tx", TX_TYPE_RETRACTABLE_TRANSFER):
             # --- Tau Validation (Deterministic Two-Step) ---
@@ -1053,12 +1019,20 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         ),
                     )
                 rule_text = rule_value.strip()
-                if rule_text:
+                routed_action = (admission_eval.data or {}).get("o5_clause_action")
+                if rule_text and routed_action:
+                    if routed_action == "declare":
+                        refusal = _clause_build_refusal(
+                            (admission_eval.data or {}).get("o5_clause_body"),
+                            admission_tau.budget,
+                        )
+                        if refusal is not None:
+                            return refusal
+                elif rule_text:
                     if tau_force_test:
                         logger.info("TAU_FORCE_TEST=1: skipping Tau rule validation.")
                     elif admission_tau.isolated and not skip_tau_eval:
-                        # The revision apply will make -- the rule itself, or the
-                        # composite a routed o5 rule becomes -- offered to an
+                        # The rule apply will feed, offered to an
                         # evaluator rebuilt from the committed journal, so it
                         # meets every type commitment the chain has made,
                         # superseded rules' included. This replaces both the
@@ -1066,7 +1040,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         # the preflight against the in-process mirror, whose
                         # representation is not the one the authority runs.
                         refusal = _revision_refusal(
-                            admission_tau.revise(admission_candidate or rule_text)
+                            admission_tau.revise(rule_text)
                         )
                         if refusal is not None:
                             return refusal
@@ -1297,6 +1271,21 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                     ),
                                     transfer_index=i + 1,
                                 )
+
+                        own_blocks, own_o5 = _sender_clause_blocks(
+                            tip_view, sender_pubkey,
+                            tau_input_stream_values, admission_tau.budget,
+                        )
+                        if own_blocks:
+                            return _qt_err(
+                                "TX_REJECTED",
+                                (
+                                    f"Transaction rejected: the sender's own policy clause "
+                                    f"blocked transfer #{i+1} ({transfer_details}). "
+                                    f"Policy output: {own_o5}"
+                                ),
+                                transfer_index=i + 1,
+                            )
 
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.

@@ -46,8 +46,9 @@ MAX_TRANSFER_VALUE = (1 << TRANSFER_VALUE_BV_WIDTH) - 1
 # o5 (user policy) and o8 (user custom fee) are the same width as the transfer
 # value streams. Per-stream bitvector typing is process-global and sticky: the
 # first unit that types o5 pins the interpreter, so a later bv[16] clause
-# leaves get_interpreter failing for everyone. Reject-unless-annotated
-# at admission and apply (consensus/approvals.py::screen_policy_widths).
+# leaves get_interpreter failing for everyone. User rules, clause bodies and
+# governance revisions are all reject-unless-annotated bv[24] at admission and
+# apply (consensus/approvals.py::screen_policy_widths).
 # o9 is pinned by the shipped genesis consensus rules; advertised here so
 # wallets stop scraping rule text for widths.
 USER_POLICY_BV_WIDTH = 24
@@ -123,6 +124,24 @@ TAU_OUTPUT_STREAM_VALIDATION_RESULT = "o1"
 USER_POLICY_STREAM_INDEX = 5
 USER_POLICY_BLOCK_VALUE = 0
 USER_POLICY_ALLOW_VALUE = 1
+
+# An account's rule-change guard lives in the clause registry beside its o5
+# clause, at this stream index. It is not an output stream: the top of the
+# uint32 range is never a real stream, and offers can only target o5.
+RULE_CHANGE_GUARD_INDEX = 0xFFFFFFFF
+
+# i1 of a guard evaluation: which policy change is being judged.
+RULE_CHANGE_KIND_SET_POLICY = 1
+RULE_CHANGE_KIND_REVOKE_POLICY = 2
+RULE_CHANGE_KIND_ACCEPT_OFFER = 3
+RULE_CHANGE_KIND_SET_GUARD = 4
+RULE_CHANGE_KIND_REVOKE_GUARD = 5
+
+# Blocks after which a parked rule-change request may release without approvals.
+RULE_CHANGE_DELAY_BLOCKS = 1000
+
+# Bounds the clause builds one block's release sweep may run.
+MAX_RULE_CHANGE_RELEASES_PER_BLOCK = 8
 
 # --- Fee Streams ---
 # o8: user CUSTOM FEE output stream (application rules, user-deployed).

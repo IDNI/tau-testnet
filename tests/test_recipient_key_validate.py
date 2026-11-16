@@ -119,7 +119,6 @@ def _rule_offer_tip_view():
     view.get_offer_lifecycle_state.return_value = None
     view.pending_offers_for_recipient.return_value = 0
     view.pending_offers_for_offerer.return_value = 0
-    view.clauses_for_stream.return_value = {}
     view.clause_for.return_value = None
     return view
 

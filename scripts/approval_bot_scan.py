@@ -205,6 +205,11 @@ class ScanBot(ApproverBot):
         self.denylist = {d.lower() for d in denylist}
         self.max_amount = max_amount
 
+    def decide_rule_change(self, request: dict):
+        """An automatic co-signer would approve whatever a thief submits."""
+        self.show_rule_change(request)
+        return None
+
     def decide(self, request: dict):
         self.index.refresh()
         recipient = str(request.get("recipient_pubkey", "")).lower()
@@ -227,7 +232,9 @@ class ScanBot(ApproverBot):
 
 
 def main(argv=None):
-    parser = base_arg_parser(__doc__.splitlines()[0])
+    parser = base_arg_parser(
+        __doc__.splitlines()[0]
+        + " Rule-change requests are shown and never approved by this bot.")
     parser.add_argument("--index-path", default=DEFAULT_INDEX_PATH)
     parser.add_argument("--llm", action="store_true",
                         help="Also require a model to pass (needs ANTHROPIC_API_KEY)")

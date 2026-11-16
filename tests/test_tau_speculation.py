@@ -590,10 +590,8 @@ def test_an_unconsumed_candidate_is_incomplete_not_accepted(tmp_path):
 
 @pytest.mark.skipif(not _native_available(), reason="native tau module not built")
 def test_a_real_revision_past_its_deadline_is_a_timeout(tmp_path):
-    """An o5 composite of this many authors compiles for several seconds, far
-    past the one-second deadline."""
-    from consensus.rule_offers import compose_stream_rule
-
+    """A sender-guarded chain over this many authors compiles for several
+    seconds, far past the one-second deadline."""
     def bv24(n):
         return "{ #x" + format(n, "06x") + " }:bv[24]"
 
@@ -612,10 +610,14 @@ def test_a_real_revision_past_its_deadline_is_a_timeout(tmp_path):
                 " || (i1[t]:bv[24] > " + bv24(1000) + " && !(i18[t]:bv[384] = " + bv384(a) + ")) )"
                 " ? " + o5(0) + " : " + o5(1) + " )")
 
-    composite = compose_stream_rule(5, {
+    clauses = {
         key("ab", i): clause(key("ca", i), key("cb", i), key("cc", i))
         for i in range(20)
-    })
+    }
+    chain = o5(1)
+    for author in sorted(clauses, reverse=True):
+        chain = f"((i12[t]:bv[384] = {bv384(author)}) ? ( {clauses[author]} ) : {chain})"
+    slow_rule = f"always ( {chain} )."
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(repo_root, "genesis.tau")) as fh:
         router = fh.read().strip()
@@ -626,7 +628,7 @@ def test_a_real_revision_past_its_deadline_is_a_timeout(tmp_path):
         s.init(f"always ( {router} ).")
         started = time.monotonic()
         with pytest.raises(spec.WorkerTimeout):
-            s.revise(composite, "slow", timeout=1.0)
+            s.revise(slow_rule, "slow", timeout=1.0)
         elapsed = time.monotonic() - started
         assert 0.9 <= elapsed < 6.0, elapsed
         assert s._proc.returncode is not None, "the slow worker was not reaped"

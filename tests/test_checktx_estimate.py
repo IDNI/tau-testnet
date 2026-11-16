@@ -66,7 +66,7 @@ class _Standby:
 
 
 @pytest.fixture
-def node(temp_database, monkeypatch):
+def node(temp_database, mock_policy_evaluators, monkeypatch):
     """Worker-backed admission with a fake worker, and a real database."""
     # o5 allows, except where a test needs a policy that asks for approval.
     script = {"steps": [], "revisions": [], "built": 0, "disposed": 0, "o5": "1"}
@@ -144,6 +144,9 @@ def _payload(kind, fee_limit="0"):
     if kind == "approval_request":
         return _envelope(kind, SENDER, fee_limit, recipient_pubkey=RECIPIENT,
                          amount=500, approvers={"18": APPROVER}, custom_inputs={})
+    if kind == "rule_change_request":
+        return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
+                         approvers={"18": APPROVER})
     raise AssertionError(kind)
 
 
@@ -154,7 +157,8 @@ def _check(payload, *, estimate=True):
 
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
-               "rule_offer_accept", "rule_offer_reject", "approval_request"]
+               "rule_offer_accept", "rule_offer_reject", "approval_request",
+               "rule_change_request"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from consensus.tx_signing import signing_message_bytes, verify_tx_signature
-from tests.bls_keys import SK_ALICE, pubkey_hex, sign_message
+from bls_keys import SK_ALICE, pubkey_hex, sign_message
 
 MAIN_ACTIVITY = (
     Path(__file__).resolve().parent.parent

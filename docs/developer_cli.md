@@ -66,7 +66,7 @@ Error codes emitted by the node, by origin:
 | `sendtx` / `checktx` structural | `TX_INVALID`, `TX_EXPIRED`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_REJECTED` |
 | `sendtx` fees & capacity | `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `MEMPOOL_FULL`, `ESTIMATE_BUSY` (`checktx estimate` only) |
 | `sendtx` approval request | `APPROVAL_NOT_NEEDED`: the policy of the sender allows the transfer with no votes, so send it as an ordinary transfer. Only admission gives it, because block apply drops such a request. |
-| Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `CLAUSE_REGISTRY_FULL`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED` |
+| Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED`, `RULE_CHANGE_NEEDS_APPROVAL`, `INVALID_RULE_CHANGE_REQUEST`, `INVALID_RULE_CHANGE_CANCEL`, `NOT_REQUEST_SENDER` |
 | `createblock` | `MEMPOOL_EMPTY`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED` |
 | Governance / rule / approval reads | `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `REQUEST_UNKNOWN`, `FEATURE_INACTIVE`, `TAU_UNAVAILABLE`, `TAU_ERROR` |
 
@@ -175,7 +175,7 @@ The full registry (28 names, `app/container.py`):
 | `getapprovalrequest` | `getapprovalrequest <request_id>` |
 | `getrequestid` | `getrequestid <json_payload>` |
 | `getapprovalslots` | `getapprovalslots <address>` — advisory, node-local |
-| `getapprovalpreview` | `getapprovalpreview <json_draft>` — advisory, node-local |
+| `getapprovalpreview` | `getapprovalpreview <json_draft>` — advisory, node-local; `"request_type":"rule_change"` previews a policy change |
 | `getretractable` | `getretractable <retractable_id>` — 64 hex chars |
 | `getretractables` | `getretractables <address> [in\|out\|all]` (default `all`) |
 | `getretractableid` | `getretractableid <json_payload>` |
@@ -428,6 +428,11 @@ tau-testnet tx raw-sign --privkey 0xabc... --payload tx.json > signed_tx.json
 tau-testnet tx raw-submit --file signed_tx.json
 ```
 
+A rule that writes `o5` is registered as the sender's own policy clause, so it
+carries no `i12` guard and cannot share a transaction with transfers
+(`RULE_WITH_TRANSFERS`); send it on its own. Fee rules that write `o8` must
+reference `i12` or `i3` (`UNSCOPED_USER_RULE`).
+
 `tx send` exits `1` when the node returns a `{"status":"error",...}`
 envelope (any `error.code`, e.g. `INVALID_SIGNATURE`, `INVALID_SEQUENCE`,
 `TX_REJECTED`), `4` for bad amounts/empty operations/missing inputs, `3` on
@@ -453,14 +458,14 @@ The fee-exempt commands have no `--fee`: `approval approve`, `approval decline`,
 ## Rule sharing
 
 Send a Tau rule to another user; they check its conflict status and then accept
-it into their own specification or reject it.
+it as their own policy clause or reject it.
 
 ```bash
 # Offer a rule. --expire-in N gives it N blocks to land, counted from the next
 # block (expire_at_height = tip + 1 + N);
 # --expire-at-height sets an absolute height instead.
 tau-testnet rule offer --key alice --to <bob_pubkey> --rule-file policy.tau
-tau-testnet rule offer --key alice --to <bob_pubkey> --rule 'always ( o5[t]:bv[24] = { #x000000 }:bv[24] ).' \
+tau-testnet rule offer --key alice --to <bob_pubkey> --rule 'always ( (i1[t]:bv[24] > { #x002710 }:bv[24]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).' \
     --expire-at-height 5000
 
 # Inspect. `list` defaults to the --key owner's address; --role filters direction.
@@ -490,11 +495,35 @@ Underlying RPCs: `getruleoffers <address> [in|out|all]`, `getruleoffer <offer_id
 `getruleconflict <offer_id>`, `getofferid '<json>'`.
 
 The conflict report is **advisory and node-local** and never gates a
-transaction. It does not check satisfiability — tau-lang exposes
+transaction. Its layers are `shape`, `reserved_domains`, `registry_collision`,
+`bv_widths`, `compile` (whether the clause builds) and `unrealizable`. It does
+not check satisfiability — tau-lang exposes
 `sat`/`unsat`/`valid`/`unrealizable` in C++ but not through its Python
 bindings — so a clean result means no conflict was *observed*. See the
-[Rule sharing](../README.md#rule-sharing) section for the composite-rule model
-and why an accepted rule is composed rather than appended.
+[Rule sharing](../README.md#rule-sharing) section for the per-account clause
+registry and the screens a clause must pass.
+
+## Policy guard
+
+Guard your own `o5` policy so that changing it needs co-signers. Semantics, kinds
+and limits are in [approvals.md](approvals.md#guarding-policy-changes).
+
+```bash
+tau-testnet policy guard set --key alice --file guard.tau --approver 18=<xpub>
+tau-testnet policy guard revoke --key alice
+tau-testnet policy guard show <address>
+tau-testnet policy change request --key alice --kind set --file policy.tau --approver 18=<xpub>
+tau-testnet policy change request --key alice --kind revoke --approver 18=<xpub>
+tau-testnet policy change request --key alice --kind accept --offer-id <offer_id>
+tau-testnet policy change cancel --key alice --request-id <request_id>
+```
+
+`guard set` and `guard revoke` are rule-change requests of kind 4 and 5; `change
+request --kind` is `set`, `revoke` or `accept`. All request commands take `--body`
+in place of `--file`, `--fee`, `--expire-in N` (default 2000 blocks, so the
+1000-block time escape can apply), `--expire-at-height`, `--preview` (ask the node,
+send nothing) and `--dry-run`, and print the request id. `cancel` is feeless.
+They exit like the other transaction commands.
 
 ## Retractable transfers
 

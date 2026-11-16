@@ -316,6 +316,16 @@ class TotpBot(ApproverBot):
         # declining would waste the request.
         return None
 
+    def decide_rule_change(self, request: dict):
+        """Only a valid code for THIS request approves: no on-chain code path,
+        no amount or recipient test."""
+        self.show_rule_change(request)
+        request_id = request["request_id"]
+        with self._lock:
+            self._pending[request_id] = request
+            accepted = request_id in self._accepted
+        return (True, "valid TOTP received") if accepted else None
+
 
 def main(argv=None):
     parser = base_arg_parser(__doc__.splitlines()[0])

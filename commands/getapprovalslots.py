@@ -62,6 +62,7 @@ def execute(raw_command: str, container):
 
     clause = tip.clause_for(address, tau_defs.USER_POLICY_STREAM_INDEX)
     slots = extract_slot_approvers(clause) if clause else {}
+    guard = tip.clause_for(address, tau_defs.RULE_CHANGE_GUARD_INDEX)
 
     return api_response.success_response(_CMD, {
         "address": address,
@@ -69,6 +70,8 @@ def execute(raw_command: str, container):
         "has_clause": clause is not None,
         "slots": {str(k): v for k, v in slots.items()},
         "unreadable": clause is not None and not slots,
+        "has_rule_change_guard": guard is not None,
+        "rule_change_guard": guard,
         "note": (
             "Advisory: read from the clause text by pattern, never "
             "consensus-binding. An empty map means the clause shape could not be "

@@ -31,9 +31,12 @@ LANE_NAMES = {LANE_FAST: "fast", LANE_SLOW: "slow"}
 # Types whose apply path routes text through i0 and rebuilds the interpreter.
 # `rule_offer` is slow because admission compiles the offered clause;
 # `rule_offer_reject` is fast because it only resolves a set membership.
+# `rule_change_request` is slow because releasing it builds a clause;
+# `rule_change_cancel` is fast because it only resolves a set membership.
 SLOW_TX_TYPES = frozenset({
     "rule_offer",
     "rule_offer_accept",
+    "rule_change_request",
     "consensus_rule_update",
 })
 
@@ -62,6 +65,7 @@ TAU_EVALUATING_TX_TYPES = frozenset({
     "approval_request",
     "transfer_vote",
     "retractable_transfer",
+    "rule_change_request",
 })
 
 

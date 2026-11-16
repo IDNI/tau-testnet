@@ -24,6 +24,8 @@ def execute(raw_command: str, container):
 
     row = tip.get_approval_request(request_id)
     if row is None:
+        row = tip.get_rule_change_request(request_id)
+    if row is None:
         return api_response.error_response(
             _CMD, f"Unknown approval request: {request_id}", "REQUEST_UNKNOWN"
         )
@@ -33,9 +35,9 @@ def execute(raw_command: str, container):
     declined = {int(d) for d in (row.get("declined") or [])}
     awaiting = sorted(int(s) for s in approvers if int(s) not in voted | declined)
 
-    from commands.getapprovalrequests import _row_view
+    from commands.getapprovalrequests import request_view
 
-    data = _row_view(row)
+    data = request_view(row)
     # The actionable summary: which slots are still holding the transfer up.
     data["awaiting_slots"] = awaiting
     data["awaiting_approvers"] = [approvers[s] if s in approvers else approvers.get(str(s))

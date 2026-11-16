@@ -14,7 +14,6 @@ from consensus.admission import (
     validate_rule_offer_payload,
 )
 from consensus.rule_offers import (
-    MAX_ACCEPTORS_PER_STREAM,
     MAX_OFFER_RULE_BYTES,
     MAX_OFFER_WINDOW_BLOCKS,
     MAX_PENDING_OFFERS_PER_OFFERER,
@@ -49,7 +48,6 @@ def tip_view():
     view.pending_offers_for_recipient.return_value = 0
     view.pending_offers_for_offerer.return_value = 0
     view.clause_for.return_value = None
-    view.clauses_for_stream.return_value = {}
     return view
 
 
@@ -114,10 +112,7 @@ def test_valid_offer_admitted(tip_view):
     assert res.data["offer_id"] == _offer_id()
     assert res.data["target_stream"] == TARGET
     assert res.data["clause_body"] == clause_body_v1(BLOCK_RULE)
-    # The prospective composite is produced so sendtx can compile the text that
-    # would actually enter the specification.
-    assert res.data["composite_rule"].startswith("always ( ")
-    assert B in res.data["composite_rule"]
+    assert set(res.data) == {"offer_id", "clause_body", "target_stream"}
 
 
 def test_offer_to_self_rejected(tip_view):
@@ -221,7 +216,6 @@ def test_inbox_and_outbox_caps(tip_view):
     ("always ( o9[t]:bv[24] = { #x000001 }:bv[24] ).", "reserved"),
     ("always ( o7[t]:bv[16] = { #x0001 }:bv[16] ).", "reserved"),
     ("always ( o6[t]:bv[16] = { #x0001 }:bv[16] ).", "reserved"),
-    ("always ( o5[t]:bv[24] = i2[t]:bv[24] ).", "mocked"),
     ("always ( o5[t]:bv[24] = i14[t]:bv[24] ).", "reserved input"),
     ("always ( o5[t]:bv[24] = i15[t]:bv[24] ).", "reserved input"),
     ("always ( o5[t]:bv[24] = i13[t]:bv[24] ).", "reserved input"),
@@ -248,12 +242,9 @@ def test_reserved_input_screen_is_mode_independent(tip_view):
     assert not res.is_valid and "reserved input" in res.error
 
 
-def test_offer_rejected_when_the_stream_is_already_full(tip_view):
-    tip_view.clauses_for_stream.return_value = {
-        format(i, "096x"): "o5[t] = 1" for i in range(MAX_ACCEPTORS_PER_STREAM)
-    }
+def test_offer_is_admitted_whatever_the_registry_holds(tip_view):
     res = validate_mempool_admission(offer_tx(), tip_view)
-    assert not res.is_valid and "maximum" in res.error
+    assert res.is_valid, res.error
 
 
 # --- accept -----------------------------------------------------------------
@@ -263,7 +254,8 @@ def test_valid_accept_admitted(tip_view):
     res = validate_mempool_admission(accept_tx(), tip_view)
     assert res.is_valid, res.error
     assert res.data["target_stream"] == TARGET
-    assert B in res.data["composite_rule"]
+    assert res.data["clause_body"] == clause_body_v1(BLOCK_RULE)
+    assert set(res.data) == {"offer_id", "clause_body", "target_stream"}
 
 
 def test_accept_of_unknown_offer_rejected(tip_view):
@@ -306,35 +298,17 @@ def test_accept_without_text_rejected(tip_view):
     assert not res.is_valid and "Malformed" in res.error
 
 
-def test_accept_replacing_own_clause_ignores_the_cap(tip_view):
-    """Replacing your own clause does not grow the composite."""
-    full = {format(i, "096x"): "o5[t] = 1" for i in range(MAX_ACCEPTORS_PER_STREAM - 1)}
-    full[B] = "o5[t] = 1"
-    assert len(full) == MAX_ACCEPTORS_PER_STREAM
-    tip_view.clauses_for_stream.return_value = full
+def test_accept_is_admitted_whatever_the_registry_holds(tip_view):
     tip_view.get_offer.return_value = _offer_row()
     res = validate_mempool_admission(accept_tx(), tip_view)
     assert res.is_valid, res.error
 
 
-def test_accept_by_a_new_acceptor_hits_the_cap(tip_view):
-    tip_view.clauses_for_stream.return_value = {
-        format(i, "096x"): "o5[t] = 1" for i in range(MAX_ACCEPTORS_PER_STREAM)
-    }
-    tip_view.get_offer.return_value = _offer_row()
-    res = validate_mempool_admission(accept_tx(), tip_view)
-    assert not res.is_valid and "maximum" in res.error
-
-
-def test_accept_preserves_other_acceptors_in_the_composite(tip_view):
-    """The composite must keep every existing acceptor's clause, or accepting
-    would silently disable someone else's policy."""
-    tip_view.clauses_for_stream.return_value = {C: "o5[t]:bv[24] = { #x000001 }:bv[24]"}
+def test_accept_replacing_own_clause_is_admitted(tip_view):
+    tip_view.clause_for.return_value = "o5[t] = 1"
     tip_view.get_offer.return_value = _offer_row()
     res = validate_mempool_admission(accept_tx(), tip_view)
     assert res.is_valid, res.error
-    assert B in res.data["composite_rule"]
-    assert C in res.data["composite_rule"]
 
 
 # --- reject -----------------------------------------------------------------
@@ -343,8 +317,7 @@ def test_valid_reject_admitted(tip_view):
     tip_view.get_offer.return_value = _offer_row()
     res = validate_mempool_admission(reject_tx(), tip_view)
     assert res.is_valid, res.error
-    # A rejection compiles nothing, so no composite is produced.
-    assert "composite_rule" not in res.data
+    assert "clause_body" not in res.data
 
 
 def test_reject_by_non_recipient_rejected(tip_view):
@@ -379,7 +352,6 @@ def test_offer_and_accept_screens_agree(tip_view):
     without ever passing the offer screens."""
     bad_rules = [
         "always ( o9[t]:bv[24] = { #x000001 }:bv[24] ).",
-        "always ( o5[t]:bv[24] = i2[t]:bv[24] ).",
         "always ( o5[t]:bv[24] = i14[t]:bv[24] ).",
         "always ( o12[t]:bv[24] = { #x000001 }:bv[24] ).",
         "always ( always ( o5[t] = 1 ) ).",
