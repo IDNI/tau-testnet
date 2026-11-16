@@ -77,11 +77,7 @@ def stop_tau_manager_thread(thread: threading.Thread, timeout: float = 30.0) -> 
     import tau_manager
 
     tau_manager.request_shutdown()
-    deadline = time.monotonic() + timeout
-    # The manager clears the stop flag when it starts, so set it until the thread ends.
-    while thread.is_alive() and time.monotonic() < deadline:
-        tau_manager.server_should_stop.set()
-        thread.join(0.1)
+    thread.join(timeout)
     return not thread.is_alive()
 
 
