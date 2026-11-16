@@ -421,7 +421,8 @@ class TestStateReconstruction(unittest.TestCase):
         # --- Start Tau ---
         self.start_tau()
         try:
-            rule_text = "o12[t] = i1[t]."
+            # start_tau loads no builtin rules, so an untyped i1 here would be typed :tau before rule 02.
+            rule_text = "o12[t]:bv[24] = i1[t]:bv[24]."
 
             # Create a transaction containing both the rule and a transfer
             tx1 = self.create_test_transaction(
