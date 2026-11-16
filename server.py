@@ -60,9 +60,11 @@ _EXPENSIVE_REFILL_PER_SEC = 0.5
 # and getapprovalslots is unauthenticated text inspection; both are advisory
 # conveniences. getblocks/getallaccounts/gettaustate/getgovernance/history are
 # cheap for the caller and hold the process-wide DB or state lock, so a poller
-# can stall mining and admission.
+# can stall mining and admission. getaccountrules takes the state locks and
+# scans the mempool and the rule history.
 _EXPENSIVE_COMMANDS = frozenset({
     "checktx",
+    "getaccountrules",
     "getapprovalpreview",
     "getapprovalslots",
     "getblocks",

@@ -566,6 +566,55 @@ def _record_retractable_events(block, next_snapshot) -> None:
         logger.exception("could not record retractable events")
 
 
+def _outcomes_for_block(block, outcomes) -> list:
+    """The outcome rows that belong to the transactions of `block`, in its order.
+
+    A block built by this node reuses the snapshot of the builder's simulation,
+    which executed every reserved transaction (as copies carrying the mempool
+    hash as `tx_id`) and then dropped the rejected ones from the block. Rows are
+    matched to the committed block by hash, else by that `tx_id`; rows for
+    transactions the block does not contain are left out, and `index` is the
+    position in the committed block.
+    """
+    ids = list(getattr(block, "tx_ids", None) or [])
+    if not ids:
+        from block import compute_tx_hash
+
+        ids = [compute_tx_hash(tx) for tx in block.transactions]
+    position = {h: i for i, h in enumerate(ids)}
+    rows = []
+    for row in outcomes or ():
+        tx_hash = row.get("tx_hash")
+        if tx_hash not in position and row.get("tx_id") in position:
+            tx_hash = row["tx_id"]
+        if tx_hash not in position:
+            continue
+        fixed = {k: v for k, v in row.items() if k != "tx_id"}
+        fixed["tx_hash"] = tx_hash
+        fixed["index"] = position[tx_hash]
+        rows.append(fixed)
+    return rows
+
+
+def _record_tx_outcomes(block, next_snapshot) -> None:
+    """Best-effort history write of each transaction's outcome (issue #42).
+
+    From the snapshot for the same reason as the retractable events: a block that
+    reuses its own evaluation has no apply result.
+    """
+    try:
+        meta = getattr(next_snapshot, "metadata", None) or {}
+        outcomes = _outcomes_for_block(block, meta.get("tx_outcomes"))
+        releases = meta.get("rule_change_releases")
+        if outcomes or releases:
+            db.record_tx_outcomes(
+                block.block_hash, block.header.block_number,
+                outcomes, list(releases or ()),
+            )
+    except Exception:
+        logger.exception("could not record transaction outcomes")
+
+
 def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
     """The canonical rows for a block, computed from its SNAPSHOT.
 
@@ -1088,6 +1137,7 @@ def _process_new_block_locked(block: Block) -> bool:
                 _swap_in_memory_state(next_snapshot, block)
 
             _record_retractable_events(block, next_snapshot)
+            _record_tx_outcomes(block, next_snapshot)
 
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
@@ -1369,6 +1419,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                                       reason="state_hash invariant mismatch")
 
             _record_retractable_events(block, next_snapshot)
+            _record_tx_outcomes(block, next_snapshot)
 
             if _enabled:
                 # The block's evaluator history becomes durable exactly as a live

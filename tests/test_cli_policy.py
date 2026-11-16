@@ -318,3 +318,48 @@ def test_approve_on_a_rule_change_id_builds_a_plain_vote(alice):
     assert tx["tx_type"] == "transfer_vote"
     assert tx["request_id"] == REQ_ID
     assert tx["approve"] is True
+
+
+# --- policy show (issue #42) ---------------------------------------------------
+
+ACCOUNT_RULES = {
+    "address": APPROVER, "block_number": 41, "block_hash": "ee" * 32,
+    "rule_clauses_root": "11" * 32,
+    "clauses": [{"stream": 5, "name": "o5", "body": "(o5[t]:bv[24] = { #x000000 }:bv[24])",
+                 "sha256": "22" * 32, "since": {"block_number": 40, "tx_hash": "33" * 32}}],
+    "rule_change_guard": None,
+    "application_rules": [],
+    "open_rule_changes": [{"request_id": REQ_ID, "kind": "set_policy", "body_sha256": "44" * 32,
+                           "offer_id": None, "approvers": {"18": APPROVER}, "voted": {},
+                           "declined": [], "ready": False, "created_height": 39,
+                           "expire_at_height": 2039}],
+    "awaiting_my_vote": [], "pending_offers": 1, "mempool": [],
+    "history": [{"block_number": 40, "kind": "clause", "action": "registered", "stream": 5,
+                 "tx_hash": "33" * 32, "sha256": "22" * 32},
+                {"block_number": 38, "kind": "rule_change_request",
+                 "action": "release_failed", "request_id": "55" * 32,
+                 "detail": "no policy to revoke"}],
+}
+
+
+def test_policy_show_reads_getaccountrules_and_explains_it(alice):
+    recorded = []
+    rc, out, err = _run(["policy", "show", APPROVER], [_ok(ACCOUNT_RULES)], recorded)
+    assert rc == 0, err
+    assert recorded == [f"getaccountrules {APPROVER}"]
+    assert "o5 clause: sha256 " + "22" * 32 in out
+    assert "set at block 40 by tx 333333333333..." in out
+    assert "rule-change guard: none" in out
+    assert "open rule-change requests: 1" in out
+    assert "votes 0/1  waiting  expires at 2039" in out
+    assert "block 38  rule_change_request release_failed" in out
+    assert "(no policy to revoke)" in out
+
+
+def test_policy_show_defaults_to_the_key_and_passes_json_through(alice):
+    recorded = []
+    rc, out, _ = _run(["--json", "policy", "show", "--key", "alice"],
+                      [_ok(ACCOUNT_RULES)], recorded)
+    assert rc == 0
+    assert recorded == [f"getaccountrules {alice}"]
+    assert json.loads(out)["data"]["clauses"][0]["sha256"] == "22" * 32

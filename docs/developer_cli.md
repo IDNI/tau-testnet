@@ -147,7 +147,7 @@ arguments keep their case except where a handler lowercases a hex id. Payload
 commands take the rest of the line verbatim as one JSON argument, and tolerate
 it being wrapped in matching single or double quotes.
 
-The full registry (28 names, `app/container.py`):
+The full registry (29 names, `app/container.py`):
 
 | Command | Grammar |
 |---|---|
@@ -171,6 +171,7 @@ The full registry (28 names, `app/container.py`):
 | `getruleoffers` | `getruleoffers <address> [in\|out\|all]` (default `all`) |
 | `getruleoffer` | `getruleoffer <offer_id>` — 64 hex chars |
 | `getruleconflict` | `getruleconflict <offer_id>` — advisory, node-local |
+| `getaccountrules` | `getaccountrules <address>` — everything in force for an account's rules, at one tip; see [rules_in_force.md](rules_in_force.md) |
 | `getapprovalrequests` | `getapprovalrequests <address> [in\|out\|all]` (default `all`) |
 | `getapprovalrequest` | `getapprovalrequest <request_id>` |
 | `getrequestid` | `getrequestid <json_payload>` |
@@ -265,7 +266,7 @@ connection — reconnecting resets them.
 | Bucket | Burst | Refill | Applies to |
 |---|---|---|---|
 | general | 10 | 5/s | every command |
-| expensive | 2 | 0.5/s | `checktx`, `getapprovalpreview`, `getapprovalslots` |
+| expensive | 2 | 0.5/s | `checktx`, `getaccountrules`, `getapprovalpreview`, `getapprovalslots` |
 
 An expensive command is charged to *both* buckets, so it cannot be used to
 dodge the general rate. `sendtx` is deliberately not in the expensive tier: it
@@ -514,6 +515,8 @@ Guard your own `o5` policy so that changing it needs co-signers. Semantics, kind
 and limits are in [approvals.md](approvals.md#guarding-policy-changes).
 
 ```bash
+tau-testnet policy show <address>       # everything in force, from one tip
+tau-testnet policy show --key alice
 tau-testnet policy guard set --key alice --file guard.tau --approver 18=<xpub>
 tau-testnet policy guard revoke --key alice
 tau-testnet policy guard show <address>
@@ -529,6 +532,15 @@ in place of `--file`, `--fee`, `--expire-in N` (default 2000 blocks, so the
 1000-block time escape can apply), `--expire-at-height`, `--preview` (ask the node,
 send nothing) and `--dry-run`, and print the request id. `cancel` is feeless.
 They exit like the other transaction commands.
+
+`policy show` reads `getaccountrules`: the `o5` clause and the guard with the
+sha256 of each stored body and the block and transaction (or released request)
+that set it, application rules naming the account, open requests with their
+votes, requests waiting for this account's vote, pending offers, queued rule
+transactions and the latest rule changes, including releases that failed and
+why. With `--json` it prints the raw answer. To see what one transaction did,
+`tau-testnet rpc gettxstatus <tx_hash>` and read `outcome`. Long form:
+[rules_in_force.md](rules_in_force.md).
 
 ## Retractable transfers
 

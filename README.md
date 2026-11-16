@@ -583,6 +583,14 @@ Registration also needs the engine to build the clause and step it once. A claus
 
 **Caveats.** Offer caps are frozen constants, not config, because a per-node value would let honest nodes disagree about admissibility: 8 KiB per rule, 32 pending offers per recipient, 16 per offerer, and a 100 000-block maximum offer window. Rule transactions count against the per-block rule budget (see [Mempool policy](#mempool-policy)).
 
+### Seeing what is in force
+
+`getaccountrules <address>` lists the clauses, guard, open rule-change requests
+and application rules for one account at one tip, with the sha256 of each stored
+text, and `gettxstatus` says whether a rule transaction registered, replaced or
+revoked a clause or was skipped. A wallet should say "protection on" only when
+the clause hash matches the rule it sent: [docs/rules_in_force.md](docs/rules_in_force.md).
+
 ### Checking conflict status
 
 `getruleconflict <offer_id>` returns a layered report. It is **advisory and node-local** and never gates a transaction: it depends on process-local state (per-stream bitvector typing is process-global and sticky, and the shrink width derives from the node's own intern table), the engine build is explicitly unstable, and the cost is unbounded — binding it to block validity would turn a heavy rule into a chain halt.
@@ -743,6 +751,16 @@ For a wallet view that accounts for queued sends, use the additive commands
   is one of `queued` (in the mempool, incl. reserved-for-mining), `confirmed`
   (with `block_hash`/`block_number`/`confirmations`), `expired`, `evicted`,
   `rejected`, or `unknown`. `unknown` is a normal answer, not an error.
+  `confirmed` means included; what the transaction did is in `outcome`:
+  `applied`, `skipped` (valid but changed nothing), its `reason`,
+  `fee_charged`, the receipt `logs`, and for rule transactions `rule_effects`
+  with the sha256 of the stored rule. See
+  [docs/rules_in_force.md](docs/rules_in_force.md).
+- **`getaccountrules <address>`** — everything in force for one account's rules,
+  read at one tip: its registry clauses and rule-change guard with their
+  sha256, application rules naming it, its open rule-change requests, requests
+  waiting for its vote, pending offers, queued rule transactions and the latest
+  rule changes. CLI: `tau-testnet policy show <address>`.
 
 `sendtx` returns the computed `tx_hash` in its success `data`, so a wallet can
 poll `gettxstatus` immediately after queuing.

@@ -17,6 +17,7 @@ import tau_manager
 from commands import checktx, createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks, getallaccounts, gettaustate, getgovernance, getupdateid, getaccountstate, gettxstatus
 from commands import getofferid, getruleoffers, getruleoffer, getruleconflict
 from commands import (
+    getaccountrules,
     getapprovalpreview,
     getapprovalrequest,
     getapprovalrequests,
@@ -77,6 +78,8 @@ class ServiceContainer:
             "getruleoffers": getruleoffers,
             "getruleoffer": getruleoffer,
             "getruleconflict": getruleconflict,
+            # Issue #42: everything in force for one account, at one tip.
+            "getaccountrules": getaccountrules,
         # Co-signature approvals. `getapprovalrequests` is the approver inbox,
         # and its emptiness is meaningful: a request names only the approvers its
         # amount requires, so an approver who sees nothing is not needed.

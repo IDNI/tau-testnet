@@ -2166,6 +2166,88 @@ def cmd_policy_guard_show(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _short(value, n=12) -> str:
+    text = str(value or "")
+    return text if len(text) <= n else text[:n] + "..."
+
+
+def _format_account_rules(data: dict) -> str:
+    """Human summary of `getaccountrules` (issue #42)."""
+    def _since(item):
+        since = item.get("since") or {}
+        if not since:
+            return "set before this node's records"
+        how = (f"tx {_short(since['tx_hash'])}" if since.get("tx_hash")
+               else f"request {_short(since.get('request_id'))}")
+        return f"set at block {since.get('block_number')} by {how}"
+
+    lines = [f"rules in force for {_short(data.get('address'), 16)} at block "
+             f"{data.get('block_number')} ({_short(data.get('block_hash'))})"]
+    clauses = data.get("clauses") or []
+    if not clauses:
+        lines.append("  o5 policy: none (only the network's own rules apply)")
+    for clause in clauses:
+        lines.append(f"  {clause.get('name')} clause: sha256 {clause.get('sha256')}")
+        lines.append(f"    {_since(clause)}")
+        lines.append(f"    {clause.get('body')}")
+    guard = data.get("rule_change_guard")
+    if guard:
+        lines.append(f"  rule-change guard: sha256 {guard.get('sha256')}")
+        lines.append(f"    {_since(guard)}")
+        lines.append(f"    {guard.get('body')}")
+    else:
+        lines.append("  rule-change guard: none (a stolen key can replace the policy at once)")
+    units = data.get("application_rules") or []
+    lines.append(f"  application rules naming this account: {len(units)}")
+    for unit in units:
+        lines.append(f"    sha256 {unit.get('sha256')}  {_since(unit)}")
+    changes = data.get("open_rule_changes") or []
+    lines.append(f"  open rule-change requests: {len(changes)}")
+    for change in changes:
+        lines.append(
+            f"    {_short(change.get('request_id'))} {change.get('kind')}"
+            f"  votes {len(change.get('voted') or {})}/{len(change.get('approvers') or {})}"
+            f"  {'ready' if change.get('ready') else 'waiting'}"
+            f"  expires at {change.get('expire_at_height')}")
+    to_vote = data.get("awaiting_my_vote") or []
+    lines.append(f"  requests waiting for this account's vote: {len(to_vote)}")
+    for change in to_vote:
+        lines.append(f"    {_short(change.get('request_id'))} {change.get('kind')}"
+                     f" from {_short(change.get('sender_pubkey'))}")
+    lines.append(f"  pending rule offers: {data.get('pending_offers', 0)}")
+    queued = data.get("mempool") or []
+    lines.append(f"  rule transactions still queued: {len(queued)}")
+    for tx in queued:
+        lines.append(f"    {_short(tx.get('tx_hash'))} {tx.get('tx_type')}")
+    history = data.get("history") or []
+    if history:
+        lines.append("recent rule changes (newest first):")
+    for effect in history:
+        what = (f"o{effect['stream']}" if effect.get("stream") not in (None, 0xFFFFFFFF)
+                else ("guard" if effect.get("stream") == 0xFFFFFFFF else effect.get("kind")))
+        source = (f"tx {_short(effect['tx_hash'])}" if effect.get("tx_hash")
+                  else f"request {_short(effect.get('request_id'))}")
+        tail = f"  sha256 {_short(effect['sha256'], 16)}" if effect.get("sha256") else ""
+        if effect.get("detail"):
+            tail += f"  ({effect['detail']})"
+        lines.append(f"  block {effect.get('block_number')}  {what} "
+                     f"{effect.get('action')}  {source}{tail}")
+    return "\n".join(lines)
+
+
+def cmd_policy_show(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    raw = _send(args, f"getaccountrules {address}")
+    if rpc_mod.is_error_response(raw) or args.json:
+        return _simple_query_response(args, raw)
+    print(_format_account_rules((parse_json_response(raw) or {}).get("data") or {}))
+    return EXIT_OK
+
+
 def cmd_policy_change_request(args: argparse.Namespace) -> int:
     kind = _KIND_BY_NAME[args.kind]
     rule_text, offer_id = "", ""
@@ -2208,7 +2290,7 @@ def _add_policy_subparsers(sub) -> None:
     p_pol = sub.add_parser(
         "policy",
         parents=[_GLOBAL_PARENT],
-        help="Guard your o5 policy with co-signers (guard, change requests)",
+        help="Your o5 policy: what is in force, the guard, change requests",
     )
     psub = p_pol.add_subparsers(dest="policy_command", required=True)
     common = [_GLOBAL_PARENT]
@@ -2253,6 +2335,14 @@ def _add_policy_subparsers(sub) -> None:
             "--dry-run", action="store_true",
             help="Sign and print the transaction, and send nothing",
         )
+
+    p_pshow = psub.add_parser(
+        "show", parents=common,
+        help="Everything in force for an account's rules, from one tip",
+    )
+    p_pshow.add_argument("address", nargs="?", help="Address (default: your key's)")
+    _key_group(p_pshow, required=False)
+    p_pshow.set_defaults(func=cmd_policy_show)
 
     p_guard = psub.add_parser("guard", parents=common,
                               help="Set, revoke or show the rule-change guard")

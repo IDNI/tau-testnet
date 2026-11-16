@@ -1,0 +1,176 @@
+# Which rules are in force, and what a transaction did
+
+Two questions a wallet has to answer before it can tell a user "your protection
+is on":
+
+1. **Did my rule transaction take effect?** A transaction in a block is not the
+   same as a transaction that did something. `gettxstatus` used to answer
+   `confirmed` for both.
+2. **What is in force for this account right now?** The `o5` clause, the
+   rule-change guard, open rule-change requests and application rules that name
+   the account lived behind four different reads.
+
+`gettxstatus` now carries the transaction's **outcome**, and `getaccountrules`
+answers the second question from one tip. Both are read-only, need no restart,
+no regenesis and no change to the state hash. Issue: #42.
+
+Short reference: [README](../README.md#pending-aware-wallet-queries). CLI:
+[developer_cli.md](developer_cli.md#policy-guard). This guide is the long form.
+
+## Outcome of a confirmed transaction
+
+```bash
+tau-testnet rpc gettxstatus <tx_hash>
+```
+
+A `confirmed` answer adds `outcome`:
+
+```json
+{"tx_hash": "…", "status": "confirmed", "block_number": 41, "confirmations": 3,
+ "outcome": {
+   "status": "applied", "index": 0, "fee_charged": 10,
+   "logs": ["o5 clause registered for 8e7bb4c3e3", "Fee charged: 10 -> proposer 1a2b…"],
+   "rule_effects": [{"account": "8e7b…", "kind": "clause", "stream": 5,
+                     "action": "registered", "sha256": "…"}]}}
+```
+
+| Field | Meaning |
+|---|---|
+| `status` | `applied`: the transaction did what it carried. `skipped`: it is in the block and valid, but it changed nothing (the receipt logged an ignored offer, decision, request, vote or update). `rejected`: the block carries a transaction its apply step refused (an honest proposer leaves those out; see below). `not_recorded`: this node applied the block before it began recording outcomes. |
+| `index` | Position in the block. |
+| `reason` | The receipt's machine reason, when it has one (`rule_not_applied`, `rule_change_needs_approval`, …). |
+| `fee_charged` | What the sender paid. `0` for an included transaction that paid nothing. A skipped transaction can still have paid: that is the case a wallet must show. |
+| `logs` | The apply receipt, at most 16 lines of at most 400 characters each, then a `... N more line(s)` marker. |
+| `rule_effects` | What the transaction changed in anyone's rules, only on `applied`. |
+
+A transaction that changed a rule is never `skipped`, even when another of its
+operations logged "ignored".
+
+### Rule effects
+
+| `kind` | `action` | `stream` | `sha256` of |
+|---|---|---|---|
+| `clause` | `registered`, `replaced` | `5` for the `o5` policy, `4294967295` (`0xFFFFFFFF`) for the rule-change guard | the clause body as the registry stores it |
+| `clause` | `revoked` | as above | none |
+| `application_rule` | `accumulated` | none | the unit as the application-rules accumulation stores it |
+
+`account` is the account whose rules changed (the sender, or the acceptor of an
+offer). The hash is over the exact stored text, which is also what
+`getaccountrules` hashes, so the two can be compared byte for byte.
+
+### What is recorded where
+
+Every node records the outcome of every block it applies, live or in a replay,
+during the same apply that computes the state, so two nodes record the same
+status, fee and rule effects for the same block. The logs can differ where a node
+hit a node-local error (a width conflict in its own interpreter, a Tau process
+that was not ready). The record is node-local, like the retractable events:
+it is not part of the state hash, a fork needs no cleanup, and canonicality is
+resolved when it is read.
+
+- A node that **synced from genesis** after this change has the outcome of every
+  block. A node that was **upgraded in place** has it from the upgrade on and
+  answers `not_recorded` before that; resyncing from an empty data directory
+  fills the gap.
+- A transaction that **apply rejects** is left out of the block by the node that
+  builds it. That node keeps the reason in `mempool_dropped`, and its
+  `gettxstatus` answers `rejected` with `reason` and `detail`. Other nodes never
+  see the transaction in a block and report it `queued` until it expires.
+  Outcomes do not change this: they describe transactions that reached a block.
+
+## Everything in force for one account
+
+```bash
+tau-testnet policy show <address>          # human summary
+tau-testnet --json policy show --key alice # the raw answer
+tau-testnet rpc getaccountrules <address>
+```
+
+```json
+{"address": "8e7b…", "block_number": 41, "block_hash": "…",
+ "rule_clauses_root": "…",
+ "clauses": [{"stream": 5, "name": "o5", "body": "…", "sha256": "…",
+              "since": {"block_number": 40, "tx_hash": "…"}}],
+ "rule_change_guard": {"body": "…", "sha256": "…",
+                       "since": {"block_number": 12, "request_id": "…"}},
+ "application_rules": [],
+ "open_rule_changes": [{"request_id": "…", "kind": "set_policy", "body_sha256": "…",
+                        "offer_id": null, "approvers": {"18": "…"}, "voted": {},
+                        "declined": [], "ready": false,
+                        "created_height": 39, "expire_at_height": 2039}],
+ "awaiting_my_vote": [],
+ "pending_offers": 1,
+ "mempool": [{"tx_hash": "…", "tx_type": "rule_change_request"}],
+ "history": [{"block_number": 40, "kind": "clause", "stream": 5,
+              "action": "registered", "tx_hash": "…", "sha256": "…"}]}
+```
+
+| Field | Meaning |
+|---|---|
+| `block_number`, `block_hash` | The tip every chain field below was read at. |
+| `rule_clauses_root` | The registry root folded into the state hash (`""` while the rule book is empty, as in the state hash itself). |
+| `clauses` | The account's registry clauses except the guard, with the sha256 of each stored body. |
+| `rule_change_guard` | The guard clause, same shape, or `null`. |
+| `since` | The block, and the transaction or released request, that put this exact text in place, from this node's records; `null` when that happened before the node began recording. |
+| `application_rules` | Units of the application-rules accumulation whose text names the account's key (`#x<address>`), each with its sha256. |
+| `open_rule_changes` | The account's own rule-change requests that are still open: kind, hash of the requested body, approvers by slot, votes, declines, whether the guard already allows it (`ready`), and the expiry height. |
+| `awaiting_my_vote` | Open rule-change requests from other accounts that name this account as an approver, with their `sender_pubkey`. |
+| `pending_offers` | Rule offers addressed to the account that are still undecided. |
+| `mempool` | Rule-bearing transactions from the account not yet in a block (an `o5`/rule op `0`, offer decisions, rule-change requests and cancels). |
+| `history` | The latest 20 rule effects that named the account, newest first. |
+
+All chain fields come from **one** tip: the node reads its in-memory state under
+the same locks a block swap holds, so a block landing during the call cannot mix
+two tips. `history`, `since` and `mempool` are this node's own view.
+
+### Checking that the rule in force is the one the user meant
+
+A wallet that sent a rule knows its text. It can hash the text the way the node
+stores it and compare:
+
+1. Send the rule and remember the `tx_hash`.
+2. Poll `gettxstatus` until `confirmed`; read `outcome.rule_effects`.
+3. Read `getaccountrules`; the clause on that stream must carry the same
+   `sha256`, and `since.tx_hash` must be the transaction from step 1.
+
+Only then should a wallet say "protection on". A `skipped` outcome, a different
+hash, or a `null` clause means it is not.
+
+### The rule-change release
+
+A guarded rule change is parked as a request and written later by the release
+at the end of a block, not by a transaction. The release records what it wrote
+in the same history, with `request_id` in place of `tx_hash`. A request that
+fails at release (the policy it would revoke is already gone, the offer
+expired, the body no longer builds) appears as:
+
+```json
+{"block_number": 38, "kind": "rule_change_request", "action": "release_failed",
+ "request_id": "…", "detail": "no policy to revoke"}
+```
+
+Before this, the reason was only in the node's log.
+
+## Operator notes
+
+| Table | Written | Read by |
+|---|---|---|
+| `tx_outcomes (tx_hash, block_hash, …)` | per block, every node, apply and replay | `gettxstatus` |
+| `rule_effects (account, block_hash, …)`, indexed by account | per block, every node | `getaccountrules` |
+
+Both writes are best effort: a failure is logged and never reaches block commit.
+Both tables are created on start (`CREATE TABLE IF NOT EXISTS`); there is no
+migration. They grow with the chain; a full replay rewrites them idempotently.
+
+`getaccountrules` is in the expensive rate-limit tier: it takes the state locks
+and scans the mempool and the history.
+
+## What this does not do
+
+- It does not prove anything to a wallet that does not trust its node. A light
+  wallet that wants proof needs a receipts root committed by the block, which
+  changes the header or the state hash and therefore needs a coordinated
+  restart.
+- It does not change which transactions are valid or what they cost. Soft no-ops
+  (an offer that lost a race, a duplicate request) still sit in the block and
+  pay their fee; they are now visible as `skipped` with their `fee_charged`.
