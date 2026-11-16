@@ -595,13 +595,14 @@ def build_rule_change_request_tx(
 
     Kinds 1 and 4 carry the clause in ``rule_text``; kind 3 carries the exact
     offered text and the offer id; kind 6 carries a payout rule's canonical spec
-    text (``payout_spec_text`` without a sequence number); kinds 2, 5 and 7
-    carry neither. Zero approvers is
+    text (``payout_spec_text`` without a sequence number) and kind 8 a receive
+    route's (``route_spec_text``); kinds 2, 5, 7 and 9 carry neither. Zero
+    approvers is
     valid: the time escape alone can release the request.
     """
-    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5, 6, 7):
-        raise ValueError("kind must be 1..7")
-    has_body = kind in (1, 3, 4, 6)
+    if isinstance(kind, bool) or kind not in range(1, 10):
+        raise ValueError("kind must be 1..9")
+    has_body = kind in (1, 3, 4, 6, 8)
     if has_body and not (isinstance(rule_text, str) and rule_text.strip()):
         raise ValueError("this kind needs a non-empty rule text")
     if not has_body and rule_text:
@@ -1030,3 +1031,99 @@ def build_payout_execute_tx(
             raise ValueError("sale_id must be a 64-character transaction hash")
         tx["sale_id"] = sale_id.lower()
     return tx
+
+
+def build_receive_route_set_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    destination_pubkey: str,
+    share_bps: int,
+    min_amount: int = 0,
+    active_from: int = 0,
+    expires_at: int = 0,
+    locked: bool = False,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='receive_route_set'`` payload (without signature).
+
+    ``share_bps`` is the routed share in basis points (2000 = 20%). The optional
+    terms are left out at their defaults, so the payload reads like the spec a
+    guarded account would file: a minimum credit, a start and an end (unix
+    seconds, block time), and ``locked``, which needs an end.
+    """
+    if not isinstance(destination_pubkey, str) or len(destination_pubkey) != 96:
+        raise ValueError("destination_pubkey must be a 96-character hex public key")
+    if isinstance(share_bps, bool) or not isinstance(share_bps, int):
+        raise ValueError("share_bps must be an integer")
+    if locked and not expires_at:
+        raise ValueError("a locked route needs an end (expires_at)")
+    tx = {
+        "tx_type": "receive_route_set",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "destination_pubkey": destination_pubkey.lower(),
+        "share_bps": share_bps,
+    }
+    for name, value in (("min_amount", min_amount), ("active_from", active_from),
+                        ("expires_at", expires_at)):
+        if value:
+            tx[name] = int(value)
+    if locked:
+        tx["locked"] = True
+    return tx
+
+
+def build_receive_route_remove_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='receive_route_remove'`` payload (without signature). Feeless."""
+    return {
+        "tx_type": "receive_route_remove",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+    }
+
+
+def build_receive_route_release_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    owner_pubkey: str,
+    route_id: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='receive_route_release'`` payload (without signature).
+
+    Signed by the route's DESTINATION. ``route_id`` pins the exact route: if
+    the owner replaced it since, the release is refused. Feeless.
+    """
+    if not isinstance(owner_pubkey, str) or len(owner_pubkey) != 96:
+        raise ValueError("owner_pubkey must be a 96-character hex public key")
+    if not isinstance(route_id, str) or len(route_id) != 64:
+        raise ValueError("route_id must be a 64-character hex string")
+    return {
+        "tx_type": "receive_route_release",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "owner_pubkey": owner_pubkey.lower(),
+        "route_id": route_id.lower(),
+    }

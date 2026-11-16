@@ -139,6 +139,9 @@ RULE_CHANGE_KIND_REVOKE_GUARD = 5
 # Payout rules (#63): installing or replacing one, and revoking it.
 RULE_CHANGE_KIND_SET_PAYOUT = 6
 RULE_CHANGE_KIND_REVOKE_PAYOUT = 7
+# Receive routes (#35): setting or replacing one, and removing it.
+RULE_CHANGE_KIND_SET_ROUTE = 8
+RULE_CHANGE_KIND_REMOVE_ROUTE = 9
 
 # Blocks after which a parked rule-change request may release without approvals.
 RULE_CHANGE_DELAY_BLOCKS = 1000

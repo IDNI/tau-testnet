@@ -578,6 +578,46 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_payout_events_account "
                 "ON payout_events(account_pubkey, block_number);"
             )
+            # Receive routes (#35): one route per account. Bound into
+            # consensus_meta_hash once the book has held anything, so written in
+            # the same transaction as accounts.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS receive_routes_v1 (
+                    owner_pubkey       TEXT PRIMARY KEY,
+                    route_id           TEXT NOT NULL,
+                    sequence_number    INTEGER NOT NULL,
+                    destination_pubkey TEXT NOT NULL,
+                    share_bps          INTEGER NOT NULL,
+                    min_amount         INTEGER NOT NULL,
+                    active_from        INTEGER NOT NULL,
+                    expires_at         INTEGER NOT NULL,
+                    locked             INTEGER NOT NULL
+                );
+            ''')
+            # Node-local history: every split (gross, routed, net, credit
+            # class, where the payment came from) and every route change. Read
+            # by owner and by destination.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS route_events (
+                    owner_pubkey       TEXT NOT NULL,
+                    destination_pubkey TEXT NOT NULL,
+                    route_id           TEXT NOT NULL,
+                    block_hash         TEXT NOT NULL,
+                    block_number       INTEGER NOT NULL,
+                    event_index        INTEGER NOT NULL,
+                    outcome            TEXT NOT NULL,
+                    detail_json        TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (block_hash, event_index)
+                );
+            ''')
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_route_events_owner "
+                "ON route_events(owner_pubkey, block_number);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_route_events_destination "
+                "ON route_events(destination_pubkey, block_number);"
+            )
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -2367,7 +2407,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None, receive_routes: Dict | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2408,6 +2448,7 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 rule_change_requests=rule_change_requests,
                 standing_payments=standing_payments,
                 payout_rules=payout_rules,
+                receive_routes=receive_routes,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
 
@@ -2472,7 +2513,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None, receive_routes: Dict | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2685,6 +2726,8 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
         _write_standing_rows(standing_payments)
     if payout_rules is not None:
         _write_payout_rows(payout_rules)
+    if receive_routes is not None:
+        _write_route_rows(receive_routes)
 
     if max_rule_txs_per_block is not None:
         # Governance-activated value; persisted verbatim so a reload
@@ -3019,6 +3062,136 @@ def record_payout_events(block_hash: str, block_number: int, events) -> None:
                     )
     except Exception:
         logger.exception("could not record payout events")
+
+
+_ROUTE_COLUMNS = (
+    'route_id, owner_pubkey, sequence_number, destination_pubkey, share_bps, '
+    'min_amount, active_from, expires_at, locked'
+)
+
+
+def _write_route_rows(state: Dict) -> None:
+    """Full replace of the receive routes in force plus the removal commitment."""
+    _db_conn.execute('DELETE FROM receive_routes_v1')
+    for row in state['rows']:
+        route_id, owner, sequence, destination, share, min_amount, start, end, locked = row
+        _db_conn.execute(
+            f'INSERT INTO receive_routes_v1 ({_ROUTE_COLUMNS}) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (bytes(route_id).hex(), owner, int(sequence), destination, int(share),
+             int(min_amount), int(start), int(end), 1 if locked else 0),
+        )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        (
+            'route_resolved',
+            json.dumps({'count': int(state['resolved_count']), 'acc': state['resolved_acc']}),
+        )
+    )
+
+
+def load_route_state() -> tuple[List[tuple], int, bytes]:
+    """(rows, resolved_count, resolved_acc) in ReceiveRouteBook.restore order."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            f'SELECT {_ROUTE_COLUMNS} FROM receive_routes_v1 ORDER BY owner_pubkey'
+        ).fetchall()
+        raw = _db_conn.execute(
+            "SELECT value FROM chain_state WHERE key = 'route_resolved'"
+        ).fetchone()
+    count, acc = 0, bytes(32)
+    if raw and raw[0]:
+        parsed = json.loads(raw[0])
+        count, acc = int(parsed['count']), bytes.fromhex(parsed['acc'])
+    out = [
+        (bytes.fromhex(r[0]), r[1], int(r[2]), r[3], int(r[4]), int(r[5]), int(r[6]),
+         int(r[7]), bool(r[8]))
+        for r in rows
+    ]
+    return out, count, acc
+
+
+def record_route_events(block_hash: str, block_number: int, events) -> None:
+    """Node-local history of what a block routed and changed. Best effort."""
+    if _db_conn is None:
+        init_db()
+    try:
+        with _db_lock:
+            with _db_conn:
+                for index, event in enumerate(events):
+                    detail = {k: v for k, v in event.items()
+                              if k not in ('owner_pubkey', 'destination_pubkey',
+                                           'route_id', 'outcome')}
+                    _db_conn.execute(
+                        'INSERT OR REPLACE INTO route_events '
+                        '(owner_pubkey, destination_pubkey, route_id, block_hash, '
+                        'block_number, event_index, outcome, detail_json) '
+                        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                        (event['owner_pubkey'], event['destination_pubkey'],
+                         event['route_id'], block_hash, int(block_number), index,
+                         event['outcome'], json.dumps(detail, sort_keys=True)),
+                    )
+    except Exception:
+        logger.exception("could not record receive route events")
+
+
+def get_canonical_route_events(pubkey: str, *, role: str = "owner",
+                               limit: int = 50) -> List[Dict]:
+    """History of the routes an account owns (`role="owner"`) or is paid by
+    (`role="destination"`) on the canonical chain, newest first."""
+    column = {'owner': 'owner_pubkey', 'destination': 'destination_pubkey'}[role]
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT owner_pubkey, destination_pubkey, route_id, block_hash, block_number, '
+            f'event_index, outcome, detail_json FROM route_events WHERE {column} = ? '
+            'ORDER BY block_number DESC, event_index DESC',
+            (pubkey,),
+        ).fetchall()
+    out: List[Dict] = []
+    canonical: Dict[str, bool] = {}
+    for owner, destination, route_id, block_hash, number, index, outcome, detail in rows:
+        if block_hash not in canonical:
+            canonical[block_hash] = get_canonical_confirmation(block_hash, int(number))[0]
+        if not canonical[block_hash]:
+            continue
+        item = {"block_number": int(number), "block_hash": block_hash,
+                "owner_pubkey": owner, "destination_pubkey": destination,
+                "route_id": route_id, "outcome": outcome}
+        try:
+            item.update(json.loads(detail or '{}'))
+        except Exception:
+            pass
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def get_canonical_route_events_for_tx(tx_hash: str, block_hash: str) -> List[Dict]:
+    """The splits and route changes one transaction made in one block."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT owner_pubkey, destination_pubkey, route_id, outcome, detail_json '
+            'FROM route_events WHERE block_hash = ? ORDER BY event_index',
+            (block_hash,),
+        ).fetchall()
+    out: List[Dict] = []
+    for owner, destination, route_id, outcome, detail in rows:
+        try:
+            extra = json.loads(detail or '{}')
+        except Exception:
+            extra = {}
+        if extra.get('tx_id') != tx_hash:
+            continue
+        out.append({"owner_pubkey": owner, "destination_pubkey": destination,
+                    "route_id": route_id, "outcome": outcome, **extra})
+    return out
 
 
 def get_canonical_payout_events(account_pubkey: str, limit: int = 50) -> List[Dict]:

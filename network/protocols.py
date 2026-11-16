@@ -27,6 +27,8 @@ TAU_GOSSIP_TOPIC_RETRACTABLE = "tau/retractable/1.0.0"
 TAU_GOSSIP_TOPIC_STANDING = "tau/standing/1.0.0"
 # Payout rules: installs carry rule text, executions are what moves the money.
 TAU_GOSSIP_TOPIC_PAYOUT = "tau/payout/1.0.0"
+# Receive routes: small, rare, and a release by a destination is time-sensitive.
+TAU_GOSSIP_TOPIC_ROUTES = "tau/routes/1.0.0"
 TAU_GOSSIP_TOPIC_PEERS = "tau/peers/2.0.0"
 
 # Mempool & Edge Ingestion Limits
@@ -74,3 +76,8 @@ TAU_MAX_PAYOUT_RULE_SET_BYTES = 16384
 TAU_MAX_PAYOUT_EXECUTE_BYTES = 8192
 TAU_MAX_PAYOUT_RULE_REVOKE_BYTES = 4096
 TAU_MEMPOOL_SNAPSHOT_MAX_PAYOUT_TXS = 32
+# A route set carries a destination and five numbers; remove and release less.
+TAU_MAX_RECEIVE_ROUTE_SET_BYTES = 4096
+TAU_MAX_RECEIVE_ROUTE_REMOVE_BYTES = 4096
+TAU_MAX_RECEIVE_ROUTE_RELEASE_BYTES = 4096
+TAU_MEMPOOL_SNAPSHOT_MAX_ROUTE_TXS = 32

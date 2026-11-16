@@ -64,6 +64,17 @@ from consensus.payout import (
     parse_payout_spec,
     settle as settle_payout,
 )
+from consensus.receive_route import (
+    TX_TYPE_RECEIVE_ROUTE_RELEASE,
+    TX_TYPE_RECEIVE_ROUTE_REMOVE,
+    TX_TYPE_RECEIVE_ROUTE_SET,
+    RouteShapeError,
+    describe as describe_route,
+    parse_receive_route_release,
+    parse_receive_route_remove,
+    parse_receive_route_set,
+    parse_route_spec,
+)
 from consensus.standing import (
     KIND_BLOCKS as STANDING_KIND_BLOCKS,
     MAX_OPEN_STANDING_PER_PAYER,
@@ -1426,6 +1437,19 @@ def _rule_change_precondition_error(request, tip_view: TipAdmissionView) -> Opti
     elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
         if tip_view.payout_book().get(sender) is None:
             return "there is no payout rule to revoke"
+    elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_ROUTE:
+        try:
+            terms = parse_route_spec(request.body, sender)
+        except RouteShapeError as exc:
+            return str(exc)
+        _, reason = tip_view.route_book().can_admit_set(terms, tip_view.next_block_timestamp)
+        if reason:
+            return reason
+    elif request.kind == tau_defs.RULE_CHANGE_KIND_REMOVE_ROUTE:
+        _, reason = tip_view.route_book().can_admit_remove(
+            sender, tip_view.next_block_timestamp)
+        if reason:
+            return reason
     elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
         row = tip_view.get_offer(request.offer_id)
         if not isinstance(row, dict) or row.get("status") != STATUS_OFFERED:
@@ -2035,6 +2059,85 @@ def validate_payout_execute_payload(
     })
 
 
+def _route_code(reason: str) -> str:
+    if "full" in reason:
+        return "RECEIVE_ROUTE_BOOK_FULL"
+    if "already installed" in reason:
+        return "DUPLICATE_RECEIVE_ROUTE"
+    if "locked until" in reason:
+        return "RECEIVE_ROUTE_LOCKED"
+    if "no receive route" in reason:
+        return "NO_RECEIVE_ROUTE"
+    if "not the one named" in reason:
+        return "STALE_ROUTE_ID"
+    if "destination may release" in reason:
+        return "NOT_ROUTE_DESTINATION"
+    return "INVALID_RECEIVE_ROUTE"
+
+
+def validate_receive_route_set_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for setting or replacing the sender's receive route (#35).
+
+    The checks are apply's own (`can_admit_set`) against the next block's
+    timestamp, plus the destination key and the sender's rule-change guard (kind 8).
+    """
+    try:
+        terms = parse_receive_route_set(tx)
+    except RouteShapeError as exc:
+        return format_error(f"Malformed receive_route_set: {exc}.", code="INVALID_RECEIVE_ROUTE")
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != terms.owner_pubkey:
+        return format_error("receive_route_set sender_pubkey must match the signer.")
+    err = validate_bls_pubkey(terms.destination_pubkey, "destination_pubkey")
+    if err:
+        return format_error(f"receive_route_set rejected: {err}", code="INVALID_RECEIVE_ROUTE")
+    ts = tip_view.next_block_timestamp
+    ok, reason = tip_view.route_book().can_admit_set(terms, ts)
+    if not ok:
+        return format_error(f"receive_route_set rejected: {reason}", code=_route_code(reason))
+    refusal = _rule_change_refusal(tip_view, sender, tau_defs.RULE_CHANGE_KIND_SET_ROUTE)
+    if refusal is not None:
+        return refusal
+    return success(describe_route(terms, ts))
+
+
+def validate_receive_route_remove_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    try:
+        owner = parse_receive_route_remove(tx)
+    except RouteShapeError as exc:
+        return format_error(f"Malformed receive_route_remove: {exc}.")
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != owner:
+        return format_error("receive_route_remove sender_pubkey must match the signer.")
+    book = tip_view.route_book()
+    ok, reason = book.can_admit_remove(owner, tip_view.next_block_timestamp)
+    if not ok:
+        return format_error(f"receive_route_remove rejected: {reason}", code=_route_code(reason))
+    refusal = _rule_change_refusal(tip_view, sender, tau_defs.RULE_CHANGE_KIND_REMOVE_ROUTE)
+    if refusal is not None:
+        return refusal
+    return success({"route_id": book.get(owner).route_id.hex()})
+
+
+def validate_receive_route_release_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """A destination letting go of a route that pays it. Not a rule change of the
+    owner: it only stops money the owner would otherwise have sent away."""
+    try:
+        signer, owner, route_id = parse_receive_route_release(tx)
+    except RouteShapeError as exc:
+        return format_error(f"Malformed receive_route_release: {exc}.")
+    ok, reason = tip_view.route_book().can_admit_release(owner, route_id, signer)
+    if not ok:
+        return format_error(f"receive_route_release rejected: {reason}", code=_route_code(reason))
+    return success({"route_id": route_id.hex(), "owner_pubkey": owner})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -2175,6 +2278,15 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
          return validate_payout_execute_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_RECEIVE_ROUTE_SET:
+         return validate_receive_route_set_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_RECEIVE_ROUTE_REMOVE:
+         return validate_receive_route_remove_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_RECEIVE_ROUTE_RELEASE:
+         return validate_receive_route_release_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

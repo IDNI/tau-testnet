@@ -367,6 +367,14 @@ def test_cli_leaves_a_plain_transfer_as_it_was(alice_key):
 def test_every_bound_type_is_a_type_the_node_knows():
     from commands.sendtx import _get_signing_message_bytes  # noqa: F401  (import check)
     from consensus.payout import PAYOUT_TX_TYPES
+    from consensus.receive_route import ROUTE_TX_TYPES
     from consensus.standing import STANDING_TX_TYPES
 
-    assert set(STANDING_TX_TYPES) | set(PAYOUT_TX_TYPES) <= BOUND_TX_TYPES
+    assert set(STANDING_TX_TYPES) | set(PAYOUT_TX_TYPES) | set(ROUTE_TX_TYPES) <= BOUND_TX_TYPES
+
+
+@pytest.mark.parametrize("tx_type", sorted(BOUND_TX_TYPES))
+def test_every_bound_type_is_left_out_of_a_block_for_another_network(tx_type):
+    """The network is checked before anything the type itself checks."""
+    assert apply_tx_error({"tx_type": tx_type, FIELD: ELSEWHERE})[0] == "wrong_network"
+    assert apply_tx_error({"tx_type": tx_type})[0] == "wrong_network"

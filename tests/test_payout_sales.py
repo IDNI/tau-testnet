@@ -33,6 +33,7 @@ from tests.test_standing_apply import (
     ALICE, BOB, CAROL, HEIGHT, PROPOSER, SKS, TS, Chain, Oracle, _sign, spend_tx,
 )
 from tests import test_payout_integration as integ
+from tests.test_receive_route_apply import route_tx
 
 # A 5% royalty on each sale, paid to the creator in slot 0.
 # 5% is a twentieth; dividing only, the amount can never wrap at bv[24]
@@ -220,6 +221,29 @@ def test_a_block_does_not_touch_its_parents_sales(royalty):
     _sell(ch, oracle)
     assert parent.state_of(ALICE).open_sales == ()
     assert ch.lm.payout_rules.state_of(ALICE).open_sales != ()
+
+
+def test_a_routed_payment_is_a_sale_at_its_gross_amount_and_the_share_is_no_sale(royalty):
+    """With a receive route (#35): the sale is what the payer sent, before the
+    route splits off its share, and the share is not a sale of the destination."""
+    ch, oracle, rule = _store()
+    # BOB, the route's destination, pays per sale as well
+    bob_rule = set_tx(sender=BOB, rule=ROYALTY, per_sale=True, slots=[CAROL],
+                      cap_exec=100, cap_period=1_000)
+    route = route_tx(sender=ALICE, seq=1, dest=BOB, share=2000)
+    ch.block([bob_rule, route], height=HEIGHT + 1, ts=TS + 1)
+    assert ch.lm.payout_rules.get(BOB).per_sale and ch.lm.receive_routes.get(ALICE)
+
+    buy = spend_tx(CAROL, ALICE, 101, 0)
+    ch.block([buy], height=HEIGHT + 2, ts=TS + 2)
+    assert ch.bal[ALICE] == 1_000 + 81 and ch.bal[BOB] == 20
+    (sale,) = ch.lm.payout_rules.state_of(ALICE).open_sales
+    assert sale[0].hex() == _sale_id(buy) and sale[2] == 101
+    assert ch.lm.payout_rules.state_of(BOB).open_sales == ()
+
+    ch.block([_pay(rule, _sale_id(buy), seq=1)], height=HEIGHT + 3, ts=TS + 3)
+    assert _events(ch)[0]["total"] == 5
+    assert ch.bal[ALICE] == 1_081 - 5 and ch.bal[BOB] == 25
 
 
 # --- the book ------------------------------------------------------------------------

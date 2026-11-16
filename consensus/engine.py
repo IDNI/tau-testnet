@@ -56,6 +56,23 @@ from .payout import (
     parse_payout_rule_set,
     settle as settle_payout,
 )
+from .receive_route import (
+    CREDIT_APPROVED_TRANSFER,
+    CREDIT_PAYOUT,
+    CREDIT_RETRACTABLE_RELEASE,
+    CREDIT_STANDING_PAYMENT,
+    CREDIT_TRANSFER,
+    ROUTE_TX_TYPES,
+    ReceiveRouteBook,
+    RouteShapeError,
+    TX_TYPE_RECEIVE_ROUTE_RELEASE,
+    TX_TYPE_RECEIVE_ROUTE_SET,
+    credit_event as route_credit_event,
+    lifecycle_event as route_lifecycle_event,
+    parse_receive_route_release,
+    parse_receive_route_remove,
+    parse_receive_route_set,
+)
 from .standing import (
     ATTEMPT_BLOCKED,
     ATTEMPT_NO_FUNDS,
@@ -101,7 +118,8 @@ from .rule_offers import (
 # `standing_payment_execute` is paid by its executor, whoever that is, because it
 # asks for a payment (and its clause step) the sweep would otherwise make later.
 # `payout_rule_set` pays because it builds a clause; `payout_execute` is paid by
-# its executor, whoever that is, because it steps the rule.
+# its executor, whoever that is, because it steps the rule. `receive_route_set`
+# pays because it adds to a bounded book; removing a route is free.
 #
 # MUST stay in step with commands.sendtx.FEE_BEARING_TX_TYPES -- the same
 # constant is deliberately duplicated there to keep the admission path free of
@@ -111,7 +129,7 @@ FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_STANDING_PAYMENT_CREATE,
      TX_TYPE_STANDING_PAYMENT_UPDATE, TX_TYPE_STANDING_PAYMENT_EXECUTE,
-     TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE}
+     TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_RECEIVE_ROUTE_SET}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -280,17 +298,56 @@ def _escrow_total(lm) -> int:
     return book.escrow_total() if book is not None else 0
 
 
-def _release_due_retractables(lm, balances, sequences, height, timestamp) -> List[str]:
+def _route_book(lm) -> Optional[ReceiveRouteBook]:
+    book = getattr(lm, "receive_routes", None)
+    return book if isinstance(book, ReceiveRouteBook) else None
+
+
+def _routed_credit(lm, recipient, gross, timestamp, credit, credit_class,
+                   **source) -> Optional[Dict[str, Any]]:
+    """Credit `gross` to `recipient`, split by the recipient's receive route (#35).
+
+    The ONE place a payment lands, for every routed credit class. `credit(addr,
+    amount)` adds to a balance through the caller's own view (a transaction's
+    staged writes, or the block's balances at the end of the block). The routed
+    share is credited to the destination with a plain credit, never through this
+    function, so it is never routed again: one hop, no loops. Returns the route
+    event, or None when nothing was routed.
+    """
+    book = _route_book(lm)
+    route, routed = (book.split(recipient, gross, int(timestamp or 0))
+                     if book is not None else (None, 0))
+    credit(recipient, int(gross) - routed)
+    if not routed:
+        return None
+    credit(route.destination_pubkey, routed)
+    return route_credit_event(route, gross, routed, credit_class, **source)
+
+
+def _balance_credit(balances, sequences, grant):
+    """A credit into the block's balances, with the grant of an account that has
+    no record yet, exactly as a transfer's credit does."""
+    def credit(addr, amount):
+        balances[addr] = faucet.spendable(balances, sequences, addr, grant) + amount
+    return credit
+
+
+def _release_due_retractables(lm, balances, sequences, height, timestamp,
+                              route_events: Optional[List[Dict[str, Any]]] = None) -> List[str]:
     """Pay every matured entry to its recipient; returns the released ids."""
     book = _retractable_book(lm)
     if book is None:
         return []
     released = book.release_due(int(height), int(timestamp))
-    grant = faucet.amount(lm)
+    credit = _balance_credit(balances, sequences, faucet.amount(lm))
     for entry in released:
-        balances[entry.recipient_pubkey] = faucet.spendable(
-            balances, sequences, entry.recipient_pubkey, grant
-        ) + entry.amount
+        event = _routed_credit(
+            lm, entry.recipient_pubkey, entry.amount, timestamp, credit,
+            CREDIT_RETRACTABLE_RELEASE, payer_pubkey=entry.sender_pubkey,
+            retractable_id=entry.retractable_id.hex(),
+        )
+        if event is not None and route_events is not None:
+            route_events.append(event)
     return [entry.retractable_id.hex() for entry in released]
 
 
@@ -342,8 +399,37 @@ def _expire_payout_rules(lm, height, timestamp) -> List[Dict[str, Any]]:
     ]
 
 
+def _expire_receive_routes(lm, timestamp) -> List[Dict[str, Any]]:
+    """Remove every receive route whose end this block reached; their events.
+    Credits in the block already saw the route as ended (ts >= expires_at)."""
+    book = _route_book(lm)
+    if book is None or not book.has_expiring(int(timestamp)):
+        return []
+    return [route_lifecycle_event(t, "expired") for t in book.expire(int(timestamp))]
+
+
+def _route_request_problem(lm, sender, body, timestamp) -> Optional[str]:
+    """Why a route spec (a kind-8 body) may not be installed now, or None."""
+    from consensus.receive_route import parse_route_spec
+
+    try:
+        terms = parse_route_spec(body, sender)
+    except RouteShapeError as exc:
+        return str(exc)
+    from consensus.tx_checks import validate_bls_pubkey
+
+    err = validate_bls_pubkey(terms.destination_pubkey, "destination_pubkey")
+    if err:
+        return err
+    book = _route_book(lm) or ReceiveRouteBook()
+    _, reason = book.can_admit_set(terms, int(timestamp))
+    return reason or None
+
+
 def _run_standing_payments(lm, balances, sequences, last_ts, parent_meta, height,
-                           timestamp, *, timeout=None, replay_mode=False) -> List[Dict[str, Any]]:
+                           timestamp, *, timeout=None, replay_mode=False,
+                           route_events: Optional[List[Dict[str, Any]]] = None
+                           ) -> List[Dict[str, Any]]:
     """Pay what the standing-payment book says is due in this block; its events.
 
     Runs after the transaction loop and the retractable release, so a cancel in
@@ -358,6 +444,7 @@ def _run_standing_payments(lm, balances, sequences, last_ts, parent_meta, height
     if book is None or not book.terms:
         return []
     grant = faucet.amount(lm)
+    credit = _balance_credit(balances, sequences, grant)
     parent_bals = parent_meta.get("balances") or {}
     parent_seqs = parent_meta.get("sequence_numbers") or {}
     parent_lts = parent_meta.get("last_transfer_ts") or {}
@@ -410,7 +497,11 @@ def _run_standing_payments(lm, balances, sequences, last_ts, parent_meta, height
             if blocked:
                 return ATTEMPT_BLOCKED
         balances[payer] = have - amount
-        balances[recipient] = faucet.spendable(balances, sequences, recipient, grant) + amount
+        event = _routed_credit(lm, recipient, amount, timestamp, credit,
+                               CREDIT_STANDING_PAYMENT, payer_pubkey=payer,
+                               standing_id=terms.standing_id.hex())
+        if event is not None and route_events is not None:
+            route_events.append(event)
         if last_ts is not None:
             last_ts[payer] = int(timestamp)
         return ATTEMPT_PAID
@@ -456,7 +547,8 @@ def _payout_request_problem(lm, sender, body, height, timestamp) -> Optional[str
 
 
 def _release_rule_changes(lm, height, timestamp, timeout,
-                          payout_events: Optional[List[Dict[str, Any]]] = None
+                          payout_events: Optional[List[Dict[str, Any]]] = None,
+                          route_events: Optional[List[Dict[str, Any]]] = None,
                           ) -> List[Tuple[str, str]]:
     """Write every READY rule-change request, lowest id first, up to the per-block cap.
 
@@ -478,7 +570,8 @@ def _release_rule_changes(lm, height, timestamp, timeout,
             continue
         processed += 1
         problem = _write_rule_change(lm, rid, entry, int(height), timeout,
-                                     timestamp=int(timestamp), payout_events=payout_events)
+                                     timestamp=int(timestamp), payout_events=payout_events,
+                                     route_events=route_events)
         if problem:
             approvals.resolve_rule_change(rid, STATUS_FAILED)
             logger.info("Rule-change request %s failed at release: %s", rid.hex(), problem)
@@ -490,7 +583,7 @@ def _release_rule_changes(lm, height, timestamp, timeout,
 
 
 def _write_rule_change(lm, rid, entry, height, timeout, *, timestamp=0,
-                       payout_events=None) -> Optional[str]:
+                       payout_events=None, route_events=None) -> Optional[str]:
     """Apply one request to the block's lifecycle. None on success, else why not.
 
     Every check runs before the first write, so a failure leaves nothing behind.
@@ -498,6 +591,9 @@ def _write_rule_change(lm, rid, entry, height, timeout, *, timestamp=0,
     if entry.kind in (tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
                       tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT):
         return _write_payout_change(lm, entry, height, timestamp, timeout, payout_events)
+    if entry.kind in (tau_defs.RULE_CHANGE_KIND_SET_ROUTE,
+                      tau_defs.RULE_CHANGE_KIND_REMOVE_ROUTE):
+        return _write_route_change(lm, entry, timestamp, route_events)
     offers = lm.rule_offers
     approvals = lm.approval_requests
     sender = entry.sender_pubkey
@@ -604,6 +700,38 @@ def _write_payout_change(lm, entry, height, timestamp, timeout, events) -> Optio
         events.append({"account_pubkey": sender, "rule_id": terms.rule_id.hex(),
                        "outcome": "installed",
                        **({"replaced": replaced.hex()} if replaced else {})})
+    return None
+
+
+def _write_route_change(lm, entry, timestamp, events) -> Optional[str]:
+    """Set or remove a receive route from a released rule-change request.
+
+    The lock is checked again here: a remove parked while the route was free
+    fails if the owner has since locked it, because the lock protects the
+    destination, and no co-signature of the owner's side can lift it.
+    """
+    from consensus.receive_route import parse_route_spec
+
+    book = _route_book(lm)
+    if book is None:
+        return "no receive route book"
+    sender = entry.sender_pubkey
+    if entry.kind == tau_defs.RULE_CHANGE_KIND_REMOVE_ROUTE:
+        _, reason = book.can_admit_remove(sender, int(timestamp))
+        if reason:
+            return reason
+        gone = book.remove(sender)
+        if events is not None:
+            events.append(route_lifecycle_event(gone, "removed"))
+        return None
+    problem = _route_request_problem(lm, sender, entry.body, timestamp)
+    if problem:
+        return problem
+    terms = parse_route_spec(entry.body, sender)
+    replaced = book.install(terms)
+    if events is not None:
+        events.append(route_lifecycle_event(
+            terms, "installed", replaced=replaced.hex() if replaced else None))
     return None
 
 
@@ -1130,8 +1258,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # burn). A mismatch is a consensus bug, not a recoverable error.
         # The sweep runs after the transaction loop, so a retract (strictly
         # before release) and a release can never both fire in one block.
+        # Credits that land at the end of the block go through the receive
+        # routes in force after the last transaction (#35).
+        route_block_events: List[Dict[str, Any]] = []
         released_retractables = _release_due_retractables(
-            lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
+            lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp,
+            route_events=route_block_events,
         )
         _block_session = session if session is not None else getattr(proposal, "session", None)
         standing_sweep = _run_standing_payments(
@@ -1139,10 +1271,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             block.header.block_number, block.header.timestamp,
             timeout=getattr(_block_session, "request_budget", None),
             replay_mode=replay_mode,
+            route_events=route_block_events,
         )
         payout_expired = _expire_payout_rules(
             lm, block.header.block_number, block.header.timestamp
         )
+        route_block_events.extend(_expire_receive_routes(lm, block.header.timestamp))
         payout_released: List[Dict[str, Any]] = []
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
@@ -1151,6 +1285,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "request_budget", None,
             ),
             payout_events=payout_released,
+            route_events=route_block_events,
         )
 
         minted = faucet.granted(
@@ -1223,6 +1358,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 payout_events.append(event)
         payout_events.extend(payout_expired)
         payout_events.extend(payout_released)
+
+        # Receive routes: the splits and route changes of the kept transactions,
+        # in block order, then the end of the block: releases, standing
+        # payments, expiries and guarded changes, in the order they ran.
+        route_events: List[Dict[str, Any]] = []
+        for i, tx in enumerate(block.transactions):
+            events = (exec_result.receipts.get(tx.get('tx_id', str(i))) or {}).get("route_events")
+            if events and tx in exec_result.accepted_transactions:
+                route_events.extend(events)
+        route_events.extend(route_block_events)
 
         # 3. Post-State Materialization Layer
         
@@ -1381,6 +1526,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "retractable_events": retractable_events,
                 "standing_events": standing_events,
                 "payout_events": payout_events,
+                "route_events": route_events,
             }
         )
         
@@ -1396,6 +1542,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "retractable_events": retractable_events,
                 "standing_events": standing_events,
                 "payout_events": payout_events,
+                "route_events": route_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -1949,11 +2096,30 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 key = (str(to_addr), str(from_addr))
                 pending_sales[key] = pending_sales.get(key, 0) + int(amount)
 
+            pending_route_set = None
+            pending_route_remove: Optional[str] = None
+            pending_route_release: Optional[str] = None
+
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
                 if addr in staged_writes:
                     return staged_writes[addr]
                 return _balance_of(addr)
+
+            def _stage_credit_raw(addr: str, amount: int) -> None:
+                staged_writes[addr] = _read_bal(addr) + amount
+
+            def _stage_credit(recipient: str, amount: int, credit_class: str,
+                              payer: Optional[str], **source) -> None:
+                """A payment landing on `recipient` within this transaction: staged,
+                and split by the recipient's receive route (#35)."""
+                event = _routed_credit(
+                    lifecycle_mgr, recipient, amount, block_timestamp,
+                    _stage_credit_raw, credit_class, payer_pubkey=payer, tx_id=tx_id,
+                    **source,
+                )
+                if event is not None:
+                    tx_receipt.setdefault("route_events", []).append(event)
 
             def _apply_o5_clause_routing(rule_text):
                 """Register or revoke the sender's o5 clause. True when handled.
@@ -2166,7 +2332,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
-                                          escrow=False):
+                                          escrow=False, credit_class=CREDIT_TRANSFER):
                 """Execute ONE transfer under the fee model. True to continue.
 
                 Extracted verbatim from the user_tx transfer loop so the
@@ -2187,7 +2353,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 the vote path passes the pubkeys of approvers who actually voted.
 
                 `escrow` stages only the debit: the credit belongs to the
-                retractable book until it releases.
+                retractable book until it releases. `credit_class` names the
+                credit for the recipient's receive route.
                 """
                 nonlocal accepted_in_block, hard_reject, execution_success
                 try:
@@ -2302,7 +2469,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         return False
                     staged_writes[from_addr] = current_from - amount
                     if not escrow:
-                        staged_writes[to_addr] = _read_bal(to_addr) + amount
+                        _stage_credit(to_addr, amount, credit_class, from_addr)
                 except FeeRuleError:
                     raise
                 except Exception as e:
@@ -2580,6 +2747,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 height_now, int(block_timestamp or 0))
                             if why:
                                 problem = (why, "rule_change_request_invalid")
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_ROUTE:
+                            why = _route_request_problem(
+                                lifecycle_mgr, request.sender_pubkey, request.body,
+                                int(block_timestamp or 0))
+                            if why:
+                                problem = (why, "rule_change_request_invalid")
                     if request is not None and problem is None:
                         precondition = None
                         if request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
@@ -2593,6 +2766,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
                             if lifecycle_mgr.payout_rules.get(request.sender_pubkey) is None:
                                 precondition = "there is no payout rule to revoke"
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_REMOVE_ROUTE:
+                            _, why = lifecycle_mgr.receive_routes.can_admit_remove(
+                                request.sender_pubkey, int(block_timestamp or 0))
+                            if why:
+                                precondition = why
                         elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
                             offer_entry = offers.offered.get(bytes.fromhex(request.offer_id))
                             if offer_entry is None:
@@ -2810,6 +2988,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         entry.amount,
                                         slot_values=prospective,
                                         overrides=entry.custom_inputs,
+                                        credit_class=CREDIT_APPROVED_TRANSFER,
                                     )
                                     if released:
                                         approvals.resolve(vote.request_id, STATUS_EXECUTED)
@@ -2840,6 +3019,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         # verdict flags and record it terminally.
                                         accepted_in_block, hard_reject, execution_success = guard
                                         staged_writes.clear()
+                                        tx_receipt.pop("route_events", None)
                                         approvals.resolve(vote.request_id, STATUS_FAILED)
                                         tx_receipt["reason"] = "parked_transfer_failed"
                                         tx_receipt["logs"].append(
@@ -2991,7 +3171,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             # Debit first, then credit through the staged view,
                             # so an executor who is also a party nets right.
                             staged_writes[payer] = _read_bal(payer) - terms.amount
-                            staged_writes[recipient] = _read_bal(recipient) + terms.amount
+                            _stage_credit(recipient, terms.amount, CREDIT_STANDING_PAYMENT, payer,
+                                          standing_id=standing_id.hex())
                             pending_standing_execute = (standing_id, payer)
                             standing_executions_in_block += 1
                             tx_receipt["logs"].append(
@@ -3159,7 +3340,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             # so a recipient that is also the executor nets right.
                             staged_writes[account] = _read_bal(account) - total
                             for _, who, amount in legs:
-                                staged_writes[who] = _read_bal(who) + amount
+                                _stage_credit(who, amount, CREDIT_PAYOUT, account)
                             pending_payout_exec = (account, total, legs, exe.sale_id)
                             payout_executions_in_block += 1
                             tx_receipt["logs"].append(
@@ -3191,6 +3372,80 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         else:
                             pending_payout_revoke = account
                             tx_receipt["logs"].append("Payout rule revoked: " + account[:16])
+
+            elif tx_type in ROUTE_TX_TYPES:
+                # Root fields only: only they are signed.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    book = lifecycle_mgr.receive_routes
+                    ts_now = int(block_timestamp or 0)
+                    budget = getattr(_session, "request_budget", None)
+
+                    def _guard_blocks(kind):
+                        blocked, detail = sender_policy.rule_change_blocked(
+                            lambda who, idx: lifecycle_mgr.rule_offers.accepted_clauses.get((who, idx)),
+                            sender, kind, ts_now, pool="apply", timeout=budget,
+                        )
+                        return (f"rule-change guard blocks ({detail}); use a rule-change request"
+                                if blocked else "")
+
+                    reason = ""
+                    if tx_type == TX_TYPE_RECEIVE_ROUTE_SET:
+                        terms = None
+                        try:
+                            terms = parse_receive_route_set(tx)
+                        except RouteShapeError as exc:
+                            reason = f"invalid receive route ({exc})"
+                        if terms is not None:
+                            if not isinstance(sender, str) or sender != terms.owner_pubkey:
+                                reason = "sender is not the signer"
+                            else:
+                                _, reason = book.can_admit_set(terms, ts_now)
+                        if terms is not None and not reason:
+                            reason = _guard_blocks(tau_defs.RULE_CHANGE_KIND_SET_ROUTE)
+                        if reason:
+                            tx_receipt["reason"] = "receive_route_not_set"
+                        else:
+                            pending_route_set = terms
+                            tx_receipt["logs"].append(
+                                "Receive route set: " + terms.route_id.hex())
+                    elif tx_type == TX_TYPE_RECEIVE_ROUTE_RELEASE:
+                        try:
+                            signer, owner, route_id = parse_receive_route_release(tx)
+                        except RouteShapeError as exc:
+                            reason = f"invalid receive route release ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != signer:
+                                reason = "sender is not the signer"
+                            else:
+                                _, reason = book.can_admit_release(owner, route_id, signer)
+                        if reason:
+                            tx_receipt["reason"] = "receive_route_not_released"
+                        else:
+                            pending_route_release = owner
+                            tx_receipt["logs"].append(
+                                "Receive route released by its destination: " + route_id.hex())
+                    else:  # TX_TYPE_RECEIVE_ROUTE_REMOVE
+                        owner = None
+                        try:
+                            owner = parse_receive_route_remove(tx)
+                        except RouteShapeError as exc:
+                            reason = f"invalid receive route remove ({exc})"
+                        if owner is not None:
+                            if not isinstance(sender, str) or sender != owner:
+                                reason = "sender is not the signer"
+                            else:
+                                _, reason = book.can_admit_remove(owner, ts_now)
+                        if owner is not None and not reason:
+                            reason = _guard_blocks(tau_defs.RULE_CHANGE_KIND_REMOVE_ROUTE)
+                        if reason:
+                            tx_receipt["reason"] = "receive_route_not_removed"
+                        else:
+                            pending_route_remove = owner
+                            tx_receipt["logs"].append("Receive route removed: " + owner[:16])
+                    if reason:
+                        tx_receipt["logs"].append(f"Receive route change ignored: {reason}")
+                        accepted_in_block = False
 
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
@@ -3553,9 +3808,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                             tx_receipt["logs"].append("Transfer balance state failed (insufficient)")
                                             break
                                             
-                                        current_to = _balance_of(to_addr)
                                         target_balances[from_addr] = current_from - amount
-                                        target_balances[to_addr] = current_to + amount
+                                        # The same split the fee-era path makes (#35).
+                                        legacy_event = _routed_credit(
+                                            lifecycle_mgr, to_addr, amount, block_timestamp,
+                                            lambda addr, amt: target_balances.__setitem__(
+                                                addr, _balance_of(addr) + amt),
+                                            CREDIT_TRANSFER, payer_pubkey=from_addr, tx_id=tx_id,
+                                        )
+                                        if legacy_event is not None:
+                                            tx_receipt.setdefault("route_events", []).append(
+                                                legacy_event)
                                         _note_sale(to_addr, from_addr, amount)
                                     else:
                                         if not chain_state.update_balances_after_transfer(from_addr, to_addr, amount):
@@ -3801,6 +4064,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["logs"].append(
                                 f"Sale {noted} for the payout rule of {to[:10]}...: "
                                 f"{sale_id.hex()[:16]} ({amount})")
+                if pending_route_set is not None:
+                    replaced = _lifecycle_for_write().receive_routes.install(pending_route_set)
+                    tx_receipt.setdefault("route_events", []).append(route_lifecycle_event(
+                        pending_route_set, "installed", tx_id=tx_id,
+                        replaced=replaced.hex() if replaced else None))
+                elif pending_route_remove is not None:
+                    gone = _lifecycle_for_write().receive_routes.remove(pending_route_remove)
+                    tx_receipt.setdefault("route_events", []).append(
+                        route_lifecycle_event(gone, "removed", tx_id=tx_id))
+                elif pending_route_release is not None:
+                    gone = _lifecycle_for_write().receive_routes.release(pending_route_release)
+                    tx_receipt.setdefault("route_events", []).append(
+                        route_lifecycle_event(gone, "released", tx_id=tx_id))
+            else:
+                # Nothing the transaction staged lands, so no split happened either.
+                tx_receipt.pop("route_events", None)
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same

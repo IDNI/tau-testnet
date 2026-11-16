@@ -204,9 +204,10 @@ itself:
 - **The chain records the sale.** Every signed transfer (`user_tx`) into the
   account while the rule is installed is an open sale: its id is the
   transaction's hash, its amount what that transaction paid the account (all
-  its legs to the account together, capped at 16,777,215), its payer the
-  sender. A transfer from the account itself is not a sale. Transfers before
-  the rule was installed are not sales of it.
+  its legs to the account together, before a receive route splits off a
+  share, capped at 16,777,215), its payer the sender. A routed share is not a
+  sale of the route's destination. A transfer from the account itself is not
+  a sale. Transfers before the rule was installed are not sales of it.
 - **An execution names one open sale** (`sale_id`, `payout execute --sale
   <tx_hash>`). The rule reads its amount as `i27` and its payer as `i28`, so the
   executor cannot choose the amount. An execution without a sale, with a sale

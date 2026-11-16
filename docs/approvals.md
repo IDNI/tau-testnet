@@ -254,9 +254,11 @@ widths and shape apply.
 | 5 | revoke guard | Remove the guard. |
 | 6 | set payout rule | Install or replace the account's payout rule ([payout_rules.md](payout_rules.md)). |
 | 7 | revoke payout rule | Remove the payout rule. |
+| 8 | set receive route | Set or replace the account's receive route ([receive_routes.md](receive_routes.md)). |
+| 9 | remove receive route | Remove the receive route. |
 
 A guard that blocks every change without its co-signers (the first two templates
-below) covers kinds 6 and 7 as well. A guard that names the kinds it blocks, like
+below) covers kinds 6 to 9 as well. A guard that names the kinds it blocks, like
 the weaker template, does not block kinds it does not name.
 
 Because the guard is judged on kind 4 and 5 as well, it protects itself: with a
@@ -278,8 +280,8 @@ slots, such as the weaker template below, therefore leaves those kinds open.
 
 | Field | Notes |
 |---|---|
-| `kind` | `1`–`7`, as above. |
-| `rule_text` | Required for kinds 1 and 4. For kind 3, the exact raw text of the offer. For kind 6, the payout rule's canonical spec text (`payout_spec_text`, without a sequence number). Absent for kinds 2, 5 and 7. At most `MAX_RULE_CHANGE_TEXT_BYTES` (8192). |
+| `kind` | `1`–`9`, as above. |
+| `rule_text` | Required for kinds 1 and 4. For kind 3, the exact raw text of the offer. For kind 6, the payout rule's canonical spec text (`payout_spec_text`, without a sequence number). For kind 8, the route's canonical spec text (`route_spec_text`, without a sequence number). Absent for kinds 2, 5, 7 and 9. At most `MAX_RULE_CHANGE_TEXT_BYTES` (8192). |
 | `offer_id` | Kind 3 only: the offer being accepted. |
 | `approvers` | Slot to public key, up to 8. A request that names approvers needs approval slots active. May be empty, which leaves the time escape as the only way out. |
 | `expire_at_height` | The height after which the request expires. |

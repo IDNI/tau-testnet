@@ -718,6 +718,33 @@ Semantics:
 
 **Upgrade.** The book root is folded into the consensus metadata as `payout_rules_root` only once the book has held a rule, so **no regenesis** is needed. Nodes must upgrade before the first install.
 
+## Receive routes
+
+Long-form guide: [docs/receive_routes.md](docs/receive_routes.md).
+
+A `receive_route_set` installs the account's one receive route: a destination and a share. From then on every payment the account receives is split as it lands, in the same state transition: `routed = floor(gross * share_bps / 10000)` goes to the destination, the rest to the account. Nobody has to be online.
+
+```bash
+tau-testnet route set --key shop --to <tax_pubkey> --share 5
+tau-testnet route set --key project --to <treasury_pubkey> --share 20 --ends-in 31536000 --locked
+tau-testnet route show <address>                             # route, routes paying it, history
+tau-testnet route remove --key shop
+tau-testnet route release --key treasury --owner <project_pubkey>   # destination lets go
+```
+
+Semantics:
+
+- **Split.** Per credit, rounding the routed part down; nothing below `min_amount`; share 1..9000 bps (the account keeps at least 10%). Optional `active_from` / `expires_at` in block time.
+- **No bypass.** Transfers, approved transfers, retractable releases, standing payments and payout legs all split. Retract refunds, faucet grants and fees do not. A routed share is never routed again (one hop), and a route straight back (A -> B while B -> A) is refused.
+- **Payer and account.** The payer pays its own fee, unchanged; routing has no fee. The routed part never touches the account's balance, so no `o5` clause, cooldown or spend count sees it.
+- **Admin.** Setting and removing are rule changes (kinds 8 and 9) that a rule-change guard judges; a guarded account uses `--request`. A `--locked` route binds the account until its end (at most 366 days): it cannot be removed or weakened, and only the destination can release it early.
+- **Fees.** Setting costs one fee; remove and release are fee-free.
+- **One network.** All three types sign `genesis_hash`, like standing payments; one signed for another network is refused (`WRONG_NETWORK`).
+- **Caps.** One route per account, one destination, 4096 routes in total.
+- **Reads.** `getreceiveroute <address>` (with `routes_in`, `history`, `history_in`, `semantics`), `gettxstatus` (`receive_routes`: the splits a transaction caused), and `sendtx` / `checktx` (`receive_routes`: how the routes in force would split its credits).
+
+**Upgrade.** The book root is folded into the consensus metadata as `receive_routes_root` only once the book has held a route, so **no regenesis** is needed. Nodes must upgrade before the first route is set.
+
 ## Mempool policy
 
 - **Lanes** — every tx is classified `fast` (coin transfers) or `slow` (anything carrying Tau rule text: `rule_offer`, `rule_offer_accept`, `consensus_rule_update`, or a `user_tx` with a non-empty `operations["0"]`). A `user_tx` carrying both a rule and transfers is `slow` — the signature covers the whole payload, so it cannot be split. Applying a rule builds or recompiles Tau state, which costs far more than a transfer's one cheap step; without separation a burst of rule work delays every queued transfer. Fee priority cannot express the split, because a rule emits its own `o8` user fee and can therefore price itself to the front of the queue.

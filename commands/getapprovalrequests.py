@@ -75,6 +75,8 @@ KIND_NAMES = {
     tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD: "revoke_guard",
     tau_defs.RULE_CHANGE_KIND_SET_PAYOUT: "set_payout_rule",
     tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT: "revoke_payout_rule",
+    tau_defs.RULE_CHANGE_KIND_SET_ROUTE: "set_receive_route",
+    tau_defs.RULE_CHANGE_KIND_REMOVE_ROUTE: "remove_receive_route",
 }
 
 

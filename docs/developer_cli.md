@@ -147,7 +147,7 @@ arguments keep their case except where a handler lowercases a hex id. Payload
 commands take the rest of the line verbatim as one JSON argument, and tolerate
 it being wrapped in matching single or double quotes.
 
-The full registry (31 names, `app/container.py`):
+The full registry (32 names, `app/container.py`):
 
 | Command | Grammar |
 |---|---|
@@ -182,6 +182,7 @@ The full registry (31 names, `app/container.py`):
 | `getstandingpayments` | `getstandingpayments <address> [out\|in\|all]` (default `all`) |
 | `getstandingpayment` | `getstandingpayment <standing_id>` — 64 hex chars |
 | `getpayoutrule` | `getpayoutrule <address>` |
+| `getreceiveroute` | `getreceiveroute <address>` |
 
 `gettimestamp` and `getcurrenttimestamp` share one handler, and it hardcodes
 its own name: a `getcurrenttimestamp` request comes back with
@@ -450,7 +451,7 @@ connection/timeout errors.
 
 `--fee <n>` sets `fee_limit`. Without `--fee`, a fee-bearing command (`tx send`,
 `rule offer|accept|reject`, `approval request`, `retractable send`,
-`standing create|update|execute`, `payout set`, `payout execute`) signs a
+`standing create|update|execute`, `payout set`, `payout execute`, `route set`) signs a
 draft with `fee_limit` 0, asks the node with `checktx estimate`, and signs the
 transaction again with the estimate as `fee_limit`. The estimate does not
 depend on the draft's `fee_limit`. On `ESTIMATE_BUSY`, the CLI asks again up to
@@ -462,8 +463,8 @@ A sender that cannot pay the estimated fee gets `INSUFFICIENT_FUNDS` and no
 estimate, even with `--fee`. Fund the sender first.
 
 The fee-exempt commands have no `--fee`: `approval approve`, `approval decline`,
-`retractable retract`, `standing cancel`, `payout revoke`, `gov propose` and
-`gov vote`. They sign `fee_limit` 0.
+`retractable retract`, `standing cancel`, `payout revoke`, `route remove`,
+`route release`, `gov propose` and `gov vote`. They sign `fee_limit` 0.
 
 ## Rule sharing
 
@@ -677,6 +678,54 @@ RPC replies:
 - `gettxstatus` adds `payout` to a confirmed payout transaction: its outcome and
   legs, and for an install whether the rule is still `installed` or was
   `replaced`, `revoked` or `expired`.
+
+## Receive routes
+
+Send a share of every payment an account receives to another account, split
+as it lands. Semantics are in the [README](../README.md#receive-routes).
+Long-form guide: [receive_routes.md](receive_routes.md).
+
+```bash
+tau-testnet route set --key shop --to <tax_pk> --share 5
+tau-testnet route set --key creator --to <collab_pk> --share 12.5 --min-amount 100 \
+    --starts-in 3600 --ends-in 2592000
+tau-testnet route set --key project --to <treasury_pk> --share 20 --ends-in 31536000 --locked
+tau-testnet route show <address>
+tau-testnet route remove --key shop
+tau-testnet route release --key treasury --owner <project_pk>
+# an account with a rule-change guard: the same, as a rule-change request (kinds 8 and 9)
+tau-testnet route set ... --request --approver 18=<cosigner_pk>
+tau-testnet route remove --key shop --request --approver 18=<cosigner_pk>
+```
+
+`--share` is a percent with at most two decimals; `--share-bps` gives basis
+points instead (one of the two; the node accepts 1..9000 bps). One of `--starts-at` (unix
+seconds) and `--starts-in` (seconds from now), and one of `--ends-at` and
+`--ends-in`. `--locked` needs an end. `release` is signed by the destination and
+reads the installed `route_id` from the node unless `--route-id` pins it, so a
+route replaced in the meantime is not released. `set` prints the route id.
+
+Raw transactions (root fields only; a nested `payload` is ignored):
+
+| `tx_type` | Signed fields beyond the envelope |
+|---|---|
+| `receive_route_set` | `genesis_hash`, `destination_pubkey`, `share_bps`, optional `min_amount`, `active_from`, `expires_at`, `locked` |
+| `receive_route_remove` | `genesis_hash` (feeless) |
+| `receive_route_release` | `genesis_hash`, `owner_pubkey`, `route_id` (feeless) |
+
+RPC replies:
+
+- `getreceiveroute` returns `installed`, the `route` (terms, `share_percent`,
+  `status`, `removable_by_owner`, a worked `example`), `routes_in` (the routes
+  that pay this account), `history` and `history_in` (installed, routed with
+  `gross` / `routed` / `net` / class / payer, removed, released, expired;
+  canonical blocks only, newest first), `block_hash`, and `semantics`.
+- `gettxstatus` adds `receive_routes` to a confirmed transaction: the splits it
+  caused, and for a route change whether the route is still `installed` or was
+  `replaced`, `removed`, `released` or `expired`.
+- `sendtx` and `checktx` add `receive_routes`: how the routes in force would
+  split the transaction's credits (advisory; `lands_later` marks credits that
+  the route in force at landing decides).
 
 ## Governance
 

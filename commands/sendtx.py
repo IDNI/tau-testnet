@@ -31,6 +31,7 @@ from consensus.payout import (
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_RULE_SET,
 )
+from consensus.receive_route import ROUTE_TX_TYPES, TX_TYPE_RECEIVE_ROUTE_SET
 from consensus.standing import (
     STANDING_TX_TYPES,
     TX_TYPE_STANDING_PAYMENT_CANCEL,
@@ -58,6 +59,7 @@ KNOWN_TX_TYPES = frozenset(
     | set(RETRACTABLE_TX_TYPES)
     | set(STANDING_TX_TYPES)
     | set(PAYOUT_TX_TYPES)
+    | set(ROUTE_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
 # execution later is free and there is no second fee to drift. `transfer_vote` is
@@ -68,12 +70,14 @@ KNOWN_TX_TYPES = frozenset(
 # `standing_payment_execute` is paid by its executor;
 # `standing_payment_cancel` is free like `retract_transfer`.
 # `payout_rule_set` pays for its build; `payout_execute` is paid by its executor;
-# `payout_rule_revoke` is free like a cancel.
+# `payout_rule_revoke` is free like a cancel. `receive_route_set` pays because it
+# adds to a bounded book; `receive_route_remove` and `receive_route_release` are
+# free because they only shrink it.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_STANDING_PAYMENT_CREATE,
      TX_TYPE_STANDING_PAYMENT_UPDATE, TX_TYPE_STANDING_PAYMENT_EXECUTE,
-     TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE}
+     TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_RECEIVE_ROUTE_SET}
     | set(RULE_OFFER_TX_TYPES)
 )
 from db import add_mempool_tx
@@ -437,6 +441,21 @@ def _preflight_prepared_rule(rule_text: str):
             "Rule validation is temporarily unavailable; please resubmit.",
         )
     return None
+
+
+def _route_preview(payload) -> list:
+    """How the receive routes in force now would split this transaction's
+    credits (#35), so a payer sees the split before the block does. Advisory:
+    the block it lands in decides."""
+    try:
+        from consensus.facade import TipAdmissionView
+        from consensus.receive_route import preview_credits
+
+        view = TipAdmissionView()
+        return preview_credits(payload, view.route_book(), view.next_block_timestamp)
+    except Exception:
+        logger.debug("receive route preview unavailable", exc_info=True)
+        return []
 
 
 def _admission_timestamp() -> int:
@@ -1505,6 +1524,9 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             update_id = admission_eval.data.get("update_id")
             if update_id:
                 verdict["update_id"] = update_id
+            routes = _route_preview(payload)
+            if routes:
+                verdict["receive_routes"] = routes
             return verdict
 
         if db.count_mempool_txs() >= config.MAX_MEMPOOL_TXS:
@@ -1542,6 +1564,9 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
         update_id = admission_eval.data.get("update_id")
         if update_id:
             extra["update_id"] = update_id
+        routes = _route_preview(payload)
+        if routes:
+            extra["receive_routes"] = routes
         return _qt_ok(tx_message_id, message=msg, **extra)
 
     except ValueError as e:
@@ -1615,6 +1640,8 @@ def execute(raw_command: str, container):
         }
         if result.get("update_id"):
             data["update_id"] = result["update_id"]
+        if result.get("receive_routes"):
+            data["receive_routes"] = result["receive_routes"]
         return api_response.success_response("sendtx", data)
     return api_response.error_response(
         "sendtx",

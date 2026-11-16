@@ -1224,6 +1224,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_retractable_subparsers(sub)
     _add_standing_subparsers(sub)
     _add_payout_subparsers(sub)
+    _add_route_subparsers(sub)
     _add_node_subparsers(sub)
 
     return parser
@@ -2876,6 +2877,244 @@ def _add_payout_subparsers(sub) -> None:
     p_show.add_argument("address", nargs="?", help="Address (default: your key's)")
     _key_group(p_show, required=False)
     p_show.set_defaults(func=cmd_payout_show)
+
+
+# --- Receive routes ---------------------------------------------------------
+
+_KIND_ROUTE_SET = 8
+_KIND_ROUTE_REMOVE = 9
+
+
+def _share_bps(args) -> int:
+    """Basis points from --share-bps, or from --share as a percent (2 decimals)."""
+    from decimal import Decimal, InvalidOperation
+
+    if args.share_bps is not None:
+        return int(args.share_bps)
+    try:
+        bps = Decimal(str(args.share).strip().rstrip("%")) * 100
+    except InvalidOperation:
+        raise _PayloadError(f"--share {args.share!r} is not a percent")
+    if bps != bps.to_integral_value():
+        raise _PayloadError("--share has at most two decimals (it is basis points / 100)")
+    return int(bps)
+
+
+def _route_fields(args, now: int) -> dict:
+    """The signed fields of a receive route from the command line."""
+    destination = args.to.strip().lower()
+    start = 0
+    if args.starts_at is not None:
+        start = int(args.starts_at)
+    elif args.starts_in is not None:
+        start = now + int(args.starts_in)
+    end = 0
+    if args.ends_at is not None:
+        end = int(args.ends_at)
+    elif args.ends_in is not None:
+        end = now + int(args.ends_in)
+    if end and end <= max(now, start):
+        raise _PayloadError(f"the route would end at {end}, before it starts")
+    if args.locked and not end:
+        raise _PayloadError("a locked route needs an end: give --ends-at or --ends-in")
+    return {"destination_pubkey": destination, "share_bps": _share_bps(args),
+            "min_amount": int(args.min_amount or 0), "active_from": start,
+            "expires_at": end, "locked": bool(args.locked)}
+
+
+def cmd_route_set(args: argparse.Namespace) -> int:
+    from consensus.receive_route import (
+        RouteShapeError, parse_receive_route_set, route_spec_text,
+    )
+
+    try:
+        fields = _route_fields(args, int(_now()))
+    except (_PayloadError, ValueError) as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    if args.request:
+        return _submit_rule_change(args, _KIND_ROUTE_SET, route_spec_text(fields), "")
+
+    created = {}
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        payload = tx_mod.build_receive_route_set_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            **fields,
+        )
+        try:
+            created["id"] = parse_receive_route_set(payload).route_id.hex()
+        except RouteShapeError as exc:
+            raise _PayloadError(str(exc))
+        return payload
+
+    if args.expire_in is None:
+        args.expire_in = 1000
+    status = _submit_rule_tx(args, _build)
+    if status == EXIT_OK and created.get("id"):
+        quiet = args.json or getattr(args, "dry_run", False)
+        print(f"receive route id: {created['id']}", file=sys.stderr if quiet else sys.stdout)
+    return status
+
+
+def cmd_route_remove(args: argparse.Namespace) -> int:
+    if args.request:
+        return _submit_rule_change(args, _KIND_ROUTE_REMOVE, "", "")
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_receive_route_remove_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+        )
+
+    if args.expire_in is None:
+        args.expire_in = 1000
+    if args.fee is None:
+        args.fee = "0"  # fee-exempt: the node gives no estimate to ask for
+    return _submit_rule_tx(args, _build)
+
+
+def _installed_route_id(args, owner: str) -> str:
+    raw = _send(args, f"getreceiveroute {owner}")
+    if rpc_mod.is_error_response(raw):
+        raise _PayloadError(f"cannot read the receive route of {owner}: {raw}")
+    data = (parse_json_response(raw) or {}).get("data") or {}
+    if not data.get("installed"):
+        raise _PayloadError(f"{owner} has no receive route")
+    return data["route"]["route_id"]
+
+
+def cmd_route_release(args: argparse.Namespace) -> int:
+    try:
+        owner = args.owner.strip().lower()
+        route_id = (args.route_id or _installed_route_id(args, owner)).strip().lower()
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_receive_route_release_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            owner_pubkey=owner,
+            route_id=route_id,
+        )
+
+    if args.expire_in is None:
+        args.expire_in = 1000
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_route_show(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getreceiveroute {address}")
+
+
+def _add_route_subparsers(sub) -> None:
+    """`tau-testnet route ...` -- send a share of what an account receives on."""
+    import tau_defs
+
+    p_route = sub.add_parser(
+        "route",
+        parents=[_GLOBAL_PARENT],
+        help="Receive routes (set, remove, release, show)",
+    )
+    rsub = p_route.add_subparsers(dest="route_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser, fee=True, request=False):
+        if fee or request:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument(
+            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+        window = parser.add_mutually_exclusive_group()
+        window.add_argument(
+            "--expire-in", type=_block_count, default=None,
+            help="Blocks the transaction may land in, from the next one (default: "
+                 f"1000, or {2 * tau_defs.RULE_CHANGE_DELAY_BLOCKS} with --request)",
+        )
+        window.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+        parser.add_argument("--dry-run", action="store_true",
+                            help="Sign and print the transaction, and send nothing")
+        if request:
+            parser.add_argument(
+                "--request", action="store_true",
+                help="Send as a rule-change request, for an account with a guard",
+            )
+            parser.add_argument(
+                "--approver", action="append", metavar="SLOT=PUBKEY",
+                help="With --request: approver for one slot. Repeatable.",
+            )
+            parser.add_argument(
+                "--preview", action="store_true",
+                help="With --request: ask what the request would need, send nothing",
+            )
+
+    p_set = rsub.add_parser(
+        "set", parents=common,
+        help="Send a share of everything your account receives to another account",
+    )
+    _key_group(p_set)
+    p_set.add_argument("--to", required=True, metavar="PUBKEY",
+                       help="The destination account (96 hex)")
+    share = p_set.add_mutually_exclusive_group(required=True)
+    share.add_argument("--share", metavar="PERCENT",
+                       help="Share in percent, up to two decimals (20 = 20%%)")
+    share.add_argument("--share-bps", type=int, metavar="BPS",
+                       help="Share in basis points (2000 = 20%%)")
+    p_set.add_argument("--min-amount", type=int, default=0, metavar="N",
+                       help="Credits smaller than this are not split")
+    starts = p_set.add_mutually_exclusive_group()
+    starts.add_argument("--starts-at", type=int, metavar="UNIX")
+    starts.add_argument("--starts-in", type=int, metavar="SECONDS")
+    ends = p_set.add_mutually_exclusive_group()
+    ends.add_argument("--ends-at", type=int, metavar="UNIX")
+    ends.add_argument("--ends-in", type=int, metavar="SECONDS")
+    p_set.add_argument("--locked", action="store_true",
+                       help="Bind yourself until the end: only the destination can "
+                            "release the route earlier")
+    _tx_flags(p_set, request=True)
+    p_set.set_defaults(func=cmd_route_set)
+
+    p_rem = rsub.add_parser("remove", parents=common, help="Remove your receive route")
+    _key_group(p_rem)
+    _tx_flags(p_rem, fee=False, request=True)
+    p_rem.set_defaults(func=cmd_route_remove)
+
+    p_rel = rsub.add_parser(
+        "release", parents=common,
+        help="As a route's destination, let go of a route that pays you",
+    )
+    _key_group(p_rel)
+    p_rel.add_argument("--owner", required=True, help="The account that routes to you")
+    p_rel.add_argument("--route-id", help="Pin the route (default: the installed one)")
+    _tx_flags(p_rel, fee=False)
+    p_rel.set_defaults(func=cmd_route_release)
+
+    p_show = rsub.add_parser("show", parents=common,
+                             help="An account's receive route and the routes that pay it")
+    p_show.add_argument("address", nargs="?", help="Address (default: your key's)")
+    _key_group(p_show, required=False)
+    p_show.set_defaults(func=cmd_route_show)
 
 
 def _add_retractable_subparsers(sub) -> None:

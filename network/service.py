@@ -117,6 +117,9 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "payout_rule_set",
     "payout_rule_revoke",
     "payout_execute",
+    "receive_route_set",
+    "receive_route_remove",
+    "receive_route_release",
 })
 
 
@@ -598,6 +601,7 @@ class NetworkService:
             TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS,
             TAU_MEMPOOL_SNAPSHOT_MAX_STANDING_TXS,
             TAU_MEMPOOL_SNAPSHOT_MAX_PAYOUT_TXS,
+            TAU_MEMPOOL_SNAPSHOT_MAX_ROUTE_TXS,
             TAU_GOSSIP_MAX_RAW_TX_BYTES
         )
         try:
@@ -612,6 +616,7 @@ class NetworkService:
             retractable_txs_count = 0
             standing_txs_count = 0
             payout_txs_count = 0
+            route_txs_count = 0
 
             for tx in txs:
                 if total_count >= TAU_MEMPOOL_SNAPSHOT_MAX_TOTAL:
@@ -667,6 +672,11 @@ class NetworkService:
                     if payout_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_PAYOUT_TXS:
                         continue
                     payout_txs_count += 1
+                elif tx_type in ("receive_route_set", "receive_route_remove",
+                                 "receive_route_release"):
+                    if route_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_ROUTE_TXS:
+                        continue
+                    route_txs_count += 1
                 topic = self.topic_for_tx_type(tx_type)
                     
                 # 4. Optional partial decode
@@ -696,6 +706,7 @@ class NetworkService:
             TAU_GOSSIP_TOPIC_RETRACTABLE,
             TAU_GOSSIP_TOPIC_STANDING,
             TAU_GOSSIP_TOPIC_PAYOUT,
+            TAU_GOSSIP_TOPIC_ROUTES,
             TAU_GOSSIP_TOPIC_BLOCKS,
             TAU_GOSSIP_TOPIC_PEERS,
         )
@@ -707,6 +718,7 @@ class NetworkService:
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_RETRACTABLE, self._on_retractable_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_STANDING, self._on_standing_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PAYOUT, self._on_payout_gossip)
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_ROUTES, self._on_route_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PEERS, self._on_peer_advertisement)
 
@@ -948,6 +960,23 @@ class NetworkService:
             },
         )
 
+    async def _on_route_gossip(self, envelope: Dict[str, Any]) -> None:
+        from .protocols import (
+            TAU_MAX_RECEIVE_ROUTE_RELEASE_BYTES,
+            TAU_MAX_RECEIVE_ROUTE_REMOVE_BYTES,
+            TAU_MAX_RECEIVE_ROUTE_SET_BYTES,
+        )
+        await self._process_gossip_payload(
+            envelope,
+            allowed_types={"receive_route_set", "receive_route_remove",
+                           "receive_route_release"},
+            type_limits={
+                "receive_route_set": TAU_MAX_RECEIVE_ROUTE_SET_BYTES,
+                "receive_route_remove": TAU_MAX_RECEIVE_ROUTE_REMOVE_BYTES,
+                "receive_route_release": TAU_MAX_RECEIVE_ROUTE_RELEASE_BYTES,
+            },
+        )
+
     async def _process_gossip_payload(self, envelope: Dict[str, Any], allowed_types: set, type_limits: dict) -> None:
         import json
         from .protocols import TAU_GOSSIP_MAX_RAW_TX_BYTES
@@ -1074,6 +1103,14 @@ class NetworkService:
         elif tx_type == "payout_execute":
             if "account_pubkey" not in p_dict or "rule_id" not in p_dict:
                 logger.debug("Gossip rejected: payout_execute missing account_pubkey or rule_id")
+                return
+        elif tx_type == "receive_route_set":
+            if "destination_pubkey" not in p_dict or "share_bps" not in p_dict:
+                logger.debug("Gossip rejected: receive_route_set missing destination or share")
+                return
+        elif tx_type == "receive_route_release":
+            if "owner_pubkey" not in p_dict or "route_id" not in p_dict:
+                logger.debug("Gossip rejected: receive_route_release missing owner or route_id")
                 return
 
         try:
@@ -1693,6 +1730,7 @@ class NetworkService:
             TAU_GOSSIP_TOPIC_RULES,
             TAU_GOSSIP_TOPIC_STANDING,
             TAU_GOSSIP_TOPIC_PAYOUT,
+            TAU_GOSSIP_TOPIC_ROUTES,
             TAU_GOSSIP_TOPIC_TRANSACTIONS,
         )
         if tx_type in ("consensus_rule_update", "consensus_rule_vote"):
@@ -1707,6 +1745,8 @@ class NetworkService:
             return TAU_GOSSIP_TOPIC_STANDING
         if tx_type in ("payout_rule_set", "payout_rule_revoke", "payout_execute"):
             return TAU_GOSSIP_TOPIC_PAYOUT
+        if tx_type in ("receive_route_set", "receive_route_remove", "receive_route_release"):
+            return TAU_GOSSIP_TOPIC_ROUTES
         return TAU_GOSSIP_TOPIC_TRANSACTIONS
 
     def broadcast_transaction(self, payload: str, message_id: str) -> None:

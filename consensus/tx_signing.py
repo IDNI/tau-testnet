@@ -42,6 +42,10 @@ from consensus.payout import (
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_RULE_SET,
 )
+from consensus.receive_route import (
+    TX_TYPE_RECEIVE_ROUTE_RELEASE,
+    TX_TYPE_RECEIVE_ROUTE_SET,
+)
 from consensus.standing import (
     TX_TYPE_STANDING_PAYMENT_CANCEL,
     TX_TYPE_STANDING_PAYMENT_EXECUTE,
@@ -185,6 +189,20 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         if "sale_id" in payload:
             signing_dict["sale_id"] = payload.get("sale_id")
     # payout_rule_revoke signs the envelope only: it names the sender's own rule.
+    elif tx_type == TX_TYPE_RECEIVE_ROUTE_SET:
+        # Every term the split is computed from. The optional ones are listed
+        # even when absent, so adding one later changes the bytes.
+        signing_dict["destination_pubkey"] = payload.get("destination_pubkey")
+        signing_dict["share_bps"] = payload.get("share_bps")
+        signing_dict["min_amount"] = payload.get("min_amount")
+        signing_dict["active_from"] = payload.get("active_from")
+        signing_dict["expires_at"] = payload.get("expires_at")
+        signing_dict["locked"] = payload.get("locked")
+    elif tx_type == TX_TYPE_RECEIVE_ROUTE_RELEASE:
+        # The destination answers for which account's route, and which version.
+        signing_dict["owner_pubkey"] = payload.get("owner_pubkey")
+        signing_dict["route_id"] = payload.get("route_id")
+    # receive_route_remove signs the envelope only: it names the sender's own route.
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

@@ -211,6 +211,9 @@ def _payload(kind, fee_limit="0"):
                          rule_id=_payout_book().get(RECIPIENT).rule_id.hex(),
                          recipients={}, data={"0": 7},
                          genesis_hash=chain_genesis_hash())
+    if kind == "receive_route_set":
+        return _envelope(kind, SENDER, fee_limit, destination_pubkey=RECIPIENT,
+                         share_bps=2000, genesis_hash=chain_genesis_hash())
     raise AssertionError(kind)
 
 
@@ -224,7 +227,7 @@ FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
                "rule_change_request", "standing_payment_create",
                "standing_payment_update", "standing_payment_execute", "payout_rule_set",
-               "payout_execute"]
+               "payout_execute", "receive_route_set"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

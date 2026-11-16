@@ -546,6 +546,13 @@ class RuleChangeRequest:
             from consensus.payout import payout_spec_text
 
             return payout_spec_text(json.loads(self.rule_text), self.sequence_number)
+        if self.kind == tau_defs.RULE_CHANGE_KIND_SET_ROUTE:
+            # Likewise for a receive route: its id carries this sequence number.
+            import json
+
+            from consensus.receive_route import route_spec_text
+
+            return route_spec_text(json.loads(self.rule_text), self.sequence_number)
         from consensus.rule_offers import clause_body_v1
 
         return clause_body_v1(self.rule_text)
@@ -590,9 +597,10 @@ _RULE_CHANGE_BODY_KINDS = frozenset({
     tau_defs.RULE_CHANGE_KIND_SET_GUARD,
     tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
     tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
+    tau_defs.RULE_CHANGE_KIND_SET_ROUTE,
 })
 _RULE_CHANGE_KINDS = frozenset(range(
-    tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT + 1
+    tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_REMOVE_ROUTE + 1
 ))
 
 
@@ -618,7 +626,7 @@ def parse_rule_change_request_checked(
         if isinstance(val, bool) or not isinstance(val, int):
             return None, "kind, sequence_number and expire_at_height must be integers"
     if kind not in _RULE_CHANGE_KINDS:
-        return None, f"kind must be 1..{tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT}"
+        return None, f"kind must be 1..{tau_defs.RULE_CHANGE_KIND_REMOVE_ROUTE}"
 
     rule_text = tx.get("rule_text", "")
     if rule_text is None:
@@ -665,6 +673,14 @@ def parse_rule_change_request_checked(
             parse_payout_spec(rule_text, sender_n, seq)
         except PayoutShapeError as exc:
             return None, f"rule_text is not a payout rule spec: {exc}"
+    elif kind == tau_defs.RULE_CHANGE_KIND_SET_ROUTE:
+        # The canonical route spec, without a sequence number.
+        from consensus.receive_route import RouteShapeError, parse_route_spec
+
+        try:
+            parse_route_spec(rule_text, sender_n, seq)
+        except RouteShapeError as exc:
+            return None, f"rule_text is not a receive route spec: {exc}"
     elif has_body:
         try:
             body = clause_body_v1(rule_text)

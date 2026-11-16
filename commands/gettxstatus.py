@@ -151,6 +151,41 @@ def _payout_fields(tx: dict, tx_hash: str, block_hash: str) -> dict:
     return {"payout": out}
 
 
+def _route_status(db, installed: dict) -> str:
+    """Whether a route this transaction installed is still in force, or how it ended."""
+    route_id = installed.get("route_id")
+    try:
+        history = db.get_canonical_route_events(
+            installed.get("owner_pubkey", ""), role="owner", limit=500)
+    except Exception:
+        return "unknown"
+    for event in history:   # newest first: the latest thing that happened to it
+        if event.get("route_id") == route_id and event.get("outcome") in (
+                "removed", "released", "expired"):
+            return event["outcome"]
+        if event.get("replaced") == route_id:
+            return "replaced"
+    return "installed"
+
+
+def _route_fields(db, tx_hash: str, block_hash: str) -> dict:
+    """`receive_routes`: how this transaction's payments were split by receive
+    routes (gross, routed, net, credit class), and the route change it made (#35)."""
+    try:
+        events = db.get_canonical_route_events_for_tx(tx_hash, block_hash)
+    except Exception:
+        return {}
+    if not events:
+        return {}
+    out = []
+    for event in events:
+        item = {k: v for k, v in event.items() if k != "tx_id"}
+        if event.get("outcome") == "installed":
+            item["status"] = _route_status(db, event)
+        out.append(item)
+    return {"receive_routes": out}
+
+
 def execute(raw_command: str, container):
     parts = raw_command.split()
     if len(parts) != 2:
@@ -206,6 +241,7 @@ def execute(raw_command: str, container):
                     "confirmations": max(1, confirmations),
                 }
                 data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
+                data.update(_route_fields(db, tx_hash, loc["block_hash"]))
                 return api_response.success_response("gettxstatus", data)
 
         # 3. Dropped without being mined?

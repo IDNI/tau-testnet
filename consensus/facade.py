@@ -505,3 +505,13 @@ class TipAdmissionView:
         lm = getattr(chain_state, "_lifecycle_manager", None)
         book = getattr(lm, "payout_rules", None)
         return book if isinstance(book, PayoutBook) else PayoutBook()
+
+    # --- Receive routes ----------------------------------------------------
+
+    def route_book(self):
+        """The receive-route book of the canonical tip, read like `payout_book`."""
+        from consensus.receive_route import ReceiveRouteBook
+
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        book = getattr(lm, "receive_routes", None)
+        return book if isinstance(book, ReceiveRouteBook) else ReceiveRouteBook()

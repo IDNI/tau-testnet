@@ -1056,3 +1056,101 @@ def compute_payout_book_root(
     out.extend(encode_uint64(int(resolved_count)))
     out.extend(encode_hash32(resolved_acc))
     return blake3(bytes(out)).digest()
+
+
+# --- Receive routes (#35) -----------------------------------------------------
+
+DOMAIN_RECEIVE_ROUTE_V1 = b"tau.receive_route.v1"
+DOMAIN_RECEIVE_ROUTE_RESOLVED_V1 = b"tau.receive_route.resolved.v1"
+DOMAIN_RECEIVE_ROUTE_BOOK_V1 = b"tau.receive_route.book.v1"
+
+
+def _encode_route_terms(
+    owner_pubkey: Any,
+    sequence_number: int,
+    destination_pubkey: Any,
+    share_bps: int,
+    min_amount: int,
+    active_from: int,
+    expires_at: int,
+    locked: bool,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(encode_pubkey48(destination_pubkey))
+    out.extend(encode_uint32(int(share_bps)))
+    out.extend(encode_uint64(int(min_amount)))
+    out.extend(encode_uint64(int(active_from)))
+    out.extend(encode_uint64(int(expires_at)))
+    out.extend(encode_bool(bool(locked)))
+    return bytes(out)
+
+
+def compute_receive_route_id(
+    owner_pubkey: Any,
+    sequence_number: int,
+    destination_pubkey: Any,
+    share_bps: int,
+    min_amount: int,
+    active_from: int,
+    expires_at: int,
+    locked: bool,
+) -> bytes:
+    """BLAKE3 of the signed terms of a receive route. Returns 32 bytes.
+
+    A destination releasing a route names this id, so a route the owner
+    replaced in between is not released by a signature meant for another one.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RECEIVE_ROUTE_V1.decode()))
+    out.extend(_encode_route_terms(
+        owner_pubkey, sequence_number, destination_pubkey, share_bps, min_amount,
+        active_from, expires_at, locked,
+    ))
+    return blake3(bytes(out)).digest()
+
+
+def compute_receive_route_resolved_acc(acc: Any, route_id: Any, outcome: int) -> bytes:
+    """Fold one removal (removed, released, expired, replaced) into the commitment."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RECEIVE_ROUTE_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(route_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    return blake3(bytes(out)).digest()
+
+
+def encode_receive_route_entry(
+    route_id: Any,
+    owner_pubkey: Any,
+    sequence_number: int,
+    destination_pubkey: Any,
+    share_bps: int,
+    min_amount: int,
+    active_from: int,
+    expires_at: int,
+    locked: bool,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_hash32(route_id))
+    out.extend(_encode_route_terms(
+        owner_pubkey, sequence_number, destination_pubkey, share_bps, min_amount,
+        active_from, expires_at, locked,
+    ))
+    return bytes(out)
+
+
+def compute_receive_route_book_root(
+    entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    """BLAKE3 of the route book: sorted routes in force, then the removals."""
+    encoded = sorted(encode_receive_route_entry(*e) for e in (entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RECEIVE_ROUTE_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()

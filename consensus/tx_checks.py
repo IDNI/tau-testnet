@@ -5,13 +5,17 @@ admission does not bind it. Admission and apply call the same functions here.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Optional, Tuple
+
+import tau_defs
 
 from consensus import network_binding
 from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
 from consensus.payout import TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_PAYOUT_RULE_SET
+from consensus.receive_route import TX_TYPE_RECEIVE_ROUTE_RELEASE, TX_TYPE_RECEIVE_ROUTE_SET
 from consensus.standing import TX_TYPE_STANDING_PAYMENT_CREATE, TX_TYPE_STANDING_PAYMENT_UPDATE
 from consensus import bls
 
@@ -64,6 +68,10 @@ def _recipient_keys(tx: dict) -> list:
         slots = tx.get("slots")
         return [(f"slots[{k}]", key) for k, key in enumerate(slots or [])
                 if key != ""] if isinstance(slots, list) else []
+    if tx_type == TX_TYPE_RECEIVE_ROUTE_SET:
+        return [("destination_pubkey", tx.get("destination_pubkey"))]
+    if tx_type == TX_TYPE_RECEIVE_ROUTE_RELEASE:
+        return [("owner_pubkey", tx.get("owner_pubkey"))]
     if tx_type == TX_TYPE_PAYOUT_EXECUTE:
         recipients = tx.get("recipients")
         keys = [("account_pubkey", tx.get("account_pubkey"))]
@@ -78,6 +86,14 @@ def _recipient_keys(tx: dict) -> list:
         approvers = tx.get("approvers")
         if isinstance(approvers, dict):
             keys.extend(("approver", key) for key in approvers.values())
+        if tx_type == TX_TYPE_RULE_CHANGE_REQUEST and tx.get("kind") == tau_defs.RULE_CHANGE_KIND_SET_ROUTE:
+            # A receive route's destination travels inside its spec (kind 8).
+            try:
+                spec = json.loads(tx.get("rule_text") or "")
+            except (TypeError, ValueError):
+                spec = None
+            if isinstance(spec, dict) and "destination_pubkey" in spec:
+                keys.append(("destination_pubkey", spec["destination_pubkey"]))
         return keys
     return []
 
