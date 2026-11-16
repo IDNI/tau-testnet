@@ -235,8 +235,8 @@ class Block:
 
         Genesis (block 0) is provisioned directly with the all-zero proposer
         sentinel and carries no proposer signature, so it is treated as valid.
-        Fails closed (returns ``False``) if BLS is unavailable or the
-        signature/pubkey is missing or malformed.
+        Fails closed (returns ``False``) if the signature/pubkey is missing or
+        malformed.
         """
         if self.header.block_number == 0:
             return True
@@ -246,12 +246,13 @@ class Block:
         if not proof or not self.header.proposer_pubkey:
             return False
         try:
-            import hashlib
-            from py_ecc.bls import G2Basic
+            # Deferred: the consensus package imports this module at load time.
+            from consensus import bls
+
             msg_hash = hashlib.sha256(self.header.canonical_bytes()).digest()
             pubkey_bytes = bytes.fromhex(self.header.proposer_pubkey)
             sig_bytes = bytes.fromhex(proof)
-            return bool(G2Basic.Verify(pubkey_bytes, msg_hash, sig_bytes))
+            return bls.verify(pubkey_bytes, msg_hash, sig_bytes)
         except Exception:
             return False
 

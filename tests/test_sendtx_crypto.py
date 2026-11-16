@@ -84,15 +84,6 @@ class TestSendTxCrypto(unittest.TestCase):
         import config
         config.set_database_path(self.old_db_path)
         
-        # Reset globals
-        if hasattr(sendtx, '_PY_ECC_AVAILABLE'):
-            try:
-                import py_ecc.bls
-                sendtx._PY_ECC_AVAILABLE = True
-                sendtx._PY_ECC_BLS = py_ecc.bls
-            except ImportError:
-                sendtx._PY_ECC_AVAILABLE = False
-                sendtx._PY_ECC_BLS = None
 
     def _create_tx(self, transfers, expiration=None, sequence=None, sender_privkey=None, signature=None, sender_pubkey=None):
         ops = {"1": transfers}
@@ -128,8 +119,6 @@ class TestSendTxCrypto(unittest.TestCase):
         chain_state._balances[pk_hex] = amount
         ops = {"1": [[pk_hex, ADDR_A, str(amount)]]}
         tx_json = self._create_tx([[pk_hex, ADDR_A, str(amount)]], sequence=initial_seq, sender_privkey=privkey)
-        sendtx._PY_ECC_AVAILABLE = True
-        sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
         self.assertTrue(result["ok"], msg=f"Transaction failed: {result}")
 
@@ -140,8 +129,6 @@ class TestSendTxCrypto(unittest.TestCase):
         seq = chain_state.get_sequence_number(pk_hex)
         bad_sig = "00" * 96
         tx_json = self._create_tx([[pk_hex, ADDR_A, "2"]], sequence=seq, signature=bad_sig, sender_pubkey=pk_hex)
-        sendtx._PY_ECC_AVAILABLE = True
-        sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "INVALID_SIGNATURE")
@@ -164,8 +151,6 @@ class TestSendTxCrypto(unittest.TestCase):
         msg_hash = hashlib.sha256(msg_bytes).digest()
         sig = bls.Sign(privkey, msg_hash).hex()
         tx_json = self._create_tx([[pk_hex, ADDR_A, "3"]], sequence=seq, signature=sig, sender_pubkey=pk_hex)
-        sendtx._PY_ECC_AVAILABLE = True
-        sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "INVALID_SIGNATURE")
@@ -188,8 +173,6 @@ class TestSendTxCrypto(unittest.TestCase):
         msg_hash = hashlib.sha256(msg_bytes).digest()
         sig = bls.Sign(privkey2, msg_hash).hex()
         tx_json = self._create_tx([[pk_hex, ADDR_A, "5"]], sequence=seq, signature=sig, sender_pubkey=pk_hex)
-        sendtx._PY_ECC_AVAILABLE = True
-        sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "INVALID_SIGNATURE")
@@ -201,8 +184,6 @@ class TestSendTxCrypto(unittest.TestCase):
         initial_seq = chain_state.get_sequence_number(pk_hex)
         wrong_seq = initial_seq + 1
         tx_json = self._create_tx([[pk_hex, ADDR_A, "7"]], sequence=wrong_seq, sender_privkey=privkey)
-        sendtx._PY_ECC_AVAILABLE = True
-        sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json)
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "INVALID_SEQUENCE")
@@ -216,19 +197,7 @@ class TestSendTxCrypto(unittest.TestCase):
         tx_dict = json.loads(tx_json)
         tx_dict["operations"]["1"][0][2] = "9"
         tx_json_tampered = json.dumps(tx_dict)
-        sendtx._PY_ECC_AVAILABLE = True
-        sendtx._PY_ECC_BLS = bls
         result = sendtx.queue_transaction(tx_json_tampered)
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "INVALID_SIGNATURE")
 
-    def test_bls_unavailable_rejects_transaction(self):
-        # When BLS crypto is unavailable, transactions must be rejected — never
-        # admitted with verification silently skipped.
-        tx_json = self._create_tx([[GENESIS, ADDR_A, "5"]], signature="00")
-        sendtx._PY_ECC_AVAILABLE = False
-        result = sendtx.queue_transaction(tx_json)
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["code"], "BLS_UNAVAILABLE")
-        mempool = db.get_mempool_txs()
-        self.assertEqual(len(mempool), 0)
