@@ -42,6 +42,9 @@ SLOW_TX_TYPES = frozenset({
 
 # `retractable_transfer` and `retract_transfer` are absent too, i.e. FAST: a park
 # costs one transfer step and a retract needs no Tau evaluation at all.
+# `standing_payment_create` and `standing_payment_cancel` are FAST: a create
+# costs one fee-query step and a cancel needs no Tau evaluation. The payments
+# themselves run in the end-of-block sweep under their own per-block cap.
 # `approval_request` and `transfer_vote` are deliberately absent, i.e. FAST.
 # Neither routes text through i0, so neither rebuilds the interpreter: a request
 # costs one cheap Tau step like a transfer, and a vote costs one more only when
@@ -66,6 +69,7 @@ TAU_EVALUATING_TX_TYPES = frozenset({
     "transfer_vote",
     "retractable_transfer",
     "rule_change_request",
+    "standing_payment_create",
 })
 
 

@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from typing import Any, Optional, Tuple
 
+from consensus import network_binding
 from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
+from consensus.standing import TX_TYPE_STANDING_PAYMENT_CREATE
 from consensus import bls
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -54,7 +56,8 @@ def check_transfer(transfer: Any, sender_pubkey: Any) -> Optional[str]:
 
 def _recipient_keys(tx: dict) -> list:
     tx_type = tx.get("tx_type", "user_tx")
-    if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER):
+    if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER,
+                   TX_TYPE_STANDING_PAYMENT_CREATE):
         return [("recipient_pubkey", tx.get("recipient_pubkey"))]
     if tx_type in (TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST):
         keys = (
@@ -71,9 +74,13 @@ def _recipient_keys(tx: dict) -> list:
 def apply_tx_error(tx: dict) -> Optional[Tuple[str, str]]:
     """(receipt reason, detail) when block apply must refuse `tx`, else None.
 
-    Checks each transfer of a user_tx and the recipient keys of the other types.
-    The signature check runs before this one, in the apply loop.
+    Checks each transfer of a user_tx, the recipient keys of the other types and,
+    for the types bound to a network, that the network is this one. The signature
+    check runs before this one, in the apply loop.
     """
+    network_error = network_binding.problem(tx)
+    if network_error:
+        return network_binding.APPLY_REASON_WRONG_NETWORK, network_error
     if tx.get("tx_type", "user_tx") == "user_tx":
         operations = tx.get("operations")
         transfers = operations.get("1") if isinstance(operations, dict) else None

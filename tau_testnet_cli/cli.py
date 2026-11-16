@@ -708,7 +708,7 @@ def _submit_rule_tx(args: argparse.Namespace, build, *, pass_tip: bool = False) 
         return EXIT_LOCAL
 
     try:
-        sequence_number, tip = tx_mod.get_sequence_and_tip(
+        sequence_number, tip, genesis_hash = tx_mod.get_sequence_tip_and_network(
             sender_pubkey, host=args.host, port=args.port, timeout=args.timeout
         )
     except RuntimeError as exc:
@@ -719,6 +719,9 @@ def _submit_rule_tx(args: argparse.Namespace, build, *, pass_tip: bool = False) 
         height = _resolve_expire_at_height(args, tip=tip)
         payload = (build(sender_pubkey, sequence_number, height, tip) if pass_tip
                    else build(sender_pubkey, sequence_number, height))
+        # The types bound to a network sign its genesis hash; the node reported
+        # it with the sequence, so no extra call.
+        tx_mod.bind_to_network(payload, genesis_hash)
     except (_PayloadError, ValueError) as exc:
         print_error(str(exc))
         return EXIT_LOCAL
@@ -1219,6 +1222,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_approval_subparsers(sub)
     _add_policy_subparsers(sub)
     _add_retractable_subparsers(sub)
+    _add_standing_subparsers(sub)
     _add_node_subparsers(sub)
 
     return parser
@@ -2417,6 +2421,173 @@ def cmd_retractable_id(args: argparse.Namespace) -> int:
     else:
         print(rid)
     return EXIT_OK
+
+
+# --- Standing payments ------------------------------------------------------
+
+
+def _standing_first_due(args, tip: int, now: int) -> int:
+    """first_due from whichever --first-due-* flag is set, checked against the tip."""
+    if args.every_blocks is not None:
+        if args.first_due_height is not None:
+            height = int(args.first_due_height)
+        elif args.first_due_in is not None:
+            height = (tip or _tip_height(args)) + 1 + int(args.first_due_in)
+        else:
+            raise _PayloadError("a block schedule needs --first-due-height or --first-due-in")
+        if height <= (tip or _tip_height(args)) + 1:
+            raise _PayloadError(
+                f"first due height {height} is not after the next block; "
+                "the authorization would be mined at or past its first payment."
+            )
+        return height
+    if args.first_due_time is not None:
+        when = int(args.first_due_time)
+    elif args.first_due_after is not None:
+        when = now + int(args.first_due_after)
+    else:
+        raise _PayloadError("a time schedule needs --first-due-time or --first-due-after")
+    if when <= now + 1:
+        raise _PayloadError(f"first due time {when} is already (almost) past.")
+    return when
+
+
+def _standing_interval(args) -> dict:
+    for flag, field in (("every_blocks", "interval_blocks"),
+                        ("every_seconds", "interval_seconds"),
+                        ("every_months", "interval_months")):
+        value = getattr(args, flag, None)
+        if value is not None:
+            return {field: int(value)}
+    raise _PayloadError("give one of --every-blocks, --every-seconds, --every-months")
+
+
+def cmd_standing_create(args: argparse.Namespace) -> int:
+    from consensus.standing import StandingShapeError, parse_standing_payment_create
+
+    created = {}
+
+    def _build(sender_pubkey, sequence_number, expire_at_height, tip):
+        now = int(_now())
+        payload = tx_mod.build_standing_payment_create_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=now + args.expiry,
+            expire_at_height=expire_at_height,
+            recipient_pubkey=args.to,
+            amount=int(args.amount),
+            first_due=_standing_first_due(args, tip, now),
+            periods=int(args.periods),
+            **_standing_interval(args),
+        )
+        try:
+            created["id"] = parse_standing_payment_create(payload).standing_id.hex()
+        except StandingShapeError as exc:
+            raise _PayloadError(str(exc))
+        return payload
+
+    status = _submit_rule_tx(args, _build, pass_tip=True)
+    if status == EXIT_OK and created.get("id"):
+        print(f"standing payment id: {created['id']}",
+              file=sys.stderr if args.json else sys.stdout)
+    return status
+
+
+def cmd_standing_cancel(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_standing_payment_cancel_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            standing_id=args.standing_id,
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_standing_list(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getstandingpayments {address} {getattr(args, 'role', 'all')}")
+
+
+def cmd_standing_show(args: argparse.Namespace) -> int:
+    return _simple_query(args, f"getstandingpayment {args.standing_id}")
+
+
+def _add_standing_subparsers(sub) -> None:
+    """`tau-testnet standing ...` -- payments the network makes on a schedule."""
+    p_st = sub.add_parser(
+        "standing",
+        parents=[_GLOBAL_PARENT],
+        help="Standing payments (create, cancel, inspect)",
+    )
+    ssub = p_st.add_subparsers(dest="standing_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser, fee=True):
+        if fee:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument(
+            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+        parser.add_argument("--expire-in", type=_block_count, default=1000,
+                            help="Blocks the transaction may land in, from the next one")
+        parser.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+
+    p_new = ssub.add_parser(
+        "create", parents=common,
+        help="Sign once: pay a fixed amount to a fixed recipient every period",
+    )
+    _key_group(p_new)
+    p_new.add_argument("--to", required=True, help="Recipient public key (96 hex)")
+    p_new.add_argument("--amount", required=True, type=int, help="Amount per period")
+    p_new.add_argument("--periods", required=True, type=int,
+                       help="How many periods the authorization covers (its end)")
+    every = p_new.add_mutually_exclusive_group(required=True)
+    every.add_argument("--every-blocks", type=int, metavar="N")
+    every.add_argument("--every-seconds", type=int, metavar="N")
+    every.add_argument("--every-months", type=int, metavar="N",
+                       help="Calendar months in UTC; a missing day pays on the last day")
+    first = p_new.add_mutually_exclusive_group(required=True)
+    first.add_argument("--first-due-height", type=int, metavar="HEIGHT")
+    first.add_argument("--first-due-in", type=_block_count, metavar="BLOCKS",
+                       help="First payment this many blocks after the next one")
+    first.add_argument("--first-due-time", type=int, metavar="UNIX")
+    first.add_argument("--first-due-after", type=_block_count, metavar="SECONDS",
+                       help="First payment this many seconds from now")
+    _tx_flags(p_new)
+    p_new.set_defaults(func=cmd_standing_create)
+
+    p_cancel = ssub.add_parser("cancel", parents=common,
+                               help="Stop every later payment of an authorization")
+    _key_group(p_cancel)
+    p_cancel.add_argument("standing_id", help="Standing payment id (64 hex)")
+    # A cancel is fee-exempt, so a fee limit changes nothing.
+    _tx_flags(p_cancel, fee=False)
+    p_cancel.set_defaults(func=cmd_standing_cancel)
+
+    p_list = ssub.add_parser("list", parents=common,
+                             help="Standing payments an address pays or receives")
+    p_list.add_argument("--address", help="Address (default: your key's)")
+    _key_group(p_list, required=False)
+    p_list.add_argument("--role", choices=["in", "out", "all"], default="all")
+    p_list.set_defaults(func=cmd_standing_list)
+
+    p_show = ssub.add_parser("show", parents=common, help="One standing payment and its history")
+    p_show.add_argument("standing_id", help="Standing payment id (64 hex)")
+    p_show.set_defaults(func=cmd_standing_show)
 
 
 def _add_retractable_subparsers(sub) -> None:

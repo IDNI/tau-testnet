@@ -48,6 +48,19 @@ from consensus.approvals import (
     validate_request_shape,
     validate_rule_change_shape,
 )
+from consensus import network_binding
+from consensus.standing import (
+    KIND_BLOCKS as STANDING_KIND_BLOCKS,
+    MAX_OPEN_STANDING_PER_PAYER,
+    MAX_OPEN_STANDING_TOTAL,
+    KIND_NAMES as STANDING_KIND_NAMES,
+    TX_TYPE_STANDING_PAYMENT_CANCEL,
+    TX_TYPE_STANDING_PAYMENT_CREATE,
+    StandingShapeError,
+    parse_standing_payment_cancel,
+    parse_standing_payment_create,
+    validate_create_shape as validate_standing_create_shape,
+)
 from consensus.retractable import (
     KIND_HEIGHT,
     MAX_OPEN_RETRACTABLE_PER_SENDER,
@@ -1618,6 +1631,111 @@ def validate_retract_transfer_payload(
     return success({"retractable_id": request.retractable_id.hex()})
 
 
+# --- Standing payments -------------------------------------------------------
+
+def validate_standing_payment_create_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for a standing payment authorization.
+
+    The fee and the funds for it are checked on the sendtx path like any
+    fee-bearing type. Shape, schedule and book limits are shared with block apply
+    (`validate_create_shape`, then the same order of book checks as
+    `StandingBook.can_admit_create`), so admission refuses what apply refuses.
+    """
+    try:
+        terms = parse_standing_payment_create(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment_create: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != terms.payer_pubkey:
+        return format_error("standing_payment_create sender_pubkey must match the signer.")
+
+    err = validate_bls_pubkey(terms.recipient_pubkey, "recipient_pubkey")
+    if err:
+        return format_error(f"standing_payment_create rejected: {err}")
+
+    shape_error = validate_standing_create_shape(
+        terms, tip_view.next_block_height, tip_view.next_block_timestamp
+    )
+    if shape_error:
+        return format_error(
+            f"standing_payment_create rejected: {shape_error}", code="INVALID_SCHEDULE"
+        )
+
+    book = tip_view.standing_book()
+    standing_id = terms.standing_id
+    if book.knows(standing_id):
+        return format_error(
+            "Duplicate standing_payment_create (same payer, terms and sequence).",
+            code="DUPLICATE_STANDING_PAYMENT",
+        )
+    if book.open_count_for_payer(terms.payer_pubkey) >= MAX_OPEN_STANDING_PER_PAYER:
+        return format_error(
+            f"Payer already has {MAX_OPEN_STANDING_PER_PAYER} open standing payments.",
+            code="TOO_MANY_STANDING_PAYMENTS",
+        )
+    if book.open_count() >= MAX_OPEN_STANDING_TOTAL:
+        return format_error(
+            "The standing payment book is full.", code="STANDING_BOOK_FULL"
+        )
+
+    # Advisory deadline coupling, as for a retractable park: a create mined at or
+    # after its own first due point is refused by apply, so do not queue one that
+    # could be.
+    if terms.kind == STANDING_KIND_BLOCKS:
+        expire_at_height = tx.get("expire_at_height")
+        if isinstance(expire_at_height, int) and expire_at_height > terms.first_due:
+            return format_error(
+                "expire_at_height must not be after first_due.",
+                code="DEADLINE_AFTER_FIRST_DUE",
+            )
+    else:
+        expiration_time = tx.get("expiration_time")
+        if isinstance(expiration_time, int) and expiration_time >= terms.first_due:
+            return format_error(
+                "expiration_time must be before first_due.",
+                code="DEADLINE_AFTER_FIRST_DUE",
+            )
+
+    return success({
+        "standing_id": standing_id.hex(),
+        "amount": terms.amount,
+        "recipient_pubkey": terms.recipient_pubkey,
+        "schedule": STANDING_KIND_NAMES[terms.kind],
+        "interval": terms.interval,
+        "first_due": terms.first_due,
+        "periods": terms.periods,
+        "end": terms.end,
+    })
+
+
+def validate_standing_payment_cancel_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for ending a standing payment; apply runs the same book check."""
+    try:
+        signer, standing_id = parse_standing_payment_cancel(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment_cancel: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != signer:
+        return format_error("standing_payment_cancel sender_pubkey must match the signer.")
+
+    terms = tip_view.standing_book().get(standing_id)
+    if terms is None:
+        return format_error(
+            "Unknown or already ended standing payment.", code="UNKNOWN_STANDING_PAYMENT"
+        )
+    if terms.payer_pubkey != signer:
+        return format_error(
+            "Only the payer may cancel a standing payment.", code="NOT_STANDING_PAYER"
+        )
+    return success({"standing_id": standing_id.hex()})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -1682,6 +1800,15 @@ def validate_mempool_admission(
     if expiry_error is not None:
         return expiry_error
 
+    # Block apply runs the same check (tx_checks.apply_tx_error).
+    network_error = network_binding.problem(payload)
+    if network_error is not None:
+        return format_error(
+            f"{tx_type} rejected: {network_error}.",
+            code="WRONG_NETWORK",
+            genesis_hash=network_binding.chain_genesis_hash(),
+        )
+
     if tx_type == "user_tx":
          return validate_user_tx_reserved_domains(payload, tip_view)
          
@@ -1728,6 +1855,12 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
          return validate_retract_transfer_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_CREATE:
+         return validate_standing_payment_create_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
+         return validate_standing_payment_cancel_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

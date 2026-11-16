@@ -33,9 +33,14 @@ from consensus.approvals import (
     TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
+from consensus.network_binding import BOUND_TX_TYPES, FIELD as NETWORK_FIELD
 from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
+)
+from consensus.standing import (
+    TX_TYPE_STANDING_PAYMENT_CANCEL,
+    TX_TYPE_STANDING_PAYMENT_CREATE,
 )
 from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
@@ -66,6 +71,10 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
     # below with the same value, which is a no-op on a dict.
     if payload.get("expire_at_height") is not None:
         signing_dict["expire_at_height"] = payload["expire_at_height"]
+    # The network a transaction is for is signed by the types that carry it, so
+    # nobody can move one to another network by editing the field.
+    if tx_type in BOUND_TX_TYPES:
+        signing_dict[NETWORK_FIELD] = payload.get(NETWORK_FIELD)
     if tx_type == "user_tx":
         signing_dict["operations"] = payload.get("operations", {})
     elif tx_type == "consensus_rule_update":
@@ -123,6 +132,21 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_CREATE:
+        # Every term the sweep will act on is signed: it pays later, from
+        # hash-bound state, with no signature of the payer in sight, so an
+        # unsigned field would let a proposer change who is paid, how much or
+        # when. The three interval fields are all listed so that naming a
+        # different one changes the bytes.
+        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
+        signing_dict["amount"] = payload.get("amount")
+        signing_dict["interval_blocks"] = payload.get("interval_blocks")
+        signing_dict["interval_seconds"] = payload.get("interval_seconds")
+        signing_dict["interval_months"] = payload.get("interval_months")
+        signing_dict["first_due"] = payload.get("first_due")
+        signing_dict["periods"] = payload.get("periods")
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
+        signing_dict["standing_id"] = payload.get("standing_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

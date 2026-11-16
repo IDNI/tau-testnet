@@ -223,6 +223,21 @@ def get_sequence_and_tip(
     the height its ``expire_at_height`` is counted from. A node too old to
     report ``tip_height`` yields 0, and the caller falls back to getblocks.
     """
+    return get_sequence_tip_and_network(pubkey, host=host, port=port, timeout=timeout)[:2]
+
+
+def get_sequence_tip_and_network(
+    pubkey: str,
+    *,
+    host: str,
+    port: int,
+    timeout: float = rpc_mod.DEFAULT_TIMEOUT,
+) -> tuple[int, int, str]:
+    """Sequence number, tip height and the network's genesis hash, in one call.
+
+    The genesis hash is what the types bound to a network sign
+    (``consensus/network_binding.py``). A node too old to report it yields "".
+    """
     response = rpc_mod.send_command(
         f"getsequence {pubkey}", host, port, timeout=timeout
     )
@@ -244,7 +259,28 @@ def get_sequence_and_tip(
     tip = data.get("tip_height")
     if not isinstance(tip, int) or isinstance(tip, bool):
         tip = 0
-    return seq, tip
+    genesis_hash = data.get("genesis_hash")
+    if not isinstance(genesis_hash, str):
+        genesis_hash = ""
+    return seq, tip, genesis_hash
+
+
+def bind_to_network(payload: dict, genesis_hash: str) -> dict:
+    """Name the network in a payload whose type signs it; call before signing.
+
+    Other types are returned untouched. Raises ``ValueError`` when the type needs
+    the network and ``genesis_hash`` is empty.
+    """
+    from consensus.network_binding import BOUND_TX_TYPES, FIELD
+
+    if payload.get("tx_type") in BOUND_TX_TYPES:
+        if not genesis_hash:
+            raise ValueError(
+                "the node did not report its genesis hash, and this transaction "
+                "type is signed for one network"
+            )
+        payload[FIELD] = genesis_hash
+    return payload
 
 
 def submit_tx(
@@ -742,4 +778,91 @@ def build_retract_transfer_tx(
         "expire_at_height": _check_expire_at_height(expire_at_height),
         "fee_limit": str(fee_limit),
         "retractable_id": retractable_id.lower(),
+    }
+
+
+_STANDING_INTERVAL_FIELDS = ("interval_blocks", "interval_seconds", "interval_months")
+
+
+def build_standing_payment_create_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    recipient_pubkey: str,
+    amount: int,
+    first_due: int,
+    periods: int,
+    interval_blocks: int | None = None,
+    interval_seconds: int | None = None,
+    interval_months: int | None = None,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='standing_payment_create'`` payload (without signature).
+
+    Exactly one interval. Admission refuses a create that could be mined at or
+    after its own first due point, so the deadline is clamped to it:
+    ``expire_at_height`` to ``first_due`` for a block schedule, ``expiration_time``
+    below ``first_due`` for a time schedule.
+    """
+    if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
+        raise ValueError("recipient_pubkey must be a 96-character hex public key")
+    for name, value in (("amount", amount), ("first_due", first_due), ("periods", periods)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    given = {
+        name: value for name, value in zip(
+            _STANDING_INTERVAL_FIELDS, (interval_blocks, interval_seconds, interval_months)
+        ) if value is not None
+    }
+    if len(given) != 1:
+        raise ValueError("give exactly one of interval_blocks, interval_seconds, interval_months")
+    (name, interval), = given.items()
+    if not isinstance(interval, int) or isinstance(interval, bool) or interval < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    expire_at_height = _check_expire_at_height(expire_at_height)
+    if name == "interval_blocks":
+        expire_at_height = min(expire_at_height, first_due)
+    else:
+        expiration_time = min(expiration_time, first_due - 1)
+    return {
+        "tx_type": "standing_payment_create",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": expire_at_height,
+        "fee_limit": str(fee_limit),
+        "recipient_pubkey": recipient_pubkey.lower(),
+        "amount": amount,
+        name: interval,
+        "first_due": first_due,
+        "periods": periods,
+    }
+
+
+def build_standing_payment_cancel_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    standing_id: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='standing_payment_cancel'`` payload (without signature).
+
+    Feeless. It must be INCLUDED in a block before the next due point to stop
+    that payment, so send it with margin.
+    """
+    if not isinstance(standing_id, str) or len(standing_id) != 64:
+        raise ValueError("standing_id must be a 64-character hex string")
+    return {
+        "tx_type": "standing_payment_cancel",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "standing_id": standing_id.lower(),
     }
