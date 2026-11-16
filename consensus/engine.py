@@ -20,12 +20,17 @@ from . import sender_policy
 from .fees import FeeRuleError
 from .approvals import (
     APPROVAL_TX_TYPES,
+    RULE_CHANGE_TX_TYPES,
     STATUS_EXECUTED,
     STATUS_FAILED,
+    STATUS_CANCELLED,
     STATUS_OPEN,
     TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
     parse_approval_request,
+    parse_rule_change_cancel,
+    parse_rule_change_request_checked,
     parse_transfer_vote,
 )
 from .retractable import (
@@ -38,6 +43,7 @@ from .retractable import (
 )
 from .rule_offers import (
     RULE_OFFER_TX_TYPES,
+    RuleOfferDecision,
     RuleOfferShapeError,
     clause_body_v1,
     is_neutral_clause_body,
@@ -63,7 +69,8 @@ from .rule_offers import (
 # an engine import, and a divergence charges a different fee at admission than
 # at inclusion.
 FEE_BEARING_TX_TYPES = frozenset(
-    {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER}
+    {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
+     TX_TYPE_RULE_CHANGE_REQUEST}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -74,6 +81,7 @@ _LIFECYCLE_TX_TYPES = frozenset(
     {"consensus_rule_update", "consensus_rule_vote"}
     | set(RULE_OFFER_TX_TYPES)
     | set(APPROVAL_TX_TYPES)
+    | set(RULE_CHANGE_TX_TYPES)
 )
 from consensus.tx_checks import apply_tx_error
 from consensus.tx_signing import verify_tx_signature
@@ -232,18 +240,20 @@ def _release_due_retractables(lm, balances, sequences, height, timestamp) -> Lis
 
 
 TEMPORAL_REFERENCE_REASON = "temporal_reference"
+RULE_CHANGE_NEEDS_APPROVAL_REASON = "rule_change_needs_approval"
 
 
-def _clause_domain_rejection(body: str) -> Optional[Tuple[str, str]]:
+def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tuple[str, str]]:
     """(error, receipt reason) when admission would refuse this clause body."""
     # Lazy: consensus.admission imports chain_state, which imports this module.
     from consensus.admission import (
         _screen_clause_domains,
+        _screen_guard_domains,
         _width_mismatch_details,
         is_temporal_reference_error,
     )
 
-    error = _screen_clause_domains(body)
+    error = (_screen_guard_domains if guard else _screen_clause_domains)(body)
     if error is None:
         return None
     if is_temporal_reference_error(error):
@@ -251,6 +261,116 @@ def _clause_domain_rejection(body: str) -> Optional[Tuple[str, str]]:
     if _width_mismatch_details(error):
         return error, "width_mismatch"
     return error, "rule_not_applied"
+
+
+def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str]]:
+    """Write every READY rule-change request, lowest id first, up to the per-block cap.
+
+    Runs after the transaction loop and before expiry, so a deferred request
+    whose window closes this block expires instead of releasing. A failure is
+    recorded on the request, never on the block. Returns (id, status name).
+    """
+    approvals = lm.approval_requests
+    if not approvals.rule_change_requests:
+        return []
+    approvals.mark_escape_due_ready(int(height))
+    events: List[Tuple[str, str]] = []
+    processed = 0
+    for rid in approvals.ready_rule_change_ids():
+        if processed >= tau_defs.MAX_RULE_CHANGE_RELEASES_PER_BLOCK:
+            break
+        entry = approvals.get_rule_change(rid)
+        if entry is None or entry.status != STATUS_OPEN:
+            continue
+        processed += 1
+        problem = _write_rule_change(lm, rid, entry, int(height), timeout)
+        if problem:
+            approvals.resolve_rule_change(rid, STATUS_FAILED)
+            logger.info("Rule-change request %s failed at release: %s", rid.hex(), problem)
+            events.append((rid.hex(), "failed"))
+            continue
+        approvals.resolve_rule_change(rid, STATUS_EXECUTED)
+        events.append((rid.hex(), "executed"))
+    return events
+
+
+def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
+    """Apply one request to the block's lifecycle. None on success, else why not.
+
+    Every check runs before the first write, so a failure leaves nothing behind.
+    """
+    offers = lm.rule_offers
+    approvals = lm.approval_requests
+    sender = entry.sender_pubkey
+    kind = entry.kind
+    policy_key = (sender, tau_defs.USER_POLICY_STREAM_INDEX)
+    guard_key = (sender, tau_defs.RULE_CHANGE_GUARD_INDEX)
+
+    def _screen_and_build(body, *, guard=False):
+        rejection = _clause_domain_rejection(body, guard=guard)
+        if rejection:
+            return rejection[0]
+        builds, build_error = sender_policy.clause_builds(
+            body, pool="apply", timeout=timeout
+        )
+        return None if builds else f"does not build: {build_error}"
+
+    decision = None
+    if kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+        problem = _screen_and_build(entry.body)
+    elif kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
+        problem = _screen_and_build(entry.body, guard=True)
+    elif kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
+        problem = None if offers.clause_for(*policy_key) else "no policy to revoke"
+    elif kind == tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD:
+        problem = None if offers.clause_for(*guard_key) else "no guard to revoke"
+    elif kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+        offer_id = bytes.fromhex(entry.offer_id)
+        offer = offers.offered.get(offer_id)
+        text = entry.body
+        if offer is None:
+            problem = "the offer is no longer open"
+        elif offer.recipient_pubkey != sender:
+            problem = "the offer is not addressed to the sender"
+        elif offer.expire_at_height <= height:
+            problem = "the offer has expired"
+        else:
+            decision = RuleOfferDecision(
+                offer_id=offer_id, actor_pubkey=sender, accept=True, rule_text=text
+            )
+            ok, reason = offers.can_admit_decision(decision)
+            problem = None if ok else reason
+            if ok:
+                try:
+                    problem = _screen_and_build(clause_body_v1(text))
+                except RuleOfferShapeError as exc:
+                    problem = str(exc)
+    else:
+        problem = f"unknown kind {kind}"
+    if problem:
+        return problem
+
+    if kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+        offers.accepted_clauses[policy_key] = entry.body
+    elif kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
+        offers.accepted_clauses.pop(policy_key, None)
+    elif kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
+        offers.accepted_clauses[guard_key] = entry.body
+    elif kind == tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD:
+        offers.accepted_clauses.pop(guard_key, None)
+    else:
+        try:
+            offers.submit_decision(decision)
+        except RuleOfferShapeError as exc:
+            return str(exc)
+
+    if kind in (tau_defs.RULE_CHANGE_KIND_SET_GUARD, tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD):
+        approvals.resolve_open_rule_changes_for_sender(
+            sender, STATUS_FAILED, except_id=rid
+        )
+    else:
+        approvals.resolve_all_for_sender(sender, STATUS_FAILED)
+    return None
 
 
 def _refuse_in_process_authority(entry: str) -> None:
@@ -458,7 +578,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         policy rule, because every such rule registers a clause.
         """
         tx_type = tx.get("tx_type", "user_tx")
-        if tx_type in RULE_OFFER_TX_TYPES:
+        if tx_type in RULE_OFFER_TX_TYPES or tx_type == TX_TYPE_RULE_CHANGE_REQUEST:
             return True
         if tx_type != "user_tx":
             return False
@@ -777,6 +897,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # before release) and a release can never both fire in one block.
         released_retractables = _release_due_retractables(
             lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
+        )
+        _release_rule_changes(
+            lm, block.header.block_number, block.header.timestamp,
+            getattr(
+                session if session is not None else getattr(proposal, "session", None),
+                "request_budget", None,
+            ),
         )
 
         minted = faucet.granted(
@@ -1520,6 +1647,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # Set when this tx parked an approval request. The fee settles after
             # the park and can still reject the tx, so the request is withdrawn below.
             parked_request_id: Optional[bytes] = None
+            parked_rule_change_id: Optional[bytes] = None
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
 
@@ -1601,6 +1729,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     if not builds:
                         _did_not_land(f"o5 clause ignored (does not build: {build_error})")
                         return True
+
+                guard_blocked, guard_detail = sender_policy.rule_change_blocked(
+                    lambda who, idx: offers.accepted_clauses.get((who, idx)),
+                    sender_n,
+                    tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY if revoking
+                    else tau_defs.RULE_CHANGE_KIND_SET_POLICY,
+                    int(block_timestamp or 0),
+                    pool="apply",
+                    timeout=getattr(_session, "request_budget", None),
+                )
+                if guard_blocked:
+                    _did_not_land(
+                        f"o5 clause ignored (rule-change guard blocks: {guard_detail})",
+                        reason=RULE_CHANGE_NEEDS_APPROVAL_REASON,
+                    )
+                    return True
 
                 # A request snapshots its approvers but re-evaluates the CURRENT
                 # clause, so changing the clause under an open request would
@@ -2040,6 +2184,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                             if not builds:
                                 rejection = (build_error, "rule_not_applied")
+                        guard_blocked, guard_detail = False, ""
+                        if accepted_body is not None and not rejection:
+                            guard_blocked, guard_detail = sender_policy.rule_change_blocked(
+                                lambda who, idx: offers.accepted_clauses.get((who, idx)),
+                                decision.actor_pubkey,
+                                tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
+                                int(block_timestamp or 0),
+                                pool="apply",
+                                timeout=getattr(_session, "request_budget", None),
+                            )
                         if not ok:
                             tx_receipt["logs"].append(
                                 f"Offer decision ignored ({reason})"
@@ -2051,6 +2205,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             execution_success = False
                             tx_receipt["reason"] = domain_reason
                             tx_receipt["logs"].append(f"Error: {domain_error}")
+                        elif guard_blocked:
+                            accepted_in_block = False
+                            hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = RULE_CHANGE_NEEDS_APPROVAL_REASON
+                            tx_receipt["logs"].append(
+                                f"Offer accept ignored (rule-change guard blocks: {guard_detail})"
+                            )
                         else:
                             target_stream = offers.submit_decision(decision)
                             if target_stream is None:
@@ -2077,12 +2239,123 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     + decision.offer_id_hex
                                 )
 
+            elif tx_type in RULE_CHANGE_TX_TYPES:
+                # Failures are SOFT no-ops with a receipt log, like approval
+                # requests: the tx is not included and pays nothing.
+                operations = {}
+                approvals = lifecycle_mgr.approval_requests
+                offers = lifecycle_mgr.rule_offers
+                height_now = int(block_height or 0)
+
+                if tx_type == TX_TYPE_RULE_CHANGE_REQUEST:
+                    request, parse_error = parse_rule_change_request_checked(tx)
+                    problem = None
+                    if request is None:
+                        problem = (parse_error, "rule_change_request_invalid")
+                    elif not isinstance(sender, str) or sender.lower() != request.sender_pubkey:
+                        problem = ("sender is not the signer", "rule_change_request_invalid")
+                    elif request.approvers and not approval_slots_on:
+                        problem = (
+                            "approval slots are not active",
+                            "rule_change_request_invalid",
+                        )
+                    else:
+                        ok, reason = approvals.can_admit_rule_change(request, height_now)
+                        if not ok:
+                            problem = (reason, "rule_change_request_invalid")
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+                            rejection = _clause_domain_rejection(request.body)
+                            if rejection:
+                                problem = rejection
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
+                            rejection = _clause_domain_rejection(request.body, guard=True)
+                            if rejection:
+                                problem = rejection
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+                            rejection = _clause_domain_rejection(
+                                clause_body_v1(request.rule_text))
+                            if rejection:
+                                problem = rejection
+                    if request is not None and problem is None:
+                        precondition = None
+                        if request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
+                            if not offers.clause_for(
+                                    request.sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX):
+                                precondition = "there is no registered o5 policy to revoke"
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD:
+                            if not offers.clause_for(
+                                    request.sender_pubkey, tau_defs.RULE_CHANGE_GUARD_INDEX):
+                                precondition = "there is no registered rule-change guard to revoke"
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+                            offer_entry = offers.offered.get(bytes.fromhex(request.offer_id))
+                            if offer_entry is None:
+                                precondition = "the offer is not open"
+                            elif offer_entry.recipient_pubkey != request.sender_pubkey:
+                                precondition = "only the offer recipient may park its acceptance"
+                            elif offer_entry.expire_at_height <= height_now:
+                                precondition = "the offer expires at or before the next block"
+                            else:
+                                accepted, why = offers.can_admit_decision(RuleOfferDecision(
+                                    offer_id=bytes.fromhex(request.offer_id),
+                                    actor_pubkey=request.sender_pubkey,
+                                    accept=True, rule_text=request.rule_text))
+                                if not accepted:
+                                    precondition = why
+                        if precondition:
+                            problem = (precondition, "rule_change_request_invalid")
+                    if problem is not None:
+                        tx_receipt["logs"].append(f"Rule-change request ignored ({problem[0]})")
+                        tx_receipt["reason"] = problem[1]
+                        accepted_in_block = False
+                    elif approvals.submit_rule_change(request, height_now):
+                        parked_rule_change_id = request.request_id
+                        tx_receipt["logs"].append(
+                            "Rule-change request parked: " + request.request_id_hex
+                        )
+                        blocked, _detail = sender_policy.rule_change_blocked(
+                            lambda who, idx: offers.accepted_clauses.get((who, idx)),
+                            request.sender_pubkey, request.kind,
+                            int(block_timestamp or 0),
+                            pool="apply",
+                            timeout=getattr(_session, "request_budget", None),
+                        )
+                        if not blocked:
+                            approvals.mark_rule_change_ready(request.request_id)
+                            tx_receipt["logs"].append(
+                                "Rule-change request ready: " + request.request_id_hex
+                            )
+                    else:
+                        tx_receipt["logs"].append(
+                            "Duplicate rule-change request ignored: " + request.request_id_hex
+                        )
+                        tx_receipt["reason"] = "rule_change_request_invalid"
+                        accepted_in_block = False
+
+                else:  # TX_TYPE_RULE_CHANGE_CANCEL
+                    cancel = parse_rule_change_cancel(tx)
+                    if cancel is None:
+                        reason = "invalid rule-change cancel format"
+                    elif not isinstance(sender, str) or sender.lower() != cancel.sender_pubkey:
+                        reason = "sender is not the signer"
+                    else:
+                        ok, reason = approvals.can_cancel_rule_change(cancel, height_now)
+                        if ok:
+                            approvals.resolve_rule_change(cancel.request_id, STATUS_CANCELLED)
+                            tx_receipt["logs"].append(
+                                "Rule-change request cancelled: " + cancel.request_id_hex
+                            )
+                    if cancel is None or reason:
+                        tx_receipt["logs"].append(f"Rule-change cancel ignored ({reason})")
+                        tx_receipt["reason"] = "rule_change_cancel_invalid"
+                        accepted_in_block = False
+
             elif tx_type in APPROVAL_TX_TYPES:
                 # Bounds and state disagreements are SOFT no-ops with a receipt
                 # log, matching the rule-offer branch: the block stays valid and
                 # the action simply is not recorded, so replay is deterministic
                 # regardless of tip state. Only a Tau failure hard-rejects.
                 approvals = lifecycle_mgr.approval_requests
+                offers_book = lifecycle_mgr.rule_offers
 
                 if not approval_slots_on:
                     tx_receipt["logs"].append(
@@ -2160,6 +2433,35 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             if not ok:
                                 tx_receipt["logs"].append(f"Transfer vote ignored ({reason})")
                                 accepted_in_block = False
+                            elif vote.request_id in approvals.rule_change_requests:
+                                rc_entry = approvals.get_rule_change(vote.request_id)
+                                # Evaluated on the prospective slots and committed
+                                # after, so a failed evaluation records no vote.
+                                filled = approvals.prospective_rule_change_slots(
+                                    vote.request_id, vote
+                                )
+                                blocked = True
+                                if vote.approve and not rc_entry.ready:
+                                    blocked, _detail = sender_policy.rule_change_blocked(
+                                        lambda who, idx: offers_book.accepted_clauses.get(
+                                            (who, idx)),
+                                        rc_entry.sender_pubkey, rc_entry.kind,
+                                        int(block_timestamp or 0),
+                                        pool="apply",
+                                        timeout=getattr(_session, "request_budget", None),
+                                        voted=filled,
+                                    )
+                                approvals.commit_rule_change_vote(vote)
+                                tx_receipt["logs"].append(
+                                    "Rule-change vote recorded: %s %s"
+                                    % (vote.request_id_hex,
+                                       "approve" if vote.approve else "decline")
+                                )
+                                if not blocked and approvals.mark_rule_change_ready(
+                                        vote.request_id):
+                                    tx_receipt["logs"].append(
+                                        "Rule-change request ready: " + vote.request_id_hex
+                                    )
                             else:
                                 entry = approvals.get_request(vote.request_id)
                                 # PROSPECTIVE first, commit after: a failed
@@ -2836,6 +3138,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if _lifecycle_for_write().approval_requests.withdraw_request(parked_request_id):
                     tx_receipt["logs"].append(
                         "Approval request un-parked (its fee was not paid)"
+                    )
+
+            if parked_rule_change_id is not None and not accepted_in_block:
+                if _lifecycle_for_write().approval_requests.withdraw_rule_change(
+                        parked_rule_change_id):
+                    tx_receipt["logs"].append(
+                        "Rule-change request un-parked (its fee was not paid)"
                     )
 
             stamp_retractable_park = False

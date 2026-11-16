@@ -29,7 +29,9 @@ from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
+    RULE_CHANGE_TX_TYPES,
     TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
 
@@ -40,6 +42,7 @@ KNOWN_TX_TYPES = frozenset(
     {"user_tx", "consensus_rule_update", "consensus_rule_vote"}
     | set(RULE_OFFER_TX_TYPES)
     | set(APPROVAL_TX_TYPES)
+    | set(RULE_CHANGE_TX_TYPES)
     | set(RETRACTABLE_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
@@ -48,7 +51,8 @@ KNOWN_TX_TYPES = frozenset(
 # and a fee strategy, and the vote is bounded by the request's declared approver
 # set instead.
 FEE_BEARING_TX_TYPES = frozenset(
-    {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER}
+    {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
+     TX_TYPE_RULE_CHANGE_REQUEST}
     | set(RULE_OFFER_TX_TYPES)
 )
 from db import add_mempool_tx
@@ -839,7 +843,17 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
     from consensus.facade import TipAdmissionView
     tip_view = TipAdmissionView()
     
-    admission_eval = validate_mempool_admission(payload, tip_view)
+    try:
+        admission_eval = validate_mempool_admission(payload, tip_view)
+    except tau_admission.AdmissionTimeout as e:
+        logger.warning("Admission evaluation timed out: %s", e)
+        return _qt_err("ADMISSION_TIMEOUT", "Transaction evaluation timed out and was rejected.")
+    except tau_admission.AdmissionUnavailable as e:
+        logger.warning("Admission evaluation unavailable: %s", e)
+        return _qt_err(
+            "ADMISSION_UNAVAILABLE",
+            "Transaction validation is temporarily unavailable; please resubmit.",
+        )
     if not admission_eval.is_valid:
         # Forward the admission layer's own code/details when it set them;
         # everything else still collapses to TX_REJECTED as before (issue #23).
@@ -1000,6 +1014,13 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             )
             if refusal is not None:
                 return refusal
+
+        elif tx_type == TX_TYPE_RULE_CHANGE_REQUEST:
+            clause_body = (admission_eval.data or {}).get("clause_body")
+            if clause_body:
+                refusal = _clause_build_refusal(clause_body, admission_tau.budget)
+                if refusal is not None:
+                    return refusal
 
         elif tx_type in ("user_tx", TX_TYPE_RETRACTABLE_TRANSFER):
             # --- Tau Validation (Deterministic Two-Step) ---

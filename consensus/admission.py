@@ -35,13 +35,18 @@ from consensus.approvals import (
     MAX_PENDING_REQUESTS_PER_SENDER,
     STATUS_OPEN,
     TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_RULE_CHANGE_CANCEL,
+    TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
     parse_approval_request,
+    parse_rule_change_cancel,
+    parse_rule_change_request_checked,
     parse_transfer_vote,
     screen_policy_widths,
     screen_slot_widths,
     screen_stream_widths,
     validate_request_shape,
+    validate_rule_change_shape,
 )
 from consensus.retractable import (
     KIND_HEIGHT,
@@ -963,6 +968,11 @@ def _screen_clause_domains(body: str) -> Optional[str]:
             + ", ".join(typed)
         )
 
+    return _screen_clause_widths_and_structure(body)
+
+
+def _screen_clause_widths_and_structure(body: str) -> Optional[str]:
+    """Width-typing and size screens every clause body must clear."""
     # Approval slots may be read, but every occurrence must be typed bv[384].
     # Per-stream bitvector typing is process-global and sticky, so one clause
     # typing i18 at bv[384] and another at bv[24] makes get_interpreter
@@ -987,6 +997,64 @@ def _screen_clause_domains(body: str) -> Optional[str]:
     if structure_error:
         return "Shared rules: " + structure_error
     return None
+
+
+# i1 = change kind, i5 = timestamp, i18..i25 = approval slots.
+GUARD_READABLE_INPUTS = frozenset({
+    1,
+    int(tau_defs.TAU_INPUT_STREAM_TIMESTAMP[1:]),
+    *tau_defs.approval_slot_indices(),
+})
+
+
+def _screen_guard_domains(body: str) -> Optional[str]:
+    """Domain screen for a rule-change guard body: reads i1, i5 and the approval
+    slots only, and writes o5 only."""
+    temporal_error = screen_temporal_rule(body)
+    if temporal_error:
+        return temporal_error
+
+    scrubbed = _strip_tau_comments(body)
+    for match in re.finditer(r"\bi(\d+)\b", scrubbed):
+        if int(match.group(1)) not in GUARD_READABLE_INPUTS:
+            return (
+                "Rule-change guards may read only i1, i5 and the approval "
+                f"slots, found i{match.group(1)}"
+            )
+    for match in re.finditer(r"\bo(\d+)\b", scrubbed):
+        if int(match.group(1)) != tau_defs.USER_POLICY_STREAM_INDEX:
+            return (
+                "Rule-change guards may reference only o5, "
+                f"found o{match.group(1)}"
+            )
+    if not re.search(r"\bo5\s*\[", scrubbed):
+        return "Rule-change guards must write o5"
+    return _screen_clause_widths_and_structure(body)
+
+
+def _rule_change_refusal(
+    tip_view: TipAdmissionView, sender: str, kind: int
+) -> Optional[AdmissionResult]:
+    """Refusal when the sender's rule-change guard blocks this kind of change."""
+    import tau_admission
+    from consensus import sender_policy
+    from tau_speculation import SpeculationError, WorkerLost, WorkerTimeout
+
+    try:
+        blocked, detail = sender_policy.rule_change_blocked(
+            tip_view.clause_for, sender, kind, tip_view.next_block_timestamp,
+            pool="admission", timeout=tau_admission.default_budget(),
+        )
+    except WorkerTimeout as exc:
+        raise tau_admission.AdmissionTimeout(str(exc)) from exc
+    except (WorkerLost, SpeculationError) as exc:
+        raise tau_admission.AdmissionUnavailable(str(exc)) from exc
+    if not blocked:
+        return None
+    return format_error(
+        "Your rule-change guard requires approval for this change.",
+        code="RULE_CHANGE_NEEDS_APPROVAL",
+    )
 
 
 def validate_rule_offer_decision_payload(
@@ -1046,6 +1114,12 @@ def validate_rule_offer_decision_payload(
     domain_error = _screen_clause_domains(body)
     if domain_error:
         return _admission_from_domain_error(domain_error)
+
+    refusal = _rule_change_refusal(
+        tip_view, decision.actor_pubkey, tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER
+    )
+    if refusal is not None:
+        return refusal
 
     return success({
         "offer_id": offer_id_hex,
@@ -1123,7 +1197,16 @@ def validate_o5_clause_routing(
         return format_error("o5 policy rule needs a sender_pubkey.")
     sender_n = sender.strip().lower()
 
-    if is_neutral_clause_body(body, tau_defs.USER_POLICY_STREAM_INDEX):
+    revoking = is_neutral_clause_body(body, tau_defs.USER_POLICY_STREAM_INDEX)
+    refusal = _rule_change_refusal(
+        tip_view, sender_n,
+        tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY if revoking
+        else tau_defs.RULE_CHANGE_KIND_SET_POLICY,
+    )
+    if refusal is not None:
+        return refusal
+
+    if revoking:
         # Revocation makes no engine call.
         return success({
             "o5_clause_action": "revoke",
@@ -1243,7 +1326,9 @@ def validate_transfer_vote_payload(
 
     row = tip_view.get_approval_request(vote.request_id_hex)
     if row is None:
-        return format_error("Unknown approval request.", code="UNKNOWN_REQUEST")
+        row = tip_view.get_rule_change_request(vote.request_id_hex)
+        if not isinstance(row, dict):
+            return format_error("Unknown approval request.", code="UNKNOWN_REQUEST")
     if int(row.get("status", STATUS_OPEN)) != STATUS_OPEN:
         return format_error(
             "Approval request is already resolved.", code="REQUEST_RESOLVED"
@@ -1278,6 +1363,153 @@ def validate_transfer_vote_payload(
         "slot": slot,
         "approve": vote.approve,
     })
+
+
+# --- Rule-change requests ----------------------------------------------------
+
+def _invalid_rule_change(why: str) -> AdmissionResult:
+    return format_error(
+        f"rule_change_request rejected: {why}", code="INVALID_RULE_CHANGE_REQUEST"
+    )
+
+
+def _rule_change_precondition_error(request, tip_view: TipAdmissionView) -> Optional[str]:
+    """Why the sender's current state cannot take this kind of change, if it cannot."""
+    sender = request.sender_pubkey
+    if request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
+        if not tip_view.clause_for(sender, tau_defs.USER_POLICY_STREAM_INDEX):
+            return "there is no registered o5 policy to revoke"
+    elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD:
+        if not tip_view.clause_for(sender, tau_defs.RULE_CHANGE_GUARD_INDEX):
+            return "there is no registered rule-change guard to revoke"
+    elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+        row = tip_view.get_offer(request.offer_id)
+        if not isinstance(row, dict) or row.get("status") != STATUS_OFFERED:
+            return "the offer is not open"
+        if str(row.get("recipient_pubkey", "")).lower() != sender:
+            return "only the offer recipient may park its acceptance"
+        if int(row.get("expire_at_height", 0)) <= tip_view.next_block_height:
+            return "the offer expires at or before the next block"
+        rebuilt = compute_offer_id(
+            offerer_pubkey=str(row.get("offerer_pubkey", "")).lower(),
+            recipient_pubkey=sender,
+            rule_text=request.rule_text,
+            expire_at_height=int(row.get("expire_at_height", 0)),
+        )
+        if rebuilt.hex() != request.offer_id:
+            return "rule text does not match the offer digest"
+    return None
+
+
+def validate_rule_change_request_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for parking a change to the sender's policy or guard.
+
+    The guard is deliberately not consulted: a request is how a change gets
+    approved. Bodies are screened, not built; the build happens when the change
+    is written.
+    """
+    request, why = parse_rule_change_request_checked(tx)
+    if request is None:
+        return _invalid_rule_change(why)
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender.strip().lower() != request.sender_pubkey:
+        return _invalid_rule_change("sender_pubkey must match the signer")
+
+    if request.approvers and not approval_slots_active(tip_view):
+        return _approvals_inactive_error()
+
+    for approver in request.approvers.values():
+        err = validate_bls_pubkey(approver, "approver")
+        if err:
+            return _invalid_rule_change(err)
+
+    shape_error = validate_rule_change_shape(request, tip_view.next_block_height)
+    if shape_error:
+        return _invalid_rule_change(shape_error)
+
+    if request.kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+        domain_error = _screen_clause_domains(request.body)
+    elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
+        domain_error = _screen_guard_domains(request.body)
+    elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+        domain_error = _screen_clause_domains(clause_body_v1(request.rule_text))
+    else:
+        domain_error = None
+    if domain_error:
+        return _admission_from_domain_error(
+            domain_error, prefix="rule_change_request rejected: "
+        )
+
+    precondition = _rule_change_precondition_error(request, tip_view)
+    if precondition:
+        return _invalid_rule_change(precondition)
+
+    request_id_hex = request.request_id_hex
+    if tip_view.get_rule_change_request(request_id_hex) is not None:
+        return format_error(
+            "Duplicate rule_change_request (same sender, sequence, kind, body, "
+            "approvers and expiry).",
+            code="DUPLICATE_REQUEST",
+        )
+
+    if tip_view.open_requests_for_sender(request.sender_pubkey) >= MAX_PENDING_REQUESTS_PER_SENDER:
+        return format_error(
+            f"Sender already has {MAX_PENDING_REQUESTS_PER_SENDER} open requests.",
+            code="TOO_MANY_REQUESTS",
+        )
+    for approver in sorted(request.approvers.values()):
+        if tip_view.open_requests_for_approver(approver) >= MAX_PENDING_REQUESTS_PER_APPROVER:
+            return format_error(
+                f"Approver {approver[:10]}... already has "
+                f"{MAX_PENDING_REQUESTS_PER_APPROVER} open requests.",
+                code="TOO_MANY_REQUESTS",
+            )
+
+    data = {
+        "request_id": request_id_hex,
+        "kind": request.kind,
+        "approvers": dict(request.approvers),
+        "expire_at_height": request.expire_at_height,
+    }
+    if request.body:
+        data["clause_body"] = request.body
+    return success(data)
+
+
+def validate_rule_change_cancel_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for withdrawing a parked rule-change request. Feeless; the
+    sequence number the envelope carries is the replay protection."""
+    cancel = parse_rule_change_cancel(tx)
+    if cancel is None:
+        return format_error(
+            "Malformed rule_change_cancel: needs a 32-byte hex request_id.",
+            code="INVALID_RULE_CHANGE_CANCEL",
+        )
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender.strip().lower() != cancel.sender_pubkey:
+        return format_error("rule_change_cancel sender_pubkey must match the signer.")
+
+    row = tip_view.get_rule_change_request(cancel.request_id_hex)
+    if not isinstance(row, dict):
+        return format_error("Unknown rule-change request.", code="UNKNOWN_REQUEST")
+    if str(row.get("sender_pubkey", "")).lower() != cancel.sender_pubkey:
+        return format_error(
+            "Only the request's sender may cancel it.", code="NOT_REQUEST_SENDER"
+        )
+    if int(row.get("status", STATUS_OPEN)) != STATUS_OPEN:
+        return format_error(
+            "Rule-change request is already resolved.", code="REQUEST_RESOLVED"
+        )
+    if int(row.get("expire_at_height", 0)) <= tip_view.next_block_height:
+        return format_error("Rule-change request has expired.", code="REQUEST_EXPIRED")
+
+    return success({"request_id": cancel.request_id_hex})
 
 
 # --- Retractable transfers ---------------------------------------------------
@@ -1392,6 +1624,7 @@ def validate_retract_transfer_payload(
 _EXPIRY_WINDOW_BY_TYPE = {
     TX_TYPE_RULE_OFFER: MAX_OFFER_WINDOW_BLOCKS,
     TX_TYPE_APPROVAL_REQUEST: MAX_APPROVAL_WINDOW_BLOCKS,
+    TX_TYPE_RULE_CHANGE_REQUEST: MAX_APPROVAL_WINDOW_BLOCKS,
 }
 
 
@@ -1483,6 +1716,12 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_TRANSFER_VOTE:
          return validate_transfer_vote_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_RULE_CHANGE_REQUEST:
+         return validate_rule_change_request_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_RULE_CHANGE_CANCEL:
+         return validate_rule_change_cancel_payload(payload, tip_view)
 
     elif tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
          return validate_retractable_transfer_payload(payload, tip_view)

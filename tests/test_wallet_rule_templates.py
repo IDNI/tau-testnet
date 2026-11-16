@@ -14,7 +14,13 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from wallet_templates import live_rule, shipped_templates, template_names, writes
+from wallet_templates import (
+    live_rule,
+    shipped_guard_templates,
+    shipped_templates,
+    template_names,
+    writes,
+)
 
 SENDER = "ab" * 48
 NOT_DEPLOYABLE = "Time-Decaying Multi-Signature Vault (NOT DEPLOYABLE)"
@@ -79,3 +85,35 @@ def test_shipped_policy_template_is_sender_scoped(name):
         )
     else:
         pytest.skip("template carries no live rule")
+
+
+GUARD_TEMPLATES = shipped_guard_templates()
+
+
+def test_every_guard_template_was_extracted():
+    assert sorted(GUARD_TEMPLATES) == sorted(template_names("guardTemplates"))
+    assert len(GUARD_TEMPLATES) == 3
+    assert not set(GUARD_TEMPLATES) & set(TEMPLATES)
+
+
+@pytest.mark.parametrize("name", sorted(GUARD_TEMPLATES))
+def test_shipped_guard_template_passes_the_guard_screen(name):
+    from consensus.admission import _screen_guard_domains
+    from consensus.rule_offers import clause_body_v1
+
+    text = GUARD_TEMPLATES[name]
+    assert writes(text, "o5")
+    assert _screen_guard_domains(clause_body_v1(text)) is None
+
+
+@pytest.mark.parametrize("name", sorted(GUARD_TEMPLATES))
+def test_shipped_guard_template_is_not_a_sender_guard(name):
+    from consensus.admission import _streams_referenced
+
+    assert not _streams_referenced(live_rule(GUARD_TEMPLATES[name]), ("i12",))
+
+
+def test_the_weaker_guard_says_so_in_its_header():
+    weaker = next(t for n, t in GUARD_TEMPLATES.items() if "weaker" in n.lower())
+    header = weaker.split("always", 1)[0]
+    assert "WEAKER" in header and "permissive" in header

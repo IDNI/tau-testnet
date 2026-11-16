@@ -88,6 +88,143 @@ def _enumerate(slots, base, candidates, step):
     return results
 
 
+def _guard_blocks(guard, kind, timestamp, voted):
+    """True when the guard blocks; worker failures map to the admission errors."""
+    from tau_speculation import SpeculationError, WorkerLost, WorkerTimeout
+
+    try:
+        blocked, _detail = sender_policy.rule_change_blocked(
+            lambda _sender, _stream: guard, "", kind, timestamp,
+            pool="admission", timeout=tau_admission.default_budget(), voted=voted,
+        )
+    except WorkerTimeout as exc:
+        raise tau_admission.AdmissionTimeout(str(exc)) from exc
+    except (WorkerLost, SpeculationError) as exc:
+        raise tau_admission.AdmissionUnavailable(str(exc)) from exc
+    return blocked
+
+
+def _rule_change_screen(request, tip):
+    from consensus import admission
+    from consensus.rule_offers import clause_body_v1
+
+    error = admission._rule_change_precondition_error(request, tip)
+    if not error:
+        if request.kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+            error = admission._screen_clause_domains(request.body)
+        elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
+            error = admission._screen_guard_domains(request.body)
+        elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+            error = admission._screen_clause_domains(clause_body_v1(request.rule_text))
+    return {"ok": not error, "error": error or None}
+
+
+def _execute_rule_change(draft):
+    from commands.getapprovalrequests import KIND_NAMES
+    from consensus.approvals import (
+        TX_TYPE_RULE_CHANGE_REQUEST,
+        parse_rule_change_request_checked,
+    )
+    from consensus.facade import TipAdmissionView
+
+    tx = {
+        "tx_type": TX_TYPE_RULE_CHANGE_REQUEST,
+        "sender_pubkey": draft.get("sender_pubkey") or draft.get("sender"),
+        "sequence_number": 0,
+        "expire_at_height": 0,
+        "kind": draft.get("kind"),
+        "rule_text": draft.get("rule_text", ""),
+        "offer_id": draft.get("offer_id", ""),
+        "approvers": draft.get("approvers") or {},
+    }
+    request, why = parse_rule_change_request_checked(tx)
+    if request is None:
+        return api_response.error_response(_CMD, why, "INVALID_PARAMS")
+
+    tip = TipAdmissionView()
+    if request.approvers and not tip.approval_slots_active:
+        return api_response.error_response(
+            _CMD, "Co-signature approvals are not active on this chain.",
+            "FEATURE_INACTIVE",
+        )
+
+    candidates = dict(request.approvers)
+    if len(candidates) > MAX_PREVIEW_SLOTS:
+        return api_response.success_response(_CMD, {
+            "advisory": True,
+            "available": False,
+            "reason": (
+                f"{len(candidates)} candidate slots exceeds the {MAX_PREVIEW_SLOTS} "
+                f"this can enumerate ({2 ** MAX_PREVIEW_SLOTS} subsets); declare "
+                f"approvers explicitly rather than trusting a partial search."
+            ),
+        })
+    bad_slot = next((s for s in sorted(candidates)
+                     if s not in tau_defs.approval_slot_indices()), None)
+    if bad_slot is not None:
+        return api_response.error_response(
+            _CMD, f"i{bad_slot} is not an approval slot.", "INVALID_PARAMS"
+        )
+
+    guard = tip.clause_for(request.sender_pubkey, tau_defs.RULE_CHANGE_GUARD_INDEX)
+    data = {
+        "request_type": "rule_change",
+        "advisory": True,
+        "available": True,
+        "kind": request.kind,
+        "kind_name": KIND_NAMES.get(request.kind, "unknown"),
+        "has_guard": bool(guard),
+        "screen": _rule_change_screen(request, tip),
+        "escape_delay_blocks": tau_defs.RULE_CHANGE_DELAY_BLOCKS,
+    }
+    if not guard:
+        data.update({
+            "executes_immediately": True,
+            "required_slots": [],
+            "required_approvers": {},
+            "allowing_subsets": [[]],
+            "satisfiable": True,
+            "probes": 0,
+        })
+        return api_response.success_response(_CMD, data)
+
+    timestamp = tip.next_block_timestamp
+    slots = sorted(candidates)
+    probes = 0
+    allowing = []
+    try:
+        for size in range(0, len(slots) + 1):
+            for subset in itertools.combinations(slots, size):
+                probes += 1
+                voted = {idx: candidates[idx] for idx in subset}
+                if not _guard_blocks(guard, request.kind, timestamp, voted):
+                    allowing.append(list(subset))
+            if allowing:
+                break
+    except tau_admission.AdmissionUnavailable as exc:
+        return api_response.success_response(_CMD, {
+            "advisory": True,
+            "available": False,
+            "reason": f"the approval preview could not be evaluated: {exc}",
+        })
+    except Exception as exc:
+        return api_response.error_response(
+            _CMD, f"Evaluation failed: {exc}", "TAU_ERROR"
+        )
+
+    minimal = allowing[0] if allowing else None
+    data.update({
+        "executes_immediately": minimal == [],
+        "required_slots": minimal,
+        "required_approvers": ({str(i): candidates[i] for i in minimal}
+                              if minimal is not None else None),
+        "allowing_subsets": allowing,
+        "satisfiable": minimal is not None,
+        "probes": probes,
+    })
+    return api_response.success_response(_CMD, data)
+
+
 def execute(raw_command: str, container):
     parts = raw_command.split(None, 1)
     if len(parts) < 2:
@@ -105,6 +242,9 @@ def execute(raw_command: str, container):
         return api_response.error_response(
             _CMD, "Draft must be a JSON object.", "INVALID_PARAMS"
         )
+
+    if draft.get("request_type") == "rule_change" or "kind" in draft:
+        return _execute_rule_change(draft)
 
     try:
         sender = _normalize_pubkey(draft.get("sender_pubkey"))

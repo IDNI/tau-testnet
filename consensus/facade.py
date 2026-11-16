@@ -255,7 +255,65 @@ class TipAdmissionView:
                 (sender_pubkey.lower(), STATUS_OPEN),
             )
             row = cur.fetchone()
-        return int(row[0]) if row else 0
+            cur.execute(
+                "SELECT COUNT(*) FROM rule_change_requests_v1 "
+                "WHERE sender_pubkey = ? AND status = ?",
+                (sender_pubkey.lower(), STATUS_OPEN),
+            )
+            rule_row = cur.fetchone()
+        return (int(row[0]) if row else 0) + (int(rule_row[0]) if rule_row else 0)
+
+    def get_rule_change_request(self, request_id: str) -> Optional[dict]:
+        """The rule-change request row, or None. Any status."""
+        import json as _json
+
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT request_id, sender_pubkey, kind, body, offer_id, "
+                "approvers_json, voted_json, declined_json, ready, created_height, "
+                "expire_at_height, status FROM rule_change_requests_v1 "
+                "WHERE request_id = ?",
+                (request_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+
+        def _imap(raw):
+            try:
+                parsed = _json.loads(raw or "{}")
+            except (TypeError, ValueError):
+                return {}
+            out = {}
+            for k, v in (parsed.items() if isinstance(parsed, dict) else ()):
+                try:
+                    out[int(k)] = v
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        def _slots(raw):
+            try:
+                parsed = _json.loads(raw or "[]")
+            except (TypeError, ValueError):
+                return []
+            return sorted(s for s in parsed if isinstance(s, int)) if isinstance(parsed, list) else []
+
+        return {
+            "request_id": row[0],
+            "sender_pubkey": row[1],
+            "kind": int(row[2]),
+            "body": row[3],
+            "offer_id": row[4],
+            "approvers": _imap(row[5]),
+            "voted": _imap(row[6]),
+            "declined": _slots(row[7]),
+            "ready": bool(row[8]),
+            "created_height": int(row[9] or 0),
+            "expire_at_height": int(row[10] or 0),
+            "status": int(row[11] or 0),
+        }
 
     def open_requests_for_approver(self, approver_pubkey: str) -> int:
         """Open requests naming this account as an approver.
@@ -274,6 +332,11 @@ class TipAdmissionView:
                 (STATUS_OPEN,),
             )
             rows = cur.fetchall()
+            cur.execute(
+                "SELECT approvers_json FROM rule_change_requests_v1 WHERE status = ?",
+                (STATUS_OPEN,),
+            )
+            rows += cur.fetchall()
         count = 0
         for (blob,) in rows:
             if target in (blob or "").lower():
@@ -309,6 +372,34 @@ class TipAdmissionView:
                 continue
             if target in {str(v).lower() for v in approvers.values()}:
                 row = self.get_approval_request(request_id)
+                if row:
+                    out.append(row)
+        return out
+
+    def open_rule_changes_naming(self, approver_pubkey: str) -> list:
+        """Open rule-change request rows naming this account as an approver."""
+        import json as _json
+        from consensus.approvals import STATUS_OPEN
+
+        target = approver_pubkey.lower()
+        with db._db_lock:
+            cur = db._db_conn.cursor()
+            cur.execute(
+                "SELECT request_id, approvers_json FROM rule_change_requests_v1 "
+                "WHERE status = ? ORDER BY request_id",
+                (STATUS_OPEN,),
+            )
+            rows = cur.fetchall()
+        out = []
+        for request_id, blob in rows:
+            try:
+                approvers = _json.loads(blob or "{}")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(approvers, dict) and target in {
+                str(v).lower() for v in approvers.values()
+            }:
+                row = self.get_rule_change_request(request_id)
                 if row:
                     out.append(row)
         return out

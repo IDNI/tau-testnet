@@ -139,7 +139,7 @@ the code is verified by the bot, not the chain, and the flag exists to say so.
 
 ## Lifecycle
 
-`open → executed | expired | failed`
+`open → executed | expired | failed | cancelled`
 
 | Status | Meaning |
 |---|---|
@@ -147,6 +147,7 @@ the code is verified by the bot, not the chain, and the flag exists to say so.
 | `executed` | The rule was satisfied and the parked transfer ran. |
 | `failed` | Terminal: every declared approver answered and the policy still blocks, the sender's policy was replaced, `o1` rejected the transfer, or the balance no longer covers it. A single decline is not a veto and does not fail a request. |
 | `expired` | `expire_at_height` passed with the rule still blocking. |
+| `cancelled` | A rule-change request its sender cancelled; see [Guarding policy changes](#guarding-policy-changes). |
 
 **Nothing is escrowed.** A pending request reserves no balance; if the sender
 spends the money elsewhere, execution soft-fails when the last approval arrives
@@ -210,9 +211,211 @@ Hardening is default-on: loopback bind (`--bind` widens it, with a startup
 warning), a per-source token bucket, and a `0600` secrets file inside a `0700`
 directory that the bot refuses to start on looser modes.
 
+Each bot treats rule-change requests differently from transfers; see
+[Bots and rule changes](#bots-and-rule-changes).
+
 The scanner needs confirmed chain history, which no RPC serves today
 (`commands/history.py` walks mempool rows only), so it self-indexes by walking
 `getblocks` from its last-seen height and caching to disk.
+
+## Guarding policy changes
+
+A policy protects transfers, but whoever holds the key can replace the policy and
+then send freely. A **rule-change guard** closes that: an optional clause that
+decides whether a change to the account's own `o5` policy may happen at once, or
+must wait for co-signers. With a guard in place, a stolen key alone cannot change
+the policy.
+
+The guard is a clause like any other, registered in the same per-account registry
+at the reserved index `0xFFFFFFFF` (`RULE_CHANGE_GUARD_INDEX`) beside the account's
+`o5` clause, and removed the same way. It is evaluated only for its author. An
+account with no guard behaves exactly as before.
+
+### What the guard reads and writes
+
+The guard writes `o5` (`0` blocks the change, `1` allows it) and reads only:
+
+| Stream | Meaning |
+|---|---|
+| `i1` | The kind of change, `bv[24]`, from the table below. |
+| `i5` | The timestamp of the block that carries the change, as for a transfer. |
+| `i18`–`i25` | The approval slots, `bv[384]`: the approver's public key once their signed vote is verified, `0` while empty. |
+
+Any other input, any output other than `o5`, a clause that does not write `o5`, or
+a step other than `[t]` is refused at admission. The usual clause screens for
+widths and shape apply.
+
+| `i1` | Kind | Change |
+|---|---|---|
+| 1 | set policy | Register an `o5` clause. |
+| 2 | revoke policy | Remove the `o5` clause. |
+| 3 | accept offer | Accept a rule offer as the `o5` clause. |
+| 4 | set guard | Register or replace the guard itself. |
+| 5 | revoke guard | Remove the guard. |
+
+Because the guard is judged on kind 4 and 5 as well, it protects itself: with a
+guard in force, replacing or removing it needs the same approvals.
+
+### The two direct doors
+
+Two transactions still change the policy immediately: a `user_tx` carrying an `o5`
+rule in operation `0`, and `rule_offer_accept`. Each consults the guard with every
+slot empty. If the guard blocks, admission returns `RULE_CHANGE_NEEDS_APPROVAL`,
+and block apply records a soft reject with the receipt reason
+`rule_change_needs_approval`; nothing changes and the block stays valid. If it
+allows, the change executes as before. A guard that allows everything with empty
+slots, such as the weaker template below, therefore leaves those kinds open.
+
+### Requests
+
+`rule_change_request` is the way to make a change that the guard parks.
+
+| Field | Notes |
+|---|---|
+| `kind` | `1`–`5`, as above. |
+| `rule_text` | Required for kinds 1 and 4. For kind 3, the exact raw text of the offer. Absent for kinds 2 and 5. At most `MAX_RULE_CHANGE_TEXT_BYTES` (8192). |
+| `offer_id` | Kind 3 only: the offer being accepted. |
+| `approvers` | Slot to public key, up to 8. A request that names approvers needs approval slots active. May be empty, which leaves the time escape as the only way out. |
+| `expire_at_height` | The height after which the request expires. |
+| `fee_limit` | Charged once, at request time, as for transfer requests. |
+
+It is the only way to set or revoke a guard. The request id is derived from the
+signed fields, so it can be computed before sending, and kind 3 binds the offered
+text into the id.
+
+`rule_change_cancel` carries a `request_id`, is signed by the request's sender
+and is feeless. It ends an open request as `cancelled`; anyone else's cancel, an
+unknown id and an already resolved request are refused at admission
+(`NOT_REQUEST_SENDER`, `UNKNOWN_REQUEST`, `REQUEST_RESOLVED`).
+
+With **no guard**, or a guard that allows the change with empty slots, a request
+executes in the block that carries it. Otherwise it parks as `open`.
+
+### Votes and READY
+
+An approver answers with the same `transfer_vote` as for a transfer request, on
+the rule-change request id; the declared approvers and the one-vote rule are
+unchanged. A request is **ready** when the guard in force now allows the change
+with the slots filled so far. That is evaluated when the request is applied and at
+every approving vote. A decline records a refusal and fills nothing.
+
+A ready request is written by the **end-of-block release sweep**, in the block that
+made it ready. The sweep releases ready requests in id order, at most
+`MAX_RULE_CHANGE_RELEASES_PER_BLOCK` (8) per block; the rest wait for the next
+block. Each release re-screens the body, builds the clause, and writes the registry.
+The guard that judges a vote is the one in force at that vote, so replacing the
+guard changes what an existing request needs.
+
+### The time escape
+
+A request that is still `open` becomes ready on its own `RULE_CHANGE_DELAY_BLOCKS`
+(1000) blocks after it was mined, whatever the slots hold, and the sweep then
+releases it. This is the way out when an approver is lost or unwilling: without it,
+a guard naming a key nobody holds would freeze the policy for good. The cost is
+that a thief who cannot get approvals can also wait the delay out, which gives the
+owner that long to notice and cancel.
+
+A request that expires before its escape height expires without releasing. The CLI
+therefore defaults `--expire-in` to 2000 blocks, twice the delay, so a request it
+sends can use the escape, and warns when a shorter window rules it out. The window
+is capped by `MAX_APPROVAL_WINDOW_BLOCKS`.
+
+### Cancel and the owner/thief stalemate
+
+The owner and a thief hold the same key, so both can request and both can cancel.
+Neither can force a change through: the thief's request parks until an approver
+votes or the delay passes, and the owner can cancel it in that time, and the other
+way round. An approver is the tie-breaker, and an approval
+that arrives for a request the sender has cancelled does nothing. A cancel removes
+only the request it names: a thief can request again, and the owner can cancel
+again.
+
+### What a release does
+
+A successful release writes the registry and then ends other requests that the
+change makes stale:
+
+| Kind released | Also fails (`failed`) |
+|---|---|
+| 1, 2, 3 | The sender's open transfer requests, as any policy replacement does. Rule-change requests are untouched. |
+| 4, 5 | The sender's other open rule-change requests, which were judged by a guard that no longer exists. Transfer requests are untouched. |
+
+A release can also fail: the body no longer passes the screen or does not build, a
+revoke finds nothing to revoke, or an offered rule was accepted, rejected or has
+expired in the meantime. The request becomes `failed`, nothing is
+written, no sibling is failed, and the block stays valid; every node reaches the same
+result. Admission builds a request's clause before queueing the request; the release
+builds it again, and a failure there fails the request without failing the block.
+
+### Limits
+
+A sender's open transfer requests and open rule-change requests share the cap of
+`MAX_PENDING_REQUESTS_PER_SENDER` (8); more is refused with `TOO_MANY_REQUESTS`.
+The release sweep writes at most `MAX_RULE_CHANGE_RELEASES_PER_BLOCK` (8) requests
+per block, and a request that fails counts toward that cap.
+
+### Inspecting
+
+- `getapprovalrequests <address> [in|out|all]` and `getapprovalrequest <id>` return
+  rule-change requests alongside transfer requests. A rule-change row has
+  `request_type: "rule_change"`, `kind`, `kind_name`, `body` (for kind 3, the exact
+  offered text), `body_hash`, `offer_id`, `approvers` with each slot's state
+  (`awaiting`, `approved`, `declined`), `voted`, `declined`, `ready`,
+  `created_height`, `escape_height`, `expire_at_height` and `status`
+  (`open`, `executed`, `expired`, `failed` or `cancelled`).
+- `getapprovalpreview` accepts `"request_type": "rule_change"` with `kind`,
+  `rule_text`, `offer_id` and `approvers`, and reports whether the change would
+  execute at once, which approvers it needs, the screen result and the escape
+  delay. It is advisory and node-local.
+- `getruleoffers <address>` and `getapprovalslots <address>` return the account's
+  guard as `rule_change_guard`; the guard is not listed with the account's
+  `accepted_clauses`.
+
+### CLI
+
+```bash
+tau-testnet policy guard set    --key alice --file guard.tau --approver 18=<xpub> [--expire-in N]
+tau-testnet policy guard revoke --key alice [--approver SLOT=PUBKEY ...]
+tau-testnet policy guard show   [<address>]
+tau-testnet policy change request --key alice --kind set    --file policy.tau --approver 18=<xpub>
+tau-testnet policy change request --key alice --kind revoke --approver 18=<xpub>
+tau-testnet policy change request --key alice --kind accept --offer-id <offer_id> --approver 18=<xpub>
+tau-testnet policy change cancel  --key alice --request-id <request_id>
+```
+
+`--body` takes the clause text inline instead of `--file`. Each request command
+accepts `--preview` (ask the node what it would need and send nothing),
+`--dry-run` (sign and print), `--fee`, `--expire-in` (default 2000) and
+`--expire-at-height`, and prints the request id. `--kind accept` fetches the offered
+text from the node, which keeps it only as node-local data.
+
+### Bots and rule changes
+
+A rule change is never decided by a transfer criterion:
+
+- `approval_bot_totp.py` approves only with a valid code for that request, sent to
+  its endpoint. There is no on-chain code path and no amount or recipient test.
+- `approval_bot_partner.py` skips rule changes unless started with
+  `--allow-rule-changes`, and then asks a human at the terminal. `--yes` never
+  applies to them, and with no terminal the request is deferred.
+- `approval_bot_scan.py` shows rule changes and never approves one: an automatic
+  co-signer would approve whatever a thief submits.
+
+### Wallet templates
+
+The web wallet's Policy Change Request panel and the guard templates in its
+editor menu cover three guards. Replace each placeholder key with the co-signer's
+96-character public key hex and declare the approvers for the slots shown.
+
+| Template | Slots | Effect |
+|---|---|---|
+| Any policy change needs co-signer X | `i18` | Every kind is blocked until X has voted. |
+| 2 of 3 co-signers for any policy change | `i18`, `i19`, `i20` | Every kind is blocked until any two of the three have voted. |
+| Revoking needs a co-signer (weaker) | `i18` | Only revoking a policy (kind 2) or a guard (kind 5) is blocked. Setting a policy, accepting an offer and setting a guard are allowed with no approval. |
+
+The weaker template does **not** stop a thief: they can replace the policy with a
+permissive one, or replace the guard itself, and then drain the account. Use it
+only to stop accidental or lone revocations.
 
 ## Stream and slot map
 
@@ -293,7 +496,11 @@ the width the clause declared for that stream, the transfer is blocked.
 | `MAX_CLAUSE_DEPTH` | `32` | Levels of parentheses in one clause body. |
 | `MAX_OFFER_RULE_BYTES` | `8192` | Size of a clause's rule text. |
 | `MAX_APPROVERS_PER_REQUEST` | `8` | Tiers use three; the rest are spare. |
-| `MAX_PENDING_REQUESTS_PER_SENDER` | `8` | |
+| `MAX_PENDING_REQUESTS_PER_SENDER` | `8` | Shared by a sender's open transfer requests and open rule-change requests. |
+| `MAX_RULE_CHANGE_TEXT_BYTES` | `8192` | Size of a rule-change request's `rule_text`. |
+| `RULE_CHANGE_DELAY_BLOCKS` | `1000` | Blocks after which an open rule-change request is ready with no approvals. |
+| `MAX_RULE_CHANGE_RELEASES_PER_BLOCK` | `8` | Rule-change requests the end-of-block sweep writes per block. |
+| `RULE_CHANGE_GUARD_INDEX` | `0xFFFFFFFF` | Registry index of an account's rule-change guard. |
 | `MAX_APPROVAL_WINDOW_BLOCKS` | `10_000` | CLI `--expire-in` defaults to `1000`. |
 | `MAX_CUSTOM_INPUTS_PER_REQUEST` | `8` | Indices ≥ 26. |
 | `MAX_CUSTOM_INPUT_BYTES` | `256` | Per entry. |
@@ -330,6 +537,10 @@ on how many accounts hold clauses.
 | `REQUEST_EXPIRED` | `expire_at_height` passed before the vote. |
 | `REQUEST_RESOLVED` | Already `executed` or `failed`. |
 | `UNKNOWN_REQUEST` | No such request id. |
+| `RULE_CHANGE_NEEDS_APPROVAL` | The sender's rule-change guard blocks a direct `o5` change (op-0 rule or offer accept) with empty slots. Block apply gives the receipt reason `rule_change_needs_approval`. |
+| `INVALID_RULE_CHANGE_REQUEST` | A `rule_change_request` is malformed, its body fails the screen or does not build, its precondition fails (nothing to revoke, or the offer is not open, not addressed to the sender, or its text does not match), or it names approvers while approval slots are inactive. |
+| `INVALID_RULE_CHANGE_CANCEL` | A `rule_change_cancel` is malformed. |
+| `NOT_REQUEST_SENDER` | Only the request's sender may cancel it. |
 
 ## Activation
 
@@ -393,8 +604,8 @@ reaches that verdict from the block bytes alone.
 ## Not in this release
 
 - **Balance locking / escrow.** A pending request reserves nothing.
-- **Sender-initiated cancel.** Expiry only, plus policy replacement, which fails
-  the sender's own open requests.
+- **Cancelling a transfer request.** Expiry only, plus policy replacement, which
+  fails the sender's own open requests. Rule-change requests can be cancelled.
 - **Weighted or threshold-of-N voting** ("any two of three") as a shipped
   template. The form itself works — a within-step disjunction of conjunctions
   over the slots expresses it, and does not need cross-step accumulation — but
@@ -409,6 +620,7 @@ reaches that verdict from the block bytes alone.
   accumulated application rules and blocks activation; clearing it is an
   operator action.
 
-Nothing here protects a stolen key: an attacker holding it can replace the policy
-and then send freely. This raises the bar on a single mistaken or coerced
-transfer; it is not a recovery mechanism.
+Without a rule-change guard, nothing here protects a stolen key: an attacker
+holding it can replace the policy and then send freely. A guard changes that for
+policy changes, as long as its approvers keep their keys and it blocks every kind
+with empty slots; it is not a recovery mechanism for funds already moved.

@@ -30,6 +30,40 @@ logger = logging.getLogger("approval_bot")
 VOTE_EXPIRY_BLOCKS = 500
 
 
+# Bodies longer than this show as a hash and a length, so a request cannot bury
+# its effect under a wall of text the approver will not read.
+BODY_INLINE_LIMIT = 500
+
+
+def is_rule_change(request: dict) -> bool:
+    return request.get("request_type") == "rule_change"
+
+
+def describe_rule_change(request: dict) -> str:
+    """What an approver needs to see before co-signing a policy change."""
+    body = request.get("body") or ""
+    if not body:
+        shown = "(none)"
+    elif len(body) <= BODY_INLINE_LIMIT:
+        shown = body
+    else:
+        shown = f"{len(body)} chars, hash {request.get('body_hash', '?')}"
+    lines = [
+        f"rule change {request.get('request_id', '')[:24]}",
+        f"  kind       {request.get('kind_name', '?')} ({request.get('kind', '?')})",
+        f"  requester  {str(request.get('sender_pubkey', ''))[:24]}...",
+    ]
+    if request.get("offer_id"):
+        lines.append(f"  offer      {request['offer_id']}")
+    lines += [
+        f"  body       {shown}",
+        f"  escape at  height {request.get('escape_height', '?')} "
+        f"(releases without approvals)",
+        f"  expires    at height {request.get('expire_at_height', '?')}",
+    ]
+    return "\n".join(lines)
+
+
 class RpcError(RuntimeError):
     pass
 
@@ -105,6 +139,7 @@ class ApproverBot:
         # Requests already acted on, so a slow block does not cause a double
         # submit (the node would reject it, but the log noise hides real issues).
         self._acted: set[str] = set()
+        self._shown: set[str] = set()
 
     # -- to implement -------------------------------------------------------
 
@@ -115,6 +150,22 @@ class ApproverBot:
         arrives, and a scanner may want another block of history first.
         """
         raise NotImplementedError
+
+    def decide_rule_change(self, request: dict):
+        """Rule changes never reach `decide`: a transfer criterion (amount,
+        recipient) says nothing about whether to let someone rewrite a policy.
+        The default shows the request and defers."""
+        self.show_rule_change(request)
+        return None
+
+    def show_rule_change(self, request: dict) -> str:
+        """Print the request once; returns the text so callers can forward it."""
+        text = describe_rule_change(request)
+        request_id = request.get("request_id")
+        if request_id not in self._shown:
+            self._shown.add(request_id)
+            print("\n" + text, flush=True)
+        return text
 
     # -- machinery ----------------------------------------------------------
 
@@ -179,7 +230,8 @@ class ApproverBot:
             if slot is None or state != "awaiting":
                 continue
             try:
-                decision = self.decide(request)
+                decision = (self.decide_rule_change(request)
+                            if is_rule_change(request) else self.decide(request))
             except Exception:
                 logger.exception("decide() failed for %s; deferring", request_id[:16])
                 continue

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Optional, Tuple
 
-from consensus.approvals import TX_TYPE_APPROVAL_REQUEST
+from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
 from consensus.tx_signing import decode_pubkey
@@ -56,8 +56,11 @@ def _recipient_keys(tx: dict) -> list:
     tx_type = tx.get("tx_type", "user_tx")
     if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER):
         return [("recipient_pubkey", tx.get("recipient_pubkey"))]
-    if tx_type == TX_TYPE_APPROVAL_REQUEST:
-        keys = [("recipient_pubkey", tx.get("recipient_pubkey"))]
+    if tx_type in (TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST):
+        keys = (
+            [("recipient_pubkey", tx.get("recipient_pubkey"))]
+            if tx_type == TX_TYPE_APPROVAL_REQUEST else []
+        )
         approvers = tx.get("approvers")
         if isinstance(approvers, dict):
             keys.extend(("approver", key) for key in approvers.values())

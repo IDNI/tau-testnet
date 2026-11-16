@@ -418,6 +418,28 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_approval_requests_expiry "
                 "ON approval_requests_v1(expire_at_height);"
             )
+            # Rule-change requests, every status. Kept apart from
+            # approval_requests_v1 so transfer queries never see them.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_change_requests_v1 (
+                    request_id       TEXT PRIMARY KEY,
+                    sender_pubkey    TEXT NOT NULL,
+                    kind             INTEGER NOT NULL,
+                    body             TEXT NOT NULL DEFAULT '',
+                    offer_id         TEXT NOT NULL DEFAULT '',
+                    approvers_json   TEXT NOT NULL DEFAULT '{}',
+                    voted_json       TEXT NOT NULL DEFAULT '{}',
+                    declined_json    TEXT NOT NULL DEFAULT '[]',
+                    ready            INTEGER NOT NULL DEFAULT 0,
+                    created_height   INTEGER NOT NULL DEFAULT 0,
+                    expire_at_height INTEGER NOT NULL,
+                    status           INTEGER NOT NULL DEFAULT 0
+                );
+            ''')
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rule_change_requests_sender_status "
+                "ON rule_change_requests_v1(sender_pubkey, status);"
+            )
             # Retractable transfers: the open escrow book. Bound into
             # consensus_meta_hash, so written in the same transaction as accounts.
             conn.execute('''
@@ -2221,7 +2243,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2259,6 +2281,7 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 approval_requests=approval_requests,
                 approval_slots_active=approval_slots_active,
                 retractable_transfers=retractable_transfers,
+                rule_change_requests=rule_change_requests,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
 
@@ -2323,7 +2346,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2491,6 +2514,31 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
                     req.get('custom_inputs_json', '{}'),
                     req.get('voted_json', '{}'),
                     req.get('declined_json', '[]'),
+                    int(req.get('status', 0)),
+                )
+            )
+
+    if rule_change_requests is not None:
+        _db_conn.execute('DELETE FROM rule_change_requests_v1')
+        for req in rule_change_requests:
+            _db_conn.execute(
+                'INSERT OR REPLACE INTO rule_change_requests_v1 '
+                '(request_id, sender_pubkey, kind, body, offer_id, approvers_json, '
+                'voted_json, declined_json, ready, created_height, '
+                'expire_at_height, status) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (
+                    req['request_id'],
+                    req.get('sender_pubkey', ''),
+                    int(req.get('kind', 0)),
+                    req.get('body', ''),
+                    req.get('offer_id', ''),
+                    req.get('approvers_json', '{}'),
+                    req.get('voted_json', '{}'),
+                    req.get('declined_json', '[]'),
+                    int(req.get('ready', 0)),
+                    int(req.get('created_height', 0)),
+                    int(req.get('expire_at_height', 0)),
                     int(req.get('status', 0)),
                 )
             )
@@ -2687,6 +2735,36 @@ def load_approval_requests() -> List[Dict]:
                 "voted_json": r[7],
                 "declined_json": r[8],
                 "status": int(r[9]),
+            }
+            for r in cur.fetchall()
+        ]
+
+
+def load_rule_change_requests() -> List[Dict]:
+    """All rule-change request rows in every status, ordered by id."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.execute(
+            'SELECT request_id, sender_pubkey, kind, body, offer_id, approvers_json, '
+            'voted_json, declined_json, ready, created_height, '
+            'expire_at_height, status '
+            'FROM rule_change_requests_v1 ORDER BY request_id'
+        )
+        return [
+            {
+                "request_id": r[0],
+                "sender_pubkey": r[1],
+                "kind": int(r[2]),
+                "body": r[3],
+                "offer_id": r[4],
+                "approvers_json": r[5],
+                "voted_json": r[6],
+                "declined_json": r[7],
+                "ready": int(r[8]),
+                "created_height": int(r[9]),
+                "expire_at_height": int(r[10]),
+                "status": int(r[11]),
             }
             for r in cur.fetchall()
         ]

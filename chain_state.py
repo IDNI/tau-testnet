@@ -604,6 +604,7 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         rule_clauses=lm.rule_offers.clause_plan(),
         max_rule_txs_per_block=lm.max_rule_txs_per_block,
         approval_requests=lm.approval_requests.snapshot_requests(),
+        rule_change_requests=lm.approval_requests.snapshot_rule_change_requests(),
         approval_slots_active=lm.approval_slots_active,
         retractable_transfers=_retractable_state(lm),
         eligibility_mode=lm.eligibility_mode,
@@ -2168,6 +2169,57 @@ def _restore_approvals(lm) -> None:
     lm.approval_requests.resolved_details = details
 
 
+def _restore_rule_change_requests(lm) -> None:
+    """Rebuild the rule-change book, terminal requests included: their status is
+    bound into the state root."""
+    from consensus.approvals import RuleChangeRequestEntry, STATUS_OPEN
+
+    def _index_map(raw):
+        try:
+            parsed = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            return {}
+        out = {}
+        for k, v in (parsed.items() if isinstance(parsed, dict) else ()):
+            try:
+                out[int(k)] = str(v)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _slot_set(raw):
+        try:
+            parsed = json.loads(raw or "[]")
+        except (TypeError, ValueError):
+            return set()
+        return {int(s) for s in parsed if isinstance(s, int)} if isinstance(parsed, list) else set()
+
+    entries = {}
+    for row in db.load_rule_change_requests():
+        try:
+            request_id = bytes.fromhex(row["request_id"])
+        except (TypeError, ValueError):
+            logger.warning("Skipping malformed rule-change request id %r", row.get("request_id"))
+            continue
+        if len(request_id) != 32:
+            logger.warning("Skipping rule-change request id of wrong width %r", row.get("request_id"))
+            continue
+        entries[request_id] = RuleChangeRequestEntry(
+            sender_pubkey=row.get("sender_pubkey") or "",
+            kind=int(row.get("kind") or 0),
+            body=row.get("body") or "",
+            offer_id=row.get("offer_id") or "",
+            approvers=_index_map(row.get("approvers_json")),
+            created_height=int(row.get("created_height") or 0),
+            expire_at_height=int(row.get("expire_at_height") or 0),
+            status=int(row.get("status") or STATUS_OPEN),
+            voted=_index_map(row.get("voted_json")),
+            declined=_slot_set(row.get("declined_json")),
+            ready=bool(row.get("ready")),
+        )
+    lm.approval_requests.rule_change_requests = entries
+
+
 def _restore_retractables(lm) -> None:
     """Rehydrate the escrow book; a stored row that does not recompute its id is
     corruption and refuses to load rather than silently dropping escrowed funds."""
@@ -2310,6 +2362,7 @@ def load_state_from_db() -> bool:
         # on the first block after a restart.
         _restore_rule_offers(_lifecycle_manager)
         _restore_approvals(_lifecycle_manager)
+        _restore_rule_change_requests(_lifecycle_manager)
         _restore_retractables(_lifecycle_manager)
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
@@ -2363,6 +2416,9 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_clauses_list = _lifecycle_manager.rule_offers.clause_plan()
         max_rule_txs_snapshot = _lifecycle_manager.max_rule_txs_per_block
         approval_requests_list = _lifecycle_manager.approval_requests.snapshot_requests()
+        rule_change_requests_list = (
+            _lifecycle_manager.approval_requests.snapshot_rule_change_requests()
+        )
         approval_slots_active_snapshot = _lifecycle_manager.approval_slots_active
         retractable_snapshot = _retractable_state(_lifecycle_manager)
 
@@ -2380,6 +2436,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_clauses=rule_clauses_list,
         max_rule_txs_per_block=max_rule_txs_snapshot,
         approval_requests=approval_requests_list,
+        rule_change_requests=rule_change_requests_list,
         approval_slots_active=approval_slots_active_snapshot,
         retractable_transfers=retractable_snapshot,
     )
@@ -2867,6 +2924,9 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 rule_clauses=rule_clauses_list,
                 max_rule_txs_per_block=_lifecycle_manager.max_rule_txs_per_block,
                 approval_requests=_lifecycle_manager.approval_requests.snapshot_requests(),
+                rule_change_requests=(
+                    _lifecycle_manager.approval_requests.snapshot_rule_change_requests()
+                ),
                 approval_slots_active=_lifecycle_manager.approval_slots_active,
                 retractable_transfers=_retractable_state(_lifecycle_manager),
             )

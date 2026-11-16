@@ -354,3 +354,170 @@ def test_a_loose_key_file_is_refused(tmp_path):
 
     os.chmod(path, 0o600)
     assert common.load_privkey(_Args()) == "01" * 32
+
+
+# --- rule-change requests ----------------------------------------------------
+
+POLICY_BODY = "always ( o5[t]:bv[24] = { #x000003 }:bv[24] )."
+
+
+def _rule_change(request_id="cc" * 32, body=POLICY_BODY, kind=1, kind_name="set_policy",
+                 offer_id="", approver=AUTH, state="awaiting", sender=A):
+    return {
+        "request_type": "rule_change",
+        "request_id": request_id,
+        "sender_pubkey": sender,
+        "kind": kind,
+        "kind_name": kind_name,
+        "body": body,
+        "body_hash": "ee" * 32,
+        "offer_id": offer_id,
+        "created_height": 10,
+        "escape_height": 1010,
+        "expire_at_height": 2010,
+        "approvers": {"18": {"pubkey": approver, "state": state}},
+    }
+
+
+def test_a_rule_change_is_shown_with_its_kind_body_escape_and_requester(capsys):
+    bot = _partner()
+    bot.decide_rule_change(_rule_change())
+    out = capsys.readouterr().out
+    assert "set_policy" in out and POLICY_BODY in out
+    assert "height 1010" in out and A[:24] in out
+
+
+def test_a_long_body_is_shown_as_hash_and_length(capsys):
+    _partner().decide_rule_change(_rule_change(body="x" * 800))
+    out = capsys.readouterr().out
+    assert "800 chars" in out and "ee" * 32 in out
+    assert "x" * 800 not in out
+
+
+def test_an_accept_shows_the_offer_id(capsys):
+    _partner().decide_rule_change(
+        _rule_change(kind=3, kind_name="accept_offer", offer_id="ab" * 32))
+    assert "ab" * 32 in capsys.readouterr().out
+
+
+def test_a_rule_change_is_shown_once_per_request(capsys):
+    bot = _partner()
+    bot.decide_rule_change(_rule_change())
+    capsys.readouterr()
+    bot.decide_rule_change(_rule_change())
+    assert capsys.readouterr().out == ""
+
+
+def test_the_partner_skips_rule_changes_by_default_whatever_the_other_flags():
+    bot = _partner(auto_below=10 ** 9, assume_yes=True)
+    assert bot.decide_rule_change(_rule_change()) is None
+
+
+def test_an_opted_in_partner_without_a_terminal_defers(monkeypatch):
+    monkeypatch.setattr(partner_mod.sys, "stdin", None)
+    assert _partner(allow_rule_changes=True).decide_rule_change(_rule_change()) is None
+
+
+def test_a_standing_amount_limit_never_covers_a_rule_change(monkeypatch):
+    monkeypatch.setattr(partner_mod.sys, "stdin", None)
+    bot = _partner(auto_below=10 ** 9, allow_rule_changes=True)
+    assert bot.decide_rule_change(_rule_change()) is None
+
+
+def test_the_scan_bot_skips_rule_changes_by_default():
+    bot = scan_mod.ScanBot(_FakeClient(), _FakeSigner(), index=_Index())
+    assert bot.decide_rule_change(_rule_change()) is None
+
+
+def test_the_totp_bot_defers_a_rule_change_until_a_code_arrives(tmp_path):
+    bot, store, _ = _totp_bot(tmp_path)
+    store.enroll(A)
+    assert bot.decide_rule_change(_rule_change()) is None
+
+
+def test_a_valid_code_approves_a_rule_change(tmp_path):
+    import time as _time
+
+    bot, store, _ = _totp_bot(tmp_path)
+    secret = store.enroll(A)
+    request = _rule_change()
+    bot.decide_rule_change(request)
+    ok, _ = bot.submit_code(request["request_id"], totp_mod.totp_at(secret, _time.time()))
+    assert ok
+    approve, reason = bot.decide_rule_change(request)
+    assert approve is True and "TOTP" in reason
+
+
+def test_the_totp_bot_ignores_an_onchain_code_on_a_rule_change(tmp_path):
+    import time as _time
+
+    bot, store, _ = _totp_bot(tmp_path, accept_onchain_code=True)
+    secret = store.enroll(A)
+    request = _rule_change()
+    request["custom_inputs"] = {"26": totp_mod.totp_at(secret, _time.time())}
+    assert bot.decide_rule_change(request) is None
+
+
+def test_tick_routes_rule_changes_away_from_the_transfer_decision(tmp_path):
+    """A bot whose transfer rule would say yes must not be asked about a rule change."""
+    class _YesBot(common.ApproverBot):
+        def decide(self, request):
+            return True, "transfer rule"
+
+    client = _FakeClient([_rule_change()])
+    bot = _YesBot(client, _FakeSigner())
+    assert bot.tick() == 0
+    assert client.submitted == []
+
+
+def test_yes_does_not_approve_a_rule_change_without_a_terminal(monkeypatch):
+    monkeypatch.setattr(partner_mod.sys, "stdin", None)
+    bot = _partner(assume_yes=True, allow_rule_changes=True)
+    assert bot.decide_rule_change(_rule_change()) is None
+
+
+def test_an_interactive_yes_approves_an_opted_in_rule_change(monkeypatch):
+    class _Tty:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(partner_mod.sys, "stdin", _Tty())
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    approve, _ = _partner(allow_rule_changes=True).decide_rule_change(_rule_change())
+    assert approve is True
+
+
+def test_an_interactive_yes_is_ignored_without_the_opt_in(monkeypatch):
+    class _Tty:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(partner_mod.sys, "stdin", _Tty())
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    assert _partner().decide_rule_change(_rule_change()) is None
+
+
+def test_yes_still_approves_transfers():
+    approve, _ = _partner(assume_yes=True).decide(_request())
+    assert approve is True
+
+
+def test_the_scan_bot_has_no_rule_change_flag_and_never_approves_one():
+    with pytest.raises(SystemExit):
+        scan_mod.main(["--once", "--allow-rule-changes"])
+    client = _FakeClient([_rule_change()])
+    bot = scan_mod.ScanBot(client, _FakeSigner(), index=_Index())
+    assert not hasattr(bot, "allow_rule_changes")
+    assert bot.tick() == 0
+    assert client.submitted == []
+
+
+def test_the_partner_flag_is_off_unless_given(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(partner_mod, "run_bot",
+                        lambda bot, once: seen.setdefault("v", []).append(bot.allow_rule_changes) or 0)
+    monkeypatch.setattr(partner_mod, "load_privkey", lambda args: "01" * 32)
+    monkeypatch.setattr(partner_mod, "Signer", lambda key: _FakeSigner())
+    partner_mod.main(["--once"])
+    partner_mod.main(["--once", "--allow-rule-changes"])
+    assert seen["v"] == [False, True]

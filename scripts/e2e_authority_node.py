@@ -14,7 +14,7 @@ Control directory: $TAU_E2E_CONTROL
                        neither processed nor broadcast
     cmd-<id>.json      a probe to run inside the node -> res-<id>.json
 
-Probes: snapshot, verify_held, reprocess_head, ingest.
+Probes: snapshot, verify_held, reprocess_head, ingest, registry.
 """
 from __future__ import annotations
 
@@ -214,6 +214,15 @@ def probe_ingest(args):
             "seconds": round(time.time() - started, 3)}
 
 
+def probe_registry(_args):
+    """The lifecycle roots a state hash commits to, for comparing two nodes."""
+    import chain_state
+
+    lm = chain_state._lifecycle_manager
+    return {"approval_requests_root": lm.approval_requests.requests_root().hex(),
+            "rule_clauses_root": lm.rule_offers.clauses_root().hex()}
+
+
 def probe_eligibility(_args):
     """What block production asks before it builds: am I the proposer?"""
     import config
@@ -241,7 +250,8 @@ def probe_eligibility(_args):
 
 PROBES = {"snapshot": probe_snapshot, "verify_held": probe_verify_held,
           "eligibility": probe_eligibility,
-          "reprocess_head": probe_reprocess_head, "ingest": probe_ingest}
+          "reprocess_head": probe_reprocess_head, "ingest": probe_ingest,
+          "registry": probe_registry}
 
 
 def _watch() -> None:

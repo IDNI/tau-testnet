@@ -11,11 +11,11 @@ APP_JS = os.path.join(
 _ENTRY = re.compile(r'^    "(?P<name>[^"]+)": `(?P<rest>.*)$')
 
 
-def _block_lines():
+def _block_lines(block="ruleTemplates"):
     with open(APP_JS, encoding="utf-8") as fh:
         lines = fh.read().splitlines()
-    start = next((i for i, l in enumerate(lines) if "const ruleTemplates" in l), None)
-    assert start is not None, "ruleTemplates block not found in web-wallet/app.js"
+    start = next((i for i, l in enumerate(lines) if f"const {block} =" in l), None)
+    assert start is not None, f"{block} block not found in web-wallet/app.js"
     block = []
     for line in lines[start + 1:]:
         if line.startswith("};"):
@@ -24,17 +24,22 @@ def _block_lines():
     return block
 
 
-def template_names():
+def template_names(block="ruleTemplates"):
     """Names of every entry in the block, read from entry headers alone."""
-    return [m.group("name") for m in map(_ENTRY.match, _block_lines()) if m]
+    return [m.group("name") for m in map(_ENTRY.match, _block_lines(block)) if m]
 
 
-def shipped_templates():
+def shipped_guard_templates():
+    """The rule-change guard templates, in the same form as shipped_templates."""
+    return shipped_templates("guardTemplates")
+
+
+def shipped_templates(block="ruleTemplates"):
     """{name: text} with the text exactly as the wallet loads it into the editor."""
     out = {}
     name = None
     buf = []
-    for line in _block_lines():
+    for line in _block_lines(block):
         if name is None:
             m = _ENTRY.match(line)
             if not m:

@@ -255,6 +255,53 @@
             <button id="btn-send" class="w-100 mt-4 btn-lg btn-primary">Sign & Send Transaction</button>
         </section>
 
+        <section id="policy-panel" class="disabled mt-3">
+            <h2>Policy Change Request</h2>
+            <div class="form-text mb-2">Change or guard your o5 policy through a request that your guard may park
+                until co-signers approve. Approvers vote from their own wallet or bot.</div>
+            <div class="mb-3">
+                <label for="pc-kind" class="form-label">Kind</label>
+                <select class="form-select" id="pc-kind"></select>
+            </div>
+            <div class="mb-3" id="pc-body-group">
+                <div class="d-flex justify-content-between align-items-center mb-1">
+                    <label for="pc-body" class="form-label mb-0">Rule text</label>
+                    <select class="form-select form-select-sm w-auto" id="pc-template"></select>
+                </div>
+                <textarea class="form-control font-monospace" id="pc-body" rows="8"></textarea>
+            </div>
+            <div class="mb-3" id="pc-offer-group" style="display: none;">
+                <label for="pc-offer-id" class="form-label">Offer id</label>
+                <input type="text" class="form-control" id="pc-offer-id" placeholder="64-char hex">
+                <div class="form-text">The wallet fetches the exact offered text from the node.</div>
+            </div>
+            <div class="mb-3">
+                <label for="pc-approvers" class="form-label">Approvers</label>
+                <textarea class="form-control font-monospace" id="pc-approvers" rows="3"
+                    placeholder="18=<96-char public key> (one per line)"></textarea>
+            </div>
+            <div class="row mb-3">
+                <div class="col">
+                    <label for="pc-expire-in" class="form-label">Expire in (blocks)</label>
+                    <input type="number" class="form-control" id="pc-expire-in" min="1" max="10000" step="1">
+                    <div class="form-text">1000 or fewer expires before the time escape.</div>
+                </div>
+                <div class="col">
+                    <label for="pc-fee" class="form-label">Fee limit</label>
+                    <input type="number" class="form-control" id="pc-fee" min="0" value="10" step="1">
+                </div>
+            </div>
+            <button id="btn-pc-send" class="w-100 btn-primary">Sign & Submit Request</button>
+
+            <h5 class="mt-4">Your requests</h5>
+            <button id="btn-pc-refresh" class="btn-sm mb-2">Refresh</button>
+            <div id="pc-requests" class="mb-3"></div>
+            <div class="input-group">
+                <input type="text" class="form-control" id="pc-cancel-id" placeholder="Request id (64 hex) to cancel">
+                <button id="btn-pc-cancel" class="btn-sm danger-btn">Cancel request</button>
+            </div>
+        </section>
+
         <section id="gov-panel" class="disabled mt-3">
             <div class="d-flex justify-content-between align-items-center">
                 <h2>Consensus Governance</h2>

@@ -8,6 +8,7 @@ from __future__ import annotations
 import atexit
 import threading
 
+import tau_defs
 import tau_manager
 import tau_policy
 from consensus.policy_mock import MockPolicyEvaluator
@@ -54,6 +55,39 @@ def clause_inputs(values: dict) -> dict:
         name = key if isinstance(key, str) and key.startswith("i") else f"i{key}"
         out[name] = WorkerSession._bare(WorkerSession._single(value))
     return out
+
+
+def change_inputs(kind: int, timestamp: int, slot_values: dict = None) -> dict:
+    """Input map for a rule-change guard: i1 = change kind, i5 = block timestamp
+    (as the transfer path feeds it), i18..i25 = approval slots, 0 when empty."""
+    values = {1: str(kind)}
+    values.update({idx: "0" for idx in tau_defs.approval_slot_indices()})
+    for slot, value in (slot_values or {}).items():
+        values[slot] = value
+    values[5] = str(timestamp)
+    return clause_inputs(values)
+
+
+def slot_literals(voted: dict) -> dict:
+    """slot -> approver pubkey, as the `{ #x.. }:bv[384]` literal the transfer path feeds."""
+    return {
+        int(slot): "{ #x" + str(pubkey) + " }:bv[%d]" % tau_defs.APPROVAL_SLOT_BV_WIDTH
+        for slot, pubkey in (voted or {}).items()
+    }
+
+
+def rule_change_blocked(clause_for, sender: str, kind: int, timestamp: int, *,
+                        pool: str, timeout=_SESSION_DEFAULT,
+                        voted: dict = None) -> tuple[bool, str]:
+    """(blocked, detail) from the sender's rule-change guard; (False, "") when
+    none is registered. `voted` is slot -> approver pubkey for filled slots."""
+    guard = clause_for(sender, tau_defs.RULE_CHANGE_GUARD_INDEX)
+    if not isinstance(guard, str) or not guard:
+        return False, ""
+    return clause_blocks(
+        guard, change_inputs(kind, timestamp, slot_literals(voted)),
+        pool=pool, timeout=timeout,
+    )
 
 
 def clause_blocks(body, values: dict, *, pool: str,

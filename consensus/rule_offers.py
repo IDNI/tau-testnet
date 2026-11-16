@@ -577,6 +577,8 @@ class RuleOfferLifecycleManager:
             return None
 
         body, target = normalize_offer_rule_text(decision.rule_text or "")
+        if target == tau_defs.RULE_CHANGE_GUARD_INDEX:
+            raise RuleOfferShapeError("offers cannot register a rule-change guard")
         # An acceptor holds at most one clause per stream; accepting a new one
         # replaces it.
         self.accepted_clauses[(decision.actor_pubkey, target)] = body

@@ -598,9 +598,108 @@ def encode_approval_request_book(open_entries: list, resolved: list) -> bytes:
     return bytes(out)
 
 
-def compute_approval_request_book_root(open_entries: list, resolved: list) -> bytes:
-    """BLAKE3 of the canonical request book. Returns 32 bytes."""
-    return blake3(encode_approval_request_book(open_entries, resolved)).digest()
+def compute_approval_request_book_root(
+    open_entries: list, resolved: list, rule_change_entries: Optional[list] = None
+) -> bytes:
+    """BLAKE3 of the canonical request book. Returns 32 bytes.
+
+    Rule-change requests append a tagged section only when there is one, so a
+    book without them keeps the root it always had.
+    """
+    book = encode_approval_request_book(open_entries, resolved)
+    if rule_change_entries:
+        book += encode_rule_change_book(rule_change_entries)
+    return blake3(book).digest()
+
+
+# --- Rule-change requests ----------------------------------------------------
+
+DOMAIN_RULE_CHANGE_REQUEST_V1 = b"tau.rule_change.request.v1"
+DOMAIN_RULE_CHANGE_ENTRY_V1 = b"tau.rule_change.entry.v1"
+DOMAIN_RULE_CHANGE_BOOK_V1 = b"tau.rule_change.book.v1"
+
+
+def compute_rule_change_body_hash(body: str) -> bytes:
+    """BLAKE3 of the normalized clause body; of the empty string when there is none."""
+    return blake3(str(body or "").encode("utf-8")).digest()
+
+
+def encode_rule_change_request(
+    *,
+    sender_pubkey: Any,
+    sequence_number: int,
+    kind: int,
+    body_hash: Any,
+    offer_id: str,
+    approvers: Dict[Any, Any],
+    expire_at_height: int,
+) -> bytes:
+    """Canonical bytes a rule-change request id commits to."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RULE_CHANGE_REQUEST_V1.decode()))
+    out.extend(encode_pubkey48(sender_pubkey))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(bytes([int(kind) & 0xFF]))
+    out.extend(encode_hash32(body_hash))
+    out.extend(encode_string(str(offer_id or "")))
+    out.extend(_encode_index_map(approvers, encode_pubkey48))
+    out.extend(encode_uint64(int(expire_at_height)))
+    return bytes(out)
+
+
+def compute_rule_change_request_id(**kwargs) -> bytes:
+    """BLAKE3 of the canonical rule-change request. Returns 32 bytes."""
+    return blake3(encode_rule_change_request(**kwargs)).digest()
+
+
+def encode_rule_change_entry(
+    request_id: Any,
+    sender_pubkey: Any,
+    kind: int,
+    body_hash: Any,
+    offer_id: str,
+    approvers: Dict[Any, Any],
+    voted: Dict[Any, Any],
+    created_height: int,
+    expire_at_height: int,
+    status: int,
+    declined: Any = (),
+    ready: bool = False,
+) -> bytes:
+    """One request in any status, as the state root sees it.
+
+    `ready` decides when the change is written and `declined` decides who may
+    still vote, so both are bound: nodes must agree on them.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RULE_CHANGE_ENTRY_V1.decode()))
+    out.extend(encode_hash32(request_id))
+    out.extend(encode_pubkey48(sender_pubkey))
+    out.extend(bytes([int(kind) & 0xFF]))
+    out.extend(encode_hash32(body_hash))
+    out.extend(encode_string(str(offer_id or "")))
+    out.extend(_encode_index_map(approvers, encode_pubkey48))
+    out.extend(_encode_index_map(voted, encode_pubkey48))
+    out.extend(encode_uint64(int(created_height)))
+    out.extend(encode_uint64(int(expire_at_height)))
+    out.extend(bytes([int(status) & 0xFF]))
+    declined_sorted = sorted(int(d) for d in (declined or ()))
+    out.extend(encode_uint32(len(declined_sorted)))
+    for slot in declined_sorted:
+        out.extend(encode_uint32(slot))
+    out.extend(bytes([1 if ready else 0]))
+    return bytes(out)
+
+
+def encode_rule_change_book(entries: list) -> bytes:
+    """Entries sorted by their encoding, count-prefixed, under a domain tag."""
+    encoded = sorted(encode_rule_change_entry(*entry) for entry in (entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RULE_CHANGE_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    return bytes(out)
 
 
 # --- Retractable transfers ---------------------------------------------------

@@ -51,8 +51,11 @@ import tau_defs
 
 TX_TYPE_APPROVAL_REQUEST = "approval_request"
 TX_TYPE_TRANSFER_VOTE = "transfer_vote"
+TX_TYPE_RULE_CHANGE_REQUEST = "rule_change_request"
+TX_TYPE_RULE_CHANGE_CANCEL = "rule_change_cancel"
 
 APPROVAL_TX_TYPES = frozenset({TX_TYPE_APPROVAL_REQUEST, TX_TYPE_TRANSFER_VOTE})
+RULE_CHANGE_TX_TYPES = frozenset({TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_RULE_CHANGE_CANCEL})
 
 # --- Frozen consensus bounds ------------------------------------------------
 
@@ -61,6 +64,7 @@ MAX_PENDING_REQUESTS_PER_SENDER = 8
 MAX_PENDING_REQUESTS_PER_APPROVER = 64
 MAX_APPROVAL_WINDOW_BLOCKS = 10_000
 MAX_CUSTOM_INPUTS_PER_REQUEST = 8
+MAX_RULE_CHANGE_TEXT_BYTES = 8192
 
 # How many candidate slots `getapprovalpreview` will enumerate subsets over.
 # 2**6 = 64 engine steps, each single-digit milliseconds and none of them a
@@ -80,12 +84,14 @@ STATUS_OPEN = 0
 STATUS_EXECUTED = 1
 STATUS_EXPIRED = 2
 STATUS_FAILED = 3
+STATUS_CANCELLED = 4
 
 STATUS_NAMES = {
     STATUS_OPEN: "open",
     STATUS_EXECUTED: "executed",
     STATUS_EXPIRED: "expired",
     STATUS_FAILED: "failed",
+    STATUS_CANCELLED: "cancelled",
 }
 
 
@@ -512,6 +518,241 @@ def parse_transfer_vote(tx: Dict[str, Any]) -> Optional[TransferVote]:
     )
 
 
+@dataclass
+class RuleChangeRequest:
+    """A parked change to an account's o5 policy or rule-change guard."""
+
+    sender_pubkey: str
+    sequence_number: int
+    kind: int
+    rule_text: str
+    offer_id: str                      # 64 lowercase hex for kind 3, else ""
+    approvers: Dict[int, str]          # slot index -> approver pubkey
+    expire_at_height: int
+
+    @property
+    def body(self) -> str:
+        """The normalized clause body (the exact offered text for an accept);
+        "" for kinds that carry none."""
+        if self.kind not in _RULE_CHANGE_BODY_KINDS:
+            return ""
+        if self.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+            return self.rule_text
+        from consensus.rule_offers import clause_body_v1
+
+        return clause_body_v1(self.rule_text)
+
+    @property
+    def body_hash(self) -> bytes:
+        from consensus.serialization import compute_rule_change_body_hash
+
+        return compute_rule_change_body_hash(self.body)
+
+    @property
+    def request_id(self) -> bytes:
+        from consensus.serialization import compute_rule_change_request_id
+
+        return compute_rule_change_request_id(
+            sender_pubkey=self.sender_pubkey,
+            sequence_number=self.sequence_number,
+            kind=self.kind,
+            body_hash=self.body_hash,
+            offer_id=self.offer_id,
+            approvers=self.approvers,
+            expire_at_height=self.expire_at_height,
+        )
+
+    @property
+    def request_id_hex(self) -> str:
+        return self.request_id.hex()
+
+
+@dataclass
+class RuleChangeCancel:
+    sender_pubkey: str
+    request_id: bytes
+
+    @property
+    def request_id_hex(self) -> str:
+        return self.request_id.hex()
+
+
+_RULE_CHANGE_BODY_KINDS = frozenset({
+    tau_defs.RULE_CHANGE_KIND_SET_POLICY,
+    tau_defs.RULE_CHANGE_KIND_SET_GUARD,
+    tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
+})
+_RULE_CHANGE_KINDS = frozenset(range(
+    tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD + 1
+))
+
+
+def parse_rule_change_request_checked(
+    tx: Dict[str, Any]
+) -> Tuple[Optional[RuleChangeRequest], str]:
+    """(request, "") or (None, why not). Reads ROOT fields only; a nested
+    `payload` is unsigned data."""
+    from consensus.rule_offers import (
+        RuleOfferShapeError,
+        clause_body_v1,
+        clause_output_streams,
+        is_neutral_clause_body,
+    )
+
+    if tx.get("tx_type") != TX_TYPE_RULE_CHANGE_REQUEST:
+        return None, "not a rule_change_request"
+
+    kind = tx.get("kind")
+    seq = tx.get("sequence_number")
+    expire_at = tx.get("expire_at_height")
+    for val in (kind, seq, expire_at):
+        if isinstance(val, bool) or not isinstance(val, int):
+            return None, "kind, sequence_number and expire_at_height must be integers"
+    if kind not in _RULE_CHANGE_KINDS:
+        return None, "kind must be 1..5"
+
+    rule_text = tx.get("rule_text", "")
+    if rule_text is None:
+        rule_text = ""
+    if not isinstance(rule_text, str):
+        return None, "rule_text must be a string"
+    try:
+        text_bytes = len(rule_text.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None, "rule_text is not valid UTF-8"
+    if text_bytes > MAX_RULE_CHANGE_TEXT_BYTES:
+        return None, f"rule_text exceeds {MAX_RULE_CHANGE_TEXT_BYTES} bytes"
+    has_body = kind in _RULE_CHANGE_BODY_KINDS
+    if has_body and not rule_text.strip():
+        return None, "this kind needs a non-empty rule_text"
+    if not has_body and rule_text != "":
+        return None, "this kind carries no rule_text"
+
+    offer_id = tx.get("offer_id", "")
+    if offer_id is None:
+        offer_id = ""
+    if not isinstance(offer_id, str):
+        return None, "offer_id must be a string"
+    if kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
+        offer_id = offer_id.strip().lower()
+        if len(offer_id) != 64 or any(c not in "0123456789abcdef" for c in offer_id):
+            return None, "offer_id must be 64 hex digits"
+    elif offer_id != "":
+        return None, "this kind carries no offer_id"
+
+    try:
+        sender_n = _normalize_pubkey(tx.get("sender_pubkey"))
+        approvers_raw = _normalize_index_map(tx.get("approvers"), "approvers")
+        approvers = {idx: _normalize_pubkey(pk) for idx, pk in approvers_raw.items()}
+    except ApprovalShapeError as exc:
+        return None, str(exc)
+
+    if has_body:
+        try:
+            body = clause_body_v1(rule_text)
+        except RuleOfferShapeError as exc:
+            return None, f"rule_text is not a single clause: {exc}"
+        if kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+            if clause_output_streams(rule_text) != [tau_defs.USER_POLICY_STREAM_INDEX]:
+                return None, "a policy rule must write o5 and nothing else"
+            if is_neutral_clause_body(body, tau_defs.USER_POLICY_STREAM_INDEX):
+                return None, "the neutral policy is a revoke (kind 2), not a set"
+
+    return RuleChangeRequest(
+        sender_pubkey=sender_n,
+        sequence_number=seq,
+        kind=kind,
+        rule_text=rule_text,
+        offer_id=offer_id,
+        approvers=approvers,
+        expire_at_height=expire_at,
+    ), ""
+
+
+def parse_rule_change_request(tx: Dict[str, Any]) -> Optional[RuleChangeRequest]:
+    return parse_rule_change_request_checked(tx)[0]
+
+
+def parse_rule_change_cancel(tx: Dict[str, Any]) -> Optional[RuleChangeCancel]:
+    """Read every field from ROOT fields only; a nested `payload` is unsigned data."""
+    if tx.get("tx_type") != TX_TYPE_RULE_CHANGE_CANCEL:
+        return None
+    request_id_hex = tx.get("request_id")
+    if not isinstance(request_id_hex, str):
+        return None
+    try:
+        request_id = bytes.fromhex(request_id_hex)
+        sender_n = _normalize_pubkey(tx.get("sender_pubkey"))
+    except (ValueError, ApprovalShapeError):
+        return None
+    if len(request_id) != 32:
+        return None
+    return RuleChangeCancel(sender_pubkey=sender_n, request_id=request_id)
+
+
+def validate_rule_change_shape(
+    request: RuleChangeRequest, next_height: int
+) -> Optional[str]:
+    """Stateless admissibility of a rule-change request. None when acceptable.
+
+    Shared by mempool admission and block apply, which must reject exactly the
+    same inputs. Zero approvers is allowed: the time escape alone can release.
+    """
+    slots = set(tau_defs.approval_slot_indices())
+    if len(request.approvers) > MAX_APPROVERS_PER_REQUEST:
+        return f"more than {MAX_APPROVERS_PER_REQUEST} approvers"
+    bad_slot = next((s for s in sorted(request.approvers) if s not in slots), None)
+    if bad_slot is not None:
+        return (
+            f"i{bad_slot} is not an approval slot; slots are "
+            f"i{min(slots)}..i{max(slots)}"
+        )
+    keys = list(request.approvers.values())
+    if len(set(keys)) != len(keys):
+        return "approvers must be distinct accounts"
+    if request.sender_pubkey in keys:
+        return "the sender may not be their own approver"
+    if request.expire_at_height <= next_height:
+        return "expire_at_height must be in the future"
+    if request.expire_at_height > next_height + MAX_APPROVAL_WINDOW_BLOCKS:
+        return (
+            f"expire_at_height is more than {MAX_APPROVAL_WINDOW_BLOCKS} "
+            "blocks ahead"
+        )
+    return None
+
+
+@dataclass
+class RuleChangeRequestEntry:
+    """A rule-change request in any status; terminal ones are kept, never pruned.
+
+    Self-describing like ApprovalRequestEntry: expiry, cancellation and the
+    state root are computable from this entry alone.
+    """
+
+    sender_pubkey: str
+    kind: int
+    body: str
+    offer_id: str
+    approvers: Dict[int, str]
+    created_height: int
+    expire_at_height: int
+    status: int = STATUS_OPEN
+    # slot -> approver pubkey, for approvers whose vote filled the slot.
+    voted: Dict[int, str] = field(default_factory=dict)
+    # slots whose approver declined; recorded, never a veto.
+    declined: Set[int] = field(default_factory=set)
+    # The sender's guard allowed it (or the delay passed): the next release
+    # sweep writes it.
+    ready: bool = False
+
+    @property
+    def body_hash(self) -> bytes:
+        from consensus.serialization import compute_rule_change_body_hash
+
+        return compute_rule_change_body_hash(self.body)
+
+
 # --- The hash-bound entry ---------------------------------------------------
 
 @dataclass
@@ -643,6 +884,9 @@ class ApprovalRequestLifecycleManager:
         self.decline_reasons: Dict[Tuple[bytes, str], str] = {}
         # Node-local history so a resolved request stays queryable by address.
         self.resolved_details: Dict[bytes, ApprovalRequestEntry] = {}
+        # Rule-change requests in every status. Kept apart from the transfer
+        # book so transfer paths never see them.
+        self.rule_change_requests: Dict[bytes, RuleChangeRequestEntry] = {}
 
     # -- hashing ------------------------------------------------------------
 
@@ -654,7 +898,10 @@ class ApprovalRequestLifecycleManager:
         predates the feature keeps a byte-identical state hash. `resolved` is
         therefore never pruned -- a prune could flip this back to True and fork.
         """
-        return not self.open_requests and not self.resolved
+        return (
+            not self.open_requests and not self.resolved
+            and not self.rule_change_requests
+        )
 
     def requests_root(self) -> bytes:
         from consensus.serialization import compute_approval_request_book_root
@@ -676,6 +923,23 @@ class ApprovalRequestLifecycleManager:
                 for request_id, entry in self.open_requests.items()
             ],
             resolved=list(self.resolved),
+            rule_change_entries=[
+                (
+                    request_id,
+                    entry.sender_pubkey,
+                    entry.kind,
+                    entry.body_hash,
+                    entry.offer_id,
+                    entry.approvers,
+                    entry.voted,
+                    entry.created_height,
+                    entry.expire_at_height,
+                    entry.status,
+                    entry.declined,
+                    entry.ready,
+                )
+                for request_id, entry in self.rule_change_requests.items()
+            ],
         )
 
     # -- queries ------------------------------------------------------------
@@ -686,14 +950,28 @@ class ApprovalRequestLifecycleManager:
     def get_request(self, request_id: bytes) -> Optional[ApprovalRequestEntry]:
         return self.open_requests.get(request_id)
 
+    def open_rule_changes(self) -> Dict[bytes, RuleChangeRequestEntry]:
+        return {
+            rid: e for rid, e in self.rule_change_requests.items()
+            if e.status == STATUS_OPEN
+        }
+
     def pending_count_for_sender(self, pubkey: str) -> int:
+        """Open transfer requests plus open rule-change requests: one shared cap."""
         target = _normalize_pubkey(pubkey)
-        return sum(1 for e in self.open_requests.values() if e.sender_pubkey == target)
+        return sum(
+            1 for e in self.open_requests.values() if e.sender_pubkey == target
+        ) + sum(
+            1 for e in self.open_rule_changes().values() if e.sender_pubkey == target
+        )
 
     def pending_count_for_approver(self, pubkey: str) -> int:
         target = _normalize_pubkey(pubkey)
         return sum(
             1 for e in self.open_requests.values() if target in set(e.approvers.values())
+        ) + sum(
+            1 for e in self.open_rule_changes().values()
+            if target in set(e.approvers.values())
         )
 
     def inbox_for(self, pubkey: str) -> List[Tuple[bytes, ApprovalRequestEntry]]:
@@ -706,6 +984,17 @@ class ApprovalRequestLifecycleManager:
         return [
             (rid, entry)
             for rid, entry in sorted(self.open_requests.items())
+            if target in set(entry.approvers.values())
+        ]
+
+    def rule_change_inbox_for(
+        self, pubkey: str
+    ) -> List[Tuple[bytes, RuleChangeRequestEntry]]:
+        """Open rule-change requests naming this account as an approver."""
+        target = _normalize_pubkey(pubkey)
+        return [
+            (rid, entry)
+            for rid, entry in sorted(self.open_rule_changes().items())
             if target in set(entry.approvers.values())
         ]
 
@@ -769,6 +1058,8 @@ class ApprovalRequestLifecycleManager:
         return True
 
     def can_admit_vote(self, vote: TransferVote, height: int) -> Tuple[bool, str]:
+        if vote.request_id in self.rule_change_requests:
+            return self._can_admit_rule_change_vote(vote, height)
         entry = self.open_requests.get(vote.request_id)
         if entry is None:
             if vote.request_id in self.resolved:
@@ -871,7 +1162,170 @@ class ApprovalRequestLifecycleManager:
         )
         for rid in expired:
             self.resolve(rid, STATUS_EXPIRED)
-        return expired
+        lapsed = sorted(
+            rid for rid, entry in self.open_rule_changes().items()
+            if entry.expire_at_height <= height
+        )
+        for rid in lapsed:
+            self.rule_change_requests[rid].status = STATUS_EXPIRED
+        return sorted(expired + lapsed)
+
+    # -- rule-change requests -----------------------------------------------
+
+    def _can_admit_rule_change_vote(
+        self, vote: TransferVote, height: int
+    ) -> Tuple[bool, str]:
+        entry = self.rule_change_requests[vote.request_id]
+        if entry.status != STATUS_OPEN:
+            return False, "request already resolved"
+        if entry.expire_at_height <= height:
+            return False, "request has expired"
+        slot = next(
+            (s for s, pk in sorted(entry.approvers.items()) if pk == vote.voter_pubkey),
+            None,
+        )
+        if slot is None:
+            return False, "only a declared approver may vote on this request"
+        if slot in entry.voted or slot in entry.declined:
+            return False, "this approver has already voted"
+        return True, ""
+
+    def prospective_rule_change_slots(
+        self, request_id: bytes, vote: TransferVote
+    ) -> Optional[Dict[int, str]]:
+        """Filled slots AS IF this vote were recorded -- no mutation."""
+        entry = self.rule_change_requests.get(request_id)
+        if entry is None:
+            return None
+        slot = next(
+            (s for s, pk in sorted(entry.approvers.items()) if pk == vote.voter_pubkey),
+            None,
+        )
+        if slot is None:
+            return None
+        filled = dict(entry.voted)
+        if vote.approve:
+            filled[slot] = vote.voter_pubkey
+        return filled
+
+    def commit_rule_change_vote(self, vote: TransferVote) -> Optional[int]:
+        """Record a vote on a rule-change request; the slot it landed in, or None."""
+        entry = self.rule_change_requests.get(vote.request_id)
+        if entry is None or entry.status != STATUS_OPEN:
+            return None
+        slot = next(
+            (s for s, pk in sorted(entry.approvers.items()) if pk == vote.voter_pubkey),
+            None,
+        )
+        if slot is None or slot in entry.voted or slot in entry.declined:
+            return None
+        if vote.approve:
+            entry.voted[slot] = vote.voter_pubkey
+        else:
+            entry.declined.add(slot)
+        return slot
+
+    def mark_rule_change_ready(self, request_id: bytes) -> bool:
+        """Flag an OPEN request for the next release sweep. False when it cannot."""
+        entry = self.rule_change_requests.get(request_id)
+        if entry is None or entry.status != STATUS_OPEN or entry.ready:
+            return False
+        entry.ready = True
+        return True
+
+    def mark_escape_due_ready(self, height: int) -> List[bytes]:
+        """Flag every OPEN request whose delay has passed, in id order."""
+        due = sorted(
+            rid for rid, e in self.open_rule_changes().items()
+            if not e.ready
+            and height >= e.created_height + tau_defs.RULE_CHANGE_DELAY_BLOCKS
+        )
+        for rid in due:
+            self.rule_change_requests[rid].ready = True
+        return due
+
+    def ready_rule_change_ids(self) -> List[bytes]:
+        """OPEN requests awaiting release, ascending by id."""
+        return sorted(rid for rid, e in self.open_rule_changes().items() if e.ready)
+
+    def get_rule_change(self, request_id: bytes) -> Optional[RuleChangeRequestEntry]:
+        return self.rule_change_requests.get(request_id)
+
+    def can_admit_rule_change(
+        self, request: RuleChangeRequest, next_height: int
+    ) -> Tuple[bool, str]:
+        """Shape, duplicate and cap checks. The per-kind preconditions need the
+        clause registry and offer book, so the caller owns them."""
+        shape_error = validate_rule_change_shape(request, next_height)
+        if shape_error:
+            return False, shape_error
+        if request.request_id in self.rule_change_requests:
+            return False, "duplicate request"
+        if self.pending_count_for_sender(request.sender_pubkey) >= MAX_PENDING_REQUESTS_PER_SENDER:
+            return False, "sender has too many open requests"
+        for approver in sorted(request.approvers.values()):
+            if self.pending_count_for_approver(approver) >= MAX_PENDING_REQUESTS_PER_APPROVER:
+                return False, "an approver has too many open requests"
+        return True, ""
+
+    def submit_rule_change(self, request: RuleChangeRequest, created_height: int) -> bool:
+        """Record an OPEN request. False when the id is already known."""
+        request_id = request.request_id
+        if request_id in self.rule_change_requests:
+            return False
+        self.rule_change_requests[request_id] = RuleChangeRequestEntry(
+            sender_pubkey=request.sender_pubkey,
+            kind=request.kind,
+            body=request.body,
+            offer_id=request.offer_id,
+            approvers=dict(request.approvers),
+            created_height=int(created_height),
+            expire_at_height=request.expire_at_height,
+        )
+        return True
+
+    def withdraw_rule_change(self, request_id: bytes) -> bool:
+        """Forget a request outright, for a tx that did not survive paying its fee."""
+        entry = self.rule_change_requests.get(request_id)
+        if entry is None or entry.status != STATUS_OPEN:
+            return False
+        del self.rule_change_requests[request_id]
+        return True
+
+    def can_cancel_rule_change(
+        self, cancel: RuleChangeCancel, height: int
+    ) -> Tuple[bool, str]:
+        entry = self.rule_change_requests.get(cancel.request_id)
+        if entry is None:
+            return False, "unknown request"
+        if entry.sender_pubkey != cancel.sender_pubkey:
+            return False, "only the request's sender may cancel it"
+        if entry.status != STATUS_OPEN:
+            return False, "request already resolved"
+        if entry.expire_at_height <= height:
+            return False, "request has expired"
+        return True, ""
+
+    def resolve_rule_change(self, request_id: bytes, status: int) -> bool:
+        """Move an OPEN request to a terminal status. False when it was not open."""
+        entry = self.rule_change_requests.get(request_id)
+        if entry is None or entry.status != STATUS_OPEN:
+            return False
+        entry.status = status
+        return True
+
+    def resolve_open_rule_changes_for_sender(
+        self, pubkey: str, status: int, *, except_id: Optional[bytes] = None
+    ) -> List[bytes]:
+        """Terminate every open rule-change request of one sender, in id order."""
+        target = _normalize_pubkey(pubkey)
+        doomed = sorted(
+            rid for rid, e in self.open_rule_changes().items()
+            if e.sender_pubkey == target and rid != except_id
+        )
+        for rid in doomed:
+            self.resolve_rule_change(rid, status)
+        return doomed
 
     # -- persistence helpers ------------------------------------------------
 
@@ -921,5 +1375,29 @@ class ApprovalRequestLifecycleManager:
                     sort_keys=True, separators=(",", ":")),
                 "declined_json": json.dumps(sorted(entry.declined if entry else [])),
                 "status": self.terminal_status.get(rid, STATUS_FAILED),
+            })
+        return rows
+
+    def snapshot_rule_change_requests(self) -> List[Dict[str, Any]]:
+        """Rows for the node-local rule-change table, terminal ones included."""
+        rows: List[Dict[str, Any]] = []
+        for rid, entry in sorted(self.rule_change_requests.items()):
+            rows.append({
+                "request_id": rid.hex(),
+                "sender_pubkey": entry.sender_pubkey,
+                "kind": entry.kind,
+                "body": entry.body,
+                "offer_id": entry.offer_id,
+                "approvers_json": json.dumps(
+                    {str(k): v for k, v in sorted(entry.approvers.items())},
+                    sort_keys=True, separators=(",", ":")),
+                "voted_json": json.dumps(
+                    {str(k): v for k, v in sorted(entry.voted.items())},
+                    sort_keys=True, separators=(",", ":")),
+                "declined_json": json.dumps(sorted(entry.declined)),
+                "ready": 1 if entry.ready else 0,
+                "created_height": entry.created_height,
+                "expire_at_height": entry.expire_at_height,
+                "status": entry.status,
             })
         return rows

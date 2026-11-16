@@ -15,6 +15,7 @@ let pendingSequence = null;
 let tipHeight = null;
 // Blocks a transaction stays includable for. Mirrors tau_defs.DEFAULT_TX_EXPIRY_BLOCKS.
 const DEFAULT_EXPIRY_BLOCKS = 1000; // Track local sequence to prevent 'expected 1 got 0' on rapid sends
+let _pendingPolicyTx = null; // { seq } while a policy-change tx awaits the node's answer
 let _pendingGovTx = null; // { seq, activeTab } — set during gov tx send, consumed on SUCCESS/FAILURE
 let _pendingPreview = null; // { nonce, sentFingerprint } — tracks in-flight preview request
 
@@ -61,7 +62,8 @@ const panels = {
     wallet: document.getElementById('wallet-panel'),
     addressBook: document.getElementById('address-book-panel'),
     info: document.getElementById('info-panel'),
-    tx: document.getElementById('tx-panel')
+    tx: document.getElementById('tx-panel'),
+    policy: document.getElementById('policy-panel')
 };
 
 // Address Book DOM
@@ -131,6 +133,7 @@ const govVoteUpdateId = document.getElementById('gov-vote-update-id');
 const btnPasteDraftId = document.getElementById('btn-paste-draft-id');
 const govVoteIdStatus = document.getElementById('gov-vote-id-status');
 const btnGovSend = document.getElementById('btn-gov-send');
+const policyFee = document.getElementById('pc-fee');
 
 const btnRefreshProposals = document.getElementById('btn-refresh-proposals');
 const govProposalsTimestamp = document.getElementById('gov-proposals-timestamp');
@@ -506,9 +509,29 @@ function handleServerResponse(msg) {
             }));
             break;
 
+        case 'getruleoffer':
+            window.dispatchEvent(new CustomEvent('ruleOfferResponse', {
+                detail: ok ? { status: 'ok', rule_text: data.rule_text || '' } : { status: 'error', error: errMsg }
+            }));
+            break;
+
+        case 'getapprovalrequests':
+            if (ok) renderPolicyRequests(data);
+            else log(`getapprovalrequests: ${errMsg}`, 'error');
+            break;
+
         case 'sendtx':
             if (ok) {
                 log(`SUCCESS: ${data.message || 'Transaction queued.'}${data.tx_hash ? ' tx=' + data.tx_hash : ''}`, 'success');
+                if (_pendingPolicyTx) {
+                    const policySeq = _pendingPolicyTx.seq;
+                    _pendingPolicyTx = null;
+                    if (pendingSequence === null || policySeq >= pendingSequence) {
+                        pendingSequence = policySeq + 1;
+                        statSequence.textContent = `(Pending) ${policySeq + 1}`;
+                    }
+                    log("Policy transaction accepted by node.", "success");
+                }
                 if (_pendingGovTx) {
                     const govSeq = _pendingGovTx.seq;
                     const govTab = _pendingGovTx.activeTab;
@@ -535,7 +558,13 @@ function handleServerResponse(msg) {
                         errDetails.required !== undefined) {
                     log(`Insufficient funds: balance ${errDetails.balance}, need ${errDetails.required} (transfers + fee).`, 'warn');
                 }
-                if (_pendingGovTx) {
+                if (errCode === 'FEE_LIMIT_TOO_LOW' && _pendingPolicyTx && policyFee &&
+                        Number.isFinite(Number(errDetails.required_fee))) {
+                    policyFee.value = String(errDetails.required_fee);
+                }
+                if (_pendingPolicyTx) {
+                    _pendingPolicyTx = null;
+                } else if (_pendingGovTx) {
                     // Governance tx failed — leave sequence unchanged, clear pending state
                     _pendingGovTx = null;
                 } else {
@@ -1963,6 +1992,63 @@ always (
 # ================================================================`
 };
 
+// Kept apart from ruleTemplates: a guard sent as a normal rule would become the
+// account's transfer policy. Guards read i1 (change kind), i5 and slots i18..i25 only.
+const guardTemplates = {
+    "Guard: Any policy change needs co-signer X": `# ---------------------------------------------------------
+# ANY POLICY CHANGE NEEDS A CO-SIGNER
+# ---------------------------------------------------------
+# Every change to your o5 policy -- set, revoke, accept an offer, and
+# any change to this guard -- is blocked until co-signer X has voted
+# to approve the request. A stolen key alone cannot change your policy.
+#
+# i18[t] : approval slot, bv[384]. The node writes X's public key here
+#          once X's signed approval vote is verified; otherwise 0.
+# o5[t]  : verdict (bv[24]: 0 = block the change, 1 = allow it)
+# ---------------------------------------------------------
+# Replace the key with X's 96-character public key hex, then request
+# this guard with X declared as approver for slot 18.
+always ((i18[t]:bv[384] = { #xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa }:bv[384]) ? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24])).`,
+
+    "Guard: 2 of 3 co-signers for any policy change": `# ---------------------------------------------------------
+# 2 OF 3 CO-SIGNERS FOR ANY POLICY CHANGE
+# ---------------------------------------------------------
+# Every change to your o5 policy -- set, revoke, accept an offer, and
+# any change to this guard -- is blocked until at least two of your
+# three co-signers have voted to approve the request.
+#
+# i18/i19/i20 : approval slots, bv[384]. The node writes an approver's
+#               public key into their slot once their signed approval
+#               vote is verified; an unfilled slot reads 0.
+# o5[t]       : verdict (bv[24]: 0 = block the change, 1 = allow it)
+# ---------------------------------------------------------
+# Replace each key with a co-signer's 96-character public key hex, then
+# request this guard with the three approvers declared for slots 18-20.
+always (( ((i18[t]:bv[384] = { #xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa }:bv[384]) && (i19[t]:bv[384] = { #xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb }:bv[384]))
+ || ((i18[t]:bv[384] = { #xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa }:bv[384]) && (i20[t]:bv[384] = { #xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc }:bv[384]))
+ || ((i19[t]:bv[384] = { #xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb }:bv[384]) && (i20[t]:bv[384] = { #xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc }:bv[384])) ) ? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24])).`,
+
+    "Guard: Revoking needs a co-signer (weaker)": `# ---------------------------------------------------------
+# REVOKING NEEDS A CO-SIGNER, SETTING A NEW POLICY DOES NOT
+# ---------------------------------------------------------
+# WEAKER THAN THE OTHER GUARDS. Revoking your policy (kind 2) or your
+# guard (kind 5) is blocked until co-signer X approves, but SETTING a
+# new policy (kind 1), accepting an offer (kind 3) and setting a guard
+# (kind 4) are allowed without anyone. A thief holding your key can
+# therefore replace your policy with a permissive one and then drain
+# the account. Use it only to stop accidental or lone revocations.
+#
+# i1[t]  : kind of change: 1 set, 2 revoke, 3 accept, 4 set guard,
+#          5 revoke guard (bv[24])
+# i18[t] : approval slot, bv[384]; holds X's public key once X's
+#          signed approval vote is verified, otherwise 0
+# o5[t]  : verdict (bv[24]: 0 = block the change, 1 = allow it)
+# ---------------------------------------------------------
+# Replace the key with X's 96-character public key hex.
+always ((( (i1[t]:bv[24] = { #x000002 }:bv[24]) || (i1[t]:bv[24] = { #x000005 }:bv[24]) )
+ && !(i18[t]:bv[384] = { #xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa }:bv[384])) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])).`
+};
+
 function initRuleTemplates() {
     const menu = document.getElementById('rule-templates-menu');
     if (!menu) return;
@@ -1985,6 +2071,278 @@ function initRuleTemplates() {
         li.appendChild(a);
         menu.appendChild(li);
     }
+}
+
+// --- Policy change requests ---
+
+const RULE_CHANGE_KINDS = {
+    1: 'Set policy',
+    2: 'Revoke policy',
+    3: 'Accept offer',
+    4: 'Set guard',
+    5: 'Revoke guard'
+};
+const RULE_CHANGE_DELAY_BLOCKS = 1000;
+const MAX_APPROVAL_WINDOW_BLOCKS = 10000;
+const DEFAULT_RULE_CHANGE_EXPIRE_IN = 2 * RULE_CHANGE_DELAY_BLOCKS;
+const APPROVAL_SLOTS = [18, 19, 20, 21, 22, 23, 24, 25];
+
+function parseApproverLines(text) {
+    const out = {};
+    for (const raw of String(text || '').split('\n')) {
+        const line = raw.trim();
+        if (!line) continue;
+        const m = /^(\d+)\s*=\s*([0-9a-fA-F]{96})$/.exec(line);
+        if (!m) throw new Error(`Approver line must look like 18=<96-hex public key>: ${line}`);
+        const slot = parseInt(m[1], 10);
+        if (!APPROVAL_SLOTS.includes(slot)) throw new Error(`Slot ${slot} is not an approval slot (18-25).`);
+        if (String(slot) in out) throw new Error(`Slot ${slot} is given twice.`);
+        out[String(slot)] = m[2].toLowerCase();
+    }
+    const keys = Object.values(out);
+    if (new Set(keys).size !== keys.length) throw new Error("Approvers must be distinct accounts.");
+    return out;
+}
+
+// Every consensus-defaulted field is sent explicitly so the signed bytes are the ones the node rebuilds.
+function buildRuleChangeRequestBody(draft) {
+    const kind = Number(draft.kind);
+    if (!Number.isInteger(kind) || !(kind in RULE_CHANGE_KINDS)) throw new Error("kind must be 1 to 5.");
+    const hasBody = kind === 1 || kind === 3 || kind === 4;
+    const ruleText = draft.rule_text || '';
+    const offerId = (draft.offer_id || '').trim().toLowerCase();
+    if (hasBody && !ruleText.trim()) throw new Error("This kind needs a rule text.");
+    if (!hasBody && ruleText) throw new Error("This kind carries no rule text.");
+    if (kind === 3) {
+        if (!/^[0-9a-f]{64}$/.test(offerId)) throw new Error("offer_id must be 64 hex digits.");
+    } else if (offerId) {
+        throw new Error("Only an accept carries an offer id.");
+    }
+    return {
+        tx_type: 'rule_change_request',
+        kind: kind,
+        rule_text: ruleText,
+        offer_id: offerId,
+        approvers: draft.approvers || {}
+    };
+}
+
+function buildRuleChangeCancelBody(requestId) {
+    const id = String(requestId || '').trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(id)) throw new Error("request_id must be 64 hex digits.");
+    return { tx_type: 'rule_change_cancel', request_id: id };
+}
+
+function signPolicyTx(txBody, senderPub, seq, expireAtHeight, feeLimit) {
+    if (senderPub !== bytesToHex(currentKeyPair.pub)) throw new Error("sender_pubkey does not match connected wallet");
+    const signingDict = {
+        sender_pubkey: senderPub,
+        sequence_number: seq,
+        expiration_time: Math.floor(Date.now() / 1000) + 600,
+        expire_at_height: expireAtHeight,
+        fee_limit: String(feeLimit),
+        ...txBody
+    };
+    const msgHash = sha256(new TextEncoder().encode(canonicalize(signingDict)));
+    return { ...signingDict, signature: bytesToHex(bls.sign(msgHash, currentKeyPair.priv)) };
+}
+
+function liveTauLines(text) {
+    return String(text).split('\n').filter((l) => !l.trim().startsWith('#')).join('\n');
+}
+
+function policyTemplatesForKind(kind) {
+    if (kind === 4) return guardTemplates;
+    if (kind !== 1) return {};
+    const out = {};
+    for (const [name, text] of Object.entries(ruleTemplates)) {
+        if (/\bo5\s*\[/.test(liveTauLines(text))) out[name] = text;
+    }
+    return out;
+}
+
+function policyFetchOfferText(offerId) {
+    return new Promise((resolve, reject) => {
+        const onResp = (e) => {
+            window.removeEventListener('ruleOfferResponse', onResp);
+            clearTimeout(timer);
+            if (e.detail.status === 'ok' && e.detail.rule_text) resolve(e.detail.rule_text);
+            else reject(new Error(e.detail.error || "The node no longer has this offer's text."));
+        };
+        const timer = setTimeout(() => {
+            window.removeEventListener('ruleOfferResponse', onResp);
+            reject(new Error("Timed out fetching the offer."));
+        }, 5000);
+        window.addEventListener('ruleOfferResponse', onResp);
+        sendRpc("getruleoffer " + offerId);
+    });
+}
+
+function formatRuleChangeSummary(body, expireIn, expireAtHeight) {
+    let text = `Transaction Type: rule_change_request\n`
+        + `Kind: ${RULE_CHANGE_KINDS[body.kind]} (${body.kind})\n`;
+    if (body.offer_id) text += `Offer: ${body.offer_id}\n`;
+    if (body.rule_text) {
+        text += body.rule_text.length <= 500
+            ? `Body:\n${body.rule_text}\n`
+            : `Body: ${body.rule_text.length} characters\n`;
+    }
+    const slots = Object.entries(body.approvers);
+    text += slots.length
+        ? `Approvers:\n${slots.map(([s, k]) => `  i${s}: ${k}`).join('\n')}\n`
+        : `Approvers: none (the request releases at the time escape)\n`;
+    text += `Expires at height ${expireAtHeight} (${expireIn} blocks from the next block)\n`;
+    text += `Time escape: ${RULE_CHANGE_DELAY_BLOCKS} blocks after it is mined\n`;
+    if (expireIn <= RULE_CHANGE_DELAY_BLOCKS) {
+        text += `WARNING: this expires before the time escape, so it can only release through approvals.\n`;
+    }
+    return text;
+}
+
+async function onSendPolicyRequest() {
+    if (!isConnected || !currentKeyPair) {
+        log("Not connected or no wallet generated.", "error");
+        return;
+    }
+    if (!Number.isInteger(tipHeight)) {
+        log("Chain height unknown -- refresh the account before sending.", "error");
+        return;
+    }
+    try {
+        const kind = Number(document.getElementById('pc-kind').value);
+        let ruleText = document.getElementById('pc-body').value;
+        const offerId = document.getElementById('pc-offer-id').value;
+        const approvers = parseApproverLines(document.getElementById('pc-approvers').value);
+        const expireIn = parseInt(document.getElementById('pc-expire-in').value, 10);
+        const fee = Number(policyFee.value === '' ? '10' : policyFee.value);
+        if (!Number.isInteger(expireIn) || expireIn < 1) throw new Error("Expire-in must be at least 1 block.");
+        if (expireIn > MAX_APPROVAL_WINDOW_BLOCKS) throw new Error(`Expire-in may be at most ${MAX_APPROVAL_WINDOW_BLOCKS} blocks.`);
+        if (!Number.isInteger(fee) || fee < 0) throw new Error("Fee limit must be a non-negative integer.");
+
+        if (kind === 3) ruleText = await policyFetchOfferText(offerId.trim().toLowerCase());
+        const body = buildRuleChangeRequestBody({ kind, rule_text: kind === 2 || kind === 5 ? '' : ruleText, offer_id: offerId, approvers });
+        const expireAtHeight = tipHeight + 1 + expireIn;
+
+        const ok = await customConfirm("Please review the transaction details:\n\n"
+            + formatRuleChangeSummary(body, expireIn, expireAtHeight) + "\nSign and submit?");
+        if (!ok) return;
+
+        let seq = pendingSequence !== null ? pendingSequence : parseInt(statSequence.textContent);
+        if (isNaN(seq)) seq = 0;
+        const signed = signPolicyTx(body, bytesToHex(currentKeyPair.pub), seq, expireAtHeight, fee);
+        _pendingPolicyTx = { seq };
+        sendRpc("sendtx " + JSON.stringify(signed));
+        log("Sending policy change request...", "warn");
+    } catch (e) {
+        _pendingPolicyTx = null;
+        log(`[POLICY REQUEST] ${e.message}`, "error");
+    }
+}
+
+async function onSendPolicyCancel(requestId) {
+    if (!isConnected || !currentKeyPair) {
+        log("Not connected or no wallet generated.", "error");
+        return;
+    }
+    try {
+        if (!Number.isInteger(tipHeight)) throw new Error("Chain height unknown -- refresh the account first.");
+        const body = buildRuleChangeCancelBody(requestId);
+        const ok = await customConfirm(`Cancel rule-change request ${body.request_id}?\n\nThis is feeless. Sign and submit?`);
+        if (!ok) return;
+        let seq = pendingSequence !== null ? pendingSequence : parseInt(statSequence.textContent);
+        if (isNaN(seq)) seq = 0;
+        const signed = signPolicyTx(body, bytesToHex(currentKeyPair.pub), seq, tipHeight + 1 + DEFAULT_EXPIRY_BLOCKS, 0);
+        _pendingPolicyTx = { seq };
+        sendRpc("sendtx " + JSON.stringify(signed));
+        log("Sending cancel...", "warn");
+    } catch (e) {
+        _pendingPolicyTx = null;
+        log(`[POLICY CANCEL] ${e.message}`, "error");
+    }
+}
+
+function renderPolicyRequests(data) {
+    const list = document.getElementById('pc-requests');
+    if (!list) return;
+    list.textContent = '';
+    const rows = (data.outgoing || []).filter((r) => r.request_type === 'rule_change');
+    if (!rows.length) {
+        list.textContent = 'No rule-change requests from this account.';
+        return;
+    }
+    for (const row of rows) {
+        const item = document.createElement('div');
+        item.className = 'pc-request';
+        const head = document.createElement('div');
+        head.textContent = `${row.kind_name} -- ${row.status}${row.ready ? ' (ready)' : ''}`;
+        const id = document.createElement('div');
+        id.className = 'font-monospace small';
+        id.textContent = row.request_id;
+        const meta = document.createElement('div');
+        meta.className = 'small';
+        const states = Object.entries(row.approvers || {}).map(([s, a]) => `i${s} ${a.state}`).join(', ');
+        meta.textContent = `escape at ${row.escape_height}, expires at ${row.expire_at_height}`
+            + (states ? `; ${states}` : '; no approvers');
+        item.append(head, id, meta);
+        if (row.status === 'open') {
+            const btn = document.createElement('button');
+            btn.className = 'btn-sm danger-btn';
+            btn.textContent = 'Cancel';
+            btn.addEventListener('click', () => onSendPolicyCancel(row.request_id));
+            item.appendChild(btn);
+        }
+        list.appendChild(item);
+    }
+}
+
+function refreshPolicyRequests() {
+    if (!currentKeyPair) {
+        log("No wallet loaded.", "error");
+        return;
+    }
+    sendRpc(`getapprovalrequests ${bytesToHex(currentKeyPair.pub)} out`);
+}
+
+function updatePolicyKindFields() {
+    const kind = Number(document.getElementById('pc-kind').value);
+    document.getElementById('pc-body-group').style.display = (kind === 1 || kind === 4) ? '' : 'none';
+    document.getElementById('pc-offer-group').style.display = kind === 3 ? '' : 'none';
+    const select = document.getElementById('pc-template');
+    select.textContent = '';
+    const blank = document.createElement('option');
+    blank.value = '';
+    blank.textContent = 'Load template...';
+    select.appendChild(blank);
+    for (const name of Object.keys(policyTemplatesForKind(kind))) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        select.appendChild(opt);
+    }
+}
+
+function initPolicyPanel() {
+    const kindSelect = document.getElementById('pc-kind');
+    if (!kindSelect) return;
+    for (const [k, label] of Object.entries(RULE_CHANGE_KINDS)) {
+        const opt = document.createElement('option');
+        opt.value = k;
+        opt.textContent = `${label} (${k})`;
+        kindSelect.appendChild(opt);
+    }
+    document.getElementById('pc-expire-in').value = String(DEFAULT_RULE_CHANGE_EXPIRE_IN);
+    kindSelect.addEventListener('change', updatePolicyKindFields);
+    document.getElementById('pc-template').addEventListener('change', (e) => {
+        const kind = Number(kindSelect.value);
+        const text = policyTemplatesForKind(kind)[e.target.value];
+        if (text) document.getElementById('pc-body').value = text;
+    });
+    document.getElementById('btn-pc-send').addEventListener('click', onSendPolicyRequest);
+    document.getElementById('btn-pc-refresh').addEventListener('click', refreshPolicyRequests);
+    document.getElementById('btn-pc-cancel').addEventListener('click', () => {
+        onSendPolicyCancel(document.getElementById('pc-cancel-id').value);
+    });
+    updatePolicyKindFields();
 }
 
 // --- Governance Rule Templates ---
@@ -3199,6 +3557,7 @@ function checkSelectedProposalStillPending() {
 window.addEventListener('load', () => {
     initRuleTemplates();
     initGovRuleTemplates();
+    initPolicyPanel();
     if (btnRefreshProposals) btnRefreshProposals.addEventListener('click', refreshGovernanceAdvisory);
     if (btnClearSelection) btnClearSelection.addEventListener('click', clearProposalSelection);
 

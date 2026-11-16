@@ -29,6 +29,8 @@ from py_arkworks_bls12381 import G1Point, G2Point, GT
 
 from consensus.approvals import (
     TX_TYPE_APPROVAL_REQUEST,
+    TX_TYPE_RULE_CHANGE_CANCEL,
+    TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
 from consensus.retractable import (
@@ -179,6 +181,15 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["expire_at_height"] = payload.get("expire_at_height")
         signing_dict["approvers"] = payload.get("approvers", {})
         signing_dict["custom_inputs"] = payload.get("custom_inputs", {})
+    elif tx_type == TX_TYPE_RULE_CHANGE_REQUEST:
+        # Everything the request id commits to, so the approvers' votes bind
+        # the exact change and a proposer cannot swap the body or the slots.
+        signing_dict["kind"] = payload.get("kind")
+        signing_dict["rule_text"] = payload.get("rule_text", "")
+        signing_dict["offer_id"] = payload.get("offer_id", "")
+        signing_dict["approvers"] = payload.get("approvers", {})
+    elif tx_type == TX_TYPE_RULE_CHANGE_CANCEL:
+        signing_dict["request_id"] = payload.get("request_id")
     elif tx_type == TX_TYPE_TRANSFER_VOTE:
         signing_dict["request_id"] = payload.get("request_id")
         signing_dict["approve"] = payload.get("approve", True)

@@ -66,7 +66,7 @@ Error codes emitted by the node, by origin:
 | `sendtx` / `checktx` structural | `TX_INVALID`, `TX_EXPIRED`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `BLS_UNAVAILABLE`, `TX_REJECTED` |
 | `sendtx` fees & capacity | `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `MEMPOOL_FULL`, `ESTIMATE_BUSY` (`checktx estimate` only) |
 | `sendtx` approval request | `APPROVAL_NOT_NEEDED`: the policy of the sender allows the transfer with no votes, so send it as an ordinary transfer. Only admission gives it, because block apply drops such a request. |
-| Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED` |
+| Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED`, `RULE_CHANGE_NEEDS_APPROVAL`, `INVALID_RULE_CHANGE_REQUEST`, `INVALID_RULE_CHANGE_CANCEL`, `NOT_REQUEST_SENDER` |
 | `createblock` | `MEMPOOL_EMPTY`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED` |
 | Governance / rule / approval reads | `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `REQUEST_UNKNOWN`, `FEATURE_INACTIVE`, `TAU_UNAVAILABLE`, `TAU_ERROR` |
 
@@ -175,7 +175,7 @@ The full registry (28 names, `app/container.py`):
 | `getapprovalrequest` | `getapprovalrequest <request_id>` |
 | `getrequestid` | `getrequestid <json_payload>` |
 | `getapprovalslots` | `getapprovalslots <address>` — advisory, node-local |
-| `getapprovalpreview` | `getapprovalpreview <json_draft>` — advisory, node-local |
+| `getapprovalpreview` | `getapprovalpreview <json_draft>` — advisory, node-local; `"request_type":"rule_change"` previews a policy change |
 | `getretractable` | `getretractable <retractable_id>` — 64 hex chars |
 | `getretractables` | `getretractables <address> [in\|out\|all]` (default `all`) |
 | `getretractableid` | `getretractableid <json_payload>` |
@@ -502,6 +502,28 @@ not check satisfiability — tau-lang exposes
 bindings — so a clean result means no conflict was *observed*. See the
 [Rule sharing](../README.md#rule-sharing) section for the per-account clause
 registry and the screens a clause must pass.
+
+## Policy guard
+
+Guard your own `o5` policy so that changing it needs co-signers. Semantics, kinds
+and limits are in [approvals.md](approvals.md#guarding-policy-changes).
+
+```bash
+tau-testnet policy guard set --key alice --file guard.tau --approver 18=<xpub>
+tau-testnet policy guard revoke --key alice
+tau-testnet policy guard show <address>
+tau-testnet policy change request --key alice --kind set --file policy.tau --approver 18=<xpub>
+tau-testnet policy change request --key alice --kind revoke --approver 18=<xpub>
+tau-testnet policy change request --key alice --kind accept --offer-id <offer_id>
+tau-testnet policy change cancel --key alice --request-id <request_id>
+```
+
+`guard set` and `guard revoke` are rule-change requests of kind 4 and 5; `change
+request --kind` is `set`, `revoke` or `accept`. All request commands take `--body`
+in place of `--file`, `--fee`, `--expire-in N` (default 2000 blocks, so the
+1000-block time escape can apply), `--expire-at-height`, `--preview` (ask the node,
+send nothing) and `--dry-run`, and print the request id. `cancel` is feeless.
+They exit like the other transaction commands.
 
 ## Retractable transfers
 
