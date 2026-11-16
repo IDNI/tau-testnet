@@ -701,6 +701,11 @@ Node commands reply with a single-line JSON envelope (TCP appends `\r\n`; WebSoc
   and a retry is reasonable.
 - `REORG_IN_PROGRESS` means that the node is replaying the chain for a reorg. The node
   did not admit the transaction. Send the same transaction again after a short wait.
+  The node also gives this code when another chain writer holds the chain lock for
+  longer than `TAU_ADMISSION_CHAIN_LOCK_TIMEOUT` seconds (default 5).
+  A node that refuses a gossiped transaction with this code drops it and does not
+  keep it for a later retry. The transaction comes back only when its sender sends
+  it again, or when a peer sends its mempool snapshot on a new connection.
 - The `hello version=N` handshake stays plain text (versions 1 and 2).
 
 **`createblock`** takes one optional argument: `createblock allow-empty`. Block production is

@@ -1495,23 +1495,28 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                 verdict["update_id"] = update_id
             return verdict
 
-        if db.count_mempool_txs() >= config.MAX_MEMPOOL_TXS:
-            return _qt_err(
-                "MEMPOOL_FULL",
-                f"Mempool is full ({config.MAX_MEMPOOL_TXS} pending transactions). Please try again later.",
-                current_count=db.count_mempool_txs(),
-                limit=config.MAX_MEMPOOL_TXS
+        # `reorg_to` runs under `_chain_lock`, so no reorg can start between
+        # the last counter check and the insert.
+        with chain_state.chain_write_lock(timeout=config.ADMISSION_CHAIN_LOCK_TIMEOUT) as acquired:
+            if not acquired or chain_state.reorg_counter() != reorg_seen:
+                return _reorg_refusal()
+            if db.count_mempool_txs() >= config.MAX_MEMPOOL_TXS:
+                return _qt_err(
+                    "MEMPOOL_FULL",
+                    f"Mempool is full ({config.MAX_MEMPOOL_TXS} pending transactions). Please try again later.",
+                    current_count=db.count_mempool_txs(),
+                    limit=config.MAX_MEMPOOL_TXS
+                )
+            # Use canonical blob for storage to ensure consistency
+            # Use milliseconds for received_at for better ordering resolution
+            received_at = int(time.time() * 1000)
+            db.add_mempool_tx(
+                tx_canonical_blob, tx_message_id, received_at,
+                fee_limit=fee_limit_int,
+                estimated_fee=estimated_fee_total if tx_type in FEE_BEARING_TX_TYPES else 0,
+                lane=classify_lane(payload),
             )
-        # Use canonical blob for storage to ensure consistency
-        # Use milliseconds for received_at for better ordering resolution
-        received_at = int(time.time() * 1000)
-        db.add_mempool_tx(
-            tx_canonical_blob, tx_message_id, received_at,
-            fee_limit=fee_limit_int,
-            estimated_fee=estimated_fee_total if tx_type in FEE_BEARING_TX_TYPES else 0,
-            lane=classify_lane(payload),
-        )
-        progress.queued = True
+            progress.queued = True
         logger.info("Transaction successfully queued in mempool.")
         if propagate:
             if network_bus is not None:

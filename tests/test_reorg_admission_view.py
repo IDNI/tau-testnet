@@ -2,10 +2,12 @@
 admission reads passes through every lower height until the replay ends.
 """
 import json
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
 import chain_state
+import config
 import db
 from commands import checktx, sendtx
 from tau_testnet_cli import tx as tx_mod
@@ -117,6 +119,100 @@ class TestAdmissionDuringReplay(ReorgRestoreTestCase):
         stale = transfer(SK_ALICE, CAROL, 1, 9)
         result = sendtx.queue_transaction(json.dumps(stale), propagate=False)
         self.assertEqual(result.get("code"), "INVALID_SEQUENCE", result)
+
+
+class TestReorgAfterTheLastCheck(ReorgRestoreTestCase):
+    """A reorg that tries to start between the last counter check and the insert."""
+
+    def setUp(self):
+        super().setUp()
+        self.adopt_orphan_to_be([])
+        # The winning branch spends ALICE's sequence 0, which `self.tx` also uses.
+        self.spent = transfer(SK_ALICE, CAROL, 5, 0)
+        self.tx = transfer(SK_ALICE, CAROL, 1, 0)
+        self.start = chain_state.reorg_counter()
+        self.reorg_took_the_lock = None
+        self.insert_counters = []
+
+    def reorg_in_other_thread(self):
+        errors = []
+
+        def run():
+            try:
+                with chain_state.chain_write_lock(timeout=0) as acquired:
+                    self.reorg_took_the_lock = acquired
+                    if acquired:
+                        self.win_with([self.spent])
+            except BaseException as exc:  # noqa: BLE001 - reported to the test thread
+                errors.append(exc)
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        worker.join()
+        if errors:
+            raise errors[0]
+
+    def admit_with_a_reorg_before_the_insert(self):
+        real_count = db.count_mempool_txs
+        real_add = db.add_mempool_tx
+        admitting = threading.get_ident()
+
+        def count_then_reorg():
+            if threading.get_ident() == admitting and self.reorg_took_the_lock is None:
+                self.reorg_in_other_thread()
+            return real_count()
+
+        def recording_add(*args, **kwargs):
+            if threading.get_ident() == admitting:
+                self.insert_counters.append(chain_state.reorg_counter())
+            return real_add(*args, **kwargs)
+
+        with patch.object(db, "count_mempool_txs", count_then_reorg), \
+                patch.object(db, "add_mempool_tx", recording_add):
+            return sendtx.queue_transaction(json.dumps(self.tx), propagate=False)
+
+    def test_reorg_cannot_start_between_the_last_check_and_the_insert(self):
+        result = self.admit_with_a_reorg_before_the_insert()
+
+        self.assertIsNotNone(self.reorg_took_the_lock, "the hook did not run")
+        self.assertFalse(self.reorg_took_the_lock, "a reorg ran inside the admission window")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.insert_counters, [self.start])
+
+    def test_waiting_reorg_runs_after_the_admission(self):
+        self.admit_with_a_reorg_before_the_insert()
+        self.win_with([self.spent])
+
+        self.assertEqual(chain_state.reorg_counter(), self.start + 2)
+        self.assertEqual(chain_state.get_sequence_number(ALICE), 1)
+
+    def test_busy_chain_lock_gives_the_reorg_refusal(self):
+        held, done = threading.Event(), threading.Event()
+
+        def hold():
+            with chain_state.chain_write_lock():
+                held.set()
+                done.wait()
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        held.wait()
+        try:
+            with patch.object(config, "ADMISSION_CHAIN_LOCK_TIMEOUT", 0):
+                result = sendtx.queue_transaction(json.dumps(self.tx), propagate=False)
+        finally:
+            done.set()
+            holder.join()
+
+        self.assertEqual(result.get("code"), "REORG_IN_PROGRESS", result)
+        self.assertFalse(self.in_mempool(self.tx))
+
+    def test_dry_run_takes_no_chain_lock(self):
+        with patch.object(chain_state, "chain_write_lock",
+                          side_effect=AssertionError("dry run took the lock")):
+            result = sendtx.queue_transaction(json.dumps(self.tx), propagate=False, dry_run=True)
+
+        self.assertTrue(result["ok"], result)
 
 
 class TestReorgCounter(ReorgRestoreTestCase):

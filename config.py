@@ -691,3 +691,7 @@ BLOCK_PRODUCTION_LOCK_TIMEOUT = float(os.environ.get('TAU_BLOCK_PRODUCTION_LOCK_
 # reorg cannot park trio's worker-thread pool; on timeout the batch is skipped
 # and the next gossip announce re-drives the sync.
 CHAIN_INGEST_LOCK_TIMEOUT = float(os.environ.get('TAU_CHAIN_INGEST_LOCK_TIMEOUT', '30'))
+
+# Seconds admission waits for the same lock before the insert into the mempool.
+# On a timeout the node gives REORG_IN_PROGRESS, and the sender tries again.
+ADMISSION_CHAIN_LOCK_TIMEOUT = float(os.environ.get('TAU_ADMISSION_CHAIN_LOCK_TIMEOUT', '5'))
