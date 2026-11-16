@@ -52,6 +52,8 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
         tx_type = tx.get("tx_type") if isinstance(tx, dict) else None
         if tx_type in ("standing_payment_create", "standing_payment_cancel"):
             return _standing_fields(tx)
+        if tx_type in ("payout_rule_set", "payout_rule_revoke", "payout_execute"):
+            return _payout_fields(tx, tx_hash, block_hash)
         if tx_type == "retract_transfer":
             return {"retracts": tx.get("retractable_id")}
         if tx_type != "retractable_transfer":
@@ -96,6 +98,40 @@ def _standing_fields(tx: dict) -> dict:
                 status = event["outcome"]
                 break
     return {"standing": {"id": sid.hex(), "status": status}}
+
+
+def _payout_fields(tx: dict, tx_hash: str, block_hash: str) -> dict:
+    """`payout` for a confirmed payout transaction: what it did in its block.
+
+    For an install, `status` says whether the rule is still the account's rule
+    (installed), or how it ended (replaced, revoked, expired, not_recorded).
+    """
+    import db
+
+    account = tx.get("account_pubkey") if tx.get("tx_type") == "payout_execute" \
+        else tx.get("sender_pubkey")
+    if not isinstance(account, str):
+        return {}
+    history = db.get_canonical_payout_events(account.lower(), limit=500)
+    mine = next((e for e in history
+                 if e.get("tx_id") == tx_hash and e.get("block_hash") == block_hash), None)
+    if mine is None:
+        return {"payout": {"status": "not_recorded"}}
+    out = {k: v for k, v in mine.items() if k not in ("block_hash", "block_number", "tx_id")}
+    if mine.get("outcome") == "installed":
+        rule_id = mine.get("rule_id")
+        status = "installed"
+        for event in history:   # newest first: the latest thing that happened to it
+            if event.get("block_number", 0) < mine.get("block_number", 0):
+                break
+            if event.get("rule_id") == rule_id and event.get("outcome") in ("revoked", "expired"):
+                status = event["outcome"]
+                break
+            if event.get("replaced") == rule_id:
+                status = "replaced"
+                break
+        out["status"] = status
+    return {"payout": out}
 
 
 def execute(raw_command: str, container):

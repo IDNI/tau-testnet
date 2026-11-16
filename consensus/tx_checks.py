@@ -11,6 +11,7 @@ from consensus import network_binding
 from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
+from consensus.payout import TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_PAYOUT_RULE_SET
 from consensus.standing import TX_TYPE_STANDING_PAYMENT_CREATE
 from consensus import bls
 
@@ -59,6 +60,16 @@ def _recipient_keys(tx: dict) -> list:
     if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER,
                    TX_TYPE_STANDING_PAYMENT_CREATE):
         return [("recipient_pubkey", tx.get("recipient_pubkey"))]
+    if tx_type == TX_TYPE_PAYOUT_RULE_SET:
+        slots = tx.get("slots")
+        return [(f"slots[{k}]", key) for k, key in enumerate(slots or [])
+                if key != ""] if isinstance(slots, list) else []
+    if tx_type == TX_TYPE_PAYOUT_EXECUTE:
+        recipients = tx.get("recipients")
+        keys = [("account_pubkey", tx.get("account_pubkey"))]
+        if isinstance(recipients, dict):
+            keys.extend((f"recipients[{k}]", v) for k, v in sorted(recipients.items()))
+        return keys
     if tx_type in (TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST):
         keys = (
             [("recipient_pubkey", tx.get("recipient_pubkey"))]

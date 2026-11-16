@@ -291,6 +291,12 @@ tau-testnet standing list --key alice --role out
 tau-testnet standing show <standing_id>
 tau-testnet standing cancel --key alice <standing_id>
 
+# payout rules (a Tau rule pays out the account's money when anyone executes it, inside signed caps)
+tau-testnet payout set --key treasury --file payout.tau --slot <bob_pubkey> --cap-per-execution 500 --cap-per-period 2000 --period-blocks 1000 --ends-in 100000
+tau-testnet payout execute --key carol --account <treasury_pubkey> --data 0=300
+tau-testnet payout show <treasury_pubkey>
+tau-testnet payout revoke --key treasury
+
 # target a remote node
 tau-testnet --host testnet.tau.net --port 65432 status
 ```
@@ -677,6 +683,32 @@ Semantics:
 - **Reads.** `getstandingpayments <address> [out|in|all]` (with `semantics`, the node's rules and limits), `getstandingpayment <id>` (with `history`), and `gettxstatus`.
 
 **Upgrade.** The book root is folded into the consensus metadata as `standing_payments_root` only once the book has held an entry, so **no regenesis** is needed. Nodes must upgrade before the first create; an older binary diverges loudly at that block.
+
+## Payout rules
+
+Long-form guide: [docs/payout_rules.md](docs/payout_rules.md).
+
+A `payout_rule_set` installs the account's one payout rule: a Tau clause, up to eight recipient slots (a fixed key, or open for the executor to name), a cap per execution, a cap per period and an end. Anyone may then send `payout_execute`: the node steps the rule once in its own policy pool and pays every slot it writes, or nothing.
+
+```bash
+tau-testnet payout set --key treasury --file payout.tau --slot <bob_pubkey> --slot open \
+    --cap-per-execution 500 --cap-per-period 2000 --period-blocks 1000 --ends-in 100000
+tau-testnet payout execute --key carol --account <treasury_pubkey> --recipient 1=<dave_pubkey> --data 0=300
+tau-testnet payout show <treasury_pubkey>                    # terms, period spend, history
+tau-testnet payout revoke --key treasury
+```
+
+Semantics:
+
+- **ABI.** The rule reads `i2` (account balance at the parent block), `i5`/`i6` (block time and height), `i13` (executor key), `i26` (paid this period), `i30+k` (slot k's recipient), `i40+k` (executor data) and writes `o30+k` (slot k's amount), each at a fixed width.
+- **All or nothing.** `1 <= total <= cap_per_execution`, period total `<= cap_per_period`, `total <=` the account's balance; an open slot pays only a recipient the executor named, never the account itself.
+- **Periods.** Every `period_blocks` blocks or `period_seconds` of block time, counted from the install; nothing carries over.
+- **Policy.** The account's `o5` clause is not consulted: the payout rule is its own authorization. Installing, replacing and revoking are rule changes (kinds 6 and 7) that a rule-change guard judges; a guarded account uses `--request`. Payout rule + blocking `o5` + guard = escrow.
+- **Fees.** The account pays one fee to install; each execution's executor pays its fee after the legs; revoke is fee-free. A refused execution is not included.
+- **Caps.** One rule per account, 4096 in total, 8 slots, 16 executions per block.
+- **Reads.** `getpayoutrule <address>` (with `history` and `semantics`) and `gettxstatus`.
+
+**Upgrade.** The book root is folded into the consensus metadata as `payout_rules_root` only once the book has held a rule, so **no regenesis** is needed. Nodes must upgrade before the first install.
 
 ## Mempool policy
 

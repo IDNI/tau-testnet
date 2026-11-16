@@ -23,6 +23,9 @@ APPLY_REASON_WRONG_NETWORK = "wrong_network"
 BOUND_TX_TYPES = frozenset({
     "standing_payment_create",
     "standing_payment_cancel",
+    "payout_rule_set",
+    "payout_rule_revoke",
+    "payout_execute",
 })
 
 _HEX_DIGITS = frozenset("0123456789abcdef")

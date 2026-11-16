@@ -136,6 +136,9 @@ RULE_CHANGE_KIND_REVOKE_POLICY = 2
 RULE_CHANGE_KIND_ACCEPT_OFFER = 3
 RULE_CHANGE_KIND_SET_GUARD = 4
 RULE_CHANGE_KIND_REVOKE_GUARD = 5
+# Payout rules (#63): installing or replacing one, and revoking it.
+RULE_CHANGE_KIND_SET_PAYOUT = 6
+RULE_CHANGE_KIND_REVOKE_PAYOUT = 7
 
 # Blocks after which a parked rule-change request may release without approvals.
 RULE_CHANGE_DELAY_BLOCKS = 1000

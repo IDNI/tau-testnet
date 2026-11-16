@@ -38,6 +38,10 @@ from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
 )
+from consensus.payout import (
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_RULE_SET,
+)
 from consensus.standing import (
     TX_TYPE_STANDING_PAYMENT_CANCEL,
     TX_TYPE_STANDING_PAYMENT_CREATE,
@@ -147,6 +151,24 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["periods"] = payload.get("periods")
     elif tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
         signing_dict["standing_id"] = payload.get("standing_id")
+    elif tx_type == TX_TYPE_PAYOUT_RULE_SET:
+        # Every term an executor will run against: the rule text, who may be
+        # paid, both caps, the period and the end. Both period fields are
+        # listed so naming the other one changes the bytes.
+        signing_dict["rule_text"] = payload.get("rule_text")
+        signing_dict["slots"] = payload.get("slots")
+        signing_dict["cap_per_execution"] = payload.get("cap_per_execution")
+        signing_dict["cap_per_period"] = payload.get("cap_per_period")
+        signing_dict["period_blocks"] = payload.get("period_blocks")
+        signing_dict["period_seconds"] = payload.get("period_seconds")
+        signing_dict["expires_at"] = payload.get("expires_at")
+    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+        # The executor answers for which rule it ran and with what inputs.
+        signing_dict["account_pubkey"] = payload.get("account_pubkey")
+        signing_dict["rule_id"] = payload.get("rule_id")
+        signing_dict["recipients"] = payload.get("recipients")
+        signing_dict["data"] = payload.get("data")
+    # payout_rule_revoke signs the envelope only: it names the sender's own rule.
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

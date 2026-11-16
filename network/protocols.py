@@ -25,6 +25,8 @@ TAU_GOSSIP_TOPIC_RETRACTABLE = "tau/retractable/1.0.0"
 # Standing payments get their own topic too: creates can arrive in bursts, and a
 # cancel is time-sensitive -- it must land before the next due point.
 TAU_GOSSIP_TOPIC_STANDING = "tau/standing/1.0.0"
+# Payout rules: installs carry rule text, executions are what moves the money.
+TAU_GOSSIP_TOPIC_PAYOUT = "tau/payout/1.0.0"
 TAU_GOSSIP_TOPIC_PEERS = "tau/peers/2.0.0"
 
 # Mempool & Edge Ingestion Limits
@@ -63,3 +65,9 @@ TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS = 32
 TAU_MAX_STANDING_PAYMENT_CREATE_BYTES = 4096
 TAU_MAX_STANDING_PAYMENT_CANCEL_BYTES = 4096
 TAU_MEMPOOL_SNAPSHOT_MAX_STANDING_TXS = 32
+# A rule set carries up to 4 KiB of Tau text and eight slots; an execution an id,
+# up to eight recipients and eight data values; a revoke the envelope.
+TAU_MAX_PAYOUT_RULE_SET_BYTES = 16384
+TAU_MAX_PAYOUT_EXECUTE_BYTES = 8192
+TAU_MAX_PAYOUT_RULE_REVOKE_BYTES = 4096
+TAU_MEMPOOL_SNAPSHOT_MAX_PAYOUT_TXS = 32

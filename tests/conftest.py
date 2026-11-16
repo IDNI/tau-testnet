@@ -359,7 +359,7 @@ def mock_policy_evaluators() -> Iterator[None]:
     from consensus import sender_policy
     from consensus.policy_mock import MockPolicyEvaluator
 
-    pools = ("apply", "admission")
+    pools = ("apply", "admission", "payout_apply", "payout_admission")
     for pool in pools:
         sender_policy.set_evaluator(pool, MockPolicyEvaluator(pool=pool))
     yield

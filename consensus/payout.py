@@ -1,0 +1,716 @@
+"""Payout rules: an account's money paid out by a rule it installed (#63).
+
+An account installs ONE payout rule with `payout_rule_set`: a Tau clause, up to
+eight recipient slots, a cap per execution, a cap per period and an end. From
+then on anyone may send `payout_execute` naming the account, the rule's id and
+the inputs the rule reads. The node steps the clause once in an isolated policy
+worker, reads one amount per slot, and pays all of them or none:
+
+    total = sum of the slot amounts
+    1 <= total <= cap_per_execution
+    paid in this period + total <= cap_per_period
+    total <= the account's balance
+
+A slot is fixed (a recipient written into the rule) or open (the executor names
+the recipient, and the rule sees it as an input and decides what it may get).
+
+The rule is a second, separate authorization for the account's money, chosen
+by the account: the o5 clause governs transfers the account signs, the payout
+rule governs executions. Installing, replacing and revoking a payout rule are
+rule changes, so an account's rule-change guard judges them (kinds 6 and 7) and
+a guarded account installs one through a rule-change request. An escrow account
+therefore locks its money to its payout rule with three things: a payout rule,
+an o5 clause that blocks signed transfers, and a guard that needs co-signers
+for any rule change.
+
+PAYOUT ABI v1 (CONSENSUS-FROZEN)
+--------------------------------
+A payout rule is evaluated in its own policy pool, never beside o5 clauses, and
+every stream it mentions must carry exactly the width below. Stream typing is
+process-global and sticky in an interpreter process, so fixed widths are what
+let any number of payout rules share one worker.
+
+    i2   bv[24]   the account's balance at the parent block (capped at bv[24])
+    i5   bv[64]   block timestamp
+    i6   bv[64]   block height
+    i13  bv[384]  the executor's public key
+    i26  bv[24]   paid out of this account by the rule in the current period
+    i30+k bv[384] recipient of slot k (0 for an open slot nobody named)
+    i40+k bv[24]  executor data k, k in 0..7 (0 when not given)
+    o30+k bv[24]  amount for slot k (0 when the rule does not write it)
+
+A rule reads [t] only, reads at least one input and writes at least one slot
+amount, and mentions no slot it does not have.
+"""
+from __future__ import annotations
+
+import bisect
+import hashlib
+import json
+import re
+from dataclasses import dataclass, replace
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import tau_defs
+from consensus.serialization import (
+    compute_payout_body_hash,
+    compute_payout_book_root,
+    compute_payout_resolved_acc,
+    compute_payout_rule_id,
+)
+
+TX_TYPE_PAYOUT_RULE_SET = "payout_rule_set"
+TX_TYPE_PAYOUT_RULE_REVOKE = "payout_rule_revoke"
+TX_TYPE_PAYOUT_EXECUTE = "payout_execute"
+
+PAYOUT_TX_TYPES = frozenset(
+    {TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_RULE_REVOKE, TX_TYPE_PAYOUT_EXECUTE}
+)
+
+# The pools payout rules are stepped in: never the o5 pools.
+POOL_APPLY = "payout_apply"
+POOL_ADMISSION = "payout_admission"
+
+# Period clocks.
+KIND_BLOCKS = 0
+KIND_SECONDS = 1
+KIND_NAMES = {KIND_BLOCKS: "blocks", KIND_SECONDS: "seconds"}
+PERIOD_FIELDS = (("period_blocks", KIND_BLOCKS), ("period_seconds", KIND_SECONDS))
+
+# Folded into the removal commitment, one byte each.
+OUTCOME_REVOKED = 1
+OUTCOME_EXPIRED = 2
+OUTCOME_REPLACED = 3
+OUTCOME_NAMES = {OUTCOME_REVOKED: "revoked", OUTCOME_EXPIRED: "expired",
+                 OUTCOME_REPLACED: "replaced"}
+
+MAX_SLOTS = 8
+MAX_DATA = 8
+STREAM_BALANCE = 2
+STREAM_TIME = 5
+STREAM_HEIGHT = 6
+STREAM_EXECUTOR = 13
+STREAM_SPENT = 26
+SLOT_BASE = 30
+DATA_BASE = 40
+
+AMOUNT_WIDTH = tau_defs.TRANSFER_VALUE_BV_WIDTH
+KEY_WIDTH = 384
+CLOCK_WIDTH = 64
+
+MAX_RULE_BYTES = 4096
+MAX_PAYOUT_RULES_TOTAL = 4096
+MAX_PAYOUT_EXECUTIONS_PER_BLOCK = 16
+MAX_PERIOD_BLOCKS = 1_000_000
+MAX_PERIOD_SECONDS = 31_622_400            # 366 days
+MAX_LIFETIME_BLOCKS = 10_000_000
+MAX_LIFETIME_SECONDS = 4 * 31_622_400      # four years of 366 days
+
+ZERO_ACC = bytes(32)
+
+_PUBKEY_RE = re.compile(r"^[0-9a-f]{96}$")
+_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_U64_MAX = 0xFFFFFFFFFFFFFFFF
+_MENTION_RE = re.compile(r"\b([io])(\d+)\b")
+_TYPED_RE = re.compile(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*(\d+)\s*\]")
+
+
+class PayoutShapeError(ValueError):
+    """A payout transaction does not have a shape the node can record."""
+
+
+class PayoutRefused(ValueError):
+    """An execution the rule, its caps or the balance do not allow. Nothing moves."""
+
+
+def abi_width(name: str, slot_count: int = MAX_SLOTS) -> Optional[int]:
+    """The width stream `name` must carry in a payout rule, or None if it may not
+    be mentioned at all."""
+    io, index = name[0], int(name[1:])
+    if io == "o":
+        return AMOUNT_WIDTH if SLOT_BASE <= index < SLOT_BASE + slot_count else None
+    if index in (STREAM_BALANCE, STREAM_SPENT):
+        return AMOUNT_WIDTH
+    if index in (STREAM_TIME, STREAM_HEIGHT):
+        return CLOCK_WIDTH
+    if index == STREAM_EXECUTOR:
+        return KEY_WIDTH
+    if SLOT_BASE <= index < SLOT_BASE + slot_count:
+        return KEY_WIDTH
+    if DATA_BASE <= index < DATA_BASE + MAX_DATA:
+        return AMOUNT_WIDTH
+    return None
+
+
+# --- Terms and state -------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PayoutTerms:
+    """What the account signed. Immutable."""
+
+    account_pubkey: str
+    sequence_number: int
+    body: str
+    slots: Tuple[str, ...]          # a recipient pubkey, or "" for an open slot
+    cap_per_execution: int
+    cap_per_period: int
+    kind: int
+    period: int
+    expires_at: int
+
+    @property
+    def body_hash(self) -> bytes:
+        return compute_payout_body_hash(self.body)
+
+    @property
+    def rule_id(self) -> bytes:
+        return compute_payout_rule_id(
+            self.account_pubkey, self.sequence_number, self.body_hash, self.slots,
+            self.cap_per_execution, self.cap_per_period, self.kind, self.period,
+            self.expires_at,
+        )
+
+    def clock(self, height: int, ts: int) -> int:
+        return height if self.kind == KIND_BLOCKS else ts
+
+
+@dataclass(frozen=True)
+class PayoutState:
+    """Where an installed rule stands. Replaced, never mutated."""
+
+    anchor: int                  # the clock when the rule was installed
+    period_index: int = 0        # the period `spent_in_period` belongs to
+    spent_in_period: int = 0
+    executions: int = 0
+    paid_total: int = 0
+    last_height: int = 0         # height of the last execution, 0 = never
+
+    def period_at(self, terms: PayoutTerms, clock: int) -> int:
+        return max(0, int(clock) - self.anchor) // terms.period
+
+    def spent_at(self, terms: PayoutTerms, clock: int) -> int:
+        return self.spent_in_period if self.period_index == self.period_at(terms, clock) else 0
+
+
+@dataclass(frozen=True)
+class PayoutExecution:
+    executor_pubkey: str
+    account_pubkey: str
+    rule_id: bytes
+    recipients: Tuple[Tuple[int, str], ...]   # (slot, pubkey) for open slots, sorted
+    data: Tuple[Tuple[int, int], ...]         # (k, value) for i40+k, sorted
+
+
+# --- Parsing ---------------------------------------------------------------------
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _pubkey(value: Any, what: str) -> str:
+    if not isinstance(value, str) or not _PUBKEY_RE.match(value):
+        raise PayoutShapeError(f"{what} must be 96 lowercase hex characters")
+    return value
+
+
+def _u64(fields: Dict[str, Any], name: str) -> int:
+    value = fields.get(name)
+    if not _is_int(value) or value < 0 or value > _U64_MAX:
+        raise PayoutShapeError(f"{name} must be an unsigned 64-bit integer")
+    return value
+
+
+def payout_rule_body(rule_text: Any) -> str:
+    """The body of a single `always ( ... ).` unit, by the o5 clause's own rules."""
+    from consensus.rule_offers import RuleOfferShapeError, clause_body_v1
+
+    if not isinstance(rule_text, str) or not rule_text.strip():
+        raise PayoutShapeError("rule_text must be a non-empty string")
+    if len(rule_text.encode("utf-8", "surrogatepass")) > MAX_RULE_BYTES:
+        raise PayoutShapeError(f"rule_text exceeds {MAX_RULE_BYTES} bytes")
+    try:
+        return clause_body_v1(rule_text)
+    except RuleOfferShapeError as exc:
+        raise PayoutShapeError(f"rule_text is not a single clause: {exc}") from exc
+
+
+def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> PayoutTerms:
+    body = payout_rule_body(fields.get("rule_text"))
+    slots = fields.get("slots")
+    if not isinstance(slots, list) or not 1 <= len(slots) <= MAX_SLOTS:
+        raise PayoutShapeError(f"slots must be a list of 1..{MAX_SLOTS} entries")
+    parsed: List[str] = []
+    for k, slot in enumerate(slots):
+        if slot == "":
+            parsed.append("")
+        else:
+            parsed.append(_pubkey(slot, f"slots[{k}]"))
+    present = [(n, kind) for n, kind in PERIOD_FIELDS if fields.get(n) is not None]
+    if len(present) != 1:
+        raise PayoutShapeError("exactly one of period_blocks and period_seconds is required")
+    name, kind = present[0]
+    return PayoutTerms(
+        account_pubkey=account,
+        sequence_number=sequence,
+        body=body,
+        slots=tuple(parsed),
+        cap_per_execution=_u64(fields, "cap_per_execution"),
+        cap_per_period=_u64(fields, "cap_per_period"),
+        kind=kind,
+        period=_u64(fields, name),
+        expires_at=_u64(fields, "expires_at"),
+    )
+
+
+SPEC_FIELDS = ("rule_text", "slots", "cap_per_execution", "cap_per_period",
+               "period_blocks", "period_seconds", "expires_at")
+
+
+def parse_payout_rule_set(tx: Dict[str, Any]) -> PayoutTerms:
+    """Read a payout rule from ROOT fields only; a nested `payload` is unsigned."""
+    if not isinstance(tx, dict):
+        raise PayoutShapeError("transaction must be an object")
+    account = _pubkey(tx.get("sender_pubkey"), "sender_pubkey")
+    sequence = _u64(tx, "sequence_number")
+    return _terms_from_fields(tx, account, sequence)
+
+
+def payout_spec_text(fields: Dict[str, Any], sequence_number: Optional[int] = None) -> str:
+    """CONSENSUS-FROZEN. The canonical text of a payout rule's terms: sorted keys,
+    no spaces. A rule-change request (kind 6) carries it as `rule_text` without
+    a sequence number; the request's stored body adds the request's own
+    sequence number, which then enters the installed rule's id."""
+    spec = {k: fields[k] for k in SPEC_FIELDS if fields.get(k) is not None}
+    if sequence_number is not None:
+        spec["sequence_number"] = int(sequence_number)
+    return json.dumps(spec, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def parse_payout_spec(text: Any, account: str,
+                      sequence_number: Optional[int] = None) -> PayoutTerms:
+    """Terms from canonical spec text. Refuses any text that is not exactly its
+    own canonical form, so one set of terms has one body hash and one request
+    id. The sequence number comes from the text (a stored body) or from the
+    caller (a request as sent), never from both."""
+    if not isinstance(text, str):
+        raise PayoutShapeError("payout spec must be a string")
+    try:
+        fields = json.loads(text)
+    except ValueError as exc:
+        raise PayoutShapeError(f"payout spec is not JSON: {exc}") from exc
+    if not isinstance(fields, dict) or set(fields) - set(SPEC_FIELDS) - {"sequence_number"}:
+        raise PayoutShapeError(f"payout spec may carry only {', '.join(SPEC_FIELDS)}")
+    stored = fields.get("sequence_number")
+    if (stored is None) == (sequence_number is None):
+        raise PayoutShapeError("payout spec needs exactly one sequence number")
+    if payout_spec_text(fields, stored) != text:
+        raise PayoutShapeError("payout spec is not in canonical form")
+    sequence = stored if stored is not None else sequence_number
+    if not _is_int(sequence) or not 0 <= sequence <= _U64_MAX:
+        raise PayoutShapeError("sequence_number must be an unsigned 64-bit integer")
+    return _terms_from_fields(fields, account, sequence)
+
+
+def parse_payout_rule_revoke(tx: Dict[str, Any]) -> str:
+    if not isinstance(tx, dict):
+        raise PayoutShapeError("transaction must be an object")
+    return _pubkey(tx.get("sender_pubkey"), "sender_pubkey")
+
+
+def parse_payout_execute(tx: Dict[str, Any]) -> PayoutExecution:
+    if not isinstance(tx, dict):
+        raise PayoutShapeError("transaction must be an object")
+    executor = _pubkey(tx.get("sender_pubkey"), "sender_pubkey")
+    account = _pubkey(tx.get("account_pubkey"), "account_pubkey")
+    raw_id = tx.get("rule_id")
+    if not isinstance(raw_id, str) or not _ID_RE.match(raw_id):
+        raise PayoutShapeError("rule_id must be 64 lowercase hex characters")
+    recipients = tx.get("recipients")
+    if recipients is None:
+        recipients = {}
+    if not isinstance(recipients, dict) or len(recipients) > MAX_SLOTS:
+        raise PayoutShapeError(f"recipients must map at most {MAX_SLOTS} slots to keys")
+    named: List[Tuple[int, str]] = []
+    for key, value in recipients.items():
+        if not isinstance(key, str) or not key.isdigit() or int(key) >= MAX_SLOTS \
+                or str(int(key)) != key:
+            raise PayoutShapeError(f"recipients keys must be slot numbers 0..{MAX_SLOTS - 1}")
+        named.append((int(key), _pubkey(value, f"recipients[{key}]")))
+    data = tx.get("data")
+    if data is None:
+        data = {}
+    if not isinstance(data, dict) or len(data) > MAX_DATA:
+        raise PayoutShapeError(f"data must map at most {MAX_DATA} inputs to values")
+    values: List[Tuple[int, int]] = []
+    for key, value in data.items():
+        if not isinstance(key, str) or not key.isdigit() or int(key) >= MAX_DATA \
+                or str(int(key)) != key:
+            raise PayoutShapeError(f"data keys must be 0..{MAX_DATA - 1} (input i{DATA_BASE}+k)")
+        if not _is_int(value) or not 0 <= value <= tau_defs.MAX_TRANSFER_VALUE:
+            raise PayoutShapeError(f"data values must be integers 0..{tau_defs.MAX_TRANSFER_VALUE}")
+        values.append((int(key), value))
+    return PayoutExecution(executor, account, bytes.fromhex(raw_id),
+                           tuple(sorted(named)), tuple(sorted(values)))
+
+
+# --- Screens ---------------------------------------------------------------------
+
+
+def screen_payout_body(body: str, slot_count: int) -> Optional[str]:
+    """None when the body fits the payout ABI, else why not. Shared by admission,
+    apply and the rule-change release."""
+    from consensus.admission import screen_temporal_rule
+    from consensus.rule_offers import screen_clause_structure, strip_clause_comments
+
+    temporal = screen_temporal_rule(body)
+    if temporal:
+        return temporal
+    scrubbed = strip_clause_comments(body)
+    seen: Dict[str, int] = {}
+    for match in _MENTION_RE.finditer(scrubbed):
+        name = f"{match.group(1)}{match.group(2)}"
+        typed = _TYPED_RE.match(scrubbed, match.end())
+        if typed is None:
+            return f"every mention of {name} must be written {name}[t]:bv[<width>]"
+        want = abi_width(name, slot_count)
+        if want is None:
+            return f"{name} is not part of the payout ABI for {slot_count} slot(s)"
+        width = int(typed.group(1))
+        if width != want:
+            return f"{name} must be bv[{want}] in a payout rule, not bv[{width}]"
+        seen[name] = width
+    if not any(n.startswith("o") for n in seen):
+        return "a payout rule must write at least one slot amount (o30..)"
+    if not any(n.startswith("i") for n in seen):
+        return "a payout rule must read at least one input"
+    return screen_clause_structure(body)
+
+
+def validate_terms_shape(terms: PayoutTerms, height: int, ts: int) -> Optional[str]:
+    """Stateless admissibility of terms against the block that installs them."""
+    screened = screen_payout_body(terms.body, len(terms.slots))
+    if screened:
+        return screened
+    fixed = [s for s in terms.slots if s]
+    if terms.account_pubkey in fixed:
+        return "a slot may not pay the account itself"
+    if len(set(fixed)) != len(fixed):
+        return "a fixed recipient may appear in one slot only"
+    if not 1 <= terms.cap_per_execution <= tau_defs.MAX_TRANSFER_VALUE:
+        return f"cap_per_execution must be in 1..{tau_defs.MAX_TRANSFER_VALUE}"
+    if not terms.cap_per_execution <= terms.cap_per_period <= tau_defs.MAX_TRANSFER_VALUE:
+        return f"cap_per_period must be in cap_per_execution..{tau_defs.MAX_TRANSFER_VALUE}"
+    if terms.kind == KIND_BLOCKS:
+        hi, now, life = MAX_PERIOD_BLOCKS, height, MAX_LIFETIME_BLOCKS
+    else:
+        hi, now, life = MAX_PERIOD_SECONDS, ts, MAX_LIFETIME_SECONDS
+    if not 1 <= terms.period <= hi:
+        return f"the period must be in 1..{hi} {KIND_NAMES[terms.kind]}"
+    if terms.expires_at <= now:
+        return "expires_at must be in the future"
+    if terms.expires_at > now + life:
+        return f"expires_at is more than {life} {KIND_NAMES[terms.kind]} ahead"
+    return None
+
+
+# --- Evaluation ------------------------------------------------------------------
+
+
+def _key_literal(pubkey: str) -> str:
+    return "{ #x" + pubkey + " }:bv[%d]" % KEY_WIDTH
+
+
+def execution_inputs(terms: PayoutTerms, state: PayoutState, exe: PayoutExecution, *,
+                     parent_balance: int, height: int, ts: int) -> Dict[int, str]:
+    """The payout ABI input map for one execution (stream index -> value)."""
+    named = dict(exe.recipients)
+    data = dict(exe.data)
+    values: Dict[int, str] = {
+        STREAM_BALANCE: str(max(0, min(int(parent_balance), tau_defs.MAX_TRANSFER_VALUE))),
+        STREAM_TIME: str(int(ts)),
+        STREAM_HEIGHT: str(int(height)),
+        STREAM_EXECUTOR: _key_literal(exe.executor_pubkey),
+        STREAM_SPENT: str(state.spent_at(terms, terms.clock(height, ts))),
+    }
+    for k, slot in enumerate(terms.slots):
+        who = slot or named.get(k, "")
+        values[SLOT_BASE + k] = _key_literal(who) if who else "0"
+    for k in range(MAX_DATA):
+        values[DATA_BASE + k] = str(data.get(k, 0))
+    return values
+
+
+def parse_amount(value: Any) -> int:
+    """An output value as an integer; absent is 0."""
+    from tau_policy import parse_o5
+
+    if value is None:
+        return 0
+    parsed = parse_o5(str(value))
+    return 0 if parsed is None else int(parsed)
+
+
+def settle(terms: PayoutTerms, state: PayoutState, exe: PayoutExecution,
+           outputs: Dict[str, Any], *, height: int, ts: int,
+           balance: int) -> List[Tuple[int, str, int]]:
+    """The legs (slot, recipient, amount) of one execution, or PayoutRefused.
+
+    All or none: every check runs before anything moves.
+    """
+    named = dict(exe.recipients)
+    legs: List[Tuple[int, str, int]] = []
+    for k, slot in enumerate(terms.slots):
+        amount = parse_amount(outputs.get(f"o{SLOT_BASE + k}"))
+        if amount <= 0:
+            continue
+        who = slot or named.get(k)
+        if not who:
+            raise PayoutRefused(f"the rule pays open slot {k}, but no recipient was named")
+        legs.append((k, who, amount))
+    total = sum(a for _, _, a in legs)
+    if total <= 0:
+        raise PayoutRefused("the rule pays nothing for these inputs")
+    if total > terms.cap_per_execution:
+        raise PayoutRefused(
+            f"the rule pays {total}, over the cap per execution {terms.cap_per_execution}")
+    spent = state.spent_at(terms, terms.clock(height, ts))
+    if spent + total > terms.cap_per_period:
+        raise PayoutRefused(
+            f"the rule pays {total}; with {spent} paid this period that is over "
+            f"the cap per period {terms.cap_per_period}")
+    if total > balance:
+        raise PayoutRefused(f"the rule pays {total}, the account holds {balance}")
+    return legs
+
+
+# --- The book --------------------------------------------------------------------
+
+_Row = Tuple[bytes, str, int, str, Tuple[str, ...], int, int, int, int, int,
+             int, int, int, int, int, int]
+
+
+class PayoutBook:
+    """One installed rule per account. Copies share the frozen terms and states."""
+
+    def __init__(self) -> None:
+        self.terms: Dict[str, PayoutTerms] = {}
+        self.state: Dict[str, PayoutState] = {}
+        # (expires_at, account), sorted, per clock.
+        self._expiry: Dict[int, List[Tuple[int, str]]] = {KIND_BLOCKS: [], KIND_SECONDS: []}
+        self.resolved_count = 0
+        self.resolved_acc = ZERO_ACC
+        self._root: Optional[bytes] = None
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "PayoutBook":
+        clone = PayoutBook.__new__(PayoutBook)
+        clone.terms = dict(self.terms)
+        clone.state = dict(self.state)
+        clone._expiry = {k: list(rows) for k, rows in self._expiry.items()}
+        clone.resolved_count = self.resolved_count
+        clone.resolved_acc = self.resolved_acc
+        clone._root = self._root
+        memo[id(self)] = clone
+        return clone
+
+    @classmethod
+    def restore(cls, rows: Iterable[Tuple], resolved_count: int,
+                resolved_acc: bytes) -> "PayoutBook":
+        """Rebuild from stored rows (account, sequence, body, slots, caps, kind,
+        period, expires_at, rule_id, anchor, state...); refuses a row whose id
+        does not recompute or whose state is impossible."""
+        if not isinstance(resolved_acc, (bytes, bytearray)) or len(resolved_acc) != 32:
+            raise ValueError("resolved_acc must be 32 bytes")
+        if not _is_int(resolved_count) or resolved_count < 0:
+            raise ValueError("resolved_count must be a non-negative integer")
+        book = cls()
+        for row in rows:
+            (stored_id, account, sequence, body, slots, cap_exec, cap_period, kind,
+             period, expires_at, anchor, period_index, spent, executions, paid_total,
+             last_height) = row
+            if kind not in KIND_NAMES:
+                raise ValueError("stored payout rule has an unknown period clock")
+            if not (_is_int(period) and period >= 1):
+                raise ValueError("stored payout rule has a bad period")
+            terms = PayoutTerms(account, sequence, body, tuple(slots), cap_exec,
+                                cap_period, kind, period, expires_at)
+            rid = terms.rule_id
+            if rid != bytes(stored_id):
+                raise ValueError(f"stored payout rule id does not match its terms: {rid.hex()}")
+            if account in book.terms:
+                raise ValueError(f"two stored payout rules for one account: {account[:16]}")
+            state = PayoutState(anchor, period_index, spent, executions, paid_total, last_height)
+            if not all(_is_int(v) and v >= 0 for v in (anchor, period_index, spent,
+                                                        executions, paid_total, last_height)):
+                raise ValueError(f"stored payout rule has bad progress: {rid.hex()}")
+            if spent > cap_period or (executions == 0) != (paid_total == 0):
+                raise ValueError(f"stored payout rule has inconsistent progress: {rid.hex()}")
+            book._insert(terms, state)
+        book.resolved_count = resolved_count
+        book.resolved_acc = bytes(resolved_acc)
+        return book
+
+    # -- internals ---------------------------------------------------------------
+
+    def _insert(self, terms: PayoutTerms, state: PayoutState) -> None:
+        self.terms[terms.account_pubkey] = terms
+        self.state[terms.account_pubkey] = state
+        bisect.insort(self._expiry[terms.kind], (terms.expires_at, terms.account_pubkey))
+        self._root = None
+
+    def _remove(self, account: str, outcome: int) -> PayoutTerms:
+        terms = self.terms.pop(account)
+        del self.state[account]
+        rows = self._expiry[terms.kind]
+        del rows[bisect.bisect_left(rows, (terms.expires_at, account))]
+        self.resolved_acc = compute_payout_resolved_acc(self.resolved_acc, terms.rule_id, outcome)
+        self.resolved_count += 1
+        self._root = None
+        return terms
+
+    # -- queries -----------------------------------------------------------------
+
+    def _row(self, account: str) -> _Row:
+        t, s = self.terms[account], self.state[account]
+        return (t.rule_id, t.account_pubkey, t.sequence_number, t.body_hash, t.slots,
+                t.cap_per_execution, t.cap_per_period, t.kind, t.period, t.expires_at,
+                s.anchor, s.period_index, s.spent_in_period, s.executions,
+                s.paid_total, s.last_height)
+
+    def root(self) -> bytes:
+        if self._root is None:
+            self._root = compute_payout_book_root(
+                [self._row(a) for a in self.terms], self.resolved_count, self.resolved_acc)
+        return self._root
+
+    def is_empty(self) -> bool:
+        """True while the book has never held a rule (it then stays out of the hash)."""
+        return not self.terms and self.resolved_count == 0
+
+    def get(self, account: str) -> Optional[PayoutTerms]:
+        return self.terms.get(account)
+
+    def state_of(self, account: str) -> Optional[PayoutState]:
+        return self.state.get(account)
+
+    def count(self) -> int:
+        return len(self.terms)
+
+    def has_expiring(self, height: int, ts: int) -> bool:
+        h, t = self._expiry[KIND_BLOCKS], self._expiry[KIND_SECONDS]
+        return bool((h and h[0][0] <= height) or (t and t[0][0] <= ts))
+
+    def store_rows(self) -> List[Tuple]:
+        """Rows for persistence: the body text instead of its hash."""
+        out = []
+        for account in sorted(self.terms):
+            t, s = self.terms[account], self.state[account]
+            out.append((t.rule_id, account, t.sequence_number, t.body, t.slots,
+                        t.cap_per_execution, t.cap_per_period, t.kind, t.period,
+                        t.expires_at, s.anchor, s.period_index, s.spent_in_period,
+                        s.executions, s.paid_total, s.last_height))
+        return out
+
+    def resolved_state(self) -> Tuple[int, bytes]:
+        return self.resolved_count, self.resolved_acc
+
+    # -- admission ---------------------------------------------------------------
+
+    def can_admit_set(self, terms: PayoutTerms, height: int, ts: int) -> Tuple[bool, str]:
+        reason = validate_terms_shape(terms, height, ts)
+        if reason:
+            return False, reason
+        current = self.terms.get(terms.account_pubkey)
+        if current is not None and current.rule_id == terms.rule_id:
+            return False, "this payout rule is already installed"
+        if current is None and len(self.terms) >= MAX_PAYOUT_RULES_TOTAL:
+            return False, "the payout rule book is full"
+        return True, ""
+
+    def can_admit_revoke(self, account: str) -> Tuple[bool, str]:
+        if account not in self.terms:
+            return False, "the account has no payout rule"
+        return True, ""
+
+    def check_execution(self, exe: PayoutExecution, height: int,
+                        ts: int) -> Tuple[PayoutTerms, PayoutState]:
+        """The installed rule and its state for this execution, or PayoutRefused."""
+        terms = self.terms.get(exe.account_pubkey)
+        if terms is None:
+            raise PayoutRefused("the account has no payout rule")
+        if terms.rule_id != exe.rule_id:
+            raise PayoutRefused("the account's payout rule is not the one named")
+        if terms.clock(height, ts) >= terms.expires_at:
+            raise PayoutRefused("the payout rule has expired")
+        for k, who in exe.recipients:
+            if k >= len(terms.slots):
+                raise PayoutRefused(f"slot {k} does not exist")
+            if terms.slots[k]:
+                raise PayoutRefused(f"slot {k} has a fixed recipient")
+            if who == terms.account_pubkey:
+                raise PayoutRefused("a slot may not pay the account itself")
+        return terms, self.state[exe.account_pubkey]
+
+    # -- mutation ----------------------------------------------------------------
+
+    def install(self, terms: PayoutTerms, anchor: int) -> Optional[bytes]:
+        """Install `terms`; the id of a rule it replaced, else None."""
+        replaced = None
+        if terms.account_pubkey in self.terms:
+            replaced = self._remove(terms.account_pubkey, OUTCOME_REPLACED).rule_id
+        self._insert(terms, PayoutState(anchor=int(anchor)))
+        return replaced
+
+    def revoke(self, account: str) -> PayoutTerms:
+        if account not in self.terms:
+            raise KeyError(account)
+        return self._remove(account, OUTCOME_REVOKED)
+
+    def record(self, account: str, total: int, height: int, ts: int) -> PayoutState:
+        terms, state = self.terms[account], self.state[account]
+        clock = terms.clock(height, ts)
+        index = state.period_at(terms, clock)
+        spent = state.spent_at(terms, clock)
+        state = replace(state, period_index=index, spent_in_period=spent + total,
+                        executions=state.executions + 1,
+                        paid_total=state.paid_total + total, last_height=int(height))
+        self.state[account] = state
+        self._root = None
+        return state
+
+    def expire(self, height: int, ts: int) -> List[PayoutTerms]:
+        """Remove every rule whose end this block reached, earliest first."""
+        gone: List[PayoutTerms] = []
+        for kind, clock in ((KIND_BLOCKS, height), (KIND_SECONDS, ts)):
+            rows = self._expiry[kind]
+            while rows and rows[0][0] <= clock:
+                gone.append(self._remove(rows[0][1], OUTCOME_EXPIRED))
+        return gone
+
+
+def describe(terms: PayoutTerms, state: PayoutState, *, height: int = 0,
+             ts: int = 0) -> Dict[str, Any]:
+    """One installed rule as a wallet reads it."""
+    clock = terms.clock(height, ts) if (height or ts) else None
+    spent = state.spent_at(terms, clock) if clock is not None else state.spent_in_period
+    return {
+        "rule_id": terms.rule_id.hex(),
+        "account_pubkey": terms.account_pubkey,
+        "sequence_number": terms.sequence_number,
+        "rule_text": f"always ( {terms.body} ).",
+        "rule_sha256": hashlib.sha256(terms.body.encode("utf-8")).hexdigest(),
+        "slots": [{"slot": k, "recipient_pubkey": s or None, "open": not s}
+                  for k, s in enumerate(terms.slots)],
+        "cap_per_execution": terms.cap_per_execution,
+        "cap_per_period": terms.cap_per_period,
+        "period_clock": KIND_NAMES[terms.kind],
+        "period": terms.period,
+        "anchor": state.anchor,
+        "expires_at": terms.expires_at,
+        "spent_this_period": spent,
+        "left_this_period": terms.cap_per_period - spent,
+        "executions": state.executions,
+        "paid_total": state.paid_total,
+        "last_height": state.last_height or None,
+    }

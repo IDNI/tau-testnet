@@ -186,6 +186,47 @@ def _drop_sequence_gap_orphans(transactions, execution_transactions, reserved_id
     return dropped_ids
 
 
+def _defer_payout_overflow(transactions, execution_transactions, reserved_ids):
+    """Keep at most MAX_PAYOUT_EXECUTIONS_PER_BLOCK payout executions in the batch.
+
+    Apply refuses the executions over the per-block cap, and a refused
+    transaction is disposed with the block, i.e. a valid execution would be
+    destroyed only because the block was full. Leave the overflow, and every
+    later transaction of its senders (their sequence would gap), in the mempool
+    for the next block instead. All three lists are mutated in lockstep.
+    """
+    from consensus.payout import MAX_PAYOUT_EXECUTIONS_PER_BLOCK, TX_TYPE_PAYOUT_EXECUTE
+
+    kept, held_senders, dropped_ids = 0, set(), []
+    for i in range(len(transactions)):
+        tx = transactions[i]
+        if not isinstance(tx, dict):
+            continue
+        sender = tx.get("sender_pubkey")
+        if sender in held_senders:
+            dropped_ids.append(i)
+            continue
+        if tx.get("tx_type") == TX_TYPE_PAYOUT_EXECUTE:
+            if kept >= MAX_PAYOUT_EXECUTIONS_PER_BLOCK:
+                held_senders.add(sender)
+                dropped_ids.append(i)
+            else:
+                kept += 1
+    held = [reserved_ids[i] for i in dropped_ids]
+    for i in reversed(dropped_ids):
+        del transactions[i]
+        del execution_transactions[i]
+        del reserved_ids[i]
+    if held:
+        print(f"[INFO][createblock] Deferred {len(held)} tx(s) over the per-block "
+              "payout execution cap")
+        try:
+            db.unreserve_mempool_txs(held)
+        except Exception:
+            pass
+    return held
+
+
 def _restore_per_sender_sequence_order(transactions, execution_transactions, reserved_ids):
     """
     reserve_mempool_txs orders by fee priority, which can place a sender's
@@ -617,6 +658,7 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
     # the block, so drop such orphans here and let them wait for their
     # predecessor instead.
     _drop_sequence_gap_orphans(transactions, execution_transactions, filtered_reserved_ids)
+    _defer_payout_overflow(transactions, execution_transactions, filtered_reserved_ids)
 
     if not transactions and not empty_ok:
         msg = "Mempool has no contiguous-sequence txs; no block produced."

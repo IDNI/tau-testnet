@@ -8,6 +8,7 @@ from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.retractable import RetractableBook
 from consensus.standing import StandingBook
+from consensus.payout import PayoutBook
 
 logger = logging.getLogger(__name__)
 from consensus.approvals import (
@@ -200,6 +201,7 @@ def build_mechanism_metadata(
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
     standing_payments_root: str = "",
+    payout_rules_root: str = "",
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -253,6 +255,9 @@ def build_mechanism_metadata(
     # silently.
     if standing_payments_root:
         mech["standing_payments_root"] = standing_payments_root
+    # Payout rules (#63): the same gate, for the same reason.
+    if payout_rules_root:
+        mech["payout_rules_root"] = payout_rules_root
     return mech
 
 
@@ -463,6 +468,8 @@ class ConsensusLifecycleManager:
         self.retractable_transfers = RetractableBook()
         # Standing payments (#34). A FIELD for the same reason rule_offers is.
         self.standing_payments = StandingBook()
+        # Payout rules (#63). A FIELD for the same reason rule_offers is.
+        self.payout_rules = PayoutBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
@@ -561,6 +568,10 @@ class ConsensusLifecycleManager:
             standing_payments_root=(
                 "" if self.standing_payments.is_empty()
                 else self.standing_payments.root().hex()
+            ),
+            payout_rules_root=(
+                "" if self.payout_rules.is_empty()
+                else self.payout_rules.root().hex()
             ),
         )
         return compute_consensus_meta_hash(

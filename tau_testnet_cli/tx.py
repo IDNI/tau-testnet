@@ -594,12 +594,14 @@ def build_rule_change_request_tx(
     """Construct a ``tx_type='rule_change_request'`` payload (without signature).
 
     Kinds 1 and 4 carry the clause in ``rule_text``; kind 3 carries the exact
-    offered text and the offer id; kinds 2 and 5 carry neither. Zero approvers is
+    offered text and the offer id; kind 6 carries a payout rule's canonical spec
+    text (``payout_spec_text`` without a sequence number); kinds 2, 5 and 7
+    carry neither. Zero approvers is
     valid: the time escape alone can release the request.
     """
-    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5):
-        raise ValueError("kind must be 1..5")
-    has_body = kind in (1, 3, 4)
+    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5, 6, 7):
+        raise ValueError("kind must be 1..7")
+    has_body = kind in (1, 3, 4, 6)
     if has_body and not (isinstance(rule_text, str) and rule_text.strip()):
         raise ValueError("this kind needs a non-empty rule text")
     if not has_body and rule_text:
@@ -865,4 +867,110 @@ def build_standing_payment_cancel_tx(
         "expire_at_height": _check_expire_at_height(expire_at_height),
         "fee_limit": str(fee_limit),
         "standing_id": standing_id.lower(),
+    }
+
+
+def build_payout_rule_set_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    rule_text: str,
+    slots: list,
+    cap_per_execution: int,
+    cap_per_period: int,
+    expires_at: int,
+    period_blocks: int | None = None,
+    period_seconds: int | None = None,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='payout_rule_set'`` payload (without signature).
+
+    ``slots`` lists one entry per slot: a recipient's 96-hex key, or "" for an
+    open slot the executor names. ``expires_at`` is on the period's clock: a
+    height with ``period_blocks``, a unix time with ``period_seconds``.
+    """
+    if (period_blocks is None) == (period_seconds is None):
+        raise ValueError("give exactly one of period_blocks and period_seconds")
+    clean = []
+    for k, slot in enumerate(slots or []):
+        if slot in ("", None, "open"):
+            clean.append("")
+        elif isinstance(slot, str) and len(slot) == 96:
+            clean.append(slot.lower())
+        else:
+            raise ValueError(f"slot {k} must be a 96-hex public key or open")
+    tx = {
+        "tx_type": "payout_rule_set",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "rule_text": rule_text,
+        "slots": clean,
+        "cap_per_execution": int(cap_per_execution),
+        "cap_per_period": int(cap_per_period),
+        "expires_at": int(expires_at),
+    }
+    if period_blocks is not None:
+        tx["period_blocks"] = int(period_blocks)
+    else:
+        tx["period_seconds"] = int(period_seconds)
+    return tx
+
+
+def build_payout_rule_revoke_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='payout_rule_revoke'`` payload (without signature). Feeless."""
+    return {
+        "tx_type": "payout_rule_revoke",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+    }
+
+
+def build_payout_execute_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    account_pubkey: str,
+    rule_id: str,
+    recipients: dict | None = None,
+    data: dict | None = None,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='payout_execute'`` payload (without signature).
+
+    ``rule_id`` pins the exact rule: if the account replaced its rule since,
+    the execution is refused instead of running the new one. ``recipients``
+    names keys for open slots ({slot: pubkey}); ``data`` fills i40+k ({k: value}).
+    """
+    if not isinstance(account_pubkey, str) or len(account_pubkey) != 96:
+        raise ValueError("account_pubkey must be a 96-character hex public key")
+    if not isinstance(rule_id, str) or len(rule_id) != 64:
+        raise ValueError("rule_id must be a 64-character hex string")
+    return {
+        "tx_type": "payout_execute",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "account_pubkey": account_pubkey.lower(),
+        "rule_id": rule_id.lower(),
+        "recipients": {str(int(k)): v.lower() for k, v in (recipients or {}).items()},
+        "data": {str(int(k)): int(v) for k, v in (data or {}).items()},
     }
