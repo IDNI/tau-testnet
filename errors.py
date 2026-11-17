@@ -78,6 +78,14 @@ class EvaluatorLost(TauTestnetError):
         self.timed_out = timed_out
 
 
+class BlockByteCapExceeded(ValueError):
+    """Stored block JSON exceeds the consensus ``MAX_BLOCK_BYTES`` limit."""
+
+
+class BlockNumberInvalid(ValueError):
+    """Block JSON holds a float or an integer outside the consensus range."""
+
+
 class BlockchainBug(TauTestnetError):
     """Raised for internal errors, invalid states, or unhandled exceptions in the Python blockchain routing/logic."""
 

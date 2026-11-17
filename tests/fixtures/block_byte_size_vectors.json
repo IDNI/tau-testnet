@@ -1,0 +1,173 @@
+{
+  "max_block_bytes": 18874368,
+  "vectors": [
+    {
+      "id": "empty",
+      "block_json": "{\"header\": {\"block_number\": 1, \"previous_hash\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"timestamp\": 1700000000, \"merkle_root\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\", \"proposer_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"state_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"state_locator\": \"\"}, \"transactions\": [], \"block_hash\": \"cdcc07d0ac37e3a3ef11b4860cd6afe71d0e77b955f6e1a2acae15411db27516\", \"consensus_proof\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"tx_ids\": []}",
+      "byte_count": 777
+    },
+    {
+      "id": "unicode",
+      "block_json": "{\"header\": {\"block_number\": 2, \"previous_hash\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"timestamp\": 1700000000, \"merkle_root\": \"096340421f201b7cd229fd2ac13393c0a0242b29b772183a112cd9f188892562\", \"proposer_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"state_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"state_locator\": \"\"}, \"transactions\": [{\"tx_type\": \"user_tx\", \"note\": \"caf\\u00e9\", \"emoji\": \"\\ud83c\\udf0d\", \"sender_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"sequence_number\": 0}], \"block_hash\": \"9a11d0b69f9d35349cb42e223db30723c5a74eeeb09e02b4fab851342f353868\", \"consensus_proof\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"tx_ids\": [\"096340421f201b7cd229fd2ac13393c0a0242b29b772183a112cd9f188892562\"]}",
+      "byte_count": 1050
+    },
+    {
+      "id": "escapes",
+      "block_json": "{\"header\": {\"block_number\": 3, \"previous_hash\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"timestamp\": 1700000000, \"merkle_root\": \"a8f895dd6855458922b65b32c5c5ee074dadf596e0829154b5389888c482f2b6\", \"proposer_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"state_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"state_locator\": \"\"}, \"transactions\": [{\"tx_type\": \"user_tx\", \"quote\": \"\\\"\", \"backslash\": \"\\\\\", \"controls\": \"\\n\\t\\r\", \"sender_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}], \"block_hash\": \"f821c5a5f32e93571a4249cd9c37931fde73ba64268c133bd30e7eeb2f8f991b\", \"consensus_proof\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"tx_ids\": [\"a8f895dd6855458922b65b32c5c5ee074dadf596e0829154b5389888c482f2b6\"]}",
+      "byte_count": 1038
+    },
+    {
+      "id": "escape_b",
+      "block_json": "{\"header\": {\"block_number\": 10, \"previous_hash\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"timestamp\": 1700000000, \"merkle_root\": \"0ee949fd5c6336f536985f0b8bcd6bee0932112bcd8c1a2b7af5a33791275c5e\", \"proposer_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"state_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"state_locator\": \"\"}, \"transactions\": [{\"tx_type\": \"user_tx\", \"c\": \"\\b\", \"sender_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}], \"block_hash\": \"3072d02a1c5a52d350a177a89296fe747660aaf5241f74815154ce5fd8ffc9c5\", \"consensus_proof\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"tx_ids\": [\"0ee949fd5c6336f536985f0b8bcd6bee0932112bcd8c1a2b7af5a33791275c5e\"]}",
+      "byte_count": 994
+    },
+    {
+      "id": "escape_f",
+      "block_json": "{\"header\": {\"block_number\": 10, \"previous_hash\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"timestamp\": 1700000000, \"merkle_root\": \"8161e2a95a6642d98091f70dbe1b4587ad0e157455120c7bedca5e86e67a825f\", \"proposer_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"state_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"state_locator\": \"\"}, \"transactions\": [{\"tx_type\": \"user_tx\", \"c\": \"\\f\", \"sender_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}], \"block_hash\": \"792c6b9196532b7f9327167543f8a6392b0558a235ff207a20a545a394a38a0a\", \"consensus_proof\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"tx_ids\": [\"8161e2a95a6642d98091f70dbe1b4587ad0e157455120c7bedca5e86e67a825f\"]}",
+      "byte_count": 994
+    },
+    {
+      "id": "escape_u0001",
+      "block_json": "{\"header\": {\"block_number\": 10, \"previous_hash\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"timestamp\": 1700000000, \"merkle_root\": \"575b03a7c2a66a6cf6215400a03dfa5eca72a309f43a53384b39edfd4776acda\", \"proposer_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"state_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"state_locator\": \"\"}, \"transactions\": [{\"tx_type\": \"user_tx\", \"c\": \"\\u0001\", \"sender_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}], \"block_hash\": \"8da9292bbf35c34ed1315471e4283fb4df84b1544129f96647bb01d590e05ae8\", \"consensus_proof\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"tx_ids\": [\"575b03a7c2a66a6cf6215400a03dfa5eca72a309f43a53384b39edfd4776acda\"]}",
+      "byte_count": 998
+    },
+    {
+      "id": "escape_u007f",
+      "block_json": "{\"header\": {\"block_number\": 10, \"previous_hash\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"timestamp\": 1700000000, \"merkle_root\": \"b35bdc7890cf6390e4eff209276412dbe5ab9ebd8f46ba0391b2fc33fc738bc3\", \"proposer_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"state_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"state_locator\": \"\"}, \"transactions\": [{\"tx_type\": \"user_tx\", \"c\": \"\\u007f\", \"sender_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}], \"block_hash\": \"e603c72bc5b80bd79410e4d4bda6ff40a306ceb5bb604068dbadf176d8eca492\", \"consensus_proof\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"tx_ids\": [\"b35bdc7890cf6390e4eff209276412dbe5ab9ebd8f46ba0391b2fc33fc738bc3\"]}",
+      "byte_count": 998
+    },
+    {
+      "id": "nested",
+      "block_json": "{\"header\": {\"block_number\": 4, \"previous_hash\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"timestamp\": 1700000000, \"merkle_root\": \"b69f4d5274a7088400d6d90a1816893726d773a755dbac385aef09701e701cb9\", \"proposer_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"state_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"state_locator\": \"\"}, \"transactions\": [{\"tx_type\": \"user_tx\", \"sender_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"operations\": {\"1\": [[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"1\"]], \"meta\": {\"k\": [1, 2, 3]}}, \"fee_limit\": \"0\"}], \"block_hash\": \"29b6bdb65c63ae9b210d2c525dce53996cb4cee44407db2fbe43ab0960414390\", \"consensus_proof\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"tx_ids\": [\"b69f4d5274a7088400d6d90a1816893726d773a755dbac385aef09701e701cb9\"]}",
+      "byte_count": 1256
+    },
+    {
+      "id": "numbers_int",
+      "block_json": "{\"header\": {\"block_number\": 5, \"previous_hash\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"timestamp\": 1700000000, \"merkle_root\": \"f73604d81993679f84bf1d0314358319569d5c32818be5a9081ddd914bd03665\", \"proposer_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"state_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"state_locator\": \"\"}, \"transactions\": [{\"tx_type\": \"user_tx\", \"sequence_number\": 42, \"fee_limit\": \"0\", \"sender_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}], \"block_hash\": \"6f7a767250040ec2085a128d81fe33dd145fa7edfc55b9561bf34cb45f403cdd\", \"consensus_proof\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"tx_ids\": [\"f73604d81993679f84bf1d0314358319569d5c32818be5a9081ddd914bd03665\"]}",
+      "byte_count": 1023
+    },
+    {
+      "id": "numbers_int_range",
+      "block_json": "{\"header\": {\"block_number\": 7, \"previous_hash\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"timestamp\": 1700000000, \"merkle_root\": \"cdf2380773a12258f04617e993acb423688ed5addc3a664845a285cd60d86ea7\", \"proposer_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"state_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"state_locator\": \"\"}, \"transactions\": [{\"tx_type\": \"user_tx\", \"sequence_number\": 0, \"fee_limit\": \"0\", \"sender_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"operations\": {\"2\": [-1, -9223372036854775808], \"meta\": 18446744073709551615}}], \"block_hash\": \"743ea9e398e5bcfe06b7c3e08ed46fa6570ab54417d6899fc5c2bc8e574a97ce\", \"consensus_proof\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"tx_ids\": [\"cdf2380773a12258f04617e993acb423688ed5addc3a664845a285cd60d86ea7\"]}",
+      "byte_count": 1101
+    },
+    {
+      "id": "extra_keys_dropped",
+      "block_json": "{\"header\": {\"block_number\": 8, \"previous_hash\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"timestamp\": 1700000000, \"merkle_root\": \"542776127bb73578aef4301752d55a1ceccb6f388dd7fb0910e63fc5023d7ac7\", \"proposer_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"state_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"state_locator\": \"\", \"relay_note\": \"hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh\"}, \"transactions\": [{\"tx_type\": \"user_tx\", \"sequence_number\": 0, \"fee_limit\": \"0\", \"sender_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}], \"block_hash\": \"a5add8e65e703a9fa7fcd7214b4106df245eb4080a254f4339c60ebf9551a186\", \"consensus_proof\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"tx_ids\": [\"542776127bb73578aef4301752d55a1ceccb6f388dd7fb0910e63fc5023d7ac7\"], \"relay_note\": \"rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr\"}",
+      "received_byte_count": 1198,
+      "byte_count": 1022
+    },
+    {
+      "id": "hex_whitespace",
+      "block_json": "{\"header\": {\"block_number\": 9, \"previous_hash\": \" bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb bb\\tBB\\nBB\\nBB\\nBB\\nBB\\nBB\\nBB\\nBB\\nBB\\nBB\\nBB\\nBB\\nBB\\nBB\\nBB\\nBB \\r\", \"timestamp\": 1700000000, \"merkle_root\": \"542776127bb73578aef4301752d55a1ceccb6f388dd7fb0910e63fc5023d7ac7\", \"proposer_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"state_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"state_locator\": \"\"}, \"transactions\": [{\"tx_type\": \"user_tx\", \"sequence_number\": 0, \"fee_limit\": \"0\", \"sender_pubkey\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}], \"block_hash\": \"acbdc7ddcba778478f5dfb1c5aa4df01a32686d1cc29364f97298ed59c2fc38e\", \"consensus_proof\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", \"tx_ids\": [\"542776127bb73578aef4301752d55a1ceccb6f388dd7fb0910e63fc5023d7ac7\"]}",
+      "byte_count": 1073,
+      "same_hash_as_previous_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "invalid_number_literals": [
+    "1.5",
+    "1e5",
+    "7.0",
+    "-0.0",
+    "1E+2",
+    "NaN",
+    "Infinity",
+    "-Infinity",
+    "18446744073709551616",
+    "-9223372036854775809"
+  ],
+  "int_header_strings": [
+    [
+      " 3 ",
+      3
+    ],
+    [
+      "\t3\n",
+      3
+    ],
+    [
+      "\u000b3\f",
+      3
+    ],
+    [
+      "\r3",
+      3
+    ],
+    [
+      "\u00853\u00a0",
+      3
+    ],
+    [
+      "\u16803\u3000",
+      3
+    ],
+    [
+      "\u20003\u200a",
+      3
+    ],
+    [
+      "\u20283\u2029",
+      3
+    ],
+    [
+      "\u202f3\u205f",
+      3
+    ],
+    [
+      "+3",
+      3
+    ],
+    [
+      "0_3",
+      3
+    ],
+    [
+      "003",
+      3
+    ],
+    [
+      "\u0663",
+      3
+    ],
+    [
+      "\u001c3",
+      null
+    ],
+    [
+      "3\u001f",
+      null
+    ],
+    [
+      "3 3",
+      null
+    ],
+    [
+      "+ 3",
+      null
+    ],
+    [
+      "3__3",
+      null
+    ],
+    [
+      "_3",
+      null
+    ],
+    [
+      "3_",
+      null
+    ],
+    [
+      "0x3",
+      null
+    ],
+    [
+      "3.0",
+      null
+    ],
+    [
+      "--3",
+      null
+    ]
+  ]
+}
