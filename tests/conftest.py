@@ -113,6 +113,65 @@ def no_leaked_tau_manager_thread_in_module(request) -> Iterator[None]:
     _fail_on_new_tau_manager_threads(before, request.node.nodeid)
 
 
+def active_patches() -> list:
+    """Started `unittest.mock` patches that no `stop()` ended, oldest first."""
+    from unittest import mock
+
+    # Python has no public API for this list. patch.stopall() reads the same list.
+    return list(mock._patch._active_patches)
+
+
+def _describe_patch(started) -> List[str]:
+    if hasattr(started, "in_dict"):
+        if started.in_dict is os.environ:
+            return ["os.environ"]
+        return [f"dict {type(started.in_dict).__name__}"]
+    # patch.multiple keeps its other attributes in additional_patchers.
+    names = []
+    for one in [started] + list(started.additional_patchers):
+        target = getattr(one, "target", None)
+        names.append(f"{getattr(target, '__name__', type(target).__name__)}.{one.attribute}")
+    return names
+
+
+def _fail_on_new_patches(before: set, where: str) -> None:
+    leaked = [p for p in active_patches() if p not in before]
+    if not leaked:
+        return
+    names = sorted(name for p in leaked for name in _describe_patch(p))
+    # Two patches of one attribute restore the original only in reverse order.
+    for started in reversed(leaked):
+        started.stop()
+    pytest.fail(f"{where} left mock patches active: {names}", pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def no_leaked_patch(request) -> Iterator[None]:
+    """Fail a test that leaves a `unittest.mock` patch active.
+
+    A left-over patch changes the module globals of every later test.
+    """
+    before = set(active_patches())
+    yield
+    _fail_on_new_patches(before, request.node.nodeid)
+
+
+@pytest.fixture(autouse=True, scope="class")
+def no_leaked_patch_in_class(request) -> Iterator[None]:
+    """The same check for a patch that setUpClass or a class fixture starts."""
+    before = set(active_patches())
+    yield
+    _fail_on_new_patches(before, request.node.nodeid)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def no_leaked_patch_in_module(request) -> Iterator[None]:
+    """The same check for a patch that a module fixture starts."""
+    before = set(active_patches())
+    yield
+    _fail_on_new_patches(before, request.node.nodeid)
+
+
 @pytest.fixture(autouse=True)
 def reset_tau_stream_types() -> Iterator[None]:
     """Start every test from an engine that has typed no stream.
