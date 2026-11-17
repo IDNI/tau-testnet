@@ -843,6 +843,50 @@ def build_standing_payment_create_tx(
     }
 
 
+def build_standing_payment_update_tx(*, standing_id: str, **create_fields) -> dict:
+    """Construct a ``tx_type='standing_payment_update'`` payload (without signature).
+
+    Takes exactly the fields of :func:`build_standing_payment_create_tx` for the
+    NEW terms, plus the id of the authorization they replace. The new version
+    gets its own id (its terms and this transaction's sequence number); the old
+    one ends when the update lands.
+    """
+    if not isinstance(standing_id, str) or len(standing_id) != 64:
+        raise ValueError("standing_id must be a 64-character hex string")
+    payload = build_standing_payment_create_tx(**create_fields)
+    payload["tx_type"] = "standing_payment_update"
+    payload["standing_id"] = standing_id.lower()
+    return payload
+
+
+def build_standing_payment_execute_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    standing_id: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='standing_payment_execute'`` payload (without signature).
+
+    Anyone may send it. It names the authorization only: the node pays the
+    period the block falls in, from the stored terms, or refuses. The sender
+    pays the fee.
+    """
+    if not isinstance(standing_id, str) or len(standing_id) != 64:
+        raise ValueError("standing_id must be a 64-character hex string")
+    return {
+        "tx_type": "standing_payment_execute",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "standing_id": standing_id.lower(),
+    }
+
+
 def build_standing_payment_cancel_tx(
     *,
     sender_pubkey: str,

@@ -14,16 +14,21 @@ included, and on the payment history every node records)
     2. Erin's payment finds too little: `unfunded`, retried in the next block of
        the window, paid as soon as money reaches her. The next period's window
        closes unfunded: `missed`, nothing owed.
-    3. Alice cancels with `standing cancel`: fee-free, nothing is paid after it.
-    4. One network: a create signed for another network is refused at
+    3. Two strangers execute the same due period in one block: one pays it and
+       pays the fee, the other is refused and pays nothing; the sweep does not
+       pay that period again.
+    4. Alice replaces the terms with `standing update`: the old version ends
+       `replaced`, the new one (version 2) pays the new amount.
+    5. Alice cancels with `standing cancel`: fee-free, nothing is paid after it.
+    6. One network: a create signed for another network is refused at
        admission (`WRONG_NETWORK`, naming this network's genesis hash) and costs
        nothing; one whose network was rewritten after signing is refused too;
        the same create signed for this network is admitted and lands.
-    5. An idle node: node A runs its own miner, nobody sends anything, and the
+    7. An idle node: node A runs its own miner, nobody sends anything, and the
        miner's due wake seals the due block and nothing else. (A seconds
        schedule needs at least an hour per period, so the wake is shown on the
        block clock; the seconds clock is covered by the apply tests.)
-    6. Node B replays A's blocks, restarts, and ends with the same state hash,
+    8. Node B replays A's blocks, restarts, and ends with the same state hash,
        the same balances and the same answer to every standing payment read.
 
 USAGE
@@ -57,7 +62,7 @@ def outcomes(rig, sid):
 
 
 def printed_id(proc):
-    """The id the CLI prints: `standing payment id: <id>`."""
+    """The id the CLI prints: `standing payment id: [new version of <old>: ]<id>`."""
     return next((line.split()[-1] for line in (proc.stdout + proc.stderr).splitlines()
                  if line.startswith("standing payment id:")), None)
 
@@ -145,27 +150,81 @@ def scenario_unfunded(rig, ids):
     orc.verify("the missed period (nothing owed)")
 
 
-def scenario_cancel(rig, ids):
-    say("3. Alice cancels with `standing cancel`")
-    orc = Oracle(rig, "3", ("alice", "bob"))
+def scenario_execute_race(rig, ids):
+    say("3. Two strangers execute the same due period in one block")
+    orc = Oracle(rig, "3", ("alice", "bob", "carol", "dave"))
     sid = create(rig, "alice", "bob", "--amount", "500", "--periods", "3",
                  "--every-blocks", "128", "--first-due-in", "3")
-    ids["cancel"] = sid
+    ids["execute"] = sid
     rig.settle(lambda: standing(rig, sid).get("status") is not None, "the create to land")
     orc.fee("alice")
     due = int(standing(rig, sid)["first_due"])
+    rig.mine_to(due - 1)
+    outs = {}
+    for who in ("carol", "dave"):
+        proc = rig.cli("standing", "execute", "--privkey", rig.privkey(who), sid,
+                       "--fee", FEE_LIMIT)
+        outs[who] = proc
+        check(f"{who}'s execute is admitted for the period due in the next block",
+              proc.returncode == 0, proc.stdout[-300:] + proc.stderr[-300:])
+    rig.mine(empty=False)
+    hist = standing(rig, sid).get("history") or []
+    paid = [e for e in hist if e.get("outcome") == "paid"]
+    check("the period is paid exactly once", len(paid) == 1, hist)
+    winner = rig.name_of.get((paid[0] if paid else {}).get("executor_pubkey"))
+    check("the payment names the executor that paid it", winner in ("carol", "dave"), paid)
+    if winner:
+        orc.fee(winner)
+    orc.move("alice", "bob", 500)
+    orc.verify("the due block (one execute paid, the other paid nothing)")
+    rig.mine()
+    rig.mine()
+    orc.verify("later blocks of the window (the sweep pays nothing more)")
+
+
+def scenario_update(rig, ids):
+    say("4. Alice replaces the terms with `standing update`")
+    orc = Oracle(rig, "4", ("alice", "bob"))
+    old = ids["execute"]
+    row = standing(rig, old)
+    next_due = int(row["period_due"])
+    proc = rig.cli("standing", "update", old, "--privkey", rig.privkey("alice"),
+                   "--to", rig.pk["bob"], "--amount", "700", "--periods", "2",
+                   "--every-blocks", "128", "--first-due-height", str(next_due), "--fee", FEE_LIMIT)
+    new = printed_id(proc)
+    check("`standing update` prints the new version's id", proc.returncode == 0 and new,
+          proc.stdout[-400:] + proc.stderr[-400:])
+    ids["updated"] = new
+    rig.mine(empty=False)
+    orc.fee("alice")
+    old_row = standing(rig, old)
+    check("the old version ends `replaced` and names the new one",
+          old_row.get("status") == "replaced" and old_row.get("replaced_by") == new, old_row)
+    new_row = standing(rig, new)
+    check("the new version is version 2 and names the one it replaces",
+          new_row.get("version") == 2 and new_row.get("replaces") == old, new_row)
+    rig.mine_to(next_due)
+    orc.move("alice", "bob", 700)
+    orc.verify("the next due block (the new amount)")
+
+
+def scenario_cancel(rig, ids):
+    say("5. Alice cancels the new version with `standing cancel`")
+    orc = Oracle(rig, "5", ("alice", "bob"))
+    sid = ids["updated"]
+    next_due = int(standing(rig, sid)["period_due"])
     proc = rig.cli("standing", "cancel", "--privkey", rig.privkey("alice"), sid)
     check("the cancel is admitted", proc.returncode == 0, proc.stdout[-300:] + proc.stderr[-300:])
     rig.mine(empty=False)
     check("the authorization reads `cancelled`", standing(rig, sid).get("status") == "cancelled",
           standing(rig, sid))
-    rig.mine_to(due + 1)
+    rig.mine_to(next_due + 1)
     orc.verify("the cancel and the due point after it (fee-free, nothing paid)")
 
 
 def scenario_one_network(rig, ids):
-    say("4. One network: a create signed for another network is refused and costs nothing")
-    orc = Oracle(rig, "4", ("carol", "dave"))
+    say("6. One network: a create signed for another network is refused and costs nothing")
+    orc = Oracle(rig, "6", ("carol", "dave"))
     here = rig.genesis_hash()
     check("the node reports its network with the sequence (64 hex, the same on B)",
           len(here) == 64 and here == rig.genesis_hash(rig.b), (here, rig.genesis_hash(rig.b)))
@@ -214,10 +273,10 @@ def scenario_one_network(rig, ids):
 
 
 def scenario_idle_wake(rig, ids):
-    say("5. An idle node: the miner's due wake seals the due block, and only it")
+    say("7. An idle node: the miner's due wake seals the due block, and only it")
     if not rig.restart_a(TAU_MINING_ENABLED="true"):
         return
-    orc = Oracle(rig, "5", ("alice", "frank"))
+    orc = Oracle(rig, "7", ("alice", "frank"))
     sid = create(rig, "alice", "frank", "--amount", "250", "--periods", "1",
                  "--every-blocks", "128", "--first-due-in", "4")
     ids["wake"] = sid
@@ -243,7 +302,7 @@ def scenario_idle_wake(rig, ids):
 
 
 def scenario_follower(rig, ids):
-    say("6. Node B replays A's blocks, restarts, and agrees")
+    say("8. Node B replays A's blocks, restarts, and agrees")
     rig.mine()
     reads = [f"getstandingpayment {sid}" for sid in ids.values() if sid]
     reads += [f"getstandingpayments {rig.pk[n]} all" for n in ("alice", "erin", "bob", "carol")]
@@ -259,6 +318,8 @@ def run(root: str) -> int:
             rig.mine()
             scenario_sweep_and_restart(rig, ids)
             scenario_unfunded(rig, ids)
+            scenario_execute_race(rig, ids)
+            scenario_update(rig, ids)
             scenario_cancel(rig, ids)
             scenario_one_network(rig, ids)
             scenario_idle_wake(rig, ids)

@@ -450,7 +450,7 @@ connection/timeout errors.
 
 `--fee <n>` sets `fee_limit`. Without `--fee`, a fee-bearing command (`tx send`,
 `rule offer|accept|reject`, `approval request`, `retractable send`,
-`standing create`, `payout set`, `payout execute`) signs a
+`standing create|update|execute`, `payout set`, `payout execute`) signs a
 draft with `fee_limit` 0, asks the node with `checktx estimate`, and signs the
 transaction again with the estimate as `fee_limit`. The estimate does not
 depend on the draft's `fee_limit`. On `ESTIMATE_BUSY`, the CLI asks again up to
@@ -581,7 +581,8 @@ RPC replies:
 ## Standing payments
 
 Sign once to pay a fixed amount to a fixed recipient every period, until the
-last period or a cancel. Semantics are in the
+last period, a cancel or an update. Anyone may execute the period that is due
+now. Semantics are in the
 [README](../README.md#standing-payments).
 Long-form guide: [standing_payments.md](standing_payments.md).
 
@@ -591,8 +592,14 @@ tau-testnet standing create --key alice --to <pk> --amount 10 --periods 52 --eve
 tau-testnet standing create --key alice --to <pk> --amount 5 --periods 10 --every-blocks 1000 --first-due-in 50
 tau-testnet standing list --key alice --role out
 tau-testnet standing show <standing_id>
+tau-testnet standing execute --key bob <standing_id>
+tau-testnet standing update --key alice <standing_id> --to <pk> --amount 30 --periods 12 --every-months 1 --first-due-time 1801440000
 tau-testnet standing cancel --key alice <standing_id>
 ```
+
+`update` takes the id it replaces and exactly the flags of `create` for the new
+terms, and prints the new version's id. `execute` takes only the id; any key may
+send it and pays its fee.
 
 Exactly one of `--every-blocks`, `--every-seconds`, `--every-months`, and one
 first-due flag: `--first-due-height` or `--first-due-in` for a block schedule,
@@ -607,6 +614,8 @@ Raw transactions (root fields only; a nested `payload` is ignored):
 | `tx_type` | Signed fields beyond the envelope |
 |---|---|
 | `standing_payment_create` | `genesis_hash`, `recipient_pubkey`, `amount`, exactly one of `interval_blocks` / `interval_seconds` / `interval_months`, `first_due`, `periods` |
+| `standing_payment_update` | `genesis_hash`, `standing_id` (the version it replaces) and the fields of a create |
+| `standing_payment_execute` | `genesis_hash`, `standing_id`; any sender |
 | `standing_payment_cancel` | `genesis_hash`, `standing_id` (feeless) |
 
 RPC replies:
@@ -615,11 +624,13 @@ RPC replies:
   or receives, each with its terms, current period window, `status`
   `waiting`/`due`/`retrying` and counts), `block_hash`, and `semantics` (the
   node's rules and limits for the feature).
-- `getstandingpayment` returns the open entry with its `history`, or
-  `{standing_id, status: "ended"|"cancelled", resolved_at_height, history}` once
-  resolved on the canonical chain, or `STANDING_PAYMENT_UNKNOWN`.
-- `gettxstatus` adds `standing: {id, status}` to a confirmed create and
-  `cancels` to a confirmed cancel.
+- `getstandingpayment` returns the open entry (with `version` and `replaces`)
+  and its `history`, or `{standing_id, status: "ended"|"cancelled"|"replaced",
+  resolved_at_height, history}` once resolved on the canonical chain (with
+  `replaced_by` for a replaced one), or `STANDING_PAYMENT_UNKNOWN`.
+- `gettxstatus` adds `standing: {id, status}` to a confirmed create (and
+  `replaces` for an update), `executes` and `standing_payment: {period, amount}`
+  to a confirmed execute, and `cancels` to a confirmed cancel.
 
 ## Payout rules
 

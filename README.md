@@ -289,6 +289,8 @@ tau-testnet retractable retract --key alice <retractable_id>
 tau-testnet standing create --key alice --to <recipient_pubkey> --amount 25 --periods 12 --every-months 1 --first-due-after 3600
 tau-testnet standing list --key alice --role out
 tau-testnet standing show <standing_id>
+tau-testnet standing execute --key bob <standing_id>     # anyone: pay the period due now
+tau-testnet standing update --key alice <standing_id> --to <recipient_pubkey> --amount 30 --periods 12 --every-months 1 --first-due-after 3600
 tau-testnet standing cancel --key alice <standing_id>
 
 # payout rules (a Tau rule pays out the account's money when anyone executes it, inside signed caps)
@@ -656,7 +658,7 @@ Timing caveats:
 
 Long-form guide: [docs/standing_payments.md](docs/standing_payments.md).
 
-A `standing_payment_create` is an authorization signed once: pay a fixed `amount` to a fixed recipient every period, for `periods` periods. Each payment is made by an end-of-block sweep, with no further transaction. Nothing is reserved: the money stays in the payer's balance until a payment is made.
+A `standing_payment_create` is an authorization signed once: pay a fixed `amount` to a fixed recipient every period, for `periods` periods. Each payment is made by an end-of-block sweep, with no further transaction, or earlier in its period by a `standing_payment_execute` that anyone may send. Nothing is reserved: the money stays in the payer's balance until a payment is made.
 
 ```bash
 tau-testnet standing create --key alice --to <recipient_pubkey> --amount 25 --periods 12 \
@@ -666,7 +668,10 @@ tau-testnet standing create --key alice --to <recipient_pubkey> --amount 10 --pe
 tau-testnet standing create --key alice --to <recipient_pubkey> --amount 5 --periods 10 \
     --every-blocks 1000 --first-due-in 50                               # by height
 tau-testnet standing list --key alice --role out
-tau-testnet standing show <standing_id>                                  # open, ended or cancelled, with history
+tau-testnet standing show <standing_id>                                  # open, ended, cancelled or replaced, with history
+tau-testnet standing execute --key bob <standing_id>                     # anyone: pay the period due now
+tau-testnet standing update --key alice <standing_id> --to <recipient_pubkey> --amount 30 \
+    --periods 12 --every-months 1 --first-due-time 1801440000            # a new version, its own id
 tau-testnet standing cancel --key alice <standing_id>
 ```
 
@@ -676,10 +681,12 @@ Semantics:
 - **One payment per period, no catch-up.** A period whose window closes unpaid is missed.
 - **No funds.** Nothing is paid (never a part, never a debt); the period is retried in each later block of its window, then missed.
 - **Policy.** Every payment re-checks the payer's current `o5` clause as a transfer in that block, with the approval slots empty. A block misses the period, with no retry.
-- **Fees.** One fee when the authorization is created; payments and the cancel are fee-free.
-- **Cancel.** Payer only, takes effect in its own block: a payment due in that block is not made. There is no edit; cancel and create again.
-- **One network.** Both transaction types sign `genesis_hash` (the hash of block 0; `getsequence` returns it and the CLI fills it in). One signed for another network is refused at admission (`WRONG_NETWORK`) and at block apply.
-- **Caps.** 16 open per payer, 4096 in total, 32 handled per block. The shortest height interval (128 blocks) lets every entry be reached once per period even when the book is full.
+- **Execute.** Anyone may send `standing_payment_execute {standing_id}` to pay the period the block falls in, from the stored terms: refused, with nothing changed and no fee, before the first due point, after the end, when the period is already settled, without funds or when the payer's policy blocks it. The sweep then finds the period settled.
+- **Update.** `standing_payment_update` (payer only) ends an authorization as `replaced` and starts complete new terms as the next `version`, with their own id and `replaces` naming the old one, in one transaction. Signed terms are never edited.
+- **Fees.** One fee when an authorization is created or updated; payments the sweep makes and the cancel are fee-free; an execute is paid by its sender.
+- **Cancel.** Payer only, takes effect in its own block: a payment due in that block is not made.
+- **One network.** All four transaction types sign `genesis_hash` (the hash of block 0; `getsequence` returns it and the CLI fills it in). One signed for another network is refused at admission (`WRONG_NETWORK`) and at block apply.
+- **Caps.** 16 open per payer, 4096 in total, 32 handled per block by the sweep and 32 executes per block. The shortest height interval (128 blocks) lets every entry be reached once per period even when the book is full.
 - **Reads.** `getstandingpayments <address> [out|in|all]` (with `semantics`, the node's rules and limits), `getstandingpayment <id>` (with `history`), and `gettxstatus`.
 
 **Upgrade.** The book root is folded into the consensus metadata as `standing_payments_root` only once the book has held an entry, so **no regenesis** is needed. Nodes must upgrade before the first create; an older binary diverges loudly at that block.

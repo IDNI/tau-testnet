@@ -2467,10 +2467,16 @@ def cmd_standing_create(args: argparse.Namespace) -> int:
     from consensus.standing import StandingShapeError, parse_standing_payment_create
 
     created = {}
+    replaces = getattr(args, "standing_id", None)
 
     def _build(sender_pubkey, sequence_number, expire_at_height, tip):
         now = int(_now())
-        payload = tx_mod.build_standing_payment_create_tx(
+        builder = tx_mod.build_standing_payment_create_tx
+        extra = {}
+        if replaces is not None:
+            builder, extra = tx_mod.build_standing_payment_update_tx, {"standing_id": replaces}
+        payload = builder(
+            **extra,
             sender_pubkey=sender_pubkey,
             sequence_number=sequence_number,
             expiration_time=now + args.expiry,
@@ -2489,9 +2495,23 @@ def cmd_standing_create(args: argparse.Namespace) -> int:
 
     status = _submit_rule_tx(args, _build, pass_tip=True)
     if status == EXIT_OK and created.get("id"):
-        print(f"standing payment id: {created['id']}",
+        what = f"new version of {replaces}: " if replaces else ""
+        print(f"standing payment id: {what}{created['id']}",
               file=sys.stderr if args.json else sys.stdout)
     return status
+
+
+def cmd_standing_execute(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_standing_payment_execute_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            standing_id=args.standing_id,
+        )
+
+    return _submit_rule_tx(args, _build)
 
 
 def cmd_standing_cancel(args: argparse.Namespace) -> int:
@@ -2525,7 +2545,7 @@ def _add_standing_subparsers(sub) -> None:
     p_st = sub.add_parser(
         "standing",
         parents=[_GLOBAL_PARENT],
-        help="Standing payments (create, cancel, inspect)",
+        help="Standing payments (create, update, execute, cancel, inspect)",
     )
     ssub = p_st.add_subparsers(dest="standing_command", required=True)
     common = [_GLOBAL_PARENT]
@@ -2547,29 +2567,48 @@ def _add_standing_subparsers(sub) -> None:
         parser.add_argument("--expire-at-height", type=int,
                             help="Absolute expiry height (overrides --expire-in)")
 
+    def _terms_flags(parser):
+        _key_group(parser)
+        parser.add_argument("--to", required=True, help="Recipient public key (96 hex)")
+        parser.add_argument("--amount", required=True, type=int, help="Amount per period")
+        parser.add_argument("--periods", required=True, type=int,
+                            help="How many periods the authorization covers (its end)")
+        every = parser.add_mutually_exclusive_group(required=True)
+        every.add_argument("--every-blocks", type=int, metavar="N")
+        every.add_argument("--every-seconds", type=int, metavar="N")
+        every.add_argument("--every-months", type=int, metavar="N",
+                           help="Calendar months in UTC; a missing day pays on the last day")
+        first = parser.add_mutually_exclusive_group(required=True)
+        first.add_argument("--first-due-height", type=int, metavar="HEIGHT")
+        first.add_argument("--first-due-in", type=_block_count, metavar="BLOCKS",
+                           help="First payment this many blocks after the next one")
+        first.add_argument("--first-due-time", type=int, metavar="UNIX")
+        first.add_argument("--first-due-after", type=_block_count, metavar="SECONDS",
+                           help="First payment this many seconds from now")
+        _tx_flags(parser)
+        parser.set_defaults(func=cmd_standing_create)
+
     p_new = ssub.add_parser(
         "create", parents=common,
         help="Sign once: pay a fixed amount to a fixed recipient every period",
     )
-    _key_group(p_new)
-    p_new.add_argument("--to", required=True, help="Recipient public key (96 hex)")
-    p_new.add_argument("--amount", required=True, type=int, help="Amount per period")
-    p_new.add_argument("--periods", required=True, type=int,
-                       help="How many periods the authorization covers (its end)")
-    every = p_new.add_mutually_exclusive_group(required=True)
-    every.add_argument("--every-blocks", type=int, metavar="N")
-    every.add_argument("--every-seconds", type=int, metavar="N")
-    every.add_argument("--every-months", type=int, metavar="N",
-                       help="Calendar months in UTC; a missing day pays on the last day")
-    first = p_new.add_mutually_exclusive_group(required=True)
-    first.add_argument("--first-due-height", type=int, metavar="HEIGHT")
-    first.add_argument("--first-due-in", type=_block_count, metavar="BLOCKS",
-                       help="First payment this many blocks after the next one")
-    first.add_argument("--first-due-time", type=int, metavar="UNIX")
-    first.add_argument("--first-due-after", type=_block_count, metavar="SECONDS",
-                       help="First payment this many seconds from now")
-    _tx_flags(p_new)
-    p_new.set_defaults(func=cmd_standing_create)
+    _terms_flags(p_new)
+
+    p_update = ssub.add_parser(
+        "update", parents=common,
+        help="Replace an authorization by new terms (a new version with its own id)",
+    )
+    p_update.add_argument("standing_id", help="Id of the authorization to replace (64 hex)")
+    _terms_flags(p_update)
+
+    p_exec = ssub.add_parser(
+        "execute", parents=common,
+        help="Pay the period that is due now (anyone may; you pay the fee)",
+    )
+    _key_group(p_exec)
+    p_exec.add_argument("standing_id", help="Standing payment id (64 hex)")
+    _tx_flags(p_exec)
+    p_exec.set_defaults(func=cmd_standing_execute)
 
     p_cancel = ssub.add_parser("cancel", parents=common,
                                help="Stop every later payment of an authorization")

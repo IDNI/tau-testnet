@@ -2,8 +2,9 @@
 
 A standing payment is an authorization the payer signs once: pay a fixed amount
 to a fixed recipient every period, for a fixed number of periods. Each payment
-then happens in an end-of-block sweep, with no further transaction from anyone.
-Typical uses are rent, a subscription, a salary or an allowance.
+then happens in an end-of-block sweep, with no further transaction from anyone,
+or earlier in its period when anyone sends an execute for it. Typical uses are
+rent, a subscription, a salary or an allowance.
 
 Nothing is reserved. The money stays in the payer's balance until a payment is
 made, and every payment passes the payer's **current** policy at the moment it
@@ -23,6 +24,10 @@ waiting ──► due ──► paid ─────────► waiting (nex
               │                       └──► window closes: missed ───┤
               └──► policy blocks: missed ───────────────────────────┘
 any open state ──► cancelled (the payer's cancel is mined)
+any open state ──► replaced  (the payer's update is mined; the new
+                              version starts as waiting, with its own id)
+due or retrying, or waiting once the block reaches the due point
+               ──► paid by an execute (anyone's), then waiting (next period)
 ```
 
 | Status | Meaning |
@@ -32,6 +37,7 @@ any open state ──► cancelled (the payer's cancel is mined)
 | `retrying` | Open; an attempt found too little money, and it is tried again in the next block of the same window. |
 | `ended` | Every period was settled (paid or missed). Final. |
 | `cancelled` | The payer's cancel was mined. Final. |
+| `replaced` | The payer's update was mined; `replaced_by` names the new version. Final. |
 
 ## Creating
 
@@ -61,7 +67,8 @@ tau-testnet standing create --key alice --to <recipient_pubkey> --amount 5 --per
 The CLI refuses a first due point that is not after the next block, or a time
 that is already (almost) past, before signing anything. `create` prints the
 **standing payment id** (`standing payment id: <64 hex>`); with `--json` the line
-goes to stderr. Keep it: it is the handle for cancelling and inspecting. The other
+goes to stderr. Keep it: it is the handle for updating, executing, cancelling and
+inspecting. The other
 transaction flags (`--fee`, `--expiry`, `--expire-in`, `--expire-at-height`)
 behave as for a normal transfer. Without `--fee`, `create` takes the fee limit
 from the node's fee estimate (`checktx estimate`).
@@ -123,6 +130,10 @@ before the next period's due point. That span is the period's **window**.
 - **Sweep order.** Due entries form a line ordered by the block they joined it
   (fell due, or the next block after an unfunded attempt), then by id. At most
   32 entries are handled per block; the rest stay in line for the next block.
+- **Execute.** Anyone may pay the current period earlier in the block, or in a
+  block the sweep's cap would reach later, with an execute (see
+  [Executing](#executing)). It settles the period exactly as a sweep payment
+  would, and the sweep then finds nothing left to do for it.
 
 ### Policy at payment time
 
@@ -136,15 +147,19 @@ policy gains nothing from it.
 
 ### Money flow
 
-| Event | Payer | Recipient | Proposer |
-|---|---|---|---|
-| Create mined | `- fee` | none | `+ fee` |
-| Payment | `- amount` | `+ amount` | none |
-| Cancel mined | none | none | none |
+| Event | Payer | Recipient | Executor | Proposer |
+|---|---|---|---|---|
+| Create or update mined | `- fee` | none | none | `+ fee` |
+| Payment by the sweep | `- amount` | `+ amount` | none | none |
+| Payment by an execute | `- amount` | `+ amount` | `- fee` | `+ fee` |
+| Refused execute | none | none | none | none |
+| Cancel mined | none | none | none | none |
 
-The create pays one fee, set by the fee step like any other fee-bearing
-transaction; payments and cancels are fee-free. A payment does not use or change
-the payer's sequence number. A recipient that has no record yet is credited
+A create, and an update for the version it starts, pays one fee, set by the fee
+step like any other fee-bearing transaction; payments the sweep makes and
+cancels are fee-free. An execute is paid by whoever sends it, and a refused
+execute is not included, so it costs nothing. A payment does not use or change
+the payer's sequence number (an execute uses the executor's). A recipient that has no record yet is credited
 exactly as by a transfer. A payment counts as a send for the payer's cooldown
 clock, once per payment.
 
@@ -164,8 +179,71 @@ tau-testnet standing cancel --key alice <standing_id>
 - A second cancel of the same id in the mempool is refused
   (`DUPLICATE_STANDING_CANCEL`).
 
-There is no edit. To change the amount, recipient or schedule, cancel and create
-a new authorization.
+## Updating
+
+```bash
+tau-testnet standing update --key alice <standing_id> --to <recipient_pubkey> --amount 30 \
+    --periods 12 --every-months 1 --first-due-time 1801440000
+```
+
+An update replaces an authorization by a new **version**. It takes the id it
+replaces and a complete set of new terms, with exactly the flags and limits of
+`create`, and prints the new version's id.
+
+- Only the **payer** may update, and only an open authorization.
+- In the block that carries it, the old version ends as `replaced` and the new
+  one starts as `waiting`, with its own id, `version` one higher and `replaces`
+  naming the old id. Nothing is ever edited in place: the old terms stay what
+  they were signed as, and the new ones are signed as a whole.
+- The new terms are judged exactly as a create's, including a first due point
+  strictly after the block. A payment the old version made in its current
+  period stays made; choose the new `first_due` so the new version does not pay
+  that period again.
+- It replaces one for one, so it is allowed when the payer already has 16 open
+  authorizations.
+- It pays one fee, like a create. An update and an execute of the same id in one
+  block are applied in block order: an update first refuses the execute.
+- Like a cancel, an update in the block where a period falls due ends the old
+  version before that block's sweep, so the old version does not pay that
+  period; an execute placed before the update in the block does.
+- A second update of the same id is refused, in the same block too: a version
+  line never forks.
+
+Cancelling and creating anew still works; an update does it in one transaction,
+with no block in between where neither or both apply, and with a visible line
+from one version to the next.
+
+## Executing
+
+```bash
+tau-testnet standing execute --key carol <standing_id>
+```
+
+The sweep pays every due period on its own, so an execute is never needed for a
+payment to happen. It exists so that anyone with an interest in the payment (the
+recipient, the payer's wallet, a relayer) can make it happen in the very block
+they choose, without waiting for the sweep's line or for the window's later
+retries, and without holding the payer's key.
+
+- **Anyone** may send it. It names the authorization and nothing else; the
+  amount, the recipient and the period come from the stored terms and the block.
+  Fields such as `amount` or `recipient_pubkey` on an execute are not signed and
+  never read.
+- It pays the period whose window holds the block, if that period is not settled
+  yet. A period whose window closed unpaid while the entry waited is first
+  counted as missed, exactly as the sweep counts it.
+- It is **refused, with nothing changed**, before the first due point, after the
+  end, when the period is already settled (paid, or missed by a policy block),
+  when the payer cannot pay the full amount at that point in the block, or when
+  the payer's current `o5` clause blocks the payment. A refused execute is not
+  included and pays no fee; the period keeps its normal course in the sweep.
+- The policy check, the money moves and the cooldown stamp are exactly the
+  sweep's. Money that reaches the payer earlier in the same block funds it.
+- The executor pays the fee for its own transaction. A block carries at most 32
+  executes; a proposer leaves the rest in the mempool for the next block.
+- One pending execute per id and sender is accepted into the mempool
+  (`DUPLICATE_STANDING_EXECUTE`): a second one could only be refused in its
+  block, and that refusal would leave a gap in the sender's sequence.
 
 ## Idle chains
 
@@ -181,13 +259,15 @@ loses nothing. A height schedule on an idle chain still waits until enough
 blocks have been mined, and a window in which no block lands is missed. For an
 idle chain, prefer a time schedule.
 
-### Why there is no execute transaction
+### The sweep and executes together
 
 Every block attempts every due payment, so nobody has to submit anything for a
-payment to happen, and no executor can pick the moment or the order. An execute
-transaction would add a fee question (who pays for someone else's payment) and a
-race with the sweep, and could only do what the next block does anyway. Any
-transaction makes a block; on an idle chain the miner's wake does.
+payment to happen. An execute only moves a payment earlier; it cannot choose an
+amount, a recipient, a period, or pay a period twice, and the sweep and an
+execute read and settle the same book entry, so whichever comes first in a block
+pays and the other finds the period settled. The sweep stays fee-free; an
+executor pays for the transaction it chose to send. Any transaction makes a
+block, so an execute also makes one on an idle chain.
 
 ### Fairness when the book is full
 
@@ -207,23 +287,26 @@ tau-testnet standing show <standing_id>
 | RPC | Returns |
 |---|---|
 | `getstandingpayments <address> [out\|in\|all]` | `payments` (open authorizations the address pays or receives, default `all`), `block_hash` of the tip they were read at, and `semantics`: the node's own rules and limits for standing payments, so a wallet can show them before offering the feature. |
-| `getstandingpayment <id>` | An open entry with its terms and progress (below) and `history`; or `{standing_id, status: "ended"\|"cancelled", resolved_at_height, history}` once resolved on the canonical chain; or `STANDING_PAYMENT_UNKNOWN`. |
-| `gettxstatus <hash>` | For a confirmed create, `standing: {id, status}` where status is `waiting`, `due`, `retrying`, `ended`, `cancelled` or `not_recorded`; for a confirmed cancel, `cancels: <id>`. |
+| `getstandingpayment <id>` | An open entry with its terms and progress (below) and `history`; or `{standing_id, status: "ended"\|"cancelled"\|"replaced", resolved_at_height, history}` once resolved on the canonical chain, with `replaced_by` for a replaced one; or `STANDING_PAYMENT_UNKNOWN`. |
+| `gettxstatus <hash>` | For a confirmed create, `standing: {id, status}` where status is `waiting`, `due`, `retrying`, `ended`, `cancelled`, `replaced` or `not_recorded`; for a confirmed update the same for the new version, plus `replaces`; for a confirmed execute, `executes: <id>` and `standing_payment: {period, amount}`; for a confirmed cancel, `cancels: <id>`. |
 
 An open entry reads:
 
 | Field | Meaning |
 |---|---|
 | `standing_id`, `payer_pubkey`, `recipient_pubkey`, `amount`, `sequence_number` | The signed terms. |
+| `version`, `replaces` | 1 and `null` for a create; for a version an update started, its number and the id it replaced. |
 | `schedule`, `interval`, `first_due`, `periods`, `end` | The schedule: `blocks`, `seconds` or `months`. |
 | `period`, `period_due`, `period_closes` | The current period and its window. |
 | `status`, `tries` | `waiting`, `due` or `retrying`; unfunded attempts in this period. |
 | `paid_count`, `missed_count`, `paid_total`, `last_paid_height` | What it has done so far. |
 
 `history` lists the entry's events on the canonical chain, newest first:
-`created`, `paid`, `unfunded`, `missed` (with `reason` `window_closed` or
-`policy_block`, and `count`), `ended` (with `paid` and `missed`) and `cancelled`,
-each with its block height. Events follow reorganizations.
+`created` (with `version` and `replaces` for an update's new version), `paid`
+(with `executor_pubkey` when an execute paid it), `unfunded`, `missed` (with
+`reason` `window_closed` or `policy_block`, and `count`), `ended` (with `paid`
+and `missed`), `cancelled` and `replaced` (with `replaced_by`), each with its
+block height. Events follow reorganizations.
 
 ## Limits
 
@@ -235,6 +318,7 @@ honest nodes disagree about what is due and fork.
 | Open authorizations per payer | 16 |
 | Open authorizations in total | 4096 |
 | Entries handled per block | 32 |
+| Executes per block | 32 |
 | Interval, blocks | 128 to 1 000 000 |
 | Interval, seconds | 3 600 to 31 622 400 (366 days) |
 | Interval, months | 1 to 12 |
@@ -254,16 +338,23 @@ honest nodes disagree about what is due and fork.
 | `TOO_MANY_STANDING_PAYMENTS` | The payer already has 16 open authorizations. |
 | `STANDING_BOOK_FULL` | 4096 authorizations are open. |
 | `DEADLINE_AFTER_FIRST_DUE` | `expire_at_height` is after `first_due`, or `expiration_time` is not before it. |
-| `UNKNOWN_STANDING_PAYMENT` | A cancel names an id that is not open (unknown, ended or cancelled). |
-| `NOT_STANDING_PAYER` | A cancel is signed by someone other than the payer. |
+| `UNKNOWN_STANDING_PAYMENT` | A cancel, update or execute names an id that is not open (unknown, ended, cancelled or replaced). |
+| `NOT_STANDING_PAYER` | A cancel or update is signed by someone other than the payer. |
 | `DUPLICATE_STANDING_CANCEL` | A cancel of the same id is already in the mempool. |
 | `WRONG_NETWORK` | `genesis_hash` is missing, malformed, or names another network. `details.genesis_hash` is this network's. |
+| `STANDING_PAYMENT_NOT_DUE` | An execute before the first due point, after the end, or in a period already settled. |
+| `STANDING_PAYMENT_UNFUNDED` | An execute while the payer has less than the amount (judged at the tip). |
+| `STANDING_PAYMENT_BLOCKED` | An execute the payer's current `o5` clause blocks (judged at the tip). |
+| `DUPLICATE_STANDING_EXECUTE` | An execute of the same id by the same sender is already in the mempool. |
 
-A malformed transaction is rejected with a descriptive message
-(`Malformed standing_payment_create: ...`). At block apply, a create or cancel
-that does not pass these checks is rejected with receipt reason
-`standing_payment_not_created` or `standing_payment_not_cancelled` (or
-`wrong_network`), and the block stays valid.
+Funds and policy are judged at admission against the tip and again, with
+authority, in the block that carries the execute. A malformed transaction is
+rejected with a descriptive message (`Malformed standing_payment_create: ...`).
+At block apply, a create, update, execute or cancel that does not pass these
+checks is rejected with receipt reason `standing_payment_not_created`,
+`standing_payment_not_updated`, `standing_payment_not_executed` or
+`standing_payment_not_cancelled` (or `wrong_network`), and the block stays
+valid.
 
 ## Raw transactions
 
@@ -273,14 +364,16 @@ unsigned data and is ignored.
 | `tx_type` | Fields beyond the envelope |
 |---|---|
 | `standing_payment_create` | `genesis_hash`, `recipient_pubkey` (96 lowercase hex), `amount`, exactly one of `interval_blocks` / `interval_seconds` / `interval_months`, `first_due`, `periods` |
+| `standing_payment_update` | `genesis_hash`, `standing_id` of the version it replaces, then the fields of a create for the new terms |
+| `standing_payment_execute` | `genesis_hash`, `standing_id` (64 lowercase hex) and nothing else |
 | `standing_payment_cancel` | `genesis_hash`, `standing_id` (64 lowercase hex); `fee_limit` `"0"` |
 
-The envelope is the usual `sender_pubkey` (the payer, 96 lowercase hex),
-`sequence_number`, `expiration_time`, `expire_at_height`, `fee_limit` and
-signature. `genesis_hash` is the hash of block 0 of the network (64 lowercase
-hex); `getsequence <address>` returns it with the sequence number and the tip,
-so a wallet needs no extra call, and the CLI fills it in. Both types travel in
-the fast lane, on their own gossip topic `tau/standing/1.0.0`.
+The envelope is the usual `sender_pubkey` (the payer, or for an execute anyone,
+96 lowercase hex), `sequence_number`, `expiration_time`, `expire_at_height`,
+`fee_limit` and signature. `genesis_hash` is the hash of block 0 of the network
+(64 lowercase hex); `getsequence <address>` returns it with the sequence number
+and the tip, so a wallet needs no extra call, and the CLI fills it in. All four
+types travel in the fast lane, on their own gossip topic `tau/standing/1.0.0`.
 
 ## Consensus notes
 
@@ -290,13 +383,15 @@ the fast lane, on their own gossip topic `tau/standing/1.0.0`.
   regenesis is needed**; an un-upgraded node diverges loudly (state-hash
   mismatch) at the first create, so nodes upgrade before the first one lands.
 - The root commits to every open entry's terms and progress (period, counts,
-  tries, line position, last paid height), so all nodes agree on what is due and
-  in which order.
-- Ended and cancelled entries leave memory. The book keeps a **count** and an
+  tries, line position, last paid height) and its lineage (version, id
+  replaced), so all nodes agree on what is due, in which order, and which
+  version replaced which.
+- Ended, cancelled and replaced entries leave memory. The book keeps a **count** and an
   order-dependent **running hash** of them, so the root and the per-block copy
   cost depend on the open set alone.
 - The sweep runs after the block's transactions and after the retractable
-  release, and before a pending rule change takes effect.
+  release, and before a pending rule change takes effect. Creates, updates,
+  executes and cancels apply in block order, before the sweep.
 - A node restores the book from its database at start and refuses a row whose id
   does not match its terms, or whose progress is impossible.
 
@@ -309,6 +404,36 @@ the fast lane, on their own gossip topic `tau/standing/1.0.0`.
   A feeless cancel sorts last in a backed-up mempool, so cancel with margin.
 - **Height does not advance on an idle chain** (see [Idle chains](#idle-chains)).
 
+## Operator notes
+
+**Upgrading.** No regenesis and no activation height. Until the first
+`standing_payment_create` is mined, blocks and state hashes are byte-identical to a
+node without this feature, so mixed versions agree. That block adds
+`standing_payments_root` to the consensus metadata, and a node that has not upgraded
+refuses it. Upgrade every node before anyone sends the first one.
+
+| Table | Written | Read by |
+|---|---|---|
+| `standing_payments_v1` (open entries: terms, progress, version, replaces) | with the accounts, in the block's state commit | restore at start, RPCs |
+| `standing_payment_events (standing_id, block_hash, …)`, indexed by id | per block, every node, apply and replay | `getstandingpayment` history, `gettxstatus` |
+
+Tables and columns are created on start; there is no manual migration.
+Events are keyed per block, like `retractable_events`, so a reorg needs no
+cleanup. At start a node rebuilds the book from its table and refuses to
+start on a row that does not recompute its id or holds an impossible state
+(`corrupt standing payment state`): restore the database or resync the node.
+
+**Network and mining.** Creates, updates, executes and cancels gossip on
+`tau/standing/1.0.0`; a mempool snapshot carries at most 32 of them. The miner
+wakes for a payment due at the next block (at most one attempt every 2
+seconds). A block handles at most 32 sweep entries and 32 executes, and the
+block builder leaves surplus executes in the mempool for the next block, so the
+work per block is bounded whatever the book holds.
+
+**Logs.** `Replay without a policy evaluator: standing payment … assumed
+allowed` means a replay could not ask the payer's rule; the state hash still
+catches a different outcome.
+
 ## Security notes
 
 - **No new power for a key.** A payment passes the payer's current `o5` clause
@@ -317,13 +442,14 @@ the fast lane, on their own gossip topic `tau/standing/1.0.0`.
   same policy a direct transfer by that key meets, so it moves nothing the thief
   could not move by hand. A co-signature clause blocks every standing payment.
 - **Terms are fixed.** The id commits to every signed term; the recipient, a
-  relayer or a proposer can change none of them, and there is no execute call to
-  choose the moment.
+  relayer or a proposer can change none of them. An executor chooses only the
+  block, within the period's window, and an update is the payer's own signed
+  transaction that names the version it replaces.
 - **Replay.** Every transaction here carries its sender's sequence number like
   any transaction, so a copy of its signed bytes is refused wherever it is
   replayed, and the copy pays nothing.
-- **Another network.** Both types sign `genesis_hash`, the hash of block 0 of
-  the network they are for. Admission and block apply refuse one that names
+- **Another network.** All four types sign `genesis_hash`, the hash of block 0
+  of the network they are for. Admission and block apply refuse one that names
   another network (`WRONG_NETWORK`; at apply it is left out of the block, with no
   fee and no sequence number used), and the field cannot be rewritten without
   breaking the signature. So an authorization signed on a devnet, a fork or an
@@ -332,12 +458,13 @@ the fast lane, on their own gossip topic `tau/standing/1.0.0`.
   README's note on domain separation still applies to them): a type that is new
   can sign its network from its first release without breaking any signature.
   The list of bound types is `consensus/network_binding.py`.
-- **Spam.** Each create pays a fee; 16 open per payer and 4096 in total bound the
-  book, and 32 actions per block bound the sweep.
+- **Spam.** Each create and update pays a fee; 16 open per payer and 4096 in
+  total bound the book, 32 actions per block bound the sweep, and 32 executes per
+  block, each paid by its sender, bound the rest.
 
 ## Not in this release
 
-- Editing an open authorization (cancel and create instead).
+- Editing an open authorization in place (an update makes a new version).
 - Reserved or escrowed funds, partial payments, catching up missed periods.
 - Variable amounts, payments decided by a rule, or split payments.
 - Recipient refusal: the recipient cannot decline an authorization.
