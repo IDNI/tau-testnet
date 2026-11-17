@@ -1019,10 +1019,17 @@ def kill_tau_process():
         recovered_interface = tau_native.TauInterface(config.TAU_PROGRAM_FILE)
         with tau_process_lock:
             tau_direct_interface = recovered_interface
-        tau_process_ready.set()
+        # request_shutdown() sets the flag before it drops the interface, so one of the two drops it.
+        if server_should_stop.is_set():
+            with tau_process_lock:
+                tau_direct_interface = None
+            restart_in_progress.clear()
+            logger.info("Shutdown requested, Tau interface rebuild dropped.")
+            return
+        _set_unless_stopped(tau_process_ready)
         if _state_restore_callback:
             _state_restore_callback()
-        tau_ready.set()
+        _set_unless_stopped(tau_ready)
         restart_in_progress.clear()
     except Exception as e:
         logger.error("Failed to recover direct Tau interface: %s", e)
