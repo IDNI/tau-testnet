@@ -1057,6 +1057,92 @@ async def test_gossip_dht_multi_hop_routing(monkeypatch):
         await svc_a.stop()
 
 
+async def test_redial_before_late_disconnect_event_gets_handshake():
+    from network.config import NetworkConfig
+    from network.service import NetworkService
+
+    cfg = NetworkConfig(
+        network_id="late-disconnect-testnet",
+        listen_addrs=[multiaddr.Multiaddr("/ip4/127.0.0.1/tcp/0")],
+    )
+
+    svc_a = NetworkService(cfg)
+    svc_b = NetworkService(cfg)
+    svc_c = NetworkService(cfg)
+
+    # libp2p can deliver the disconnect event of an old connection after the
+    # connect event of a redial. B holds that event until the redial is handled.
+    release_disconnect = trio.Event()
+    b_connects: Dict[str, int] = {}
+    b_handshakes: Dict[str, int] = {}
+    orig_connected = svc_b._on_peer_connected
+    orig_disconnected = svc_b._on_peer_disconnected
+    orig_handshake = svc_b._perform_handshake
+
+    async def connected_b(conn):
+        key = str(conn.muxed_conn.peer_id)
+        await orig_connected(conn)
+        b_connects[key] = b_connects.get(key, 0) + 1
+        if key == str(svc_a.host.get_id()) and b_connects[key] >= 2:
+            release_disconnect.set()
+
+    async def disconnected_b(conn):
+        if str(conn.muxed_conn.peer_id) == str(svc_a.host.get_id()):
+            await release_disconnect.wait()
+        await orig_disconnected(conn)
+
+    async def handshake_b(peer_id):
+        key = str(peer_id)
+        b_handshakes[key] = b_handshakes.get(key, 0) + 1
+        await orig_handshake(peer_id)
+
+    svc_b._on_peer_connected = connected_b
+    svc_b._on_peer_disconnected = disconnected_b
+    svc_b._perform_handshake = handshake_b
+
+    await svc_a.start()
+    await svc_b.start()
+    await svc_c.start()
+
+    try:
+        addrs_b = await _wait_for_addrs(svc_b.host)
+        addrs_c = await _wait_for_addrs(svc_c.host)
+        a_key = str(svc_a.host.get_id())
+
+        peer_info_b = PeerInfo(svc_b.host.get_id(), addrs_b)
+        svc_a.host.get_peerstore().add_addrs(peer_info_b.peer_id, peer_info_b.addrs, 60)
+        await svc_a.host.connect(peer_info_b)
+
+        peer_info_c = PeerInfo(svc_c.host.get_id(), addrs_c)
+        svc_b.host.get_peerstore().add_addrs(peer_info_c.peer_id, peer_info_c.addrs, 60)
+        await svc_b.host.connect(peer_info_c)
+
+        with trio.fail_after(5):
+            while b_handshakes.get(a_key, 0) < 1:
+                await trio.sleep(0.05)
+
+        await svc_a.host.get_network().close_peer(svc_b.host.get_id())
+        assert not list(svc_a.host.get_connected_peers())
+
+        await svc_a.publish_gossip("late.disconnect.route", {"value": 1})
+
+        with trio.fail_after(5):
+            await release_disconnect.wait()
+        with trio.fail_after(5):
+            while b_handshakes.get(a_key, 0) < 2:
+                await trio.sleep(0.05)
+        with trio.fail_after(5):
+            while str(svc_c.host.get_id()) not in svc_a._opportunistic_peers:
+                await trio.sleep(0.05)
+
+        assert svc_b._peer_has_open_connection(a_key)
+    finally:
+        release_disconnect.set()
+        await svc_c.stop()
+        await svc_b.stop()
+        await svc_a.stop()
+
+
 async def test_dht_bucket_refresh_cycle():
     from network.config import NetworkConfig
     from network.service import NetworkService
