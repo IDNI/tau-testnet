@@ -29,6 +29,8 @@ TAU_GOSSIP_MAX_RAW_TX_BYTES = 262144
 # A tx or gossip request carries one payload as a JSON string. JSON escapes can
 # double its size, and the envelope adds a little more.
 TAU_STREAM_REQUEST_MAX_BYTES = 4 * TAU_GOSSIP_MAX_RAW_TX_BYTES
+# A tx or gossip request is one write of at most 1 MiB, so it arrives in seconds.
+REQUEST_READ_TIMEOUT = 30.0
 TAU_MAX_USER_TX_BYTES = 8192
 TAU_MAX_GOVERNANCE_VOTE_BYTES = 8192
 TAU_MAX_GOVERNANCE_UPDATE_BYTES = 262144

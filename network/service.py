@@ -16,6 +16,7 @@ from .host import HostManager, NetworkListenError
 from .dht_manager import DHTManager
 from .discovery import DiscoveryManager
 from .gossip import GossipManager
+from .protocols import REQUEST_READ_TIMEOUT
 from commands import sendtx
 
 logger = logging.getLogger(__name__)
@@ -26,8 +27,6 @@ MAX_HANDSHAKE_PROVIDERS = 50
 MAX_SYNC_PAGES = 50
 # A peer that never closes a sync reply must not hold the sync forever.
 SYNC_READ_TIMEOUT = 120.0
-# A tx or gossip request is one write of at most 1 MiB, so it arrives in seconds.
-REQUEST_READ_TIMEOUT = 30.0
 # Handshake and ping payloads are small; a silent peer must not block forever.
 HANDSHAKE_READ_TIMEOUT = 30.0
 PING_READ_TIMEOUT = 10.0
