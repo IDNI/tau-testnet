@@ -96,19 +96,15 @@ class DeepChainTestCase(unittest.TestCase):
         chain_state._balances[FUNDED_ACCOUNT] = GENESIS_BALANCE
 
 
-        self.verify_patch = patch(
-            'consensus.engine.TauConsensusEngine.verify_block_header', return_value=True)
-        self.verify_patch.start()
+        self.enterContext(patch(
+            'consensus.engine.TauConsensusEngine.verify_block_header', return_value=True))
         # Tau never comes up here. Answer the engine's readiness waits the way
         # they would end anyway (not ready) instead of sitting out 5 s on every
         # block that carries a transaction.
-        self.wait_patch = patch.object(tau_manager.tau_ready, 'wait', return_value=False)
-        self.wait_patch.start()
+        self.enterContext(patch.object(tau_manager.tau_ready, 'wait', return_value=False))
         self.genesis_hash = db.get_genesis_hash()
 
     def tearDown(self):
-        self.wait_patch.stop()
-        self.verify_patch.stop()
         config.set_database_path(self.original_db_path)
         if getattr(db, '_db_conn', None) is not None:
             db._db_conn.close()
