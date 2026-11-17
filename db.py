@@ -495,9 +495,21 @@ def init_db():
                     missed_count     INTEGER NOT NULL,
                     tries            INTEGER NOT NULL,
                     queued_at        INTEGER NOT NULL,
-                    last_paid_height INTEGER NOT NULL
+                    last_paid_height INTEGER NOT NULL,
+                    version          INTEGER NOT NULL DEFAULT 1,
+                    replaces         TEXT NOT NULL DEFAULT ''
                 );
             ''')
+            standing_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(standing_payments_v1);")
+            }
+            # Additive: a row from before updates existed is a first version.
+            if "version" not in standing_cols:
+                conn.execute("ALTER TABLE standing_payments_v1 "
+                             "ADD COLUMN version INTEGER NOT NULL DEFAULT 1;")
+            if "replaces" not in standing_cols:
+                conn.execute("ALTER TABLE standing_payments_v1 "
+                             "ADD COLUMN replaces TEXT NOT NULL DEFAULT '';")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_standing_payer "
                 "ON standing_payments_v1(payer_pubkey);"
@@ -2713,7 +2725,7 @@ def _write_retractable_rows(state: Dict) -> None:
 _STANDING_COLUMNS = (
     'standing_id, payer_pubkey, recipient_pubkey, amount, sequence_number, kind, '
     'interval, first_due, periods, period, paid_count, missed_count, tries, '
-    'queued_at, last_paid_height'
+    'queued_at, last_paid_height, version, replaces'
 )
 
 
@@ -2723,8 +2735,9 @@ def _write_standing_rows(state: Dict) -> None:
     for row in state['rows']:
         _db_conn.execute(
             f'INSERT INTO standing_payments_v1 ({_STANDING_COLUMNS}) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (bytes(row[0]).hex(),) + tuple(row[1:3]) + tuple(int(v) for v in row[3:]),
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (bytes(row[0]).hex(),) + tuple(row[1:3]) + tuple(int(v) for v in row[3:16])
+            + (bytes(row[16]).hex(),),
         )
     _db_conn.execute(
         'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
@@ -2738,8 +2751,8 @@ def _write_standing_rows(state: Dict) -> None:
 def load_standing_state() -> tuple[List[tuple], int, bytes]:
     """(open rows, resolved_count, resolved_acc) exactly as stored.
 
-    Rows are in StandingBook.restore order with the id as bytes, ordered by id.
-    Absent rows mean an empty book and a zero commitment.
+    Rows are in StandingBook.restore order with both ids as bytes, ordered by
+    id. Absent rows mean an empty book and a zero commitment.
     """
     if _db_conn is None:
         init_db()
@@ -2755,7 +2768,8 @@ def load_standing_state() -> tuple[List[tuple], int, bytes]:
         parsed = json.loads(raw[0])
         count, acc = int(parsed['count']), bytes.fromhex(parsed['acc'])
     return (
-        [(bytes.fromhex(r[0]), r[1], r[2]) + tuple(int(v) for v in r[3:]) for r in rows],
+        [(bytes.fromhex(r[0]), r[1], r[2]) + tuple(int(v) for v in r[3:16])
+         + (bytes.fromhex(r[16] or '00' * 32),) for r in rows],
         count,
         acc,
     )

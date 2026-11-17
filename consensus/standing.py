@@ -2,9 +2,20 @@
 
 A payer creates an authorization with `standing_payment_create`: a fixed
 recipient, a fixed amount, a schedule (every N blocks, every N seconds, or every
-N calendar months in UTC) and a number of periods. From then on the sweep at the
-end of a block pays each period at most once, without the payer's key, until the
-periods run out or the payer sends `standing_payment_cancel`.
+N calendar months in UTC) and a number of periods. From then on each period is
+paid at most once, without the payer's key, until the periods run out or the
+payer sends `standing_payment_cancel`. Two things can pay a period:
+
+- the sweep at the end of a block, on its own, once the period is due;
+- `standing_payment_execute`, which ANYONE may send (the payee, a relayer, the
+  payer's own wallet) to pay the period that is due now, in the block it lands
+  in. It names only the authorization: the executor chooses nothing but the
+  moment, and pays the fee for its own transaction.
+
+`standing_payment_update` replaces an authorization with a new version: the old
+one ends (outcome "replaced") and a new one with its own id starts in the same
+transaction, carrying `version` + 1 and the id it replaces. Signed terms are
+never edited in place.
 
 Lifecycle of one authorization, with period p in 0..periods-1 and its window
 [due(p), due(p+1)):
@@ -14,7 +25,13 @@ Lifecycle of one authorization, with period p in 0..periods-1 and its window
                                    |----no funds-----> queued again (retry later
                                    |                   in the same window)
                                    '----window closed> p missed, next period
-    after the last period, or on cancel: resolved
+    after the last period, on cancel or on update: resolved
+
+An execute acts on the same states: it pays the period the block falls in, marks
+any earlier period whose window closed unpaid as missed, and leaves the entry
+waiting for the next period. It is refused, and changes nothing, when that
+period is already settled, when the payer cannot fund it or the payer's policy
+blocks it, before the first due point and after the end.
 
 Nothing is reserved at creation: an occurrence the payer cannot fund is retried
 in later blocks of the same window and then counts as missed. It never pays
@@ -23,8 +40,9 @@ part, never borrows, and never pays two periods in one go (no catch-up).
 Every payment re-checks the payer's CURRENT o5 clause against the real recipient
 and amount, so a later freeze or a stricter rule stops it. The check goes
 through the per-clause policy evaluator, never the main interpreter, so a
-payment steps no consensus interpreter and pays no fee: the creation is the one
-charge, as for an approval request or a retractable transfer.
+payment the sweep makes steps no consensus interpreter and pays no fee: the
+creation is the one charge, as for an approval request or a retractable
+transfer. An execute is a transaction like any other and its sender pays its fee.
 
 CONSENSUS-FROZEN SURFACE
 ------------------------
@@ -54,9 +72,12 @@ from consensus.serialization import (
 
 TX_TYPE_STANDING_PAYMENT_CREATE = "standing_payment_create"
 TX_TYPE_STANDING_PAYMENT_CANCEL = "standing_payment_cancel"
+TX_TYPE_STANDING_PAYMENT_EXECUTE = "standing_payment_execute"
+TX_TYPE_STANDING_PAYMENT_UPDATE = "standing_payment_update"
 
 STANDING_TX_TYPES = frozenset(
-    {TX_TYPE_STANDING_PAYMENT_CREATE, TX_TYPE_STANDING_PAYMENT_CANCEL}
+    {TX_TYPE_STANDING_PAYMENT_CREATE, TX_TYPE_STANDING_PAYMENT_CANCEL,
+     TX_TYPE_STANDING_PAYMENT_EXECUTE, TX_TYPE_STANDING_PAYMENT_UPDATE}
 )
 
 # Schedule kinds. BLOCKS counts heights; SECONDS and MONTHS read the block
@@ -77,6 +98,7 @@ INTERVAL_FIELDS = (
 # Folded into the resolved commitment as one byte per resolution.
 OUTCOME_ENDED = 1
 OUTCOME_CANCELLED = 2
+OUTCOME_REPLACED = 3
 
 # What one attempt did.
 ATTEMPT_PAID = "paid"
@@ -88,6 +110,10 @@ MAX_OPEN_STANDING_TOTAL = 4096
 # Queue entries the sweep handles in one block: an attempt, or closing an entry
 # whose window or schedule ran out. Bounds what one block costs a validator.
 MAX_STANDING_ACTIONS_PER_BLOCK = 32
+# `standing_payment_execute` transactions one block may carry. Each runs at most
+# one o5 clause step and pays its own fee; the bound keeps a block's worst case
+# at sweep cap + this many clause steps.
+MAX_STANDING_EXECUTIONS_PER_BLOCK = 32
 
 MIN_INTERVAL_BLOCKS = 128
 MAX_INTERVAL_BLOCKS = 1_000_000
@@ -109,6 +135,8 @@ MAX_TIME = 253_402_300_799
 assert MIN_INTERVAL_BLOCKS >= -(-MAX_OPEN_STANDING_TOTAL // MAX_STANDING_ACTIONS_PER_BLOCK)
 
 ZERO_ACC = bytes(32)
+# Lineage of an entry that replaces nothing: version 1, no predecessor.
+FIRST_VERSION = (1, bytes(32))
 
 _PUBKEY_RE = re.compile(r"^[0-9a-f]{96}$")
 _ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -300,15 +328,39 @@ def parse_standing_payment_create(tx: Dict[str, Any]) -> StandingTerms:
     return StandingTerms(payer, recipient, amount, sequence, kind, interval, first_due, periods)
 
 
+def _id_field(tx: Dict[str, Any]) -> bytes:
+    raw_id = tx.get("standing_id")
+    if not isinstance(raw_id, str) or not _ID_RE.match(raw_id):
+        raise StandingShapeError("standing_id must be 64 lowercase hex characters")
+    return bytes.fromhex(raw_id)
+
+
 def parse_standing_payment_cancel(tx: Dict[str, Any]) -> Tuple[str, bytes]:
     """(signer, standing id) of a cancel."""
     if not isinstance(tx, dict):
         raise StandingShapeError("transaction must be an object")
-    signer = _pubkey_field(tx, "sender_pubkey")
-    raw_id = tx.get("standing_id")
-    if not isinstance(raw_id, str) or not _ID_RE.match(raw_id):
-        raise StandingShapeError("standing_id must be 64 lowercase hex characters")
-    return signer, bytes.fromhex(raw_id)
+    return _pubkey_field(tx, "sender_pubkey"), _id_field(tx)
+
+
+def parse_standing_payment_execute(tx: Dict[str, Any]) -> Tuple[str, bytes]:
+    """(executor, standing id) of an execute.
+
+    The id is the only thing an executor names: amount, recipient and period
+    all come from the stored authorization and the block, never from the tx.
+    """
+    if not isinstance(tx, dict):
+        raise StandingShapeError("transaction must be an object")
+    return _pubkey_field(tx, "sender_pubkey"), _id_field(tx)
+
+
+def parse_standing_payment_update(tx: Dict[str, Any]) -> Tuple[bytes, StandingTerms]:
+    """(id it replaces, new terms) of an update.
+
+    The new terms are read exactly as a create's, from root fields, with the
+    update's own sequence number, so the new version gets an id of its own.
+    """
+    terms = parse_standing_payment_create(tx)
+    return _id_field(tx), terms
 
 
 def validate_create_shape(terms: StandingTerms, height: int, ts: int) -> Optional[str]:
@@ -349,7 +401,9 @@ def validate_create_shape(terms: StandingTerms, height: int, ts: int) -> Optiona
 
 # --- The book -----------------------------------------------------------------
 
-_Row = Tuple[bytes, str, str, int, int, int, int, int, int, int, int, int, int, int, int]
+# Terms, progress, then lineage (version, id replaced or 32 zero bytes).
+_Row = Tuple[bytes, str, str, int, int, int, int, int, int, int, int, int, int, int, int,
+             int, bytes]
 
 # attempt(terms) -> ATTEMPT_PAID | ATTEMPT_NO_FUNDS | ATTEMPT_BLOCKED. A paid
 # attempt has already moved the money; the book only records the outcome.
@@ -373,6 +427,8 @@ class StandingBook:
         self._queue: List[Tuple[int, bytes]] = []
         self._fresh = 0  # queued entries not yet tried in their period
         self._per_payer: Dict[str, int] = {}
+        # (version, id replaced) of entries made by an update; absent = FIRST_VERSION.
+        self.lineage: Dict[bytes, Tuple[int, bytes]] = {}
         self.resolved_count = 0
         self.resolved_acc = ZERO_ACC
         self._root: Optional[bytes] = None
@@ -387,6 +443,7 @@ class StandingBook:
         clone._queue = list(self._queue)
         clone._fresh = self._fresh
         clone._per_payer = dict(self._per_payer)
+        clone.lineage = dict(self.lineage)
         clone.resolved_count = self.resolved_count
         clone.resolved_acc = self.resolved_acc
         clone._root = self._root
@@ -409,7 +466,8 @@ class StandingBook:
         book = cls()
         for row in rows:
             (stored_id, payer, recipient, amount, sequence, kind, interval, first_due,
-             periods, period, paid, missed, tries, queued_at, last_paid) = row
+             periods, period, paid, missed, tries, queued_at, last_paid,
+             version, replaces) = row
             if kind not in KIND_NAMES:
                 raise ValueError("stored standing payment has an unknown kind")
             if not (_is_int(interval) and interval >= 1 and _is_int(periods)
@@ -428,7 +486,12 @@ class StandingBook:
                 raise ValueError(f"stored standing payment has bad progress: {sid.hex()}")
             if period >= periods or paid + missed != period or (tries and not queued_at):
                 raise ValueError(f"stored standing payment has inconsistent progress: {sid.hex()}")
-            book._insert(sid, terms, progress)
+            lineage = (version, bytes(replaces) if isinstance(replaces, (bytes, bytearray))
+                       else b"")
+            if not (_is_int(version) and 1 <= version <= _U32_MAX and len(lineage[1]) == 32
+                    and (version == 1) == (lineage[1] == ZERO_ACC) and lineage[1] != sid):
+                raise ValueError(f"stored standing payment has a bad version: {sid.hex()}")
+            book._insert(sid, terms, progress, lineage)
         book.resolved_count = resolved_count
         book.resolved_acc = bytes(resolved_acc)
         return book
@@ -458,9 +521,12 @@ class StandingBook:
             rows, key = self._waiting[self._list_for(terms)], (terms.due(progress.period), sid)
         del rows[bisect.bisect_left(rows, key)]
 
-    def _insert(self, sid: bytes, terms: StandingTerms, progress: StandingProgress) -> None:
+    def _insert(self, sid: bytes, terms: StandingTerms, progress: StandingProgress,
+                lineage: Tuple[int, bytes] = FIRST_VERSION) -> None:
         self.terms[sid] = terms
         self.progress[sid] = progress
+        if lineage != FIRST_VERSION:
+            self.lineage[sid] = lineage
         self._place(sid)
         self._per_payer[terms.payer_pubkey] = self._per_payer.get(terms.payer_pubkey, 0) + 1
         self._root = None
@@ -476,6 +542,7 @@ class StandingBook:
         self._unplace(sid)
         terms = self.terms.pop(sid)
         del self.progress[sid]
+        self.lineage.pop(sid, None)
         left = self._per_payer[terms.payer_pubkey] - 1
         if left:
             self._per_payer[terms.payer_pubkey] = left
@@ -504,9 +571,19 @@ class StandingBook:
 
     def _row(self, sid: bytes) -> _Row:
         t, p = self.terms[sid], self.progress[sid]
+        version, replaces = self.version_of(sid)
         return (sid, t.payer_pubkey, t.recipient_pubkey, t.amount, t.sequence_number,
                 t.kind, t.interval, t.first_due, t.periods, p.period, p.paid_count,
-                p.missed_count, p.tries, p.queued_at, p.last_paid_height)
+                p.missed_count, p.tries, p.queued_at, p.last_paid_height,
+                version, replaces)
+
+    def version_of(self, sid: bytes) -> Tuple[int, bytes]:
+        """(version, id it replaced) of an open entry; (1, zeros) for a create."""
+        return self.lineage.get(sid, FIRST_VERSION)
+
+    def describe(self, sid: bytes) -> Dict[str, Any]:
+        """One open entry as a wallet reads it (see `describe`)."""
+        return describe(self.terms[sid], self.progress[sid], sid, self.version_of(sid))
 
     def get(self, sid: bytes) -> Optional[StandingTerms]:
         return self.terms.get(sid)
@@ -541,8 +618,7 @@ class StandingBook:
         return self.resolved_count, self.resolved_acc
 
     def snapshot_rows(self) -> List[Dict[str, Any]]:
-        return [describe(self.terms[sid], self.progress[sid], sid)
-                for sid in sorted(self.terms)]
+        return [self.describe(sid) for sid in sorted(self.terms)]
 
     def for_account(self, pubkey: str) -> List[Tuple[bytes, StandingTerms, StandingProgress]]:
         """Open entries this account pays or receives, by id."""
@@ -573,6 +649,46 @@ class StandingBook:
             return False, "only the payer may cancel"
         return True, ""
 
+    def payable_period(self, sid: bytes, height: int, ts: int) -> Tuple[int, str]:
+        """(period an execute in the block at (height, ts) would pay, "") or (-1, why not).
+
+        The period is the one whose window holds the block, and only while it
+        is not settled yet: before the first due point, after the end, or a
+        second time in a period there is nothing to pay. Who sends the execute
+        does not matter here; funds and policy are judged by the caller.
+        """
+        terms = self.terms.get(sid)
+        if terms is None:
+            return -1, "unknown or already ended standing payment"
+        current = terms.period_at(height, ts)
+        if current < 0:
+            return -1, f"not due yet: the first period opens at {terms.first_due}"
+        if current >= terms.periods:
+            return -1, "the schedule has ended"
+        progress = self.progress[sid]
+        if current < progress.period:
+            return -1, (f"period {current} is already settled; period {progress.period} "
+                        f"opens at {terms.due(progress.period)}")
+        return current, ""
+
+    def can_admit_update(self, sid: bytes, signer: str, terms: StandingTerms,
+                         height: int, ts: int) -> Tuple[bool, str]:
+        """Same order of checks as admission's: the entry, then the new terms."""
+        old = self.terms.get(sid)
+        if old is None:
+            return False, "unknown or already ended standing payment"
+        if signer != old.payer_pubkey or terms.payer_pubkey != signer:
+            return False, "only the payer may update"
+        reason = validate_create_shape(terms, height, ts)
+        if reason:
+            return False, reason
+        if terms.standing_id in self.terms:
+            return False, "standing payment already exists"
+        if self.version_of(sid)[0] >= _U32_MAX:
+            return False, "no more versions"
+        # One entry leaves as the other enters: neither cap can be crossed.
+        return True, ""
+
     # -- mutation ------------------------------------------------------------
 
     def create(self, terms: StandingTerms) -> bytes:
@@ -586,6 +702,45 @@ class StandingBook:
         if sid not in self.terms:
             raise KeyError(sid.hex())
         return self._resolve(sid, OUTCOME_CANCELLED)
+
+    def execute(self, sid: bytes, height: int, ts: int,
+                executor: str) -> List[Dict[str, Any]]:
+        """Record a paid execute of the period due now; its events.
+
+        The caller has already moved the money. A period whose window closed
+        while the entry waited is missed first, exactly as the sweep would miss
+        it, so the counters read the same whichever path paid.
+        """
+        period, reason = self.payable_period(sid, height, ts)
+        if reason:
+            raise ValueError(reason)
+        terms, progress = self.terms[sid], self.progress[sid]
+        events: List[Dict[str, Any]] = []
+        skipped = period - progress.period
+        if skipped:
+            events.append(_event(sid, "missed", progress.period, terms,
+                                 reason="window_closed", count=skipped))
+        events.append(_event(sid, "paid", period, terms, executor_pubkey=executor))
+        self._settle(sid, replace(progress, period=period + 1, tries=0,
+                                  paid_count=progress.paid_count + 1,
+                                  missed_count=progress.missed_count + skipped,
+                                  last_paid_height=height), events)
+        return events
+
+    def update(self, sid: bytes, terms: StandingTerms) -> Tuple[bytes, List[Dict[str, Any]]]:
+        """Replace `sid` by a new version with `terms`; (new id, events)."""
+        if sid not in self.terms:
+            raise KeyError(sid.hex())
+        new_sid = terms.standing_id
+        if new_sid in self.terms:
+            raise ValueError("standing payment already exists")
+        version = self.version_of(sid)[0] + 1
+        old = self._resolve(sid, OUTCOME_REPLACED)
+        self._insert(new_sid, terms, StandingProgress(), (version, sid))
+        return new_sid, [
+            _event(sid, "replaced", 0, old, replaced_by=new_sid.hex()),
+            _event(new_sid, "created", 0, terms, version=version, replaces=sid.hex()),
+        ]
 
     def sweep(self, height: int, ts: int, attempt: Attempt,
               cap: int = MAX_STANDING_ACTIONS_PER_BLOCK) -> List[Dict[str, Any]]:
@@ -671,11 +826,15 @@ def _event(sid: bytes, outcome: str, period: int, terms: StandingTerms,
     return event
 
 
-def describe(terms: StandingTerms, progress: StandingProgress, sid: bytes) -> Dict[str, Any]:
+def describe(terms: StandingTerms, progress: StandingProgress, sid: bytes,
+             lineage: Tuple[int, bytes] = FIRST_VERSION) -> Dict[str, Any]:
     """One entry as a wallet reads it: terms, progress, and the next due point."""
     next_due = terms.due(progress.period)
+    version, replaces = lineage
     return {
         "standing_id": sid.hex(),
+        "version": version,
+        "replaces": replaces.hex() if version > 1 else None,
         "payer_pubkey": terms.payer_pubkey,
         "recipient_pubkey": terms.recipient_pubkey,
         "amount": terms.amount,

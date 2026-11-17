@@ -432,3 +432,174 @@ def test_only_the_payer_cancels():
 
 def test_the_fairness_bound_is_a_module_invariant():
     assert MIN_INTERVAL_BLOCKS * MAX_STANDING_ACTIONS_PER_BLOCK >= MAX_OPEN_STANDING_TOTAL
+
+
+# --- execute and update ------------------------------------------------------------
+
+def test_payable_period_is_the_window_holding_the_block_while_it_is_unsettled():
+    book = StandingBook()
+    sid = book.create(blocks(first_due=H + 10, periods=2))
+    every = MIN_INTERVAL_BLOCKS
+    assert book.payable_period(sid, H + 9, TS)[0] == -1
+    assert "not due yet" in book.payable_period(sid, H + 9, TS)[1]
+    assert book.payable_period(sid, H + 10, TS) == (0, "")
+    assert book.payable_period(sid, H + 10 + every - 1, TS) == (0, "")
+    assert book.payable_period(sid, H + 10 + every, TS) == (1, "")
+    assert book.payable_period(sid, H + 10 + 2 * every, TS)[1] == "the schedule has ended"
+    assert "unknown" in book.payable_period(b"\x00" * 32, H + 10, TS)[1]
+    book.execute(sid, H + 10, TS, C)
+    period, why = book.payable_period(sid, H + 11, TS)
+    assert period == -1 and "period 0 is already settled" in why
+
+
+def test_execute_settles_like_the_sweep_and_leaves_the_entry_waiting():
+    by_execute, by_sweep = StandingBook(), StandingBook()
+    sid = by_execute.create(blocks(first_due=H + 10, periods=3))
+    by_sweep.create(blocks(first_due=H + 10, periods=3))
+    events = by_execute.execute(sid, H + 10, TS, C)
+    assert outcomes(events) == [("paid", 0)] and events[0]["executor_pubkey"] == C
+    swept = by_sweep.sweep(H + 10, TS, Script())
+    assert outcomes(swept) == [("paid", 0)]
+    assert by_execute.progress[sid] == by_sweep.progress[sid]
+    assert by_execute._waiting == by_sweep._waiting and not by_execute._queue
+    assert by_execute.root() == by_sweep.root()
+    # The sweep of the same block has nothing left to do.
+    assert by_execute.sweep(H + 10, TS, Script()) == []
+
+
+def test_execute_takes_an_entry_out_of_the_retry_line():
+    book = StandingBook()
+    sid = book.create(blocks(first_due=H + 10))
+    book.sweep(H + 10, TS, Script(default=ATTEMPT_NO_FUNDS))
+    assert book.describe(sid)["status"] == "retrying" and book._fresh == 0
+    book.execute(sid, H + 11, TS, C)
+    assert not book._queue and book.progress[sid].tries == 0
+    assert book.describe(sid)["status"] == "waiting"
+
+
+def test_execute_after_a_closed_window_misses_the_old_period_first():
+    book = StandingBook()
+    every = MIN_INTERVAL_BLOCKS
+    sid = book.create(blocks(first_due=H + 10, periods=4))
+    events = book.execute(sid, H + 10 + 2 * every, TS, C)
+    assert [(e["outcome"], e["period"], e.get("count")) for e in events] == \
+        [("missed", 0, 2), ("paid", 2, None)]
+    p = book.progress[sid]
+    assert (p.period, p.paid_count, p.missed_count) == (3, 1, 2)
+
+
+def test_executing_the_last_period_ends_the_entry():
+    book = StandingBook()
+    sid = book.create(blocks(first_due=H + 10, periods=1))
+    events = book.execute(sid, H + 10, TS, C)
+    assert outcomes(events) == [("paid", 0), ("ended", 1)]
+    assert not book.knows(sid) and book.resolved_count == 1
+
+
+def test_execute_refuses_what_payable_period_refuses():
+    book = StandingBook()
+    sid = book.create(blocks(first_due=H + 10))
+    with pytest.raises(ValueError, match="not due yet"):
+        book.execute(sid, H + 9, TS, C)
+    root = book.root()
+    book.execute(sid, H + 10, TS, C)
+    with pytest.raises(ValueError, match="already settled"):
+        book.execute(sid, H + 11, TS, C)
+    assert book.root() != root
+
+
+def test_update_resolves_the_old_version_and_inserts_the_next_one():
+    book = StandingBook()
+    old = book.create(blocks(seq=0, amount=10))
+    new_terms = blocks(seq=1, amount=12)
+    ok, why = book.can_admit_update(old, A, new_terms, H, TS)
+    assert ok, why
+    new, events = book.update(old, new_terms)
+    assert new == new_terms.standing_id != old
+    assert [(e["standing_id"], e["outcome"]) for e in events] == \
+        [(old.hex(), "replaced"), (new.hex(), "created")]
+    assert events[1]["version"] == 2 and events[1]["replaces"] == old.hex()
+    assert book.version_of(new) == (2, old) and not book.knows(old)
+    assert book.open_count_for_payer(A) == 1
+    assert book.resolved_acc == standing.compute_standing_resolved_acc(
+        bytes(32), old, standing.OUTCOME_REPLACED)
+    row = book.describe(new)
+    assert (row["version"], row["replaces"]) == (2, old.hex())
+    assert book.describe(book.create(blocks(seq=5)))["replaces"] is None
+
+
+@pytest.mark.parametrize("signer,terms,match", [
+    (C, blocks(seq=1, payer=C), "only the payer"),
+    (A, blocks(seq=1, payer=C), "only the payer"),
+    (A, blocks(seq=1, first_due=H), "first_due must be in the future"),
+    (A, blocks(seq=1, recipient=A), "recipient must differ"),
+    (A, blocks(seq=0), "already exists"),
+])
+def test_update_refusals(signer, terms, match):
+    book = StandingBook()
+    old = book.create(blocks(seq=0))
+    ok, why = book.can_admit_update(old, signer, terms, H, TS)
+    assert not ok and match in why
+
+
+def test_update_of_an_unknown_entry_is_refused():
+    ok, why = StandingBook().can_admit_update(b"\x01" * 32, A, blocks(seq=1), H, TS)
+    assert not ok and "unknown" in why
+
+
+def test_the_lineage_is_committed_copied_and_restored():
+    book = StandingBook()
+    old = book.create(blocks(seq=0))
+    new, _ = book.update(old, blocks(seq=1, amount=11))
+    plain = StandingBook()
+    plain.create(blocks(seq=1, amount=11))
+    plain.resolved_count, plain.resolved_acc = book.resolved_count, book.resolved_acc
+    plain._root = None
+    # Same terms, same progress, same resolved state: only the lineage differs.
+    assert plain.root() != book.root()
+    clone = copy.deepcopy(book)
+    assert clone.version_of(new) == (2, old)
+    clone.cancel(new)
+    assert book.version_of(new) == (2, old) and clone.lineage == {}
+    count, acc = book.resolved_state()
+    again = StandingBook.restore(book.rows(), count, acc)
+    assert again.root() == book.root() and again.version_of(new) == (2, old)
+
+
+@pytest.mark.parametrize("version,replaces,match", [
+    (2, bytes(32), "bad version"),        # a later version replaces something
+    (1, b"\x07" * 32, "bad version"),     # a first version replaces nothing
+    (0, bytes(32), "bad version"),
+    (2, b"\x07" * 31, "bad version"),
+])
+def test_restore_refuses_a_lineage_an_update_could_not_have_written(version, replaces, match):
+    book = StandingBook()
+    book.create(blocks())
+    row = list(book.rows()[0])
+    row[15], row[16] = version, replaces
+    with pytest.raises(ValueError, match=match):
+        StandingBook.restore([tuple(row)], 0, bytes(32))
+
+
+def test_restore_refuses_an_entry_that_replaces_itself():
+    book = StandingBook()
+    sid = book.create(blocks())
+    row = list(book.rows()[0])
+    row[15], row[16] = 2, sid
+    with pytest.raises(ValueError, match="bad version"):
+        StandingBook.restore([tuple(row)], 0, bytes(32))
+
+
+def test_parse_execute_and_update_read_root_fields_only():
+    execute = {"sender_pubkey": C, "standing_id": "ab" * 32,
+               "payload": {"standing_id": "cd" * 32}}
+    assert standing.parse_standing_payment_execute(execute) == (C, bytes.fromhex("ab" * 32))
+    with pytest.raises(StandingShapeError, match="standing_id"):
+        standing.parse_standing_payment_execute({"sender_pubkey": C, "standing_id": "AB" * 32})
+    update = {"sender_pubkey": A, "sequence_number": 4, "recipient_pubkey": B, "amount": 5,
+              "interval_blocks": MIN_INTERVAL_BLOCKS, "first_due": H + 10, "periods": 2,
+              "standing_id": "ef" * 32}
+    sid, terms = standing.parse_standing_payment_update(update)
+    assert sid == bytes.fromhex("ef" * 32) and terms == parse_standing_payment_create(update)
+    with pytest.raises(StandingShapeError, match="standing_id"):
+        standing.parse_standing_payment_update({**update, "standing_id": None})

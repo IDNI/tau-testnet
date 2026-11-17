@@ -60,12 +60,17 @@ from .standing import (
     ATTEMPT_BLOCKED,
     ATTEMPT_NO_FUNDS,
     ATTEMPT_PAID,
+    MAX_STANDING_EXECUTIONS_PER_BLOCK,
     STANDING_TX_TYPES,
     StandingBook,
     StandingShapeError,
     TX_TYPE_STANDING_PAYMENT_CREATE,
+    TX_TYPE_STANDING_PAYMENT_EXECUTE,
+    TX_TYPE_STANDING_PAYMENT_UPDATE,
     parse_standing_payment_cancel,
     parse_standing_payment_create,
+    parse_standing_payment_execute,
+    parse_standing_payment_update,
 )
 from .rule_offers import (
     RULE_OFFER_TX_TYPES,
@@ -91,7 +96,10 @@ from .rule_offers import (
 # governance vote, so approver bots need no funding.
 #
 # `standing_payment_create` pays for the same reason: it is the ONLY charge
-# for every payment the authorization later makes from the end-of-block sweep.
+# for every payment the authorization later makes from the end-of-block sweep;
+# `standing_payment_update` pays as the create of the new version it is.
+# `standing_payment_execute` is paid by its executor, whoever that is, because it
+# asks for a payment (and its clause step) the sweep would otherwise make later.
 # `payout_rule_set` pays because it builds a clause; `payout_execute` is paid by
 # its executor, whoever that is, because it steps the rule.
 #
@@ -102,6 +110,7 @@ from .rule_offers import (
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_STANDING_PAYMENT_CREATE,
+     TX_TYPE_STANDING_PAYMENT_UPDATE, TX_TYPE_STANDING_PAYMENT_EXECUTE,
      TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE}
     | set(RULE_OFFER_TX_TYPES)
 )
@@ -1196,13 +1205,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
 
-        # What the block did to standing payments: creations and cancels from
-        # the transactions it kept, then the sweep, in that order.
+        # What the block did to standing payments: creations, cancels, updates
+        # and executes from the transactions it kept, then the sweep, in order.
         standing_events = []
         for i, tx in enumerate(block.transactions):
-            event = (exec_result.receipts.get(tx.get('tx_id', str(i))) or {}).get("standing_event")
-            if event and tx in exec_result.accepted_transactions:
-                standing_events.append(event)
+            events = (exec_result.receipts.get(tx.get('tx_id', str(i))) or {}).get("standing_events")
+            if events and tx in exec_result.accepted_transactions:
+                standing_events.extend(events)
         standing_events.extend(standing_sweep)
 
         # Payout rules: installs, revokes and executions from the kept
@@ -1785,6 +1794,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             return lifecycle_mgr
 
         payout_executions_in_block = 0
+        standing_executions_in_block = 0
         for i, tx in enumerate(transactions):
             # One branch per transaction. Its journal child, allocator child and
             # state delta resolve together; a rejection that already stepped the
@@ -1923,6 +1933,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_retract_id: Optional[bytes] = None
             pending_standing_create = None
             pending_standing_cancel: Optional[bytes] = None
+            pending_standing_update = None    # (id replaced, new terms)
+            pending_standing_execute = None   # (id, payer)
             pending_payout_set = None
             pending_payout_revoke: Optional[str] = None
             pending_payout_exec = None   # (account, total, legs, sale_id)
@@ -2914,7 +2926,104 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 operations = {}
                 if accepted_in_block and not hard_reject:
                     book = lifecycle_mgr.standing_payments
-                    if tx_type == TX_TYPE_STANDING_PAYMENT_CREATE:
+                    height_now = int(block_height or 0)
+                    ts_now = int(block_timestamp or 0)
+                    if tx_type == TX_TYPE_STANDING_PAYMENT_EXECUTE:
+                        reason, standing_id, executor = "", None, None
+                        try:
+                            executor, standing_id = parse_standing_payment_execute(tx)
+                        except StandingShapeError as exc:
+                            reason = f"invalid standing payment execute ({exc})"
+                        if standing_id is not None:
+                            if not isinstance(sender, str) or sender != executor:
+                                reason = "sender is not the signer"
+                            elif target_balances is None:
+                                reason = "no balance overlay"
+                            elif standing_executions_in_block >= MAX_STANDING_EXECUTIONS_PER_BLOCK:
+                                reason = ("the block already carries the most standing payment "
+                                          "executions it may")
+                            else:
+                                period, reason = book.payable_period(standing_id, height_now, ts_now)
+                        if standing_id is not None and not reason:
+                            terms = book.get(standing_id)
+                            payer, recipient = terms.payer_pubkey, terms.recipient_pubkey
+                            # The same judgement the sweep makes, on this
+                            # transaction's view of the block: funds as staged so
+                            # far, the payer's current o5 clause on the real
+                            # recipient and amount, approval slots empty.
+                            have = _read_bal(payer)
+                            if have < terms.amount:
+                                reason = (f"the payer cannot fund period {period} now "
+                                          f"(has {have}, needs {terms.amount})")
+                            else:
+                                clause = lifecycle_mgr.rule_offers.clause_for(
+                                    payer, tau_defs.USER_POLICY_STREAM_INDEX)
+                                if clause:
+                                    inputs = standing_payment_inputs(
+                                        payer, recipient, terms.amount,
+                                        parent_balance=_parent_bal(payer),
+                                        since_last=(_since_last_transfer(payer)
+                                                    if cooldown_active else None),
+                                        slots_active=approval_slots_on, timestamp=ts_now,
+                                    )
+                                    try:
+                                        blocked, detail = sender_policy.clause_blocks(
+                                            clause, inputs, pool="apply",
+                                            timeout=getattr(_session, "request_budget", None),
+                                        )
+                                    except Exception:
+                                        if not replay_mode:
+                                            raise
+                                        # The sweep's replay concession, for the
+                                        # same reason: the state hash catches it.
+                                        logger.warning(
+                                            "Replay without a policy evaluator: standing "
+                                            "payment %s execute assumed allowed.",
+                                            standing_id.hex()[:16])
+                                        blocked, detail = False, ""
+                                    if blocked:
+                                        reason = f"the payer's policy blocks this payment ({detail})"
+                        if reason:
+                            tx_receipt["logs"].append(f"Standing payment not executed: {reason}")
+                            tx_receipt["reason"] = "standing_payment_not_executed"
+                            accepted_in_block = False
+                        else:
+                            # Debit first, then credit through the staged view,
+                            # so an executor who is also a party nets right.
+                            staged_writes[payer] = _read_bal(payer) - terms.amount
+                            staged_writes[recipient] = _read_bal(recipient) + terms.amount
+                            pending_standing_execute = (standing_id, payer)
+                            standing_executions_in_block += 1
+                            tx_receipt["logs"].append(
+                                f"Standing payment executed: period {period} of "
+                                f"{standing_id.hex()}, {terms.amount} to {recipient[:10]}..."
+                            )
+                    elif tx_type == TX_TYPE_STANDING_PAYMENT_UPDATE:
+                        reason, standing_id, terms = "", None, None
+                        try:
+                            standing_id, terms = parse_standing_payment_update(tx)
+                        except StandingShapeError as exc:
+                            reason = f"invalid standing payment update ({exc})"
+                        if terms is not None:
+                            if not isinstance(sender, str) or sender != terms.payer_pubkey:
+                                reason = "sender is not the signer"
+                            elif target_balances is None:
+                                reason = "no balance overlay"
+                            else:
+                                _, reason = book.can_admit_update(
+                                    standing_id, sender, terms, height_now, ts_now)
+                        if reason:
+                            tx_receipt["logs"].append(f"Standing payment update ignored: {reason}")
+                            tx_receipt["reason"] = "standing_payment_not_updated"
+                            accepted_in_block = False
+                        else:
+                            # Priced like a create by the fee-query step below.
+                            pending_standing_update = (standing_id, terms)
+                            tx_receipt["logs"].append(
+                                f"Standing payment updated: {standing_id.hex()} -> "
+                                f"{terms.standing_id.hex()}"
+                            )
+                    elif tx_type == TX_TYPE_STANDING_PAYMENT_CREATE:
                         try:
                             terms = parse_standing_payment_create(tx)
                         except StandingShapeError as exc:
@@ -2926,9 +3035,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             elif target_balances is None:
                                 reason = "no balance overlay"
                             else:
-                                _, reason = book.can_admit_create(
-                                    terms, int(block_height or 0), int(block_timestamp or 0)
-                                )
+                                _, reason = book.can_admit_create(terms, height_now, ts_now)
                         if terms is None or reason:
                             tx_receipt["logs"].append(f"Standing payment ignored: {reason}")
                             tx_receipt["reason"] = "standing_payment_not_created"
@@ -3635,15 +3742,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     book.retract(pending_retract_id)
                 if pending_standing_create is not None:
                     sid = _lifecycle_for_write().standing_payments.create(pending_standing_create)
-                    tx_receipt["standing_event"] = {
+                    tx_receipt["standing_events"] = [{
                         "standing_id": sid.hex(), "outcome": "created", "period": 0, "amount": 0,
-                    }
+                    }]
                 elif pending_standing_cancel is not None:
                     _lifecycle_for_write().standing_payments.cancel(pending_standing_cancel)
-                    tx_receipt["standing_event"] = {
+                    tx_receipt["standing_events"] = [{
                         "standing_id": pending_standing_cancel.hex(), "outcome": "cancelled",
                         "period": 0, "amount": 0,
-                    }
+                    }]
+                elif pending_standing_update is not None:
+                    _new_sid, events = _lifecycle_for_write().standing_payments.update(
+                        *pending_standing_update)
+                    tx_receipt["standing_events"] = events
+                elif pending_standing_execute is not None:
+                    tx_receipt["standing_events"] = (
+                        _lifecycle_for_write().standing_payments.execute(
+                            pending_standing_execute[0], int(block_height or 0),
+                            int(block_timestamp or 0), sender))
                 if pending_payout_set is not None:
                     terms = pending_payout_set
                     replaced = _lifecycle_for_write().payout_rules.install(
@@ -3745,6 +3861,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # A payout is a send from the ACCOUNT, not from its executor.
                 if pending_payout_exec is not None and target_last_transfer_ts is not None:
                     target_last_transfer_ts[pending_payout_exec[0]] = int(block_timestamp or 0)
+                # So is an executed standing payment: from the payer, once.
+                if pending_standing_execute is not None and target_last_transfer_ts is not None:
+                    target_last_transfer_ts[pending_standing_execute[1]] = int(block_timestamp or 0)
 
                 if should_increment_seq and sender:
                     try:

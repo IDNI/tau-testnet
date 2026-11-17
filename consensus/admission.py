@@ -71,9 +71,13 @@ from consensus.standing import (
     KIND_NAMES as STANDING_KIND_NAMES,
     TX_TYPE_STANDING_PAYMENT_CANCEL,
     TX_TYPE_STANDING_PAYMENT_CREATE,
+    TX_TYPE_STANDING_PAYMENT_EXECUTE,
+    TX_TYPE_STANDING_PAYMENT_UPDATE,
     StandingShapeError,
     parse_standing_payment_cancel,
     parse_standing_payment_create,
+    parse_standing_payment_execute,
+    parse_standing_payment_update,
     validate_create_shape as validate_standing_create_shape,
 )
 from consensus.retractable import (
@@ -1708,9 +1712,26 @@ def validate_standing_payment_create_payload(
             "The standing payment book is full.", code="STANDING_BOOK_FULL"
         )
 
-    # Advisory deadline coupling, as for a retractable park: a create mined at or
-    # after its own first due point is refused by apply, so do not queue one that
-    # could be.
+    refusal = _standing_deadline_refusal(tx, terms)
+    if refusal is not None:
+        return refusal
+
+    return success({
+        "standing_id": standing_id.hex(),
+        "amount": terms.amount,
+        "recipient_pubkey": terms.recipient_pubkey,
+        "schedule": STANDING_KIND_NAMES[terms.kind],
+        "interval": terms.interval,
+        "first_due": terms.first_due,
+        "periods": terms.periods,
+        "end": terms.end,
+    })
+
+
+def _standing_deadline_refusal(tx: Dict, terms) -> Optional[AdmissionResult]:
+    """Advisory deadline coupling, as for a retractable park: a create (or an
+    update's new version) mined at or after its own first due point is refused
+    by apply, so do not queue one that could be."""
     if terms.kind == STANDING_KIND_BLOCKS:
         expire_at_height = tx.get("expire_at_height")
         if isinstance(expire_at_height, int) and expire_at_height > terms.first_due:
@@ -1725,9 +1746,56 @@ def validate_standing_payment_create_payload(
                 "expiration_time must be before first_due.",
                 code="DEADLINE_AFTER_FIRST_DUE",
             )
+    return None
+
+
+def validate_standing_payment_update_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for replacing an authorization by a new version.
+
+    The new terms get exactly a create's screens; the book check is apply's own
+    (`StandingBook.can_admit_update`), in the same order.
+    """
+    try:
+        standing_id, terms = parse_standing_payment_update(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment_update: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != terms.payer_pubkey:
+        return format_error("standing_payment_update sender_pubkey must match the signer.")
+
+    err = validate_bls_pubkey(terms.recipient_pubkey, "recipient_pubkey")
+    if err:
+        return format_error(f"standing_payment_update rejected: {err}")
+
+    book = tip_view.standing_book()
+    old = book.get(standing_id)
+    if old is None:
+        return format_error(
+            "Unknown or already ended standing payment.", code="UNKNOWN_STANDING_PAYMENT"
+        )
+    if old.payer_pubkey != sender:
+        return format_error(
+            "Only the payer may update a standing payment.", code="NOT_STANDING_PAYER"
+        )
+    ok, reason = book.can_admit_update(
+        standing_id, sender, terms, tip_view.next_block_height, tip_view.next_block_timestamp
+    )
+    if not ok:
+        code = ("DUPLICATE_STANDING_PAYMENT" if reason == "standing payment already exists"
+                else "INVALID_SCHEDULE")
+        return format_error(f"standing_payment_update rejected: {reason}", code=code)
+
+    refusal = _standing_deadline_refusal(tx, terms)
+    if refusal is not None:
+        return refusal
 
     return success({
-        "standing_id": standing_id.hex(),
+        "standing_id": terms.standing_id.hex(),
+        "replaces": standing_id.hex(),
+        "version": book.version_of(standing_id)[0] + 1,
         "amount": terms.amount,
         "recipient_pubkey": terms.recipient_pubkey,
         "schedule": STANDING_KIND_NAMES[terms.kind],
@@ -1735,6 +1803,80 @@ def validate_standing_payment_create_payload(
         "first_due": terms.first_due,
         "periods": terms.periods,
         "end": terms.end,
+    })
+
+
+def validate_standing_payment_execute_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for paying the period that is due now; anyone may send it.
+
+    The period check is apply's own (`StandingBook.payable_period`). Funds and
+    the payer's o5 clause are judged against the tip, as advisory as every
+    admission evaluation: apply judges them again in the block it lands in.
+    """
+    import chain_state
+    from consensus import engine, sender_policy
+
+    try:
+        executor, standing_id = parse_standing_payment_execute(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment_execute: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != executor:
+        return format_error("standing_payment_execute sender_pubkey must match the signer.")
+
+    book = tip_view.standing_book()
+    height, ts = tip_view.next_block_height, tip_view.next_block_timestamp
+    period, reason = book.payable_period(standing_id, height, ts)
+    if reason:
+        code = ("UNKNOWN_STANDING_PAYMENT" if book.get(standing_id) is None
+                else "STANDING_PAYMENT_NOT_DUE")
+        return format_error(f"standing_payment_execute refused: {reason}.", code=code)
+
+    terms = book.get(standing_id)
+    payer = terms.payer_pubkey
+    try:
+        have = int(chain_state.get_balance(payer) or 0)
+    except (TypeError, ValueError):
+        have = 0
+    if have < terms.amount:
+        return format_error(
+            f"standing_payment_execute refused: the payer cannot fund period {period} now "
+            f"(has {have}, needs {terms.amount}).",
+            code="STANDING_PAYMENT_UNFUNDED",
+        )
+
+    clause = tip_view.clause_for(payer, tau_defs.USER_POLICY_STREAM_INDEX)
+    if clause:
+        since_last = None
+        if getattr(tau_defs, "COOLDOWN_STREAM_ACTIVE", False):
+            previous = int((getattr(chain_state, "_last_transfer_ts", {}) or {}).get(payer, 0) or 0)
+            since_last = str(tau_defs.COOLDOWN_NEVER_SENT if previous <= 0 else
+                             max(0, min(ts - previous, tau_defs.COOLDOWN_NEVER_SENT)))
+        inputs = engine.standing_payment_inputs(
+            payer, terms.recipient_pubkey, terms.amount,
+            parent_balance=str(max(0, min(have, tau_defs.MAX_TRANSFER_VALUE))),
+            since_last=since_last, slots_active=tip_view.approval_slots_active,
+            timestamp=ts,
+        )
+        blocked, detail = _payout_evaluator_call(
+            lambda budget: sender_policy.clause_blocks(
+                clause, inputs, pool="admission", timeout=budget))
+        if blocked:
+            return format_error(
+                f"standing_payment_execute refused: the payer's policy blocks this payment "
+                f"({detail}).",
+                code="STANDING_PAYMENT_BLOCKED",
+            )
+
+    return success({
+        "standing_id": standing_id.hex(),
+        "period": period,
+        "amount": terms.amount,
+        "payer_pubkey": payer,
+        "recipient_pubkey": terms.recipient_pubkey,
     })
 
 
@@ -2018,6 +2160,12 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
          return validate_standing_payment_cancel_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_UPDATE:
+         return validate_standing_payment_update_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_EXECUTE:
+         return validate_standing_payment_execute_payload(payload, tip_view)
 
     elif tx_type == TX_TYPE_PAYOUT_RULE_SET:
          return validate_payout_rule_set_payload(payload, tip_view)

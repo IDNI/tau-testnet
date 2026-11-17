@@ -35,6 +35,8 @@ from consensus.standing import (
     STANDING_TX_TYPES,
     TX_TYPE_STANDING_PAYMENT_CANCEL,
     TX_TYPE_STANDING_PAYMENT_CREATE,
+    TX_TYPE_STANDING_PAYMENT_EXECUTE,
+    TX_TYPE_STANDING_PAYMENT_UPDATE,
 )
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
@@ -62,12 +64,15 @@ KNOWN_TX_TYPES = frozenset(
 # exempt like a governance vote -- approver bots would otherwise all need funding
 # and a fee strategy, and the vote is bounded by the request's declared approver
 # set instead. `standing_payment_create` pays once for every payment the sweep
-# later makes; `standing_payment_cancel` is free like `retract_transfer`.
+# later makes, and `standing_payment_update` once for the new version it starts;
+# `standing_payment_execute` is paid by its executor;
+# `standing_payment_cancel` is free like `retract_transfer`.
 # `payout_rule_set` pays for its build; `payout_execute` is paid by its executor;
 # `payout_rule_revoke` is free like a cancel.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_STANDING_PAYMENT_CREATE,
+     TX_TYPE_STANDING_PAYMENT_UPDATE, TX_TYPE_STANDING_PAYMENT_EXECUTE,
      TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE}
     | set(RULE_OFFER_TX_TYPES)
 )
@@ -894,20 +899,23 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                 pending_tx_hash=rivals[0],
             )
 
-    if tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
+    if tx_type in (TX_TYPE_STANDING_PAYMENT_CANCEL, TX_TYPE_STANDING_PAYMENT_EXECUTE):
         # One pending cancel per authorization, as for a retract: it is free.
+        # One pending execute per authorization and sender: a second one can
+        # only be refused in its block, and the refusal would leave a gap in
+        # that sender's sequence for every transaction queued after it.
         own_hash, _ = _compute_transaction_message_id(payload)
         rivals = [
             h for h in db.pending_tx_hashes_naming(
-                sender_pubkey, TX_TYPE_STANDING_PAYMENT_CANCEL,
-                "standing_id", payload["standing_id"],
+                sender_pubkey, tx_type, "standing_id", payload["standing_id"],
             )
             if h != own_hash
         ]
         if rivals:
+            what = "A cancel" if tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL else "An execute"
             return _qt_err(
-                "DUPLICATE_STANDING_CANCEL",
-                "A cancel for this standing payment is already pending.",
+                "DUPLICATE_STANDING_" + what.split()[1].upper(),
+                f"{what} for this standing payment is already pending.",
                 pending_tx_hash=rivals[0],
             )
 

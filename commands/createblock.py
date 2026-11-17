@@ -187,17 +187,25 @@ def _drop_sequence_gap_orphans(transactions, execution_transactions, reserved_id
 
 
 def _defer_payout_overflow(transactions, execution_transactions, reserved_ids):
-    """Keep at most MAX_PAYOUT_EXECUTIONS_PER_BLOCK payout executions in the batch.
+    """Keep at most the per-block number of executions of each capped type.
 
-    Apply refuses the executions over the per-block cap, and a refused
-    transaction is disposed with the block, i.e. a valid execution would be
-    destroyed only because the block was full. Leave the overflow, and every
+    Apply refuses payout executions over MAX_PAYOUT_EXECUTIONS_PER_BLOCK and
+    standing payment executes over MAX_STANDING_EXECUTIONS_PER_BLOCK, and a
+    refused transaction is disposed with the block, i.e. a valid execution would
+    be destroyed only because the block was full. Leave the overflow, and every
     later transaction of its senders (their sequence would gap), in the mempool
     for the next block instead. All three lists are mutated in lockstep.
     """
     from consensus.payout import MAX_PAYOUT_EXECUTIONS_PER_BLOCK, TX_TYPE_PAYOUT_EXECUTE
+    from consensus.standing import (
+        MAX_STANDING_EXECUTIONS_PER_BLOCK,
+        TX_TYPE_STANDING_PAYMENT_EXECUTE,
+    )
 
-    kept, held_senders, dropped_ids = 0, set(), []
+    caps = {TX_TYPE_PAYOUT_EXECUTE: MAX_PAYOUT_EXECUTIONS_PER_BLOCK,
+            TX_TYPE_STANDING_PAYMENT_EXECUTE: MAX_STANDING_EXECUTIONS_PER_BLOCK}
+    kept = dict.fromkeys(caps, 0)
+    held_senders, dropped_ids = set(), []
     for i in range(len(transactions)):
         tx = transactions[i]
         if not isinstance(tx, dict):
@@ -206,20 +214,21 @@ def _defer_payout_overflow(transactions, execution_transactions, reserved_ids):
         if sender in held_senders:
             dropped_ids.append(i)
             continue
-        if tx.get("tx_type") == TX_TYPE_PAYOUT_EXECUTE:
-            if kept >= MAX_PAYOUT_EXECUTIONS_PER_BLOCK:
+        tx_type = tx.get("tx_type")
+        if tx_type in caps:
+            if kept[tx_type] >= caps[tx_type]:
                 held_senders.add(sender)
                 dropped_ids.append(i)
             else:
-                kept += 1
+                kept[tx_type] += 1
     held = [reserved_ids[i] for i in dropped_ids]
     for i in reversed(dropped_ids):
         del transactions[i]
         del execution_transactions[i]
         del reserved_ids[i]
     if held:
-        print(f"[INFO][createblock] Deferred {len(held)} tx(s) over the per-block "
-              "payout execution cap")
+        print(f"[INFO][createblock] Deferred {len(held)} tx(s) over a per-block "
+              "execution cap")
         try:
             db.unreserve_mempool_txs(held)
         except Exception:

@@ -50,8 +50,9 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
             return {}
         tx = txs[ids.index(tx_hash)]
         tx_type = tx.get("tx_type") if isinstance(tx, dict) else None
-        if tx_type in ("standing_payment_create", "standing_payment_cancel"):
-            return _standing_fields(tx)
+        if tx_type in ("standing_payment_create", "standing_payment_cancel",
+                       "standing_payment_update", "standing_payment_execute"):
+            return _standing_fields(tx, block_hash)
         if tx_type in ("payout_rule_set", "payout_rule_revoke", "payout_execute"):
             return _payout_fields(tx, tx_hash, block_hash)
         if tx_type == "retract_transfer":
@@ -74,30 +75,46 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
         return {}
 
 
-def _standing_fields(tx: dict) -> dict:
-    """`standing` for a confirmed create, `cancels` for a confirmed cancel.
+def _standing_fields(tx: dict, block_hash: str = "") -> dict:
+    """`standing` for a confirmed create or update, `cancels` for a cancel,
+    `executes` for an execute.
 
     `status` is the authorization's state now: waiting, due or retrying while it
-    is open, ended or cancelled once resolved, not_recorded when this node has
-    no record of how it ended.
+    is open, ended, cancelled or replaced once resolved, not_recorded when this
+    node has no record of how it ended. An update also says which id it replaced.
     """
-    if tx.get("tx_type") == "standing_payment_cancel":
+    tx_type = tx.get("tx_type")
+    if tx_type == "standing_payment_cancel":
         return {"cancels": tx.get("standing_id")}
     from commands.getstandingpayments import _tip
-    from consensus.standing import describe, parse_standing_payment_create
+    from consensus.standing import parse_standing_payment_create
     import db
+
+    if tx_type == "standing_payment_execute":
+        # What it paid: the "paid" event of this block that names this executor.
+        sid_hex = tx.get("standing_id")
+        paid = next((e for e in db.get_canonical_standing_events(sid_hex)
+                     if e.get("block_hash") == block_hash and e.get("outcome") == "paid"
+                     and e.get("executor_pubkey") == tx.get("sender_pubkey")), None)
+        out = {"executes": sid_hex}
+        if paid is not None:
+            out["standing_payment"] = {"period": paid["period"], "amount": paid["amount"]}
+        return out
 
     sid = parse_standing_payment_create(tx).standing_id
     _head, book = _tip()
     if book.knows(sid):
-        status = describe(book.get(sid), book.progress[sid], sid)["status"]
+        status = book.describe(sid)["status"]
     else:
         status = "not_recorded"
         for event in db.get_canonical_standing_events(sid.hex()):
-            if event.get("outcome") in ("ended", "cancelled"):
+            if event.get("outcome") in ("ended", "cancelled", "replaced"):
                 status = event["outcome"]
                 break
-    return {"standing": {"id": sid.hex(), "status": status}}
+    out = {"standing": {"id": sid.hex(), "status": status}}
+    if tx_type == "standing_payment_update":
+        out["standing"]["replaces"] = tx.get("standing_id")
+    return out
 
 
 def _payout_fields(tx: dict, tx_hash: str, block_hash: str) -> dict:

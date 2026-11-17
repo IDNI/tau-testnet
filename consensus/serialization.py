@@ -862,12 +862,16 @@ def encode_standing_entry(
     tries: int,
     queued_at: int,
     last_paid_height: int,
+    version: int = 1,
+    replaces: Any = bytes(32),
 ) -> bytes:
-    """The signed terms, then the progress the sweep keeps.
+    """The signed terms, the progress the sweep keeps, then the lineage.
 
     Progress is committed, not only the terms: which entries the capped sweep
     reaches in a block depends on it, so two nodes that agreed on the terms but
-    not on the queue would pay different entries in the same block.
+    not on the queue would pay different entries in the same block. The lineage
+    (version, id replaced by an update) is committed so a node restored from
+    storage reports the same version history its peers do.
     """
     out = bytearray()
     out.extend(encode_hash32(standing_id))
@@ -881,6 +885,8 @@ def encode_standing_entry(
     out.extend(encode_uint32(int(tries)))
     out.extend(encode_uint64(int(queued_at)))
     out.extend(encode_uint64(int(last_paid_height)))
+    out.extend(encode_uint32(int(version)))
+    out.extend(encode_hash32(replaces))
     return bytes(out)
 
 

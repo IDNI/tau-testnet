@@ -112,9 +112,20 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "retract_transfer",
     "standing_payment_create",
     "standing_payment_cancel",
+    "standing_payment_update",
+    "standing_payment_execute",
     "payout_rule_set",
     "payout_rule_revoke",
     "payout_execute",
+})
+
+
+# The standing payment types share one gossip topic and one snapshot sub-quota.
+_STANDING_TX_TYPES = frozenset({
+    "standing_payment_create",
+    "standing_payment_update",
+    "standing_payment_cancel",
+    "standing_payment_execute",
 })
 
 
@@ -648,7 +659,7 @@ class NetworkService:
                     if retractable_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS:
                         continue
                     retractable_txs_count += 1
-                elif tx_type in ("standing_payment_create", "standing_payment_cancel"):
+                elif tx_type in _STANDING_TX_TYPES:
                     if standing_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_STANDING_TXS:
                         continue
                     standing_txs_count += 1
@@ -907,13 +918,17 @@ class NetworkService:
         from .protocols import (
             TAU_MAX_STANDING_PAYMENT_CANCEL_BYTES,
             TAU_MAX_STANDING_PAYMENT_CREATE_BYTES,
+            TAU_MAX_STANDING_PAYMENT_EXECUTE_BYTES,
+            TAU_MAX_STANDING_PAYMENT_UPDATE_BYTES,
         )
         await self._process_gossip_payload(
             envelope,
-            allowed_types={"standing_payment_create", "standing_payment_cancel"},
+            allowed_types=set(_STANDING_TX_TYPES),
             type_limits={
                 "standing_payment_create": TAU_MAX_STANDING_PAYMENT_CREATE_BYTES,
+                "standing_payment_update": TAU_MAX_STANDING_PAYMENT_UPDATE_BYTES,
                 "standing_payment_cancel": TAU_MAX_STANDING_PAYMENT_CANCEL_BYTES,
+                "standing_payment_execute": TAU_MAX_STANDING_PAYMENT_EXECUTE_BYTES,
             },
         )
 
@@ -1032,18 +1047,20 @@ class NetworkService:
             if "retractable_id" not in p_dict:
                 logger.debug("Gossip rejected: retract_transfer missing retractable_id")
                 return
-        elif tx_type == "standing_payment_create":
+        elif tx_type in ("standing_payment_create", "standing_payment_update"):
             missing = [f for f in ("recipient_pubkey", "amount", "first_due", "periods")
                        if f not in p_dict]
             intervals = [f for f in ("interval_blocks", "interval_seconds", "interval_months")
                          if p_dict.get(f) is not None]
+            if tx_type == "standing_payment_update" and "standing_id" not in p_dict:
+                missing.append("standing_id")
             if missing or len(intervals) != 1:
-                logger.debug("Gossip rejected: standing_payment_create missing %s or "
-                             "not exactly one interval", missing)
+                logger.debug("Gossip rejected: %s missing %s or not exactly one interval",
+                             tx_type, missing)
                 return
-        elif tx_type == "standing_payment_cancel":
+        elif tx_type in ("standing_payment_cancel", "standing_payment_execute"):
             if "standing_id" not in p_dict:
-                logger.debug("Gossip rejected: standing_payment_cancel missing standing_id")
+                logger.debug("Gossip rejected: %s missing standing_id", tx_type)
                 return
         elif tx_type == "payout_rule_set":
             missing = [f for f in ("rule_text", "slots", "cap_per_execution",
@@ -1686,7 +1703,7 @@ class NetworkService:
             return TAU_GOSSIP_TOPIC_APPROVALS
         if tx_type in ("retractable_transfer", "retract_transfer"):
             return TAU_GOSSIP_TOPIC_RETRACTABLE
-        if tx_type in ("standing_payment_create", "standing_payment_cancel"):
+        if tx_type in _STANDING_TX_TYPES:
             return TAU_GOSSIP_TOPIC_STANDING
         if tx_type in ("payout_rule_set", "payout_rule_revoke", "payout_execute"):
             return TAU_GOSSIP_TOPIC_PAYOUT

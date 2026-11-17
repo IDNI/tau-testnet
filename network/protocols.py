@@ -61,9 +61,12 @@ TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS = 32
 TAU_MAX_RETRACTABLE_TRANSFER_BYTES = 4096
 TAU_MAX_RETRACT_TRANSFER_BYTES = 4096
 TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS = 32
-# A create carries two pubkeys and a few integers; a cancel carries one id.
+# A create carries two pubkeys and a few integers, an update the same plus the
+# id it replaces; a cancel and an execute carry one id.
 TAU_MAX_STANDING_PAYMENT_CREATE_BYTES = 4096
+TAU_MAX_STANDING_PAYMENT_UPDATE_BYTES = 4096
 TAU_MAX_STANDING_PAYMENT_CANCEL_BYTES = 4096
+TAU_MAX_STANDING_PAYMENT_EXECUTE_BYTES = 4096
 TAU_MEMPOOL_SNAPSHOT_MAX_STANDING_TXS = 32
 # A rule set carries up to 4 KiB of Tau text and eight slots; an execution an id,
 # up to eight recipients and eight data values; a revoke the envelope.
