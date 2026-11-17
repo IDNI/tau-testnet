@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import tau_advisory
 import tau_authority
 import tau_manager
 from block import Block
@@ -102,3 +103,62 @@ def test_worker_backed_authority_makes_the_advisory_evaluator_available():
     with patch.object(tau_authority, "owner", return_value=owner), \
          patch.object(tau_manager, "tau_test_mode", True):
         assert ce._advisory_is_available() is False
+
+
+def _ready():
+    ready = MagicMock()
+    ready.is_set.return_value = True
+    return ready
+
+
+def _refusing_evaluator():
+    """A real advisory evaluator whose worker refuses every step."""
+    evaluator = tau_advisory.AdvisoryEvaluator()
+    session = MagicMock()
+    session.step.return_value = {"ok": False, "outputs": None,
+                                 "diagnostics": "(Error) refused"}
+    evaluator._ensure_consensus = lambda rules: session
+    return evaluator
+
+
+def _verify_refused(mode):
+    view = _view(mode)
+    if mode == "stake":
+        view.parent_balances = {A: 100}
+    multi = MagicMock(return_value={6: "1", 7: "1"})
+    single = MagicMock(return_value="1")
+    with patch.object(tau_manager, "tau_ready", _ready()), \
+         patch.object(ce, "_advisory_is_available", return_value=True), \
+         patch.object(tau_manager, "communicate_with_tau_multi", multi), \
+         patch.object(tau_manager, "communicate_with_tau", single), \
+         patch.object(ce.tau_advisory, "evaluator", return_value=_refusing_evaluator()), \
+         patch("consensus.engine.normalize_validator_set", return_value={A}):
+        verdict = TauConsensusEngine().verify_block_header(view, _block(), {"proof_ok": True})
+    return verdict, multi, single
+
+
+@pytest.mark.parametrize("mode", ["tau_validator_set", "stake"])
+def test_tau_bound_header_falls_back_on_refused_advisory_step(mode):
+    verdict, multi, _ = _verify_refused(mode)
+    assert verdict is True
+    multi.assert_called_once()
+
+
+def test_validator_set_header_falls_back_on_refused_advisory_step():
+    verdict, _, single = _verify_refused("validator_set")
+    assert verdict is True
+    single.assert_called_once()
+
+
+def test_eligibility_falls_back_on_refused_advisory_step(monkeypatch):
+    # Remove the conftest stub, so the real query_eligibility runs.
+    monkeypatch.undo()
+    import chain_state
+    single = MagicMock(return_value="1")
+    with patch.object(tau_manager, "tau_ready", _ready()), \
+         patch.object(ce, "_advisory_is_available", return_value=True), \
+         patch.object(tau_manager, "communicate_with_tau", single), \
+         patch.object(chain_state, "_lifecycle_manager", None, create=True), \
+         patch.object(ce.tau_advisory, "evaluator", return_value=_refusing_evaluator()):
+        assert TauConsensusEngine().query_eligibility(_view("validator_set"), A, 10, 1234567890) is True
+    single.assert_called_once()

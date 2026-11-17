@@ -114,7 +114,9 @@ class AdvisoryEvaluator:
         try:
             session = self._ensure_consensus(consensus_rules)
             result = session.step(self._named(inputs))
-            outputs = result.get("outputs") or {}
+            if self._refused(result):
+                return None
+            outputs = result["outputs"]
             return {t: outputs.get(f"o{t}") for t in targets}
         except (Exception, tau_speculation.WorkerLost) as exc:
             logger.warning("advisory consensus evaluation unavailable: %s", exc)
@@ -161,12 +163,25 @@ class AdvisoryEvaluator:
         try:
             session = self._ensure(canonical_spec)
             result = session.step(self._named(inputs))
-            outputs = result.get("outputs") or {}
+            if self._refused(result):
+                return None
+            outputs = result["outputs"]
             return {t: outputs.get(f"o{t}") for t in targets}
         except (Exception, tau_speculation.WorkerLost) as exc:
             logger.warning("advisory evaluation unavailable: %s", exc)
             self.dispose()
             return None
+
+    @staticmethod
+    def _refused(result: dict) -> bool:
+        """A refused step gives no answer: a dict of None values reads as a
+        verdict of 0, while None lets the caller fall back. The worker stays
+        healthy and the step advanced nothing, so the session is kept."""
+        if result.get("ok") and result.get("outputs") is not None:
+            return False
+        logger.warning("advisory step failed: %s",
+                       str(result.get("diagnostics") or "").strip()[:200])
+        return True
 
     @staticmethod
     def _named(inputs: dict) -> dict:
@@ -197,8 +212,9 @@ class AdvisoryEvaluator:
         try:
             session = self._ensure(canonical_spec)
             result = session.step(self._named(inputs))
-            outputs = result.get("outputs") or {}
-            return outputs.get(f"o{target}")
+            if self._refused(result):
+                return None
+            return result["outputs"].get(f"o{target}")
         except (Exception, tau_speculation.WorkerLost) as exc:
             logger.warning("advisory evaluation unavailable: %s", exc)
             self.dispose()
