@@ -37,14 +37,14 @@ import chain_state
 import db
 import tau_manager
 from errors import TauEngineCrash
-from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_payload
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
 from commands import sendtx, createblock
 
 GENESIS_TAU = os.path.join(project_root, "genesis.tau")
 TRANSFER_RULE_PATH = os.path.join(project_root, "rules", "04_handle_valid_transfer.tau")
 
 
-RECIPIENT = "c" * 96
+RECIPIENT = pubkey_hex(SK_CAROL)
 
 
 class _NativeFeeE2EBase(unittest.TestCase):
@@ -107,7 +107,6 @@ class _NativeFeeE2EBase(unittest.TestCase):
         # is real (conftest defaults it to "1" for the legacy suite).
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}).start()
 
-        patch("commands.sendtx.validate_bls_pubkey", return_value=None).start()
         patch("commands.createblock._BLS_AVAILABLE", True).start()
         patch("block.bls_signing_available", return_value=True).start()
         patch("consensus.engine.TauConsensusEngine.verify_block_header", return_value=True).start()
