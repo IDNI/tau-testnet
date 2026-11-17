@@ -144,6 +144,51 @@ def test_the_screen(body, problem):
     assert (got is None) if problem is None else (problem in got), got
 
 
+_O, _P = "o30[t]:bv[24]", "o31[t]:bv[24]"
+_X, _Y = "i40[t]:bv[24]", "i41[t]:bv[24]"
+_Z = "{ #x000000 }:bv[24]"
+_KEY = "{ #x" + "ab" * 48 + " }:bv[384]"
+
+
+@pytest.mark.parametrize("body, problem", [
+    # every amount fixed: definitions, conditions on inputs, a choice on inputs
+    (f"{_O} = {_X}", None),
+    (f"({_O} = {_X}) && ({_P} = {_Y})", None),
+    (f"(i13[t]:bv[384] = {_KEY}) ? ({_O} = {_X}) : ({_O} = {_Z})", None),
+    (f"(i13[t]:bv[384] = {_KEY}) ? (({_O} = {_X}) && ({_P} = {_Z})) : (({_O} = {_Z}) && ({_P} = {_X}))", None),
+    (f"({_X} > {_Z}) && {_O} = min({_X}, i2[t]:bv[24])", None),
+    (f"({_X} > {_Z} || {_Y} > {_Z}) && {_O} = {_X} - {_Y}", None),
+    (f"{_O} = {{ 5 }}:bv[24] + {_X}'", None),
+    # an amount the rule leaves open: the engine would pick one
+    (f"{_O} <= {_X}", "o30 is not fixed"),
+    (f"{_O} > {_Z} && {_O} < i2[t]:bv[24]", "o30 is not fixed"),
+    (f"({_O} = {_X}) || ({_O} = {_Z})", "o30 is not fixed"),
+    (f"!({_O} = {_X})", "o30 is not fixed"),
+    (f"({_X} > {_Z}) ? ({_O} = {_X}) : ({_X} = {_X})", "fixed on one side of a condition only"),
+    (f"({_O} = {_X}) ? ({_O} = {_X}) : ({_O} = {_Z})", "a condition may read inputs only"),
+    (f"{_P} = {_O} && {_O} = {_X}", "not by another amount"),
+    (f"{_O} = {_X} && {_P} = {_Y} || {_X} > {_Z}", "put parentheses around"),
+    (f"{_X} > {_Z} || {_Y} > {_Z} && {_O} = {_X}", "put parentheses around"),
+    (f"!({_X} = {_Z}) && {_O} = {_X}", "put parentheses around"),
+    (f"({_X} = {_Z}) ? ({_O} = {_X}) : ({_O} = {_Z}) && {_P} = {_X}", "put parentheses around"),
+    # anything that reads earlier steps, in every spelling the engine parses
+    (f"{_O} = {_X} && ({_X} = {_Z} since {_Y} = {_Z})", "may not use 'since'"),
+    (f"{_O} = {_X} && ({_X} = {_Z} S {_Y} = {_Z})", "may not use 'S'"),
+    (f"{_O} = {_X} && ({_X} = {_Z} U {_Y} = {_Z})", "may not use 'U'"),
+    (f"{_O} = {_X} && <> ({_X} = {_Z})", "may not use '<>'"),
+    (f"{_O} = {_X} && [] ({_X} = {_Z})", "may not use '[]"),
+    (f"{_O} = {_X} && G ({_X} = {_Z})", "may not use 'G'"),
+    (f"{_O} = {_X} && F", "may not use 'F'"),
+    (f"{_O} = {_X} && [t > 3]", "may not use '[t'"),
+    (f"{_O} = {_X} && ex x ({_X} = x)", "may not use 'ex'"),
+    (f"{_O} = {_X} && <a:b>", "may not use"),
+    (f"{_O} = -{_X}", "may not use '-'"),
+])
+def test_every_amount_is_fixed_and_reads_this_step_only(body, problem):
+    got = screen_payout_body(body, 2)
+    assert (got is None) if problem is None else (got is not None and problem in got), got
+
+
 def test_slots_must_be_keys_or_open():
     with pytest.raises(PayoutShapeError):
         parse_payout_rule_set(rule_set(slots=[]))
@@ -623,6 +668,27 @@ def test_the_cli_parses_the_payout_commands():
     assert args.recipient == [f"1={B}"] and args.data == ["0=40"]
     assert parser.parse_args(["payout", "show", A]).address == A
     assert parser.parse_args(["payout", "revoke", "--key", "k"]).request is False
+
+
+def test_payout_revoke_without_fee_sends_fee_limit_0_and_asks_for_no_estimate(monkeypatch):
+    """A fee-exempt type gets no estimate from the node, so the CLI must not ask
+    for one (it used to fail with "give the fee limit with --fee")."""
+    from tau_testnet_cli import cli
+    from tau_testnet_cli import tx as tx_mod
+
+    def no_estimate(*_a, **_k):
+        raise RuntimeError("no estimated_fee for a fee-exempt type")
+
+    sent = []
+    monkeypatch.setattr(tx_mod, "get_sequence_tip_and_network",
+                        lambda *_a, **_k: (3, 100, chain_genesis_hash()))
+    monkeypatch.setattr(tx_mod, "estimate_fee", no_estimate)
+    monkeypatch.setattr(tx_mod, "submit_tx", lambda payload, **_k: sent.append(payload)
+                        or '{"status": "ok", "data": {"tx_hash": "ab"}}')
+    args = cli.build_parser().parse_args(["payout", "revoke", "--privkey", "1"])
+    assert args.func(args) == cli.EXIT_OK
+    assert [(t["tx_type"], t["fee_limit"]) for t in sent] == [("payout_rule_revoke", "0")]
+    assert sent[0]["genesis_hash"] == chain_genesis_hash()
 
 
 def test_the_proposer_leaves_executions_over_the_block_cap_in_the_mempool(monkeypatch):

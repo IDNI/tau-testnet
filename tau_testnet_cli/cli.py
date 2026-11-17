@@ -2678,6 +2678,8 @@ def cmd_payout_revoke(args: argparse.Namespace) -> int:
 
     if args.expire_in is None:
         args.expire_in = 1000
+    if args.fee is None:
+        args.fee = "0"  # fee-exempt: the node gives no estimate to ask for
     return _submit_rule_tx(args, _build)
 
 

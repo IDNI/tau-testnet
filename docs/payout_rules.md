@@ -93,6 +93,36 @@ A rule reads `[t]` only, reads at least one input, writes at least one slot
 amount, and mentions no slot it does not have. Anything else is refused at
 install.
 
+### Every amount is fixed by the rule
+
+Every node must pay the same amounts, whatever it evaluated before, and the
+amounts must be the rule's decision, not the engine's. So a payout rule has a
+narrow shape, checked at install:
+
+- **Each amount is a definition:** `oN[t]:bv[24] = <expression of inputs>`.
+  Definitions are joined with `&&` or chosen by `(condition) ? (...) : (...)`,
+  where the condition reads inputs only and both sides fix the same amounts.
+  A rule such as `o30[t]:bv[24] <= i40[t]:bv[24]` is refused: it allows many
+  amounts, and which one an engine picks is the engine's choice, not the
+  account's (an equation fixes its unknown only in this definitional form; see
+  Rudeanu, *Boolean Functions and Equations*, Thm 6.6).
+- **Conditions on inputs are allowed** next to the definitions, for example
+  `(i40[t]:bv[24] > { #x000000 }:bv[24]) && o30[t]:bv[24] = i40[t]:bv[24]`.
+  When one does not hold, the rule has no solution and the execution is refused.
+- **Nothing that reads earlier steps:** no temporal operator in any spelling
+  (`always`/`G`/`[]`, `sometimes`/`F`/`<>`, `until`/`U`, `release`/`R`,
+  `weak_until`/`W`, `since`/`S`, `trigger`/`T`, `A`, `E`), no step constraint
+  such as `[t > 3]`, no quantifier, variable, named constant or function. Policy
+  interpreters are kept and stepped again, so any of these would make an amount
+  depend on what that node stepped before.
+- **Parentheses where joins mix:** a part with `||`, `->`, `!` or `? :` is put in
+  its own parentheses before it is joined with `&&`, so the amounts never depend
+  on how a parser groups them.
+
+Only typed streams at `[t]`, typed constants (`{ #x.. }`, `{ #b.. }`,
+`{ 123 }` with `:bv[W]`), `min`/`max`, and the comparison, Boolean and
+bit-vector operators are accepted; anything else is refused by name.
+
 ### Examples
 
 Pay slot 0 what the executor asks, inside the caps:
@@ -290,6 +320,36 @@ execution signed for another network is refused here.
   nothing, and the state hash shows it.
 - Expiry runs after the block's transactions, before rule-change releases; an
   execution in the expiry block is refused by its clock check.
+
+## Operator notes
+
+**Upgrading.** No regenesis and no activation height. Until the first
+`payout_rule_set` is mined, blocks and state hashes are byte-identical to a
+node without this feature, so mixed versions agree. That block adds
+`payout_rules_root` to the consensus metadata, and a node that has not upgraded
+refuses it. Upgrade every node before anyone sends the first one.
+
+| Table | Written | Read by |
+|---|---|---|
+| `payout_rules_v1 (account_pubkey, rule_id, …)` | with the accounts, in the block's state commit | restore at start, `getpayoutrule` |
+| `payout_events (account_pubkey, block_hash, …)`, indexed by account | per block, every node, apply and replay | `getpayoutrule`, `gettxstatus` |
+
+Tables and columns are created on start; there is no manual migration.
+Events are keyed per block, like `retractable_events`, so a reorg needs no
+cleanup. At start a node rebuilds the book from its table and refuses to
+start on a row that does not recompute its id or holds an impossible state
+(`corrupt payout rule state`): restore the database or resync the node.
+
+**Policy workers.** An execute runs the installed rule in the policy
+evaluator's apply pool, never in the main interpreter, within the same time
+budget as a transfer's policy step. A block carries at most 16 executes; the
+block builder leaves the rest in the mempool for the next block.
+
+**Network.** `payout_rule_set`, `payout_rule_revoke` and `payout_execute` gossip on
+`tau/payout/1.0.0`; a mempool snapshot carries at most 32 of them.
+
+**Logs.** `Replay without a policy evaluator: payout … not re-run` means a
+replay could not run the rule; nothing moves, and the state hash says so.
 
 ## Security notes
 

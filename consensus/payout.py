@@ -385,7 +385,177 @@ def screen_payout_body(body: str, slot_count: int) -> Optional[str]:
         return "a payout rule must write at least one slot amount (o30..)"
     if not any(n.startswith("i") for n in seen):
         return "a payout rule must read at least one input"
+    shape = screen_payout_shape(scrubbed)
+    if shape:
+        return shape
     return screen_clause_structure(body)
+
+
+# --- The shape of a payout rule (CONSENSUS-FROZEN with ABI v1) ---------------------
+#
+# Every node must pay the same amounts, whatever that node evaluated before, and
+# the amounts must be the rule's decision, not the engine's. Two things would
+# break that, so the screen refuses them:
+#
+# 1. An amount the rule does not fix. `o30 <= i40` has many answers; an engine
+#    picks one of them, and which one is its own choice (it may differ between
+#    engine versions). An equation fixes an unknown only in its definitional form
+#    (one solution exactly when f(0) and f(1) are complements; Rudeanu, Boolean
+#    Functions and Equations, Thm 6.6), so every amount is written as
+#    `oN = <expression over inputs>`. Definitions are joined with `&&`, or chosen
+#    by `(condition) ? (...) : (...)` whose condition reads inputs only; both
+#    branches fix the same amounts. Anything else that mentions an amount (`<=`,
+#    `||`, `!`, `!=`, an amount on the right side) is refused. A condition over
+#    inputs that does not hold leaves no solution, which refuses the execution.
+# 2. Anything whose answer depends on earlier steps. Policy interpreters are kept
+#    and stepped again, so a temporal operator (always/G/[], sometimes/F/<>,
+#    until/U, release/R, weak_until/W, since/S, trigger/T, A, E), a step
+#    constraint such as `[t > 3]`, a quantifier, a variable, a named constant or a
+#    function would make an amount depend on what that node stepped before.
+#    Only the tokens below are accepted: everything else is refused by name.
+
+_SHAPE_TOKENS = re.compile(
+    r"\s*(?:"
+    r"(?P<io>([io])(\d+)\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*\d+\s*\])"
+    r"|(?P<const>\{\s*(?:#x[0-9a-fA-F]+|#b[01]+|\d+)\s*\}\s*:\s*bv\s*\[\s*\d+\s*\])"
+    r"|(?P<fn>\b(?:min|max)\b)"
+    r"|(?P<never><>)"
+    r"|(?P<op><->|!<=|!>=|->|<-|&&|\|\||\^\^|!=|<=|>=|!<|!>|<<|>>|!\||!\^|!&"
+    r"|[=<>!?:()+\-*/%|^&',])"
+    r")")
+_BOOL_OPS = frozenset({"<->", "->", "<-", "&&", "||", "^^", "!", "?", ":"})
+_COMPARE_OPS = frozenset({"=", "!=", "<", "<=", ">", ">=", "!<", "!<=", "!>", "!>="})
+_TERM_OPS = frozenset({"(", ")", "+", "-", "*", "/", "%", "<<", ">>", "|", "^", "&",
+                       "!|", "!^", "!&", "'", ","})
+
+
+class _Open(ValueError):
+    """The rule leaves an amount open (or names one where it cannot fix it)."""
+
+
+def _shape_tokens(text: str):
+    """[(kind, text, name)] with kind io_in | io_out | const | fn | op, or the
+    first piece of text a payout rule may not use."""
+    out, i, end = [], 0, len(text.rstrip())
+    while i < end:
+        m = _SHAPE_TOKENS.match(text, i)
+        if m is None or m.end() == i:
+            piece = text[i:].strip().split()[0] if text[i:].strip() else text[i:]
+            return None, piece[:24]
+        if m.group("never"):
+            return None, m.group("never")
+        i = m.end()
+        if m.group("io"):
+            kind = "io_out" if m.group(2) == "o" else "io_in"
+            out.append((kind, m.group("io"), f"{m.group(2)}{m.group(3)}"))
+        elif m.group("const"):
+            out.append(("const", m.group("const"), ""))
+        elif m.group("fn"):
+            out.append(("fn", m.group("fn"), ""))
+        else:
+            op = m.group("op")
+            if op == "-" and not (out and (out[-1][0] in ("io_in", "io_out", "const")
+                                          or out[-1][1] in (")", "'"))):
+                return None, "-"
+            out.append(("op", op, ""))
+    return out, None
+
+
+def _match_paren(tok, i: int) -> int:
+    depth = 0
+    for j in range(i, len(tok)):
+        if tok[j][1] == "(":
+            depth += 1
+        elif tok[j][1] == ")":
+            depth -= 1
+            if depth == 0:
+                return j
+    raise _Open("unbalanced parentheses")
+
+
+def _amounts(tok, lo: int, hi: int) -> set:
+    return {t[2] for t in tok[lo:hi] if t[0] == "io_out"}
+
+
+_JOINS = frozenset({"||", "^^", "->", "<-", "<->", "?", ":", "!"})
+
+
+def _fixed(tok, lo: int, hi: int) -> set:
+    """The amounts tok[lo:hi] fixes; raises _Open where it leaves one open."""
+    parts, joins, depth, start = [], set(), 0, lo
+    for j in range(lo, hi + 1):
+        kind, t = (tok[j][0], tok[j][1]) if j < hi else ("op", "&&")
+        if t == "(":
+            depth += 1
+        elif t == ")":
+            depth -= 1
+        elif depth == 0 and kind == "op" and t in _JOINS:
+            joins.add(t)
+        elif t == "&&" and depth == 0:
+            if start == j:
+                raise _Open("empty part around &&")
+            parts.append((start, j))
+            start = j + 1
+    if len(parts) > 1 and joins:
+        # How && groups against ||, ->, ?: ... is the parser's choice; a rule
+        # must not depend on it, so mixed joins need their own parentheses.
+        raise _Open(f"put parentheses around the part with {sorted(joins)[0]!r} before joining it with &&")
+    fixed = set()
+    for a, b in parts:
+        fixed |= _fixed_part(tok, a, b)
+    return fixed
+
+
+def _fixed_part(tok, lo: int, hi: int) -> set:
+    if not _amounts(tok, lo, hi):
+        return set()  # a condition on inputs only
+    if tok[lo][1] == "(":
+        close = _match_paren(tok, lo)
+        if close == hi - 1:
+            return _fixed(tok, lo + 1, close)
+        if close + 1 < hi and tok[close + 1][1] == "?":
+            if _amounts(tok, lo, close + 1):
+                raise _Open("a condition may read inputs only, not an amount")
+            a = close + 2
+            if a >= hi or tok[a][1] != "(":
+                raise _Open("write both sides of a condition in parentheses: (c) ? (...) : (...)")
+            a_end = _match_paren(tok, a)
+            b = a_end + 2
+            if a_end + 1 >= hi or tok[a_end + 1][1] != ":" or b >= hi or tok[b][1] != "(":
+                raise _Open("write both sides of a condition in parentheses: (c) ? (...) : (...)")
+            b_end = _match_paren(tok, b)
+            if b_end != hi - 1:
+                raise _Open("put a condition (c) ? (...) : (...) in parentheses before joining it with more")
+            yes, no = _fixed(tok, a + 1, a_end), _fixed(tok, b + 1, b_end)
+            if yes != no:
+                name = sorted(yes ^ no)[0]
+                raise _Open(f"{name} is fixed on one side of a condition only")
+            return yes
+    first = tok[lo]
+    if first[0] == "io_out" and hi - lo >= 3 and tok[lo + 1][1] == "=":
+        expr = tok[lo + 2:hi]
+        if any(t[0] == "io_out" for t in expr):
+            raise _Open(f"{first[2]} must be fixed by inputs, not by another amount")
+        bad = [t[1] for t in expr if t[0] == "op" and t[1] not in _TERM_OPS]
+        if bad:
+            raise _Open(f"{first[2]} = ... may hold an expression only, not {bad[0]!r}")
+        return {first[2]}
+    name = sorted(_amounts(tok, lo, hi))[0]
+    raise _Open(f"{name} is not fixed: write it as {name}[t]:bv[24] = <expression of inputs>")
+
+
+def screen_payout_shape(scrubbed_body: str) -> Optional[str]:
+    """None when every amount is fixed by the inputs and nothing reads earlier
+    steps, else why not. `scrubbed_body` is the comment-stripped clause body."""
+    tok, bad = _shape_tokens(scrubbed_body)
+    if tok is None:
+        return (f"a payout rule may not use {bad!r}: only typed streams at [t], typed "
+                f"constants, min/max, and comparison, Boolean and bit-vector operators")
+    try:
+        _fixed(tok, 0, len(tok))
+    except _Open as e:
+        return f"a payout rule must fix every amount: {e}"
+    return None
 
 
 def validate_terms_shape(terms: PayoutTerms, height: int, ts: int) -> Optional[str]:
