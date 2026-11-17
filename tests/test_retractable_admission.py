@@ -8,6 +8,7 @@ inputs or the chain splits.
 `MagicMock(spec=TipAdmissionView)` returns a truthy Mock for any attribute left
 unset, so every accessor the validators read is set explicitly below.
 """
+import contextlib
 import json
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -296,21 +297,17 @@ def node(temp_database, monkeypatch):
         patch("commands.sendtx.validate_bls_pubkey", return_value=None),
         patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}),
     ]
-    mocks = [p.start() for p in patches]
-    mocks[0].is_set.return_value = True
-    monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
-    height = patch.object(TipAdmissionView, "next_block_height",
-                          new_callable=PropertyMock, return_value=NEXT_HEIGHT)
-    ts = patch.object(TipAdmissionView, "tip_timestamp",
-                      new_callable=PropertyMock, return_value=TIP_TS)
-    next_ts = patch.object(TipAdmissionView, "next_block_timestamp",
-                           new_callable=PropertyMock, return_value=TIP_TS)
-    height.start()
-    ts.start()
-    next_ts.start()
-    yield sendtx, script
-    for p in reversed(patches + [height, ts, next_ts]):
-        p.stop()
+    with contextlib.ExitStack() as stack:
+        mocks = [stack.enter_context(p) for p in patches]
+        mocks[0].is_set.return_value = True
+        monkeypatch.setitem(chain_state._balances, SENDER, 1_000_000)
+        stack.enter_context(patch.object(TipAdmissionView, "next_block_height",
+                                         new_callable=PropertyMock, return_value=NEXT_HEIGHT))
+        stack.enter_context(patch.object(TipAdmissionView, "tip_timestamp",
+                                         new_callable=PropertyMock, return_value=TIP_TS))
+        stack.enter_context(patch.object(TipAdmissionView, "next_block_timestamp",
+                                         new_callable=PropertyMock, return_value=TIP_TS))
+        yield sendtx, script
 
 
 def _park_payload(**over):
