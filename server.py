@@ -23,6 +23,7 @@ import api_response
 from commands import createblock, sendtx  # Import command handlers
 from errors import ConfigurationError, TauEngineCrash, TauTestnetError
 import tau_logging
+from rate_limit import TokenBucket as _TokenBucket
 
 
 logger = logging.getLogger("tau.server")
@@ -93,34 +94,6 @@ _WS_MAX_RESPONSE_BYTES = 900_000
 # Bare `getblocks` over WS used to dump the whole chain. TCP/CLI keep that
 # behaviour; WS pollers get a recent window and truncated=true when there is more.
 _WS_DEFAULT_GETBLOCKS_LIMIT = 50
-
-
-class _TokenBucket:
-    """Token bucket over an injected clock.
-
-    The clock is a parameter because the two transports measure time
-    differently: the WebSocket loop runs under trio and must use
-    `trio.current_time()`, while the TCP handler is a plain thread using
-    `time.monotonic()`. Not thread-safe — one instance per connection.
-    """
-
-    __slots__ = ("capacity", "refill_per_second", "_tokens", "_last")
-
-    def __init__(self, capacity: float, refill_per_second: float, now: float):
-        self.capacity = capacity
-        self.refill_per_second = refill_per_second
-        self._tokens = capacity
-        self._last = now
-
-    def take(self, now: float) -> bool:
-        """Consume one token. False when the caller is over budget."""
-        elapsed = max(0.0, now - self._last)
-        self._last = now
-        self._tokens = min(self.capacity, self._tokens + elapsed * self.refill_per_second)
-        if self._tokens < 1.0:
-            return False
-        self._tokens -= 1.0
-        return True
 
 
 class _RpcLimiter:
@@ -963,8 +936,7 @@ def _run_server(container: ServiceContainer):
         tau_module.set_rules_handler(chain_state_module.save_effective_tau_spec)
 
     logger.info("Starting Tau Process Manager Thread...")
-    manager_thread = threading.Thread(target=tau_module.start_and_manage_tau_process, daemon=True)
-    manager_thread.start()
+    manager_thread = tau_module.start_manager_thread()
 
     logger.info("Waiting for Tau to signal readiness...")
     # This waits for 'tau_ready', which is set AFTER the callback completes

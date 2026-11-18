@@ -77,7 +77,6 @@ def run_test_sequential_ops():
     config.set_database_path(os.path.join(tmpdir, "test_sequential_sendtx.sqlite"))
     db.init_db()
     chain_state.load_genesis("data/genesis.json")
-    sendtx_module._PY_ECC_AVAILABLE = True # Enable crypto for these tests
     
     mock_tau_manager = MockTauManagerSequential()
     patcher_tau = patch('commands.sendtx.tau_manager', mock_tau_manager)

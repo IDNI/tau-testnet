@@ -473,6 +473,11 @@ def test_a_refused_step_is_never_read_as_no_outputs(authority):
 
 # --- the approval preview reads the authority's policy ---------------------------
 
+def _approver(tag):
+    """A valid BLS12-381 public key: admission refuses any other approver."""
+    return bls.SkToPk(bls.KeyGen(tag.encode().ljust(32, b"_"))).hex()
+
+
 def _tiered_policy(approver):
     """Anything over 1000 needs slot i18 to carry `approver`. Unguarded: the
     registry scopes a routed clause to its author."""
@@ -487,7 +492,7 @@ def test_the_approval_preview_sees_the_authoritys_policy(authority):
     from commands import getapprovalpreview
 
     sk, pk = _sender("preview_owner")
-    approver = "ab" * 48
+    approver = _approver("preview_approver")
     db.set_chain_state_value("approval_slots_active", "1")
     chain_state._lifecycle_manager.activate_approval_slots()
     assert _submit(sk, pk, {"0": _tiered_policy(approver)}).get("ok")
@@ -524,7 +529,7 @@ def _approval_request(sk, pk, amount, approver):
 def test_admission_refuses_a_request_the_policy_does_not_gate(authority):
     """Apply drops such a request, so admission must not queue it for free."""
     sk, pk = _sender("request_owner")
-    approver = "ab" * 48
+    approver = _approver("request_approver")
     db.set_chain_state_value("approval_slots_active", "1")
     chain_state._lifecycle_manager.activate_approval_slots()
     assert _submit(sk, pk, {"0": _tiered_policy(approver)}).get("ok")

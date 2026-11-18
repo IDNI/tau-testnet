@@ -77,11 +77,7 @@ def stop_tau_manager_thread(thread: threading.Thread, timeout: float = 30.0) -> 
     import tau_manager
 
     tau_manager.request_shutdown()
-    deadline = time.monotonic() + timeout
-    # The manager clears the stop flag when it starts, so set it until the thread ends.
-    while thread.is_alive() and time.monotonic() < deadline:
-        tau_manager.server_should_stop.set()
-        thread.join(0.1)
+    thread.join(timeout)
     return not thread.is_alive()
 
 
@@ -135,6 +131,15 @@ def reset_tau_stream_types() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def reset_estimate_limits() -> Iterator[None]:
+    """The estimate budget of each sender key is process-global."""
+    sendtx = sys.modules.get("commands.sendtx")
+    if sendtx is not None:
+        sendtx.reset_estimate_limits()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def restore_lifecycle_manager() -> Iterator[None]:
     """Keep the validator set of one test out of later tests.
 
@@ -148,6 +153,14 @@ def restore_lifecycle_manager() -> Iterator[None]:
     yield
     vars(manager).update(fields)
     chain_state._lifecycle_manager = manager
+
+
+@pytest.fixture(autouse=True)
+def restore_genesis_approval_slots(monkeypatch):
+    """Keep the genesis slot flag of one test out of the next test."""
+    import chain_state
+    monkeypatch.setattr(chain_state, "_genesis_approval_slots_active",
+                        chain_state._genesis_approval_slots_active)
 
 
 @pytest.fixture(autouse=True)

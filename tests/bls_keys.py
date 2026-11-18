@@ -44,6 +44,21 @@ def sign_payload(payload: Dict[str, Any], sk: int) -> Dict[str, Any]:
     return payload
 
 
+def sign_header(header, sk: int) -> str:
+    """Hex proof over sha256 of the header's canonical bytes, as a proposer signs a block."""
+    digest = hashlib.sha256(header.canonical_bytes()).digest()
+    return sign_message(sk, digest).hex()
+
+
+def signed_block(sk: int, **create_kwargs):
+    """Block.create with `sk`'s key as proposer and a real proof over the header."""
+    from block import Block
+
+    blk = Block.create(proposer_pubkey=pubkey_hex(sk), **create_kwargs)
+    blk.consensus_proof = sign_header(blk.header, sk)
+    return blk
+
+
 def sign_tx(tx: Dict[str, Any], sk: int = SK_ALICE) -> Dict[str, Any]:
     """sign_payload for a test transaction that leaves out envelope fields the preimage needs."""
     tx.setdefault("sequence_number", 0)

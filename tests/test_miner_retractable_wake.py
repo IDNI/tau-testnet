@@ -38,13 +38,13 @@ def node(tmp_path, monkeypatch):
     chain_state._balances[SENDER] = 100
 
     import tau_manager
-    from py_ecc.bls import G2Basic
+    from consensus import bls
 
     monkeypatch.setattr(config, "MINER_PRIVKEY", "1" * 64)
     monkeypatch.setattr(tau_manager, "communicate_with_tau", lambda **kw: "require_bls_sig")
     monkeypatch.setattr(tau_manager, "communicate_with_tau_multi", lambda **kw: {})
     monkeypatch.setattr(createblock, "_BLS_AVAILABLE", True)
-    monkeypatch.setattr(G2Basic, "Verify", lambda *a, **k: True)
+    monkeypatch.setattr(bls, "verify", lambda *a, **k: True)
     monkeypatch.setattr(TauConsensusEngine, "query_eligibility", lambda self, *a, **k: True)
     tau_manager.tau_ready.set()
 

@@ -5,7 +5,6 @@ import json
 import tempfile
 import sys
 
-import threading
 import tau_manager
 import tau_defs
 import random
@@ -32,10 +31,8 @@ class TestStateReconstruction(unittest.TestCase):
         self._prev_tau_force_test = os.environ.get("TAU_FORCE_TEST", "1")
         if force_native:
             os.environ["TAU_FORCE_TEST"] = "0"
-        tau_manager.server_should_stop.clear()
         tau_manager.tau_ready.clear()
-        self.tau_thread = threading.Thread(target=tau_manager.start_and_manage_tau_process, daemon=True)
-        self.tau_thread.start()
+        self.tau_thread = tau_manager.start_manager_thread()
         ready = tau_manager.tau_ready.wait(timeout=60)
         if not ready:
             self.stop_tau()
@@ -433,7 +430,8 @@ class TestStateReconstruction(unittest.TestCase):
         # --- Start Tau ---
         self.start_tau()
         try:
-            rule_text = "o12[t] = i1[t]."
+            # start_tau loads no builtin rules, so an untyped i1 here would be typed :tau before rule 02.
+            rule_text = "o12[t]:bv[24] = i1[t]:bv[24]."
 
             # Create a transaction containing both the rule and a transfer
             tx1 = self.create_test_transaction(

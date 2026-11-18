@@ -495,6 +495,7 @@ _genesis_vote_quorum: str = ""
 _genesis_eligibility_mode: str = ""
 _genesis_fee_beneficiary: str = ""
 _genesis_faucet_amount: int = 0
+_genesis_approval_slots_active: bool = False
 # Genesis rule text, re-seeded on full rebuild so the replayed state hash
 # matches the mined chain (the reorg path replays only the new suffix, not
 # the genesis block, so its rules would otherwise be lost).
@@ -1158,6 +1159,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             _lifecycle_manager.eligibility_mode = _genesis_eligibility_mode
             _lifecycle_manager.fee_beneficiary = _genesis_fee_beneficiary
             _lifecycle_manager.faucet_amount = _genesis_faucet_amount
+            if _genesis_approval_slots_active:
+                _lifecycle_manager.activate_approval_slots()
             _lifecycle_manager.recompute_approval_threshold()
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
@@ -1286,7 +1289,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             active_view = engine.derive_active_consensus(parent_snapshot, block_number)
             
             # 3. Verify Block Header
-            # proof_ok skips the cryptography re-checks (db integrity covers them); o6/o7 still run.
+            # proof_ok skips the signature re-check: ingest and process_new_block verified it before the row was stored.
+            # o6/o7 still run.
             # Under worker-backed authority they run on the advisory evaluator, so a down interpreter is no reason to skip.
             if _enabled:
                 if block_number == 0:
@@ -1500,6 +1504,7 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     # regardless of whether the DB is fresh or already provisioned.
     global _genesis_accounts_state, _genesis_active_validators, _genesis_vote_quorum
     global _genesis_eligibility_mode, _genesis_fee_beneficiary, _genesis_faucet_amount
+    global _genesis_approval_slots_active
     global _genesis_application_rules, _genesis_consensus_rules
     _genesis_accounts_state = {
         k: int(v) for k, v in genesis_data.get("accounts_state", {}).items()
@@ -1516,6 +1521,9 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     if _faucet_err:
         raise ValueError(f"FATAL: genesis faucet_amount {_faucet_err}: {_faucet!r}")
     _genesis_faucet_amount = _faucet
+    _genesis_approval_slots_active = (
+        (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("approval_slots_active") is True
+    )
     _genesis_application_rules = genesis_data.get("application_rules", "")
     _genesis_consensus_rules = genesis_data.get("consensus_rules", "")
 
@@ -1568,7 +1576,7 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
             # A fresh chain may ship with co-signature approval slots already
             # reserved (scripts/gen_genesis.py --approval-slots). One-way, so
             # this only ever turns it on.
-            if meta.get("mechanism_specific_metadata", {}).get("approval_slots_active") is True:
+            if _genesis_approval_slots_active:
                 _lifecycle_manager.activate_approval_slots()
                 # Persist immediately, so a restart before the first block
                 # still reads the flag back from the chain_state row.
@@ -2367,8 +2375,19 @@ def load_state_from_db() -> bool:
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
         persisted_slots = db.get_chain_state_value("approval_slots_active", _MISSING)
-        if persisted_slots is not _MISSING and str(persisted_slots) == "1":
+        # The genesis flag also counts: the flag is one-way, so a genesis that
+        # turns it on keeps it on at every height.
+        if _genesis_approval_slots_active or (
+            persisted_slots is not _MISSING and str(persisted_slots) == "1"
+        ):
             _lifecycle_manager.activate_approval_slots()
+            if str(persisted_slots) != "1":
+                try:
+                    db.set_chain_state_value("approval_slots_active", "1")
+                except Exception:
+                    logger.warning(
+                        "could not persist approval_slots_active from genesis",
+                        exc_info=True)
 
         for p in pending_updates:
             update = ConsensusRuleUpdate(
@@ -2652,6 +2671,13 @@ def ingest_block(block: Block) -> IngestResult:
             block.header.block_number, block.block_hash[:16], body_reason,
         )
         return IngestResult('invalid', f"Block body verification failed: {body_reason}")
+    # A fork that wins fork choice is replayed without re-checking proofs, so this is the only gate.
+    if not block.verify_consensus_proof():
+        logger.warning(
+            "[chain_state] Block #%s %s... not ingested: its consensus proof does not verify.",
+            block.header.block_number, block.block_hash[:16],
+        )
+        return IngestResult('invalid', "Block consensus proof verification failed")
     engine = TauConsensusEngine()
     # NOTE: legacy verify signature (no active_view): membership/stake gates and
     # the parent-state stake input do NOT run here. This pre-filter only checks

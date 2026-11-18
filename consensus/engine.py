@@ -74,6 +74,11 @@ FEE_BEARING_TX_TYPES = frozenset(
     | set(RULE_OFFER_TX_TYPES)
 )
 
+
+def _receipt_lookup_key(tx: Dict[str, Any], index: int) -> str:
+    """Receipt dict key; only used for receipts and ApplyBlockResult id lists."""
+    return tx.get("tx_id") or str(index)
+
 # Branches that mutate the lifecycle manager in place. They write only to the
 # fork of the tx, which both apply paths drop on a rejection. A tx that is
 # already rejected skips them, so it never reaches the evaluator.
@@ -84,6 +89,7 @@ _LIFECYCLE_TX_TYPES = frozenset(
     | set(RULE_CHANGE_TX_TYPES)
 )
 from consensus.tx_checks import apply_tx_error
+from consensus import bls
 from consensus.tx_signing import verify_tx_signature
 import tau_native
 import tau_advisory
@@ -756,7 +762,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     return True
             if "require_bls_sig" in output:
                 try:
-                    from py_ecc.bls import G2Basic
                     import hashlib
                     block_sig = block.consensus_proof
                     if isinstance(block_sig, dict):
@@ -767,7 +772,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     msg_hash = hashlib.sha256(block.header.canonical_bytes()).digest()
                     pubkey_bytes = bytes.fromhex(block.header.proposer_pubkey)
                     sig_bytes = bytes.fromhex(block_sig)
-                    if not G2Basic.Verify(pubkey_bytes, msg_hash, sig_bytes):
+                    if not bls.verify(pubkey_bytes, msg_hash, sig_bytes):
                         logger.warning("Consensus: Block #%s cryptographic proof failed", block.header.block_number)
                         return False
                 except Exception as e:
@@ -921,10 +926,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         outcomes = []
         accepted_ids = []
         skipped_ids = []
-        
-        for tx in block.transactions:
-            tx_id = tx.get('tx_id')
-            if tx in exec_result.accepted_transactions:
+        invalid_ids = []
+
+        accepted_obj = {id(t) for t in exec_result.accepted_transactions}
+        rejected_obj = {id(t) for t in exec_result.rejected_transactions}
+
+        # Receipt keys match apply(); id() membership keeps a content-equal
+        # rejected duplicate distinct from the accepted object.
+        for i, tx in enumerate(block.transactions):
+            tx_id = _receipt_lookup_key(tx, i)
+            if id(tx) in accepted_obj:
                 # We consider all accepted ones as "applied" or "skipped/no-op"
                 # Internal execution logs tell us if it was essentially a no-op 
                 status = "applied"
@@ -937,15 +948,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     accepted_ids.append(tx_id)
                     
                 outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, receipt_logs=logs))
-            elif tx in exec_result.rejected_transactions:
+            elif id(tx) in rejected_obj:
                 status = "invalid"
                 receipt = exec_result.receipts.get(tx_id, {})
                 outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, reason=receipt.get("reason"), receipt_logs=receipt.get("logs", [])))
+                invalid_ids.append(tx_id)
 
         retractable_events = []
         for i, tx in enumerate(block.transactions):
-            event = (exec_result.receipts.get(tx.get('tx_id', str(i))) or {}).get("retractable_event")
-            if event and tx in exec_result.accepted_transactions:
+            event = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "retractable_event"
+            )
+            if event and id(tx) in accepted_obj:
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
 
@@ -1112,7 +1126,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             outcomes=outcomes,
             accepted_tx_ids=accepted_ids,
             skipped_tx_ids=skipped_ids,
-            invalid_tx_ids=[tx.get('tx_id') for tx in exec_result.rejected_transactions],
+            invalid_tx_ids=invalid_ids,
             governance_changes={
                 "activated_updates": [u.update_id_hex for u in newly_active],
                 "released_retractables": released_retractables,
@@ -1525,7 +1539,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     str(tx.get("tx_id") or tx.get("tx_hash") or f"tx{i}")
                 )
                 _session = proposal.session
-            tx_id = tx.get('tx_id', str(i)) # Fallback if no ID
+            tx_id = _receipt_lookup_key(tx, i)
             # operations is signed only for user_tx.
             operations = tx.get('operations', {}) if tx.get('tx_type', 'user_tx') == 'user_tx' else {}
             sender = tx.get('sender_pubkey')

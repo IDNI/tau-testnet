@@ -63,7 +63,7 @@ Error codes emitted by the node, by origin:
 |---|---|
 | Server dispatch (`server.py`) | `UNKNOWN_COMMAND`, `RATE_LIMITED`, `FORBIDDEN`, `TIMEOUT`, `INTERNAL_ERROR` |
 | Argument / payload parsing (every command) | `INVALID_PARAMS`, `PARSE_ERROR` |
-| `sendtx` / `checktx` structural | `TX_INVALID`, `TX_EXPIRED`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `BLS_UNAVAILABLE`, `TX_REJECTED` |
+| `sendtx` / `checktx` structural | `TX_INVALID`, `TX_EXPIRED`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_REJECTED` |
 | `sendtx` fees & capacity | `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `MEMPOOL_FULL`, `ESTIMATE_BUSY` (`checktx estimate` only) |
 | `sendtx` approval request | `APPROVAL_NOT_NEEDED`: the policy of the sender allows the transfer with no votes, so send it as an ordinary transfer. Only admission gives it, because block apply drops such a request. |
 | Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED`, `RULE_CHANGE_NEEDS_APPROVAL`, `INVALID_RULE_CHANGE_REQUEST`, `INVALID_RULE_CHANGE_CANCEL`, `NOT_REQUEST_SENDER` |
@@ -210,6 +210,11 @@ in an isolated admission context on its own single slot.
 - It never uses the in-process path. A node with no isolated context gives
   `ADMISSION_UNAVAILABLE`.
 - When another estimate runs, it gives `ESTIMATE_BUSY` at once.
+- Each sender key has a budget of slot time: 0.5 seconds at most, and 0.25 seconds more each second.
+  The node deducts the time of each estimate from the budget of its key, so one key holds the
+  slot for at most about a quarter of the time. A key with no budget left gets `ESTIMATE_BUSY`
+  before the node takes the slot. An estimate that finds the slot busy costs nothing.
+  Many funded keys can still share the slot, but each of them needs funds.
 - It gives `estimated_fee` for every fee-bearing type. The `fee_limit` of the
   payload does not change the estimate. A wallet can sign a draft with any
   `fee_limit`, ask, and sign again with the estimate.

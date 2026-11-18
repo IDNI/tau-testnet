@@ -37,7 +37,7 @@ import tau_manager
 import tau_authority
 from chain_state import GENESIS_BALANCE
 from block import Block, compute_tx_hash
-from bls_keys import SK_ALICE, SK_CAROL, pubkey_hex, sign_payload
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, SK_MALLORY, pubkey_hex, sign_payload, signed_block
 
 ADDR2 = "893c8134a31379c394b4ed31e67daf9565b1d2022aa96d83ca88d013bc208672bcf73dae5cc105da1e277109584239b2"
 ADDR3 = pubkey_hex(SK_CAROL)
@@ -117,15 +117,15 @@ class DeepChainTestCase(unittest.TestCase):
             os.remove(self.temp_db_path)
 
     @staticmethod
-    def extend(parent_hash, parent_number, count, proposer="a" * 96, txs=None):
+    def extend(parent_hash, parent_number, count, proposer=SK_ALICE, txs=None):
         """`count` blocks on top of `parent_hash`, oldest first. `txs` maps a
         block number to its transactions; every other block is empty."""
         txs = txs or {}
         blocks = []
         prev = parent_hash
         for n in range(parent_number + 1, parent_number + count + 1):
-            blk = Block.create(block_number=n, previous_hash=prev, transactions=txs.get(n, []),
-                               proposer_pubkey=proposer, timestamp=BASE_TS + n)
+            blk = signed_block(proposer, block_number=n, previous_hash=prev,
+                               transactions=txs.get(n, []), timestamp=BASE_TS + n)
             blocks.append(blk)
             prev = blk.block_hash
         return blocks
@@ -198,7 +198,7 @@ class TestDeepReorg(DeepChainTestCase):
         self.assertEqual(chain_state.get_balance(ADDR2), 5)
 
         fork_block = main[fork_at - 1]
-        branch = self.extend(fork_block.block_hash, fork_at, 15, proposer="b" * 96,
+        branch = self.extend(fork_block.block_hash, fork_at, 15, proposer=SK_BOB,
                              txs={fork_at + 1: [won_tx]})
         self.ingest(branch)
         rebuild = chain_state._rebuild_state_from_blockchain_internal
@@ -223,7 +223,7 @@ class TestFindForkPoint(DeepChainTestCase):
         #   genesis - 1 .. 10 - 11 .. 20          (main)
         #                    \- 11' .. 14'        (side)
         self.main = self.extend(self.genesis_hash, 0, 20)
-        self.side = self.extend(self.main[9].block_hash, 10, 4, proposer="b" * 96)
+        self.side = self.extend(self.main[9].block_hash, 10, 4, proposer=SK_BOB)
         for blk in self.main + self.side:
             db.add_block(blk)
 
@@ -287,7 +287,7 @@ class TestFindForkPoint(DeepChainTestCase):
         other_root = Block.create(block_number=0, previous_hash="0" * 64, transactions=[],
                                   proposer_pubkey="d" * 96, timestamp=BASE_TS)
         db.add_block(other_root)
-        other = self.extend(other_root.block_hash, 0, 3, proposer="d" * 96)
+        other = self.extend(other_root.block_hash, 0, 3, proposer=SK_MALLORY)
         for blk in other:
             db.add_block(blk)
         with self.assertRaises(db.ChainAncestryError) as ctx:
@@ -332,8 +332,8 @@ class TestUnresolvableAncestry(DeepChainTestCase):
         # The lying child arrives first and is stored as an orphan; its parent,
         # a valid #21, arrives next. The pair must not become a "#30" head.
         parent = self.extend(self.main[-1].block_hash, 20, 1)[0]
-        liar = Block.create(block_number=30, previous_hash=parent.block_hash,
-                            transactions=[], proposer_pubkey="c" * 96, timestamp=BASE_TS + 30)
+        liar = signed_block(SK_CAROL, block_number=30, previous_hash=parent.block_hash,
+                            transactions=[], timestamp=BASE_TS + 30)
         self.ingest([liar], expect='orphan')
         self.ingest([parent])
         with self.assertLogs('chain_state', level='WARNING') as logs:
@@ -350,11 +350,11 @@ class TestUnresolvableAncestry(DeepChainTestCase):
         # Once the head has a child it is no longer a childless "candidate".
         # If everything above it is rejected, staying put must still beat the
         # tip of an old fork further down.
-        stale = self.extend(self.main[4].block_hash, 5, 2, proposer="b" * 96)
+        stale = self.extend(self.main[4].block_hash, 5, 2, proposer=SK_BOB)
         self.ingest(stale)
         parent = self.extend(self.main[-1].block_hash, 20, 1)[0]
-        liar = Block.create(block_number=30, previous_hash=parent.block_hash,
-                            transactions=[], proposer_pubkey="c" * 96, timestamp=BASE_TS + 30)
+        liar = signed_block(SK_CAROL, block_number=30, previous_hash=parent.block_hash,
+                            transactions=[], timestamp=BASE_TS + 30)
         self.ingest([liar], expect='orphan')
         self.ingest([parent])
         with self.assertLogs('chain_state', level='WARNING'), quiet():
@@ -362,7 +362,7 @@ class TestUnresolvableAncestry(DeepChainTestCase):
         self.assertEqual(self.head(), self.main[-1].block_hash)
 
     def test_lost_block_below_the_fork_point_is_refused_loudly(self):
-        branch = self.extend(self.main[14].block_hash, 15, 7, proposer="b" * 96)
+        branch = self.extend(self.main[14].block_hash, 15, 7, proposer=SK_BOB)
         self.ingest(branch)
         self.drop_block(self.main[4])
         with self.assertLogs('chain_state', level='ERROR') as logs:
@@ -374,7 +374,7 @@ class TestUnresolvableAncestry(DeepChainTestCase):
     def test_lost_block_under_the_current_head_does_not_strand_the_node(self):
         # The head's own chain is damaged above the fork point; the branch is
         # sound all the way to genesis. Reported, then the node moves onto it.
-        branch = self.extend(self.main[9].block_hash, 10, 12, proposer="b" * 96)
+        branch = self.extend(self.main[9].block_hash, 10, 12, proposer=SK_BOB)
         self.ingest(branch)
         self.drop_block(self.main[14])
         with self.assertLogs('chain_state', level='ERROR') as logs, quiet():
@@ -383,7 +383,7 @@ class TestUnresolvableAncestry(DeepChainTestCase):
         self.assertEqual(self.head(), branch[-1].block_hash)
 
     def test_stale_fork_tips_below_the_head_are_not_walked(self):
-        stale = self.extend(self.main[2].block_hash, 3, 2, proposer="b" * 96)
+        stale = self.extend(self.main[2].block_hash, 3, 2, proposer=SK_BOB)
         self.ingest(stale)
         nxt = self.extend(self.main[-1].block_hash, 20, 1)
         self.ingest(nxt)
@@ -446,7 +446,7 @@ class TestExtensionFastPathUnderAuthority(DeepChainTestCase):
         self.rebuild.assert_not_called()
 
     def test_a_head_with_broken_ancestry_is_rebuilt_not_extended(self):
-        branch = self.extend(self.main[9].block_hash, 10, 12, proposer="b" * 96)
+        branch = self.extend(self.main[9].block_hash, 10, 12, proposer=SK_BOB)
         self.ingest(branch)
         self.drop_block(self.main[14])
         with self.assertLogs('chain_state', level='ERROR'), quiet():

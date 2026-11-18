@@ -58,9 +58,23 @@ FEE_BEARING_TX_TYPES = frozenset(
 from db import add_mempool_tx
 from network import bus as network_bus
 import api_response
+from rate_limit import KeyedBuckets
 
 
 logger = logging.getLogger(__name__)
+
+# The connection limiter does not stop one key that opens a new connection for
+# each estimate. The bucket holds seconds of slot time, so one key holds the
+# estimate slot for at most about a quarter of the time on any chain length.
+_ESTIMATE_SLOT_SECONDS_PER_SEC = 0.25
+_ESTIMATE_SLOT_SECONDS_BURST = 0.5
+_ESTIMATE_MAX_KEYS = 4096
+_estimate_buckets = KeyedBuckets(_ESTIMATE_SLOT_SECONDS_BURST,
+                                 _ESTIMATE_SLOT_SECONDS_PER_SEC, _ESTIMATE_MAX_KEYS)
+
+
+def reset_estimate_limits() -> None:
+    _estimate_buckets.clear()
 
 
 def _qt_ok(tx_hash: str, message: str = "Transaction queued.", **extra) -> dict:
@@ -79,6 +93,10 @@ def _qt_err(code: str, message: str, **details) -> dict:
 # the 64 the host used to check against — a value in between was accepted here
 # and then truncated mod 2^24 inside Tau. See tau_defs.TRANSFER_VALUE_BV_WIDTH.
 _MAX_TAU_BV_VALUE = tau_defs.MAX_TRANSFER_VALUE
+
+
+def _estimate_busy(message: str = "Another fee estimate is running on this node; please retry.") -> dict:
+    return _qt_err("ESTIMATE_BUSY", message)
 
 
 def _admission_i2(address: str) -> str:
@@ -115,21 +133,6 @@ def _compute_transaction_message_id(payload: dict) -> tuple[str, str]:
     canonical = _canonicalize_transaction(payload)
     tx_hash = block_module.compute_tx_hash(payload)
     return tx_hash, canonical
-
-_PY_ECC_AVAILABLE = False
-_PY_ECC_BLS = None
-try:
-    import py_ecc.bls as _bls_mod
-    from py_ecc.bls import G2Basic
-    _PY_ECC_BLS = _bls_mod
-    _PY_ECC_AVAILABLE = True
-    logger.info("py_ecc.bls module loaded. BLS public key validation enabled.")
-except ModuleNotFoundError:
-    logger.warning(
-        "py_ecc.bls module not found. BLS public key validation will be skipped; only format checks run."
-    )
-except Exception as e:
-    logger.warning("Error importing py_ecc.bls (%s). Skipping BLS public key validation.", e)
 
 
 def _parse_bitvector_string(bv_str: str) -> int:
@@ -642,9 +645,6 @@ def _check_tx_envelope(payload: dict) -> dict | None:
         return _qt_err("INVALID_PARAMS", "Missing or invalid 'signature' in transaction.")
     signature = payload['signature']
 
-    if not (_PY_ECC_AVAILABLE and _PY_ECC_BLS):
-        return _qt_err("BLS_UNAVAILABLE", "BLS signatures are required but py_ecc is missing.")
-
     # One verifier, shared with block apply (consensus/tx_signing.py).
     sig_ok, sig_reason = verify_tx_signature(payload)
     if not sig_ok:
@@ -998,6 +998,11 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                 balance=sender_balance,
                 required=floor,
             )
+    estimate_started = None
+    if estimate:
+        if not _estimate_buckets.admit(sender_pubkey):
+            return _estimate_busy("This sender used its share of fee estimates; please retry.")
+        estimate_started = _estimate_buckets.clock()
     admission_tau = _AdmissionTau(
         candidate_rules=(admission_candidate,) if admission_candidate else (),
         estimate=estimate, facts=facts,
@@ -1364,8 +1369,13 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                 if tx_type == TX_TYPE_APPROVAL_REQUEST:
                     from commands.getapprovalpreview import _o5_allows
 
-                    # Apply drops a request whose transfer the policy already allows.
-                    if _o5_allows(fee_outputs):
+                    # Apply drops a request whose transfer the policy already
+                    # allows: the o5 rules and the sender's own clause, which
+                    # the registry holds apart from the step.
+                    if _o5_allows(fee_outputs) and not _sender_clause_blocks(
+                        tip_view, sender_pubkey, fee_query_inputs,
+                        admission_tau.budget,
+                    )[0]:
                         return _qt_err(
                             "APPROVAL_NOT_NEEDED",
                             "The sender's policy allows this transfer with no votes. "
@@ -1395,8 +1405,6 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
         # --- Post-Tau Processing ---
         # Note: We do NOT increment sequence number or update balances here anymore.
         # This is now an ingestion-only phase. State mutation happens during mining.
-        # if _PY_ECC_AVAILABLE and _PY_ECC_BLS:
-        #     chain_state.increment_sequence_number(sender_pubkey)
 
         if all_validated_transfers:
             logger.info(
@@ -1506,10 +1514,9 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
         return _qt_err("TX_REJECTED", f"Transaction rejected by Tau. {e}")
     except tau_admission.EstimateBusy as e:
         logger.info("Fee estimate refused: %s", e)
-        return _qt_err(
-            "ESTIMATE_BUSY",
-            "Another fee estimate is running on this node; please retry.",
-        )
+        # The sender did not get the slot, so its retry costs it nothing.
+        estimate_started = None
+        return _estimate_busy()
     except tau_admission.AdmissionTimeout as e:
         logger.warning("Admission evaluation timed out: %s", e)
         return _qt_err(
@@ -1531,6 +1538,9 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
         return _qt_err("INTERNAL_ERROR", "An unexpected server error occurred.")
     finally:
         admission_tau.close()
+        if estimate_started is not None:
+            _estimate_buckets.charge(sender_pubkey,
+                                     _estimate_buckets.clock() - estimate_started)
 
 
 def execute(raw_command: str, container):
@@ -1544,14 +1554,6 @@ def execute(raw_command: str, container):
             "sendtx",
             "Invalid sendtx format. Use sendtx '{\"0\":...}'.",
             "INVALID_PARAMS",
-        )
-
-    if not _PY_ECC_AVAILABLE:
-        logger.error("BLS library not available. Transaction rejected.")
-        return api_response.error_response(
-            "sendtx",
-            "BLS signatures are required but py_ecc is missing.",
-            "BLS_UNAVAILABLE",
         )
 
     json_blob = raw_command[len(prefix):].strip()

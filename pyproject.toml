@@ -73,6 +73,7 @@ py-modules = [
     "config",
     "db",
     "errors",
+    "rate_limit",
     "server",
     "tau_admission",
     "tau_advisory",

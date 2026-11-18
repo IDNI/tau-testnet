@@ -11,8 +11,8 @@ from unittest.mock import patch
 import pytest
 
 from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_payload
-from consensus import tx_signing
-from consensus.tx_signing import _bls_verify, verify_tx_signature
+from consensus import bls
+from consensus.tx_signing import verify_tx_signature
 
 VECTORS_PATH = Path(__file__).parent / "fixtures" / "bls_g2basic_vectors.json"
 VECTORS = json.loads(VECTORS_PATH.read_text())["vectors"]
@@ -51,7 +51,7 @@ def test_every_vector_gets_the_oracle_verdict():
     wrong = [
         (i, v["label"], v["expected"])
         for i, v in enumerate(VECTORS)
-        if _bls_verify(*_vector_inputs(v)) is not v["expected"]
+        if bls.verify(*_vector_inputs(v)) is not v["expected"]
     ]
     assert wrong == []
 
@@ -69,7 +69,7 @@ def test_a_live_sample_still_matches_py_ecc():
         pk, msg, sig = _vector_inputs(v)
         oracle = bool(G2Basic.Verify(pk, msg, sig))
         assert oracle is v["expected"], (i, v["label"])
-        assert _bls_verify(pk, msg, sig) is oracle, (i, v["label"])
+        assert bls.verify(pk, msg, sig) is oracle, (i, v["label"])
 
 
 @pytest.mark.parametrize(
@@ -86,7 +86,7 @@ def test_a_live_sample_still_matches_py_ecc():
     ],
 )
 def test_non_bytes_inputs_are_rejected_without_raising(pk, msg, sig):
-    assert _bls_verify(pk, msg, sig) is False
+    assert bls.verify(pk, msg, sig) is False
 
 
 def test_a_signed_transaction_verifies():
@@ -148,9 +148,9 @@ def test_a_payload_missing_a_signed_field_is_unsignable():
     assert ok is False and reason.startswith("unsignable payload")
 
 
-def test_the_verdict_comes_from_bls_verify():
+def test_the_tx_verdict_comes_from_bls_verify():
     tx = _tx()
     tx["signature"] = "00" * 96
-    with patch.object(tx_signing, "_bls_verify", return_value=True) as forced:
+    with patch.object(bls, "verify", return_value=True) as forced:
         assert verify_tx_signature(tx) == (True, "")
     assert forced.call_count == 1

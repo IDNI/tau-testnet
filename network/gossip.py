@@ -9,8 +9,14 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 import trio
 from libp2p.peer.id import ID
 
-from .libp2p_compat import close_stream_safely
-from .protocols import TAU_PROTOCOL_GOSSIP
+from .libp2p_compat import (
+    StreamReadTimeout,
+    StreamTooLarge,
+    close_stream_safely,
+    read_until_eof,
+    reset_stream_safely,
+)
+from .protocols import REQUEST_READ_TIMEOUT, TAU_PROTOCOL_GOSSIP
 from .host import HostManager
 from .dht_manager import DHTManager
 
@@ -177,6 +183,18 @@ class GossipManager:
         finally:
             if stream is not None:
                 await close_stream_safely(stream)
+                # yamux keeps the entry of a closed stream until the peer closes its side too.
+                if self._nursery:
+                    self._nursery.start_soon(self._reset_unless_peer_closes, stream)
+
+    async def _reset_unless_peer_closes(self, stream: Any) -> None:
+        # The wait equals the server read timeout, so a slow server gets the full request before a reset.
+        try:
+            await read_until_eof(stream, 65535, read_timeout=REQUEST_READ_TIMEOUT)
+        except (StreamReadTimeout, StreamTooLarge):
+            await reset_stream_safely(stream)
+        except Exception:
+            pass
 
     async def receive(self, envelope: Dict[str, Any]) -> None:
         import time

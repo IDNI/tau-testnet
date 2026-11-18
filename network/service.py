@@ -16,6 +16,7 @@ from .host import HostManager, NetworkListenError
 from .dht_manager import DHTManager
 from .discovery import DiscoveryManager
 from .gossip import GossipManager
+from .protocols import REQUEST_READ_TIMEOUT
 from commands import sendtx
 
 logger = logging.getLogger(__name__)
@@ -26,8 +27,6 @@ MAX_HANDSHAKE_PROVIDERS = 50
 MAX_SYNC_PAGES = 50
 # A peer that never closes a sync reply must not hold the sync forever.
 SYNC_READ_TIMEOUT = 120.0
-# A tx or gossip request is one write of at most 1 MiB, so it arrives in seconds.
-REQUEST_READ_TIMEOUT = 30.0
 # Handshake and ping payloads are small; a silent peer must not block forever.
 HANDSHAKE_READ_TIMEOUT = 30.0
 PING_READ_TIMEOUT = 10.0
@@ -149,10 +148,9 @@ class NetworkService:
         
         # Metrics
         self._metric_timestamps: Dict[str, float] = {}
-        # Track peers we've already processed a "connected" event for to avoid
-        # duplicate handshakes/subscription spam when libp2p emits multiple
-        # connected notifications for the same peer.
-        self._connected_peer_ids: Set[str] = set()
+        # Keyed by connection: libp2p can deliver the disconnect event of an old
+        # connection after the connect event of a redial to the same peer.
+        self._peer_connections: Dict[str, Set[Any]] = {}
         # Peers whose handshake failed the genesis gate. Survives disconnects so a
         # rejected peer that reconnects cannot trigger syncs through gossip.
         self._genesis_rejected_peers: "OrderedDict[str, None]" = OrderedDict()
@@ -171,10 +169,11 @@ class NetworkService:
     async def _on_peer_connected(self, conn: Any) -> None:
         peer_id = conn.muxed_conn.peer_id
         peer_key = str(peer_id)
-        if peer_key in self._connected_peer_ids:
+        conns = self._peer_connections.setdefault(peer_key, set())
+        if conn in conns:
             logger.debug("Duplicate peer connected event ignored: %s", peer_id)
             return
-        self._connected_peer_ids.add(peer_key)
+        conns.add(conn)
         logger.info("Peer connected: %s", peer_id)
         
         # Manually add peer address to peerstore for inbound connections
@@ -220,10 +219,19 @@ class NetworkService:
 
     async def _on_peer_disconnected(self, conn: Any) -> None:
         try:
-            peer_id = conn.muxed_conn.peer_id
-            self._connected_peer_ids.discard(str(peer_id))
+            peer_key = str(conn.muxed_conn.peer_id)
         except Exception:
-            pass
+            return
+        conns = self._peer_connections.get(peer_key)
+        if conns is None:
+            return
+        conns.discard(conn)
+        if not conns:
+            del self._peer_connections[peer_key]
+
+    def _peer_has_open_connection(self, peer_id: Any) -> bool:
+        conns = self._peer_connections.get(str(peer_id), ())
+        return any(getattr(c, "is_closed", False) is not True for c in conns)
 
     async def _perform_handshake(self, peer_id: Any) -> None:
         """Handshake with retry. The first attempt races connection setup (the
@@ -242,7 +250,7 @@ class NetworkService:
                                 peer_id, attempt)
                 return
             except Exception:
-                if str(peer_id) not in self._connected_peer_ids:
+                if not self._peer_has_open_connection(peer_id):
                     logger.debug("Handshake retry abandoned; %s disconnected",
                                  peer_id)
                     return
