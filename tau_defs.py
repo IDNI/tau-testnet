@@ -65,6 +65,20 @@ HOST_STREAM_WIDTHS = {
     "o9": CONSENSUS_FEE_BV_WIDTH,
 }
 
+# Frozen capability flags `getgovernance` returns as `capabilities`, beside
+# `stream_widths` (issues #47/#76). They describe the node SOFTWARE, never
+# chain state: a wallet asks "does this node enforce recipient-side policy?"
+# before offering the user an inbound rule. The CHAIN flag wallets must check
+# before deploying one is `recipient_policy_active` (a one-way governance
+# patch, reported beside these). A node built without the recipient gate
+# reports False here, and its admission screens refuse a rule only the gate
+# could enforce instead of silently admitting a rule that never runs.
+HOST_CAPABILITIES = {
+    "recipient_policy": True,
+    "recipient_max_hold": True,
+    "recipient_guarded_pass": True,
+}
+
 # --- Transaction expiry ---
 # Every transaction carries `expire_at_height`: the first height at which it is
 # too late to include it. Height is the expiry a proposer cannot lie about --
@@ -310,6 +324,49 @@ APPROVAL_SLOT_BV_WIDTH = 384
 # and a parked request can outlive the mode it was admitted under.
 REQUEST_CUSTOM_INPUT_MIN = APPROVAL_SLOT_BASE + APPROVAL_SLOT_COUNT
 
+# --- Recipient hold streams (issues #47/#76) ----------------------------------
+# i17: how long a payment to the evaluated recipient may still be held, in
+# SECONDS (release_at_time minus the block timestamp). i27: the same hold in
+# BLOCKS (release_at_height minus the block height). Both bv[64], node-fed and
+# host-computed, like i16, so a cap rule is a single comparison per stream --
+# no bv subtraction in the rule, no underflow question:
+#
+#   only A may pay me:      always ( (i3[t]:bv[384] = { #x<A> }:bv[384]) ? o5 = 1 : o5 = 0 ).
+#   instant only (cap 0):   block when i17[t]:bv[64] > { 0 }:bv[64] or i27[t]:bv[64] > { 0 }:bv[64]
+#   held 600 s at most:     block when i17[t]:bv[64] > { 600 }:bv[64]
+#
+# A plain transfer feeds 0 on BOTH streams, so a cap of 0 admits plain
+# transfers and refuses every park. A park of one kind feeds 0 on the other
+# kind's stream, so a cap rule must bound BOTH streams to bound both kinds.
+# Admission measures against the tip view's next-block height/timestamp (the
+# same clock that refuses a park minable at or after its release); apply
+# measures against the block being applied.
+#
+# The feed lives ONLY inside the node: the recipient-policy evaluation
+# (consensus/recipient_policy.py forces both values into the recipient pass,
+# at admission and at apply, from the same helper), and — while active —
+# explicit zeros on the SENDER pass, so the owner's own cap clause reads 0 on
+# its outbound transfers exactly as the approval slots feed 0 there. A
+# sender-supplied operations value on i17/i27 never reaches either pass.
+# Like the approval slots they are WRITE-reserved from activation on
+# (`recipient_policy_active`, a one-way governance patch read from consensus
+# state) and readable only from a registered o5 clause, at exactly bv[64]:
+# per-stream typing is process-global and sticky, so one clause typing i17 at
+# another width would fail the build of every other clause that reads it.
+# Until activation i17/i27 stay ordinary custom streams. Width bv[64]: the
+# widest release window is 7_776_000 seconds / 100_000 blocks, far inside it.
+TAU_INPUT_STREAM_HOLD_SECONDS = "i17"
+TAU_INPUT_STREAM_HOLD_BLOCKS = "i27"
+HOLD_SECONDS_STREAM_INDEX = 17
+HOLD_BLOCKS_STREAM_INDEX = 27
+HOLD_STREAM_BV_WIDTH = 64
+
+
+def hold_stream_indices() -> tuple:
+    """The recipient hold stream indices: seconds first, then blocks."""
+    return (HOLD_SECONDS_STREAM_INDEX, HOLD_BLOCKS_STREAM_INDEX)
+
+
 # Rule-text screening contexts. Slots are readable in exactly one of them.
 RULE_TEXT_CONTEXT_USER = "user_rule"
 RULE_TEXT_CONTEXT_O5_CLAUSE = "o5_clause"
@@ -322,17 +379,19 @@ def approval_slot_indices() -> tuple:
 
 
 def reserved_operation_keys(
-    eligibility_mode: str = "", approval_slots_active: bool = False
+    eligibility_mode: str = "", approval_slots_active: bool = False,
+    recipient_policy_active: bool = False,
 ) -> tuple:
     """Operation keys a user_tx may not target, for the given eligibility mode.
 
     Every ingest/apply site must derive the set through this helper so admission,
     sendtx and block apply agree — a disagreement here is a consensus split.
 
-    `approval_slots_active` comes from CONSENSUS STATE (the lifecycle manager's
-    one-way activation flag, read from the parent snapshot), never from a module
-    global: block apply deep-copies the lifecycle manager per candidate, so a
-    global would leak across simulation, rollback and reorg.
+    `approval_slots_active` and `recipient_policy_active` come from CONSENSUS
+    STATE (the lifecycle manager's one-way activation flags, read from the
+    parent snapshot), never from a module global: block apply deep-copies the
+    lifecycle manager per candidate, so a global would leak across simulation,
+    rollback and reorg.
     """
     keys = EXTRA_RESERVED_OPERATION_KEYS
     if eligibility_mode == "tau_validator_set":
@@ -345,6 +404,11 @@ def reserved_operation_keys(
         # Reserved exactly when the node starts feeding them, mirroring the i13
         # and i16 precedents.
         keys = keys + approval_slot_indices()
+    if recipient_policy_active:
+        # Same rule again: i17/i27 are reserved from the block after recipient
+        # policy activates, and ordinary custom streams until then. A sender
+        # who could write them would answer the recipient's question for them.
+        keys = keys + hold_stream_indices()
     return keys
 
 
@@ -352,6 +416,7 @@ def rule_text_forbidden_input_streams(
     context: str = RULE_TEXT_CONTEXT_USER,
     eligibility_mode: str = "",
     approval_slots_active: bool = False,
+    recipient_policy_active: bool = False,
 ) -> tuple:
     """Input stream NAMES that rule text of this kind may not reference.
 
@@ -360,12 +425,15 @@ def rule_text_forbidden_input_streams(
     rule text depends on what the rule is. i12 is the standing example — reading
     the sender pubkey is how a policy rule scopes itself, only writing it as an
     operation is forbidden. Approval slots are the second: write-forbidden
-    everywhere, readable only from a registered o5 clause.
+    everywhere, readable only from a registered o5 clause. The recipient hold
+    streams (i17/i27) are the third, on the same terms.
     """
     keys = reserved_operation_keys(
-        eligibility_mode, approval_slots_active=approval_slots_active
+        eligibility_mode, approval_slots_active=approval_slots_active,
+        recipient_policy_active=recipient_policy_active,
     )
     readable = {12}
     if context == RULE_TEXT_CONTEXT_O5_CLAUSE:
         readable |= set(approval_slot_indices())
+        readable |= set(hold_stream_indices())
     return tuple(f"i{idx}" for idx in keys if idx not in readable)

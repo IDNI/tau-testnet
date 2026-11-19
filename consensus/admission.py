@@ -27,6 +27,7 @@ from consensus.rule_offers import (
     screen_clause_structure,
 )
 from consensus.facade import TipAdmissionView
+from consensus import recipient_policy
 from consensus.approvals import (
     MAX_APPROVAL_WINDOW_BLOCKS,
     audit_stream_collisions,
@@ -69,6 +70,7 @@ from consensus.governance import (
     HOST_CONTRACT_PATCH_KEYS,
     validate_fee_beneficiary,
     validate_approval_slots_active,
+    validate_recipient_policy_active,
 )
 
 logger = logging.getLogger(__name__)
@@ -246,12 +248,16 @@ class UserRuleRejection(NamedTuple):
 
 
 def screen_user_rule_text(
-    rule_text: str, eligibility_mode: str, slots_active: bool
+    rule_text: str, eligibility_mode: str, slots_active: bool,
+    receive_active: bool = False,
 ) -> Optional[UserRuleRejection]:
     """Screens for an accumulated op-0 rule, run by admission and by block apply.
 
     A proposer can include a tx that never passed admission, so apply must refuse
-    exactly what admission refuses.
+    exactly what admission refuses. `receive_active` is the chain's
+    recipient_policy_active flag (tip at admission, parent snapshot at apply):
+    from activation on, the hold streams i17/i27 are readable only from a
+    registered o5 clause, never from an accumulated rule.
     """
     # A user rule on a consensus-owned output forges verdicts or fees, or makes the spec unsat.
     # Governance revisions are exempt because writing those streams is their job.
@@ -283,8 +289,20 @@ def screen_user_rule_text(
         tau_defs.RULE_TEXT_CONTEXT_USER,
         eligibility_mode,
         approval_slots_active=slots_active,
+        recipient_policy_active=receive_active,
     )
     typed_reserved_in = _streams_referenced(rule_text, typed_reserved)
+    if typed_reserved_in and typed_reserved_in[0] in (
+            tau_defs.TAU_INPUT_STREAM_HOLD_SECONDS,
+            tau_defs.TAU_INPUT_STREAM_HOLD_BLOCKS):
+        return UserRuleRejection(
+            f"user_tx rule text references the recipient hold stream "
+            f"'{typed_reserved_in[0]}': the node feeds it only to a registered "
+            f"o5 policy clause, and typing it from another rule can pin a "
+            f"conflicting bitvector width process-wide.",
+            "reserved_input_stream",
+            "TX_REJECTED",
+        )
     if typed_reserved_in:
         return UserRuleRejection(
             f"user_tx rule text references reserved consensus input stream "
@@ -362,9 +380,11 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
     # The slot reservation is what makes a co-signature unforgeable: without it a
     # sender could put "18" in `operations` and write their own approval.
     slots_active = approval_slots_active(tip_view)
+    receive_active = recipient_policy.recipient_policy_active(tip_view)
     reserved_ops = tau_defs.reserved_operation_keys(
         getattr(tip_view, "eligibility_mode", ""),
         approval_slots_active=slots_active,
+        recipient_policy_active=receive_active,
     )
 
     for key, val in operations.items():
@@ -388,8 +408,8 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
                 f"Invalid operation target '{key}'. Stream {idx} is reserved "
                 f"(i12 sender pubkey; i14/i15 consensus stake/mode inputs; "
                 f"i13 consensus proposer pubkey under tau_validator_set; "
-                f"i18-i25 co-signature approval slots, which only the node may "
-                f"write)."
+                f"i18-i25 co-signature approval slots and i17/i27 recipient "
+                f"hold streams, which only the node may write)."
             )
 
     rule_text = operations.get("0")
@@ -401,7 +421,8 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         if routing is not None:
             return routing
 
-        rejection = screen_user_rule_text(rule_text, tip_view.eligibility_mode, slots_active)
+        rejection = screen_user_rule_text(
+            rule_text, tip_view.eligibility_mode, slots_active, receive_active)
         if rejection:
             return format_error(
                 rejection.error, code=rejection.code, **(rejection.details or {})
@@ -546,6 +567,23 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         if findings:
             return (
                 "approval_slots_active cannot be activated on this chain: "
+                + "; ".join(findings)
+            )
+    if "recipient_policy_active" in patch:
+        err = validate_recipient_policy_active(patch["recipient_policy_active"])
+        if err:
+            return f"recipient_policy_active: {err}"
+        # First phase of the two-phase activation, as for the approval slots:
+        # refusing the PROPOSAL is the only place a collision can be reported
+        # loudly. Before activation i17/i27 are ordinary custom streams, so
+        # any rule already reading them would be reinterpreted as a recipient
+        # hold policy (or type the stream at a second width) once the flag
+        # flips. Grandfathered clauses hold the activation back until replaced.
+        findings = recipient_policy.audit_receive_stream_collisions(
+            _tip_effective_spec_texts())
+        if findings:
+            return (
+                "recipient_policy_active cannot be activated on this chain: "
                 + "; ".join(findings)
             )
     if "vote_quorum" in patch:
@@ -917,9 +955,13 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
     except RuleOfferShapeError as exc:
         return format_error(f"Offered rule has an unsupported shape: {exc}")
 
-    domain_error = _screen_clause_domains(body)
+    domain_error = _screen_clause(
+        body, recipient_policy.recipient_policy_active(tip_view))
     if domain_error:
         return _admission_from_domain_error(domain_error)
+    inactive = receive_stream_inactive_error(body, tip_view)
+    if inactive is not None:
+        return inactive
 
     return success({
         "offer_id": offer_id_hex,
@@ -952,14 +994,18 @@ def _screen_clause_domains(body: str) -> Optional[str]:
     # but they get a stricter width check instead, below.
     #
     # The widest reserved set is screened regardless of the tip's current
-    # eligibility mode, AND regardless of whether approval slots are active. A
-    # clause outlives the mode that was active when it was accepted, so admitting
-    # one that types i13 under validator_set would turn into a reserved-stream
-    # collision the moment governance switches to tau_validator_set.
+    # eligibility mode, AND regardless of whether approval slots or recipient
+    # policy are active. A clause outlives the mode that was active when it was
+    # accepted, so admitting one that types i13 under validator_set would turn
+    # into a reserved-stream collision the moment governance switches to
+    # tau_validator_set. The hold streams i17/i27 are readable here on the same
+    # terms as the slots; their flag-gated width screen and the inactive-chain
+    # deploy refusal live in _screen_clause / receive_stream_inactive_error.
     reserved_inputs = tau_defs.rule_text_forbidden_input_streams(
         tau_defs.RULE_TEXT_CONTEXT_O5_CLAUSE,
         "tau_validator_set",
         approval_slots_active=True,
+        recipient_policy_active=True,
     )
     typed = _streams_referenced(body, reserved_inputs)
     if typed:
@@ -969,6 +1015,52 @@ def _screen_clause_domains(body: str) -> Optional[str]:
         )
 
     return _screen_clause_widths_and_structure(body)
+
+
+def _screen_clause(body: str, receive_active: bool = False) -> Optional[str]:
+    """The clause screen, plus the one check that depends on chain state
+    (issues #47/#76).
+
+    `_screen_clause_domains` reads the body and nothing else, so it gives the
+    same answer on every node at every height. The width of the hold streams
+    cannot be screened that way: before `recipient_policy_active` is set,
+    i17/i27 are ordinary custom streams that a block may already carry at any
+    width, and refusing that at apply would split an upgraded node from the
+    rest. So that one check is gated on `receive_active`, the chain's flag,
+    which admission reads from the tip and apply from the parent snapshot.
+    """
+    error = _screen_clause_domains(body)
+    if error:
+        return error
+    if receive_active:
+        hold_error = recipient_policy.screen_hold_stream_widths(body)
+        if hold_error:
+            return "Shared rules: " + hold_error
+    return None
+
+
+def receive_stream_inactive_error(body: str, tip_view) -> Optional[AdmissionResult]:
+    """Admission's refusal of a clause that reads i17/i27 on a chain without
+    recipient policy, or None (issues #47/#76).
+
+    Admission only, never block apply: the clause would register and then
+    never be asked about a single incoming payment, which is the silent
+    failure a wallet cannot see. So the node says it at deploy. A clause
+    reading only i3 is NOT refused: statically it is indistinguishable from a
+    sender-pass clause (the counterparty is a first-class sender input too);
+    the capabilities report is how a wallet learns whether the recipient pass
+    will also enforce it inbound.
+    """
+    if recipient_policy.recipient_policy_active(tip_view) or \
+            not recipient_policy.clause_reads_hold_stream(body or ""):
+        return None
+    return format_error(
+        "This rule reads a recipient hold stream (i17/i27), but recipient-side "
+        "policy is not active on this chain, so the rule would never be asked "
+        "about an incoming payment. The feature activates by governance patch "
+        "(recipient_policy_active).",
+        code="RECIPIENT_POLICY_INACTIVE",
+    )
 
 
 def _screen_clause_widths_and_structure(body: str) -> Optional[str]:
@@ -1111,9 +1203,13 @@ def validate_rule_offer_decision_payload(
     except RuleOfferShapeError as exc:
         return format_error(f"Accepted rule has an unsupported shape: {exc}")
 
-    domain_error = _screen_clause_domains(body)
+    domain_error = _screen_clause(
+        body, recipient_policy.recipient_policy_active(tip_view))
     if domain_error:
         return _admission_from_domain_error(domain_error)
+    inactive = receive_stream_inactive_error(body, tip_view)
+    if inactive is not None:
+        return inactive
 
     refusal = _rule_change_refusal(
         tip_view, decision.actor_pubkey, tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER
@@ -1186,11 +1282,15 @@ def validate_o5_clause_routing(
             code="CLAUSE_SHAPE",
         )
 
-    domain_error = _screen_clause_domains(body)
+    domain_error = _screen_clause(
+        body, recipient_policy.recipient_policy_active(tip_view))
     if domain_error:
         return _admission_from_domain_error(
             domain_error, prefix="o5 policy rule rejected: "
         )
+    inactive = receive_stream_inactive_error(body, tip_view)
+    if inactive is not None:
+        return inactive
 
     sender = tx.get("sender_pubkey")
     if not isinstance(sender, str):
@@ -1430,18 +1530,26 @@ def validate_rule_change_request_payload(
     if shape_error:
         return _invalid_rule_change(shape_error)
 
+    receive_active = recipient_policy.recipient_policy_active(tip_view)
+    clause_text = None
     if request.kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
-        domain_error = _screen_clause_domains(request.body)
+        clause_text = request.body
+        domain_error = _screen_clause(clause_text, receive_active)
     elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
         domain_error = _screen_guard_domains(request.body)
     elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
-        domain_error = _screen_clause_domains(clause_body_v1(request.rule_text))
+        clause_text = clause_body_v1(request.rule_text)
+        domain_error = _screen_clause(clause_text, receive_active)
     else:
         domain_error = None
     if domain_error:
         return _admission_from_domain_error(
             domain_error, prefix="rule_change_request rejected: "
         )
+    if clause_text is not None:
+        inactive = receive_stream_inactive_error(clause_text, tip_view)
+        if inactive is not None:
+            return inactive
 
     precondition = _rule_change_precondition_error(request, tip_view)
     if precondition:
