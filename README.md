@@ -590,6 +590,10 @@ and application rules for one account at one tip, with the sha256 of each stored
 text, and `gettxstatus` says whether a rule transaction registered, replaced or
 revoked a clause or was skipped. A wallet should say "protection on" only when
 the clause hash matches the rule it sent: [docs/rules_in_force.md](docs/rules_in_force.md).
+`running_spec` (in `getaccountrules` and `getgovernance`) is the specification
+the engine runs at that head, rebuilt by the engine from the committed rules,
+with its sha256: a later rule can revise part of an earlier one, so the stored
+units are what was sent and `running_spec` is what is in force.
 
 ### Checking conflict status
 
@@ -760,7 +764,8 @@ For a wallet view that accounts for queued sends, use the additive commands
   read at one tip: its registry clauses and rule-change guard with their
   sha256, application rules naming it, its open rule-change requests, requests
   waiting for its vote, pending offers, queued rule transactions and the latest
-  rule changes. CLI: `tau-testnet policy show <address>`.
+  rule changes, and `running_spec`, what the engine runs. CLI: `tau-testnet
+  policy show <address>`.
 
 `sendtx` returns the computed `tx_hash` in its success `data`, so a wallet can
 poll `gettxstatus` immediately after queuing.

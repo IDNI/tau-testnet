@@ -305,6 +305,11 @@ def main(argv=None) -> int:
                     body = session.step(req.get("inputs") or {})
             elif op == "state":
                 body = {"ok": True, **session.observe()}
+            elif op == "spec":
+                # The specification as the engine revised it, read from the
+                # interpreter: what it runs, not what was sent.
+                spec = session.itp.current_spec() if session.itp is not None else None
+                body = {"ok": spec is not None, "spec": spec, **session.observe()}
             elif op == "close":
                 _write_frame(fd, {"ok": True, "request_id": rid, "closing": True})
                 return 0

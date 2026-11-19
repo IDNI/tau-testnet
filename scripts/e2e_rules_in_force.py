@@ -23,9 +23,15 @@ SCENARIOS
        requests park: Carol sees them as open, Xavier sees them waiting for his
        vote. He approves both in one block: the release writes the first
        (`revoked`) and records the second as `release_failed` with its reason.
-    6. Node A restarts and answers the same; node B replays A's blocks,
-       restarts, and gives the same outcome for every transaction and the same
-       rules in force for every account.
+    6. The probe of Sep 27 on #42: `o26 = {7} && o27 = {9}`, then `o26 = {3}`.
+       `running_spec` (in `getgovernance` and `getaccountrules`) says the engine
+       runs `o26 = 3` and `o27 = 9` with the hash of that text, at the head the
+       answer describes, while the stored application rules still list both
+       units.
+    7. Node A restarts and answers the same (its running spec rebuilt from the
+       journal); node B replays A's blocks, restarts, and gives the same outcome
+       for every transaction, the same rules in force for every account and the
+       same running spec.
 
 USAGE
     python scripts/e2e_rules_in_force.py provision --dir .local/e2e-rules-in-force
@@ -54,6 +60,12 @@ PERMISSIVE = ("always ( (i1[t]:bv[24] > { #x7fffff }:bv[24]) ? "
               "( o5[t]:bv[24] = { #x000000 }:bv[24] ) : "
               "( o5[t]:bv[24] = { #x000001 }:bv[24] ) ).")
 NEUTRAL = "always ( (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
+
+
+PROBE_A = "always ( o26[t]:bv[24] = { 7 }:bv[24] && o27[t]:bv[24] = { 9 }:bv[24] )."
+PROBE_B = "always ( o26[t]:bv[24] = { 3 }:bv[24] )."
+RUNS_3 = "o26[t]:bv[24] = { 3 }:bv[24]"
+RUNS_9 = "o27[t]:bv[24] = { 9 }:bv[24]"
 
 
 def guard_text(cosigner_pk):
@@ -276,8 +288,35 @@ def scenario_guard_and_release(rig, st):
     check("nothing is left open", not view.get("open_rule_changes"), view.get("open_rule_changes"))
 
 
+def scenario_running_spec(rig, st):
+    say("6. The probe of Sep 27: what the engine runs, next to what was sent")
+    before = (rig.read("getgovernance") or {}).get("running_spec") or {}
+    check("before the probe the running spec has a text and no o26",
+          bool(before.get("text")) and "o26" not in before["text"], before)
+    st["txs"].append(landed(rig, rule_tx(rig, "bob", PROBE_A), "`o26 = 7 && o27 = 9`"))
+    st["txs"].append(landed(rig, rule_tx(rig, "bob", PROBE_B), "`o26 = 3`"))
+    gov = rig.read("getgovernance") or {}
+    running = gov.get("running_spec") or {}
+    text = running.get("text") or ""
+    check("the engine runs o26 = 3 and o27 = 9, and the 7 is gone",
+          RUNS_3 in text and RUNS_9 in text and "{ 7 }" not in text, text[-300:] or running)
+    check("its sha256 is the hash of that text",
+          running.get("sha256") == hashlib.sha256(text.encode()).hexdigest(), running.get("sha256"))
+    check("it names the head the rest of the answer describes",
+          running.get("block_hash") == gov.get("head_hash"),
+          (running.get("block_hash"), gov.get("head_hash")))
+    stored = gov.get("application_rules") or ""
+    check("the stored application rules still list both units, the 7 included",
+          "{ 7 }" in stored and "{ 3 }" in stored and "{ 9 }" in stored, stored[-300:])
+    mine = rules(rig, "bob").get("running_spec") or {}
+    check("`getaccountrules` gives the same running spec",
+          (mine.get("sha256"), mine.get("block_hash")) == (running.get("sha256"), running.get("block_hash")),
+          mine.get("sha256"))
+    st["running_sha"] = running.get("sha256")
+
+
 def scenario_restart_and_follower(rig, st):
-    say("6. Node A restarts; node B replays A's blocks, restarts, and agrees")
+    say("7. Node A restarts; node B replays A's blocks, restarts, and agrees")
     reads = [f"gettxstatus {h}" for h in st["txs"] if h]
     reads += [f"getaccountrules {rig.pk[n]}" for n in ACTORS if n != "miner"]
     before = {cmd: rig_mod.stable(rig.read(cmd)) for cmd in reads}
@@ -287,6 +326,10 @@ def scenario_restart_and_follower(rig, st):
               before == after, [c for c in reads if before[c] != after[c]][:3])
     rig.mine()
     rig.follower_agrees(reads)
+    on_b = (rig.read("getgovernance", rig.b) or {}).get("running_spec") or {}
+    check("node B, rebuilt from its own journal, runs the same spec",
+          on_b.get("sha256") == st.get("running_sha") and RUNS_3 in (on_b.get("text") or ""),
+          on_b.get("sha256"))
 
 
 def run(root: str) -> int:
@@ -300,6 +343,7 @@ def run(root: str) -> int:
             scenario_plain(rig, st)
             scenario_skipped(rig, st)
             scenario_guard_and_release(rig, st)
+            scenario_running_spec(rig, st)
             scenario_restart_and_follower(rig, st)
     except Exception:
         import traceback

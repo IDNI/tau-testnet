@@ -9,9 +9,13 @@ is on":
 2. **What is in force for this account right now?** The `o5` clause, the
    rule-change guard, open rule-change requests and application rules that name
    the account lived behind four different reads.
+3. **What does the engine actually run?** A later rule can revise part of an
+   earlier one, so the stored rule units say what was sent, not what is in
+   force.
 
-`gettxstatus` now carries the transaction's **outcome**, and `getaccountrules`
-answers the second question from one tip. Both are read-only, need no restart,
+`gettxstatus` now carries the transaction's **outcome**, `getaccountrules`
+answers the second question from one tip, and `running_spec` (in
+`getaccountrules` and `getgovernance`) answers the third. Both are read-only, need no restart,
 no regenesis and no change to the state hash. Issue: #42.
 
 Short reference: [README](../README.md#pending-aware-wallet-queries). CLI:
@@ -94,6 +98,8 @@ tau-testnet rpc getaccountrules <address>
  "rule_change_guard": {"body": "…", "sha256": "…",
                        "since": {"block_number": 12, "request_id": "…"}},
  "application_rules": [],
+ "running_spec": {"text": "always (…) && o27[t]:bv[24] = { 9 }:bv[24] && o26[t]:bv[24] = { 3 }:bv[24]",
+                  "sha256": "…", "block_hash": "…"},
  "open_rule_changes": [{"request_id": "…", "kind": "set_policy", "body_sha256": "…",
                         "offer_id": null, "approvers": {"18": "…"}, "voted": {},
                         "declined": [], "ready": false,
@@ -113,6 +119,7 @@ tau-testnet rpc getaccountrules <address>
 | `rule_change_guard` | The guard clause, same shape, or `null`. |
 | `since` | The block, and the transaction or released request, that put this exact text in place, from this node's records; `null` when that happened before the node began recording. |
 | `application_rules` | Units of the application-rules accumulation whose text names the account's key (`#x<address>`), each with its sha256. |
+| `running_spec` | The specification the engine runs at `running_spec.block_hash`, as the engine revised it, in canonical (full-width) form, with the sha256 of that text. See [What the engine runs](#what-the-engine-runs-running_spec). |
 | `open_rule_changes` | The account's own rule-change requests that are still open: kind, hash of the requested body, approvers by slot, votes, declines, whether the guard already allows it (`ready`), and the expiry height. |
 | `awaiting_my_vote` | Open rule-change requests from other accounts that name this account as an approver, with their `sender_pubkey`. |
 | `pending_offers` | Rule offers addressed to the account that are still undecided. |
@@ -122,6 +129,9 @@ tau-testnet rpc getaccountrules <address>
 All chain fields come from **one** tip: the node reads its in-memory state under
 the same locks a block swap holds, so a block landing during the call cannot mix
 two tips. `history`, `since` and `mempool` are this node's own view.
+`running_spec` names its own head (`block_hash`), read in one database read with
+the rules it was built from; the call reads it again, at most three times, until
+that head is the tip above.
 
 ### Checking that the rule in force is the one the user meant
 
@@ -135,6 +145,49 @@ stores it and compare:
 
 Only then should a wallet say "protection on". A `skipped` outcome, a different
 hash, or a `null` clause means it is not.
+
+### What the engine runs (`running_spec`)
+
+A rule unit can revise part of an earlier one. The probe of Sep 27 on #42:
+
+1. `always ( o26[t]:bv[24] = { 7 }:bv[24] && o27[t]:bv[24] = { 9 }:bv[24] ).`
+2. `always ( o26[t]:bv[24] = { 3 }:bv[24] ).`
+
+After the second, `getgovernance.application_rules` still holds both units, the
+`7` included, while the engine runs `o26 = 3` and `o27 = 9`. `running_spec.text`
+is that second answer:
+
+```text
+always (i0[t]:tau = 0 || …) && … && o27[t]:bv[24] = { 9 }:bv[24] && o26[t]:bv[24] = { 3 }:bv[24]
+```
+
+Stored units stay listed as what was sent and are never labelled "in force";
+`running_spec` is what a wallet reads to know what is in force.
+
+How it is built. The authoritative evaluator runs in a worker whose rule text
+feeds some streams shrunk (an address stream as `bv[8]` instead of `bv[384]`),
+so its own text is not one two nodes can compare. The node gives the same engine
+the committed rule history in canonical form, in a worker of its own: the units
+of the last journal reset, then every revision the engine accepted, in order.
+It reads back the engine's own `current_spec()`. The steps between the
+revisions are not replayed: the revised text depends on the revisions and their
+order, not on the inputs or the time point at which they arrived (the same text
+and hash with no steps and with steps between).
+
+What to compare. At the same `block_hash`, every node gives the same `text` and
+`sha256`: the history it is built from is the committed journal, which a
+restarted node and a follower replaying from block 0 rebuild the same way. A
+wallet that wants to know whether a rule it sent is in force can look for its
+terms in `running_spec.text` and check `sha256` across nodes it uses.
+
+When it is missing. `text` and `sha256` are `null`, with `unavailable` naming
+why, on a node that runs without the authoritative engine (the mock engine of
+`TAU_FORCE_TEST`) or when the engine could not rebuild the text (a unit not
+accepted again is reported, never a partial text).
+
+`tests/test_running_spec_native.py` runs the probe through real blocks on the
+real engine; `scripts/e2e_rules_in_force.py` (scenarios 6 and 7) on two live
+nodes, across a restart and a follower's replay.
 
 ### The rule-change release
 
@@ -164,6 +217,13 @@ migration. They grow with the chain; a full replay rewrites them idempotently.
 
 `getaccountrules` is in the expensive rate-limit tier: it takes the state locks
 and scans the mempool and the history.
+
+`running_spec` is cached per committed rule history. The first read after a
+journal reset or an accepted revision starts one engine worker, replays the rule
+units in canonical form and closes it (measured: about 0.3 s for the 8 rule
+units of the test chain; it grows with the number of units); every later read
+until the next rule change is a database read (0.1 ms). It is never built under the state locks, so a block never waits
+for it.
 
 ## What this does not do
 
