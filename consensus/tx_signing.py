@@ -34,6 +34,11 @@ from consensus.approvals import (
     TX_TYPE_TRANSFER_VOTE,
 )
 from consensus.routes import TX_TYPE_ROUTE_REMOVE, TX_TYPE_ROUTE_SET
+from consensus.payouts import (
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_INSTALL,
+    TX_TYPE_PAYOUT_REMOVE,
+)
 from consensus.standing import (
     TX_TYPE_STANDING_CANCEL,
     TX_TYPE_STANDING_CREATE,
@@ -168,6 +173,15 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         for field in ("destination_pubkey", "bps", "min_incoming", "activate_at",
                       "expires_at", "locked_until"):
             signing_dict[field] = payload.get(field)
+    elif tx_type == TX_TYPE_PAYOUT_INSTALL:
+        for field in ("rule_text", "recipients", "max_per_execution", "max_per_period",
+                      "period_kind", "period_seconds", "start_at", "expires_at"):
+            signing_dict[field] = payload.get(field)
+    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+        signing_dict["rule_id"] = payload.get("rule_id")
+        signing_dict["inputs"] = payload.get("inputs", {})
+    elif tx_type == TX_TYPE_PAYOUT_REMOVE:
+        signing_dict["rule_id"] = payload.get("rule_id")
     elif tx_type == TX_TYPE_ROUTE_REMOVE:
         pass  # nothing beyond the common fields: it removes the signer's own route
 

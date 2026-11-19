@@ -1222,6 +1222,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_grant_subparsers(sub)
     _add_standing_subparsers(sub)
     _add_route_subparsers(sub)
+    _add_payout_subparsers(sub)
     _add_node_subparsers(sub)
 
     return parser
@@ -3189,6 +3190,140 @@ def _add_route_subparsers(sub) -> None:
     sh.add_argument("--address", help="Address (default: your key's)")
     _key_group(sh, required=False)
     sh.set_defaults(func=cmd_route_show)
+
+
+
+
+# --- Rule-computed payouts (#63) ----------------------------------------------
+
+
+def _parse_input(value: str):
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("inputs look like 13=500")
+    key, val = value.split("=", 1)
+    return key.strip().lstrip("i"), val.strip()
+
+
+def cmd_payout_install(args: argparse.Namespace) -> int:
+    from consensus.payouts import PayoutShapeError, parse_payout_install
+
+    created = {}
+    try:
+        with open(args.rule_file, encoding="utf-8") as fh:
+            rule_text = fh.read()
+    except OSError as exc:
+        print_error(f"cannot read --rule-file: {exc}")
+        return EXIT_LOCAL
+    kind, seconds = _PERIODS.get(args.period, 3), 0
+    if args.period_seconds:
+        kind, seconds = 0, int(args.period_seconds)
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        payload = tx_mod.build_payout_install_tx(
+            sender_pubkey=sender_pubkey, sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry, expire_at_height=expire_at_height,
+            rule_text=rule_text, recipients=args.recipient,
+            max_per_execution=args.max_per_execution, max_per_period=args.max_per_period,
+            period_kind=kind, period_seconds=seconds,
+            start_at=args.start or 0, expires_at=args.until or 0,
+        )
+        try:
+            created["id"] = parse_payout_install(payload).rule_id.hex()
+        except PayoutShapeError as exc:
+            raise _PayloadError(str(exc))
+        return payload
+
+    status = _submit_rule_tx(args, _build)
+    if status == EXIT_OK and created.get("id"):
+        print(f"payout rule id: {created['id']}", file=sys.stderr if args.json else sys.stdout)
+    return status
+
+
+def cmd_payout_execute(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_payout_execute_tx(
+            sender_pubkey=sender_pubkey, sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry, expire_at_height=expire_at_height,
+            rule_id=args.rule_id, inputs=dict(args.input or []),
+        )
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_payout_remove(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_payout_remove_tx(
+            sender_pubkey=sender_pubkey, sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry, expire_at_height=expire_at_height,
+            rule_id=args.rule_id,
+        )
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_payout_list(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getpayoutrules {address} {getattr(args, 'role', 'all')}")
+
+
+def _add_payout_subparsers(sub) -> None:
+    """`tau-testnet payout ...` -- payouts whose amounts a Tau rule computes (#63)."""
+    p = sub.add_parser("payout", parents=[_GLOBAL_PARENT],
+                       help="Rule-computed payouts: royalties, escrow release, profit shares")
+    psub = p.add_subparsers(dest="payout_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser, fee=True):
+        if fee:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument("--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+                            help="Seconds until expiration_time (default: %(default)s)")
+        parser.add_argument("--expire-in", type=_block_count, default=1000,
+                            help="Blocks the transaction may land in, from the next one")
+        parser.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+
+    i = psub.add_parser("install", parents=common, help="Install a payout rule on your account")
+    _key_group(i)
+    i.add_argument("--rule-file", required=True,
+                   help="File with ONE Tau clause body; o<k> is the amount for --recipient k")
+    i.add_argument("--recipient", action="append", required=True,
+                   help="Recipient public key; repeat in slot order (max 8)")
+    i.add_argument("--max-per-execution", type=int, required=True)
+    i.add_argument("--max-per-period", type=int, required=True)
+    i.add_argument("--period", choices=sorted(_PERIODS), default="month")
+    i.add_argument("--period-seconds", type=int, help="Fixed period length instead")
+    i.add_argument("--start", type=_parse_when)
+    i.add_argument("--until", type=_parse_when)
+    _tx_flags(i)
+    i.set_defaults(func=cmd_payout_install)
+
+    e = psub.add_parser("execute", parents=common, help="Run a payout rule (anyone may)")
+    _key_group(e)
+    e.add_argument("rule_id", help="Payout rule id (64 hex)")
+    e.add_argument("--input", action="append", type=_parse_input,
+                   help="Executor input, e.g. 13=1000 (streams 13..20); repeatable")
+    _tx_flags(e)
+    e.set_defaults(func=cmd_payout_execute)
+
+    r = psub.add_parser("remove", parents=common, help="Remove a payout rule you own (feeless)")
+    _key_group(r)
+    r.add_argument("rule_id", help="Payout rule id (64 hex)")
+    _tx_flags(r, fee=False)
+    r.set_defaults(func=cmd_payout_remove)
+
+    ls = psub.add_parser("list", parents=common, help="Payout rules for an address")
+    ls.add_argument("--address", help="Address (default: your key's)")
+    _key_group(ls, required=False)
+    ls.add_argument("--role", choices=["in", "out", "all"], default="all")
+    ls.set_defaults(func=cmd_payout_list)
 
 
 

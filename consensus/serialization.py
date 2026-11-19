@@ -988,3 +988,56 @@ def compute_route_book_root(entries: list, changes: int) -> bytes:
         out.extend(blob)
     out.extend(encode_uint64(int(changes)))
     return blake3(bytes(out)).digest()
+
+
+# --- Payout rules ------------------------------------------------------------
+
+DOMAIN_PAYOUT_RULE_V1 = b"tau.payout.rule.v1"
+DOMAIN_PAYOUT_BOOK_V1 = b"tau.payout.book.v1"
+
+
+def _encode_payout_terms(owner_pubkey: Any, rule_text: str, recipients: tuple,
+                         max_per_execution: int, max_per_period: int,
+                         period_kind: int, period_seconds: int, start_at: int,
+                         expires_at: int, sequence_number: int) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(encode_string(rule_text))
+    out.extend(encode_uint32(len(recipients)))
+    for r in recipients:
+        out.extend(encode_pubkey48(r))
+    out.extend(encode_uint64(int(max_per_execution)))
+    out.extend(encode_uint64(int(max_per_period)))
+    out.extend(bytes([int(period_kind) & 0xFF]))
+    out.extend(encode_uint64(int(period_seconds)))
+    out.extend(encode_uint64(int(start_at)))
+    out.extend(encode_uint64(int(expires_at)))
+    out.extend(encode_uint64(int(sequence_number)))
+    return bytes(out)
+
+
+def compute_payout_rule_id(*terms: Any) -> bytes:
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_RULE_V1.decode()))
+    out.extend(_encode_payout_terms(*terms))
+    return blake3(bytes(out)).digest()
+
+
+def compute_payout_book_root(entries: list, changes: int) -> bytes:
+    """entries: (rule_id, terms_tuple, period_index, paid_in_period, executions, total)."""
+    encoded = []
+    for rid, terms, period_index, paid, executions, total in entries or []:
+        blob = bytearray()
+        blob.extend(encode_hash32(rid))
+        blob.extend(_encode_payout_terms(*terms))
+        for v in (period_index, paid, executions, total):
+            blob.extend(encode_uint64(int(v)))
+        encoded.append(bytes(blob))
+    encoded.sort()
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(changes)))
+    return blake3(bytes(out)).digest()

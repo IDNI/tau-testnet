@@ -17,6 +17,7 @@ from .governance import (
 )
 from . import faucet, fees
 from . import sender_policy
+from tau_policy import PolicyBuildError, PolicyStepError
 from .fees import FeeRuleError
 from .approvals import (
     APPROVAL_TX_TYPES,
@@ -32,6 +33,19 @@ from .approvals import (
     parse_rule_change_cancel,
     parse_rule_change_request_checked,
     parse_transfer_vote,
+)
+from .payouts import (
+    PAYOUT_POLICY_POOL,
+    PAYOUT_TX_TYPES,
+    PayoutBook,
+    PayoutShapeError,
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_INSTALL,
+    legs_from_outputs,
+    parse_payout_execute,
+    parse_payout_install,
+    parse_payout_remove,
+    rule_inputs,
 )
 from .routes import (
     ROUTE_TX_TYPES,
@@ -101,7 +115,8 @@ from .rule_offers import (
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW,
-     TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE, TX_TYPE_ROUTE_SET}
+     TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE, TX_TYPE_ROUTE_SET,
+     TX_TYPE_PAYOUT_INSTALL, TX_TYPE_PAYOUT_EXECUTE}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -971,6 +986,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         route_book = getattr(lm, "receive_routes", None)
         if isinstance(route_book, RouteBook):
             route_book.expire_due(int(block.header.timestamp))
+        payout_book = getattr(lm, "payout_rules", None)
+        if isinstance(payout_book, PayoutBook):
+            payout_book.expire_due(int(block.header.timestamp))
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
             getattr(
@@ -1755,6 +1773,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_grant_op = None  # ("create", terms) | ("draw", draw) | ("cancel", gid)
             pending_standing_op = None  # ("create"|"execute"|"cancel", parsed)
             pending_route_op = None  # ("set", route) | ("remove", owner)
+            pending_payout_op = None  # ("install", terms) | ("execute", (rid, total)) | ("remove", rid)
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2900,6 +2919,88 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         pending_route_op = op
                         tx_receipt["logs"].append(f"Receive route {op[0]} for {sender[:10]}...")
 
+            elif tx_type in PAYOUT_TX_TYPES:
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    pbook = lifecycle_mgr.payout_rules
+                    ts_now = int(block_timestamp or 0)
+                    reason = ""
+                    op = None
+                    try:
+                        if tx_type == TX_TYPE_PAYOUT_INSTALL:
+                            op = ("install", parse_payout_install(tx))
+                            signer = op[1].owner_pubkey
+                        elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+                            op = ("execute", parse_payout_execute(tx))
+                            signer = op[1].executor_pubkey
+                        else:
+                            op = ("remove", parse_payout_remove(tx))
+                            signer = op[1].owner_pubkey
+                    except PayoutShapeError as exc:
+                        reason = f"invalid {tx_type} ({exc})"
+                    legs = []
+                    if op is not None:
+                        if not isinstance(sender, str) or sender != signer:
+                            reason = "sender is not the signer"
+                        elif target_balances is None:
+                            reason = "no balance overlay for a payout"
+                        elif op[0] == "install":
+                            _, reason = pbook.can_admit_install(op[1], ts_now)
+                        elif op[0] == "remove":
+                            _, reason = pbook.can_admit_remove(op[1], ts_now)
+                        else:
+                            _, reason = pbook.can_admit_execute(op[1], ts_now)
+                            if not reason:
+                                state = pbook.get(op[1].rule_id)
+                                terms = state.terms
+                                _, count = state.paid_this_period(ts_now)
+                                try:
+                                    outs = sender_policy.evaluator(PAYOUT_POLICY_POOL).outputs(
+                                        terms.rule_text,
+                                        sender_policy.clause_inputs(rule_inputs(
+                                            _read_bal(terms.owner_pubkey), count,
+                                            terms.period_of(ts_now), op[1].inputs,
+                                        )),
+                                        timeout=getattr(_session, "request_budget", None),
+                                    )
+                                    legs = legs_from_outputs(terms, outs)
+                                except (PolicyBuildError, PolicyStepError) as exc:
+                                    reason = f"payout rule cannot be evaluated ({exc})"
+                                except (ValueError, TypeError) as exc:
+                                    reason = f"payout rule wrote an unreadable amount ({exc})"
+                                if not reason:
+                                    _, reason = pbook.check_legs(op[1].rule_id, legs, ts_now)
+                    if op is None or reason:
+                        tx_receipt["logs"].append(f"Payout transaction ignored: {reason}")
+                        tx_receipt["reason"] = "payout_not_applied"
+                        accepted_in_block = False
+                    elif op[0] == "execute":
+                        owner = pbook.get(op[1].rule_id).terms.owner_pubkey
+                        # Every leg through the OWNER's ordinary gates; the first
+                        # failure hard-rejects the tx, so no leg is committed.
+                        ok_all = True
+                        for recipient, amount in legs:
+                            if not _execute_fee_era_transfer(
+                                owner, recipient, amount,
+                                slot_values=_approval_slot_values(), overrides={},
+                            ):
+                                ok_all = False
+                                break
+                        fee_already_measured = True
+                        if ok_all and accepted_in_block and not hard_reject:
+                            total = sum(a for _, a in legs)
+                            pending_payout_op = ("execute", (op[1].rule_id, total, owner))
+                            tx_receipt["payout_legs"] = [
+                                {"recipient": r, "amount": a} for r, a in legs
+                            ]
+                            tx_receipt["logs"].append(
+                                f"Payout executed: {total} in {len(legs)} leg(s) from "
+                                f"rule {op[1].rule_id.hex()}"
+                            )
+                    else:
+                        pending_payout_op = op
+                        tx_receipt["logs"].append(f"Payout rule {op[0]}")
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3446,6 +3547,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 elif pending_retract_id is not None:
                     tx_receipt["retractable_event"] = (pending_retract_id.hex(), "retracted")
                     book.retract(pending_retract_id)
+                if pending_payout_op is not None:
+                    pbook_w = _lifecycle_for_write().payout_rules
+                    kind, obj = pending_payout_op
+                    if kind == "install":
+                        rid = pbook_w.install(obj)
+                        tx_receipt["payout_event"] = (rid.hex(), "installed")
+                    elif kind == "execute":
+                        rid, total, owner = obj
+                        pbook_w.record(rid, total, int(block_timestamp or 0))
+                        tx_receipt["payout_event"] = (rid.hex(), "executed")
+                        if target_last_transfer_ts is not None:
+                            target_last_transfer_ts[owner] = int(block_timestamp or 0)
+                    else:
+                        pbook_w.remove(obj.rule_id)
+                        tx_receipt["payout_event"] = (obj.rule_id.hex(), "removed")
                 if pending_route_op is not None:
                     rbook_w = _lifecycle_for_write().receive_routes
                     if pending_route_op[0] == "set":

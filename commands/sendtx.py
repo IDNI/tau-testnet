@@ -28,6 +28,7 @@ from consensus.rule_offers import (
 from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
 from consensus.grants import GRANT_TX_TYPES, TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW
 from consensus.routes import ROUTE_TX_TYPES, TX_TYPE_ROUTE_SET
+from consensus.payouts import PAYOUT_TX_TYPES, TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_PAYOUT_INSTALL
 from consensus.standing import STANDING_TX_TYPES, TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
@@ -50,6 +51,7 @@ KNOWN_TX_TYPES = frozenset(
     | set(GRANT_TX_TYPES)
     | set(STANDING_TX_TYPES)
     | set(ROUTE_TX_TYPES)
+    | set(PAYOUT_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
 # execution later is free and there is no second fee to drift. `transfer_vote` is
@@ -59,7 +61,8 @@ KNOWN_TX_TYPES = frozenset(
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW,
-     TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE, TX_TYPE_ROUTE_SET}
+     TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE, TX_TYPE_ROUTE_SET,
+     TX_TYPE_PAYOUT_INSTALL, TX_TYPE_PAYOUT_EXECUTE}
     | set(RULE_OFFER_TX_TYPES)
 )
 from db import add_mempool_tx

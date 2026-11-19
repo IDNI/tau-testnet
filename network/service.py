@@ -118,6 +118,9 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "standing_payment_cancel",
     "receive_route_set",
     "receive_route_remove",
+    "payout_rule_install",
+    "payout_execute",
+    "payout_rule_remove",
 })
 
 
@@ -647,7 +650,9 @@ class NetworkService:
                                  "grant_create", "grant_draw", "grant_cancel",
                                  "standing_payment_create", "standing_payment_execute",
                                  "standing_payment_cancel",
-                                 "receive_route_set", "receive_route_remove"):
+                                 "receive_route_set", "receive_route_remove",
+                                 "payout_rule_install", "payout_execute",
+                                 "payout_rule_remove"):
                     if retractable_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS:
                         continue
                     retractable_txs_count += 1
@@ -892,7 +897,8 @@ class NetworkService:
                            "grant_create", "grant_draw", "grant_cancel",
                            "standing_payment_create", "standing_payment_execute",
                            "standing_payment_cancel",
-                           "receive_route_set", "receive_route_remove"},
+                           "receive_route_set", "receive_route_remove",
+                           "payout_rule_install", "payout_execute", "payout_rule_remove"},
             type_limits={
                 "retractable_transfer": TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
                 "retract_transfer": TAU_MAX_RETRACT_TRANSFER_BYTES,
@@ -904,6 +910,10 @@ class NetworkService:
                 "standing_payment_cancel": TAU_MAX_RETRACT_TRANSFER_BYTES,
                 "receive_route_set": TAU_MAX_RETRACT_TRANSFER_BYTES,
                 "receive_route_remove": TAU_MAX_RETRACT_TRANSFER_BYTES,
+                # A payout rule carries a clause body (<= 8 KiB) and 8 keys.
+                "payout_rule_install": 16384,
+                "payout_execute": TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
+                "payout_rule_remove": TAU_MAX_RETRACT_TRANSFER_BYTES,
             },
         )
 
@@ -1026,6 +1036,15 @@ class NetworkService:
         elif tx_type == "standing_payment_cancel":
             if "standing_id" not in p_dict:
                 logger.debug("Gossip rejected: standing_payment_cancel missing standing_id")
+                return
+        elif tx_type == "payout_rule_install":
+            if not all(k in p_dict for k in ("rule_text", "recipients", "max_per_execution",
+                                            "max_per_period")):
+                logger.debug("Gossip rejected: payout_rule_install missing required fields")
+                return
+        elif tx_type in ("payout_execute", "payout_rule_remove"):
+            if "rule_id" not in p_dict:
+                logger.debug("Gossip rejected: %s missing rule_id", tx_type)
                 return
         elif tx_type == "receive_route_set":
             if "destination_pubkey" not in p_dict or "bps" not in p_dict:
@@ -1663,7 +1682,8 @@ class NetworkService:
                        "grant_create", "grant_draw", "grant_cancel",
                        "standing_payment_create", "standing_payment_execute",
                        "standing_payment_cancel",
-                       "receive_route_set", "receive_route_remove"):
+                       "receive_route_set", "receive_route_remove",
+                       "payout_rule_install", "payout_execute", "payout_rule_remove"):
             return TAU_GOSSIP_TOPIC_RETRACTABLE
         return TAU_GOSSIP_TOPIC_TRANSACTIONS
 

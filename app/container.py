@@ -23,6 +23,7 @@ from commands import (
     getapprovalslots,
     getrequestid,
     getgrants,
+    getpayoutrules,
     getreceiveroute,
     getstandingpayments,
     getretractable,
@@ -91,6 +92,7 @@ class ServiceContainer:
         "getretractableid": getretractableid,
         # Conditional grants (programmable payments).
         "getgrants": getgrants,
+        "getpayoutrules": getpayoutrules,
         "getreceiveroute": getreceiveroute,
         "getstandingpayments": getstandingpayments,
         # Advisory, node-local, and engine-driving -- rate-limited accordingly

@@ -163,7 +163,31 @@ def _payload(kind, fee_limit="0"):
     if kind == "receive_route_set":
         return _envelope(kind, SENDER, fee_limit, destination_pubkey=RECIPIENT, bps=2000,
                          min_incoming=0, activate_at=0, expires_at=0, locked_until=0)
+    if kind == "payout_rule_install":
+        return _envelope(kind, SENDER, fee_limit, rule_text="o1[t]:bv[24] = i13[t]:bv[24]",
+                         recipients=[RECIPIENT], max_per_execution=10, max_per_period=10,
+                         period_kind=3, period_seconds=0, start_at=0, expires_at=0)
+    if kind == "payout_execute":
+        return _envelope(kind, RECIPIENT, fee_limit, rule_id=_seed_payout(),
+                         inputs={"13": "5"})
     raise AssertionError(kind)
+
+
+def _seed_payout():
+    from chain_state import _payouts_state
+    from consensus.payouts import PayoutBook, parse_payout_install
+
+    book = PayoutBook()
+    rid = book.install(parse_payout_install({
+        "sender_pubkey": SENDER, "rule_text": "o1[t]:bv[24] = i13[t]:bv[24]",
+        "recipients": [RECIPIENT], "max_per_execution": 10, "max_per_period": 10,
+        "sequence_number": 0}))
+
+    class _LM:
+        payout_rules = book
+
+    db.set_chain_state_value("payouts_v1", json.dumps(_payouts_state(_LM)))
+    return rid.hex()
 
 
 def _seed_standing():
@@ -227,7 +251,7 @@ FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
                "rule_change_request", "grant_create", "grant_draw",
                "standing_payment_create", "standing_payment_execute",
-               "receive_route_set"]
+               "receive_route_set", "payout_rule_install", "payout_execute"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

@@ -69,6 +69,7 @@ TAU_EVALUATING_TX_TYPES = frozenset({
     "retractable_transfer",
     "grant_create",
     "standing_payment_execute",
+    "payout_execute",
     "rule_change_request",
 })
 

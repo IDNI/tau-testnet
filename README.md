@@ -686,6 +686,21 @@ tau-testnet route set --key bob --to <savings_pubkey> --share 20
 
 Full guide: [docs/receive_routes.md](docs/receive_routes.md).
 
+## Rule-computed payouts
+
+A payout rule is a Tau clause whose outputs `o1..o8` are the amounts paid to
+up to eight declared recipients, within per-execution and per-period caps.
+Anyone can trigger it with inputs; every leg runs through the owner's policy
+and balance checks, atomically.
+
+```bash
+tau-testnet payout install --key shop --rule-file royalty.tau \
+  --recipient <artist> --recipient <seller> --max-per-execution 2000 --max-per-period 50000
+tau-testnet payout execute --key relayer <rule_id> --input 13=1000
+```
+
+Full guide: [docs/payout_rules.md](docs/payout_rules.md).
+
 ## Mempool policy
 
 - **Lanes** — every tx is classified `fast` (coin transfers) or `slow` (anything carrying Tau rule text: `rule_offer`, `rule_offer_accept`, `consensus_rule_update`, or a `user_tx` with a non-empty `operations["0"]`). A `user_tx` carrying both a rule and transfers is `slow` — the signature covers the whole payload, so it cannot be split. Applying a rule builds or recompiles Tau state, which costs far more than a transfer's one cheap step; without separation a burst of rule work delays every queued transfer. Fee priority cannot express the split, because a rule emits its own `o8` user fee and can therefore price itself to the front of the queue.

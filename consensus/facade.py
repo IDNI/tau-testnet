@@ -415,6 +415,15 @@ class TipAdmissionView:
         except Exception:
             return GrantBook()
 
+    def payout_book(self):
+        """The committed payout-rule book (empty on error)."""
+        from consensus.payouts import PayoutBook, load_payout_book
+
+        try:
+            return load_payout_book(db.load_payouts_state())
+        except Exception:
+            return PayoutBook()
+
     def route_book(self):
         """The committed receive-route book (empty on error)."""
         from consensus.routes import RouteBook, load_route_book

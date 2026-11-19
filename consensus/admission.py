@@ -48,6 +48,16 @@ from consensus.approvals import (
     validate_request_shape,
     validate_rule_change_shape,
 )
+from consensus.payouts import (
+    PAYOUT_POLICY_POOL,
+    PayoutShapeError,
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_INSTALL,
+    TX_TYPE_PAYOUT_REMOVE,
+    parse_payout_execute,
+    parse_payout_install,
+    parse_payout_remove,
+)
 from consensus.routes import (
     RouteShapeError,
     TX_TYPE_ROUTE_REMOVE,
@@ -1699,6 +1709,54 @@ def validate_grant_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionRes
     return success({"grant_id": cancel.grant_id.hex()})
 
 
+def validate_payout_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+    """Screens for payout_rule_install / payout_execute / payout_rule_remove.
+
+    An install must build in the payout policy pool (anti-spam: a rule that can
+    never run is refused up front). An execution's amounts are computed and
+    judged at apply, on the real block and balances.
+    """
+    tx_type = tx.get("tx_type")
+    ts = tip_view.next_block_timestamp
+    book = tip_view.payout_book()
+    try:
+        if tx_type == TX_TYPE_PAYOUT_INSTALL:
+            obj = parse_payout_install(tx)
+            signer = obj.owner_pubkey
+        elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+            obj = parse_payout_execute(tx)
+            signer = obj.executor_pubkey
+        else:
+            obj = parse_payout_remove(tx)
+            signer = obj.owner_pubkey
+    except PayoutShapeError as exc:
+        return format_error(f"Malformed {tx_type}: {exc}.")
+    if tx.get("sender_pubkey") != signer:
+        return format_error(f"{tx_type} sender_pubkey must match the signer.")
+    if tx_type == TX_TYPE_PAYOUT_INSTALL:
+        for r in obj.recipients:
+            err = validate_bls_pubkey(r, "recipient")
+            if err:
+                return format_error(f"{tx_type} rejected: {err}")
+        ok, reason = book.can_admit_install(obj, ts)
+        if ok:
+            from consensus import sender_policy
+            builds, build_error = sender_policy.clause_builds(obj.rule_text, pool=PAYOUT_POLICY_POOL)
+            if not builds:
+                return format_error(f"{tx_type} rejected: rule does not build ({build_error})",
+                                    code="PAYOUT_RULE_INVALID")
+        rid = obj.rule_id.hex()
+    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+        ok, reason = book.can_admit_execute(obj, ts)
+        rid = obj.rule_id.hex()
+    else:
+        ok, reason = book.can_admit_remove(obj, ts)
+        rid = obj.rule_id.hex()
+    if not ok:
+        return format_error(f"{tx_type} rejected: {reason}", code="PAYOUT_REJECTED")
+    return success({"rule_id": rid})
+
+
 def validate_route_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """Screens for receive_route_set / receive_route_remove, shared with apply."""
     tx_type = tx.get("tx_type")
@@ -1883,6 +1941,9 @@ def validate_mempool_admission(
 
     elif tx_type in (TX_TYPE_ROUTE_SET, TX_TYPE_ROUTE_REMOVE):
          return validate_route_payload(payload, tip_view)
+
+    elif tx_type in (TX_TYPE_PAYOUT_INSTALL, TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_PAYOUT_REMOVE):
+         return validate_payout_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

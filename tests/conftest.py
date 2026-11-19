@@ -342,11 +342,11 @@ def temp_database(tmp_path) -> Iterator[str]:
 
 @pytest.fixture
 def mock_policy_evaluators() -> Iterator[None]:
-    """Serve o5 clause verdicts from the mock in both pools, whatever TAU_FORCE_TEST says."""
+    """Serve clause verdicts from the mock in every pool, whatever TAU_FORCE_TEST says."""
     from consensus import sender_policy
     from consensus.policy_mock import MockPolicyEvaluator
 
-    pools = ("apply", "admission")
+    pools = ("apply", "admission", "payout")
     for pool in pools:
         sender_policy.set_evaluator(pool, MockPolicyEvaluator(pool=pool))
     yield

@@ -935,3 +935,45 @@ def build_route_remove_tx(
     """Construct a fee-exempt ``receive_route_remove`` payload (without signature)."""
     return _grant_base("receive_route_remove", sender_pubkey, sequence_number,
                        expiration_time, expire_at_height, "0")
+
+
+def build_payout_install_tx(
+    *, sender_pubkey: str, sequence_number: int, expiration_time: int,
+    expire_at_height: int, rule_text: str, recipients: list, max_per_execution: int,
+    max_per_period: int, period_kind: int = 3, period_seconds: int = 0,
+    start_at: int = 0, expires_at: int = 0, fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``payout_rule_install`` payload (without signature)."""
+    tx = _grant_base("payout_rule_install", sender_pubkey, sequence_number,
+                     expiration_time, expire_at_height, fee_limit)
+    tx.update({
+        "rule_text": rule_text.strip(), "recipients": [r.lower() for r in recipients],
+        "max_per_execution": int(max_per_execution), "max_per_period": int(max_per_period),
+        "period_kind": int(period_kind), "period_seconds": int(period_seconds),
+        "start_at": int(start_at), "expires_at": int(expires_at),
+    })
+    return tx
+
+
+def build_payout_execute_tx(
+    *, sender_pubkey: str, sequence_number: int, expiration_time: int,
+    expire_at_height: int, rule_id: str, inputs: dict | None = None,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``payout_execute`` payload; anyone may sign it."""
+    tx = _grant_base("payout_execute", sender_pubkey, sequence_number,
+                     expiration_time, expire_at_height, fee_limit)
+    tx.update({"rule_id": rule_id.lower(),
+               "inputs": {str(k): str(v) for k, v in (inputs or {}).items()}})
+    return tx
+
+
+def build_payout_remove_tx(
+    *, sender_pubkey: str, sequence_number: int, expiration_time: int,
+    expire_at_height: int, rule_id: str,
+) -> dict:
+    """Construct a fee-exempt ``payout_rule_remove`` payload."""
+    tx = _grant_base("payout_rule_remove", sender_pubkey, sequence_number,
+                     expiration_time, expire_at_height, "0")
+    tx["rule_id"] = rule_id.lower()
+    return tx

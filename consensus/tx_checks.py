@@ -11,6 +11,7 @@ from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_RE
 from consensus.grants import TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW
 from consensus.standing import TX_TYPE_STANDING_CREATE
 from consensus.routes import TX_TYPE_ROUTE_SET
+from consensus.payouts import TX_TYPE_PAYOUT_INSTALL
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
 from consensus import bls
@@ -60,6 +61,9 @@ def _recipient_keys(tx: dict) -> list:
     if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER, TX_TYPE_GRANT_DRAW,
                    TX_TYPE_STANDING_CREATE):
         return [("recipient_pubkey", tx.get("recipient_pubkey"))]
+    if tx_type == TX_TYPE_PAYOUT_INSTALL:
+        recipients = tx.get("recipients")
+        return [("recipient", r) for r in recipients] if isinstance(recipients, list) else []
     if tx_type == TX_TYPE_ROUTE_SET:
         return [("destination_pubkey", tx.get("destination_pubkey"))]
     if tx_type == TX_TYPE_GRANT_CREATE:
