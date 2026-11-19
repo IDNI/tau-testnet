@@ -816,6 +816,34 @@ def committed_journal_entries(limit=None):
         return _journal_rows(_db_conn.cursor(), limit=limit)
 
 
+def committed_rule_history():
+    """(canonical head hash, rule entries) read as ONE.
+
+    The rule entries are the RESET and REVISION rows of the committed journal, in
+    order, without the step rows: what the engine's specification is built from.
+    A block commit writes its journal rows and the canonical head in one
+    transaction under this lock, so both describe the same block.
+    """
+    global _db_conn
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        row = cur.execute(
+            "SELECT value FROM chain_state WHERE key = 'canonical_head_hash'"
+        ).fetchone()
+        rows = cur.execute(
+            "SELECT seq, kind, rule_text, units, outcome, link FROM tau_journal_v1 "
+            "WHERE kind IN ('reset', 'revision') ORDER BY seq"
+        ).fetchall()
+    entries = [{
+        "seq": int(r[0]), "kind": r[1], "rule_text": r[2],
+        "units": [tuple(u) for u in json.loads(r[3] or "[]")],
+        "outcome": r[4], "link": r[5],
+    } for r in rows]
+    return (row[0] if row else None), entries
+
+
 def _journal_rows(cur, limit=None):
     """The committed journal, on a cursor the caller already holds the lock for."""
     sql = ('SELECT seq, kind, phase, rule_text, inputs, target, accumulate, '

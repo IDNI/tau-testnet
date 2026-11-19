@@ -21,6 +21,11 @@ def execute(raw_command: str, container):
     chain_state = container.chain_state
     db = container.db
 
+    # Read outside the chain locks: rebuilding it after a rule change starts an
+    # engine worker, and a block must not wait for a read.
+    import tau_running_spec
+    running = tau_running_spec.at_head()
+
     with chain_state._balance_lock, chain_state._sequence_lock, chain_state._rules_lock:
         head = db.get_canonical_head_block() or {}
         header = head.get("header") or {}
@@ -174,6 +179,9 @@ def execute(raw_command: str, container):
             "active_consensus_id": active_consensus_id,
             "consensus_rules": chain_state._consensus_rules_state,
             "application_rules": chain_state._application_rules_state,
+            # What the engine runs: a later unit can revise part of an earlier
+            # one, so the stored units are what was sent and this is in force.
+            "running_spec": running,
             "pending_updates": pending_updates,
             "scheduled_updates": scheduled_updates,
             "archival_updates": archival_updates,
@@ -182,5 +190,10 @@ def execute(raw_command: str, container):
             "lifecycle": lifecycle,
             "stream_widths": dict(tau_defs.HOST_STREAM_WIDTHS),
         }
+
+    if running.get("block_hash") not in (None, head_hash):
+        # A block committed between the two reads: read the spec again at the
+        # head the rest of this answer describes, or say which head it is at.
+        payload["running_spec"] = tau_running_spec.at_head()
 
     return api_response.success_response("getgovernance", payload)

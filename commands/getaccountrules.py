@@ -10,7 +10,13 @@ for "did my last rule transaction change anything". This answers it in one call:
                        the sha256 of the stored body and, where this node
                        recorded it, the block and transaction that set it
   rule_change_guard    the guard clause, same shape, or null
-  application_rules    accumulated units that name the account's key
+  application_rules    accumulated units that name the account's key, as stored
+  running_spec         the specification the engine runs at this head, as the
+                       engine revised it (canonical form), with its sha256. A
+                       later unit can revise part of an earlier one, so the
+                       stored units above are what was sent and this is what is
+                       in force. Null text with `unavailable` on a node without
+                       the authoritative engine
   open_rule_changes    the account's own rule-change requests still open
   awaiting_my_vote     open rule-change requests naming the account as approver
   pending_offers       rule offers addressed to the account, not yet decided
@@ -63,6 +69,23 @@ def _tip_view(chain_state):
             chain_state._lifecycle_manager,
             chain_state._application_rules_state or "",
         )
+
+
+def tip_and_running_spec(chain_state, store=None):
+    """`_tip_view` plus the running spec at the same head.
+
+    The running spec carries the head it was read with. A block that commits
+    between the two reads moves one of them; read again (at most three times) so
+    the answer names one block.
+    """
+    import tau_running_spec
+
+    for _ in range(3):
+        view = _tip_view(chain_state)
+        running = tau_running_spec.at_head(store)
+        if running.get("block_hash") in (None, view[0]):
+            break
+    return view, running
 
 
 def _request_row(rid: bytes, entry) -> dict:
@@ -135,7 +158,7 @@ def execute(raw_command: str, container):
     chain_state = container.chain_state
     database = container.db
     try:
-        head_hash, lm, app_rules = _tip_view(chain_state)
+        (head_hash, lm, app_rules), running = tip_and_running_spec(chain_state)
         head = database.get_block_by_hash(head_hash) if head_hash else None
         if head is None:
             head = database.get_canonical_head_block()
@@ -190,6 +213,7 @@ def execute(raw_command: str, container):
             "clauses": clauses,
             "rule_change_guard": guard,
             "application_rules": units,
+            "running_spec": running,
             "open_rule_changes": open_changes,
             "awaiting_my_vote": to_vote,
             "pending_offers": offers.pending_count_for_recipient(address),
