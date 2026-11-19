@@ -27,7 +27,9 @@ PIN_BUILD_SECONDS = 0.100
 RECYCLE_BUILDS = 500
 RECYCLE_STEPS = 20_000
 RECYCLE_RSS_BYTES = 1 << 30
-POOL_NAMES = ("apply", "admission")
+# "payout" steps rule-computed payout clauses (#63) in a worker of its own, so
+# their stream typing never meets an o5 clause's.
+POOL_NAMES = ("apply", "admission", "payout")
 
 # Without an injected probe, worker memory is read this often (in requests).
 RSS_PROBE_EVERY = 64
