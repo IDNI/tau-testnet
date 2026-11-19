@@ -114,12 +114,31 @@ REASON = "recipient_policy_block"
 #: wallet can print "accepts payments held for up to N".
 REASON_MAX_HOLD = "recipient_max_hold"
 
-#: A clause opts into recipient-side enforcement by reading the
-#: counterparty stream i3 (the sender's full public key) ...
-_COUNTERPARTY_STREAM = re.compile(r"\bi3\s*\[")
-#: ... or a hold stream (i17 seconds / i27 blocks), which only the
-#: recipient pass ever feeds meaningfully.
-_HOLD_STREAM = re.compile(r"\bi(?:17|27)\s*\[")
+#: A clause opts into recipient-side enforcement by reading either the
+#: counterparty as a *stream* — i3 carries the sender's full public key in
+#: the recipient pass — or a hold stream (i17 seconds / i27 blocks), which
+#: only the recipient pass ever feeds meaningfully.
+#:
+#: "As a stream" is load-bearing: the node's input map for a plain transfer
+#: already carries i3 (the sender) and both hold streams (0), so a rule that
+#: compares a *literal containing a key* on some other stream — the usual
+#: outbound whitelist on i4 — would be judged inbound too if the screen
+#: matched any mention of i3, or matched text instead of streams. Reading
+#: the index off each input reference (i3[t], i3[t+1], ...) keeps the screen
+#: on what the rule actually consumes.
+_INPUT_REF = re.compile(r"\bi(\d+)\s*\[")
+_COUNTERPARTY_INDEX = 3
+_HOLD_INDICES = frozenset(
+    (tau_defs.HOLD_SECONDS_STREAM_INDEX, tau_defs.HOLD_BLOCKS_STREAM_INDEX)
+)
+
+
+def _indices_read(body) -> frozenset:
+    """The stream indices a clause body reads, comments scrubbed."""
+    if not isinstance(body, str) or not body:
+        return frozenset()
+    return frozenset(int(m.group(1)) for m in _INPUT_REF.finditer(
+        strip_clause_comments(body)))
 
 
 @dataclass(frozen=True)
@@ -141,27 +160,18 @@ def supported(capability: str = "recipient_policy") -> bool:
 def clause_is_counterparty_aware(body) -> bool:
     """True when `body` reads the counterparty (i3) and so opts into
     recipient-side enforcement. False for outbound-only clauses."""
-    if not isinstance(body, str) or not body:
-        return False
-    return bool(_COUNTERPARTY_STREAM.search(strip_clause_comments(body)))
+    return _COUNTERPARTY_INDEX in _indices_read(body)
 
 
 def clause_reads_hold_stream(body) -> bool:
     """True when `body` reads i17 or i27 — the mark of a hold-cap clause."""
-    if not isinstance(body, str) or not body:
-        return False
-    return bool(_HOLD_STREAM.search(strip_clause_comments(body)))
+    return bool(_indices_read(body) & _HOLD_INDICES)
 
 
 def clause_is_recipient_relevant(body) -> bool:
     """The opt-in screen: a clause is enforced on inbound transfers only
     when it reads the counterparty (i3) or a hold stream (i17/i27)."""
-    if not isinstance(body, str) or not body:
-        return False
-    scrubbed = strip_clause_comments(body)
-    return bool(
-        _COUNTERPARTY_STREAM.search(scrubbed) or _HOLD_STREAM.search(scrubbed)
-    )
+    return clause_is_counterparty_aware(body) or clause_reads_hold_stream(body)
 
 
 def hold_values(kind, release_at, height, timestamp) -> dict:
@@ -184,8 +194,9 @@ def hold_values(kind, release_at, height, timestamp) -> dict:
     }
 
 
-_LITERAL = r"\{\s*(?:#x(?P<hex>[0-9a-fA-F]+)|(?P<dec>\d+))\s*\}\s*:\s*bv\s*\[\s*\d+\s*\]"
-_STREAM_REF = r"i(?P<stream>17|27)\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*\d+\s*\]"
+_LITERAL = (r"\{\s*(?:#x(?P<hex>[0-9a-fA-F]+)|(?P<dec>\d+))\s*\}"
+            r"(?:\s*:\s*bv\s*\[\s*\d+\s*\])?")
+_STREAM_REF = r"i(?P<stream>17|27)\s*\[\s*t\s*\]\s*(?::\s*bv\s*\[\s*\d+\s*\])?"
 _CAP_DIRECT = re.compile(_STREAM_REF + r"\s*(?P<op><=|<)\s*" + _LITERAL)
 _CAP_REVERSED = re.compile(_LITERAL + r"\s*(?P<op>>=|>)\s*" + _STREAM_REF)
 
@@ -287,6 +298,60 @@ def recipient_clause_blocks(clause_for, sender_pubkey, recipient_pubkey,
     return True, detail, refusal
 
 
+def spec_units(spec_text) -> list:
+    """The guarded units of a spec text, each split into (guard, body) on the
+    '?' that separates them, with comments scrubbed first.
+
+    Only the canonical guarded shape `always ( (i12[t] = { #xKEY }) ? body :
+    body ).` is recognised — the same shape the sender pass evaluates. A unit
+    split fails (no '?') and is then kept as its whole scrubbed text, so an
+    unexpected shape still gets evaluated rather than silently skipped.
+    """
+    if not spec_text or not isinstance(spec_text, str):
+        return []
+    scrubbed = strip_clause_comments(spec_text)
+    units = []
+    for chunk in scrubbed.split("always"):
+        chunk = chunk.strip()
+        if _UNIT_SCOPE.search(chunk):
+            guard, sep, body = chunk.partition("?")
+            units.append((guard, body) if sep else (chunk, ""))
+    return units
+
+
+def _unit_for_owner(unit_guard: str, recipient_pubkey: str):
+    """The guard literal if `unit_guard` scopes on `recipient_pubkey`, else None.
+
+    A guard scopes an owner by comparing i12 against that owner's key as a
+    full-width literal. Matching the literal — not a substring of the spec —
+    is what makes the pass judge only units that can actually be the
+    recipient's: a key that appears in a comment, or inside a *body* (an
+    inbound allow-list naming the key it allows), is not a scope and must
+    not make an unrelated unit speak for the recipient.
+    """
+    if not unit_guard or not recipient_pubkey:
+        return None
+    for match in _UNIT_SCOPE.finditer(unit_guard):
+        if _hex_padded(match.group("key")) == str(recipient_pubkey):
+            return match.group("key")
+    return None
+
+
+_SPEC_KEY_LITERAL = r"\{\s*#x(?P<key>[0-9a-fA-F]+)\s*\}\s*:\s*bv\s*\[\s*384\s*\]"
+_UNIT_SCOPE = re.compile(
+    r"\bi12\s*\[\s*t\s*\]\s*(?::\s*bv\s*\[\s*\d+\s*\])?\s*=\s*" + _SPEC_KEY_LITERAL)
+
+
+def _hex_padded(literal: str) -> str:
+    """A spec key literal normalised to the bare, lower-case, 96-hex-digit
+    public key the rest of the node compares against.
+
+    Spec text may carry a key in any zero-padded width (and either case); a
+    direct string compare would then miss its own unit.
+    """
+    return (literal or "").strip().lower().rjust(96, "0")[-96:]
+
+
 def guarded_recipient_blocks(evaluate, values, sender_pubkey,
                              recipient_pubkey, *, spec_text=None
                              ) -> tuple[bool, Optional[str]]:
@@ -300,20 +365,25 @@ def guarded_recipient_blocks(evaluate, values, sender_pubkey,
     included, is the transfer's own. A missing o5 is the neutral default
     (allow), exactly as in the sender pass.
 
-    Pre-screen: a guarded unit scopes on its owner's key as a literal in
-    the spec text, so the pass steps only when the caller-supplied
-    current spec text (`spec_text`, in production
-    tau_manager.last_known_tau_spec) actually contains the recipient's
-    key. Otherwise the recipient provably has no guarded unit and the
-    pass is skipped without stepping — an extra step on the shared
-    session is not free: history-reading rules (the cooldown stream,
-    say) observe every step, and existing fee/policy accounting counts
-    the main step's roundtrips. An unknown or empty spec text therefore
-    also skips: no spec, no units.
+    Pre-screen: the pass steps only when `spec_text` carries a *unit scoped
+    on the recipient* (see `_unit_for_owner`), because a step on the shared
+    session is not free — history-reading rules (the cooldown stream, say)
+    observe every step, and existing fee/policy accounting counts the main
+    step's roundtrips. A key that is only in a comment, or only inside
+    another unit's body, therefore does not make the pass run. When it does
+    run, the recipient's unit is judged *alone* rather than trusting
+    whichever unit the accumulated spec happens to resolve to — so a
+    recipient with no unit of her own gets the neutral default instead of a
+    verdict from somebody else's unit.
+
+    `spec_text` must be the spec of the state being applied (the block's
+    parent rules at apply, the tip view at admission), not a live global:
+    see `resolve_spec_text`.
     """
     if not recipient_pubkey or recipient_pubkey == sender_pubkey:
         return False, None
-    if not spec_text or str(recipient_pubkey) not in spec_text:
+    unit = _unit_for_owner_for_spec(spec_text, recipient_pubkey)
+    if unit is None:
         return False, None
     recip_values = dict(values or {})
     recip_values[12] = "{ #x" + str(recipient_pubkey) + " }:bv[384]"
@@ -325,3 +395,33 @@ def guarded_recipient_blocks(evaluate, values, sender_pubkey,
         tau_manager.parse_tau_output(o5_raw) == tau_defs.USER_POLICY_BLOCK_VALUE
     )
     return blocked, o5_raw
+
+
+def _unit_for_owner_for_spec(spec_text, recipient_pubkey):
+    for guard, body in spec_units(spec_text):
+        if _unit_for_owner(guard, recipient_pubkey) is not None:
+            return body
+    return None
+
+
+def resolve_spec_text(snapshot=None, parent_snapshot=None) -> str:
+    """The spec text to prescreen with, pinned to the state under apply.
+
+    `apply` must judge a block against the rules its parent carried, not
+    against whatever the process loaded last: the same block re-applied
+    after the tip moved on must reach the same verdict (issue #47's
+    determinism requirement, and replay). A snapshot carries the
+    canonical rules as `tau_bytes`, and the caller's live value is read
+    only when no snapshot is at hand (tests, admission's tip view).
+    """
+    for source in (snapshot, parent_snapshot):
+        raw = getattr(source, "tau_bytes", None) if source is not None else None
+        if isinstance(raw, (bytes, bytearray)):
+            text = raw.decode("utf-8", errors="ignore")
+        elif isinstance(raw, str):
+            text = raw
+        else:
+            continue
+        if text:
+            return text
+    return tau_manager.last_known_tau_spec or ""
