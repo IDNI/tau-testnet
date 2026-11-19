@@ -13,6 +13,7 @@ from consensus.approvals import (
     ApprovalRequestLifecycleManager,
     audit_stream_collisions,
 )
+from consensus.recipient_policy import audit_receive_stream_collisions
 
 VALIDATOR_DELTA_FIELDS = ("validator_additions", "validator_removals")
 
@@ -93,6 +94,7 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "fee_beneficiary",
     "max_rule_txs_per_block",
     "approval_slots_active",
+    "recipient_policy_active",
 })
 
 
@@ -106,6 +108,16 @@ def validate_approval_slots_active(value: Any) -> Optional[str]:
     """
     if value is not True:
         return "must be true; approval slots cannot be deactivated once active"
+    return None
+
+
+def validate_recipient_policy_active(value: Any) -> Optional[str]:
+    """Receive-stream activation is a ONE-WAY switch to True, like the approval
+    slots: turning it off would un-reserve i17 while registered clauses still
+    read it, and a sender could then answer the recipient's question for them.
+    """
+    if value is not True:
+        return "must be true; the receive stream cannot be deactivated once active"
     return None
 
 
@@ -198,6 +210,7 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    recipient_policy_active: bool = False,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -238,6 +251,10 @@ def build_mechanism_metadata(
         mech["approval_requests_root"] = approval_requests_root
     if faucet_amount:
         mech["faucet_amount"] = faucet_amount
+    # Recipient-side policy: emitted only once activated, so a chain that never
+    # turns it on hashes exactly as it did before the field existed.
+    if recipient_policy_active:
+        mech["recipient_policy_active"] = True
     # Always present, unlike the keys above: the feature has no activation gate,
     # so the empty-book root is part of every chain's genesis hash.
     if retractable_transfers_root is None:
@@ -457,6 +474,10 @@ class ConsensusLifecycleManager:
         # rollback, reorg and competing branches. Read from the PARENT snapshot,
         # so an activation recorded in block H governs H+1 onward.
         self.approval_slots_active: bool = False
+        # Recipient-side policy (the receive stream i17). ONE-WAY and held in
+        # consensus state for the same reasons, and read from the PARENT
+        # snapshot the same way.
+        self.recipient_policy_active: bool = False
         # Pinned by genesis for the life of the network: no patch sets it.
         # Bound into the meta hash only when non-zero.
         self.faucet_amount: int = 0
@@ -546,6 +567,7 @@ class ConsensusLifecycleManager:
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
+            recipient_policy_active=self.recipient_policy_active,
         )
         return compute_consensus_meta_hash(
             host_contract={},
@@ -657,7 +679,29 @@ class ConsensusLifecycleManager:
                 )
             else:
                 self.activate_approval_slots()
+
+        if "recipient_policy_active" in patch:
+            err = validate_recipient_policy_active(patch["recipient_policy_active"])
+            if err:
+                raise ValueError(f"recipient_policy_active: {err}")
+            # Two-phase, exactly as above: a collision at the activation height
+            # leaves the flag False on every node alike instead of freezing the
+            # chain. The audit reads only hash-bound state.
+            corpus = effective_spec_texts() if callable(effective_spec_texts) else effective_spec_texts
+            findings = audit_receive_stream_collisions(corpus or ())
+            if findings:
+                logger.error(
+                    "recipient_policy_active activation REFUSED at this height; the "
+                    "effective spec already reads the receive stream: %s",
+                    "; ".join(findings),
+                )
+            else:
+                self.activate_recipient_policy()
         self.recompute_approval_threshold()
+
+    def activate_recipient_policy(self) -> None:
+        """Turn the receive stream on. Idempotent, and there is no way back."""
+        self.recipient_policy_active = True
 
     def activate_approval_slots(self) -> None:
         """Turn approval slots on. Idempotent, and there is no way back.

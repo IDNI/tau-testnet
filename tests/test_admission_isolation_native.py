@@ -327,12 +327,14 @@ def test_a_rule_is_judged_against_the_committed_type_history(authority):
 
 # --- custom inputs reach the evaluator as values --------------------------------
 
-CUSTOM = "17"
+# Not 17: i17 is the receive stream, and a clause that reads it is refused at
+# deploy on a chain that has not activated recipient-side policy.
+CUSTOM = "30"
 
 
 def _custom_policy():
-    """The sender is blocked when its own custom input i17 is 7."""
-    return ("always ( (i17[t]:bv[24] = { #x000007 }:bv[24]) "
+    """The sender is blocked when its own custom input i30 is 7."""
+    return ("always ( (i30[t]:bv[24] = { #x000007 }:bv[24]) "
             "? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
             ": (o5[t]:bv[24] = { #x000001 }:bv[24]) ).")
 

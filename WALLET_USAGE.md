@@ -144,6 +144,7 @@ An operation key `N` maps to Tau input stream `iN`. The wallet supports:
 | `i13` | proposer pubkey, reserved under the `tau_validator_set` eligibility mode |
 | `i14` / `i15` | consensus stake / eligibility-mode inputs |
 | `i16` | seconds since the sender's previous transfer (`bv[64]`). Reserved **only while the network feeds it**; until then it is an ordinary custom stream. While reserved, a policy clause may not read it. |
+| `i17` | the receive stream (`bv[64]`), reserved once the chain has activated recipient-side policy; only the node fills it, and only a policy clause may read it. See [docs/recipient_controls.md](docs/recipient_controls.md) |
 | `i18`–`i25` | co-signature approval slots, reserved once the chain has activated approvals; only the node fills them |
 
 So user-controllable custom input streams start at **`i13`**, and the streams

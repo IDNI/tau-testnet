@@ -147,7 +147,7 @@ arguments keep their case except where a handler lowercases a hex id. Payload
 commands take the rest of the line verbatim as one JSON argument, and tolerate
 it being wrapped in matching single or double quotes.
 
-The full registry (28 names, `app/container.py`):
+The full registry (29 names, `app/container.py`):
 
 | Command | Grammar |
 |---|---|
@@ -176,6 +176,7 @@ The full registry (28 names, `app/container.py`):
 | `getrequestid` | `getrequestid <json_payload>` |
 | `getapprovalslots` | `getapprovalslots <address>` — advisory, node-local |
 | `getapprovalpreview` | `getapprovalpreview <json_draft>` — advisory, node-local; `"request_type":"rule_change"` previews a policy change |
+| `getrecipientpolicy` | `getrecipientpolicy <address> [<sender> <amount>]` — whether the address judges incoming payments; the probe form is advisory, node-local |
 | `getretractable` | `getretractable <retractable_id>` — 64 hex chars |
 | `getretractables` | `getretractables <address> [in\|out\|all]` (default `all`) |
 | `getretractableid` | `getretractableid <json_payload>` |
@@ -265,7 +266,7 @@ connection — reconnecting resets them.
 | Bucket | Burst | Refill | Applies to |
 |---|---|---|---|
 | general | 10 | 5/s | every command |
-| expensive | 2 | 0.5/s | `checktx`, `getapprovalpreview`, `getapprovalslots` |
+| expensive | 2 | 0.5/s | `checktx`, `getapprovalpreview`, `getapprovalslots`, `getrecipientpolicy` |
 
 An expensive command is charged to *both* buckets, so it cannot be used to
 dodge the general rate. `sendtx` is deliberately not in the expensive tier: it
@@ -521,6 +522,17 @@ tau-testnet policy change request --key alice --kind set --file policy.tau --app
 tau-testnet policy change request --key alice --kind revoke --approver 18=<xpub>
 tau-testnet policy change request --key alice --kind accept --offer-id <offer_id>
 tau-testnet policy change cancel --key alice --request-id <request_id>
+```
+
+### Recipient controls
+
+Whether an address judges the payments made to it (an inbound allow-list, a cap
+on how long a retractable transfer may be held), and what its rule says about
+one payment. Semantics are in [recipient_controls.md](recipient_controls.md).
+
+```bash
+tau-testnet policy receive <address>
+tau-testnet policy receive <address> --from <sender_pubkey> --amount 25
 ```
 
 `guard set` and `guard revoke` are rule-change requests of kind 4 and 5; `change
