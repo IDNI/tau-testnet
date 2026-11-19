@@ -2065,11 +2065,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         # guarded unit is the one that can say no, the
                         # counterparty stays readable on i3. Mirrors the
                         # admission pass in commands/sendtx.py.
+                        # The spec is pinned to the state under apply (the
+                        # parent snapshot's rules), never the live module
+                        # global: a block re-applied after the tip moved on
+                        # must reach the same verdict, or replay diverges.
                         guarded_blocks, guarded_o5 = recipient_policy.guarded_recipient_blocks(
                             lambda vals: _session.evaluate(
                                 vals, multi=True, apply_rules_update=False),
                             tau_input_stream_values, from_addr, to_addr,
-                            spec_text=tau_manager.last_known_tau_spec,
+                            spec_text=recipient_policy.resolve_spec_text(snapshot),
                         )
                         if guarded_blocks:
                             logger.info(
