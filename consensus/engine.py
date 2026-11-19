@@ -16,6 +16,7 @@ from .governance import (
     is_tau_authoritative_eligibility_mode,
 )
 from . import faucet, fees
+from . import recipient_policy
 from . import sender_policy
 from .fees import FeeRuleError
 from .approvals import (
@@ -1882,7 +1883,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
-                                          escrow=False):
+                                          escrow=False, recipient_hold=None):
                 """Execute ONE transfer under the fee model. True to continue.
 
                 Extracted verbatim from the user_tx transfer loop so the
@@ -1918,6 +1919,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         # ordinary path identical.
                         overrides=custom_tau_inputs if overrides is None else overrides,
                     )
+                    # A park's hold length (issue #76) is NOT fed into
+                    # this map: i17/i27 belong to the recipient pass only,
+                    # which forces them from recipient_hold itself, so the
+                    # sender pass's inputs are untouched by the cap
+                    # feature. Only the escrow leg of a fresh park carries
+                    # a recipient_hold; releases and ordinary transfers
+                    # pass None (the recipient pass then forces 0 for a
+                    # clause that reads the streams).
 
                     if not _session.ready(timeout=5):
                         if replay_mode:
@@ -2001,6 +2010,79 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["reason"] = "user_policy_block"
                             tx_receipt["logs"].append(
                                 f"Transfer rejected by the sender's own policy clause (o5={own_o5})"
+                            )
+                            return False
+
+                        # --- Recipient policy (o5, issues #47/#76) ---
+                        # The recipient's own clause is consulted on the
+                        # same inputs, mirroring admission exactly (see
+                        # consensus/recipient_policy.py). A block rejects
+                        # the whole user_tx, like a sender-policy block:
+                        # staged writes never commit, so a batch with one
+                        # refused output applies nothing. A park blocked
+                        # by the recipient's hold cap carries the distinct
+                        # recipient_max_hold reason and the cap itself, so
+                        # the payer's wallet can print it.
+                        recip_blocks, recip_o5, recip_refusal = recipient_policy.recipient_clause_blocks(
+                            lifecycle_mgr.rule_offers.clause_for,
+                            from_addr, to_addr,
+                            tau_input_stream_values, pool="apply",
+                            timeout=getattr(_session, "request_budget", None),
+                            hold=recipient_hold,
+                        )
+                        if recip_blocks:
+                            logger.info(
+                                "Transfer rejected by recipient policy for %s->%s (o5=%s)",
+                                str(from_addr)[:10], str(to_addr)[:10], recip_o5,
+                            )
+                            if not replay_mode:
+                                accepted_in_block = False
+                                hard_reject = True
+                            execution_success = False
+                            if recip_refusal is not None and \
+                                    recip_refusal.reason == recipient_policy.REASON_MAX_HOLD:
+                                tx_receipt["reason"] = recipient_policy.REASON_MAX_HOLD
+                                if recip_refusal.max_hold_seconds is not None:
+                                    tx_receipt["recipient_max_hold_seconds"] = \
+                                        recip_refusal.max_hold_seconds
+                                if recip_refusal.max_hold_blocks is not None:
+                                    tx_receipt["recipient_max_hold_blocks"] = \
+                                        recip_refusal.max_hold_blocks
+                                tx_receipt["logs"].append(
+                                    recipient_policy.refusal_message(recip_refusal)
+                                    + f" (o5={recip_o5})"
+                                )
+                            else:
+                                tx_receipt["reason"] = recipient_policy.REASON
+                                tx_receipt["logs"].append(
+                                    f"Transfer rejected by recipient policy (o5={recip_o5})"
+                                )
+                            return False
+
+                        # --- Recipient policy, guarded mode (issue #47) ---
+                        # A second evaluation of the accumulated spec
+                        # with i12 set to the recipient: the recipient's
+                        # guarded unit is the one that can say no, the
+                        # counterparty stays readable on i3. Mirrors the
+                        # admission pass in commands/sendtx.py.
+                        guarded_blocks, guarded_o5 = recipient_policy.guarded_recipient_blocks(
+                            lambda vals: _session.evaluate(
+                                vals, multi=True, apply_rules_update=False),
+                            tau_input_stream_values, from_addr, to_addr,
+                            spec_text=tau_manager.last_known_tau_spec,
+                        )
+                        if guarded_blocks:
+                            logger.info(
+                                "Transfer rejected by recipient policy (guarded) for %s->%s (o5=%s)",
+                                str(from_addr)[:10], str(to_addr)[:10], guarded_o5,
+                            )
+                            if not replay_mode:
+                                accepted_in_block = False
+                                hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = recipient_policy.REASON
+                            tx_receipt["logs"].append(
+                                f"Transfer rejected by recipient policy (guarded, o5={guarded_o5})"
                             )
                             return False
 
@@ -2588,11 +2670,22 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["reason"] = "retractable_not_parked"
                             accepted_in_block = False
                         else:
+                            # The park's hold length against this block's
+                            # clock (issue #76): admission measured it
+                            # against the tip view of the same next block,
+                            # so admission and apply judge the cap on equal
+                            # numbers.
+                            park_hold = recipient_policy.hold_values(
+                                park.kind, park.release_at,
+                                int(block_height or 0),
+                                int(block_timestamp or 0),
+                            )
                             escrowed = _execute_fee_era_transfer(
                                 park.sender_pubkey, park.recipient_pubkey, park.amount,
                                 slot_values=_approval_slot_values(),
                                 overrides={},
                                 escrow=True,
+                                recipient_hold=park_hold,
                             )
                             fee_already_measured = True
                             if escrowed and accepted_in_block and not hard_reject:
