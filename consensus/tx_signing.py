@@ -33,6 +33,11 @@ from consensus.approvals import (
     TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
+from consensus.grants import (
+    TX_TYPE_GRANT_CANCEL,
+    TX_TYPE_GRANT_CREATE,
+    TX_TYPE_GRANT_DRAW,
+)
 from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
@@ -123,6 +128,22 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
+    elif tx_type == TX_TYPE_GRANT_CREATE:
+        # Every term the escrowed funds obey later is signed: draws and the
+        # expiry refund are applied from hash-bound state, so an unsigned term
+        # would let a proposer loosen a limit or redirect the refund.
+        for field in (
+            "grantee_pubkey", "refund_to_pubkey", "amount", "start_at",
+            "expires_at", "spend_cap", "cap_period_kind", "cap_period_seconds",
+            "per_payment_cap", "weekday_mask", "hour_mask", "revocable",
+        ):
+            signing_dict[field] = payload.get(field)
+    elif tx_type == TX_TYPE_GRANT_DRAW:
+        signing_dict["grant_id"] = payload.get("grant_id")
+        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
+        signing_dict["amount"] = payload.get("amount")
+    elif tx_type == TX_TYPE_GRANT_CANCEL:
+        signing_dict["grant_id"] = payload.get("grant_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

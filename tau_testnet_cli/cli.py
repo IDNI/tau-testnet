@@ -1219,6 +1219,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_approval_subparsers(sub)
     _add_policy_subparsers(sub)
     _add_retractable_subparsers(sub)
+    _add_grant_subparsers(sub)
     _add_node_subparsers(sub)
 
     return parser
@@ -2715,6 +2716,217 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print_error("interrupted")
         return EXIT_LOCAL
+
+
+
+# --- Conditional grants (programmable payments) ------------------------------
+
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_PERIODS = {"day": 1, "week": 2, "month": 3}
+
+
+def _parse_when(value: str) -> int:
+    """A unix timestamp, or an ISO date/datetime read as UTC (2026-12-01, 2026-12-01T09:00)."""
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    from datetime import datetime, timezone
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a unix time or ISO date: {value!r}")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
+def _parse_days(value: str) -> int:
+    mask = 0
+    for part in value.lower().split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = (p.strip() for p in part.split("-", 1))
+            if a not in _WEEKDAYS or b not in _WEEKDAYS:
+                raise argparse.ArgumentTypeError(f"unknown day range {part!r}")
+            for i in range(_WEEKDAYS.index(a), _WEEKDAYS.index(b) + 1):
+                mask |= 1 << i
+        elif part in _WEEKDAYS:
+            mask |= 1 << _WEEKDAYS.index(part)
+        else:
+            raise argparse.ArgumentTypeError(f"unknown day {part!r} (use mon..sun)")
+    return mask
+
+
+def _parse_hours(value: str) -> int:
+    """UTC hours: '9-17' means 09:00 up to 17:59; '8,12,20' lists single hours."""
+    mask = 0
+    for part in value.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = (int(p) for p in part.split("-", 1))
+        else:
+            a = b = int(part)
+        if not (0 <= a <= b <= 23):
+            raise argparse.ArgumentTypeError(f"bad hour range {part!r} (0..23)")
+        for h in range(a, b + 1):
+            mask |= 1 << h
+    return mask
+
+
+def cmd_grant_create(args: argparse.Namespace) -> int:
+    from consensus.grants import GrantShapeError, parse_grant_create
+
+    created = {}
+    period_kind, period_seconds = _PERIODS.get(args.cap_period, 0), 0
+    if args.cap_period_seconds is not None:
+        period_kind, period_seconds = 0, int(args.cap_period_seconds)
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        now = int(_now())
+        payload = tx_mod.build_grant_create_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=min(now + args.expiry, args.expires - 1),
+            expire_at_height=expire_at_height,
+            grantee_pubkey=args.to,
+            amount=int(args.amount),
+            start_at=args.start or 0,
+            expires_at=args.expires,
+            spend_cap=int(args.cap or 0),
+            cap_period_kind=period_kind,
+            cap_period_seconds=period_seconds,
+            per_payment_cap=int(args.per_payment_cap or 0),
+            weekday_mask=args.days,
+            hour_mask=args.hours,
+            refund_to_pubkey=args.refund_to,
+            revocable=args.revocable,
+        )
+        try:
+            created["id"] = parse_grant_create(payload).grant_id.hex()
+        except GrantShapeError as exc:
+            raise _PayloadError(str(exc))
+        return payload
+
+    status = _submit_rule_tx(args, _build)
+    if status == EXIT_OK and created.get("id"):
+        print(f"grant id: {created['id']}", file=sys.stderr if args.json else sys.stdout)
+    return status
+
+
+def cmd_grant_draw(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_grant_draw_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            grant_id=args.grant_id,
+            recipient_pubkey=args.to,
+            amount=int(args.amount),
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_grant_cancel(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_grant_cancel_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            grant_id=args.grant_id,
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_grant_list(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getgrants {address} {getattr(args, 'role', 'all')}")
+
+
+def _add_grant_subparsers(sub) -> None:
+    """`tau-testnet grant ...` -- escrow funds a grantee spends under conditions."""
+    p_grant = sub.add_parser(
+        "grant",
+        parents=[_GLOBAL_PARENT],
+        help="Conditional grants: spending limits, time locks and expiry refunds",
+    )
+    gsub = p_grant.add_subparsers(dest="grant_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser, fee=True):
+        if fee:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument(
+            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+        parser.add_argument("--expire-in", type=_block_count, default=1000,
+                            help="Blocks the transaction may land in, from the next one")
+        parser.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+
+    p_new = gsub.add_parser(
+        "create", parents=common,
+        help="Lock funds for a grantee under limits, time locks and an expiry refund",
+    )
+    _key_group(p_new)
+    p_new.add_argument("--to", required=True, help="Grantee public key (96 hex)")
+    p_new.add_argument("--amount", required=True, type=int, help="Amount to lock")
+    p_new.add_argument("--expires", required=True, type=_parse_when,
+                       help="Deadline (unix or ISO UTC); what is left returns then")
+    p_new.add_argument("--start", type=_parse_when,
+                       help="Time lock: no spending before this (unix or ISO UTC)")
+    p_new.add_argument("--cap", type=int, help="Spending limit per period")
+    p_new.add_argument("--cap-period", choices=sorted(_PERIODS), default="week",
+                       help="Calendar period for --cap, UTC (default: week, Monday start)")
+    p_new.add_argument("--cap-period-seconds", type=int,
+                       help="Fixed-length period in seconds instead, anchored at --start")
+    p_new.add_argument("--per-payment-cap", type=int, help="Maximum per single payment")
+    p_new.add_argument("--days", type=_parse_days, default=0x7F,
+                       help="Allowed UTC weekdays, e.g. mon-fri or sat,sun (default: all)")
+    p_new.add_argument("--hours", type=_parse_hours, default=0xFFFFFF,
+                       help="Allowed UTC hours, e.g. 9-17 (default: all)")
+    p_new.add_argument("--refund-to", help="Who receives the leftover at expiry (default: you)")
+    p_new.add_argument("--revocable", action="store_true",
+                       help="Allow yourself to cancel early (refunds what is left)")
+    _tx_flags(p_new)
+    p_new.set_defaults(func=cmd_grant_create)
+
+    p_draw = gsub.add_parser("draw", parents=common,
+                             help="Spend from a grant you received")
+    _key_group(p_draw)
+    p_draw.add_argument("grant_id", help="Grant id (64 hex)")
+    p_draw.add_argument("--to", required=True, help="Recipient public key (96 hex)")
+    p_draw.add_argument("--amount", required=True, type=int)
+    _tx_flags(p_draw)
+    p_draw.set_defaults(func=cmd_grant_draw)
+
+    p_cancel = gsub.add_parser("cancel", parents=common,
+                               help="Cancel a revocable grant you made (feeless)")
+    _key_group(p_cancel)
+    p_cancel.add_argument("grant_id", help="Grant id (64 hex)")
+    _tx_flags(p_cancel, fee=False)
+    p_cancel.set_defaults(func=cmd_grant_cancel)
+
+    p_list = gsub.add_parser("list", parents=common,
+                             help="Open grants for an address, with what is drawable now")
+    p_list.add_argument("--address", help="Address (default: your key's)")
+    _key_group(p_list, required=False)
+    p_list.add_argument("--role", choices=["in", "out", "all"], default="all")
+    p_list.set_defaults(func=cmd_grant_list)
+
 
 
 if __name__ == "__main__":

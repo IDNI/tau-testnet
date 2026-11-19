@@ -33,6 +33,17 @@ from .approvals import (
     parse_rule_change_request_checked,
     parse_transfer_vote,
 )
+from .grants import (
+    GRANT_TX_TYPES,
+    GrantBook,
+    GrantShapeError,
+    TX_TYPE_GRANT_CANCEL,
+    TX_TYPE_GRANT_CREATE,
+    TX_TYPE_GRANT_DRAW,
+    parse_grant_cancel,
+    parse_grant_create,
+    parse_grant_draw,
+)
 from .retractable import (
     RETRACTABLE_TX_TYPES,
     RetractableBook,
@@ -70,7 +81,7 @@ from .rule_offers import (
 # at inclusion.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST}
+     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -226,9 +237,31 @@ def _retractable_book(lm) -> Optional[RetractableBook]:
     return book if isinstance(book, RetractableBook) else None
 
 
+def _grant_book(lm) -> Optional[GrantBook]:
+    book = getattr(lm, "grants", None)
+    return book if isinstance(book, GrantBook) else None
+
+
 def _escrow_total(lm) -> int:
+    """Funds held by consensus books rather than accounts (supply invariant)."""
     book = _retractable_book(lm)
-    return book.escrow_total() if book is not None else 0
+    grants = _grant_book(lm)
+    return (book.escrow_total() if book is not None else 0) + (
+        grants.escrow_total() if grants is not None else 0
+    )
+
+
+def _expire_due_grants(lm, balances, sequences, timestamp) -> List[str]:
+    """Refund every expired grant's remaining funds; returns the expired ids."""
+    book = _grant_book(lm)
+    if book is None:
+        return []
+    expired = book.expire_due(int(timestamp))
+    grant = faucet.amount(lm)
+    for state in expired:
+        to = state.terms.refund_to_pubkey
+        balances[to] = faucet.spendable(balances, sequences, to, grant) + state.remaining
+    return [state.terms.grant_id.hex() for state in expired]
 
 
 def _release_due_retractables(lm, balances, sequences, height, timestamp) -> List[str]:
@@ -903,6 +936,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         released_retractables = _release_due_retractables(
             lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
         )
+        # Same position and reasoning for grants: a draw needs ts < expires_at,
+        # so it can never share a block with its grant's expiry refund.
+        expired_grants = _expire_due_grants(lm, t_bals, t_seqs, block.header.timestamp)
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
             getattr(
@@ -962,6 +998,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if event and id(tx) in accepted_obj:
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
+
+        grant_events = []
+        for i, tx in enumerate(block.transactions):
+            event = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "grant_event"
+            )
+            if event and id(tx) in accepted_obj:
+                grant_events.append(event)
+        grant_events.extend((gid, "expired") for gid in expired_grants)
 
         # 3. Post-State Materialization Layer
         
@@ -1118,6 +1163,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "grant_events": grant_events,
             }
         )
         
@@ -1664,6 +1710,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             parked_rule_change_id: Optional[bytes] = None
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
+            pending_grant_op = None  # ("create", terms) | ("draw", draw) | ("cancel", gid)
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2628,6 +2675,79 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 "Retractable transfer retracted: " + request.retractable_id.hex()
                             )
 
+            elif tx_type in GRANT_TX_TYPES:
+                # Root fields only, as for retractables: nested data is unsigned.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    grants_book = lifecycle_mgr.grants
+                    ts_now = int(block_timestamp or 0)
+                    reason = ""
+                    op = None
+                    try:
+                        if tx_type == TX_TYPE_GRANT_CREATE:
+                            op = ("create", parse_grant_create(tx))
+                        elif tx_type == TX_TYPE_GRANT_DRAW:
+                            op = ("draw", parse_grant_draw(tx))
+                        else:
+                            op = ("cancel", parse_grant_cancel(tx))
+                    except GrantShapeError as exc:
+                        reason = f"invalid {tx_type} ({exc})"
+                    if op is not None:
+                        signer = (op[1].grantor_pubkey if op[0] != "draw"
+                                  else op[1].grantee_pubkey)
+                        if not isinstance(sender, str) or sender != signer:
+                            reason = "sender is not the signer"
+                        elif target_balances is None:
+                            reason = "no balance overlay for grant funds"
+                        elif op[0] == "create":
+                            _, reason = grants_book.can_admit_create(op[1], ts_now)
+                        elif op[0] == "draw":
+                            _, reason = grants_book.can_admit_draw(op[1], ts_now)
+                        else:
+                            _, reason = grants_book.can_admit_cancel(op[1], ts_now)
+                    if op is None or reason:
+                        tx_receipt["logs"].append(f"Grant transaction ignored: {reason}")
+                        tx_receipt["reason"] = "grant_not_applied"
+                        accepted_in_block = False
+                    elif op[0] == "create":
+                        terms = op[1]
+                        # Same gates as a retractable park: the grantor's o1/o5
+                        # policy, the fee step and the balance check; the funds
+                        # are debited into the grant, credited to nobody yet.
+                        escrowed = _execute_fee_era_transfer(
+                            terms.grantor_pubkey, terms.grantee_pubkey, terms.amount,
+                            slot_values=_approval_slot_values(),
+                            overrides={},
+                            escrow=True,
+                        )
+                        fee_already_measured = True
+                        if escrowed and accepted_in_block and not hard_reject:
+                            pending_grant_op = op
+                            tx_receipt["logs"].append(
+                                "Grant created: " + terms.grant_id.hex()
+                            )
+                    elif op[0] == "draw":
+                        draw_req = op[1]
+                        # The grant's own terms are the policy for these funds:
+                        # they never were the grantee's balance, so the
+                        # grantee's o5 does not apply. The fee is the
+                        # grantee's, charged by the transfer-less fee step.
+                        staged_writes[draw_req.recipient_pubkey] = (
+                            _read_bal(draw_req.recipient_pubkey) + draw_req.amount
+                        )
+                        pending_grant_op = op
+                        tx_receipt["logs"].append(
+                            f"Grant draw: {draw_req.amount} from {draw_req.grant_id.hex()}"
+                        )
+                    else:
+                        state = grants_book.get(op[1].grant_id)
+                        to = state.terms.refund_to_pubkey
+                        staged_writes[to] = _read_bal(to) + state.remaining
+                        pending_grant_op = op
+                        tx_receipt["logs"].append(
+                            "Grant cancelled: " + op[1].grant_id.hex()
+                        )
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3174,6 +3294,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 elif pending_retract_id is not None:
                     tx_receipt["retractable_event"] = (pending_retract_id.hex(), "retracted")
                     book.retract(pending_retract_id)
+                if pending_grant_op is not None:
+                    gbook = _lifecycle_for_write().grants
+                    kind, payload_obj = pending_grant_op
+                    ts_now = int(block_timestamp or 0)
+                    if kind == "create":
+                        gid = gbook.submit(payload_obj, ts_now)
+                        tx_receipt["grant_event"] = (gid.hex(), "created")
+                        stamp_retractable_park = True  # a create is a send
+                    elif kind == "draw":
+                        after = gbook.draw(payload_obj, ts_now)
+                        tx_receipt["grant_event"] = (
+                            payload_obj.grant_id.hex(),
+                            "exhausted" if after.remaining == 0 else "drawn",
+                        )
+                    else:
+                        gbook.cancel(payload_obj.grant_id)
+                        tx_receipt["grant_event"] = (payload_obj.grant_id.hex(), "cancelled")
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same

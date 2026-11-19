@@ -780,3 +780,98 @@ def compute_retractable_book_root(
     out.extend(encode_uint64(int(resolved_count)))
     out.extend(encode_hash32(resolved_acc))
     return blake3(bytes(out)).digest()
+
+
+# --- Conditional grants ------------------------------------------------------
+
+DOMAIN_GRANT_V1 = b"tau.grant.v1"
+DOMAIN_GRANT_RESOLVED_V1 = b"tau.grant.resolved.v1"
+DOMAIN_GRANT_BOOK_V1 = b"tau.grant.book.v1"
+
+
+def _encode_grant_terms(
+    grantor_pubkey: Any,
+    grantee_pubkey: Any,
+    refund_to_pubkey: Any,
+    amount: int,
+    sequence_number: int,
+    start_at: int,
+    expires_at: int,
+    spend_cap: int,
+    cap_period_kind: int,
+    cap_period_seconds: int,
+    per_payment_cap: int,
+    weekday_mask: int,
+    hour_mask: int,
+    revocable: bool,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(grantor_pubkey))
+    out.extend(encode_pubkey48(grantee_pubkey))
+    out.extend(encode_pubkey48(refund_to_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(encode_uint64(int(start_at)))
+    out.extend(encode_uint64(int(expires_at)))
+    out.extend(encode_uint64(int(spend_cap)))
+    out.extend(bytes([int(cap_period_kind) & 0xFF]))
+    out.extend(encode_uint64(int(cap_period_seconds)))
+    out.extend(encode_uint64(int(per_payment_cap)))
+    out.extend(bytes([int(weekday_mask) & 0x7F]))
+    out.extend(encode_uint32(int(hour_mask)))
+    out.extend(encode_bool(bool(revocable)))
+    return bytes(out)
+
+
+def compute_grant_id(*terms: Any) -> bytes:
+    """BLAKE3 of a grant's signed terms (``_encode_grant_terms`` order). 32 bytes.
+
+    Content-derived like the retractable id; sequence_number keeps two identical
+    grants from the same grantor apart.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_GRANT_V1.decode()))
+    out.extend(_encode_grant_terms(*terms))
+    return blake3(bytes(out)).digest()
+
+
+def compute_grant_resolved_acc(acc: Any, grant_id: Any, outcome: int) -> bytes:
+    """Fold one grant resolution into the running commitment. Order-dependent."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_GRANT_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(grant_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    return blake3(bytes(out)).digest()
+
+
+def encode_grant_entry(
+    grant_id: Any,
+    terms: tuple,
+    remaining: int,
+    cap_period_index: int,
+    spent_in_period: int,
+) -> bytes:
+    """One open grant: id, signed terms, then the mutable spending state."""
+    out = bytearray()
+    out.extend(encode_hash32(grant_id))
+    out.extend(_encode_grant_terms(*terms))
+    out.extend(encode_uint64(int(remaining)))
+    out.extend(encode_uint64(int(cap_period_index)))
+    out.extend(encode_uint64(int(spent_in_period)))
+    return bytes(out)
+
+
+def compute_grant_book_root(
+    open_entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    """BLAKE3 of the grant book: sorted open entries, then the resolved commitment."""
+    encoded = sorted(encode_grant_entry(*e) for e in (open_entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_GRANT_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()

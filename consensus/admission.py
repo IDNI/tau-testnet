@@ -48,6 +48,15 @@ from consensus.approvals import (
     validate_request_shape,
     validate_rule_change_shape,
 )
+from consensus.grants import (
+    GrantShapeError,
+    TX_TYPE_GRANT_CANCEL,
+    TX_TYPE_GRANT_CREATE,
+    TX_TYPE_GRANT_DRAW,
+    parse_grant_cancel,
+    parse_grant_create,
+    parse_grant_draw,
+)
 from consensus.retractable import (
     KIND_HEIGHT,
     MAX_OPEN_RETRACTABLE_PER_SENDER,
@@ -1618,6 +1627,62 @@ def validate_retract_transfer_payload(
     return success({"retractable_id": request.retractable_id.hex()})
 
 
+# --- Conditional grants --------------------------------------------------------
+
+def validate_grant_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+    """Tau-free screens for grant_create / grant_draw / grant_cancel.
+
+    The book checks are the same functions block apply runs, against the
+    committed book and the advisory next-block timestamp; apply re-judges on the
+    real block timestamp. For grant_create the o5 verdict, fee and funds checks
+    run on the sendtx path, as for a retractable park.
+    """
+    tx_type = tx.get("tx_type")
+    sender = tx.get("sender_pubkey")
+    ts = tip_view.next_block_timestamp
+    book = tip_view.grant_book()
+    try:
+        if tx_type == TX_TYPE_GRANT_CREATE:
+            terms = parse_grant_create(tx)
+            signer = terms.grantor_pubkey
+        elif tx_type == TX_TYPE_GRANT_DRAW:
+            draw = parse_grant_draw(tx)
+            signer = draw.grantee_pubkey
+        else:
+            cancel = parse_grant_cancel(tx)
+            signer = cancel.grantor_pubkey
+    except GrantShapeError as exc:
+        return format_error(f"Malformed {tx_type}: {exc}.")
+    if not isinstance(sender, str) or sender != signer:
+        return format_error(f"{tx_type} sender_pubkey must match the signer.")
+
+    if tx_type == TX_TYPE_GRANT_CREATE:
+        for name in ("grantee_pubkey", "refund_to_pubkey"):
+            err = validate_bls_pubkey(getattr(terms, name), name)
+            if err:
+                return format_error(f"grant_create rejected: {err}")
+        ok, reason = book.can_admit_create(terms, ts)
+        if not ok:
+            return format_error(f"grant_create rejected: {reason}", code="GRANT_REJECTED")
+        return success({
+            "grant_id": terms.grant_id.hex(),
+            "amount": terms.amount,
+            "grantee_pubkey": terms.grantee_pubkey,
+        })
+    if tx_type == TX_TYPE_GRANT_DRAW:
+        err = validate_bls_pubkey(draw.recipient_pubkey, "recipient_pubkey")
+        if err:
+            return format_error(f"grant_draw rejected: {err}")
+        ok, reason = book.can_admit_draw(draw, ts)
+        if not ok:
+            return format_error(f"grant_draw rejected: {reason}", code="GRANT_DRAW_REJECTED")
+        return success({"grant_id": draw.grant_id.hex(), "amount": draw.amount})
+    ok, reason = book.can_admit_cancel(cancel, ts)
+    if not ok:
+        return format_error(f"grant_cancel rejected: {reason}", code="GRANT_CANCEL_REJECTED")
+    return success({"grant_id": cancel.grant_id.hex()})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -1728,6 +1793,9 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
          return validate_retract_transfer_payload(payload, tip_view)
+
+    elif tx_type in (TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW, TX_TYPE_GRANT_CANCEL):
+         return validate_grant_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

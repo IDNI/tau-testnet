@@ -743,3 +743,104 @@ def build_retract_transfer_tx(
         "fee_limit": str(fee_limit),
         "retractable_id": retractable_id.lower(),
     }
+
+
+def _grant_base(tx_type, sender_pubkey, sequence_number, expiration_time,
+                expire_at_height, fee_limit):
+    return {
+        "tx_type": tx_type,
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+    }
+
+
+def build_grant_create_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    grantee_pubkey: str,
+    amount: int,
+    expires_at: int,
+    start_at: int = 0,
+    spend_cap: int = 0,
+    cap_period_kind: int = 2,
+    cap_period_seconds: int = 0,
+    per_payment_cap: int = 0,
+    weekday_mask: int = 0x7F,
+    hour_mask: int = 0xFFFFFF,
+    refund_to_pubkey: str | None = None,
+    revocable: bool = False,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='grant_create'`` payload (without signature).
+
+    Every term is written explicitly, so the signed bytes never depend on a
+    node-side default.
+    """
+    if not isinstance(grantee_pubkey, str) or len(grantee_pubkey) != 96:
+        raise ValueError("grantee_pubkey must be a 96-character hex public key")
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount < 1:
+        raise ValueError("amount must be a positive integer")
+    tx = _grant_base("grant_create", sender_pubkey, sequence_number,
+                     expiration_time, expire_at_height, fee_limit)
+    tx.update({
+        "grantee_pubkey": grantee_pubkey.lower(),
+        "refund_to_pubkey": (refund_to_pubkey or sender_pubkey).lower(),
+        "amount": amount,
+        "start_at": int(start_at),
+        "expires_at": int(expires_at),
+        "spend_cap": int(spend_cap),
+        "cap_period_kind": int(cap_period_kind),
+        "cap_period_seconds": int(cap_period_seconds),
+        "per_payment_cap": int(per_payment_cap),
+        "weekday_mask": int(weekday_mask),
+        "hour_mask": int(hour_mask),
+        "revocable": bool(revocable),
+    })
+    return tx
+
+
+def build_grant_draw_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    grant_id: str,
+    recipient_pubkey: str,
+    amount: int,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='grant_draw'`` payload (without signature)."""
+    if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
+        raise ValueError("recipient_pubkey must be a 96-character hex public key")
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount < 1:
+        raise ValueError("amount must be a positive integer")
+    tx = _grant_base("grant_draw", sender_pubkey, sequence_number,
+                     expiration_time, expire_at_height, fee_limit)
+    tx.update({
+        "grant_id": grant_id.lower(),
+        "recipient_pubkey": recipient_pubkey.lower(),
+        "amount": amount,
+    })
+    return tx
+
+
+def build_grant_cancel_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    grant_id: str,
+) -> dict:
+    """Construct a fee-exempt ``tx_type='grant_cancel'`` payload (without signature)."""
+    tx = _grant_base("grant_cancel", sender_pubkey, sequence_number,
+                     expiration_time, expire_at_height, "0")
+    tx["grant_id"] = grant_id.lower()
+    return tx

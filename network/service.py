@@ -110,6 +110,9 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "transfer_vote",
     "retractable_transfer",
     "retract_transfer",
+    "grant_create",
+    "grant_draw",
+    "grant_cancel",
 })
 
 
@@ -635,7 +638,8 @@ class NetworkService:
                     if approval_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS:
                         continue
                     approval_txs_count += 1
-                elif tx_type in ("retractable_transfer", "retract_transfer"):
+                elif tx_type in ("retractable_transfer", "retract_transfer",
+                                 "grant_create", "grant_draw", "grant_cancel"):
                     if retractable_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS:
                         continue
                     retractable_txs_count += 1
@@ -875,10 +879,15 @@ class NetworkService:
         )
         await self._process_gossip_payload(
             envelope,
-            allowed_types={"retractable_transfer", "retract_transfer"},
+            # Grants share the escrow topic: same size class, same flood profile.
+            allowed_types={"retractable_transfer", "retract_transfer",
+                           "grant_create", "grant_draw", "grant_cancel"},
             type_limits={
                 "retractable_transfer": TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
                 "retract_transfer": TAU_MAX_RETRACT_TRANSFER_BYTES,
+                "grant_create": TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
+                "grant_draw": TAU_MAX_RETRACT_TRANSFER_BYTES,
+                "grant_cancel": TAU_MAX_RETRACT_TRANSFER_BYTES,
             },
         )
 
@@ -980,6 +989,18 @@ class NetworkService:
         elif tx_type == "retract_transfer":
             if "retractable_id" not in p_dict:
                 logger.debug("Gossip rejected: retract_transfer missing retractable_id")
+                return
+        elif tx_type == "grant_create":
+            if not all(k in p_dict for k in ("grantee_pubkey", "amount", "expires_at")):
+                logger.debug("Gossip rejected: grant_create missing required structural fields")
+                return
+        elif tx_type == "grant_draw":
+            if not all(k in p_dict for k in ("grant_id", "recipient_pubkey", "amount")):
+                logger.debug("Gossip rejected: grant_draw missing required structural fields")
+                return
+        elif tx_type == "grant_cancel":
+            if "grant_id" not in p_dict:
+                logger.debug("Gossip rejected: grant_cancel missing grant_id")
                 return
 
         try:
@@ -1605,7 +1626,8 @@ class NetworkService:
             return TAU_GOSSIP_TOPIC_RULES
         if tx_type in ("approval_request", "transfer_vote"):
             return TAU_GOSSIP_TOPIC_APPROVALS
-        if tx_type in ("retractable_transfer", "retract_transfer"):
+        if tx_type in ("retractable_transfer", "retract_transfer",
+                       "grant_create", "grant_draw", "grant_cancel"):
             return TAU_GOSSIP_TOPIC_RETRACTABLE
         return TAU_GOSSIP_TOPIC_TRANSACTIONS
 

@@ -147,7 +147,42 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
+    if kind == "grant_create":
+        return _envelope(kind, SENDER, fee_limit, grantee_pubkey=RECIPIENT,
+                         amount=100, expires_at=_now() + 86_400)
+    if kind == "grant_draw":
+        return _envelope(kind, RECIPIENT, fee_limit, grant_id=_seed_grant(),
+                         recipient_pubkey=SENDER, amount=10)
     raise AssertionError(kind)
+
+
+def _now():
+    import time
+
+    return int(time.time())
+
+
+def _seed_grant():
+    """Commit one open grant SENDER -> RECIPIENT so a draw has something to draw."""
+    import time
+
+    from chain_state import _grants_state
+    from consensus.grants import GrantBook, parse_grant_create
+
+    book = GrantBook()
+    now = int(time.time())
+    terms = parse_grant_create({"sender_pubkey": SENDER, "grantee_pubkey": RECIPIENT,
+                                "amount": 1000, "sequence_number": 0,
+                                "expires_at": now + 86_400})
+    gid = book.submit(terms, now)
+
+    class _LM:
+        grants = book
+
+    db.set_chain_state_value(
+        "grants_v1", json.dumps(_grants_state(_LM), sort_keys=True, separators=(",", ":"))
+    )
+    return gid.hex()
 
 
 def _check(payload, *, estimate=True):
@@ -158,7 +193,7 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request"]
+               "rule_change_request", "grant_create", "grant_draw"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

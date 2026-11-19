@@ -404,6 +404,17 @@ class TipAdmissionView:
                     out.append(row)
         return out
 
+    # --- Conditional grants -------------------------------------------------
+
+    def grant_book(self):
+        """The committed grant book, rebuilt from persisted state (empty on error)."""
+        from consensus.grants import GrantBook, load_grant_book
+
+        try:
+            return load_grant_book(db.load_grants_state())
+        except Exception:
+            return GrantBook()
+
     # --- Retractable transfers ---------------------------------------------
     #
     # Persisted rows, not the in-memory manager, for the same reason as the
