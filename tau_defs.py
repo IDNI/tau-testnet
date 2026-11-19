@@ -65,6 +65,19 @@ HOST_STREAM_WIDTHS = {
     "o9": CONSENSUS_FEE_BV_WIDTH,
 }
 
+# Frozen capability flags `getgovernance` returns as `capabilities`, beside
+# `stream_widths`. They describe the node SOFTWARE, never chain state, so a
+# wallet can ask "does this node enforce recipient-side policy?" before it
+# offers the user an inbound rule (issues #47/#76). A node built without the
+# recipient gate reports False here, and its admission screens refuse a rule
+# that only the gate could enforce (a hold-cap clause) instead of silently
+# admitting a rule that never runs.
+HOST_CAPABILITIES = {
+    "recipient_policy": True,
+    "recipient_max_hold": True,
+    "recipient_guarded_pass": True,
+}
+
 # --- Transaction expiry ---
 # Every transaction carries `expire_at_height`: the first height at which it is
 # too late to include it. Height is the expiry a proposer cannot lie about --
@@ -257,6 +270,30 @@ COOLDOWN_NEVER_SENT = (1 << 63) - 1
 # Storage, persistence and the accounts column ship unconditionally ahead of the
 # feed, so by the time this is switched on the history is already accumulated.
 COOLDOWN_STREAM_ACTIVE = False
+
+# --- Recipient hold streams (issues #47/#76) --------------------------------
+# i17: how long a payment to the evaluated recipient may still be held, in
+# SECONDS, host-computed from the park's release point (release_at_time minus
+# the block time). i27: the same hold in BLOCKS (release_at_height minus the
+# block height). A plain transfer feeds 0 on both, so "only payments I get
+# straight away" is a cap of 0. A park of one kind feeds 0 on the other
+# kind's stream, so a cap rule must bound BOTH streams to bound both kinds.
+#
+# Host-computed, like i16, so a cap rule is a single comparison per stream --
+# no bv subtraction in the rule, no underflow question. Unlike i16 the feed
+# lives ONLY inside the recipient-policy evaluation (consensus/
+# recipient_policy.py forces both values into the recipient pass, at
+# admission and at apply, from the same helper): the streams are not fed to
+# the sender pass or the consensus evaluation, and a sender-supplied
+# operations value on i17/i27 never reaches the recipient's clause, so the
+# streams do NOT join reserved_operation_keys and pre-existing custom uses
+# elsewhere keep their meaning. Width bv[64]: the widest release window is
+# 7_776_000 seconds / 100_000 blocks, far inside it, with headroom.
+TAU_INPUT_STREAM_HOLD_SECONDS = "i17"
+TAU_INPUT_STREAM_HOLD_BLOCKS = "i27"
+HOLD_SECONDS_STREAM_INDEX = 17
+HOLD_BLOCKS_STREAM_INDEX = 27
+HOLD_STREAM_BV_WIDTH = 64
 
 # --- Tau Consensus ABI v1.2 additions (Tau-encoded validator membership) ---
 # Proposer BLS pubkey fed so a consensus rule can test set membership itself
