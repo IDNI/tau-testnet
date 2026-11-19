@@ -16,6 +16,7 @@ from .governance import (
     is_tau_authoritative_eligibility_mode,
 )
 from . import faucet, fees
+from . import recipient_policy
 from . import sender_policy
 from .fees import FeeRuleError
 from .approvals import (
@@ -163,6 +164,10 @@ class TransactionOutcome:
     status: str # "applied", "skipped", "invalid"
     reason: Optional[str] = None
     receipt_logs: List[str] = None
+    # The full apply receipt, so structured refusal details (e.g. the
+    # recipient hold cap of issues #47/#76: recipient_max_hold_seconds /
+    # recipient_max_hold_blocks) travel beside the machine reason and logs.
+    receipt: Optional[Dict[str, Any]] = None
 
 @dataclass
 class ApplyBlockResult:
@@ -249,17 +254,27 @@ TEMPORAL_REFERENCE_REASON = "temporal_reference"
 RULE_CHANGE_NEEDS_APPROVAL_REASON = "rule_change_needs_approval"
 
 
-def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tuple[str, str]]:
-    """(error, receipt reason) when admission would refuse this clause body."""
+def _clause_domain_rejection(body: str, *, guard: bool = False,
+                             receive_active: bool = False) -> Optional[Tuple[str, str]]:
+    """(error, receipt reason) when admission would refuse this clause body.
+
+    `receive_active` is the PARENT snapshot's `recipient_policy_active`
+    (issues #47/#76): the hold-stream width screen runs only on a chain that
+    feeds i17/i27. The inactive-chain deploy refusal is admission-only and
+    deliberately NOT re-run here: a grandfathered clause keeps working.
+    """
     # Lazy: consensus.admission imports chain_state, which imports this module.
     from consensus.admission import (
-        _screen_clause_domains,
+        _screen_clause,
         _screen_guard_domains,
         _width_mismatch_details,
         is_temporal_reference_error,
     )
 
-    error = (_screen_guard_domains if guard else _screen_clause_domains)(body)
+    error = (
+        _screen_guard_domains(body) if guard
+        else _screen_clause(body, receive_active)
+    )
     if error is None:
         return None
     if is_temporal_reference_error(error):
@@ -269,7 +284,8 @@ def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tupl
     return error, "rule_not_applied"
 
 
-def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str]]:
+def _release_rule_changes(lm, height, timestamp, timeout,
+                          receive_active: bool = False) -> List[Tuple[str, str]]:
     """Write every READY rule-change request, lowest id first, up to the per-block cap.
 
     Runs after the transaction loop and before expiry, so a deferred request
@@ -289,7 +305,8 @@ def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str
         if entry is None or entry.status != STATUS_OPEN:
             continue
         processed += 1
-        problem = _write_rule_change(lm, rid, entry, int(height), timeout)
+        problem = _write_rule_change(
+            lm, rid, entry, int(height), timeout, receive_active)
         if problem:
             approvals.resolve_rule_change(rid, STATUS_FAILED)
             logger.info("Rule-change request %s failed at release: %s", rid.hex(), problem)
@@ -300,7 +317,8 @@ def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str
     return events
 
 
-def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
+def _write_rule_change(lm, rid, entry, height, timeout,
+                       receive_active: bool = False) -> Optional[str]:
     """Apply one request to the block's lifecycle. None on success, else why not.
 
     Every check runs before the first write, so a failure leaves nothing behind.
@@ -313,7 +331,8 @@ def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
     guard_key = (sender, tau_defs.RULE_CHANGE_GUARD_INDEX)
 
     def _screen_and_build(body, *, guard=False):
-        rejection = _clause_domain_rejection(body, guard=guard)
+        rejection = _clause_domain_rejection(
+            body, guard=guard, receive_active=receive_active)
         if rejection:
             return rejection[0]
         builds, build_error = sender_policy.clause_builds(
@@ -544,6 +563,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "approval_slots_active": bool(
                     getattr(lm, "approval_slots_active", False)
                 ),
+                # Whether i17/i27 are reserved and fed to recipients' clauses
+                # (issues #47/#76). Read from the PARENT snapshot's manager,
+                # so an activation recorded in block H governs H+1 onward.
+                "recipient_policy_active": getattr(
+                    lm, "recipient_policy_active", False
+                ) is True,
             },
             parent_balances=parent_snapshot.metadata.get("balances"),
         )
@@ -909,6 +934,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 session if session is not None else getattr(proposal, "session", None),
                 "request_budget", None,
             ),
+            # Still the parent's flag here: an activation carried by this block
+            # runs in process_height_transitions, below (issues #47/#76).
+            receive_active=getattr(lm, "recipient_policy_active", False) is True,
         )
 
         minted = faucet.granted(
@@ -947,11 +975,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 else:
                     accepted_ids.append(tx_id)
                     
-                outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, receipt_logs=logs))
+                outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, receipt_logs=logs, receipt=receipt))
             elif id(tx) in rejected_obj:
                 status = "invalid"
                 receipt = exec_result.receipts.get(tx_id, {})
-                outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, reason=receipt.get("reason"), receipt_logs=receipt.get("logs", [])))
+                outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, reason=receipt.get("reason"), receipt_logs=receipt.get("logs", []), receipt=receipt))
                 invalid_ids.append(tx_id)
 
         retractable_events = []
@@ -1469,6 +1497,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # activation recorded in block H governs H+1 onward and never changes the
         # meaning of the block that carried it.
         approval_slots_on = getattr(lifecycle_mgr, "approval_slots_active", False) is True
+        # Recipient-side policy (issues #47/#76), read at the same point for
+        # the same reason: the manager is the deep copy of the PARENT, so an
+        # activation recorded in block H governs H+1 onward and never changes
+        # the meaning of the block that carried it.
+        recipient_policy_on = getattr(lifecycle_mgr, "recipient_policy_active", False) is True
 
         def _approval_slot_values(overlay=None):
             """The i18..i25 feed for one transfer, or None while inactive.
@@ -1721,7 +1754,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
                 # Same screen admission runs, so the two paths reject the same
                 # clause bodies.
-                rejection = _clause_domain_rejection(body)
+                rejection = _clause_domain_rejection(
+                    body, receive_active=recipient_policy_on)
                 if rejection:
                     domain_error, reason = rejection
                     _did_not_land(f"o5 clause ignored ({domain_error})", reason=reason)
@@ -1819,6 +1853,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # commands/sendtx.py. Reserved, so a sender cannot pre-fill one.
                 for slot, slot_val in (slot_values or {}).items():
                     values[slot] = slot_val
+                # Hold streams (i17/i27, issues #47/#76): the sender pass reads
+                # explicit 0 while active, byte-identically to admission, so the
+                # owner's own cap clause sees "no hold" on its outbound
+                # transfers. The recipient pass forces the park's real hold
+                # onto its own copy. Reserved, so a sender cannot pre-fill one.
+                if recipient_policy_on:
+                    values[tau_defs.HOLD_SECONDS_STREAM_INDEX] = "0"
+                    values[tau_defs.HOLD_BLOCKS_STREAM_INDEX] = "0"
                 values[5] = str(block_timestamp)
                 return values
 
@@ -1882,7 +1924,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
-                                          escrow=False):
+                                          escrow=False, recipient_hold=None):
                 """Execute ONE transfer under the fee model. True to continue.
 
                 Extracted verbatim from the user_tx transfer loop so the
@@ -1904,6 +1946,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
                 `escrow` stages only the debit: the credit belongs to the
                 retractable book until it releases.
+
+                `recipient_hold` is the {17: seconds, 27: blocks} hold map the
+                RECIPIENT's clause reads on i17/i27 (issues #47/#76): only the
+                escrow leg of a fresh park carries one, computed from THIS
+                block's height/timestamp. Plain transfers and the approval-vote
+                release pass None (final-now): the release intentionally re-runs
+                o5 through this same closure, and the money arrives at release,
+                so the recipient pass sees a final payment, not the original
+                park's hold. A matured retractable release never comes through
+                here at all (_release_due_retractables credits directly).
                 """
                 nonlocal accepted_in_block, hard_reject, execution_success
                 try:
@@ -2003,6 +2055,90 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 f"Transfer rejected by the sender's own policy clause (o5={own_o5})"
                             )
                             return False
+
+                        # --- Recipient policy (o5, issues #47/#76) ---
+                        # The recipient's own clause is consulted on the same
+                        # inputs, after every check on the sender's side,
+                        # mirroring admission exactly (consensus/
+                        # recipient_policy.py). A block rejects the whole
+                        # user_tx like a sender-policy block: staged writes
+                        # never commit, the proposer filters the tx out of the
+                        # block and NO FEE is charged. A park blocked by the
+                        # recipient's hold cap carries the distinct
+                        # recipient_max_hold reason and the cap itself, so the
+                        # payer's wallet can print it.
+                        if recipient_policy_on:
+                            recip_blocks, recip_o5, recip_refusal = recipient_policy.recipient_clause_blocks(
+                                lifecycle_mgr.rule_offers.clause_for,
+                                from_addr, to_addr,
+                                tau_input_stream_values, pool="apply",
+                                timeout=getattr(_session, "request_budget", None),
+                                hold=recipient_hold,
+                            )
+                            if recip_blocks:
+                                logger.info(
+                                    "Transfer rejected by recipient policy for %s->%s (o5=%s)",
+                                    str(from_addr)[:10], str(to_addr)[:10], recip_o5,
+                                )
+                                if not replay_mode:
+                                    accepted_in_block = False
+                                    hard_reject = True
+                                execution_success = False
+                                if recip_refusal is not None and \
+                                        recip_refusal.reason == recipient_policy.REASON_MAX_HOLD:
+                                    tx_receipt["reason"] = recipient_policy.REASON_MAX_HOLD
+                                    if recip_refusal.max_hold_seconds is not None:
+                                        tx_receipt["recipient_max_hold_seconds"] = \
+                                            recip_refusal.max_hold_seconds
+                                    if recip_refusal.max_hold_blocks is not None:
+                                        tx_receipt["recipient_max_hold_blocks"] = \
+                                            recip_refusal.max_hold_blocks
+                                    tx_receipt["recipient_hold_seconds"] = recip_refusal.hold_seconds
+                                    tx_receipt["recipient_hold_blocks"] = recip_refusal.hold_blocks
+                                    tx_receipt["logs"].append(
+                                        recipient_policy.refusal_message(recip_refusal)
+                                        + f" (o5={recip_o5})"
+                                    )
+                                else:
+                                    tx_receipt["reason"] = recipient_policy.REASON
+                                    tx_receipt["logs"].append(
+                                        f"Transfer rejected by recipient policy (o5={recip_o5})"
+                                    )
+                                return False
+
+                            # --- Recipient policy, guarded mode (issue #47) ---
+                            # A second evaluation of the accumulated spec with
+                            # i12 set to the recipient: the recipient's guarded
+                            # unit is the one that can say no, the counterparty
+                            # stays readable on i3. Mirrors the admission pass
+                            # in commands/sendtx.py; the pre-screen inside
+                            # skips the step when the recipient's key is absent
+                            # from the spec.
+                            def _recipient_step(vals):
+                                with tau_manager.tau_comm_lock:
+                                    return _session.evaluate(
+                                        vals, multi=True, apply_rules_update=False)
+
+                            guarded_blocks, guarded_o5 = recipient_policy.guarded_recipient_blocks(
+                                _recipient_step,
+                                tau_input_stream_values, from_addr, to_addr,
+                                spec_text=tau_manager.last_known_tau_spec,
+                                hold=recipient_hold,
+                            )
+                            if guarded_blocks:
+                                logger.info(
+                                    "Transfer rejected by recipient policy (guarded) for %s->%s (o5=%s)",
+                                    str(from_addr)[:10], str(to_addr)[:10], guarded_o5,
+                                )
+                                if not replay_mode:
+                                    accepted_in_block = False
+                                    hard_reject = True
+                                execution_success = False
+                                tx_receipt["reason"] = recipient_policy.REASON
+                                tx_receipt["logs"].append(
+                                    f"Transfer rejected by recipient policy (guarded, o5={guarded_o5})"
+                                )
+                                return False
 
                     current_from = _read_bal(from_addr)
                     if current_from < amount:
@@ -2152,7 +2288,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             next_height=block_height if block_height is not None else 0,
                         )
                         rejection = (
-                            _clause_domain_rejection(clause_body_v1(offer.rule_text))
+                            _clause_domain_rejection(
+                                clause_body_v1(offer.rule_text),
+                                receive_active=recipient_policy_on)
                             if ok else None
                         )
                         if not ok:
@@ -2188,7 +2326,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             clause_body_v1(decision.rule_text) if ok and accept else None
                         )
                         rejection = (
-                            _clause_domain_rejection(accepted_body)
+                            _clause_domain_rejection(
+                                accepted_body, receive_active=recipient_policy_on)
                             if accepted_body is not None else None
                         )
                         if accepted_body is not None and not rejection:
@@ -2278,7 +2417,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         if not ok:
                             problem = (reason, "rule_change_request_invalid")
                         elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
-                            rejection = _clause_domain_rejection(request.body)
+                            rejection = _clause_domain_rejection(
+                                request.body, receive_active=recipient_policy_on)
                             if rejection:
                                 problem = rejection
                         elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
@@ -2287,7 +2427,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 problem = rejection
                         elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
                             rejection = _clause_domain_rejection(
-                                clause_body_v1(request.rule_text))
+                                clause_body_v1(request.rule_text),
+                                receive_active=recipient_policy_on)
                             if rejection:
                                 problem = rejection
                     if request is not None and problem is None:
@@ -2511,6 +2652,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     # False for a vote so nothing is settled.
                                     # No sequence increment for the request's
                                     # sender either -- the request consumed one.
+                                    # recipient_hold stays None (final-now): the
+                                    # recipient pass re-runs o5 on the arriving
+                                    # payment, not on the original park's hold
+                                    # (issues #47/#76).
                                     guard = (accepted_in_block, hard_reject, execution_success)
                                     released = _execute_fee_era_transfer(
                                         entry.sender_pubkey, entry.recipient_pubkey,
@@ -2588,11 +2733,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["reason"] = "retractable_not_parked"
                             accepted_in_block = False
                         else:
+                            # The park's hold length against THIS block's clock
+                            # (issue #76): admission measured it against the
+                            # tip view of the same next block, so admission and
+                            # apply judge the cap on equal numbers.
+                            park_hold = recipient_policy.hold_values(
+                                park.kind, park.release_at,
+                                int(block_height or 0),
+                                int(block_timestamp or 0),
+                            )
                             escrowed = _execute_fee_era_transfer(
                                 park.sender_pubkey, park.recipient_pubkey, park.amount,
                                 slot_values=_approval_slot_values(),
                                 overrides={},
                                 escrow=True,
+                                recipient_hold=park_hold,
                             )
                             fee_already_measured = True
                             if escrowed and accepted_in_block and not hard_reject:
@@ -2668,7 +2823,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     # sendtx/admission gate. Consensus change.
                     if idx in tau_defs.RESERVED_STREAMS or idx in tau_defs.reserved_operation_keys(
                             getattr(lifecycle_mgr, "effective_eligibility_mode", lambda: "")(),
-                            approval_slots_active=approval_slots_on):
+                            approval_slots_active=approval_slots_on,
+                            recipient_policy_active=recipient_policy_on):
                          reserved_error = f"Operation key '{k}' matches reserved stream {idx}."
                          reserved_reason = "reserved_operation_key"
                          break
@@ -2746,6 +2902,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             rule_text,
                             getattr(lifecycle_mgr, "effective_eligibility_mode", lambda: "")(),
                             approval_slots_on,
+                            recipient_policy_on,
                         )
                         if rejection and not hard_reject:
                             accepted_in_block = False
@@ -3280,6 +3437,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     # never pays anything.
                     rejected_receipt["reason"] = tx_receipt["reason"]
                     rejected_receipt["fee_charged"] = 0
+                # Structured recipient-refusal details (issues #47/#76) travel
+                # with the machine reason, so a wallet can print the cap.
+                for _detail_key in ("recipient_max_hold_seconds",
+                                    "recipient_max_hold_blocks",
+                                    "recipient_hold_seconds",
+                                    "recipient_hold_blocks"):
+                    if _detail_key in tx_receipt:
+                        rejected_receipt[_detail_key] = tx_receipt[_detail_key]
                 receipts[tx_id] = rejected_receipt
                 logger.error("TX REJECTED during apply: %s", tx_receipt["logs"])
 

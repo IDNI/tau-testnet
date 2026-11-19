@@ -14,7 +14,7 @@ import tau_manager
 from tau_manager import parse_tau_output
 import utils
 from errors import TauCommunicationError
-from consensus import fees, sender_policy
+from consensus import fees, recipient_policy, sender_policy
 from consensus.fees import FeeRuleError
 from consensus.lanes import classify_lane
 from consensus.tx_checks import check_transfer, validate_bls_pubkey
@@ -521,6 +521,19 @@ def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
     ))
 
 
+def _recipient_clause_blocks(tip_view, sender_pubkey, recipient_pubkey,
+                             values, budget, hold=None):
+    """(blocked, detail, refusal) for the recipient's own o5 clause on one
+    transfer's inputs (issues #47/#76): the recipient-side policy gate,
+    judged by consensus/recipient_policy.py with the same inputs as the
+    sender pass. `hold` is the park hold map (recipient_policy.hold_values)
+    for a retractable_transfer, None for a plain transfer."""
+    return _policy_call(lambda: recipient_policy.recipient_clause_blocks(
+        tip_view.clause_for, sender_pubkey, recipient_pubkey, values,
+        pool="admission", timeout=budget, hold=hold,
+    ))
+
+
 def _clause_build_refusal(body, budget):
     """The rejection envelope when `body` does not build as a clause, or None."""
     ok, error = _policy_call(lambda: sender_policy.clause_builds(
@@ -882,6 +895,9 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
         operations = payload.get("operations", {})
         has_transfers = "1" in operations
         has_rules = "0" in operations
+        # A plain transfer's hold length is 0 on both streams; the recipient
+        # pass forces that itself (issue #76).
+        park_hold = None
     elif tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
         # A park is judged as the one transfer leg it will become at apply; its
         # (unsigned) operations are never read.
@@ -893,9 +909,21 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             admission_eval.data["recipient_pubkey"],
             str(admission_eval.data["amount"]),
         ]]
+        # The park's hold length (issue #76), measured on the same tip clock
+        # the shape screen used to refuse a park minable at or after its
+        # release: handed to the recipient pass below, which forces it onto
+        # i17/i27 for the recipient's cap rule. Apply measures against the
+        # block being applied, so both judge the cap on equal numbers.
+        park_hold = recipient_policy.hold_values(
+            admission_eval.data["release_kind"],
+            admission_eval.data["release_at"],
+            tip_view.next_block_height,
+            tip_view.next_block_timestamp,
+        )
     else:
         has_transfers = False
         has_rules = False
+        park_hold = None
 
     if has_transfers:
         transfers_list = operations["1"]
@@ -936,6 +964,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         or idx in tau_defs.reserved_operation_keys(
                             tip_view.eligibility_mode,
                             approval_slots_active=approval_slots_active(tip_view),
+                            recipient_policy_active=recipient_policy.recipient_policy_active(tip_view),
                         ):
                     return _qt_err(
                         "TX_INVALID",
@@ -1253,6 +1282,15 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         # Reserved upstream, so a sender cannot pre-fill one.
                         for slot in _approval_slot_feed(tip_view):
                             tau_input_stream_values[slot] = "0"
+                        # Hold streams (i17/i27, issues #47/#76): the sender
+                        # pass reads explicit 0 while active — the owner's own
+                        # cap clause must see "no hold" on its outbound
+                        # transfers, never an unfed stream. The recipient pass
+                        # below forces the park's real hold onto its own copy.
+                        # Reserved upstream, so a sender cannot pre-fill one.
+                        if recipient_policy.recipient_policy_active(tip_view):
+                            tau_input_stream_values[tau_defs.HOLD_SECONDS_STREAM_INDEX] = "0"
+                            tau_input_stream_values[tau_defs.HOLD_BLOCKS_STREAM_INDEX] = "0"
                         # i5: advisory block timestamp (see admission_ts above) so
                         # time-lock o5 rules pre-check at admission; apply is
                         # authoritative.
@@ -1309,6 +1347,77 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 ),
                                 transfer_index=i + 1,
                             )
+
+                        # --- Recipient policy (o5, issues #47/#76) ---
+                        # The recipient's own clause gets a say on money
+                        # arriving, after every check on the sender's side,
+                        # with a reason that names the side that refused. A
+                        # park refused by the recipient's hold cap answers
+                        # RECIPIENT_MAX_HOLD with the cap, so the payer's
+                        # wallet can print it. Only while the chain flag is
+                        # active: before activation i17/i27 are ordinary
+                        # custom streams and nothing here runs.
+                        if recipient_policy.recipient_policy_active(tip_view):
+                            recip_blocks, recip_o5, recip_refusal = _recipient_clause_blocks(
+                                tip_view, sender_pubkey, tau_input_dict['to_addr'],
+                                tau_input_stream_values, admission_tau.budget,
+                                hold=park_hold,
+                            )
+                            if recip_blocks:
+                                if recip_refusal is not None and \
+                                        recip_refusal.reason == recipient_policy.REASON_MAX_HOLD:
+                                    details = {"transfer_index": i + 1}
+                                    if recip_refusal.max_hold_seconds is not None:
+                                        details["max_hold_seconds"] = recip_refusal.max_hold_seconds
+                                    if recip_refusal.max_hold_blocks is not None:
+                                        details["max_hold_blocks"] = recip_refusal.max_hold_blocks
+                                    details["hold_seconds"] = recip_refusal.hold_seconds
+                                    details["hold_blocks"] = recip_refusal.hold_blocks
+                                    return _qt_err(
+                                        "RECIPIENT_MAX_HOLD",
+                                        (
+                                            f"{recipient_policy.refusal_message(recip_refusal)} "
+                                            f"for transfer #{i+1} ({transfer_details}). "
+                                            f"Policy output: {recip_o5}"
+                                        ),
+                                        **details,
+                                    )
+                                return _qt_err(
+                                    "TX_REJECTED",
+                                    (
+                                        f"Transaction rejected by recipient policy (o5) "
+                                        f"for transfer #{i+1} ({transfer_details}). "
+                                        f"Policy output: {recip_o5}"
+                                    ),
+                                    transfer_index=i + 1,
+                                )
+
+                            # --- Recipient policy, guarded mode (issue #47) ---
+                            # A second step of the accumulated spec with i12
+                            # set to the recipient: the recipient's guarded
+                            # unit is the one that can say no, the
+                            # counterparty stays readable on i3. Mirrors the
+                            # apply-side pass in consensus/engine.py. The
+                            # pre-screen inside skips the step entirely when
+                            # the recipient's key is absent from the spec.
+                            guarded_blocks, guarded_o5 = recipient_policy.guarded_recipient_blocks(
+                                lambda vals: admission_tau.step_multi(
+                                    vals, source=sender_pubkey),
+                                tau_input_stream_values, sender_pubkey,
+                                tau_input_dict['to_addr'],
+                                spec_text=tau_manager.last_known_tau_spec,
+                                hold=park_hold,
+                            )
+                            if guarded_blocks:
+                                return _qt_err(
+                                    "TX_REJECTED",
+                                    (
+                                        f"Transaction rejected by recipient policy (o5) "
+                                        f"for transfer #{i+1} ({transfer_details}). "
+                                        f"Policy output: {guarded_o5}"
+                                    ),
+                                    transfer_index=i + 1,
+                                )
 
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.

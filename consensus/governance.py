@@ -93,6 +93,7 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "fee_beneficiary",
     "max_rule_txs_per_block",
     "approval_slots_active",
+    "recipient_policy_active",
 })
 
 
@@ -106,6 +107,21 @@ def validate_approval_slots_active(value: Any) -> Optional[str]:
     """
     if value is not True:
         return "must be true; approval slots cannot be deactivated once active"
+    return None
+
+
+def validate_recipient_policy_active(value: Any) -> Optional[str]:
+    """Recipient-policy activation is a ONE-WAY switch to True, like the
+    approval slots.
+
+    Turning it back off would un-reserve i17/i27 while registered clauses
+    still read them: a sender could then answer the recipient's hold question
+    for them, and the recipient pass would stop asking clauses that were
+    deployed to judge incoming payments. So only `True` is a legal patch
+    value, and `apply_host_contract_patch` additionally refuses a downgrade.
+    """
+    if value is not True:
+        return "must be true; recipient policy cannot be deactivated once active"
     return None
 
 
@@ -198,6 +214,7 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    recipient_policy_active: bool = False,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -236,6 +253,11 @@ def build_mechanism_metadata(
         mech["approval_slots_active"] = True
     if approval_requests_root:
         mech["approval_requests_root"] = approval_requests_root
+    # Recipient-side policy (issues #47/#76): same non-default gate, same
+    # reasoning. Emitted only once activated, so a chain that never turns it
+    # on hashes exactly as it did before the field existed.
+    if recipient_policy_active:
+        mech["recipient_policy_active"] = True
     if faucet_amount:
         mech["faucet_amount"] = faucet_amount
     # Always present, unlike the keys above: the feature has no activation gate,
@@ -457,6 +479,10 @@ class ConsensusLifecycleManager:
         # rollback, reorg and competing branches. Read from the PARENT snapshot,
         # so an activation recorded in block H governs H+1 onward.
         self.approval_slots_active: bool = False
+        # Recipient-side policy (issues #47/#76): the hold streams i17/i27 and
+        # the recipient o5 pass. ONE-WAY and held in consensus state for the
+        # same reasons, and read from the PARENT snapshot the same way.
+        self.recipient_policy_active: bool = False
         # Pinned by genesis for the life of the network: no patch sets it.
         # Bound into the meta hash only when non-zero.
         self.faucet_amount: int = 0
@@ -546,6 +572,7 @@ class ConsensusLifecycleManager:
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
+            recipient_policy_active=self.recipient_policy_active,
         )
         return compute_consensus_meta_hash(
             host_contract={},
@@ -657,6 +684,33 @@ class ConsensusLifecycleManager:
                 )
             else:
                 self.activate_approval_slots()
+
+        if "recipient_policy_active" in patch:
+            # Same "only consensus-binding validation" reasoning as above:
+            # _check_host_contract_patch runs at mempool admission only and
+            # block apply reaches here without it.
+            err = validate_recipient_policy_active(patch["recipient_policy_active"])
+            if err:
+                raise ValueError(f"recipient_policy_active: {err}")
+
+            # Second phase of a two-phase activation, exactly as for the
+            # approval slots: raising here would freeze the chain at the
+            # activation height, so a collision leaves the flag False on
+            # every node alike. The audit reads only hash-bound state
+            # (consensus rules, the application-rules accumulation, builtins,
+            # the clause registry), so every node computes the same findings.
+            # Lazy: recipient_policy pulls in the policy evaluator stack.
+            from consensus.recipient_policy import audit_receive_stream_collisions
+            corpus = effective_spec_texts() if callable(effective_spec_texts) else effective_spec_texts
+            findings = audit_receive_stream_collisions(corpus or ())
+            if findings:
+                logger.error(
+                    "recipient_policy_active activation REFUSED at this height; "
+                    "the effective spec already reads a hold stream: %s",
+                    "; ".join(findings),
+                )
+            else:
+                self.activate_recipient_policy()
         self.recompute_approval_threshold()
 
     def activate_approval_slots(self) -> None:
@@ -667,6 +721,17 @@ class ConsensusLifecycleManager:
         depend on them, letting a sender write their own approval slots.
         """
         self.approval_slots_active = True
+
+    def activate_recipient_policy(self) -> None:
+        """Turn recipient-side policy on (issues #47/#76). Idempotent, and
+        there is no way back.
+
+        Deactivation is unrepresentable for the same reason as the approval
+        slots: it would un-reserve i17/i27 while registered clauses still
+        read them, letting a sender answer the recipient's hold question for
+        them.
+        """
+        self.recipient_policy_active = True
 
     def knows_update(self, update_id: bytes) -> bool:
         """Check if an update is currently known in any state."""
