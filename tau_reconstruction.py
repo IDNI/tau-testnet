@@ -119,6 +119,7 @@ def plan_representation(*, history_rules=(), candidate_rules=(), width=None):
     the whole design exists to avoid.
     """
     import tau_allocator
+    import tau_defs
     import tau_shrink
 
     if width is None:
@@ -130,8 +131,11 @@ def plan_representation(*, history_rules=(), candidate_rules=(), width=None):
     # is about to be anchored to.
     scratch = tau_allocator.Allocator(tau_allocator.DbMappingSnapshot(),
                                       width=width, label="planner")
-    texts = [str(t) for t in list(history_rules) + list(candidate_rules)
-             if t and str(t).strip()]
+    # Recipient envelopes compile in separate policy workers and never enter
+    # this interpreter. Their owner keys and hold inputs cannot pin its streams.
+    candidates = [text for text in candidate_rules
+                  if not str(text).strip().startswith(tau_defs.RECIPIENT_POLICY_PREFIX)]
+    texts = [str(t) for t in list(history_rules) + candidates if t and str(t).strip()]
     # The engine types a bare reference with no width source by itself, so a
     # shrunk feed of that stream, or of its equality partners, cannot match it.
     for text in texts:

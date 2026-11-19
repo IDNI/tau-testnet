@@ -32,6 +32,7 @@ from consensus.approvals import (
     audit_stream_collisions,
     MAX_PENDING_REQUESTS_PER_APPROVER,
     approval_slots_active,
+    recipient_controls_active,
     MAX_PENDING_REQUESTS_PER_SENDER,
     STATUS_OPEN,
     TX_TYPE_APPROVAL_REQUEST,
@@ -69,6 +70,7 @@ from consensus.governance import (
     HOST_CONTRACT_PATCH_KEYS,
     validate_fee_beneficiary,
     validate_approval_slots_active,
+    validate_recipient_controls_active,
 )
 
 logger = logging.getLogger(__name__)
@@ -534,6 +536,10 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         next_validators = (validators - removals) | additions
         if not next_validators:
             return "Validator delta would leave no active validators."
+    if "recipient_controls_active" in patch:
+        err = validate_recipient_controls_active(patch["recipient_controls_active"])
+        if err:
+            return f"recipient_controls_active: {err}"
     if "approval_slots_active" in patch:
         err = validate_approval_slots_active(patch["approval_slots_active"])
         if err:
@@ -1167,6 +1173,26 @@ def validate_o5_clause_routing(
     Returns None for any other rule, which accumulates. Otherwise returns the
     verdict and, on success, the clause body and action the apply path registers.
     """
+    from consensus import recipient_policy
+
+    if rule_text.strip().startswith(recipient_policy.PREFIX):
+        sender = tx.get("sender_pubkey")
+        if not isinstance(sender, str):
+            return format_error("Recipient policy needs a sender_pubkey.")
+        owner = sender.lower()
+        try:
+            update = recipient_policy.prepare(
+                rule_text.strip(), tx.get("operations") or {}, owner,
+                tip_view.clause_for, active=recipient_controls_active(tip_view),
+            )
+        except recipient_policy.PolicyError as exc:
+            return format_error(str(exc), code=exc.code)
+        for kind in update.guard_kinds():
+            refusal = _rule_change_refusal(tip_view, owner, kind)
+            if refusal is not None:
+                return refusal
+        return success({"o5_clause_action": "recipient", "policy_builds": update.builds})
+
     streams = clause_output_streams(rule_text)
     if tau_defs.USER_POLICY_STREAM_INDEX not in streams:
         return None
@@ -1537,7 +1563,9 @@ def validate_retractable_transfer_payload(
     if err:
         return format_error(f"retractable_transfer rejected: {err}")
 
-    shape_error = validate_park_shape(park, tip_view.next_block_height, tip_view.next_block_timestamp)
+    height = tip_view.next_block_height
+    timestamp = tip_view.next_block_timestamp
+    shape_error = validate_park_shape(park, height, timestamp)
     if shape_error:
         return format_error(f"retractable_transfer rejected: {shape_error}")
 
@@ -1573,13 +1601,16 @@ def validate_retractable_transfer_payload(
                 code="DEADLINE_AFTER_RELEASE",
             )
 
-    return success({
+    data = {
         "retractable_id": retractable_id.hex(),
         "amount": park.amount,
         "recipient_pubkey": park.recipient_pubkey,
         "release_kind": park.kind,
         "release_at": park.release_at,
-    })
+    }
+    if recipient_controls_active(tip_view):
+        data.update(candidate_height=height, candidate_timestamp=timestamp)
+    return success(data)
 
 
 def validate_retract_transfer_payload(

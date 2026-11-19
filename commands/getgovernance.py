@@ -180,6 +180,9 @@ def execute(raw_command: str, container):
             "archival_update_details": archival_update_details,
             "votes": sorted(votes, key=lambda entry: (entry["update_id"], entry["voter_pubkey"])),
             "lifecycle": lifecycle,
+            "recipient_controls_active": (
+                getattr(chain_state._lifecycle_manager, "recipient_controls_active", False) is True
+            ),
             "stream_widths": dict(tau_defs.HOST_STREAM_WIDTHS),
         }
 

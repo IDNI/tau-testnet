@@ -29,6 +29,7 @@ from block import Block
 from consensus.approvals import (
     STATUS_EXECUTED,
     STATUS_FAILED,
+    STATUS_OPEN,
     ApprovalRequest,
 )
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
@@ -330,6 +331,31 @@ def test_the_released_transfer_stamps_the_senders_transfer_history():
     stamps = result.next_snapshot.metadata.get("last_transfer_ts") or {}
     assert stamps.get(ALICE) == 1234567890
     assert AUTH not in stamps, "the approver did not make a transfer"
+
+
+def test_final_vote_distinguishes_recipient_refusal_from_worker_failure():
+    from consensus.recipient_policy import Refusal
+    from tau_speculation import SpeculationError, WorkerLost
+
+    req = _request()
+    lm = _lm()
+    lm.recipient_controls_active = True
+    _, parked, _ = _apply([request_tx(req)], lm=lm)
+    vote = vote_tx(req)
+    with patch("consensus.recipient_policy.check_recipient", side_effect=SpeculationError("bad response")):
+        with pytest.raises(WorkerLost):
+            _apply([vote], lm=parked, height=HEIGHT + 1)
+    assert parked.approval_requests.get_request(req.request_id) is not None
+    assert parked.approval_requests.terminal_status[req.request_id] == STATUS_OPEN
+
+    blocked = Refusal("RECIPIENT_POLICY_BLOCKED", "Recipient refuses payment.", {"recipient_pubkey": BOB})
+    with patch("consensus.recipient_policy.check_recipient", return_value=blocked):
+        result, post, _ = _apply([vote], lm=parked, height=HEIGHT + 1)
+    assert vote["tx_id"] in result.accepted_tx_ids
+    assert post.approval_requests.terminal_status[req.request_id] == STATUS_FAILED
+    assert _balances(result)[BOB] == 0
+    assert result.outcomes[0].reason == blocked.code
+    assert result.outcomes[0].receipt_details["recipient_pubkey"] == BOB
 
 
 def test_a_forged_vote_neither_records_nor_releases():

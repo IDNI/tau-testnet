@@ -36,6 +36,10 @@ def get_args():
     )
     parser.add_argument("--network-id", type=str, default="tau-testnet-v2", help="Network ID")
     parser.add_argument(
+        "--recipient-controls", action="store_true",
+        help="Activate recipient transfer policies at genesis on a new chain.",
+    )
+    parser.add_argument(
         "--approval-slots", action="store_true",
         help=(
             "Activate co-signature approval slots (i18-i25) from block 0. For a "
@@ -318,6 +322,7 @@ def main():
     mech_meta = build_mechanism_metadata(
         args.vote_quorum, args.eligibility_mode, args.fee_beneficiary,
         approval_slots_active=bool(getattr(args, "approval_slots", False)),
+        recipient_controls_active=bool(getattr(args, "recipient_controls", False)),
         faucet_amount=args.faucet_amount,
     )
     consensus_meta = {

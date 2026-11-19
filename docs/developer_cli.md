@@ -410,6 +410,9 @@ tau-testnet keys delete alice --yes
 
 ## Transactions
 
+To require instant payment or accept transfers only from specific senders, see
+[Accepting payments](recipient_controls.md).
+
 ```bash
 # Single-recipient transfer
 tau-testnet tx send --key alice --to <recipient_pubkey> --amount 10

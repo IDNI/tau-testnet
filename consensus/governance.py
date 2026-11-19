@@ -93,6 +93,7 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "fee_beneficiary",
     "max_rule_txs_per_block",
     "approval_slots_active",
+    "recipient_controls_active",
 })
 
 
@@ -106,6 +107,12 @@ def validate_approval_slots_active(value: Any) -> Optional[str]:
     """
     if value is not True:
         return "must be true; approval slots cannot be deactivated once active"
+    return None
+
+
+def validate_recipient_controls_active(value: Any) -> Optional[str]:
+    if value is not True:
+        return "must be true; installed recipient policies cannot be deactivated"
     return None
 
 
@@ -198,6 +205,7 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    recipient_controls_active: bool = False,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -234,6 +242,8 @@ def build_mechanism_metadata(
     # unaffected.
     if approval_slots_active:
         mech["approval_slots_active"] = True
+    if recipient_controls_active:
+        mech["recipient_controls_active"] = True
     if approval_requests_root:
         mech["approval_requests_root"] = approval_requests_root
     if faucet_amount:
@@ -457,6 +467,7 @@ class ConsensusLifecycleManager:
         # rollback, reorg and competing branches. Read from the PARENT snapshot,
         # so an activation recorded in block H governs H+1 onward.
         self.approval_slots_active: bool = False
+        self.recipient_controls_active: bool = False
         # Pinned by genesis for the life of the network: no patch sets it.
         # Bound into the meta hash only when non-zero.
         self.faucet_amount: int = 0
@@ -544,6 +555,7 @@ class ConsensusLifecycleManager:
                 else self.approval_requests.requests_root().hex()
             ),
             approval_slots_active=self.approval_slots_active,
+            recipient_controls_active=self.recipient_controls_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
         )
@@ -628,6 +640,12 @@ class ConsensusLifecycleManager:
             if err:
                 raise ValueError(f"max_rule_txs_per_block: {err}")
             self.max_rule_txs_per_block = int(budget)
+
+        if "recipient_controls_active" in patch:
+            err = validate_recipient_controls_active(patch["recipient_controls_active"])
+            if err:
+                raise ValueError(f"recipient_controls_active: {err}")
+            self.recipient_controls_active = True
 
         if "approval_slots_active" in patch:
             # Same "only consensus-binding validation" reasoning as
