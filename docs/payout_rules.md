@@ -86,3 +86,7 @@ caps, `paid_this_period`, `left_this_period` and the input conventions above.
 
 `payout_rule_remove` (owner): `rule_id`. Removal follows the account's normal
 rules; protected policy administration (#33) can later lock it.
+
+Every transaction above also signs `chain_id` (the network's genesis hash,
+RPC `getchainid`); a node of any other network refuses it. See
+[programmable_payments.md](programmable_payments.md#design-decisions).

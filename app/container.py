@@ -22,6 +22,7 @@ from commands import (
     getapprovalrequests,
     getapprovalslots,
     getrequestid,
+    getchainid,
     getgrants,
     getpayoutrules,
     getreceiveroute,
@@ -91,6 +92,7 @@ class ServiceContainer:
         "getretractables": getretractables,
         "getretractableid": getretractableid,
         # Conditional grants (programmable payments).
+        "getchainid": getchainid,
         "getgrants": getgrants,
         "getpayoutrules": getpayoutrules,
         "getreceiveroute": getreceiveroute,

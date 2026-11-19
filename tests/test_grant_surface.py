@@ -5,6 +5,8 @@ import types
 
 import pytest
 
+from chain_ids import TEST_CHAIN_ID
+
 import chain_state
 import db
 from commands import getgrants
@@ -88,15 +90,15 @@ def test_admission_uses_the_committed_book(temp_database):
     gid = book.submit(_terms(now, start_at=0), now)
     _commit(book)
     view = TipAdmissionView()
-    ok = validate_grant_payload({"tx_type": "grant_draw", "sender_pubkey": BOB,
+    ok = validate_grant_payload({"chain_id": TEST_CHAIN_ID, "tx_type": "grant_draw", "sender_pubkey": BOB,
                                  "grant_id": gid.hex(), "recipient_pubkey": ALICE,
                                  "amount": 100}, view)
     assert ok.is_valid, ok.error
-    over_cap = validate_grant_payload({"tx_type": "grant_draw", "sender_pubkey": BOB,
+    over_cap = validate_grant_payload({"chain_id": TEST_CHAIN_ID, "tx_type": "grant_draw", "sender_pubkey": BOB,
                                        "grant_id": gid.hex(), "recipient_pubkey": ALICE,
                                        "amount": 101}, view)
     assert not over_cap.is_valid and "spending cap" in over_cap.error
-    wrong_signer = validate_grant_payload({"tx_type": "grant_draw", "sender_pubkey": ALICE,
+    wrong_signer = validate_grant_payload({"chain_id": TEST_CHAIN_ID, "tx_type": "grant_draw", "sender_pubkey": ALICE,
                                            "grant_id": gid.hex(), "recipient_pubkey": ALICE,
                                            "amount": 1}, view)
     assert not wrong_signer.is_valid
@@ -104,7 +106,7 @@ def test_admission_uses_the_committed_book(temp_database):
 
 def test_admission_rejects_bad_create(temp_database):
     view = TipAdmissionView()
-    res = validate_grant_payload({"tx_type": "grant_create", "sender_pubkey": ALICE,
+    res = validate_grant_payload({"chain_id": TEST_CHAIN_ID, "tx_type": "grant_create", "sender_pubkey": ALICE,
                                   "grantee_pubkey": BOB, "amount": 10,
                                   "sequence_number": 0, "expires_at": 1}, view)
     assert not res.is_valid and "future" in res.error
@@ -129,7 +131,7 @@ def test_getgrants_reports_drawable_now(temp_database):
 
 
 def test_every_grant_term_is_signed():
-    base = tx_mod.build_grant_create_tx(
+    base = tx_mod.build_grant_create_tx(chain_id=TEST_CHAIN_ID, 
         sender_pubkey=ALICE, sequence_number=0, expiration_time=10,
         expire_at_height=5, grantee_pubkey=BOB, amount=10, expires_at=100,
     )
@@ -142,7 +144,7 @@ def test_every_grant_term_is_signed():
         changed = dict(base, **{field: value})
         assert signing_message_bytes(changed) != ref, field
 
-    draw = tx_mod.build_grant_draw_tx(sender_pubkey=BOB, sequence_number=0,
+    draw = tx_mod.build_grant_draw_tx(chain_id=TEST_CHAIN_ID, sender_pubkey=BOB, sequence_number=0,
                                       expiration_time=10, expire_at_height=5,
                                       grant_id="ab" * 32, recipient_pubkey=SHOP, amount=5)
     ref = signing_message_bytes(draw)
@@ -180,7 +182,7 @@ def test_cli_grant_create_parses_the_demo():
 
 
 def test_builder_output_parses_to_the_same_terms():
-    tx = tx_mod.build_grant_create_tx(
+    tx = tx_mod.build_grant_create_tx(chain_id=TEST_CHAIN_ID, 
         sender_pubkey=ALICE, sequence_number=3, expiration_time=10,
         expire_at_height=5, grantee_pubkey=BOB, amount=5000,
         start_at=1_796_083_200, expires_at=1_772_323_200, spend_cap=500,

@@ -5,6 +5,8 @@ is the in-process MockPolicyEvaluator, whose outputs are scripted per rule text
 from the very inputs the engine feeds (i1 balance, i2 count, i3 period, i13+).
 """
 import itertools
+
+from chain_ids import TEST_CHAIN_ID
 import json
 import types
 from datetime import datetime, timezone
@@ -53,7 +55,7 @@ def payout_pool():
 def _base(tx_type, sender, seq, fee_limit=100):
     return {"tx_id": f"{tx_type}-{next(_SEQ)}", "tx_type": tx_type,
             "sender_pubkey": sender, "sequence_number": seq,
-            "expiration_time": FAR, "expire_at_height": 1000, "fee_limit": str(fee_limit)}
+            "expiration_time": FAR, "expire_at_height": 1000, "chain_id": TEST_CHAIN_ID, "fee_limit": str(fee_limit)}
 
 
 def install_tx(seq=0, rule=ROYALTY, recipients=(BOB, CAROL), **over):
@@ -206,14 +208,14 @@ def test_persistence_rpc_signing_cli(temp_database):
     with pytest.raises(chain_state.DatabaseError):
         chain_state._restore_payouts(types.SimpleNamespace())
 
-    base = tx_mod.build_payout_install_tx(
+    base = tx_mod.build_payout_install_tx(chain_id=TEST_CHAIN_ID, 
         sender_pubkey=ALICE, sequence_number=0, expiration_time=1, expire_at_height=1,
         rule_text=ROYALTY, recipients=[BOB], max_per_execution=1, max_per_period=1)
     ref = signing_message_bytes(base)
     for k, v in [("rule_text", "y"), ("recipients", [CAROL]), ("max_per_execution", 2),
                  ("max_per_period", 2), ("period_kind", 1), ("expires_at", 5)]:
         assert signing_message_bytes(dict(base, **{k: v})) != ref, k
-    ex = tx_mod.build_payout_execute_tx(sender_pubkey=BOB, sequence_number=0,
+    ex = tx_mod.build_payout_execute_tx(chain_id=TEST_CHAIN_ID, sender_pubkey=BOB, sequence_number=0,
                                         expiration_time=1, expire_at_height=1,
                                         rule_id="ab" * 32, inputs={"13": "5"})
     assert signing_message_bytes(dict(ex, inputs={"13": "6"})) != signing_message_bytes(ex)

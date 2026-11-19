@@ -125,3 +125,7 @@ All fields are root fields of the signed payload.
 `grant_draw` (signed by the grantee): `grant_id`, `recipient_pubkey`, `amount`.
 
 `grant_cancel` (signed by the grantor): `grant_id`.
+
+Every transaction above also signs `chain_id` (the network's genesis hash,
+RPC `getchainid`); a node of any other network refuses it. See
+[programmable_payments.md](programmable_payments.md#design-decisions).

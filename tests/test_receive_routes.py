@@ -1,5 +1,7 @@
 """Receive routes (#35): book rules, block apply, persistence, RPC and CLI."""
 import itertools
+
+from chain_ids import TEST_CHAIN_ID
 import json
 import types
 from datetime import datetime, timezone
@@ -34,7 +36,7 @@ T0 = at(2026, 11, 20)
 def _base(tx_type, sender, seq, fee_limit=100):
     return {"tx_id": f"{tx_type}-{next(_SEQ)}", "tx_type": tx_type,
             "sender_pubkey": sender, "sequence_number": seq,
-            "expiration_time": FAR, "expire_at_height": 1000, "fee_limit": str(fee_limit)}
+            "expiration_time": FAR, "expire_at_height": 1000, "chain_id": TEST_CHAIN_ID, "fee_limit": str(fee_limit)}
 
 
 def route_tx(owner, dest, bps, seq=0, **over):
@@ -184,7 +186,7 @@ def test_rpc_reports_route_and_semantics(temp_database):
 
 
 def test_route_terms_are_signed_and_cli_parses():
-    base = tx_mod.build_route_set_tx(sender_pubkey=BOB, sequence_number=0, expiration_time=1,
+    base = tx_mod.build_route_set_tx(chain_id=TEST_CHAIN_ID, sender_pubkey=BOB, sequence_number=0, expiration_time=1,
                                      expire_at_height=1, destination_pubkey=CAROL, bps=2000)
     ref = signing_message_bytes(base)
     for k, v in [("destination_pubkey", ALICE), ("bps", 2001), ("min_incoming", 1),

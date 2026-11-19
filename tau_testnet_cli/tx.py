@@ -746,9 +746,17 @@ def build_retract_transfer_tx(
 
 
 def _grant_base(tx_type, sender_pubkey, sequence_number, expiration_time,
-                expire_at_height, fee_limit):
+                expire_at_height, fee_limit, chain_id=""):
+    """Common envelope of the programmable-payment types.
+
+    ``chain_id`` is the target network's genesis block hash (RPC ``getchainid``);
+    it is signed, and a node of any other network refuses the transaction.
+    """
+    if not isinstance(chain_id, str) or len(chain_id) != 64:
+        raise ValueError("chain_id must be the 64-hex genesis hash (RPC getchainid)")
     return {
         "tx_type": tx_type,
+        "chain_id": chain_id.lower(),
         "sender_pubkey": sender_pubkey,
         "sequence_number": sequence_number,
         "expiration_time": expiration_time,
@@ -775,7 +783,7 @@ def build_grant_create_tx(
     hour_mask: int = 0xFFFFFF,
     refund_to_pubkey: str | None = None,
     revocable: bool = False,
-    fee_limit: str | int = "0",
+    fee_limit: str | int = "0", chain_id: str = "",
 ) -> dict:
     """Construct a ``tx_type='grant_create'`` payload (without signature).
 
@@ -787,7 +795,7 @@ def build_grant_create_tx(
     if not isinstance(amount, int) or isinstance(amount, bool) or amount < 1:
         raise ValueError("amount must be a positive integer")
     tx = _grant_base("grant_create", sender_pubkey, sequence_number,
-                     expiration_time, expire_at_height, fee_limit)
+                     expiration_time, expire_at_height, fee_limit, chain_id=chain_id)
     tx.update({
         "grantee_pubkey": grantee_pubkey.lower(),
         "refund_to_pubkey": (refund_to_pubkey or sender_pubkey).lower(),
@@ -814,7 +822,7 @@ def build_grant_draw_tx(
     grant_id: str,
     recipient_pubkey: str,
     amount: int,
-    fee_limit: str | int = "0",
+    fee_limit: str | int = "0", chain_id: str = "",
 ) -> dict:
     """Construct a ``tx_type='grant_draw'`` payload (without signature)."""
     if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
@@ -822,7 +830,7 @@ def build_grant_draw_tx(
     if not isinstance(amount, int) or isinstance(amount, bool) or amount < 1:
         raise ValueError("amount must be a positive integer")
     tx = _grant_base("grant_draw", sender_pubkey, sequence_number,
-                     expiration_time, expire_at_height, fee_limit)
+                     expiration_time, expire_at_height, fee_limit, chain_id=chain_id)
     tx.update({
         "grant_id": grant_id.lower(),
         "recipient_pubkey": recipient_pubkey.lower(),
@@ -837,11 +845,11 @@ def build_grant_cancel_tx(
     sequence_number: int,
     expiration_time: int,
     expire_at_height: int,
-    grant_id: str,
+    grant_id: str, chain_id: str = "",
 ) -> dict:
     """Construct a fee-exempt ``tx_type='grant_cancel'`` payload (without signature)."""
     tx = _grant_base("grant_cancel", sender_pubkey, sequence_number,
-                     expiration_time, expire_at_height, "0")
+                     expiration_time, expire_at_height, "0", chain_id=chain_id)
     tx["grant_id"] = grant_id.lower()
     return tx
 
@@ -862,7 +870,7 @@ def build_standing_create_tx(
     due_offset_seconds: int = 0,
     end_at: int = 0,
     max_occurrences: int = 0,
-    fee_limit: str | int = "0",
+    fee_limit: str | int = "0", chain_id: str = "",
 ) -> dict:
     """Construct a ``standing_payment_create`` payload (without signature)."""
     if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
@@ -872,7 +880,7 @@ def build_standing_create_tx(
     if not end_at and not max_occurrences:
         raise ValueError("give an end: end_at, max_occurrences or both")
     tx = _grant_base("standing_payment_create", sender_pubkey, sequence_number,
-                     expiration_time, expire_at_height, fee_limit)
+                     expiration_time, expire_at_height, fee_limit, chain_id=chain_id)
     tx.update({
         "recipient_pubkey": recipient_pubkey.lower(),
         "amount": amount,
@@ -890,22 +898,22 @@ def build_standing_create_tx(
 
 def build_standing_execute_tx(
     *, sender_pubkey: str, sequence_number: int, expiration_time: int,
-    expire_at_height: int, standing_id: str, period: int, fee_limit: str | int = "0",
+    expire_at_height: int, standing_id: str, period: int, fee_limit: str | int = "0", chain_id: str = "",
 ) -> dict:
     """Construct a ``standing_payment_execute`` payload; anyone may sign it."""
     tx = _grant_base("standing_payment_execute", sender_pubkey, sequence_number,
-                     expiration_time, expire_at_height, fee_limit)
+                     expiration_time, expire_at_height, fee_limit, chain_id=chain_id)
     tx.update({"standing_id": standing_id.lower(), "period": int(period)})
     return tx
 
 
 def build_standing_cancel_tx(
     *, sender_pubkey: str, sequence_number: int, expiration_time: int,
-    expire_at_height: int, standing_id: str,
+    expire_at_height: int, standing_id: str, chain_id: str = "",
 ) -> dict:
     """Construct a fee-exempt ``standing_payment_cancel`` payload."""
     tx = _grant_base("standing_payment_cancel", sender_pubkey, sequence_number,
-                     expiration_time, expire_at_height, "0")
+                     expiration_time, expire_at_height, "0", chain_id=chain_id)
     tx["standing_id"] = standing_id.lower()
     return tx
 
@@ -914,13 +922,13 @@ def build_route_set_tx(
     *, sender_pubkey: str, sequence_number: int, expiration_time: int,
     expire_at_height: int, destination_pubkey: str, bps: int, min_incoming: int = 0,
     activate_at: int = 0, expires_at: int = 0, locked_until: int = 0,
-    fee_limit: str | int = "0",
+    fee_limit: str | int = "0", chain_id: str = "",
 ) -> dict:
     """Construct a ``receive_route_set`` payload (without signature)."""
     if not isinstance(destination_pubkey, str) or len(destination_pubkey) != 96:
         raise ValueError("destination_pubkey must be a 96-character hex public key")
     tx = _grant_base("receive_route_set", sender_pubkey, sequence_number,
-                     expiration_time, expire_at_height, fee_limit)
+                     expiration_time, expire_at_height, fee_limit, chain_id=chain_id)
     tx.update({
         "destination_pubkey": destination_pubkey.lower(), "bps": int(bps),
         "min_incoming": int(min_incoming), "activate_at": int(activate_at),
@@ -930,22 +938,22 @@ def build_route_set_tx(
 
 
 def build_route_remove_tx(
-    *, sender_pubkey: str, sequence_number: int, expiration_time: int, expire_at_height: int,
+    *, sender_pubkey: str, sequence_number: int, expiration_time: int, expire_at_height: int, chain_id: str = "",
 ) -> dict:
     """Construct a fee-exempt ``receive_route_remove`` payload (without signature)."""
     return _grant_base("receive_route_remove", sender_pubkey, sequence_number,
-                       expiration_time, expire_at_height, "0")
+                       expiration_time, expire_at_height, "0", chain_id=chain_id)
 
 
 def build_payout_install_tx(
     *, sender_pubkey: str, sequence_number: int, expiration_time: int,
     expire_at_height: int, rule_text: str, recipients: list, max_per_execution: int,
     max_per_period: int, period_kind: int = 3, period_seconds: int = 0,
-    start_at: int = 0, expires_at: int = 0, fee_limit: str | int = "0",
+    start_at: int = 0, expires_at: int = 0, fee_limit: str | int = "0", chain_id: str = "",
 ) -> dict:
     """Construct a ``payout_rule_install`` payload (without signature)."""
     tx = _grant_base("payout_rule_install", sender_pubkey, sequence_number,
-                     expiration_time, expire_at_height, fee_limit)
+                     expiration_time, expire_at_height, fee_limit, chain_id=chain_id)
     tx.update({
         "rule_text": rule_text.strip(), "recipients": [r.lower() for r in recipients],
         "max_per_execution": int(max_per_execution), "max_per_period": int(max_per_period),
@@ -958,11 +966,11 @@ def build_payout_install_tx(
 def build_payout_execute_tx(
     *, sender_pubkey: str, sequence_number: int, expiration_time: int,
     expire_at_height: int, rule_id: str, inputs: dict | None = None,
-    fee_limit: str | int = "0",
+    fee_limit: str | int = "0", chain_id: str = "",
 ) -> dict:
     """Construct a ``payout_execute`` payload; anyone may sign it."""
     tx = _grant_base("payout_execute", sender_pubkey, sequence_number,
-                     expiration_time, expire_at_height, fee_limit)
+                     expiration_time, expire_at_height, fee_limit, chain_id=chain_id)
     tx.update({"rule_id": rule_id.lower(),
                "inputs": {str(k): str(v) for k, v in (inputs or {}).items()}})
     return tx
@@ -970,10 +978,10 @@ def build_payout_execute_tx(
 
 def build_payout_remove_tx(
     *, sender_pubkey: str, sequence_number: int, expiration_time: int,
-    expire_at_height: int, rule_id: str,
+    expire_at_height: int, rule_id: str, chain_id: str = "",
 ) -> dict:
     """Construct a fee-exempt ``payout_rule_remove`` payload."""
     tx = _grant_base("payout_rule_remove", sender_pubkey, sequence_number,
-                     expiration_time, expire_at_height, "0")
+                     expiration_time, expire_at_height, "0", chain_id=chain_id)
     tx["rule_id"] = rule_id.lower()
     return tx

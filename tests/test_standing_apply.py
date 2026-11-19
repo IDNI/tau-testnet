@@ -1,5 +1,7 @@
 """Block-apply semantics for standing payments, mapped to #34's acceptance cases."""
 import itertools
+
+from chain_ids import TEST_CHAIN_ID
 from datetime import datetime, timezone
 
 from consensus import periods
@@ -27,7 +29,7 @@ def month(y, m):
 def _base(tx_type, sender, seq, fee_limit):
     return {"tx_id": f"{tx_type}-{next(_SEQ)}", "tx_type": tx_type,
             "sender_pubkey": sender, "sequence_number": seq,
-            "expiration_time": FAR, "expire_at_height": 1000,
+            "expiration_time": FAR, "expire_at_height": 1000, "chain_id": TEST_CHAIN_ID,
             "fee_limit": str(fee_limit)}
 
 

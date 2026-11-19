@@ -118,3 +118,7 @@ value (`standing_v1`) and every id is recomputed on load.
 `standing_payment_execute` (anyone): `standing_id`, `period`.
 
 `standing_payment_cancel` (payer): `standing_id`.
+
+Every transaction above also signs `chain_id` (the network's genesis hash,
+RPC `getchainid`); a node of any other network refuses it. See
+[programmable_payments.md](programmable_payments.md#design-decisions).

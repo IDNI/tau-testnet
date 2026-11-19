@@ -48,6 +48,7 @@ from consensus.approvals import (
     validate_request_shape,
     validate_rule_change_shape,
 )
+from consensus.chain_binding import check_chain_id
 from consensus.payouts import (
     PAYOUT_POLICY_POOL,
     PayoutShapeError,
@@ -1663,6 +1664,9 @@ def validate_grant_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionRes
     real block timestamp. For grant_create the o5 verdict, fee and funds checks
     run on the sendtx path, as for a retractable park.
     """
+    chain_error = check_chain_id(tx)
+    if chain_error:
+        return format_error(f"{tx.get('tx_type')} rejected: {chain_error}", code="WRONG_CHAIN_ID")
     tx_type = tx.get("tx_type")
     sender = tx.get("sender_pubkey")
     ts = tip_view.next_block_timestamp
@@ -1716,6 +1720,9 @@ def validate_payout_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionRe
     never run is refused up front). An execution's amounts are computed and
     judged at apply, on the real block and balances.
     """
+    chain_error = check_chain_id(tx)
+    if chain_error:
+        return format_error(f"{tx.get('tx_type')} rejected: {chain_error}", code="WRONG_CHAIN_ID")
     tx_type = tx.get("tx_type")
     ts = tip_view.next_block_timestamp
     book = tip_view.payout_book()
@@ -1759,6 +1766,9 @@ def validate_payout_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionRe
 
 def validate_route_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """Screens for receive_route_set / receive_route_remove, shared with apply."""
+    chain_error = check_chain_id(tx)
+    if chain_error:
+        return format_error(f"{tx.get('tx_type')} rejected: {chain_error}", code="WRONG_CHAIN_ID")
     tx_type = tx.get("tx_type")
     ts = tip_view.next_block_timestamp
     book = tip_view.route_book()
@@ -1787,6 +1797,9 @@ def validate_standing_payload(tx: Dict, tip_view: TipAdmissionView) -> Admission
     advisory next-block timestamp. The payer's o5 verdict and funds for an
     execution are judged at apply, on the real block.
     """
+    chain_error = check_chain_id(tx)
+    if chain_error:
+        return format_error(f"{tx.get('tx_type')} rejected: {chain_error}", code="WRONG_CHAIN_ID")
     tx_type = tx.get("tx_type")
     sender = tx.get("sender_pubkey")
     ts = tip_view.next_block_timestamp

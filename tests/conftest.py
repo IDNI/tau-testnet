@@ -511,3 +511,12 @@ def pytest_unconfigure(config):
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(_exit_status)
+
+
+@pytest.fixture(autouse=True)
+def _programmable_payments_chain_id(monkeypatch):
+    """Programmable-payment txs are bound to the genesis hash; tests use a fixed one."""
+    from consensus import chain_binding
+    from chain_ids import TEST_CHAIN_ID
+
+    monkeypatch.setattr(chain_binding, "current_chain_id", lambda: TEST_CHAIN_ID)

@@ -2722,6 +2722,24 @@ def main(argv: list[str] | None = None) -> int:
 
 
 
+# --- Chain binding for programmable payments -----------------------------------
+
+_CHAIN_IDS: dict = {}
+
+
+def _chain_id(args: argparse.Namespace) -> str:
+    """The node's chain id (genesis hash), which programmable-payment txs sign."""
+    key = (getattr(args, "host", None), getattr(args, "port", None))
+    if key not in _CHAIN_IDS:
+        response = _send(args, "getchainid")
+        if rpc_mod.is_error_response(response):
+            raise _PayloadError(f"could not read the chain id: {response}")
+        data = parse_json_response(response)
+        data = data.get("data", data) if isinstance(data, dict) else {}
+        _CHAIN_IDS[key] = str(data.get("chain_id", ""))
+    return _CHAIN_IDS[key]
+
+
 # --- Conditional grants (programmable payments) ------------------------------
 
 _WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
@@ -2787,6 +2805,7 @@ def cmd_grant_create(args: argparse.Namespace) -> int:
     def _build(sender_pubkey, sequence_number, expire_at_height):
         now = int(_now())
         payload = tx_mod.build_grant_create_tx(
+            chain_id=_chain_id(args),
             sender_pubkey=sender_pubkey,
             sequence_number=sequence_number,
             expiration_time=min(now + args.expiry, args.expires - 1),
@@ -2819,6 +2838,7 @@ def cmd_grant_create(args: argparse.Namespace) -> int:
 def cmd_grant_draw(args: argparse.Namespace) -> int:
     def _build(sender_pubkey, sequence_number, expire_at_height):
         return tx_mod.build_grant_draw_tx(
+            chain_id=_chain_id(args),
             sender_pubkey=sender_pubkey,
             sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry,
@@ -2834,6 +2854,7 @@ def cmd_grant_draw(args: argparse.Namespace) -> int:
 def cmd_grant_cancel(args: argparse.Namespace) -> int:
     def _build(sender_pubkey, sequence_number, expire_at_height):
         return tx_mod.build_grant_cancel_tx(
+            chain_id=_chain_id(args),
             sender_pubkey=sender_pubkey,
             sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry,
@@ -2965,6 +2986,7 @@ def cmd_standing_create(args: argparse.Namespace) -> int:
     def _build(sender_pubkey, sequence_number, expire_at_height):
         now = int(_now())
         payload = tx_mod.build_standing_create_tx(
+            chain_id=_chain_id(args),
             sender_pubkey=sender_pubkey,
             sequence_number=sequence_number,
             expiration_time=now + args.expiry,
@@ -3000,6 +3022,7 @@ def cmd_standing_execute(args: argparse.Namespace) -> int:
                 args, args.standing_id.lower(), (args.party or sender_pubkey).lower()
             )
         return tx_mod.build_standing_execute_tx(
+            chain_id=_chain_id(args),
             sender_pubkey=sender_pubkey,
             sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry,
@@ -3014,6 +3037,7 @@ def cmd_standing_execute(args: argparse.Namespace) -> int:
 def cmd_standing_cancel(args: argparse.Namespace) -> int:
     def _build(sender_pubkey, sequence_number, expire_at_height):
         return tx_mod.build_standing_cancel_tx(
+            chain_id=_chain_id(args),
             sender_pubkey=sender_pubkey,
             sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry,
@@ -3119,6 +3143,7 @@ def _parse_percent(value: str) -> int:
 def cmd_route_set(args: argparse.Namespace) -> int:
     def _build(sender_pubkey, sequence_number, expire_at_height):
         return tx_mod.build_route_set_tx(
+            chain_id=_chain_id(args),
             sender_pubkey=sender_pubkey, sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry, expire_at_height=expire_at_height,
             destination_pubkey=args.to, bps=args.share, min_incoming=int(args.min or 0),
@@ -3131,6 +3156,7 @@ def cmd_route_set(args: argparse.Namespace) -> int:
 def cmd_route_remove(args: argparse.Namespace) -> int:
     def _build(sender_pubkey, sequence_number, expire_at_height):
         return tx_mod.build_route_remove_tx(
+            chain_id=_chain_id(args),
             sender_pubkey=sender_pubkey, sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry, expire_at_height=expire_at_height,
         )
@@ -3220,6 +3246,7 @@ def cmd_payout_install(args: argparse.Namespace) -> int:
 
     def _build(sender_pubkey, sequence_number, expire_at_height):
         payload = tx_mod.build_payout_install_tx(
+            chain_id=_chain_id(args),
             sender_pubkey=sender_pubkey, sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry, expire_at_height=expire_at_height,
             rule_text=rule_text, recipients=args.recipient,
@@ -3242,6 +3269,7 @@ def cmd_payout_install(args: argparse.Namespace) -> int:
 def cmd_payout_execute(args: argparse.Namespace) -> int:
     def _build(sender_pubkey, sequence_number, expire_at_height):
         return tx_mod.build_payout_execute_tx(
+            chain_id=_chain_id(args),
             sender_pubkey=sender_pubkey, sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry, expire_at_height=expire_at_height,
             rule_id=args.rule_id, inputs=dict(args.input or []),
@@ -3252,6 +3280,7 @@ def cmd_payout_execute(args: argparse.Namespace) -> int:
 def cmd_payout_remove(args: argparse.Namespace) -> int:
     def _build(sender_pubkey, sequence_number, expire_at_height):
         return tx_mod.build_payout_remove_tx(
+            chain_id=_chain_id(args),
             sender_pubkey=sender_pubkey, sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry, expire_at_height=expire_at_height,
             rule_id=args.rule_id,

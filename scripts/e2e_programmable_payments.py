@@ -64,8 +64,10 @@ class PP(h.Signer):
 
     def _env(self, node, name):
         seq, tip = self._envelope(node, name)
+        chain_id = node.rpc("getchainid")["data"]["chain_id"]
         return dict(sender_pubkey=self.pk(name), sequence_number=seq,
-                    expiration_time=int(time.time()) + 3600, expire_at_height=tip + 1000)
+                    expiration_time=int(time.time()) + 3600, expire_at_height=tip + 1000,
+                    chain_id=chain_id)
 
     def send(self, node, name, payload):
         return self.submit(node, self.sign(name, payload))
@@ -240,6 +242,14 @@ def scenario_p(node, sg):
     return rid
 
 
+def scenario_c(node, sg):
+    say("c. cross-network replay: a tx signed for another chain id is refused")
+    env = sg._env(node, "r_sender")
+    env["chain_id"] = "9a" * 32
+    p = sg.tx.build_route_remove_tx(**env)
+    refused(sg.send(node, "r_sender", p), "c: other network's chain_id", "WRONG_CHAIN_ID")
+
+
 def scenario_x(node1, node2, sg):
     say("x. restart and follower sync")
     snap = {
@@ -291,6 +301,7 @@ def run(base, log_dir, deadline):
         scenario_s(node1, sg)
         scenario_p(node1, sg)
         scenario_g(node1, sg)
+        scenario_c(node1, sg)
         scenario_x(node1, node2, sg)
     finally:
         h.stop_all()

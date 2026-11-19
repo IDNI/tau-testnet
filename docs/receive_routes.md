@@ -75,3 +75,7 @@ the meta hash only once the first route is installed. It is persisted as
 
 A bounded list of destinations, and removal of a locked route with the
 destination's co-signature through protected policy administration (#33).
+
+Every transaction above also signs `chain_id` (the network's genesis hash,
+RPC `getchainid`); a node of any other network refuses it. See
+[programmable_payments.md](programmable_payments.md#design-decisions).

@@ -5,6 +5,8 @@ retractable apply tests, and checks full balance maps, escrow and the open set
 after each block, including the Alice/Bob demo end to end.
 """
 import itertools
+
+from chain_ids import TEST_CHAIN_ID
 from datetime import datetime, timezone
 
 import pytest
@@ -36,8 +38,9 @@ def _base(tx_type, sender, seq, fee_limit):
         "sender_pubkey": sender,
         "sequence_number": seq,
         "expiration_time": FAR,
-        "expire_at_height": 1000,
+        "expire_at_height": 1000, "chain_id": TEST_CHAIN_ID,
         "fee_limit": str(fee_limit),
+        "chain_id": TEST_CHAIN_ID,
     }
 
 

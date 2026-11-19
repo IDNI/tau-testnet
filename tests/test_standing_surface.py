@@ -5,6 +5,8 @@ import types
 
 import pytest
 
+from chain_ids import TEST_CHAIN_ID
+
 import chain_state
 import db
 from commands import getstandingpayments
@@ -71,18 +73,18 @@ def test_admission_execute_due_and_not_due(temp_database):
     _commit(book)
     view = TipAdmissionView()
     period = t.period_of(view.next_block_timestamp)
-    ok = validate_standing_payload({"tx_type": "standing_payment_execute",
+    ok = validate_standing_payload({"chain_id": TEST_CHAIN_ID, "tx_type": "standing_payment_execute",
                                     "sender_pubkey": OTHER, "standing_id": sid.hex(),
                                     "period": period}, view)
     assert ok.is_valid, ok.error
-    bad = validate_standing_payload({"tx_type": "standing_payment_execute",
+    bad = validate_standing_payload({"chain_id": TEST_CHAIN_ID, "tx_type": "standing_payment_execute",
                                      "sender_pubkey": OTHER, "standing_id": sid.hex(),
                                      "period": period + 1}, view)
     assert not bad.is_valid and bad.code == "STANDING_NOT_DUE"
 
 
 def test_admission_requires_an_end(temp_database):
-    res = validate_standing_payload({
+    res = validate_standing_payload({"chain_id": TEST_CHAIN_ID, 
         "tx_type": "standing_payment_create", "sender_pubkey": ALICE,
         "recipient_pubkey": BOB, "amount": 5, "sequence_number": 0,
         "period_kind": periods.PERIOD_DAY, "start_at": int(time.time()),
@@ -110,7 +112,7 @@ def test_rpc_reports_due_and_paid(temp_database):
 
 
 def test_every_schedule_term_is_signed():
-    base = tx_mod.build_standing_create_tx(
+    base = tx_mod.build_standing_create_tx(chain_id=TEST_CHAIN_ID, 
         sender_pubkey=ALICE, sequence_number=0, expiration_time=10, expire_at_height=5,
         recipient_pubkey=BOB, amount=10, period_kind=3, start_at=1, window_seconds=3600,
         due_day=31, max_occurrences=3)
@@ -120,7 +122,7 @@ def test_every_schedule_term_is_signed():
                  ("due_offset_seconds", 60), ("window_seconds", 7200), ("end_at", 99),
                  ("max_occurrences", 4)]:
         assert signing_message_bytes(dict(base, **{k: v})) != ref, k
-    ex = tx_mod.build_standing_execute_tx(sender_pubkey=OTHER, sequence_number=0,
+    ex = tx_mod.build_standing_execute_tx(chain_id=TEST_CHAIN_ID, sender_pubkey=OTHER, sequence_number=0,
                                           expiration_time=1, expire_at_height=1,
                                           standing_id="ab" * 32, period=7)
     assert signing_message_bytes(dict(ex, period=8)) != signing_message_bytes(ex)

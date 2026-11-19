@@ -33,6 +33,7 @@ from consensus.approvals import (
     TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
+from consensus.chain_binding import CHAIN_BOUND_TX_TYPES
 from consensus.routes import TX_TYPE_ROUTE_REMOVE, TX_TYPE_ROUTE_SET
 from consensus.payouts import (
     TX_TYPE_PAYOUT_EXECUTE,
@@ -184,6 +185,10 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["rule_id"] = payload.get("rule_id")
     elif tx_type == TX_TYPE_ROUTE_REMOVE:
         pass  # nothing beyond the common fields: it removes the signer's own route
+
+    if tx_type in CHAIN_BOUND_TX_TYPES:
+        # Programmable payments bind the network: see consensus.chain_binding.
+        signing_dict["chain_id"] = payload.get("chain_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

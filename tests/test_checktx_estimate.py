@@ -118,9 +118,14 @@ def _offer_row():
 
 
 def _envelope(tx_type, sender, fee_limit, **fields):
+    from consensus.chain_binding import CHAIN_BOUND_TX_TYPES
+    from chain_ids import TEST_CHAIN_ID
+
     tx = {"tx_type": tx_type, "sender_pubkey": sender, "sequence_number": 1,
           "expiration_time": FAR, "expire_at_height": NEXT_HEIGHT + 20,
           "fee_limit": fee_limit}
+    if tx_type in CHAIN_BOUND_TX_TYPES:
+        tx["chain_id"] = TEST_CHAIN_ID
     tx.update(fields)
     return tx
 

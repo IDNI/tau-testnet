@@ -91,6 +91,15 @@ one block the transactions apply first and the sweep after them, so a draw
 (which needs `ts < expires_at`) and the refund of the same grant can never both
 happen; a cancel and an execution in the same block are decided by block order.
 
+**Replay protection.** Every programmable-payment transaction signs
+`chain_id`, the genesis block hash of its network (RPC `getchainid`; the CLI
+fetches it). Admission and block apply refuse a transaction whose `chain_id`
+is not the chain's own, so a transaction signed for one network cannot be
+replayed on another; the check fails closed on a node that does not know its
+genesis yet. Older transaction types sign exactly as before. Within a chain,
+replay is prevented by the sender's sequence number and, for executions, by
+binding them to an object id and period.
+
 **State and compatibility.** Each feature is a book inside the consensus
 lifecycle manager (like retractable transfers), with a root bound into the
 consensus meta hash **only once the feature is first used**, so an existing

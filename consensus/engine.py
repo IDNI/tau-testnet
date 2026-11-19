@@ -34,6 +34,7 @@ from .approvals import (
     parse_rule_change_request_checked,
     parse_transfer_vote,
 )
+from .chain_binding import check_chain_id
 from .payouts import (
     PAYOUT_POLICY_POOL,
     PAYOUT_TX_TYPES,
@@ -2766,7 +2767,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if accepted_in_block and not hard_reject:
                     grants_book = lifecycle_mgr.grants
                     ts_now = int(block_timestamp or 0)
-                    reason = ""
+                    reason = check_chain_id(tx) or ""
                     op = None
                     try:
                         if tx_type == TX_TYPE_GRANT_CREATE:
@@ -2777,7 +2778,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             op = ("cancel", parse_grant_cancel(tx))
                     except GrantShapeError as exc:
                         reason = f"invalid {tx_type} ({exc})"
-                    if op is not None:
+                    if op is not None and not reason:
                         signer = (op[1].grantor_pubkey if op[0] != "draw"
                                   else op[1].grantee_pubkey)
                         if not isinstance(sender, str) or sender != signer:
@@ -2836,7 +2837,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if accepted_in_block and not hard_reject:
                     sbook = lifecycle_mgr.standing_payments
                     ts_now = int(block_timestamp or 0)
-                    reason = ""
+                    reason = check_chain_id(tx) or ""
                     op = None
                     try:
                         if tx_type == TX_TYPE_STANDING_CREATE:
@@ -2847,7 +2848,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             op = ("cancel", parse_standing_cancel(tx))
                     except StandingShapeError as exc:
                         reason = f"invalid {tx_type} ({exc})"
-                    if op is not None:
+                    if op is not None and not reason:
                         signer = {"create": lambda o: o.payer_pubkey,
                                   "execute": lambda o: o.executor_pubkey,
                                   "cancel": lambda o: o.payer_pubkey}[op[0]](op[1])
@@ -2897,14 +2898,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if accepted_in_block and not hard_reject:
                     rbook = lifecycle_mgr.receive_routes
                     ts_now = int(block_timestamp or 0)
-                    reason = ""
+                    reason = check_chain_id(tx) or ""
                     op = None
                     try:
                         op = (("set", parse_route_set(tx)) if tx_type == TX_TYPE_ROUTE_SET
                               else ("remove", parse_route_remove(tx)))
                     except RouteShapeError as exc:
                         reason = f"invalid {tx_type} ({exc})"
-                    if op is not None:
+                    if op is not None and not reason:
                         if not isinstance(sender, str) or sender != op[1].owner_pubkey:
                             reason = "sender is not the signer"
                         elif op[0] == "set":
@@ -2924,7 +2925,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if accepted_in_block and not hard_reject:
                     pbook = lifecycle_mgr.payout_rules
                     ts_now = int(block_timestamp or 0)
-                    reason = ""
+                    reason = check_chain_id(tx) or ""
                     op = None
                     try:
                         if tx_type == TX_TYPE_PAYOUT_INSTALL:
@@ -2939,7 +2940,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     except PayoutShapeError as exc:
                         reason = f"invalid {tx_type} ({exc})"
                     legs = []
-                    if op is not None:
+                    if op is not None and not reason:
                         if not isinstance(sender, str) or sender != signer:
                             reason = "sender is not the signer"
                         elif target_balances is None:
