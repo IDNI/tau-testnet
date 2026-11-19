@@ -150,6 +150,12 @@ sender's `o5` policy (evaluated with the approval slots empty), the fee step, an
 the balance. Scheduling a payment therefore cannot be used to get around a
 co-signature policy. Retractable transfers are not co-signable.
 
+A park is also judged by the **recipient's** policy when the chain has recipient
+controls active: a recipient can cap how long a payment to it may be held, down
+to "instant only" (cap 0). A park over the cap is refused at park time with
+`RECIPIENT_MAX_HOLD`, which carries the cap; a retract is never gated by it. See
+[recipient_controls.md](recipient_controls.md).
+
 Nothing is re-checked at release. The release sweep is a plain credit from the
 escrow book, with no Tau evaluation, so a later policy change, a changed fee
 model, or the sender's balance dropping to zero does not block it. This is also

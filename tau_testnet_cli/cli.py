@@ -2201,6 +2201,253 @@ def cmd_policy_change_cancel(args: argparse.Namespace) -> int:
     return _submit_rule_tx(args, _build)
 
 
+# --- Recipient controls: inbound policy composition -------------------------
+# Pure text composition for the recipient-side o5 gate (issues #47, #76). These
+# helpers print the exact `always ( ... ).` unit plus the command to register it
+# through the existing sendtx / rule-change flow; they touch no node and sign
+# nothing, so they work on a build where the consensus feature has not landed.
+
+
+def _receive_stream_indices() -> tuple:
+    """Hold stream indices, preferring the tau_defs constants the consensus
+    feature defines. Literal 17/27 until they land, so composition works on any
+    build (the frozen contract: i17 = hold seconds, i27 = hold blocks)."""
+    import tau_defs
+
+    return (
+        getattr(tau_defs, "HOLD_SECONDS_STREAM_INDEX", 17),
+        getattr(tau_defs, "HOLD_BLOCKS_STREAM_INDEX", 27),
+    )
+
+
+def _receive_pubkey(text: str) -> str:
+    """Normalize a pubkey argument (optional 0x prefix) to 96 lowercase hex."""
+    raw = (text or "").strip().lower()
+    if raw.startswith("0x"):
+        raw = raw[2:]
+    if len(raw) != 96 or any(c not in "0123456789abcdef" for c in raw):
+        raise _PayloadError(f"{text!r} is not a 96-character hex public key")
+    return raw
+
+
+def _receive_pubkey_literal(stream: str, pubkey: str) -> str:
+    return f"({stream}[t]:bv[384] = {{ #x{pubkey} }}:bv[384])"
+
+
+def _receive_hold_literal(index: int, value: int) -> str:
+    # Canonical comparison the gate reads to report the cap in a refusal.
+    return f"i{index}[t]:bv[64] <= {{ {value} }}:bv[64]"
+
+
+def _receive_cap(value, label: str):
+    if value is None:
+        return None
+    if not isinstance(value, int) or value < 0 or value >= (1 << 64):
+        raise _PayloadError(f"{label} must be an integer between 0 and 2^64-1")
+    return value
+
+
+def _receive_verdict() -> tuple:
+    """The o5 allow/block assignments at the consensus-pinned width (bv[24])."""
+    import tau_defs
+
+    width = tau_defs.USER_POLICY_BV_WIDTH
+    digits = width // 4
+    allow = (
+        f"(o5[t]:bv[{width}] = "
+        f"{{ #x{tau_defs.USER_POLICY_ALLOW_VALUE:0{digits}x} }}:bv[{width}])"
+    )
+    block = (
+        f"(o5[t]:bv[{width}] = "
+        f"{{ #x{tau_defs.USER_POLICY_BLOCK_VALUE:0{digits}x} }}:bv[{width}])"
+    )
+    return allow, block
+
+
+def _receive_unit(body: str) -> str:
+    allow, block = _receive_verdict()
+    return f"always ( {body} ? {allow} : {block} )."
+
+
+def _receive_dedupe(pubkeys) -> list:
+    seen, ordered = set(), []
+    for raw in pubkeys:
+        key = _receive_pubkey(raw)
+        if key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
+
+
+def compose_receive_allow_list(pubkeys) -> str:
+    """Inbound allow-list: allow when the sender (i3) is one of pubkeys.
+
+    The same clause judges the owner's outbound pass, where i3 is the owner, so
+    the owner's own key belongs in the list to keep outgoing transfers working.
+    """
+    keys = _receive_dedupe(pubkeys)
+    if not keys:
+        raise _PayloadError("an allow-list needs at least one sender pubkey")
+    if len(keys) > 32:
+        raise _PayloadError(
+            "an allow-list may name at most 32 senders (the clause comparison limit)"
+        )
+    body = " || ".join(_receive_pubkey_literal("i3", k) for k in keys)
+    if len(keys) > 1:
+        body = f"( {body} )"
+    return _receive_unit(body)
+
+
+def compose_receive_max_hold(seconds, blocks) -> str:
+    """Hold cap: allow when the hold is within the given bounds. A cap of 0 on a
+    stream admits only payments that feed 0 there (instant for that park kind).
+    Bounds whichever stream it reads; pass both to bound both park kinds."""
+    seconds = _receive_cap(seconds, "--max-hold-seconds")
+    blocks = _receive_cap(blocks, "--max-hold-blocks")
+    if seconds is None and blocks is None:
+        raise _PayloadError("give --max-hold-seconds and/or --max-hold-blocks")
+    sec_idx, blk_idx = _receive_stream_indices()
+    terms = []
+    if seconds is not None:
+        terms.append(_receive_hold_literal(sec_idx, seconds))
+    if blocks is not None:
+        terms.append(_receive_hold_literal(blk_idx, blocks))
+    body = " && ".join(terms)
+    if len(terms) > 1:
+        body = f"( {body} )"
+    return _receive_unit(body)
+
+
+def compose_receive_combined(owner, send_to, allow_from, seconds, blocks) -> str:
+    """One unit carrying an outbound whitelist, an inbound allow-list and hold
+    caps. Each conjunct reads 'if this is my own send (i3 = me), skip; otherwise
+    enforce', so the inbound rules never touch the owner's outgoing transfers.
+    """
+    owner = _receive_pubkey(owner)
+    send_to = _receive_dedupe(send_to or [])
+    allow_from = [k for k in _receive_dedupe(allow_from or []) if k != owner]
+    seconds = _receive_cap(seconds, "--max-hold-seconds")
+    blocks = _receive_cap(blocks, "--max-hold-blocks")
+    if not send_to and not allow_from and seconds is None and blocks is None:
+        raise _PayloadError(
+            "give at least one of --send-to, --allow-from, "
+            "--max-hold-seconds, --max-hold-blocks"
+        )
+    comparisons = (
+        (1 + len(send_to) if send_to else 0)
+        + (1 + len(allow_from) if allow_from else 0)
+        + (2 if seconds is not None else 0)
+        + (2 if blocks is not None else 0)
+    )
+    if comparisons > 32:
+        raise _PayloadError(
+            "this unit would exceed the 32-comparison clause limit; shorten the lists"
+        )
+    sec_idx, blk_idx = _receive_stream_indices()
+    mine = _receive_pubkey_literal("i3", owner)
+    conjuncts = []
+    if send_to:
+        listed = " || ".join(_receive_pubkey_literal("i4", k) for k in send_to)
+        conjuncts.append(f"( !{mine} || {listed} )")
+    if allow_from:
+        terms = [mine] + [_receive_pubkey_literal("i3", k) for k in allow_from]
+        conjuncts.append("( " + " || ".join(terms) + " )")
+    if seconds is not None:
+        conjuncts.append(f"( {mine} || {_receive_hold_literal(sec_idx, seconds)} )")
+    if blocks is not None:
+        conjuncts.append(f"( {mine} || {_receive_hold_literal(blk_idx, blocks)} )")
+    return _receive_unit(" && ".join(conjuncts))
+
+
+def _receive_register_guide(key_name) -> dict:
+    name = key_name or "<name>"
+    return {
+        "direct": f"tau-testnet tx send --key {name} --rule-file receive.tau",
+        "guarded": (
+            f"tau-testnet policy change request --key {name} --kind set "
+            "--file receive.tau --approver 18=<pubkey>"
+        ),
+        "note": (
+            "Save the clause to receive.tau first. It replaces your current o5 "
+            "clause; an o5 rule cannot share a transaction with transfers."
+        ),
+    }
+
+
+def _emit_receive(args, clause: str, notes, key_name) -> int:
+    guide = _receive_register_guide(key_name)
+    if args.json:
+        print_result(
+            {"clause": clause, "register": guide, "notes": list(notes)},
+            json_mode=True,
+        )
+        return EXIT_OK
+    # The clause alone goes to stdout so it can be redirected to a file; the
+    # registration guide and notes go to stderr.
+    print(clause)
+    print("Register this clause (it replaces your current o5 policy):", file=sys.stderr)
+    print(f"  {guide['direct']}", file=sys.stderr)
+    print("If your policy is guarded:", file=sys.stderr)
+    print(f"  {guide['guarded']}", file=sys.stderr)
+    for note in notes:
+        print(f"note: {note}", file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_policy_receive_allow_list(args: argparse.Namespace) -> int:
+    owner = None
+    try:
+        keys = list(args.address)
+        if getattr(args, "key", None) or getattr(args, "privkey", None):
+            _sk, owner = _resolve_signing_key(args)
+            keys = [owner] + keys
+        clause = compose_receive_allow_list(keys)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    notes = []
+    if owner is None:
+        notes.append(
+            "no --key/--privkey given, so the list omits your own pubkey and this "
+            "clause also blocks your outgoing transfers; add your key or use "
+            "'policy receive combined'"
+        )
+    return _emit_receive(args, clause, notes, getattr(args, "key", None))
+
+
+def cmd_policy_receive_max_hold(args: argparse.Namespace) -> int:
+    try:
+        clause = compose_receive_max_hold(args.max_hold_seconds, args.max_hold_blocks)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    notes = []
+    if args.max_hold_seconds == 0 and args.max_hold_blocks is None:
+        notes.append(
+            "a seconds cap of 0 refuses time parks only; height parks feed i17=0 "
+            "and pass. Add --max-hold-blocks 0 for instant-only."
+        )
+    if args.max_hold_blocks == 0 and args.max_hold_seconds is None:
+        notes.append(
+            "a blocks cap of 0 refuses height parks only; time parks feed i27=0 "
+            "and pass. Add --max-hold-seconds 0 for instant-only."
+        )
+    return _emit_receive(args, clause, notes, None)
+
+
+def cmd_policy_receive_combined(args: argparse.Namespace) -> int:
+    try:
+        _sk, owner = _resolve_signing_key(args)
+        clause = compose_receive_combined(
+            owner, args.send_to, args.allow_from,
+            args.max_hold_seconds, args.max_hold_blocks,
+        )
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _emit_receive(args, clause, [], getattr(args, "key", None))
+
+
 def _add_policy_subparsers(sub) -> None:
     """`tau-testnet policy ...` -- the rule-change guard and its requests."""
     import tau_defs
@@ -2306,6 +2553,58 @@ def _add_policy_subparsers(sub) -> None:
     p_ccan.add_argument("--expire-at-height", type=int,
                         help="Absolute expiry height (overrides --expire-in)")
     p_ccan.set_defaults(func=cmd_policy_change_cancel)
+
+    # --- receive: compose an inbound policy clause (issues #47, #76) ---
+    p_recv = psub.add_parser(
+        "receive", parents=common,
+        help="Compose an inbound policy clause (allow-list, hold caps)",
+    )
+    rsub = p_recv.add_subparsers(dest="receive_command", required=True)
+
+    p_al = rsub.add_parser(
+        "allow-list", parents=common,
+        help="Allow incoming payments only from the listed senders",
+    )
+    p_al.add_argument("address", nargs="+", help="Sender public key (96 hex); repeatable")
+    _key_group(p_al, required=False)
+    p_al.set_defaults(func=cmd_policy_receive_allow_list)
+
+    p_mh = rsub.add_parser(
+        "max-hold", parents=common,
+        help="Cap how long a payment to you may be held (0 = instant only)",
+    )
+    p_mh.add_argument(
+        "--max-hold-seconds", type=int, default=None,
+        help="Maximum hold in seconds (i17); 0 refuses every time park",
+    )
+    p_mh.add_argument(
+        "--max-hold-blocks", type=int, default=None,
+        help="Maximum hold in blocks (i27); 0 refuses every height park",
+    )
+    p_mh.set_defaults(func=cmd_policy_receive_max_hold)
+
+    p_cb = rsub.add_parser(
+        "combined", parents=common,
+        help="One unit: outbound whitelist + inbound allow-list + hold caps",
+    )
+    _key_group(p_cb, required=True)
+    p_cb.add_argument(
+        "--send-to", action="append", default=None, metavar="PUBKEY",
+        help="Outbound whitelist recipient (96 hex); repeatable",
+    )
+    p_cb.add_argument(
+        "--allow-from", action="append", default=None, metavar="PUBKEY",
+        help="Inbound allow-list sender (96 hex); repeatable",
+    )
+    p_cb.add_argument(
+        "--max-hold-seconds", type=int, default=None,
+        help="Maximum incoming hold in seconds (i17)",
+    )
+    p_cb.add_argument(
+        "--max-hold-blocks", type=int, default=None,
+        help="Maximum incoming hold in blocks (i27)",
+    )
+    p_cb.set_defaults(func=cmd_policy_receive_combined)
 
 
 # --- Retractable transfers --------------------------------------------------
