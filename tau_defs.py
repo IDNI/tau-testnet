@@ -258,6 +258,44 @@ COOLDOWN_NEVER_SENT = (1 << 63) - 1
 # feed, so by the time this is switched on the history is already accumulated.
 COOLDOWN_STREAM_ACTIVE = False
 
+# --- Recipient controls (issues #47, #76) ---
+# i17: how long the transfer being judged will be held before the recipient
+# can spend it, host-computed per transfer (bv[64]). A plain transfer holds
+# for 0. A retractable park holds release_at_time minus the block time, or
+# release_at_height minus the block height, in the park's native unit
+# (seconds for a time park, blocks for a height park):
+#
+#   always ((i17[t]:bv[64] <= {600}:bv[64]) ? (o5[t] = allow) : (o5[t] = block)).
+#
+# The recipient's policy reads it in both modes: a guarded-mode unit sees it
+# on the second evaluation pass (i12 = recipient), an o5 clause sees it on
+# the same inputs as the sender's clause (i3 = sender, i1 = amount).
+# A cap of 0 admits plain transfers and refuses every park.
+#
+# Like i2, the value is advisory at admission (next block time/height) and
+# authoritative at apply (the including block's), so a FEE rule reading it
+# would quote one fee and charge another: i17 joins
+# APPLY_MOCKED_INPUT_STREAMS in consensus/admission.py. A POLICY rule (o5)
+# reading it is deterministic across both -- the hold only shrinks as the
+# transaction lands later, so admission-accept implies apply-accept.
+TAU_INPUT_STREAM_HOLD_LENGTH = "i17"
+HOLD_LENGTH_STREAM_INDEX = 17
+HOLD_LENGTH_BV_WIDTH = 64
+
+# ON: the recipient gate is live in this build. Flipping it is a CONSENSUS
+# CHANGE requiring coordinated activation across the network -- same class as
+# editing a rules/ file, not a per-node preference. Three things change
+# together when it goes on:
+#   1. the node feeds i17 on every per-transfer step, which can change an
+#      o5 verdict for rules that read it, and
+#   2. i17 becomes a reserved operations key, and
+#   3. the recipient's policy is evaluated for every transfer (clause mode
+#      always; guarded mode when the recipient may have a unit).
+# Until then i17 stays an ordinary user custom stream, and a rule reading it
+# is refused at deploy: on a node that does not feed i17 such a rule would
+# never run, so admitting it would silently mislead its author.
+RECIPIENT_CONTROLS_ACTIVE = True
+
 # --- Tau Consensus ABI v1.2 additions (Tau-encoded validator membership) ---
 # Proposer BLS pubkey fed so a consensus rule can test set membership itself
 # (o7 = 1 iff i13 equals one of the validator pubkey constants baked into the
@@ -341,6 +379,11 @@ def reserved_operation_keys(
         # Reserved only while the node actually feeds i16 (see above), so
         # pre-existing user rules using it keep working until activation.
         keys = keys + (COOLDOWN_STREAM_INDEX,)
+    if RECIPIENT_CONTROLS_ACTIVE:
+        # Reserved only while the node actually feeds i17 (see above), so a
+        # sender cannot spoof the hold length of their own transfer by
+        # putting "17" in operations.
+        keys = keys + (HOLD_LENGTH_STREAM_INDEX,)
     if approval_slots_active:
         # Reserved exactly when the node starts feeding them, mirroring the i13
         # and i16 precedents.
@@ -368,4 +411,17 @@ def rule_text_forbidden_input_streams(
     readable = {12}
     if context == RULE_TEXT_CONTEXT_O5_CLAUSE:
         readable |= set(approval_slot_indices())
-    return tuple(f"i{idx}" for idx in keys if idx not in readable)
+    if RECIPIENT_CONTROLS_ACTIVE:
+        # The hold length is how a recipient's policy reads the park it is
+        # judging, in both guarded-mode units and o5 clauses; reading it must
+        # stay possible while the node feeds it. (Contrast i16: once the
+        # cooldown flag flips, its stream lands in this forbidden list and
+        # no rule can read it at all.)
+        readable.add(HOLD_LENGTH_STREAM_INDEX)
+    forbidden = tuple(f"i{idx}" for idx in keys if idx not in readable)
+    if not RECIPIENT_CONTROLS_ACTIVE:
+        # A rule reading the hold length on a node that does not feed it
+        # would never run; refuse it at deploy instead of silently
+        # admitting it. (Issues #47 acceptance 5, #76 acceptance 6.)
+        forbidden = forbidden + (TAU_INPUT_STREAM_HOLD_LENGTH,)
+    return forbidden

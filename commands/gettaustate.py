@@ -1,4 +1,5 @@
 import api_response
+import tau_defs
 
 
 def execute(raw_command: str, container):
@@ -9,4 +10,13 @@ def execute(raw_command: str, container):
         )
 
     state = container.chain_state.get_rules_state()
-    return api_response.success_response("gettaustate", {"rules_state": state or ""})
+    # Capabilities this node enforces, so wallets can discover them without
+    # reading the rules (issues #47/#76): an account can refuse incoming
+    # transfers (recipient_policy) and can cap how long a payment to it may
+    # be held (recipient_max_hold). Empty while the feature is inactive.
+    capabilities = []
+    if tau_defs.RECIPIENT_CONTROLS_ACTIVE:
+        capabilities.extend(["recipient_policy", "recipient_max_hold"])
+    return api_response.success_response(
+        "gettaustate", {"rules_state": state or "", "capabilities": capabilities},
+    )

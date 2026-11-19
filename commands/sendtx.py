@@ -227,6 +227,9 @@ def _parked_transfer_inputs(sender_pubkey: str, request: dict, tip_view,
         3: "{ #x" + sender_pubkey + " }:bv[384]",
         4: "{ #x" + request["recipient_pubkey"] + " }:bv[384]",
         12: "{ #x" + sender_pubkey + " }:bv[384]",
+        # i17: 0. The parked transfer executes on approval as a plain
+        # transfer (no hold): an approval request carries no release terms.
+        tau_defs.HOLD_LENGTH_STREAM_INDEX: "0",
     }
     for k, v in (request.get("custom_inputs") or {}).items():
         values[int(k)] = str(v)
@@ -519,6 +522,148 @@ def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
     return _policy_call(lambda: sender_policy.clause_blocks(
         body, values, pool="admission", timeout=budget
     ))
+
+
+def _recipient_clause_blocks(tip_view, recipient_pubkey, values, budget):
+    """(blocked, detail) for the recipient's own o5 clause on one transfer's inputs."""
+    from consensus import recipient_policy
+
+    return _policy_call(lambda: recipient_policy.recipient_clause_blocks(
+        tip_view.clause_for, recipient_pubkey, values,
+        pool="admission", timeout=budget,
+    ))
+
+
+def _recipient_unit_hold_cap(rules_text, recipient_pubkey):
+    """The hold cap in the recipient's guarded unit(s), when exactly one can be read.
+
+    Best-effort message detail only: the refusal itself never depends on it.
+    """
+    from consensus import recipient_policy
+
+    return recipient_policy.recipient_unit_hold_cap(rules_text, recipient_pubkey)
+
+
+def _recipient_policy_err(transfer_index, transfer_details, recipient_pubkey):
+    """The refusal envelope for a recipient allowlist block (issue #47)."""
+    return _qt_err(
+        "RECIPIENT_POLICY_BLOCK",
+        (
+            f"Transaction rejected: the recipient's policy (o5) blocked transfer "
+            f"#{transfer_index} ({transfer_details}). The recipient only accepts "
+            f"payments from approved senders."
+        ),
+        transfer_index=transfer_index,
+        recipient_pubkey=recipient_pubkey,
+    )
+
+
+def _recipient_max_hold_err(transfer_index, transfer_details, recipient_pubkey,
+                            hold, hold_unit, cap):
+    """The refusal envelope for a recipient max-hold block (issue #76)."""
+    if cap is not None:
+        reason = (
+            f"the recipient only accepts payments held for up to {cap} {hold_unit}; "
+            f"this payment would be held for {hold} {hold_unit}. Send it now instead."
+        )
+    else:
+        reason = (
+            f"the recipient refuses payments held this long (this payment would "
+            f"be held for {hold} {hold_unit})."
+        )
+    details = {
+        "transfer_index": transfer_index,
+        "recipient_pubkey": recipient_pubkey,
+        "hold": hold,
+        "hold_unit": hold_unit,
+    }
+    if cap is not None:
+        details["max_hold"] = cap
+    return _qt_err(
+        "RECIPIENT_MAX_HOLD",
+        (
+            f"Transaction rejected: the recipient's maximum hold (o5) blocked "
+            f"transfer #{transfer_index} ({transfer_details}): {reason}"
+        ),
+        **details,
+    )
+
+
+def _recipient_gate(tip_view, recipient_pubkey, values, hold, hold_unit,
+                    admission_tau, rules_text, transfer_index, transfer_details):
+    """The recipient-policy refusal for one transfer, or None when allowed.
+
+    Two modes, both read-only re-evaluations of the recipient's own o5 rule
+    (issues #47/#76):
+    - Clause mode always runs (an absent clause is a no-op): the recipient's
+      registered clause is evaluated on the transfer's inputs.
+    - Guarded mode runs a second Tau step with i12 set to the recipient --
+      the same inputs, only the policy subject changes -- but only when the
+      application-rules text may hold a guarded unit for them. Otherwise the
+      extra roundtrip buys nothing, and the one-roundtrip-per-transfer
+      property the codebase asserts is preserved for unguarded recipients.
+
+    A block is classified by re-evaluating with a zero hold: still blocked
+    means the sender/amount, not the hold (RECIPIENT_POLICY_BLOCK); allowed
+    at zero hold means the hold is the cause (RECIPIENT_MAX_HOLD, carrying
+    the cap when it can be read out of the rule text).
+    """
+    from consensus import recipient_policy
+    from tau_manager import parse_tau_output as _parse
+
+    if not tau_defs.RECIPIENT_CONTROLS_ACTIVE:
+        return None
+
+    budget = admission_tau.budget
+
+    # --- Clause mode ---
+    clause_body = recipient_policy.recipient_clause_body(
+        tip_view.clause_for, recipient_pubkey,
+    )
+    if clause_body:
+        blocked, _detail = _recipient_clause_blocks(
+            tip_view, recipient_pubkey, values, budget,
+        )
+        if blocked:
+            hold_only = _policy_call(lambda: recipient_policy.clause_block_is_hold_only(
+                tip_view.clause_for, recipient_pubkey, values,
+                pool="admission", timeout=budget,
+            ))
+            if hold_only:
+                return _recipient_max_hold_err(
+                    transfer_index, transfer_details, recipient_pubkey,
+                    hold, hold_unit,
+                    recipient_policy.extract_hold_cap(clause_body),
+                )
+            return _recipient_policy_err(
+                transfer_index, transfer_details, recipient_pubkey,
+            )
+
+    # --- Guarded mode (second pass, gated on a possible guarded unit) ---
+    if recipient_policy.recipient_may_have_guarded_unit(rules_text, recipient_pubkey):
+        recipient_inputs = dict(values)
+        recipient_inputs[12] = "{ #x" + recipient_pubkey + " }:bv[384]"
+        outputs = admission_tau.step_multi(recipient_inputs, source=recipient_pubkey)
+        o5_raw = outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
+        if o5_raw is not None and _parse(o5_raw) == tau_defs.USER_POLICY_BLOCK_VALUE:
+            probe_inputs = dict(recipient_inputs)
+            probe_inputs[tau_defs.HOLD_LENGTH_STREAM_INDEX] = "0"
+            probe_outputs = admission_tau.step_multi(probe_inputs, source=recipient_pubkey)
+            probe_o5 = probe_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
+            probe_blocks = (
+                probe_o5 is not None
+                and _parse(probe_o5) == tau_defs.USER_POLICY_BLOCK_VALUE
+            )
+            if not probe_blocks:
+                return _recipient_max_hold_err(
+                    transfer_index, transfer_details, recipient_pubkey,
+                    hold, hold_unit,
+                    _recipient_unit_hold_cap(rules_text, recipient_pubkey),
+                )
+            return _recipient_policy_err(
+                transfer_index, transfer_details, recipient_pubkey,
+            )
+    return None
 
 
 def _clause_build_refusal(body, budget):
@@ -1206,6 +1351,30 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         len(all_validated_transfers),
                     )
                 else:
+                    # i17 hold length for this request's transfers: 0 for a plain
+                    # transfer leg; for a retractable_transfer, the park's hold
+                    # against the next block (same clock as the advisory i5).
+                    # A retractable_transfer carries exactly one transfer.
+                    park_hold, park_hold_unit = 0, "seconds"
+                    if tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+                        from consensus import recipient_policy as _rp
+                        from consensus.retractable import KIND_HEIGHT as _KIND_H
+                        park_hold = _rp.hold_length_for_transfer(
+                            kind=admission_eval.data.get("release_kind"),
+                            release_at=admission_eval.data.get("release_at"),
+                            height=tip_view.next_block_height,
+                            timestamp=admission_ts,
+                        )
+                        park_hold_unit = (
+                            "blocks" if admission_eval.data.get("release_kind") == _KIND_H
+                            else "seconds"
+                        )
+                    # The application-rules text, read once, gates the guarded-mode
+                    # second pass (only recipients with a guarded unit get one).
+                    try:
+                        application_rules_text = chain_state.get_application_rules_state() or ""
+                    except Exception:
+                        application_rules_text = ""
                     logger.info("Validating %s transfers with Tau...", len(all_validated_transfers))
                     for i, (tau_input_dict, transfer_details) in enumerate(
                         zip(transfer_tau_inputs, all_validated_transfers)
@@ -1237,6 +1406,10 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         # i12: full 384-bit sender public key (bv[384]) for user-policy
                         # rules that scope on the real key.
                         tau_input_stream_values[12] = "{ #x" + sender_pubkey + " }:bv[384]"
+                        # i17: hold length of this transfer (0 for a plain transfer;
+                        # the park's hold for a retractable_transfer), fed identically
+                        # at apply so recipient hold-cap rules read the same value.
+                        tau_input_stream_values[tau_defs.HOLD_LENGTH_STREAM_INDEX] = str(park_hold)
                         # Custom input streams (i13+). Merged AFTER i12 and BEFORE
                         # i5, byte-identical to the apply-time overlay order in
                         # consensus/engine.py, so rules combining i13+ with the
@@ -1310,6 +1483,20 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 transfer_index=i + 1,
                             )
 
+                        # --- Recipient Policy Check (o5, issues #47/#76) ---
+                        # The recipient's own policy on this transfer: refuse
+                        # payments from unknown senders, and refuse parks held
+                        # longer than the recipient's cap. Returns the refusal
+                        # envelope, or None when the recipient allows it.
+                        recipient_refusal = _recipient_gate(
+                            tip_view, tau_input_dict['to_addr'],
+                            tau_input_stream_values, park_hold, park_hold_unit,
+                            admission_tau, application_rules_text,
+                            i + 1, transfer_details,
+                        )
+                        if recipient_refusal is not None:
+                            return recipient_refusal
+
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.
                         try:
@@ -1352,6 +1539,8 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                         3: "0", 4: "0"}
                     fee_query_inputs[5] = str(admission_ts)
                     fee_query_inputs[12] = "{ #x" + sender_pubkey + " }:bv[384]"
+                    # i17: 0. No transfers in this query, so no hold.
+                    fee_query_inputs[tau_defs.HOLD_LENGTH_STREAM_INDEX] = "0"
                     # Custom streams (i13+) last, matching the apply-time
                     # fee-query overlay order in consensus/engine.py.
                     for k, v in custom_tau_inputs.items():
