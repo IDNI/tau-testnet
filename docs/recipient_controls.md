@@ -14,6 +14,8 @@ recipient_v1 o5[t] {"max_hold_seconds":0}
 tau-testnet tx send --key shop --rule-file instant.rule
 ```
 
+In the bundled web wallet, paste the same line into the transaction’s rule editor after connecting to a node that reports active recipient controls. Leave the transfer and custom-operation fields empty and confirm the rule-only transaction.
+
 Once the installation is confirmed, the shop still accepts ordinary transfers. A sender who tries to park a payment to the shop gets `RECIPIENT_MAX_HOLD` with `max_hold_seconds: 0`. Releasing or retracting a payment parked before the shop changed its rule follows the terms of the original park.
 
 A cap of 600 accepts a time-based park with up to and including 600 seconds left. To accept height-based parks as well, set `max_hold_blocks` explicitly. Each cap applies to its own unit. With just a seconds cap, every height-based park is refused, since the length of a block in seconds is unknown. With neither cap, the recipient imposes no fixed hold limit.
@@ -53,6 +55,8 @@ The receiving account owns the clause. An owner-guarded inbound rule can match t
 ## Reading a refusal
 
 Use `checktx estimate` with the signed transaction for a full preflight. Plain `checktx` can skip policy evaluation. Admission evaluates time-based parks against the later of the tip timestamp and the node's current Unix time, and height-based parks against the next block height. Block application uses the block's own timestamp and height. A preflight therefore describes the candidate the node checked. A different inclusion time or an intervening policy change can change the result.
+
+If a payment was queued and the recipient changed their policy before mining, use `gettxstatus <tx_hash>` on the node that recorded the rejection to read the reason and detail.
 
 A recipient's Tau clause returns `RECIPIENT_POLICY_BLOCKED` when it refuses a transfer. A declared hold limit returns `RECIPIENT_MAX_HOLD` with the receiving key, the configured cap and the proposed hold. The error identifies the transfer's one-based position in a batch. The sender's policy is also enforced. A recipient refusal rejects the whole transaction before any fee, sequence or output is committed, including an earlier output that passed. Offers, approval requests and retracts do not deliver a new payment. For a co-signed transfer, the request pays its fee up front. If the recipient refuses the transfer at the final vote, the vote is recorded, the request ends as failed, the principal stays with the sender and the original request fee remains paid.
 

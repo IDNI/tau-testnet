@@ -77,6 +77,7 @@ def publish_tip(chain, monkeypatch, now):
     db.save_canonical_state_atomically(
         "head", HEIGHT - 1, chain.bal, chain.seq, "", "", "", [], [], [], [],
         rule_clauses=chain.lm.rule_offers.clause_plan(),
+        retractable_transfers=chain_state._retractable_state(chain.lm),
     )
 
 
@@ -326,3 +327,25 @@ def test_approval_request_is_admitted_but_release_requires_recipient_consent(
         request.request_id] == approvals.STATUS_FAILED
     assert result.outcomes[-1].reason == "RECIPIENT_POLICY_BLOCKED"
     assert result.next_snapshot.metadata["balances"][owner] == 0
+
+
+def test_sender_can_retract_through_checktx_and_sendtx_after_cap_changes(node, monkeypatch):
+    chain = new_chain()
+    now = int(time.time())
+    payment = park(A, 0, now, blocks=4)
+    assert chain.block([payment], HEIGHT - 2, now).accepted_tx_ids == [payment["tx_id"]]
+    tighter = deploy(max_hold_blocks=0)
+    assert chain.block([tighter], HEIGHT - 1, now).accepted_tx_ids == [tighter["tx_id"]]
+    publish_tip(chain, monkeypatch, now)
+    chain_state.get_sequence_number.return_value = 1
+    rid = parse_retractable_transfer(payment).retractable_id.hex()
+    tx = transaction(A, 1, "retract_transfer", retractable_id=rid, fee_limit="0")
+    checks_before = len(sender_policy.evaluator("recipient-admission").verdict_calls)
+    dry = estimate(tx)
+    assert dry["status"] == "ok" and dry["data"]["admissible"], dry
+    assert db.count_mempool_txs() == 0
+    queued = sendtx.queue_transaction(json.dumps(tx), propagate=False)
+    assert queued["ok"], queued
+    entry = db.get_mempool_entry(queued["tx_hash"])
+    assert int(entry["estimated_fee"]) == 0 and int(entry["fee_limit"]) == 0
+    assert len(sender_policy.evaluator("recipient-admission").verdict_calls) == checks_before

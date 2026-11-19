@@ -425,9 +425,10 @@ def _sign_with_fee(args: argparse.Namespace, payload: dict, sk_int) -> dict:
 
 
 def _no_fee_estimate(exc: RuntimeError) -> int:
-    print_error(
-        f"the node gave no fee estimate ({exc}); give the fee limit with --fee"
-    )
+    if isinstance(exc, tx_mod.RecipientRefusal):
+        print_error(str(exc))
+    else:
+        print_error(f"the node gave no fee estimate ({exc}); give the fee limit with --fee")
     return EXIT_APP_ERROR
 
 

@@ -139,7 +139,8 @@ def _mine_local_chain(work):
     import config
     import db
     from bls_keys import pubkey_hex, sign_payload
-    from commands import createblock, sendtx
+    from commands import createblock, gettxstatus, sendtx
+    from types import SimpleNamespace
     from py_ecc.bls import G2Basic
 
     secrets = {name: G2Basic.KeyGen(os.urandom(32)) for name in ("miner", "a", "b", "c")}
@@ -184,9 +185,9 @@ def _mine_local_chain(work):
         unit = "recipient_v1 o5[t] " + json.dumps({"inbound": inbound, "max_hold_blocks": cap})
         return submit("b", operations={"0": unit})
 
-    def escrow(release):
+    def escrow(release, deadline=None):
         return submit("a", "retractable_transfer", recipient_pubkey=keys["b"], amount=40,
-                      release_at_height=release, expire_at_height=height() + 2)
+                      release_at_height=release, expire_at_height=deadline or height() + 2)
 
     seal()
     assert policy(4)["ok"]
@@ -202,10 +203,22 @@ def _mine_local_chain(work):
     assert escrow(release)["ok"]
     seal()
     assert chain_state.get_balance(keys["b"]) == 10_045
+    # Defer one valid, queued park until after the recipient's tighter policy
+    # is mined. The wallet should be able to explain the later refusal.
+    deferred = escrow(height() + 5, deadline=height() + 4)
+    assert deferred["ok"], deferred
+    (row,) = db.reserve_mempool_txs(limit=1)
+    assert row["tx_hash"] == deferred["tx_hash"]
     assert policy(0)["ok"]
     seal()
+    db.unreserve_mempool_txs([row["id"]])
     while height() < release:
         seal()
+    status = json.loads(gettxstatus.execute(
+        "gettxstatus " + deferred["tx_hash"], SimpleNamespace(db=db)
+    ))["data"]
+    assert status["status"] == "rejected" and status["reason"] == "RECIPIENT_MAX_HOLD", status
+    assert "max_hold_blocks=0" in status["detail"]
 
     assert chain_state.load_state_from_db()
     assert height() == 7
