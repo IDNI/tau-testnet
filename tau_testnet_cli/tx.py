@@ -844,3 +844,67 @@ def build_grant_cancel_tx(
                      expiration_time, expire_at_height, "0")
     tx["grant_id"] = grant_id.lower()
     return tx
+
+
+def build_standing_create_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    recipient_pubkey: str,
+    amount: int,
+    period_kind: int,
+    start_at: int,
+    window_seconds: int,
+    period_seconds: int = 0,
+    due_day: int = 0,
+    due_offset_seconds: int = 0,
+    end_at: int = 0,
+    max_occurrences: int = 0,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``standing_payment_create`` payload (without signature)."""
+    if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
+        raise ValueError("recipient_pubkey must be a 96-character hex public key")
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount < 1:
+        raise ValueError("amount must be a positive integer")
+    if not end_at and not max_occurrences:
+        raise ValueError("give an end: end_at, max_occurrences or both")
+    tx = _grant_base("standing_payment_create", sender_pubkey, sequence_number,
+                     expiration_time, expire_at_height, fee_limit)
+    tx.update({
+        "recipient_pubkey": recipient_pubkey.lower(),
+        "amount": amount,
+        "period_kind": int(period_kind),
+        "period_seconds": int(period_seconds),
+        "start_at": int(start_at),
+        "due_day": int(due_day),
+        "due_offset_seconds": int(due_offset_seconds),
+        "window_seconds": int(window_seconds),
+        "end_at": int(end_at),
+        "max_occurrences": int(max_occurrences),
+    })
+    return tx
+
+
+def build_standing_execute_tx(
+    *, sender_pubkey: str, sequence_number: int, expiration_time: int,
+    expire_at_height: int, standing_id: str, period: int, fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``standing_payment_execute`` payload; anyone may sign it."""
+    tx = _grant_base("standing_payment_execute", sender_pubkey, sequence_number,
+                     expiration_time, expire_at_height, fee_limit)
+    tx.update({"standing_id": standing_id.lower(), "period": int(period)})
+    return tx
+
+
+def build_standing_cancel_tx(
+    *, sender_pubkey: str, sequence_number: int, expiration_time: int,
+    expire_at_height: int, standing_id: str,
+) -> dict:
+    """Construct a fee-exempt ``standing_payment_cancel`` payload."""
+    tx = _grant_base("standing_payment_cancel", sender_pubkey, sequence_number,
+                     expiration_time, expire_at_height, "0")
+    tx["standing_id"] = standing_id.lower()
+    return tx

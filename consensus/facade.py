@@ -415,6 +415,15 @@ class TipAdmissionView:
         except Exception:
             return GrantBook()
 
+    def standing_book(self):
+        """The committed standing-payment book (empty on error)."""
+        from consensus.standing import StandingBook, load_standing_book
+
+        try:
+            return load_standing_book(db.load_standing_state())
+        except Exception:
+            return StandingBook()
+
     # --- Retractable transfers ---------------------------------------------
     #
     # Persisted rows, not the in-memory manager, for the same reason as the

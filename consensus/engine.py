@@ -33,6 +33,17 @@ from .approvals import (
     parse_rule_change_request_checked,
     parse_transfer_vote,
 )
+from .standing import (
+    STANDING_TX_TYPES,
+    StandingBook,
+    StandingShapeError,
+    TX_TYPE_STANDING_CANCEL,
+    TX_TYPE_STANDING_CREATE,
+    TX_TYPE_STANDING_EXECUTE,
+    parse_standing_cancel,
+    parse_standing_create,
+    parse_standing_execute,
+)
 from .grants import (
     GRANT_TX_TYPES,
     GrantBook,
@@ -81,7 +92,8 @@ from .rule_offers import (
 # at inclusion.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW}
+     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW,
+     TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -249,6 +261,14 @@ def _escrow_total(lm) -> int:
     return (book.escrow_total() if book is not None else 0) + (
         grants.escrow_total() if grants is not None else 0
     )
+
+
+def _end_due_standing(lm, timestamp) -> List[str]:
+    """Resolve standing payments whose end_at has passed. Moves no funds."""
+    book = getattr(lm, "standing_payments", None)
+    if not isinstance(book, StandingBook):
+        return []
+    return [s.terms.standing_id.hex() for s in book.end_due(int(timestamp))]
 
 
 def _expire_due_grants(lm, balances, sequences, timestamp) -> List[str]:
@@ -939,6 +959,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # Same position and reasoning for grants: a draw needs ts < expires_at,
         # so it can never share a block with its grant's expiry refund.
         expired_grants = _expire_due_grants(lm, t_bals, t_seqs, block.header.timestamp)
+        ended_standing = _end_due_standing(lm, block.header.timestamp)
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
             getattr(
@@ -1007,6 +1028,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if event and id(tx) in accepted_obj:
                 grant_events.append(event)
         grant_events.extend((gid, "expired") for gid in expired_grants)
+
+        standing_events = []
+        for i, tx in enumerate(block.transactions):
+            event = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "standing_event"
+            )
+            if event and id(tx) in accepted_obj:
+                standing_events.append(event)
+        standing_events.extend((sid, "ended") for sid in ended_standing)
 
         # 3. Post-State Materialization Layer
         
@@ -1164,6 +1194,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
                 "grant_events": grant_events,
+                "standing_events": standing_events,
             }
         )
         
@@ -1711,6 +1742,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
             pending_grant_op = None  # ("create", terms) | ("draw", draw) | ("cancel", gid)
+            pending_standing_op = None  # ("create"|"execute"|"cancel", parsed)
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2748,6 +2780,67 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             "Grant cancelled: " + op[1].grant_id.hex()
                         )
 
+            elif tx_type in STANDING_TX_TYPES:
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    sbook = lifecycle_mgr.standing_payments
+                    ts_now = int(block_timestamp or 0)
+                    reason = ""
+                    op = None
+                    try:
+                        if tx_type == TX_TYPE_STANDING_CREATE:
+                            op = ("create", parse_standing_create(tx))
+                        elif tx_type == TX_TYPE_STANDING_EXECUTE:
+                            op = ("execute", parse_standing_execute(tx))
+                        else:
+                            op = ("cancel", parse_standing_cancel(tx))
+                    except StandingShapeError as exc:
+                        reason = f"invalid {tx_type} ({exc})"
+                    if op is not None:
+                        signer = {"create": lambda o: o.payer_pubkey,
+                                  "execute": lambda o: o.executor_pubkey,
+                                  "cancel": lambda o: o.payer_pubkey}[op[0]](op[1])
+                        if not isinstance(sender, str) or sender != signer:
+                            reason = "sender is not the signer"
+                        elif target_balances is None:
+                            reason = "no balance overlay for a standing payment"
+                        elif op[0] == "create":
+                            _, reason = sbook.can_admit_create(op[1], ts_now)
+                        elif op[0] == "execute":
+                            _, reason = sbook.can_admit_execute(op[1], ts_now)
+                        else:
+                            _, reason = sbook.can_admit_cancel(op[1], ts_now)
+                    if op is None or reason:
+                        tx_receipt["logs"].append(f"Standing payment transaction ignored: {reason}")
+                        tx_receipt["reason"] = "standing_payment_not_applied"
+                        accepted_in_block = False
+                    elif op[0] == "execute":
+                        terms = sbook.get(op[1].standing_id).terms
+                        # The PAYER's gates at this moment: current o1/o5 policy
+                        # against the real recipient and amount, the fee step,
+                        # the balance check. A block or shortfall rejects the
+                        # whole tx, so the occurrence is not marked executed.
+                        # The fee step's fee is the executor's (the sender).
+                        moved = _execute_fee_era_transfer(
+                            terms.payer_pubkey, terms.recipient_pubkey, terms.amount,
+                            slot_values=_approval_slot_values(),
+                            overrides={},
+                        )
+                        fee_already_measured = True
+                        if moved and accepted_in_block and not hard_reject:
+                            pending_standing_op = op
+                            tx_receipt["logs"].append(
+                                f"Standing payment executed: {op[1].standing_id.hex()} "
+                                f"period {op[1].period}"
+                            )
+                    else:
+                        pending_standing_op = op
+                        tx_receipt["logs"].append(
+                            f"Standing payment {op[0]}: "
+                            + (op[1].standing_id.hex() if op[0] == "cancel"
+                               else op[1].standing_id.hex())
+                        )
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3294,6 +3387,28 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 elif pending_retract_id is not None:
                     tx_receipt["retractable_event"] = (pending_retract_id.hex(), "retracted")
                     book.retract(pending_retract_id)
+                if pending_standing_op is not None:
+                    sbook_w = _lifecycle_for_write().standing_payments
+                    kind, obj = pending_standing_op
+                    if kind == "create":
+                        sid = sbook_w.submit(obj)
+                        tx_receipt["standing_event"] = (sid.hex(), "created")
+                    elif kind == "execute":
+                        payer = sbook_w.get(obj.standing_id).terms.payer_pubkey
+                        after = sbook_w.record_execution(obj, int(block_timestamp or 0))
+                        tx_receipt["standing_event"] = (
+                            obj.standing_id.hex(),
+                            "completed" if (after.terms.max_occurrences and
+                                            after.executions >= after.terms.max_occurrences)
+                            else "executed",
+                        )
+                        # The payer sent this money: their cooldown/spend clock
+                        # moves, exactly once, not the executor's.
+                        if target_last_transfer_ts is not None:
+                            target_last_transfer_ts[payer] = int(block_timestamp or 0)
+                    else:
+                        sbook_w.cancel(obj.standing_id)
+                        tx_receipt["standing_event"] = (obj.standing_id.hex(), "cancelled")
                 if pending_grant_op is not None:
                     gbook = _lifecycle_for_write().grants
                     kind, payload_obj = pending_grant_op

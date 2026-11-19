@@ -23,6 +23,7 @@ from commands import (
     getapprovalslots,
     getrequestid,
     getgrants,
+    getstandingpayments,
     getretractable,
     getretractableid,
     getretractables,
@@ -89,6 +90,7 @@ class ServiceContainer:
         "getretractableid": getretractableid,
         # Conditional grants (programmable payments).
         "getgrants": getgrants,
+        "getstandingpayments": getstandingpayments,
         # Advisory, node-local, and engine-driving -- rate-limited accordingly
         # in server.py.
         "getapprovalslots": getapprovalslots,

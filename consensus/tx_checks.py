@@ -9,6 +9,7 @@ from typing import Any, Optional, Tuple
 
 from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST
 from consensus.grants import TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW
+from consensus.standing import TX_TYPE_STANDING_CREATE
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
 from consensus import bls
@@ -55,7 +56,8 @@ def check_transfer(transfer: Any, sender_pubkey: Any) -> Optional[str]:
 
 def _recipient_keys(tx: dict) -> list:
     tx_type = tx.get("tx_type", "user_tx")
-    if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER, TX_TYPE_GRANT_DRAW):
+    if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER, TX_TYPE_GRANT_DRAW,
+                   TX_TYPE_STANDING_CREATE):
         return [("recipient_pubkey", tx.get("recipient_pubkey"))]
     if tx_type == TX_TYPE_GRANT_CREATE:
         keys = [("grantee_pubkey", tx.get("grantee_pubkey"))]

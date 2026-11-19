@@ -1220,6 +1220,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_policy_subparsers(sub)
     _add_retractable_subparsers(sub)
     _add_grant_subparsers(sub)
+    _add_standing_subparsers(sub)
     _add_node_subparsers(sub)
 
     return parser
@@ -2926,6 +2927,174 @@ def _add_grant_subparsers(sub) -> None:
     _key_group(p_list, required=False)
     p_list.add_argument("--role", choices=["in", "out", "all"], default="all")
     p_list.set_defaults(func=cmd_grant_list)
+
+
+
+
+# --- Standing payments (#34) --------------------------------------------------
+
+
+def _due_period_from_node(args, standing_id: str, address: str):
+    """Ask the node which period of this standing payment is due now."""
+    response = _send(args, f"getstandingpayments {address} all")
+    if rpc_mod.is_error_response(response):
+        raise _PayloadError(f"could not read standing payments: {response}")
+    data = parse_json_response(response)
+    data = data.get("data", data) if isinstance(data, dict) else {}
+    for row in data.get("standing_payments", []):
+        if row.get("standing_id") == standing_id:
+            if row.get("due_period") is None:
+                raise _PayloadError(
+                    f"no occurrence is due now (next due at {row.get('next_due_at')})"
+                )
+            return int(row["due_period"])
+    raise _PayloadError("unknown standing payment for that address (pass --period)")
+
+
+def cmd_standing_create(args: argparse.Namespace) -> int:
+    from consensus.standing import StandingShapeError, parse_standing_create
+
+    created = {}
+    kind = _PERIODS.get(args.every, 0)
+    period_seconds = int(args.every_seconds or 0)
+    if args.every_seconds:
+        kind = 0
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        now = int(_now())
+        payload = tx_mod.build_standing_create_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=now + args.expiry,
+            expire_at_height=expire_at_height,
+            recipient_pubkey=args.to,
+            amount=int(args.amount),
+            period_kind=kind,
+            period_seconds=period_seconds,
+            start_at=args.start or now,
+            due_day=int(args.day or 0),
+            due_offset_seconds=int(args.at_seconds or 0),
+            window_seconds=int(args.window),
+            end_at=args.until or 0,
+            max_occurrences=int(args.times or 0),
+        )
+        try:
+            created["id"] = parse_standing_create(payload).standing_id.hex()
+        except StandingShapeError as exc:
+            raise _PayloadError(str(exc))
+        return payload
+
+    status = _submit_rule_tx(args, _build)
+    if status == EXIT_OK and created.get("id"):
+        print(f"standing id: {created['id']}", file=sys.stderr if args.json else sys.stdout)
+    return status
+
+
+def cmd_standing_execute(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        period = args.period
+        if period is None:
+            period = _due_period_from_node(
+                args, args.standing_id.lower(), (args.party or sender_pubkey).lower()
+            )
+        return tx_mod.build_standing_execute_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            standing_id=args.standing_id,
+            period=period,
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_standing_cancel(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_standing_cancel_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            standing_id=args.standing_id,
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_standing_list(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getstandingpayments {address} {getattr(args, 'role', 'all')}")
+
+
+def _add_standing_subparsers(sub) -> None:
+    """`tau-testnet standing ...` -- recurring payments anyone can trigger when due."""
+    p = sub.add_parser("standing", parents=[_GLOBAL_PARENT],
+                       help="Standing payments: a fixed amount on a schedule (#34)")
+    ssub = p.add_subparsers(dest="standing_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser, fee=True):
+        if fee:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument("--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+                            help="Seconds until expiration_time (default: %(default)s)")
+        parser.add_argument("--expire-in", type=_block_count, default=1000,
+                            help="Blocks the transaction may land in, from the next one")
+        parser.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+
+    c = ssub.add_parser("create", parents=common,
+                        help="Authorize a fixed payment on a schedule (signed once)")
+    _key_group(c)
+    c.add_argument("--to", required=True, help="Recipient public key (96 hex)")
+    c.add_argument("--amount", required=True, type=int)
+    c.add_argument("--every", choices=sorted(_PERIODS), default="month",
+                   help="Calendar period, UTC (default: month)")
+    c.add_argument("--every-seconds", type=int,
+                   help="Fixed period length in seconds instead, anchored at --start")
+    c.add_argument("--day", type=int,
+                   help="Day of the month it is due (1..31; a missing day means the last day)")
+    c.add_argument("--at-seconds", type=int, default=0,
+                   help="Seconds into the due day (month) or into the period (others)")
+    c.add_argument("--window", type=int, default=3 * 86_400,
+                   help="Seconds after the due point during which it can execute")
+    c.add_argument("--start", type=_parse_when, help="First moment it may run (default: now)")
+    c.add_argument("--until", type=_parse_when, help="No execution at or after this time")
+    c.add_argument("--times", type=int, help="Maximum number of payments")
+    _tx_flags(c)
+    c.set_defaults(func=cmd_standing_create)
+
+    e = ssub.add_parser("execute", parents=common,
+                        help="Trigger the occurrence that is due now (anyone may)")
+    _key_group(e)
+    e.add_argument("standing_id", help="Standing payment id (64 hex)")
+    e.add_argument("--period", type=int, help="Period index (default: ask the node)")
+    e.add_argument("--party", help="Payer or recipient address, to look the payment up "
+                                   "(default: your key's address)")
+    _tx_flags(e)
+    e.set_defaults(func=cmd_standing_execute)
+
+    x = ssub.add_parser("cancel", parents=common, help="Stop a standing payment you pay (feeless)")
+    _key_group(x)
+    x.add_argument("standing_id", help="Standing payment id (64 hex)")
+    _tx_flags(x, fee=False)
+    x.set_defaults(func=cmd_standing_cancel)
+
+    ls = ssub.add_parser("list", parents=common, help="Standing payments for an address")
+    ls.add_argument("--address", help="Address (default: your key's)")
+    _key_group(ls, required=False)
+    ls.add_argument("--role", choices=["in", "out", "all"], default="all")
+    ls.set_defaults(func=cmd_standing_list)
 
 
 

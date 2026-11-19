@@ -875,3 +875,83 @@ def compute_grant_book_root(
     out.extend(encode_uint64(int(resolved_count)))
     out.extend(encode_hash32(resolved_acc))
     return blake3(bytes(out)).digest()
+
+
+# --- Standing payments -------------------------------------------------------
+
+DOMAIN_STANDING_V1 = b"tau.standing.v1"
+DOMAIN_STANDING_RESOLVED_V1 = b"tau.standing.resolved.v1"
+DOMAIN_STANDING_BOOK_V1 = b"tau.standing.book.v1"
+
+
+def _encode_standing_terms(
+    payer_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    sequence_number: int,
+    period_kind: int,
+    period_seconds: int,
+    start_at: int,
+    due_day: int,
+    due_offset_seconds: int,
+    window_seconds: int,
+    end_at: int,
+    max_occurrences: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(payer_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(bytes([int(period_kind) & 0xFF]))
+    out.extend(encode_uint64(int(period_seconds)))
+    out.extend(encode_uint64(int(start_at)))
+    out.extend(bytes([int(due_day) & 0xFF]))
+    out.extend(encode_uint64(int(due_offset_seconds)))
+    out.extend(encode_uint64(int(window_seconds)))
+    out.extend(encode_uint64(int(end_at)))
+    out.extend(encode_uint64(int(max_occurrences)))
+    return bytes(out)
+
+
+def compute_standing_id(*terms: Any) -> bytes:
+    """BLAKE3 of a standing payment's signed terms. 32 bytes."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_V1.decode()))
+    out.extend(_encode_standing_terms(*terms))
+    return blake3(bytes(out)).digest()
+
+
+def compute_standing_resolved_acc(acc: Any, standing_id: Any, outcome: int) -> bytes:
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(standing_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    return blake3(bytes(out)).digest()
+
+
+def encode_standing_entry(
+    standing_id: Any, terms: tuple, next_period: int, executions: int, total_executed: int
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_hash32(standing_id))
+    out.extend(_encode_standing_terms(*terms))
+    out.extend(encode_uint64(int(next_period)))
+    out.extend(encode_uint64(int(executions)))
+    out.extend(encode_uint64(int(total_executed)))
+    return bytes(out)
+
+
+def compute_standing_book_root(
+    open_entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    encoded = sorted(encode_standing_entry(*e) for e in (open_entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()

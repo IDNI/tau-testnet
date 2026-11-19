@@ -48,6 +48,15 @@ from consensus.approvals import (
     validate_request_shape,
     validate_rule_change_shape,
 )
+from consensus.standing import (
+    StandingShapeError,
+    TX_TYPE_STANDING_CANCEL,
+    TX_TYPE_STANDING_CREATE,
+    TX_TYPE_STANDING_EXECUTE,
+    parse_standing_cancel,
+    parse_standing_create,
+    parse_standing_execute,
+)
 from consensus.grants import (
     GrantShapeError,
     TX_TYPE_GRANT_CANCEL,
@@ -1683,6 +1692,48 @@ def validate_grant_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionRes
     return success({"grant_id": cancel.grant_id.hex()})
 
 
+def validate_standing_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+    """Tau-free screens for standing_payment_create / _execute / _cancel.
+
+    Same book checks as block apply, against the committed book and the
+    advisory next-block timestamp. The payer's o5 verdict and funds for an
+    execution are judged at apply, on the real block.
+    """
+    tx_type = tx.get("tx_type")
+    sender = tx.get("sender_pubkey")
+    ts = tip_view.next_block_timestamp
+    book = tip_view.standing_book()
+    try:
+        if tx_type == TX_TYPE_STANDING_CREATE:
+            obj = parse_standing_create(tx)
+            signer = obj.payer_pubkey
+        elif tx_type == TX_TYPE_STANDING_EXECUTE:
+            obj = parse_standing_execute(tx)
+            signer = obj.executor_pubkey
+        else:
+            obj = parse_standing_cancel(tx)
+            signer = obj.payer_pubkey
+    except StandingShapeError as exc:
+        return format_error(f"Malformed {tx_type}: {exc}.")
+    if not isinstance(sender, str) or sender != signer:
+        return format_error(f"{tx_type} sender_pubkey must match the signer.")
+    if tx_type == TX_TYPE_STANDING_CREATE:
+        err = validate_bls_pubkey(obj.recipient_pubkey, "recipient_pubkey")
+        if err:
+            return format_error(f"{tx_type} rejected: {err}")
+        ok, reason = book.can_admit_create(obj, ts)
+        code = "STANDING_REJECTED"
+    elif tx_type == TX_TYPE_STANDING_EXECUTE:
+        ok, reason = book.can_admit_execute(obj, ts)
+        code = "STANDING_NOT_DUE"
+    else:
+        ok, reason = book.can_admit_cancel(obj, ts)
+        code = "STANDING_CANCEL_REJECTED"
+    if not ok:
+        return format_error(f"{tx_type} rejected: {reason}", code=code)
+    return success({"standing_id": obj.standing_id.hex()})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -1796,6 +1847,9 @@ def validate_mempool_admission(
 
     elif tx_type in (TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW, TX_TYPE_GRANT_CANCEL):
          return validate_grant_payload(payload, tip_view)
+
+    elif tx_type in (TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE, TX_TYPE_STANDING_CANCEL):
+         return validate_standing_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

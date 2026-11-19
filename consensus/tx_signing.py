@@ -33,6 +33,11 @@ from consensus.approvals import (
     TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
+from consensus.standing import (
+    TX_TYPE_STANDING_CANCEL,
+    TX_TYPE_STANDING_CREATE,
+    TX_TYPE_STANDING_EXECUTE,
+)
 from consensus.grants import (
     TX_TYPE_GRANT_CANCEL,
     TX_TYPE_GRANT_CREATE,
@@ -144,6 +149,20 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["amount"] = payload.get("amount")
     elif tx_type == TX_TYPE_GRANT_CANCEL:
         signing_dict["grant_id"] = payload.get("grant_id")
+    elif tx_type == TX_TYPE_STANDING_CREATE:
+        # The whole schedule is signed: executions are submitted later by
+        # anyone and applied from hash-bound state.
+        for field in (
+            "recipient_pubkey", "amount", "period_kind", "period_seconds",
+            "start_at", "due_day", "due_offset_seconds", "window_seconds",
+            "end_at", "max_occurrences",
+        ):
+            signing_dict[field] = payload.get(field)
+    elif tx_type == TX_TYPE_STANDING_EXECUTE:
+        signing_dict["standing_id"] = payload.get("standing_id")
+        signing_dict["period"] = payload.get("period")
+    elif tx_type == TX_TYPE_STANDING_CANCEL:
+        signing_dict["standing_id"] = payload.get("standing_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

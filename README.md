@@ -658,6 +658,22 @@ tau-testnet grant list --key bob --role in
 
 Full guide: [docs/grants.md](docs/grants.md).
 
+## Standing payments
+
+A payer signs once that a fixed amount goes to a recipient on a schedule
+(monthly on a given day — clamped to the month's last day —, weekly, daily or
+a fixed period), with a required end. When an occurrence is due, anyone can
+trigger it; the node checks the schedule and the payer's current policy and
+balance, and never pays twice in one period or catches up missed ones.
+
+```bash
+tau-testnet standing create --key tenant --to <landlord_pubkey> --amount 1000 \
+  --every month --day 31 --window 432000 --times 12
+tau-testnet standing execute --key landlord <standing_id>
+```
+
+Full guide: [docs/standing_payments.md](docs/standing_payments.md).
+
 ## Mempool policy
 
 - **Lanes** — every tx is classified `fast` (coin transfers) or `slow` (anything carrying Tau rule text: `rule_offer`, `rule_offer_accept`, `consensus_rule_update`, or a `user_tx` with a non-empty `operations["0"]`). A `user_tx` carrying both a rule and transfers is `slow` — the signature covers the whole payload, so it cannot be split. Applying a rule builds or recompiles Tau state, which costs far more than a transfer's one cheap step; without separation a burst of rule work delays every queued transfer. Fee priority cannot express the split, because a rule emits its own `o8` user fee and can therefore price itself to the front of the queue.

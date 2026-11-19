@@ -113,6 +113,9 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "grant_create",
     "grant_draw",
     "grant_cancel",
+    "standing_payment_create",
+    "standing_payment_execute",
+    "standing_payment_cancel",
 })
 
 
@@ -639,7 +642,9 @@ class NetworkService:
                         continue
                     approval_txs_count += 1
                 elif tx_type in ("retractable_transfer", "retract_transfer",
-                                 "grant_create", "grant_draw", "grant_cancel"):
+                                 "grant_create", "grant_draw", "grant_cancel",
+                                 "standing_payment_create", "standing_payment_execute",
+                                 "standing_payment_cancel"):
                     if retractable_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS:
                         continue
                     retractable_txs_count += 1
@@ -881,13 +886,18 @@ class NetworkService:
             envelope,
             # Grants share the escrow topic: same size class, same flood profile.
             allowed_types={"retractable_transfer", "retract_transfer",
-                           "grant_create", "grant_draw", "grant_cancel"},
+                           "grant_create", "grant_draw", "grant_cancel",
+                           "standing_payment_create", "standing_payment_execute",
+                           "standing_payment_cancel"},
             type_limits={
                 "retractable_transfer": TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
                 "retract_transfer": TAU_MAX_RETRACT_TRANSFER_BYTES,
                 "grant_create": TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
                 "grant_draw": TAU_MAX_RETRACT_TRANSFER_BYTES,
                 "grant_cancel": TAU_MAX_RETRACT_TRANSFER_BYTES,
+                "standing_payment_create": TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
+                "standing_payment_execute": TAU_MAX_RETRACT_TRANSFER_BYTES,
+                "standing_payment_cancel": TAU_MAX_RETRACT_TRANSFER_BYTES,
             },
         )
 
@@ -997,6 +1007,19 @@ class NetworkService:
         elif tx_type == "grant_draw":
             if not all(k in p_dict for k in ("grant_id", "recipient_pubkey", "amount")):
                 logger.debug("Gossip rejected: grant_draw missing required structural fields")
+                return
+        elif tx_type == "standing_payment_create":
+            if not all(k in p_dict for k in ("recipient_pubkey", "amount", "period_kind",
+                                            "start_at", "window_seconds")):
+                logger.debug("Gossip rejected: standing_payment_create missing required fields")
+                return
+        elif tx_type == "standing_payment_execute":
+            if "standing_id" not in p_dict or "period" not in p_dict:
+                logger.debug("Gossip rejected: standing_payment_execute missing required fields")
+                return
+        elif tx_type == "standing_payment_cancel":
+            if "standing_id" not in p_dict:
+                logger.debug("Gossip rejected: standing_payment_cancel missing standing_id")
                 return
         elif tx_type == "grant_cancel":
             if "grant_id" not in p_dict:
@@ -1627,7 +1650,9 @@ class NetworkService:
         if tx_type in ("approval_request", "transfer_vote"):
             return TAU_GOSSIP_TOPIC_APPROVALS
         if tx_type in ("retractable_transfer", "retract_transfer",
-                       "grant_create", "grant_draw", "grant_cancel"):
+                       "grant_create", "grant_draw", "grant_cancel",
+                       "standing_payment_create", "standing_payment_execute",
+                       "standing_payment_cancel"):
             return TAU_GOSSIP_TOPIC_RETRACTABLE
         return TAU_GOSSIP_TOPIC_TRANSACTIONS
 
