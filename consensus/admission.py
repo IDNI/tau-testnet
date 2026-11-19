@@ -48,6 +48,13 @@ from consensus.approvals import (
     validate_request_shape,
     validate_rule_change_shape,
 )
+from consensus.routes import (
+    RouteShapeError,
+    TX_TYPE_ROUTE_REMOVE,
+    TX_TYPE_ROUTE_SET,
+    parse_route_remove,
+    parse_route_set,
+)
 from consensus.standing import (
     StandingShapeError,
     TX_TYPE_STANDING_CANCEL,
@@ -1692,6 +1699,29 @@ def validate_grant_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionRes
     return success({"grant_id": cancel.grant_id.hex()})
 
 
+def validate_route_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+    """Screens for receive_route_set / receive_route_remove, shared with apply."""
+    tx_type = tx.get("tx_type")
+    ts = tip_view.next_block_timestamp
+    book = tip_view.route_book()
+    try:
+        obj = parse_route_set(tx) if tx_type == TX_TYPE_ROUTE_SET else parse_route_remove(tx)
+    except RouteShapeError as exc:
+        return format_error(f"Malformed {tx_type}: {exc}.")
+    if tx.get("sender_pubkey") != obj.owner_pubkey:
+        return format_error(f"{tx_type} sender_pubkey must match the signer.")
+    if tx_type == TX_TYPE_ROUTE_SET:
+        err = validate_bls_pubkey(obj.destination_pubkey, "destination_pubkey")
+        if err:
+            return format_error(f"{tx_type} rejected: {err}")
+        ok, reason = book.can_admit_set(obj, ts)
+    else:
+        ok, reason = book.can_admit_remove(obj, ts)
+    if not ok:
+        return format_error(f"{tx_type} rejected: {reason}", code="ROUTE_REJECTED")
+    return success({"owner_pubkey": obj.owner_pubkey})
+
+
 def validate_standing_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """Tau-free screens for standing_payment_create / _execute / _cancel.
 
@@ -1850,6 +1880,9 @@ def validate_mempool_admission(
 
     elif tx_type in (TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE, TX_TYPE_STANDING_CANCEL):
          return validate_standing_payload(payload, tip_view)
+
+    elif tx_type in (TX_TYPE_ROUTE_SET, TX_TYPE_ROUTE_REMOVE):
+         return validate_route_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

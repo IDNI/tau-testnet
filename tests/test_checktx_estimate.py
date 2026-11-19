@@ -160,6 +160,9 @@ def _payload(kind, fee_limit="0"):
     if kind == "standing_payment_execute":
         sid, period = _seed_standing()
         return _envelope(kind, RECIPIENT, fee_limit, standing_id=sid, period=period)
+    if kind == "receive_route_set":
+        return _envelope(kind, SENDER, fee_limit, destination_pubkey=RECIPIENT, bps=2000,
+                         min_incoming=0, activate_at=0, expires_at=0, locked_until=0)
     raise AssertionError(kind)
 
 
@@ -223,7 +226,8 @@ def _check(payload, *, estimate=True):
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
                "rule_change_request", "grant_create", "grant_draw",
-               "standing_payment_create", "standing_payment_execute"]
+               "standing_payment_create", "standing_payment_execute",
+               "receive_route_set"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

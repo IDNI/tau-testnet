@@ -955,3 +955,36 @@ def compute_standing_book_root(
     out.extend(encode_uint64(int(resolved_count)))
     out.extend(encode_hash32(resolved_acc))
     return blake3(bytes(out)).digest()
+
+
+# --- Receive routes ----------------------------------------------------------
+
+DOMAIN_ROUTE_BOOK_V1 = b"tau.route.book.v1"
+
+
+def encode_route_entry(
+    owner_pubkey: Any, destination_pubkey: Any, bps: int, min_incoming: int,
+    activate_at: int, expires_at: int, locked_until: int, version: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(encode_pubkey48(destination_pubkey))
+    out.extend(encode_uint32(int(bps)))
+    out.extend(encode_uint64(int(min_incoming)))
+    out.extend(encode_uint64(int(activate_at)))
+    out.extend(encode_uint64(int(expires_at)))
+    out.extend(encode_uint64(int(locked_until)))
+    out.extend(encode_uint64(int(version)))
+    return bytes(out)
+
+
+def compute_route_book_root(entries: list, changes: int) -> bytes:
+    """BLAKE3 of the installed routes (sorted) and the count of changes so far."""
+    encoded = sorted(encode_route_entry(*e) for e in (entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ROUTE_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(changes)))
+    return blake3(bytes(out)).digest()

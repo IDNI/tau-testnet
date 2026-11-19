@@ -116,6 +116,8 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "standing_payment_create",
     "standing_payment_execute",
     "standing_payment_cancel",
+    "receive_route_set",
+    "receive_route_remove",
 })
 
 
@@ -644,7 +646,8 @@ class NetworkService:
                 elif tx_type in ("retractable_transfer", "retract_transfer",
                                  "grant_create", "grant_draw", "grant_cancel",
                                  "standing_payment_create", "standing_payment_execute",
-                                 "standing_payment_cancel"):
+                                 "standing_payment_cancel",
+                                 "receive_route_set", "receive_route_remove"):
                     if retractable_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS:
                         continue
                     retractable_txs_count += 1
@@ -888,7 +891,8 @@ class NetworkService:
             allowed_types={"retractable_transfer", "retract_transfer",
                            "grant_create", "grant_draw", "grant_cancel",
                            "standing_payment_create", "standing_payment_execute",
-                           "standing_payment_cancel"},
+                           "standing_payment_cancel",
+                           "receive_route_set", "receive_route_remove"},
             type_limits={
                 "retractable_transfer": TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
                 "retract_transfer": TAU_MAX_RETRACT_TRANSFER_BYTES,
@@ -898,6 +902,8 @@ class NetworkService:
                 "standing_payment_create": TAU_MAX_RETRACTABLE_TRANSFER_BYTES,
                 "standing_payment_execute": TAU_MAX_RETRACT_TRANSFER_BYTES,
                 "standing_payment_cancel": TAU_MAX_RETRACT_TRANSFER_BYTES,
+                "receive_route_set": TAU_MAX_RETRACT_TRANSFER_BYTES,
+                "receive_route_remove": TAU_MAX_RETRACT_TRANSFER_BYTES,
             },
         )
 
@@ -1020,6 +1026,10 @@ class NetworkService:
         elif tx_type == "standing_payment_cancel":
             if "standing_id" not in p_dict:
                 logger.debug("Gossip rejected: standing_payment_cancel missing standing_id")
+                return
+        elif tx_type == "receive_route_set":
+            if "destination_pubkey" not in p_dict or "bps" not in p_dict:
+                logger.debug("Gossip rejected: receive_route_set missing required fields")
                 return
         elif tx_type == "grant_cancel":
             if "grant_id" not in p_dict:
@@ -1652,7 +1662,8 @@ class NetworkService:
         if tx_type in ("retractable_transfer", "retract_transfer",
                        "grant_create", "grant_draw", "grant_cancel",
                        "standing_payment_create", "standing_payment_execute",
-                       "standing_payment_cancel"):
+                       "standing_payment_cancel",
+                       "receive_route_set", "receive_route_remove"):
             return TAU_GOSSIP_TOPIC_RETRACTABLE
         return TAU_GOSSIP_TOPIC_TRANSACTIONS
 

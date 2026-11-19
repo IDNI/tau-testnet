@@ -33,6 +33,14 @@ from .approvals import (
     parse_rule_change_request_checked,
     parse_transfer_vote,
 )
+from .routes import (
+    ROUTE_TX_TYPES,
+    RouteBook,
+    RouteShapeError,
+    TX_TYPE_ROUTE_SET,
+    parse_route_remove,
+    parse_route_set,
+)
 from .standing import (
     STANDING_TX_TYPES,
     StandingBook,
@@ -93,7 +101,7 @@ from .rule_offers import (
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW,
-     TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE}
+     TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE, TX_TYPE_ROUTE_SET}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -960,6 +968,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # so it can never share a block with its grant's expiry refund.
         expired_grants = _expire_due_grants(lm, t_bals, t_seqs, block.header.timestamp)
         ended_standing = _end_due_standing(lm, block.header.timestamp)
+        route_book = getattr(lm, "receive_routes", None)
+        if isinstance(route_book, RouteBook):
+            route_book.expire_due(int(block.header.timestamp))
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
             getattr(
@@ -1743,6 +1754,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_retract_id: Optional[bytes] = None
             pending_grant_op = None  # ("create", terms) | ("draw", draw) | ("cancel", gid)
             pending_standing_op = None  # ("create"|"execute"|"cancel", parsed)
+            pending_route_op = None  # ("set", route) | ("remove", owner)
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -1959,6 +1971,28 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 )
                 return allows, fee
 
+            def _credit_with_route(to_addr, amount):
+                """Stage an ordinary credit, split by the recipient's receive route (#35).
+
+                Single hop by construction: the routed share is credited
+                directly and never looks up the destination's own route.
+                """
+                book = getattr(lifecycle_mgr, "receive_routes", None)
+                route = (book.active_route(to_addr, int(block_timestamp or 0))
+                         if isinstance(book, RouteBook) else None)
+                net, routed = route.split(amount) if route is not None else (amount, 0)
+                staged_writes[to_addr] = _read_bal(to_addr) + net
+                if routed:
+                    dest = route.destination_pubkey
+                    staged_writes[dest] = _read_bal(dest) + routed
+                    tx_receipt.setdefault("routed", []).append({
+                        "recipient": to_addr, "gross": amount, "net": net,
+                        "routed": routed, "destination": dest, "bps": route.bps,
+                    })
+                    tx_receipt["logs"].append(
+                        f"Receive route: {routed} of {amount} to {dest[:10]}..."
+                    )
+
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
                                           escrow=False):
@@ -2097,7 +2131,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         return False
                     staged_writes[from_addr] = current_from - amount
                     if not escrow:
-                        staged_writes[to_addr] = _read_bal(to_addr) + amount
+                        _credit_with_route(to_addr, amount)
                 except FeeRuleError:
                     raise
                 except Exception as e:
@@ -2764,9 +2798,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         # they never were the grantee's balance, so the
                         # grantee's o5 does not apply. The fee is the
                         # grantee's, charged by the transfer-less fee step.
-                        staged_writes[draw_req.recipient_pubkey] = (
-                            _read_bal(draw_req.recipient_pubkey) + draw_req.amount
-                        )
+                        _credit_with_route(draw_req.recipient_pubkey, draw_req.amount)
                         pending_grant_op = op
                         tx_receipt["logs"].append(
                             f"Grant draw: {draw_req.amount} from {draw_req.grant_id.hex()}"
@@ -2840,6 +2872,33 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             + (op[1].standing_id.hex() if op[0] == "cancel"
                                else op[1].standing_id.hex())
                         )
+
+            elif tx_type in ROUTE_TX_TYPES:
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    rbook = lifecycle_mgr.receive_routes
+                    ts_now = int(block_timestamp or 0)
+                    reason = ""
+                    op = None
+                    try:
+                        op = (("set", parse_route_set(tx)) if tx_type == TX_TYPE_ROUTE_SET
+                              else ("remove", parse_route_remove(tx)))
+                    except RouteShapeError as exc:
+                        reason = f"invalid {tx_type} ({exc})"
+                    if op is not None:
+                        if not isinstance(sender, str) or sender != op[1].owner_pubkey:
+                            reason = "sender is not the signer"
+                        elif op[0] == "set":
+                            _, reason = rbook.can_admit_set(op[1], ts_now)
+                        else:
+                            _, reason = rbook.can_admit_remove(op[1], ts_now)
+                    if op is None or reason:
+                        tx_receipt["logs"].append(f"Receive route transaction ignored: {reason}")
+                        tx_receipt["reason"] = "receive_route_not_applied"
+                        accepted_in_block = False
+                    else:
+                        pending_route_op = op
+                        tx_receipt["logs"].append(f"Receive route {op[0]} for {sender[:10]}...")
 
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
@@ -3387,6 +3446,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 elif pending_retract_id is not None:
                     tx_receipt["retractable_event"] = (pending_retract_id.hex(), "retracted")
                     book.retract(pending_retract_id)
+                if pending_route_op is not None:
+                    rbook_w = _lifecycle_for_write().receive_routes
+                    if pending_route_op[0] == "set":
+                        rbook_w.install(pending_route_op[1])
+                    else:
+                        rbook_w.remove(pending_route_op[1].owner_pubkey)
                 if pending_standing_op is not None:
                     sbook_w = _lifecycle_for_write().standing_payments
                     kind, obj = pending_standing_op

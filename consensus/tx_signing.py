@@ -33,6 +33,7 @@ from consensus.approvals import (
     TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
+from consensus.routes import TX_TYPE_ROUTE_REMOVE, TX_TYPE_ROUTE_SET
 from consensus.standing import (
     TX_TYPE_STANDING_CANCEL,
     TX_TYPE_STANDING_CREATE,
@@ -163,6 +164,12 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["period"] = payload.get("period")
     elif tx_type == TX_TYPE_STANDING_CANCEL:
         signing_dict["standing_id"] = payload.get("standing_id")
+    elif tx_type == TX_TYPE_ROUTE_SET:
+        for field in ("destination_pubkey", "bps", "min_incoming", "activate_at",
+                      "expires_at", "locked_until"):
+            signing_dict[field] = payload.get(field)
+    elif tx_type == TX_TYPE_ROUTE_REMOVE:
+        pass  # nothing beyond the common fields: it removes the signer's own route
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

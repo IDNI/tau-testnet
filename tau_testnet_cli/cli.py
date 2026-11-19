@@ -1221,6 +1221,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_retractable_subparsers(sub)
     _add_grant_subparsers(sub)
     _add_standing_subparsers(sub)
+    _add_route_subparsers(sub)
     _add_node_subparsers(sub)
 
     return parser
@@ -3095,6 +3096,99 @@ def _add_standing_subparsers(sub) -> None:
     _key_group(ls, required=False)
     ls.add_argument("--role", choices=["in", "out", "all"], default="all")
     ls.set_defaults(func=cmd_standing_list)
+
+
+
+
+# --- Receive routes (#35) -------------------------------------------------------
+
+
+def _parse_percent(value: str) -> int:
+    """'20' or '20%' or '12.5' -> basis points."""
+    text = value.strip().rstrip("%")
+    try:
+        bps = round(float(text) * 100)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a percentage: {value!r}")
+    if not 1 <= bps <= 9000:
+        raise argparse.ArgumentTypeError("share must be between 0.01% and 90%")
+    return bps
+
+
+def cmd_route_set(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_route_set_tx(
+            sender_pubkey=sender_pubkey, sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry, expire_at_height=expire_at_height,
+            destination_pubkey=args.to, bps=args.share, min_incoming=int(args.min or 0),
+            activate_at=args.start or 0, expires_at=args.until or 0,
+            locked_until=args.lock_until or 0,
+        )
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_route_remove(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_route_remove_tx(
+            sender_pubkey=sender_pubkey, sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry, expire_at_height=expire_at_height,
+        )
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_route_show(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getreceiveroute {address}")
+
+
+def _add_route_subparsers(sub) -> None:
+    """`tau-testnet route ...` -- split what your account receives (#35)."""
+    p = sub.add_parser("route", parents=[_GLOBAL_PARENT],
+                       help="Receive routes: send a share of every incoming payment elsewhere")
+    rsub = p.add_subparsers(dest="route_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser, fee=True):
+        if fee:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument("--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+                            help="Seconds until expiration_time (default: %(default)s)")
+        parser.add_argument("--expire-in", type=_block_count, default=1000,
+                            help="Blocks the transaction may land in, from the next one")
+        parser.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+
+    st = rsub.add_parser("set", parents=common, help="Install or replace your receive route")
+    _key_group(st)
+    st.add_argument("--to", required=True, help="Destination public key (96 hex)")
+    st.add_argument("--share", required=True, type=_parse_percent,
+                    help="Percentage of each incoming payment, e.g. 20 or 12.5 (max 90)")
+    st.add_argument("--min", type=int, help="Only route payments of at least this amount")
+    st.add_argument("--start", type=_parse_when, help="Active from (unix or ISO UTC)")
+    st.add_argument("--until", type=_parse_when, help="Expires at (unix or ISO UTC)")
+    st.add_argument("--lock-until", type=_parse_when,
+                    help="Binding: cannot be changed or removed before this (needs --until)")
+    _tx_flags(st)
+    st.set_defaults(func=cmd_route_set)
+
+    rm = rsub.add_parser("remove", parents=common, help="Remove your receive route (feeless)")
+    _key_group(rm)
+    _tx_flags(rm, fee=False)
+    rm.set_defaults(func=cmd_route_remove)
+
+    sh = rsub.add_parser("show", parents=common, help="The route installed for an address")
+    sh.add_argument("--address", help="Address (default: your key's)")
+    _key_group(sh, required=False)
+    sh.set_defaults(func=cmd_route_show)
 
 
 

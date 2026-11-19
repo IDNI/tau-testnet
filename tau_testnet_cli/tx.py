@@ -908,3 +908,30 @@ def build_standing_cancel_tx(
                      expiration_time, expire_at_height, "0")
     tx["standing_id"] = standing_id.lower()
     return tx
+
+
+def build_route_set_tx(
+    *, sender_pubkey: str, sequence_number: int, expiration_time: int,
+    expire_at_height: int, destination_pubkey: str, bps: int, min_incoming: int = 0,
+    activate_at: int = 0, expires_at: int = 0, locked_until: int = 0,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``receive_route_set`` payload (without signature)."""
+    if not isinstance(destination_pubkey, str) or len(destination_pubkey) != 96:
+        raise ValueError("destination_pubkey must be a 96-character hex public key")
+    tx = _grant_base("receive_route_set", sender_pubkey, sequence_number,
+                     expiration_time, expire_at_height, fee_limit)
+    tx.update({
+        "destination_pubkey": destination_pubkey.lower(), "bps": int(bps),
+        "min_incoming": int(min_incoming), "activate_at": int(activate_at),
+        "expires_at": int(expires_at), "locked_until": int(locked_until),
+    })
+    return tx
+
+
+def build_route_remove_tx(
+    *, sender_pubkey: str, sequence_number: int, expiration_time: int, expire_at_height: int,
+) -> dict:
+    """Construct a fee-exempt ``receive_route_remove`` payload (without signature)."""
+    return _grant_base("receive_route_remove", sender_pubkey, sequence_number,
+                       expiration_time, expire_at_height, "0")
