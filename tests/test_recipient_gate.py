@@ -266,6 +266,171 @@ def test_recipient_without_policy_allows_all():
     assert _balances(applied)[BOB] == 100
 
 
+def test_outbound_only_clause_does_not_block_inbound():
+    # BOB's only clause is his SEND whitelist: it reads i4 (where a
+    # transfer is going) and never mentions i3 or i17. Written purely
+    # for outbound transfers, it must not veto money arriving -- the
+    # neutral default DESIGN section 1 promises ("a policy that does
+    # not mention incoming transfers allows everything"). Judged on
+    # the recipient map the clause would see i4 = BOB himself, who is
+    # not on his own send whitelist, so an unscreened gate refuses
+    # the payment for a reason the clause was never written to give.
+    clause = (
+        "always ( o5[t]:bv[24] = { #x000001 }:bv[24] "
+        "&& i4[t]:bv[384] = { #x" + CAROL + " }:bv[384] )."
+    )
+
+    def whitelist(body, inputs):
+        if body != clause:
+            return None
+        # The whitelist's own semantics: allow only sends to CAROL.
+        return "1" if inputs.get("i4") == "#x" + CAROL else "0"
+
+    lm = _lifecycle(clause=clause)
+    tx = _transfer(BOB, 100, SK_ALICE)
+    applied = _apply([tx], lm, clause_decide=whitelist)
+    assert tx["tx_id"] in applied.result.accepted_tx_ids
+    assert _balances(applied)[BOB] == 100
+
+
+def test_comment_mentioning_i4_does_not_screen_out_an_inbound_clause():
+    # PoC (comment-only reference): BOB's clause is an inbound rule
+    # -- refuse incoming above 500, reading i1 only -- and its only
+    # mention of i4 is inside a '#' comment recalling the old send
+    # whitelist. A raw-text screen would see i4 and suppress the
+    # verdict, admitting a payment the clause refuses. The screen
+    # strips comments first, so the verdict stands.
+    clause = (
+        "always ( o5[t]:bv[24] = { #x000001 }:bv[24] ). "
+        "# see also the old send whitelist on i4[t]"
+    )
+
+    def amount_rule(body, inputs):
+        if body != clause:
+            return None
+        return "0" if int(inputs.get("i1", "0")) > 500 else "1"
+
+    lm = _lifecycle(clause=clause)
+    big = _transfer(BOB, 600, SK_CAROL, sender=CAROL)
+    applied = _apply([big], lm, clause_decide=amount_rule)
+    assert _outcome(applied, big["tx_id"]).reason == recipient_gate.REASON_POLICY_BLOCK
+    assert _balances(applied)[BOB] == 0
+
+    lm = _lifecycle(clause=clause)
+    small = _transfer(BOB, 100, SK_ALICE)
+    applied = _apply([small], lm, clause_decide=amount_rule)
+    assert small["tx_id"] in applied.result.accepted_tx_ids
+    assert _balances(applied)[BOB] == 100
+
+
+def test_comment_mentioning_i3_does_not_rescue_an_outbound_clause():
+    # PoC (comment-only reference, mirrored): BOB's clause is the
+    # outbound whitelist -- reads i4 in its body, never i3/i17, no
+    # o10 -- and its only mention of i3 is inside a '#' comment.
+    # A raw-text screen would see i3 and enforce the verdict,
+    # refusing a payment the clause was never written about. The
+    # screen strips comments first, so the outbound verdict stays
+    # unenforced against the inbound transfer.
+    clause = (
+        "always ( o5[t]:bv[24] = { #x000001 }:bv[24] "
+        "&& i4[t]:bv[384] = { #x" + CAROL + " }:bv[384] ). "
+        "# inbound note: i3[t] is the sender on this map"
+    )
+
+    def whitelist(body, inputs):
+        if body != clause:
+            return None
+        return "1" if inputs.get("i4") == "#x" + CAROL else "0"
+
+    lm = _lifecycle(clause=clause)
+    tx = _transfer(BOB, 100, SK_ALICE)
+    applied = _apply([tx], lm, clause_decide=whitelist)
+    assert tx["tx_id"] in applied.result.accepted_tx_ids
+    assert _balances(applied)[BOB] == 100
+
+
+def test_one_unit_carries_inbound_and_outbound_rules():
+    # #47 case 4: BOB's ONE policy unit carries both directions -- an
+    # inbound rule (reads the counterparty on i3: refuse CAROL) and
+    # the outbound whitelist (reads the destination on i4: send only
+    # to CAROL). Both halves must enforce, each under its own reason.
+    unit = (
+        "always ( o5[t]:bv[24] = { #x000001 }:bv[24] "
+        "&& (i3[t]:bv[384] = { #x" + ALICE + " }:bv[384] "
+        "|| i4[t]:bv[384] = { #x" + CAROL + " }:bv[384]) )."
+    )
+
+    def unit_decide(body, inputs):
+        if body != unit or inputs.get("i12") != "#x" + BOB:
+            return None
+        if inputs.get("i4") == "#x" + BOB:
+            # Inbound half: BOB is being paid; refuse CAROL.
+            return "0" if inputs.get("i3") == "#x" + CAROL else "1"
+        # Outbound half: BOB is sending; only CAROL may receive.
+        return "1" if inputs.get("i4") == "#x" + CAROL else "0"
+
+    # The inbound half enforces under the recipient reason.
+    lm = _lifecycle(clause=unit)
+    bad = _transfer(BOB, 100, SK_CAROL, sender=CAROL)
+    applied = _apply([bad], lm, clause_decide=unit_decide)
+    assert _outcome(applied, bad["tx_id"]).reason == recipient_gate.REASON_POLICY_BLOCK
+    assert _balances(applied)[BOB] == 0
+
+    lm = _lifecycle(clause=unit)
+    good = _transfer(BOB, 100, SK_ALICE)
+    applied = _apply([good], lm, clause_decide=unit_decide)
+    assert good["tx_id"] in applied.result.accepted_tx_ids
+    assert _balances(applied)[BOB] == 100
+
+    # The outbound half enforces under the sender reason.
+    funded = {ALICE: 100000, AUTH: 10, BOB: 1000, CAROL: 100000, MALLORY: 0}
+    lm = _lifecycle(clause=unit)
+    out_bad = _transfer(MALLORY, 100, SK_BOB, sender=BOB)
+    applied = _apply([out_bad], lm, parent=_parent(lm, balances=dict(funded)),
+                     clause_decide=unit_decide)
+    assert _outcome(applied, out_bad["tx_id"]).reason == "user_policy_block"
+    assert _balances(applied)[MALLORY] == 0
+
+    lm = _lifecycle(clause=unit)
+    out_good = _transfer(CAROL, 100, SK_BOB, sender=BOB)
+    applied = _apply([out_good], lm, parent=_parent(lm, balances=dict(funded)),
+                     clause_decide=unit_decide)
+    assert out_good["tx_id"] in applied.result.accepted_tx_ids
+    assert _balances(applied)[CAROL] == 100000 + 100
+
+
+def test_guarded_unit_can_refuse_inbound():
+    # Guarded mode (#47): BOB's unit lives in the spec itself, guarded
+    # on i12 = BOB -- "always ((i12 = BOB) ? <body> : o5 = allow)" --
+    # and is NOT an accepted clause. The isolated clause evaluator
+    # below allows everything, so a refusal can only come from the
+    # guarded unit firing on the gate's second pass, the one that
+    # feeds i12 = recipient. BOB's unit: only ALICE may pay him.
+    def spec_decide(vals):
+        if _owner_of(vals) == BOB \
+                and _owner_of({12: vals.get(3)}) != ALICE:
+            return {5: "0"}
+        return {}
+
+    lm = _lifecycle()
+    tx = _transfer(BOB, 100, SK_CAROL, sender=CAROL)
+    applied = _apply([tx], lm, decide=spec_decide, recipient_policy=True,
+                     clause_decide=lambda body, inputs: "1")
+    assert _outcome(applied, tx["tx_id"]).reason == recipient_gate.REASON_POLICY_BLOCK
+    assert _balances(applied)[BOB] == 0
+    # The gate's second pass ran with the recipient as policy owner --
+    # the only way the guard on i12 = BOB can match.
+    assert any(_owner_of(c) == BOB for c in applied.multi_calls)
+
+    # Control: the approved sender passes the same guarded unit.
+    lm = _lifecycle()
+    tx = _transfer(BOB, 100, SK_ALICE)
+    applied = _apply([tx], lm, decide=spec_decide, recipient_policy=True,
+                     clause_decide=lambda body, inputs: "1")
+    assert tx["tx_id"] in applied.result.accepted_tx_ids
+    assert _balances(applied)[BOB] == 100
+
+
 def test_recipient_clause_alone_can_block():
     clause = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
     lm = _lifecycle(clause=clause)
@@ -317,6 +482,44 @@ def test_approval_completion_refused_by_recipient_policy():
         request_id=request.request_id_hex, approve=True), SK_AUTH)
     applied = _apply([vote], lm)
     assert _balances(applied)[BOB] == 500
+
+
+def test_recipient_refusal_at_apply_charges_like_a_sender_block():
+    # DESIGN section 4.4: a recipient refusal at apply behaves like a
+    # sender-policy block at apply. The harness observes the charge
+    # through the sender's resulting balance (outcomes carry no fee
+    # field): both refusals must cost the sender exactly the same,
+    # and strictly less than an applied transfer, which pays the
+    # amount plus the measured step fee. (The admission half of the
+    # documented behaviour -- a refusal there is free -- is a dry
+    # run: it moves no balance by construction, and its refusal
+    # envelope is pinned by the admission tests below.)
+    clause = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
+
+    # A sender-policy block: ALICE's own clause refuses her send.
+    lm = _lifecycle()
+    lm.rule_offers.accepted_clauses[(ALICE, tau_defs.USER_POLICY_STREAM_INDEX)] = clause
+    tx = _transfer(CAROL, 100, SK_ALICE)
+    applied = _apply([tx], lm,
+                     clause_decide=lambda body, inputs: "0" if body == clause else None)
+    assert _outcome(applied, tx["tx_id"]).reason == "user_policy_block"
+    sender_block_balance = _balances(applied)[ALICE]
+
+    # A recipient-policy block of the same transfer shape.
+    lm = _lifecycle()
+    tx = _transfer(BOB, 100, SK_ALICE)
+    applied = _apply([tx], lm, blocked={BOB})
+    assert _outcome(applied, tx["tx_id"]).reason == recipient_gate.REASON_POLICY_BLOCK
+    recipient_block_balance = _balances(applied)[ALICE]
+
+    # Control: the same payment applied pays amount + measured fee.
+    lm = _lifecycle()
+    tx = _transfer(CAROL, 100, SK_ALICE)
+    applied = _apply([tx], lm)
+    assert tx["tx_id"] in applied.result.accepted_tx_ids
+    assert _balances(applied)[ALICE] == 100000 - 100 - FEE
+
+    assert recipient_block_balance == sender_block_balance
 
 
 # --- #76 at apply ---------------------------------------------------------------
@@ -376,6 +579,28 @@ def test_release_and_retract_are_never_gated():
                       parent=applied.result.next_snapshot, blocked={BOB})
     assert retract["tx_id"] in applied2.result.accepted_tx_ids
     assert _balances(applied2)[ALICE] == 100000 - FEE  # escrow refunded, park fee paid
+
+
+def test_park_release_is_never_gated():
+    # The release leg of #76's "never gated", driven rather than
+    # named: the park matures in a block where the recipient's
+    # policy refuses every inbound transfer (blocked below), and
+    # the sweep still pays the recipient in full. A release is the
+    # recipient's own escrowed money leaving; gating it could trap
+    # funds behind a policy published after the park was created.
+    lm = _lifecycle()
+    tx = _park(SK_ALICE)  # releases at HEIGHT + 10
+    applied = _apply([tx], lm)
+    assert tx["tx_id"] in applied.result.accepted_tx_ids
+    entry = parse_retractable_transfer(tx)
+
+    applied2 = _apply([], applied.lifecycle,
+                      parent=applied.result.next_snapshot,
+                      height=HEIGHT + 10, blocked={BOB})
+    assert entry.retractable_id.hex() in \
+        applied2.result.governance_changes["released_retractables"]
+    assert _balances(applied2)[BOB] == 100
+    assert applied2.lifecycle.retractable_transfers.escrow_total() == 0
 
 
 def test_recipient_without_cap_allows_any_hold():
@@ -532,4 +757,16 @@ def test_recipient_cap_admission_matches_apply(admission_node):
     admission_node["caps"] = {BOB: 20}
     result = json.loads(checktx.execute(_draft(tx), None))
     assert result["status"] == "ok"
+    assert result["data"]["recipient_hold_cap"] == "enforced"
+
+
+def test_checktx_reports_recipient_capabilities_enforced(admission_node):
+    # #47 case 5 / #76 case 6, the reporting half: checktx's capability
+    # surface names both features as enforced on this node, so a
+    # wallet can detect the gate before offering an inbound rule.
+    tx = _signed_draft("user_tx", ALICE, SK_ALICE,
+                       operations={"1": [[ALICE, BOB, "100"]]})
+    result = json.loads(checktx.execute(_draft(tx), None))
+    assert result["status"] == "ok"
+    assert result["data"]["recipient_policy_gate"] == "enforced"
     assert result["data"]["recipient_hold_cap"] == "enforced"
