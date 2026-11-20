@@ -26,6 +26,7 @@ from commands import (
     getretractableid,
     getretractables,
 )
+from commands import getpaymentcapabilities, getpayments
 from errors import DependencyError
 from network import BootstrapPeer, NetworkConfig
 from network.identity import IDENTITY_SEED_SIZE
@@ -86,6 +87,11 @@ class ServiceContainer:
         "getretractable": getretractable,
         "getretractables": getretractables,
         "getretractableid": getretractableid,
+        # Programmable payments (Bounty 01): the capability report a wallet
+        # checks before offering the features, and one account's payment
+        # books status.
+        "getpaymentcapabilities": getpaymentcapabilities,
+        "getpayments": getpayments,
         # Advisory, node-local, and engine-driving -- rate-limited accordingly
         # in server.py.
         "getapprovalslots": getapprovalslots,
