@@ -124,6 +124,18 @@ def execute(raw_command: str, container):
                     "block_number": loc["block_number"],
                     "confirmations": max(1, confirmations),
                 }
+                # Issue #42: a confirmed rule transaction shows its apply
+                # outcome (the engine's revision receipt, recorded by the
+                # node that built the block), so a wallet can confirm the
+                # rule took effect without re-running the engine. Absent
+                # for non-rule transactions and for blocks built by other
+                # nodes -- the field is simply not present then.
+                try:
+                    rule_outcome = db.get_rule_outcome(tx_hash, loc["block_hash"])
+                except Exception:
+                    rule_outcome = None
+                if rule_outcome is not None:
+                    data["rule_outcome"] = rule_outcome
                 data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
                 return api_response.success_response("gettxstatus", data)
 

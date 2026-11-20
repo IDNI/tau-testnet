@@ -936,6 +936,31 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
         # `mempool_dropped` reads as "unknown" to gettxstatus.
         if rejected_hashes:
             _db.record_dropped_txs(rejected_hashes, "rejected", rejected_details)
+        # Issue #42: the mirror image of the rejection details above -- the
+        # apply outcome of each CONFIRMED rule transaction, so gettxstatus
+        # can show the revision a confirmed rule produced. Outcomes are
+        # keyed by tx_id-or-index; gettxstatus queries by the computed hash,
+        # so translate through the parallel transaction list.
+        _outcomes_by_key = {
+            outcome.tx_id: outcome
+            for outcome in (getattr(apply_result, "outcomes", None) or [])
+            if getattr(outcome, "rule_outcome", None)
+        }
+        if _outcomes_by_key:
+            rule_outcomes = {}
+            for i, tx in enumerate(execution_transactions):
+                key = tx.get('tx_id') or str(i)
+                outcome = _outcomes_by_key.get(key)
+                if outcome is not None and key in apply_result.accepted_tx_ids:
+                    rule_outcomes[block.compute_tx_hash(transactions[i])] = (
+                        outcome.rule_outcome
+                    )
+            if rule_outcomes:
+                _db.record_rule_outcomes(
+                    candidate_block.block_hash,
+                    candidate_block.header.block_number,
+                    rule_outcomes,
+                )
         if final_reserved_ids:
              _db.remove_transactions(final_reserved_ids)
         # Parsed but claimed by no verdict: return them to pending instead of
