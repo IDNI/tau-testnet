@@ -117,5 +117,6 @@ jobs:
           mkdir -p data_local && cp data/test_miner.key data/test_miner.pub data_local/ &&
           python -m pytest
           tests/test_recipient_controls_native.py
+          tests/test_recipient_controls_twonode_native.py
           -p no:asyncio -v
           "
