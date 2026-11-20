@@ -550,6 +550,11 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
             if has_due is not None and has_due(block_number, block_timestamp) is True:
                 empty_ok = True
                 break
+            # a sale still waiting for the run the node owes it
+            has_arrivals = getattr(book, "has_arrivals", None)
+            if has_arrivals is not None and has_arrivals() is True:
+                empty_ok = True
+                break
 
     # Get batch of reserved transactions from mempool. The chain-write lock is
     # already held for the whole round, so no second producer can sweep or

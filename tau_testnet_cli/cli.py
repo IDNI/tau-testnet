@@ -2626,6 +2626,12 @@ def _payout_fields(args, tip: int, now: int) -> dict:
         **({"periods_from": int(args.periods_from)}
            if getattr(args, "periods_from", None) is not None else {}),
         **({"due_at": int(args.due_at)} if getattr(args, "due_at", None) is not None else {}),
+        **({"due_every": int(args.due_every)}
+           if getattr(args, "due_every", None) is not None else {}),
+        **({"due_months": int(args.due_months)}
+           if getattr(args, "due_months", None) is not None else {}),
+        **({"on_arrival": True} if getattr(args, "on_arrival", False) else {}),
+        **({"sealed": True} if getattr(args, "sealed", False) else {}),
     }
 
 
@@ -2819,6 +2825,18 @@ def _add_payout_subparsers(sub) -> None:
     p_set.add_argument("--due-at", type=int, metavar="HEIGHT|UNIX",
                        help="The node runs the rule itself once at this point, on the "
                             "period's clock, with no executor: only fixed slots are paid")
+    p_set.add_argument("--due-every", type=int, metavar="N",
+                       help="With --due-at: the node runs the rule again every N blocks "
+                            "or seconds, on the period's clock")
+    p_set.add_argument("--due-months", type=int, metavar="N",
+                       help="With --due-at and --period-seconds: the node runs the rule "
+                            "again every N calendar months (UTC)")
+    p_set.add_argument("--on-arrival", action="store_true",
+                       help="With --per-sale: the node runs the rule itself for each "
+                            "payment that arrives, once; only fixed slots are paid")
+    p_set.add_argument("--sealed", action="store_true",
+                       help="Until the rule ends the account signs nothing and the rule "
+                            "cannot be changed: money leaves by the rule only")
     _tx_flags(p_set, request=True)
     p_set.set_defaults(func=cmd_payout_set)
 

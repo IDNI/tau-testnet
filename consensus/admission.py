@@ -1819,21 +1819,28 @@ def validate_payout_rule_set_payload(
             f"payout_rule_set rejected: the rule does not build: {built.error[:300]}",
             code="PAYOUT_RULE_DOES_NOT_BUILD",
         )
-    if terms.due_at is not None:
-        # The node steps this rule by itself at the due point, and no transaction
-        # passes admission first then. So step it once here, on the inputs such a
-        # run hands it: a rule the evaluator cannot answer within its budget stops
-        # here, as an execution that times out does. The answer itself is not
-        # judged; the block that reaches the due point decides that.
+    if terms.due_at is not None or terms.on_arrival:
+        # The node steps this rule by itself, at the due point or when a payment
+        # arrives, and no transaction passes admission first then. So step it
+        # once here, on the inputs such a run hands it: a rule the evaluator
+        # cannot answer within its budget stops here, as an execution that times
+        # out does. The answer itself is not judged; the block that makes the
+        # run decides that.
         import chain_state
 
         height, ts = tip_view.next_block_height, tip_view.next_block_timestamp
         state = PayoutState(anchor=terms.clock(height, ts))
-        if terms.kind == PAYOUT_KIND_BLOCKS:
+        trial = PayoutExecution("", terms.account_pubkey, terms.rule_id, (), ())
+        if terms.on_arrival:
+            # one sale to read: a payment of the cap per execution from a fixed slot's key
+            sale = (bytes(32), next(s for s in terms.slots if s), terms.cap_per_execution,
+                    height)
+            state = PayoutState(anchor=state.anchor, open_sales=(sale,))
+            trial = PayoutExecution("", terms.account_pubkey, terms.rule_id, (), (), sale[0])
+        elif terms.kind == PAYOUT_KIND_BLOCKS:
             height = terms.due_at
         else:
             ts = terms.due_at
-        trial = PayoutExecution("", terms.account_pubkey, terms.rule_id, (), ())
         values = payout_execution_inputs(
             terms, state, trial,
             parent_balance=int(chain_state.get_balance(terms.account_pubkey) or 0),
@@ -1857,6 +1864,10 @@ def validate_payout_rule_set_payload(
         "expires_at": terms.expires_at,
         **({"periods_from": terms.periods_from} if terms.periods_from is not None else {}),
         **({"due_at": terms.due_at} if terms.due_at is not None else {}),
+        **({"due_every": terms.due_every} if terms.due_every is not None else {}),
+        **({"due_months": terms.due_months} if terms.due_months is not None else {}),
+        **({"on_arrival": True} if terms.on_arrival else {}),
+        **({"sealed": True} if terms.sealed else {}),
     })
 
 
@@ -1969,6 +1980,14 @@ def validate_expire_at_height(payload: Dict, tip_view: TipAdmissionView) -> Opti
     return None
 
 
+def _sender_is_sealed(payload: Dict, tip_view: TipAdmissionView) -> bool:
+    book_of = getattr(tip_view, "payout_book", None)
+    if book_of is None:
+        return False
+    sealed = getattr(book_of(), "sealed", None)
+    return sealed is not None and sealed(payload.get("sender_pubkey")) is True
+
+
 def validate_mempool_admission(
     payload: Dict, tip_view: TipAdmissionView, *, compile_rules: bool = True
 ) -> AdmissionResult:
@@ -1995,6 +2014,15 @@ def validate_mempool_admission(
             f"{tx_type} rejected: {network_error}.",
             code="WRONG_NETWORK",
             genesis_hash=network_binding.chain_genesis_hash(),
+        )
+
+    # Block apply runs the same check: a sealed account signs nothing until its
+    # payout rule ends.
+    if _sender_is_sealed(payload, tip_view):
+        return format_error(
+            f"{tx_type} rejected: the account is sealed by its payout rule until "
+            "the rule ends.",
+            code="ACCOUNT_SEALED",
         )
 
     if tx_type == "user_tx":

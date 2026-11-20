@@ -135,3 +135,40 @@ def test_a_request_outside_the_abi_is_refused_up_front():
     req = _request(KIND_SET_PAYOUT, text=bad, expire=LATE)
     chain.block(_tx(req))
     assert chain.book.get_rule_change(req.request_id) is None
+
+
+# --- a sealed rule and requests that were already waiting -------------------------------
+
+def test_a_request_that_was_waiting_cannot_replace_or_revoke_a_sealed_rule():
+    """The account files a revoke and a second install, and then the install of
+    a sealed rule. Once the sealed rule is in, the two that were waiting fail at
+    their release, by co-signature or by the time escape."""
+    chain, first = _parked(KIND_SET_PAYOUT, spec())
+    chain.block(_vote(first.request_id))
+    revoke = _request(KIND_REVOKE_PAYOUT, seq=1, expire=LATE)
+    other = _request(KIND_SET_PAYOUT, text=spec(slots=[CAROL_KEY]), seq=2, expire=LATE)
+    seal = _request(KIND_SET_PAYOUT, text=spec(sealed=True), seq=3, expire=LATE)
+    for req in (revoke, other, seal):
+        chain.block(_tx(req))
+        assert chain.entry(req).status == STATUS_OPEN
+    chain.block(_vote(seal.request_id, seq=1))
+    assert chain.entry(seal).status == STATUS_EXECUTED
+    sealed = chain.lm.payout_rules.get(ALICE)
+    assert sealed.sealed and chain.lm.payout_rules.sealed(ALICE)
+
+    chain.block(_vote(revoke.request_id, seq=2))            # by co-signature
+    assert chain.entry(revoke).status == STATUS_FAILED
+    chain.block(height=HEIGHT + 2 * D)                       # by the time escape
+    assert chain.entry(other).status == STATUS_FAILED
+    assert chain.lm.payout_rules.get(ALICE) is sealed
+
+
+def test_the_sealed_account_cannot_file_a_new_request():
+    chain, seal = _parked(KIND_SET_PAYOUT, spec(sealed=True))
+    chain.block(_vote(seal.request_id))
+    assert chain.lm.payout_rules.sealed(ALICE)
+    req = _request(KIND_REVOKE_PAYOUT, seq=1, expire=LATE)
+    result = chain.block(_tx(req))
+    assert req.request_id not in chain.book.rule_change_requests
+    assert [o.reason for o in result.outcomes] == ["account_sealed"]
+

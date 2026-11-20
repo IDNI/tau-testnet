@@ -166,9 +166,11 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         # sale must not be turned into one that pays on any input, or back.
         if "per_sale" in payload:
             signing_dict["per_sale"] = payload.get("per_sale")
-        # The optional terms, signed when present: where the periods count from
-        # and the point at which the node runs the rule itself.
-        for field in ("periods_from", "due_at"):
+        # The optional terms, signed when present: where the periods count from,
+        # the points at which the node runs the rule itself, whether it runs it
+        # for each payment that arrives, and whether the account is sealed.
+        for field in ("periods_from", "due_at", "due_every", "due_months",
+                      "on_arrival", "sealed"):
             if field in payload:
                 signing_dict[field] = payload.get(field)
     elif tx_type == TX_TYPE_PAYOUT_EXECUTE:

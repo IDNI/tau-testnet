@@ -887,6 +887,10 @@ def build_payout_rule_set_tx(
     periods_from: int | None = None,
     due_at: int | None = None,
     fee_limit: str | int = "0",
+    due_every: int | None = None,
+    due_months: int | None = None,
+    on_arrival: bool = False,
+    sealed: bool = False,
 ) -> dict:
     """Construct a ``tx_type='payout_rule_set'`` payload (without signature).
 
@@ -896,6 +900,11 @@ def build_payout_rule_set_tx(
     ``periods_from`` and ``due_at`` are on the period's clock like
     ``expires_at``: where the periods count from (default: the install), and a
     point at which the node runs the rule itself, once.
+
+    ``due_every`` (on the period's clock) or ``due_months`` (calendar months,
+    time clock only) repeat that run from ``due_at`` on. ``on_arrival`` (with
+    ``per_sale``): the node runs the rule itself for each sale. ``sealed``: the
+    account signs nothing until the rule ends.
 
     ``slots`` lists one entry per slot: a recipient's 96-hex key, or "" for an
     open slot the executor names. ``expires_at`` is on the period's clock: a
@@ -934,6 +943,14 @@ def build_payout_rule_set_tx(
         tx["periods_from"] = int(periods_from)
     if due_at is not None:
         tx["due_at"] = int(due_at)
+    if due_every is not None:
+        tx["due_every"] = int(due_every)
+    if due_months is not None:
+        tx["due_months"] = int(due_months)
+    if on_arrival:
+        tx["on_arrival"] = True
+    if sealed:
+        tx["sealed"] = True
     return tx
 
 

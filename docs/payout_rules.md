@@ -56,6 +56,10 @@ tau-testnet payout set --key treasury --file payout.tau \
 | `per_sale` | Optional, `true` or left out. The rule pays only against sales the chain recorded, once per sale ([Per sale](#per-sale-royalties)). |
 | `periods_from` | Optional, a number or left out. The periods count from this point on the period's clock instead of the install ([Optional terms](#optional-terms)). |
 | `due_at` | Optional, a number or left out. At this point on the period's clock the node runs the rule itself, once ([Optional terms](#optional-terms)). |
+| `due_every` | Optional, a number or left out, with `due_at`. The node runs the rule again every so many blocks or seconds ([Three ways a rule is started](#three-ways-a-rule-is-started)). |
+| `due_months` | Optional, 1 to 12, with `due_at` and `period_seconds`. The node runs the rule again every so many calendar months, UTC. |
+| `on_arrival` | Optional, `true` or left out, with `per_sale`. The node runs the rule itself for each payment that arrives. |
+| `sealed` | Optional, `true` or left out. Until the rule ends the account signs nothing and the rule cannot be changed. |
 
 Admission and apply refuse a rule that pays the account itself in a fixed slot,
 names one fixed recipient in two slots, or does not fit the ABI. The rule is
@@ -451,6 +455,164 @@ and both clock conditions on the real engine, and `scripts/e2e_payout_due.py`
 runs them on two live nodes: the deadline arrives in an empty block and the
 money is back.
 
+## Three ways a rule is started
+
+A payout rule decides what is paid, to whom and under which condition. Something
+has to ask it. There are three ways, and a rule is signed for the ones it wants:
+
+| What starts the rule | Signed term | Who pays a fee |
+|---|---|---|
+| A transaction someone sends | none: every rule | the executor |
+| The clock | `due_at`, repeated by `due_every` or `due_months` | nobody |
+| A payment that arrives | `on_arrival` (with `per_sale`) | the payer, for its own payment only |
+
+None of the three knows what the rule is for. The node only decides when it asks
+and with which inputs; the answer is the rule's. So a standing payment and a
+share routed from every incoming payment are payout rules like any other.
+
+### The clock, again and again
+
+`due_at` alone runs the rule once. With `due_every` or `due_months` the node
+runs it at every due point from `due_at` on.
+
+```bash
+# 100 to Bob on the 31st of each month, from 31 January 2027
+tau-testnet payout set --key alice --file rent.tau --slot <bob_pubkey> \
+    --cap-per-execution 100 --cap-per-period 100 \
+    --period-seconds 86400 --ends-at 1830297600 \
+    --due-at 1801353600 --due-months 1
+```
+
+```
+# rent.tau: 100 to slot 0 when the node itself runs the rule, nothing for anyone else
+always ( (i13[t]:bv[384] = { 0 }:bv[384])
+         ? (o30[t]:bv[24] = { 100 }:bv[24]) : (o30[t]:bv[24] = { 0 }:bv[24]) ).
+```
+
+- `due_every` is on the rule's clock: 256 to 1,000,000 blocks with
+  `period_blocks`, 3,600 seconds to 366 days with `period_seconds`. Due point
+  number k is `due_at + k * due_every`.
+- `due_months` is 1 to 12 calendar months in UTC and needs the time clock. Due
+  point number k is `due_at` moved by k times that many months, with the day and
+  the time of day kept. A day the month does not have becomes its last day, and
+  each point is derived from `due_at`, never from the one before: a rule signed
+  for the 31st runs on 28 or 29 February and on the 31st again in March.
+- Each due point runs once, in the first block whose clock reaches it, exactly
+  as a single due point does (see [Optional terms](#optional-terms)): no
+  executor, fixed slots only, the balance the block has reached, all slots or
+  none, the rule's caps.
+- A due point the chain passed while another was still waiting is not caught
+  up. After a run the node queues the first due point that lies after the
+  block's clock. So a run never pays twice for one point, and a chain that
+  stood still does not pay several at once.
+- A run that pays nothing (the account does not hold the amount, a cap is
+  reached, the rule answers 0) is recorded as `due_not_paid` with the reason.
+  Nothing is owed for it later. A rule that wants to make up for it can say so
+  itself: it reads the clock of its last paid execution on `i49`.
+- The last due point is the last one before `expires_at`. The rule is kept
+  until that one has run, then it ends like any rule.
+- Revoking the rule stops every later run. A revoke in the block of a due point
+  wins: the transactions of a block come before its runs.
+- The floor of 256 blocks is what lets a full book be served: 4,096 rules at 16
+  runs a block take 256 blocks.
+
+`getpayoutrule` shows `due_every` or `due_months`, `next_due` and the number of
+the next due point; the history shows `due_index` with each run.
+
+### A payment that arrives
+
+A rule with `per_sale` pays against sales the chain recorded: signed transfers
+into the account. With `on_arrival` nobody has to execute it. The node runs the
+rule for each sale at the end of the block that recorded it.
+
+```bash
+# a fifth of every payment the shop receives goes to the creator
+tau-testnet payout set --key shop --file route.tau --slot <creator_pubkey> \
+    --per-sale --on-arrival \
+    --cap-per-execution 100000 --cap-per-period 1000000 \
+    --period-seconds 86400 --ends-in 31536000
+```
+
+```
+# route.tau
+always ( o30[t]:bv[24] = i27[t]:bv[24] / { 5 }:bv[24] ).
+```
+
+A payment of 101 leaves 81 with the shop and 20 with the creator. The payer
+paid 101 and the fee of its own transaction. The shop need not be online.
+
+- The run has no executor (`i13` is 0), so only fixed slots are paid. `i27` is
+  the amount of the sale, `i28` who paid it. Everything else is an execution
+  like any other: all slots or none, both caps, the balance.
+- Each sale is run once and then closed, paid or not. A sale the rule pays
+  nothing for is recorded as `arrival_not_paid` with the reason. The history
+  in `getpayoutrule` shows each run with the sale, its amount, who paid it and
+  what went to which slot: the gross, the shares and so the net.
+- A sale is a transfer someone signs to the account, as for every rule that
+  pays per sale. A retractable transfer released to the account, a transfer
+  released by approvers and a standing payment are not sales.
+- Money the node moves is never a sale: a payout leg, a standing payment, a
+  released transfer. So a share one rule pays out is not shared again by the
+  rule of the account that receives it. Only a payment someone signs is.
+- At most 16 runs a block. More than that wait in the rule's open sales for the
+  next blocks, and an idle chain seals a block for them. No sale is turned
+  away: the limit of 64 open sales is for rules someone has to execute. What
+  waits is bounded by what was paid for: every waiting sale is a signed
+  transaction that paid its fee. Each account's longest-waiting sale comes
+  first, so an account with many sales waiting does not hold up the one sale
+  of another.
+- A payment in the block that reaches `expires_at` is not a sale of the rule
+  any more. A rule with a sale still waiting is kept until that sale has run.
+- The condition is the rule's: a floor (`i27 >= 50`), a payer that is exempt
+  (`i28`), a date after which the share stops (`i5`), two shares to two slots.
+  `tests/test_payout_triggers_native.py` runs each of these on the real engine;
+  none of them has a line of node code.
+
+A node that takes the installing transaction steps the rule once on a trial
+sale before it accepts it, for the same reason as with a due point.
+
+### A sealed account
+
+By default the key of an account stays above its payout rule: it can spend the
+money itself, and it can replace or revoke the rule (after the guard's wait, if
+the account has a guard). `sealed: true` gives that up until the rule ends.
+
+While a sealed rule is installed:
+
+- the node takes no transaction the account signs, of any type. It is refused
+  at admission (`ACCOUNT_SEALED`) and in a block (`account_sealed`): no fee is
+  charged and no sequence number is used;
+- the rule cannot be replaced or revoked, by a transaction or by a rule-change
+  request that was already waiting;
+- transfers the account had parked for approval end as failed, and a standing
+  payment it signed earlier pays nothing (each attempt counts as blocked);
+- money still comes in, and money leaves by the rule: executions others send,
+  and the runs the node makes.
+
+The seal ends when the rule ends: at `expires_at`, or after the last run the
+node owes it. Then the key holds the account again. So a sealed rule should pay
+out or return everything before its end, as the grant below does at its due
+point, and whoever relies on it checks `sealed`, `due_at` and `expires_at` in
+`getpayoutrule` before sending money.
+
+```bash
+# the 5,000 for Bob, in an account nobody's key can touch until 1 March
+tau-testnet payout set --key grant --file conditions.tau \
+    --slot open --slot <alice_pubkey> --sealed \
+    --cap-per-execution 20000 --cap-per-period 40000 \
+    --period-seconds 604800 --ends-at 1803859200 \
+    --periods-from 1796083200 --due-at 1798502400
+```
+
+Use an account made for the purpose: a sealed account cannot do anything else
+with its key, votes and approvals included.
+
+`tests/test_payout_triggers.py` pins all of this without an engine, including
+that every rule from before is byte for byte the rule it was;
+`tests/test_payout_triggers_native.py` runs the rules above on the real engine;
+`scripts/e2e_payout_triggers.py` runs a standing payment, a route and a sealed
+account on two live nodes.
+
 ## Inspecting
 
 ```bash
@@ -476,6 +638,8 @@ account's).
 | Executor data inputs | 8 |
 | Executions per block | 16 |
 | Due points run per block | 16 |
+| Runs on arrival per block | 16 |
+| Shortest repeat (`due_every`) | 256 blocks, or 3,600 seconds |
 | Rule text | 4,096 bytes |
 | Open sales per rule (`per_sale`) | 64 |
 
@@ -492,6 +656,7 @@ account's).
 | `PAYOUT_REFUSED` | The execution would be refused (reason in the message). |
 | `RULE_CHANGE_NEEDS_APPROVAL` | The account's guard blocks the change; use `--request`. |
 | `WRONG_NETWORK` | `genesis_hash` is missing, malformed, or names another network. |
+| `ACCOUNT_SEALED` | The sender's payout rule is sealed: the account signs nothing until the rule ends. |
 
 Apply reasons in receipts: `payout_rule_not_set`, `payout_rule_not_revoked`,
 `payout_not_executed`, `wrong_network`.
@@ -547,6 +712,14 @@ execution signed for another network is refused here.
 - A rule with an optional term, or one that reads `i48` or `i49`, carries a
   second part in its book entry (the terms, the last paid clock, whether the
   due point has run). Every other rule hashes exactly as before.
+- Runs on arrival come after the standing-payment sweep and before the due
+  points, in the order (position among the account's waiting sales, block that
+  recorded the sale, account). A rule with `due_every`, `due_months`, `on_arrival` or
+  `sealed` adds those terms and the number of its next due point to the second
+  part of its entry; a rule without them hashes exactly as before.
+- The seal is checked in the block against the book as the block has built it,
+  so a transaction of the account later in the block that installed the sealed
+  rule is refused too.
 
 ## Operator notes
 
@@ -601,10 +774,15 @@ replay could not run the rule; nothing moves, and the state hash says so.
   a stolen key cannot install one.
 - Executions are bounded per block (16), and refused ones cost the executor
   nothing but are not included either, so they cannot fill blocks.
+- Runs the node makes are bounded per block too (16 at due points, 16 on
+  arrival), and each run on arrival was paid for by the fee of the payment that
+  caused it.
+- A seal binds the key holder for the life of the rule and nobody can lift it,
+  the key holder included. Check the rule text and `expires_at` before signing.
 
 ## Not in this release
 
 - More than one rule per account.
-- Running a rule by itself more than once (a due point runs one time; a
-  payment that repeats is what standing payments are for).
+- A run on arrival for money the node itself moved (a payout leg, a standing
+  payment, a released transfer): only a signed payment is a sale.
 - Executor data wider than `bv[24]`.

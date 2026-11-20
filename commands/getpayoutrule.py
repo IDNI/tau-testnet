@@ -55,6 +55,26 @@ def semantics() -> dict:
                    "and no named recipient; i2 is the balance the block has reached",
             "runs_per_block": payout.MAX_PAYOUT_DUE_RUNS_PER_BLOCK,
             "fee": "none beyond the fee of the transaction that installed the rule",
+            "repeat": "due_every (on the rule's clock, at least "
+                      f"{payout.MIN_DUE_EVERY_BLOCKS} blocks or "
+                      f"{payout.MIN_DUE_EVERY_SECONDS} seconds) or due_months (1.."
+                      f"{payout.MAX_DUE_MONTHS} calendar months, UTC, time clock): the "
+                      "node runs the rule at every such point from due_at on, each "
+                      "once; a point the chain passed is not caught up",
+        },
+        "on_arrival": {
+            "term": "on_arrival: true, with per_sale and a fixed slot",
+            "run": "the node steps the rule once for each sale, at the end of the "
+                   "block that recorded it, with no executor (i13 = 0); paid or "
+                   "not, the sale is closed; money the node moves is never a sale",
+            "runs_per_block": payout.MAX_PAYOUT_ARRIVAL_RUNS_PER_BLOCK,
+            "fee": "none: the payer pays the fee of its own payment and nothing more",
+        },
+        "sealed": {
+            "term": "sealed: true",
+            "meaning": "while the rule is installed the node takes no transaction "
+                       "the account signs and the rule cannot be replaced or "
+                       "revoked; money leaves the account by the rule only",
         },
         "lifetime_max": {"blocks": payout.MAX_LIFETIME_BLOCKS,
                          "seconds": payout.MAX_LIFETIME_SECONDS},

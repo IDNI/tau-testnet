@@ -2939,11 +2939,18 @@ def _write_payout_rows(state: Dict) -> None:
                 [bytes(sid).hex(), payer, int(amount), int(height)]
                 for sid, payer, amount, height in open_sales]}
         if len(row) > 17 and row[17] is not None:
-            periods_from, due_at, last_clock, due_done = row[17]
+            periods_from, due_at, last_clock, due_done = row[17][:4]
             more[account] = {
                 'periods_from': None if periods_from is None else int(periods_from),
                 'due_at': None if due_at is None else int(due_at),
                 'last_clock': int(last_clock), 'due_done': bool(due_done)}
+            if len(row[17]) > 4:
+                due_every, due_months, on_arrival, sealed, due_index = row[17][4:]
+                more[account].update({
+                    'due_every': None if due_every is None else int(due_every),
+                    'due_months': None if due_months is None else int(due_months),
+                    'on_arrival': bool(on_arrival), 'sealed': bool(sealed),
+                    'due_index': int(due_index)})
         _db_conn.execute(
             f'INSERT INTO payout_rules_v1 ({_PAYOUT_COLUMNS}) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -3000,8 +3007,12 @@ def load_payout_state() -> tuple[List[tuple], int, bytes]:
             kept = (entry['missed'], tuple(tuple(e) for e in entry['open']))
         if r[1] in more:
             entry = more[r[1]]
-            row += (kept, (entry['periods_from'], entry['due_at'],
-                           entry['last_clock'], entry['due_done']))
+            head = (entry['periods_from'], entry['due_at'],
+                    entry['last_clock'], entry['due_done'])
+            if 'due_index' in entry:
+                head += (entry['due_every'], entry['due_months'], entry['on_arrival'],
+                         entry['sealed'], entry['due_index'])
+            row += (kept, head)
         elif kept is not None:
             row += (kept,)
         out.append(row)
@@ -3095,7 +3106,7 @@ def has_due_standing_payments(next_height: int, now: int) -> bool:
 
 def has_due_payouts(next_height: int, now: int) -> bool:
     """True if a payout rule has a due point this height or time reaches and that
-    has not run yet.
+    has not run yet, or a sale still waits for its run on arrival.
 
     A hint for the miner thread, from persisted rows like has_due_retractables;
     the block builder re-checks against the book under the lock.
@@ -3109,8 +3120,22 @@ def has_due_payouts(next_height: int, now: int) -> bool:
             ).fetchone()
             if not raw or not raw[0]:
                 return False
-            pending = {account: entry['due_at'] for account, entry in json.loads(raw[0]).items()
+            from consensus.payout import due_point_of
+
+            kept = json.loads(raw[0])
+            pending = {account: due_point_of(entry['due_at'], entry.get('due_every'),
+                                             entry.get('due_months'),
+                                             entry.get('due_index', 0))
+                       for account, entry in kept.items()
                        if entry.get('due_at') is not None and not entry.get('due_done')}
+            if any(entry.get('on_arrival') for entry in kept.values()):
+                raw_sales = _db_conn.execute(
+                    "SELECT value FROM chain_state WHERE key = 'payout_sales'"
+                ).fetchone()
+                waiting = json.loads(raw_sales[0]) if raw_sales and raw_sales[0] else {}
+                if any(kept.get(account, {}).get('on_arrival') and entry.get('open')
+                       for account, entry in waiting.items()):
+                    return True
             if not pending:
                 return False
             rows = _db_conn.execute(

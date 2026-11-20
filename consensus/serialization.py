@@ -950,16 +950,26 @@ def _encode_payout_terms(
     return bytes(out)
 
 
-def _encode_payout_options(periods_from: Any, due_at: Any) -> bytes:
+def _encode_payout_options(periods_from: Any, due_at: Any, due_every: Any = None,
+                           due_months: Any = None, on_arrival: bool = False,
+                           sealed: bool = False) -> bytes:
     """The optional terms of a payout rule: one byte saying which are there
-    (bit 0 `periods_from`, bit 1 `due_at`), then each one present as a uint64."""
-    flags = (1 if periods_from is not None else 0) | (2 if due_at is not None else 0)
+    (bit 0 `periods_from`, bit 1 `due_at`, bit 2 `due_every`, bit 3 `due_months`,
+    bit 4 `on_arrival`, bit 5 `sealed`), then each number present as a uint64,
+    in that order. The two switches carry no number."""
+    numbers = (periods_from, due_at, due_every, due_months)
+    flags = sum(1 << k for k, value in enumerate(numbers) if value is not None)
+    flags |= (16 if on_arrival else 0) | (32 if sealed else 0)
     out = bytearray([flags])
-    if periods_from is not None:
-        out.extend(encode_uint64(int(periods_from)))
-    if due_at is not None:
-        out.extend(encode_uint64(int(due_at)))
+    for value in numbers:
+        if value is not None:
+            out.extend(encode_uint64(int(value)))
     return bytes(out)
+
+
+def payout_options_present(options: Any) -> bool:
+    """`options` = (periods_from, due_at, due_every, due_months, on_arrival, sealed)."""
+    return any(v is not None and v is not False for v in options)
 
 
 def compute_payout_rule_id(
@@ -975,6 +985,10 @@ def compute_payout_rule_id(
     per_sale: bool = False,
     periods_from: Any = None,
     due_at: Any = None,
+    due_every: Any = None,
+    due_months: Any = None,
+    on_arrival: bool = False,
+    sealed: bool = False,
 ) -> bytes:
     """BLAKE3 of the signed terms of a payout rule. Returns 32 bytes.
 
@@ -992,8 +1006,9 @@ def compute_payout_rule_id(
         account_pubkey, sequence_number, body_hash, slots, cap_per_execution,
         cap_per_period, kind, period, expires_at,
     ))
-    if periods_from is not None or due_at is not None:
-        out.extend(_encode_payout_options(periods_from, due_at))
+    options = (periods_from, due_at, due_every, due_months, on_arrival, sealed)
+    if payout_options_present(options):
+        out.extend(_encode_payout_options(*options))
     return blake3(bytes(out)).digest()
 
 
@@ -1034,8 +1049,10 @@ def encode_payout_entry(
     every node must agree on, so it is part of the entry.
 
     `more`, only for a rule that carries an optional term or reads the clocks the
-    node keeps for it: (periods_from, due_at, last_clock, due_done). A rule with
-    neither keeps the entry it always had.
+    node keeps for it: (periods_from, due_at, last_clock, due_done), then, when
+    one of the later terms is there, (due_every, due_months, on_arrival, sealed,
+    due_index). A rule with none of it keeps the entry it always had, and a rule
+    with only the first two terms keeps the entry those gave it.
     """
     out = bytearray()
     out.extend(encode_hash32(rule_id))
@@ -1060,11 +1077,17 @@ def encode_payout_entry(
             out.extend(encode_uint64(int(amount)))
             out.extend(encode_uint64(int(height)))
     if more is not None:
-        periods_from, due_at, last_clock, due_done = more
+        periods_from, due_at, last_clock, due_done = more[:4]
+        due_every, due_months, on_arrival, sealed, due_index = (
+            tuple(more[4:9]) if len(more) > 4 else (None, None, False, False, 0))
         out.extend(b"\x02")
-        out.extend(_encode_payout_options(periods_from, due_at))
+        out.extend(_encode_payout_options(
+            periods_from, due_at, due_every, due_months, on_arrival, sealed))
         out.extend(encode_uint64(int(last_clock)))
         out.extend(b"\x01" if due_done else b"\x00")
+        if due_every is not None or due_months is not None:
+            # which due point of a repeating rule comes next
+            out.extend(encode_uint64(int(due_index)))
     return bytes(out)
 
 
