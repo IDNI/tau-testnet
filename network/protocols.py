@@ -49,6 +49,11 @@ TAU_MEMPOOL_SNAPSHOT_MAX_RULE_TXS = 32
 # inputs of 256 bytes; a vote carries an id, a bool and a short reason.
 TAU_MAX_APPROVAL_REQUEST_BYTES = 8192
 TAU_MAX_TRANSFER_VOTE_BYTES = 4096
+# A rule-change request carries up to MAX_RULE_CHANGE_TEXT_BYTES (8 KiB) of
+# rule text -- JSON escaping can grow it -- plus up to 8 approvers and the
+# envelope; a cancel carries only an id. Same caps as a rule offer and a reject.
+TAU_MAX_RULE_CHANGE_REQUEST_BYTES = 24576
+TAU_MAX_RULE_CHANGE_CANCEL_BYTES = 8192
 # Same reasoning as the rule sub-quota: a backlog of parked requests must not
 # become the entire snapshot a peer receives on connect.
 TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS = 32
