@@ -505,6 +505,15 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
         book = getattr(lm, "retractable_transfers", None)
         has_due = getattr(book, "has_due", None)
         empty_ok = bool(has_due is not None and has_due(block_number, block_timestamp) is True)
+    if wake_if_due and not empty_ok:
+        # Programmable payments: a standing occurrence or a grant refund
+        # falls due on the block timestamp, and only a block settles it.
+        payments = getattr(lm, "programmable_payments", None)
+        payments_due = getattr(payments, "has_due", None)
+        empty_ok = bool(
+            payments_due is not None
+            and payments_due(block_number, block_timestamp) is True
+        )
 
     # Get batch of reserved transactions from mempool. The chain-write lock is
     # already held for the whole round, so no second producer can sweep or
