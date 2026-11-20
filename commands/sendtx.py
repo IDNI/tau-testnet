@@ -1384,6 +1384,13 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 tip_view, to_addr,
                                 recipient_values, admission_tau.budget,
                             )
+                            if recip_blocks and not recipient_gate.clause_applies_to_inbound(
+                                    _recip_clause):
+                                # Outbound-shaped clause: written for the
+                                # recipient's sends, silent on inbound --
+                                # the neutral default, mirroring apply in
+                                # consensus/engine.py.
+                                recip_blocks = False
                             if recip_blocks:
                                 return _qt_err(
                                     "TX_REJECTED",
