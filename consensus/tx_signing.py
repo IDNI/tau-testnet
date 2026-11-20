@@ -42,6 +42,7 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_ACCEPT,
     TX_TYPE_RULE_OFFER_REJECT,
 )
+from consensus.routes import TX_TYPE_ROUTE_INSTALL, TX_TYPE_ROUTE_REMOVE
 
 def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
     """CONSENSUS-FROZEN. Canonical bytes over the signed fields of a transaction.
@@ -123,6 +124,27 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
+    elif tx_type == TX_TYPE_ROUTE_INSTALL:
+        # Every field that fixes the route's terms is signed: the route
+        # diverts future credits by node action, with no further
+        # signature from the owner, so a proposer who could rewrite the
+        # destination or the share would be redirecting money the owner
+        # never agreed to divert.
+        signing_dict["destination_pubkey"] = payload.get("destination_pubkey")
+        signing_dict["bps"] = payload.get("bps")
+        signing_dict["min_incoming"] = payload.get("min_incoming")
+        signing_dict["activation_timestamp"] = payload.get("activation_timestamp")
+        signing_dict["expiry_timestamp"] = payload.get("expiry_timestamp")
+        signing_dict["locked"] = payload.get("locked")
+        # Present when an install replaces a LOCKED route: the outgoing
+        # destination's unlock signature, bound for the same reason as
+        # in the remove branch below.
+        signing_dict["destination_signature"] = payload.get("destination_signature")
+    elif tx_type == TX_TYPE_ROUTE_REMOVE:
+        signing_dict["route_id"] = payload.get("route_id")
+        # The destination's unlock signature is bound too: stripping or
+        # swapping it must not be something a proposer can do silently.
+        signing_dict["destination_signature"] = payload.get("destination_signature")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 
