@@ -465,6 +465,22 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_retractable_release "
                 "ON retractable_transfers_v1(release_kind, release_at);"
             )
+            # Receive routes (Bounty 01, issue #35): the installed route
+            # book. Bound into consensus_meta_hash, so written in the
+            # same transaction as accounts, like the retractable book.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS receive_routes_v1 (
+                    route_id            TEXT PRIMARY KEY,
+                    owner_pubkey        TEXT NOT NULL UNIQUE,
+                    destination_pubkey  TEXT NOT NULL,
+                    bps                 INTEGER NOT NULL,
+                    min_incoming        INTEGER NOT NULL,
+                    activation_timestamp INTEGER NOT NULL,
+                    expiry_timestamp    INTEGER NOT NULL,
+                    locked              INTEGER NOT NULL,
+                    sequence_number     INTEGER NOT NULL
+                );
+            ''')
             # Node-local diagnostics, keyed per block so a reorg needs no cleanup;
             # canonicality is resolved at query time like tx_index.
             conn.execute('''
@@ -474,6 +490,15 @@ def init_db():
                     block_number   INTEGER NOT NULL,
                     outcome        TEXT NOT NULL,
                     PRIMARY KEY (retractable_id, block_hash, outcome)
+                );
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS route_events (
+                    route_id     TEXT NOT NULL,
+                    block_hash   TEXT NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    outcome      TEXT NOT NULL,
+                    PRIMARY KEY (route_id, block_hash, outcome)
                 );
             ''')
             conn.execute('''
@@ -2243,7 +2268,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, receive_routes: Dict | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2281,6 +2306,7 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 approval_requests=approval_requests,
                 approval_slots_active=approval_slots_active,
                 retractable_transfers=retractable_transfers,
+                receive_routes=receive_routes,
                 rule_change_requests=rule_change_requests,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
@@ -2346,7 +2372,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, receive_routes: Dict | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2555,6 +2581,9 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
     if retractable_transfers is not None:
         _write_retractable_rows(retractable_transfers)
 
+    if receive_routes is not None:
+        _write_route_rows(receive_routes)
+
     if max_rule_txs_per_block is not None:
         # Governance-activated value; persisted verbatim so a reload
         # reproduces the same per-block budget as a from-genesis replay.
@@ -2622,6 +2651,47 @@ def load_retractable_state() -> tuple[List[tuple], int, bytes]:
     )
 
 
+def _write_route_rows(state: Dict) -> None:
+    """Full replace of the installed route rows."""
+    _db_conn.execute('DELETE FROM receive_routes_v1')
+    for row in state['rows']:
+        _db_conn.execute(
+            'INSERT INTO receive_routes_v1 '
+            '(route_id, owner_pubkey, destination_pubkey, bps, min_incoming, '
+            'activation_timestamp, expiry_timestamp, locked, sequence_number) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                row['route_id'],
+                row['owner_pubkey'],
+                row['destination_pubkey'],
+                int(row['bps']),
+                int(row['min_incoming']),
+                int(row['activation_timestamp']),
+                int(row['expiry_timestamp']),
+                int(row['locked']),
+                int(row['sequence_number']),
+            )
+        )
+
+
+def load_route_state() -> List[Dict]:
+    """The installed route rows as dicts, exactly as stored."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT route_id, owner_pubkey, destination_pubkey, bps, '
+            'min_incoming, activation_timestamp, expiry_timestamp, locked, '
+            'sequence_number FROM receive_routes_v1 ORDER BY owner_pubkey'
+        ).fetchall()
+    keys = (
+        'route_id', 'owner_pubkey', 'destination_pubkey', 'bps',
+        'min_incoming', 'activation_timestamp', 'expiry_timestamp', 'locked',
+        'sequence_number',
+    )
+    return [dict(zip(keys, r)) for r in rows]
+
+
 def get_open_retractables(address: str, role: str = "all") -> List[Dict]:
     """Open retractable transfers sent by (`out`), addressed to (`in`) or either
     side of (`all`) this address, oldest release first."""
@@ -2648,6 +2718,27 @@ def get_open_retractables(address: str, role: str = "all") -> List[Dict]:
         }
         for r in rows
     ]
+
+
+def record_route_events(block_hash: str, block_number: int, events) -> None:
+    """Node-local history of what a block did to receive routes.
+
+    Diagnostic only: a failure is logged and never reaches block commit.
+    """
+    if not events:
+        return
+    try:
+        if _db_conn is None:
+            init_db()
+        with _db_lock:
+            with _db_conn:
+                _db_conn.executemany(
+                    'INSERT OR IGNORE INTO route_events '
+                    '(route_id, block_hash, block_number, outcome) VALUES (?, ?, ?, ?)',
+                    [(rid, block_hash, int(block_number), outcome) for rid, outcome in events],
+                )
+    except Exception:
+        logger.exception("could not record route events")
 
 
 def record_retractable_events(block_hash: str, block_number: int, events) -> None:
