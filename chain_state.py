@@ -640,6 +640,121 @@ def get_shadow_spec():
         return _shadow_spec
 
 
+def _shared_rule_submissions(block, next_snapshot):
+    """(tx_hash, account, canonical unit) per accepted shared-spec rule
+    transaction in this block, in block order -- the attribution source
+    for the shadow's feed steps.
+
+    The unit is staged exactly as the engine stages it in _apply
+    (`_preprocess_tau_spec_text(rule_text)`, raw text as fallback), so it
+    compares equal to the accumulation line the shadow feeds. Transactions
+    whose rule text cannot be recovered from the block are skipped: their
+    units are still fed and recorded, just unattributed.
+    """
+    outcomes = (getattr(next_snapshot, "metadata", None) or {}).get(
+        "rule_outcomes") or []
+    by_hash = {}
+    txs = getattr(block, "transactions", None) or []
+    tx_ids = getattr(block, "tx_ids", None) or []
+    for i, tx in enumerate(txs):
+        if i < len(tx_ids):
+            tx_hash = tx_ids[i]
+        else:
+            try:
+                from block import compute_tx_hash
+
+                tx_hash = compute_tx_hash(tx)
+            except Exception:
+                continue
+        by_hash[tx_hash] = tx
+    submissions = []
+    for tx_hash, record in outcomes:
+        if not isinstance(record, dict) or record.get("path") != "shared_spec":
+            continue
+        tx = by_hash.get(tx_hash)
+        rule_text = None
+        if isinstance(tx, dict):
+            operations = tx.get("operations")
+            if isinstance(operations, str):
+                try:
+                    operations = json.loads(operations)
+                except Exception:
+                    operations = None
+            if isinstance(operations, dict):
+                rule_text = operations.get("0")
+        if not isinstance(rule_text, str) or not rule_text.strip():
+            continue
+        try:
+            unit = (_preprocess_tau_spec_text(rule_text)
+                    or rule_text).strip()
+        except Exception:
+            unit = rule_text.strip()
+        submissions.append((tx_hash, record.get("account"), unit))
+    return submissions
+
+
+def _record_survival_feeds(block, next_snapshot, shadow, first_advance,
+                           before_text) -> None:
+    """Persist the block's shadow-feed steps for the survival ledger
+    (issue #42, step 3), and enrich the block's shared-spec receipts.
+
+    Each step is attributed to the block transaction that submitted its
+    unit (see _shared_rule_submissions); a step no transaction in this
+    block submitted -- a restarted shadow catching up on the persisted
+    accumulation -- is recorded unattributed, and on the shadow's first
+    advance a baseline row carries the spec it started from, so the
+    ledger's replay (db.get_survival_ledger) can diff from the true
+    initial text.
+
+    The same attribution carries the design's `shadow_revision` receipt
+    field: the revision the shadow took when it fed this transaction's
+    unit exists only here, at commit, so the persisted rule_outcome
+    record is re-recorded with it alongside the live spec-revision pair
+    captured at apply.
+    """
+    steps = shadow.last_steps
+    if not steps:
+        return
+    submissions = _shared_rule_submissions(block, next_snapshot)
+    used = [False] * len(submissions)
+    outcomes = (getattr(next_snapshot, "metadata", None) or {}).get(
+        "rule_outcomes") or []
+    outcome_by_hash = {h: r for h, r in outcomes if isinstance(r, dict)}
+    rows = []
+    if first_advance:
+        rows.append({
+            "unit_text": None, "tx_hash": None, "account": None,
+            "spec_text_after": before_text,
+        })
+    enriched = []
+    for step in steps:
+        tx_hash = account = None
+        for i, (sub_hash, sub_account, sub_unit) in enumerate(submissions):
+            if not used[i] and sub_unit == step["unit"]:
+                used[i] = True
+                tx_hash, account = sub_hash, sub_account
+                break
+        rows.append({
+            "unit_text": step["unit"], "tx_hash": tx_hash,
+            "account": account, "spec_text_after": step["text_after"],
+        })
+        if tx_hash is not None and step.get("revision_after") is not None:
+            record = outcome_by_hash.get(tx_hash)
+            if record is not None:
+                enriched.append((tx_hash, {
+                    **record,
+                    "evidence": {
+                        **(record.get("evidence") or {}),
+                        "shadow_revision": step["revision_after"],
+                    },
+                }))
+    db.record_spec_unit_feeds(
+        block.block_hash, block.header.block_number, rows)
+    if enriched:
+        db.record_rule_outcomes(
+            block.block_hash, block.header.block_number, enriched)
+
+
 def _record_shadow_snapshot(block, next_snapshot) -> None:
     """Best-effort shadow advance + snapshot write, mirroring
     _record_rule_outcomes.
@@ -652,7 +767,8 @@ def _record_shadow_snapshot(block, next_snapshot) -> None:
     catches up from the full accumulation on the next rule block. When the
     accumulation changed, the snapshot is persisted per block so the
     getaccountrules view (and at-height queries) can be served without
-    touching the live interpreter.
+    touching the live interpreter, and the advance's per-unit steps are
+    persisted for the survival ledger (see _record_survival_feeds).
     """
     try:
         shadow = get_shadow_spec()
@@ -662,6 +778,8 @@ def _record_shadow_snapshot(block, next_snapshot) -> None:
         text = raw.decode("utf-8", errors="ignore") if isinstance(
             raw, (bytes, bytearray)) else str(raw)
         units = [u for u in text.split("\n") if u.strip()]
+        first_advance = not shadow.fed_units
+        before_text = shadow.normalized_text
         snap = shadow.advance(
             units,
             height=block.header.block_number,
@@ -672,6 +790,8 @@ def _record_shadow_snapshot(block, next_snapshot) -> None:
                 snap["block_hash"], snap["height"], snap["shadow_revision"],
                 snap["normalized_text"], snap["sha256"],
             )
+            _record_survival_feeds(
+                block, next_snapshot, shadow, first_advance, before_text)
     except Exception:
         logger.exception("could not record spec snapshot")
 
