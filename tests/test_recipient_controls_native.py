@@ -251,15 +251,20 @@ class TestRecipientControlsNativeE2E(unittest.TestCase):
         # cap body leaves alone.
         self._transfer(SENDER, RECIPIENT, 1, SK_ALICE)
 
-        book = chain_state._lifecycle_manager.retractable_transfers
-        escrow_before = book.escrow_total()
+        def escrow_total():
+            # Re-fetched per read: a block commit replaces the book object,
+            # so a handle taken before mining goes stale (the pattern
+            # test_retractable_native's book() helper exists for).
+            return chain_state._lifecycle_manager.retractable_transfers.escrow_total()
+
+        escrow_before = escrow_total()
         recip_before = chain_state._balances.get(RECIPIENT, 0)
         res = self._park(SENDER, RECIPIENT, 100, SK_ALICE,
                          release_at_time=int(time.time()) + 540)
         self.assertTrue(res["ok"], f"in-cap time park refused: {res}")
         block_res = createblock.create_block_from_mempool()
         self.assertEqual(len(block_res.get("transactions", [])), 1, block_res)
-        self.assertEqual(book.escrow_total() - escrow_before, 100)
+        self.assertEqual(escrow_total() - escrow_before, 100)
         self.assertEqual(chain_state._balances.get(RECIPIENT, 0), recip_before,
                          "a park escrows; it does not pay the recipient yet")
 
@@ -288,8 +293,9 @@ class TestRecipientControlsNativeE2E(unittest.TestCase):
                          release_at_time=int(time.time()) + 3600)
         self.assertFalse(res["ok"], f"over-cap park admitted: {res}")
         self.assertIn("RECIPIENT_MAX_HOLD", str(res))
-        self.assertEqual(res["recipient_policy"]["max_hold_seconds"],
-                         evaluation["max_hold_seconds"])
+        self.assertEqual(
+            res["details"]["recipient_policy"]["max_hold_seconds"],
+            evaluation["max_hold_seconds"])
 
 
 if __name__ == "__main__":
