@@ -2017,6 +2017,27 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         # never as a user_tx output. Releases and retracts
                         # never pass through this closure and are never
                         # gated (#76).
+                        #
+                        # The gate is CLAUSE-TRIGGERED: it runs only when
+                        # the recipient has actually published a policy --
+                        # an accepted clause on o5, or (for a park) on the
+                        # hold-cap stream o10. A neutral recipient costs
+                        # exactly what it cost before this feature: the
+                        # single evaluate above, the same fed streams, the
+                        # same fee. Per-account policy enters the spec
+                        # only through accepted clauses, so the trigger
+                        # misses no policy that exists.
+                        recipient_clause = lifecycle_mgr.rule_offers.clause_for(
+                            to_addr, tau_defs.USER_POLICY_STREAM_INDEX)
+                        recipient_cap_clause = (
+                            lifecycle_mgr.rule_offers.clause_for(
+                                to_addr, tau_defs.RECIPIENT_HOLD_CAP_STREAM_INDEX)
+                            if park_release is not None else None
+                        )
+                        gate_applies = (
+                            recipient_clause is not None
+                            or recipient_cap_clause is not None
+                        )
                         release_pair = 0
                         if park_release is not None:
                             park_kind, park_release_at = park_release
@@ -2024,32 +2045,36 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 release_ts=park_release_at if park_kind != KIND_HEIGHT else 0,
                                 release_height=park_release_at if park_kind == KIND_HEIGHT else 0,
                             )
-                        recipient_values = recipient_gate.recipient_values(
-                            tau_input_stream_values, to_addr,
-                            _parent_bal(to_addr), int(block_height or 0),
-                            release_pair=release_pair,
-                        )
-                        with tau_manager.tau_comm_lock:
-                            recipient_outputs = _session.evaluate(
-                                recipient_values, multi=True,
-                                apply_rules_update=False,
+                        recipient_values = None
+                        recipient_outputs = {}
+                        recipient_blocked = False
+                        recipient_detail = None
+                        if gate_applies:
+                            recipient_values = recipient_gate.recipient_values(
+                                tau_input_stream_values, to_addr,
+                                _parent_bal(to_addr), int(block_height or 0),
+                                release_pair=release_pair,
                             )
-                        tx_receipt["logs"].append(
-                            f"Tau(recipient) o5: {recipient_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)}"
-                        )
-                        recipient_blocked = recipient_gate.policy_blocked(
-                            recipient_outputs, tau_manager.parse_tau_output)
-                        recipient_detail = recipient_outputs.get(
-                            tau_defs.USER_POLICY_STREAM_INDEX)
-                        if not recipient_blocked:
-                            clause_blocked, clause_o5 = sender_policy.clause_blocks(
-                                lifecycle_mgr.rule_offers.clause_for(
-                                    to_addr, tau_defs.USER_POLICY_STREAM_INDEX),
-                                recipient_values, pool="apply",
-                                timeout=getattr(_session, "request_budget", None),
+                            with tau_manager.tau_comm_lock:
+                                recipient_outputs = _session.evaluate(
+                                    recipient_values, multi=True,
+                                    apply_rules_update=False,
+                                )
+                            tx_receipt["logs"].append(
+                                f"Tau(recipient) o5: {recipient_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)}"
                             )
-                            recipient_blocked = clause_blocked
-                            recipient_detail = clause_o5
+                            recipient_blocked = recipient_gate.policy_blocked(
+                                recipient_outputs, tau_manager.parse_tau_output)
+                            recipient_detail = recipient_outputs.get(
+                                tau_defs.USER_POLICY_STREAM_INDEX)
+                            if not recipient_blocked:
+                                clause_blocked, clause_o5 = sender_policy.clause_blocks(
+                                    recipient_clause,
+                                    recipient_values, pool="apply",
+                                    timeout=getattr(_session, "request_budget", None),
+                                )
+                                recipient_blocked = clause_blocked
+                                recipient_detail = clause_o5
                         if recipient_blocked:
                             logger.info(
                                 "Transfer rejected by recipient policy (o5) for %s->%s (o5=%s)",
