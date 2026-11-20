@@ -184,13 +184,38 @@ os._exit(0)
 """
 
 
+def _json_payload(stdout):
+    """Return the child probe's JSON payload from its stdout.
+
+    The engine prints a temporal-normalisation notice to stdout ahead
+    of the payload (observed in CI: the notice precedes the JSON, so a
+    bare json.loads on the whole stream fails before the payload is
+    reached). Scan for the first JSON object that carries the probe's
+    keys and return it; the assertions in the tests compare that
+    object's text and sha256 exactly as before.
+    """
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(stdout):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = decoder.raw_decode(stdout, idx)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "text" in obj and "sha256" in obj:
+            return obj
+    raise AssertionError(
+        "no probe JSON payload in child stdout; tail: " + stdout[-2000:]
+    )
+
+
 def _run_child_probe():
     proc = subprocess.run(
         [_native_python(), "-c", _CHILD_PROBE],
         capture_output=True, text=True, env=_child_env(), timeout=300,
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
-    return json.loads(proc.stdout)
+    return _json_payload(proc.stdout)
 
 
 def test_a_second_node_and_a_replay_give_the_same_text_and_hash():
