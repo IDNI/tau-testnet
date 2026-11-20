@@ -6,6 +6,7 @@ import logging
 
 import config
 import tau_defs
+from consensus import recipient_gate
 from consensus.serialization import compute_update_id, compute_offer_id
 from consensus.rule_offers import (
     MAX_OFFER_RULE_BYTES,
@@ -69,6 +70,7 @@ from consensus.governance import (
     HOST_CONTRACT_PATCH_KEYS,
     validate_fee_beneficiary,
     validate_approval_slots_active,
+    validate_recipient_gate_active,
 )
 
 logger = logging.getLogger(__name__)
@@ -548,6 +550,10 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
                 "approval_slots_active cannot be activated on this chain: "
                 + "; ".join(findings)
             )
+    if "recipient_gate_active" in patch:
+        err = validate_recipient_gate_active(patch["recipient_gate_active"])
+        if err:
+            return f"recipient_gate_active: {err}"
     if "vote_quorum" in patch:
         policy = patch["vote_quorum"]
         err = validate_quorum_policy(policy)
@@ -853,6 +859,42 @@ def validate_consensus_rule_vote_payload(tx: Dict, tip_view: TipAdmissionView) -
 
 # --- Rule sharing -----------------------------------------------------------
 
+def _recipient_gate_inactive_error() -> AdmissionResult:
+    """Deploy refusal for a recipient-feature clause while the gate is off.
+
+    Mirrors _approvals_inactive_error: the feature activates by governance
+    patch (recipient_gate_active). Refusing at deploy -- rather than
+    admitting the clause and never enforcing it -- is what #47 case 5 /
+    #76 case 6 ask of a node without the feature.
+    """
+    return format_error(
+        "Recipient policy rules are not active on this chain. The "
+        "feature activates by governance patch (recipient_gate_active), "
+        "which turns on the recipient policy gate and the park hold cap.",
+        code="FEATURE_INACTIVE",
+    )
+
+
+def _recipient_feature_refusal(
+    tip_view: TipAdmissionView, body: str, target_stream=None
+) -> Optional[AdmissionResult]:
+    """The deploy refusal when a clause would deploy the recipient
+    feature on a chain whose gate is not activated; else None.
+
+    Shared by every clause-registration surface (rule offer, offer
+    accept, o5 clause routing) so the three cannot drift: while the
+    gate is off, a clause targeting o10 or reading i17 is refused
+    with the inactive error; every other clause deploys as it always
+    has, because an ordinary o5 clause is a sender policy the chain
+    already enforces.
+    """
+    if recipient_gate.gate_active(tip_view):
+        return None
+    if recipient_gate.clause_uses_recipient_feature(body, target_stream):
+        return _recipient_gate_inactive_error()
+    return None
+
+
 def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
     """Static + tip-state checks for a `rule_offer`.
 
@@ -920,6 +962,10 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
     domain_error = _screen_clause_domains(body)
     if domain_error:
         return _admission_from_domain_error(domain_error)
+
+    refusal = _recipient_feature_refusal(tip_view, body, target_stream)
+    if refusal is not None:
+        return refusal
 
     return success({
         "offer_id": offer_id_hex,
@@ -1115,6 +1161,10 @@ def validate_rule_offer_decision_payload(
     if domain_error:
         return _admission_from_domain_error(domain_error)
 
+    inactive = _recipient_feature_refusal(tip_view, body, target_stream)
+    if inactive is not None:
+        return inactive
+
     refusal = _rule_change_refusal(
         tip_view, decision.actor_pubkey, tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER
     )
@@ -1196,6 +1246,11 @@ def validate_o5_clause_routing(
     if not isinstance(sender, str):
         return format_error("o5 policy rule needs a sender_pubkey.")
     sender_n = sender.strip().lower()
+
+    inactive = _recipient_feature_refusal(
+        tip_view, body, tau_defs.USER_POLICY_STREAM_INDEX)
+    if inactive is not None:
+        return inactive
 
     revoking = is_neutral_clause_body(body, tau_defs.USER_POLICY_STREAM_INDEX)
     refusal = _rule_change_refusal(

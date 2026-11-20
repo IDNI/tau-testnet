@@ -45,6 +45,13 @@ def execute(raw_command: str, container):
         [] if fee_checked else ["fee_limit"])
     if result.get("ok"):
         fee_bearing = result.get("tx_type") in sendtx.FEE_BEARING_TX_TYPES
+        # Capability surface (#47 case 5 / #76 case 6): the gate is a
+        # governance-activated feature, so the surface reports the
+        # activation state the dry run actually judged under --
+        # "enforced" once the recipient_gate_active patch has landed,
+        # "inactive" before it (a recipient refusal in the dry run is
+        # only possible in the first state).
+        gate_state = "enforced" if result.get("recipient_gate_active") else "inactive"
         data = {
             "admissible": True if estimate and not fee_bearing else None,
             "fee_checked": fee_checked,
@@ -52,6 +59,8 @@ def execute(raw_command: str, container):
             "tx_type": result.get("tx_type"),
             "tau_evaluated": tau_evaluated,
             "checks_skipped": checks_skipped,
+            "recipient_policy_gate": gate_state,
+            "recipient_hold_cap": gate_state,
         }
         if estimate and "estimated_fee" in result:
             data["estimated_fee"] = result["estimated_fee"]

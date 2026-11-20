@@ -34,6 +34,7 @@ from .approvals import (
     parse_transfer_vote,
 )
 from .retractable import (
+    KIND_HEIGHT,
     RETRACTABLE_TX_TYPES,
     RetractableBook,
     TX_TYPE_RETRACTABLE_TRANSFER,
@@ -41,6 +42,7 @@ from .retractable import (
     parse_retract_transfer,
     parse_retractable_transfer,
 )
+from . import recipient_gate
 from .rule_offers import (
     RULE_OFFER_TX_TYPES,
     RuleOfferDecision,
@@ -267,6 +269,28 @@ def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tupl
     if _width_mismatch_details(error):
         return error, "width_mismatch"
     return error, "rule_not_applied"
+
+
+def _recipient_inactive_rejection(lm, body) -> Optional[Tuple[str, str]]:
+    """(error, receipt reason) when this clause body would deploy the
+    recipient feature on a chain whose gate is not activated.
+
+    The apply-side mirror of admission's deploy refusal
+    (consensus.admission._recipient_feature_refusal): the flag is read
+    from the block's lifecycle manager -- consensus state, read from
+    the parent snapshot -- so admission and apply reach the same
+    verdict on the same block.
+    """
+    if getattr(lm, "recipient_gate_active", False) is True:
+        return None
+    if recipient_gate.clause_uses_recipient_feature(body):
+        return (
+            "Recipient policy rules are not active on this chain. The "
+            "feature activates by governance patch (recipient_gate_active), "
+            "which turns on the recipient policy gate and the park hold cap.",
+            recipient_gate.REASON_GATE_INACTIVE,
+        )
+    return None
 
 
 def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str]]:
@@ -1727,6 +1751,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     _did_not_land(f"o5 clause ignored ({domain_error})", reason=reason)
                     return True
 
+                # Same deploy refusal admission runs: a recipient-feature
+                # clause does not register while the gate is inactive.
+                inactive = _recipient_inactive_rejection(lifecycle_mgr, body)
+                if inactive:
+                    inactive_error, inactive_reason = inactive
+                    _did_not_land(
+                        f"o5 clause ignored ({inactive_error})",
+                        reason=inactive_reason)
+                    return True
+
                 key = (sender_n, stream)
                 revoking = is_neutral_clause_body(body, stream)
                 registered = key in offers.accepted_clauses
@@ -1882,7 +1916,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
-                                          escrow=False):
+                                          escrow=False, park_release=None):
                 """Execute ONE transfer under the fee model. True to continue.
 
                 Extracted verbatim from the user_tx transfer loop so the
@@ -2003,6 +2037,133 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 f"Transfer rejected by the sender's own policy clause (o5={own_o5})"
                             )
                             return False
+
+                        # --- Recipient policy (o5) + park hold cap (#47/#76) ---
+                        # The recipient is judged by its OWN policy on the
+                        # SAME input map with the policy owner changed
+                        # (consensus/recipient_gate.py): one extra evaluate,
+                        # then the isolated clause, mirroring the two sender
+                        # checks above. Because the gate lives in this
+                        # closure, it also covers transfers no transaction
+                        # carries -- an approval completion pays out here,
+                        # never as a user_tx output. Releases and retracts
+                        # never pass through this closure and are never
+                        # gated (#76).
+                        #
+                        # The gate is CLAUSE-TRIGGERED: it runs only when
+                        # the recipient has actually published a policy --
+                        # an accepted clause on o5, or (for a park) on the
+                        # hold-cap stream o10. A neutral recipient costs
+                        # exactly what it cost before this feature: the
+                        # single evaluate above, the same fed streams, the
+                        # same fee. Per-account policy enters the spec
+                        # only through accepted clauses, so the trigger
+                        # misses no policy that exists.
+                        recipient_clause = lifecycle_mgr.rule_offers.clause_for(
+                            to_addr, tau_defs.USER_POLICY_STREAM_INDEX)
+                        recipient_cap_clause = (
+                            lifecycle_mgr.rule_offers.clause_for(
+                                to_addr, tau_defs.RECIPIENT_HOLD_CAP_STREAM_INDEX)
+                            if park_release is not None else None
+                        )
+                        # Activation (#47 case 5): before the governance
+                        # patch turns the gate on, none of this runs --
+                        # the transfer is judged exactly as it was before
+                        # the feature existed, which is also what keeps
+                        # replay of pre-activation blocks byte-identical.
+                        gate_applies = (
+                            getattr(lifecycle_mgr, "recipient_gate_active", False) is True
+                            and (
+                                recipient_clause is not None
+                                or recipient_cap_clause is not None
+                            )
+                        )
+                        release_pair = 0
+                        if park_release is not None:
+                            park_kind, park_release_at = park_release
+                            release_pair = recipient_gate.pack_release_pair(
+                                release_ts=park_release_at if park_kind != KIND_HEIGHT else 0,
+                                release_height=park_release_at if park_kind == KIND_HEIGHT else 0,
+                            )
+                        recipient_values = None
+                        recipient_outputs = {}
+                        recipient_blocked = False
+                        recipient_detail = None
+                        if gate_applies:
+                            recipient_values = recipient_gate.recipient_values(
+                                tau_input_stream_values, to_addr,
+                                _parent_bal(to_addr), int(block_height or 0),
+                                release_pair=release_pair,
+                            )
+                            with tau_manager.tau_comm_lock:
+                                recipient_outputs = _session.evaluate(
+                                    recipient_values, multi=True,
+                                    apply_rules_update=False,
+                                )
+                            tx_receipt["logs"].append(
+                                f"Tau(recipient) o5: {recipient_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)}"
+                            )
+                            recipient_blocked = recipient_gate.policy_blocked(
+                                recipient_outputs, tau_manager.parse_tau_output)
+                            recipient_detail = recipient_outputs.get(
+                                tau_defs.USER_POLICY_STREAM_INDEX)
+                            if not recipient_blocked:
+                                clause_blocked, clause_o5 = sender_policy.clause_blocks(
+                                    recipient_clause,
+                                    recipient_values, pool="apply",
+                                    timeout=getattr(_session, "request_budget", None),
+                                )
+                                if clause_blocked and not recipient_gate.clause_applies_to_inbound(
+                                        recipient_clause):
+                                    # Outbound-shaped clause (reads the
+                                    # destination i4, never the counterparty
+                                    # i3 or the release pair i17, states no
+                                    # cap): written for the recipient's
+                                    # sends, it does not mention incoming
+                                    # transfers -- the neutral default.
+                                    clause_blocked = False
+                                    tx_receipt["logs"].append(
+                                        "Recipient clause is outbound-only; "
+                                        "not enforced against an inbound transfer"
+                                    )
+                                recipient_blocked = clause_blocked
+                                recipient_detail = clause_o5
+                        if recipient_blocked:
+                            logger.info(
+                                "Transfer rejected by recipient policy (o5) for %s->%s (o5=%s)",
+                                str(from_addr)[:10], str(to_addr)[:10], recipient_detail,
+                            )
+                            if not replay_mode:
+                                accepted_in_block = False
+                                hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = recipient_gate.REASON_POLICY_BLOCK
+                            tx_receipt["logs"].append(
+                                f"Transfer rejected by recipient policy (o5={recipient_detail})"
+                            )
+                            return False
+                        if park_release is not None:
+                            cap = recipient_gate.hold_cap(
+                                recipient_outputs, tau_manager.parse_tau_output)
+                            if cap is not None:
+                                park_kind, park_release_at = park_release
+                                now = (int(block_height or 0) if park_kind == KIND_HEIGHT
+                                       else int(block_timestamp or 0))
+                                if park_release_at - now > cap:
+                                    logger.info(
+                                        "Park rejected by recipient hold cap for %s->%s (cap=%s)",
+                                        str(from_addr)[:10], str(to_addr)[:10], cap,
+                                    )
+                                    if not replay_mode:
+                                        accepted_in_block = False
+                                        hard_reject = True
+                                    execution_success = False
+                                    tx_receipt["reason"] = recipient_gate.REASON_HOLD_CAP
+                                    tx_receipt["recipient_hold_cap"] = cap
+                                    tx_receipt["logs"].append(
+                                        f"Park rejected by recipient hold cap (cap={cap})"
+                                    )
+                                    return False
 
                     current_from = _read_bal(from_addr)
                     if current_from < amount:
@@ -2155,6 +2316,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             _clause_domain_rejection(clause_body_v1(offer.rule_text))
                             if ok else None
                         )
+                        if ok and rejection is None:
+                            rejection = _recipient_inactive_rejection(
+                                lifecycle_mgr, clause_body_v1(offer.rule_text))
                         if not ok:
                             tx_receipt["logs"].append(f"Offer ignored ({reason})")
                         elif rejection:
@@ -2191,6 +2355,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             _clause_domain_rejection(accepted_body)
                             if accepted_body is not None else None
                         )
+                        if accepted_body is not None and not rejection:
+                            rejection = _recipient_inactive_rejection(
+                                lifecycle_mgr, accepted_body)
                         if accepted_body is not None and not rejection:
                             builds, build_error = sender_policy.clause_builds(
                                 accepted_body, pool="apply",
@@ -2593,6 +2760,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 slot_values=_approval_slot_values(),
                                 overrides={},
                                 escrow=True,
+                                park_release=(park.kind, park.release_at),
                             )
                             fee_already_measured = True
                             if escrowed and accepted_in_block and not hard_reject:

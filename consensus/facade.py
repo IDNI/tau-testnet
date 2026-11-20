@@ -193,6 +193,18 @@ class TipAdmissionView:
         lm = getattr(chain_state, "_lifecycle_manager", None)
         return getattr(lm, "approval_slots_active", False) is True
 
+    @property
+    def recipient_gate_active(self) -> bool:
+        """Whether the recipient gate (#47/#76) is activated at the tip.
+
+        Read from the canonical lifecycle manager, the source block apply
+        reads, so admission refuses what apply refuses -- including the
+        deploy refusal for recipient-feature clauses while the gate is
+        off (consensus/recipient_gate.py).
+        """
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        return getattr(lm, "recipient_gate_active", False) is True
+
     def get_approval_request(self, request_id: str) -> Optional[dict]:
         """The full request row, or None. Includes the recorded votes."""
         import json as _json
