@@ -523,6 +523,24 @@ def init_db():
             for col in ("reject_code", "reject_detail"):
                 if col not in dropped_cols:
                     conn.execute(f"ALTER TABLE mempool_dropped ADD COLUMN {col} TEXT;")
+            # rule_outcomes records what a block's apply did to each CONFIRMED
+            # rule transaction (issue #42), so gettxstatus can serve the apply
+            # outcome next to "confirmed" instead of leaving the wallet to
+            # infer it. Node-local diagnostics, keyed per block like
+            # retractable_events so a reorg needs no cleanup; canonicality is
+            # resolved at query time like tx_index. Self-pruning on insert
+            # (TTL + row cap) in the mempool_dropped style.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_outcomes (
+                    tx_hash      TEXT NOT NULL,
+                    block_hash   TEXT NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    outcome_json TEXT NOT NULL,
+                    recorded_at  INTEGER NOT NULL,
+                    PRIMARY KEY (tx_hash, block_hash)
+                );
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_rule_outcomes_hash ON rule_outcomes(tx_hash);')
 
             # Backfill tx_index for databases created before it existed: if the
             # index is empty but blocks exist, populate it once from stored block
@@ -1593,6 +1611,83 @@ def get_dropped_tx(tx_hash: str) -> Optional[Dict]:
         "reject_code": row[2],
         "reject_detail": row[3],
     }
+
+
+# --- Confirmed rule-tx outcomes (issue #42: gettxstatus) ---
+_RULE_OUTCOME_TTL_MS = 7 * 24 * 60 * 60 * 1000  # keep outcome records ~7 days
+_RULE_OUTCOME_MAX_ROWS = 20000
+
+
+def record_rule_outcomes(block_hash: str, block_number: int, records) -> None:
+    """Record the rule outcomes a block's apply produced, then self-prune.
+
+    `records` is an iterable of (tx_hash, outcome) pairs, outcome being the
+    rule_outcome dict the apply path put on the transaction's receipt
+    (account / path / outcome / evidence). Patterned on the dropped-tx
+    machinery above (TTL prune, then cap to the newest rows), but keyed per
+    block like retractable_events. Diagnostic only: a failure is logged and
+    never reaches block commit.
+    """
+    records = list(records or [])
+    if not records:
+        return
+    try:
+        if _db_conn is None:
+            init_db()
+        import time as _time
+        now_ms = int(_time.time() * 1000)
+        with _db_lock:
+            cur = _db_conn.cursor()
+            for tx_hash, outcome in records:
+                cur.execute(
+                    "INSERT OR REPLACE INTO rule_outcomes "
+                    "(tx_hash, block_hash, block_number, outcome_json, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (tx_hash, block_hash, int(block_number),
+                     json.dumps(outcome, sort_keys=True), now_ms),
+                )
+            cur.execute(
+                "DELETE FROM rule_outcomes WHERE recorded_at < ?",
+                (now_ms - _RULE_OUTCOME_TTL_MS,),
+            )
+            cur.execute(
+                "DELETE FROM rule_outcomes WHERE rowid IN ("
+                "SELECT rowid FROM rule_outcomes "
+                "ORDER BY recorded_at DESC, tx_hash "
+                "LIMIT -1 OFFSET ?)",
+                (_RULE_OUTCOME_MAX_ROWS,),
+            )
+            _db_conn.commit()
+    except Exception:
+        logger.exception("could not record rule outcomes")
+
+
+def get_rule_outcome(tx_hash: str, block_hash: str) -> Optional[Dict]:
+    """Return the recorded rule outcome for a confirmed tx in a specific
+    block -- {'tx_hash', 'block_height', 'account', 'path', 'outcome',
+    'evidence'} -- or None.
+
+    Keyed by block as well as tx: the same tx applied in a fork block can
+    have a different outcome (its evidence is parent-state-relative), and
+    the caller (gettxstatus) has already resolved which block is canonical.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT block_number, outcome_json FROM rule_outcomes "
+            "WHERE tx_hash = ? AND block_hash = ? LIMIT 1",
+            (tx_hash, block_hash),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        outcome = json.loads(row[1])
+    except (ValueError, TypeError):
+        return None
+    return {"tx_hash": tx_hash, "block_height": row[0], **outcome}
 
 
 def get_tx_block_locations(tx_hash: str) -> List[Dict]:
