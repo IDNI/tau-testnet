@@ -54,4 +54,7 @@ def execute(raw_command: str, container):
             "refunded": row["refunded"],
             "state_at_tip": state,
         }
+        if row.get("cap_group"):
+            data["grant"]["cap_group"] = row["cap_group"]
+            data["grant"]["cap_group_cap"] = row["cap_group_cap"]
     return api_response.success_response(_CMD, data)
