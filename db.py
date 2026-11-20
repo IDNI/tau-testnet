@@ -541,6 +541,26 @@ def init_db():
                 );
             ''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_rule_outcomes_hash ON rule_outcomes(tx_hash);')
+            # spec_snapshots records the shadow replay's normalized shared
+            # spec after each block that changed the application-rules
+            # accumulation (issue #42, step 2): the source the getaccountrules
+            # view is served from, so the view is derived from what the
+            # engine runs rather than from the append-only submitted text.
+            # Keyed per block like rule_outcomes (canonicality resolved at
+            # query time). Not pruned: the snapshots ARE the view's history,
+            # and whether a horizon may be pruned is an open design question
+            # for the maintainers.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS spec_snapshots (
+                    block_hash      TEXT PRIMARY KEY,
+                    block_number    INTEGER NOT NULL,
+                    shadow_revision INTEGER,
+                    normalized_text TEXT NOT NULL,
+                    spec_sha256     TEXT NOT NULL,
+                    recorded_at     INTEGER NOT NULL
+                );
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_spec_snapshots_height ON spec_snapshots(block_number);')
 
             # Backfill tx_index for databases created before it existed: if the
             # index is empty but blocks exist, populate it once from stored block
@@ -1688,6 +1708,75 @@ def get_rule_outcome(tx_hash: str, block_hash: str) -> Optional[Dict]:
     except (ValueError, TypeError):
         return None
     return {"tx_hash": tx_hash, "block_height": row[0], **outcome}
+
+
+def record_spec_snapshot(block_hash: str, block_number: int, shadow_revision,
+                         normalized_text: str, spec_sha256: str) -> None:
+    """Persist one shadow-replay snapshot (issue #42, step 2).
+
+    Diagnostic/view data only, like record_rule_outcomes: a failure is
+    logged and never reaches block commit.
+    """
+    try:
+        if _db_conn is None:
+            init_db()
+        import time as _time
+        now_ms = int(_time.time() * 1000)
+        with _db_lock:
+            _db_conn.execute(
+                "INSERT OR REPLACE INTO spec_snapshots "
+                "(block_hash, block_number, shadow_revision, normalized_text, "
+                "spec_sha256, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (block_hash, int(block_number),
+                 None if shadow_revision is None else int(shadow_revision),
+                 normalized_text, spec_sha256, now_ms),
+            )
+            _db_conn.commit()
+    except Exception:
+        logger.exception("could not record spec snapshot")
+
+
+def get_spec_snapshot_at(height: Optional[int] = None) -> Optional[Dict]:
+    """Return the newest CANONICAL shadow snapshot at or before `height`
+    (the newest overall when `height` is None), or None.
+
+    A snapshot is recorded only for blocks that changed the accumulation,
+    so the newest snapshot at or before a height IS the shared-spec state
+    at that height. Canonicality is resolved per candidate exactly like
+    tx_index / rule_outcomes: a snapshot recorded for a fork block is
+    skipped, never served. Returns {'height', 'block_hash',
+    'shadow_revision', 'normalized_text', 'sha256'}.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        if height is None:
+            cur.execute(
+                "SELECT block_hash, block_number, shadow_revision, "
+                "normalized_text, spec_sha256 FROM spec_snapshots "
+                "ORDER BY block_number DESC, recorded_at DESC"
+            )
+        else:
+            cur.execute(
+                "SELECT block_hash, block_number, shadow_revision, "
+                "normalized_text, spec_sha256 FROM spec_snapshots "
+                "WHERE block_number <= ? "
+                "ORDER BY block_number DESC, recorded_at DESC",
+                (int(height),),
+            )
+        rows = cur.fetchall()
+    for block_hash, block_number, shadow_revision, text, sha in rows:
+        is_canonical, _head = get_canonical_confirmation(block_hash, block_number)
+        if is_canonical:
+            return {
+                "height": block_number,
+                "block_hash": block_hash,
+                "shadow_revision": shadow_revision,
+                "normalized_text": text,
+                "sha256": sha,
+            }
+    return None
 
 
 def get_tx_block_locations(tx_hash: str) -> List[Dict]:

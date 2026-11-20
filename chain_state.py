@@ -154,6 +154,16 @@ _last_transfer_ts: dict = {}
 # Lock for thread-safe access to rules state
 _rules_lock = threading.Lock()
 
+# Shadow replay state (issue #42, step 2): an isolated TauInterface advanced
+# at commit with exactly the units that entered _application_rules_state,
+# whose normalized spec backs the getaccountrules view. Guarded by its own
+# lock -- it is touched only from the commit-path recorder and the view's
+# accessors, never inside the balance/sequence/rules lock ordering.
+_shadow_lock = threading.Lock()
+_shadow_spec = None
+_shadow_driver_factory = None  # None -> the production TauInterface driver
+_shadow_unavailable = False  # construction failed once; do not retry per block
+
 # In-memory rules state storage
 # In-memory rules state storage
 _application_rules_state = ""
@@ -582,6 +592,127 @@ def _record_rule_outcomes(block, next_snapshot) -> None:
             )
     except Exception:
         logger.exception("could not record rule outcomes")
+
+
+def _default_shadow_driver():
+    """The production shadow driver, or None when the native bindings are
+    unavailable -- the shadow is a view accelerator, never a commit
+    dependency, so a node without a working engine binding simply serves
+    `not_recorded` for the shared-spec half of the view."""
+    try:
+        from consensus.shadow_spec import TauInterfaceShadowDriver
+
+        return TauInterfaceShadowDriver()
+    except Exception:
+        logger.exception("shadow replay unavailable; spec snapshots disabled")
+        return None
+
+
+def set_shadow_driver_factory(factory) -> None:
+    """Install the factory get_shadow_spec() builds drivers from, and drop
+    any shadow already built. Test hook, mirroring
+    consensus.sender_policy.set_evaluator: pass a factory returning a
+    scripted driver to exercise the snapshot machinery without the native
+    engine, or None to restore the production default."""
+    global _shadow_driver_factory, _shadow_spec, _shadow_unavailable
+    with _shadow_lock:
+        _shadow_driver_factory = factory
+        _shadow_spec = None
+        _shadow_unavailable = False
+
+
+def get_shadow_spec():
+    """The node's shadow, built lazily on first use; None when no driver
+    can be constructed (native bindings unavailable)."""
+    global _shadow_spec, _shadow_unavailable
+    with _shadow_lock:
+        if _shadow_spec is None:
+            if _shadow_unavailable:
+                return None
+            factory = _shadow_driver_factory or _default_shadow_driver
+            driver = factory()
+            if driver is None:
+                _shadow_unavailable = True
+                return None
+            from consensus.shadow_spec import ShadowSpec
+
+            _shadow_spec = ShadowSpec(driver)
+        return _shadow_spec
+
+
+def _record_shadow_snapshot(block, next_snapshot) -> None:
+    """Best-effort shadow advance + snapshot write, mirroring
+    _record_rule_outcomes.
+
+    The units are read from the snapshot's tau_bytes -- the post-block
+    application-rules accumulation, i.e. exactly the canonical bytes that
+    entered state in and before this block. The shadow feeds only the ones
+    it has not seen, so a clause-only block (whose snapshot text is
+    unchanged) advances nothing, and a shadow rebuilt after a restart
+    catches up from the full accumulation on the next rule block. When the
+    accumulation changed, the snapshot is persisted per block so the
+    getaccountrules view (and at-height queries) can be served without
+    touching the live interpreter.
+    """
+    try:
+        shadow = get_shadow_spec()
+        if shadow is None:
+            return
+        raw = getattr(next_snapshot, "tau_bytes", b"") or b""
+        text = raw.decode("utf-8", errors="ignore") if isinstance(
+            raw, (bytes, bytearray)) else str(raw)
+        units = [u for u in text.split("\n") if u.strip()]
+        snap = shadow.advance(
+            units,
+            height=block.header.block_number,
+            block_hash=block.block_hash,
+        )
+        if snap is not None:
+            db.record_spec_snapshot(
+                snap["block_hash"], snap["height"], snap["shadow_revision"],
+                snap["normalized_text"], snap["sha256"],
+            )
+    except Exception:
+        logger.exception("could not record spec snapshot")
+
+
+def rebuild_shadow_from_accumulation():
+    """Rebuild the shadow from block 0 over the persisted accumulation and
+    make it the node's shadow. Returns the rebuilt shadow (or None when no
+    driver is available). The snapshots this produces are the same ones
+    the incremental advance recorded -- that equality is the cross-node
+    comparability claim of the design, and it is what a restart relies on
+    instead of trusting process-local interpreter text."""
+    global _shadow_spec
+    from consensus.shadow_spec import ShadowSpec
+
+    factory = _shadow_driver_factory or _default_shadow_driver
+    driver = factory()
+    if driver is None:
+        return None
+    shadow = ShadowSpec(driver)
+    units = [u for u in (get_application_rules_state() or "").split("\n")
+             if u.strip()]
+    with _shadow_lock:
+        _shadow_spec = shadow
+    if units:
+        shadow.advance(
+            units,
+            height=int(db.get_chain_state_value("canonical_head_number", "0")
+                       or 0),
+            block_hash=db.get_chain_state_value("canonical_head_hash", ""),
+        )
+    return shadow
+
+
+def get_clauses_root() -> str | None:
+    """The clause-registry root at the current tip, hex -- the registry
+    half of the state hash, served beside the registry clauses in the
+    getaccountrules view."""
+    try:
+        return _lifecycle_manager.rule_offers.clauses_root().hex()
+    except Exception:
+        return None
 
 
 def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
@@ -1107,6 +1238,7 @@ def _process_new_block_locked(block: Block) -> bool:
 
             _record_retractable_events(block, next_snapshot)
             _record_rule_outcomes(block, next_snapshot)
+            _record_shadow_snapshot(block, next_snapshot)
 
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
@@ -1389,6 +1521,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
 
             _record_retractable_events(block, next_snapshot)
             _record_rule_outcomes(block, next_snapshot)
+            _record_shadow_snapshot(block, next_snapshot)
 
             if _enabled:
                 # The block's evaluator history becomes durable exactly as a live
