@@ -1,12 +1,13 @@
-# Envelopes (spending limits, time conditions)
+# Envelopes (spending limits, time conditions, refunds)
 
 An envelope is money sent with conditions written on it. The sender sends an
 amount to a recipient; the money leaves the sender at once and waits in the
 envelope. It is the recipient's to spend, to anyone, but only as the
 conditions allow: so fast (a spending limit), not before a time or for a while
-after it arrives (time locks), and only on some weekdays or hours (windows).
-Every node enforces the conditions when it applies a block, so no wallet, bot
-or server has to be trusted to keep them.
+after it arrives (time locks), only on some weekdays or hours (windows), and
+what is left may come back to the sender (refunds). Every node enforces the
+conditions when it applies a block, so no wallet, bot or server has to be
+trusted to keep them.
 
 Every condition is optional; an envelope carries at least one. All of an
 envelope's conditions are read on its one clock, blocks or seconds:
@@ -17,14 +18,18 @@ period n  = (clock - unlock) // period              the limit's periods start at
 cap(n)    = caps[n]                  while n < len(caps)
           = caps[-1]                 after the list, when recurring
           = no limit                 after the list, when not recurring
+idle      = (clock of the last spend, or unlock) + refund_idle
+due       = min(expires_at, idle)                   the earlier decides; a tie is the end
 
 a spend lands at clock c when
-          unlock <= c < expires_at
+          unlock <= c < due
           the block's weekday is in days, its hour in hours (both read at utc_offset)
           1 <= amount <= what the envelope holds
           spent in period n + amount <= cap(n)
 
-at expires_at                                       the rest goes to the recipient
+at due    unused for refund_idle (idle came first)  the rest goes back to the sender
+          expires_at, at_end refund                 the rest goes back to the sender
+          expires_at, at_end release (default)      the rest goes to the recipient
 ```
 
 Nothing carries over: what was not spent in one period does not raise the
@@ -37,13 +42,14 @@ Typical uses:
 | A child's pocket money | caps `[100]` weekly, recurring | at most 100 a week, every week; the rest is the child's at the end |
 | A project budget | caps `[5000]` every 30 days, recurring | at most 5,000 a month |
 | An advance, then instalments | caps `[1000, 500]` monthly, recurring | 1,000 in the first month, then 500 a month |
-| A day's spending money | hold 6 h, ends at midnight | nothing for six hours, then the recipient's to spend |
+| A day's spending money | hold 6 h, ends at midnight, at_end refund | nothing for six hours; what is not spent by midnight comes back |
 | A gift for later | not_before 1 Dec | the recipient's from 1 December |
 | Lunch money | days mon..fri, hours 11-14, utc_offset +02:00 | spendable on the sender's weekdays around lunch only |
-| A cooling-off payment | hold 24 h, end in 30 days | the recipient waits a day before the first spend |
-| A budget with all of it | caps `[500]` weekly, not_before 1 Dec, days mon..fri | 500 a week on working days from 1 December |
+| Use it or lose it | refund_idle 30 days | unused for 30 days, the rest comes back |
+| A cooling-off payment | hold 24 h, at_end refund, end in 30 days | the recipient waits a day; what they do not spend in a month returns |
+| A budget with all of it | caps `[500]` weekly, not_before 1 Dec, days mon..fri, at_end refund | 500 a week on working days from 1 December; the rest returns at the end |
 
-Short reference: [README](../README.md#envelopes-spending-limits-time-conditions). CLI summary:
+Short reference: [README](../README.md#envelopes-spending-limits-time-conditions-refunds). CLI summary:
 [developer_cli.md](developer_cli.md#envelopes). This guide is the long form.
 
 ## Lifecycle
@@ -53,12 +59,16 @@ envelope_send ──► locked (until the unlock) ──► open ──► envel
                     │                            │       the windows, within the cap) ... ──► emptied
                     │                            │
                     ├──► envelope_release (sender, any time): the rest to the recipient: released
-                    └──► expires_at reached (end of that block): the rest to the recipient: ended
+                    └──► due point reached (end of that block):
+                           unused for refund_idle .......... the rest to the sender: refunded_idle
+                           expires_at, at_end refund ........ the rest to the sender: refunded
+                           expires_at, at_end release ....... the rest to the recipient: ended
 ```
 
 Every step is recorded in the node's history: `sent`, `spend` (one per spend,
 with the payee, the amount, what remains and what the period has used),
-`emptied`, `released` and `ended` (each with `paid_out`).
+`emptied`, `released`, `ended`, `refunded` and `refunded_idle` (each with
+`paid_out` and `paid_to`: `recipient` or `sender`).
 
 ## Sending
 
@@ -69,13 +79,14 @@ tau-testnet envelope send --key client --to <contractor_pubkey> --amount 4000 \
     --cap 1000,500 --recurring --period 30d --ends-in 210d
 tau-testnet envelope send --key dao --to <team_pubkey> --amount 20000 \
     --cap 2000 --recurring --period-blocks 10000 --ends-in-blocks 100000
-# nothing for six hours; it ends at midnight (UTC)
+# nothing for six hours, and what is not spent by midnight (UTC) comes back
 tau-testnet envelope send --key alice --to <bob_pubkey> --amount 100 \
-    --hold 6h --ends-at 2026-11-18
-# 500 a week on working days from 1 December
+    --hold 6h --ends-at 2026-11-18 --at-end refund
+# 500 a week on working days from 1 December; unused for 30 days or left at
+# the end, it comes back
 tau-testnet envelope send --key alice --to <bob_pubkey> --amount 5000 \
     --cap 500 --recurring --period 7d --not-before 2026-12-01 --days mon-fri \
-    --ends-at 2027-03-01
+    --refund-idle 30d --ends-at 2027-03-01 --at-end refund
 ```
 
 | Field | Meaning |
@@ -92,6 +103,8 @@ tau-testnet envelope send --key alice --to <bob_pubkey> --amount 5000 \
 | `days` | Optional, seconds clock only. The weekdays a spend may land on: day names `mon` .. `sun`, Monday first, each once, not all seven. |
 | `hours` | Optional, seconds clock only. The hours a spend may land in: 0 .. 23, increasing, each once, not all 24. `[9, 10]` is 09:00 to 11:00. |
 | `utc_offset` | Optional, only with `days` or `hours`. Where they are read: a whole number of quarter hours east of UTC, -48 .. 56 (UTC-12:00 .. UTC+14:00), never 0. `8` is UTC+02:00, `-14` is UTC-03:30. Left out, they are read in UTC. |
+| `refund_idle` | Optional, 1 .. the lifetime limit. Unused this long (from the unlock, then from each spend), the rest goes back to the sender. |
+| `at_end` | Optional. `release` (the default): at the end the rest goes to the recipient. `refund`: it goes back to the sender. |
 
 The CLI takes `--cap` repeated or comma-separated (first period first),
 `--period` as a duration (`3600`, `90s`, `15m`, `12h`, `7d`, `2w`) or
@@ -99,14 +112,16 @@ The CLI takes `--cap` repeated or comma-separated (first period first),
 `--ends-at` takes unix seconds or `2027-01-01[T08:30]`, UTC) or
 `--ends-in-blocks` / `--ends-at-height` (block clock). The end chooses the
 clock, and every other flag must be on it: `--not-before` / `--hold` /
-`--days` / `--hours` on the time clock, `--not-before-height` / `--hold-blocks`
-on the block clock. `--days` takes `mon-fri`, `sat,sun` or `fri-mon`; `--hours`
-takes `9-17` (09:00 to 17:00, so hours 9 .. 16), `22-6` (across midnight) or
-`9,12,13`. `send` prints the envelope id.
+`--refund-idle` / `--days` / `--hours` on the time clock, `--not-before-height`
+/ `--hold-blocks` / `--refund-idle-blocks` on the block clock. `--days` takes
+`mon-fri`, `sat,sun` or `fri-mon`; `--hours` takes `9-17` (09:00 to 17:00, so
+hours 9 .. 16), `22-6` (across midnight) or `9,12,13`. `send` prints the
+envelope id.
 
 A send the envelope could never be spent from is refused (code
 `ENVELOPE_NEVER_SPENDABLE`): one that would unlock only at or after its end, or
-whose windows do not open between its unlock and its end.
+whose windows do not open between its unlock and its first due point (its end,
+or its idle point when it is not used at all).
 
 A send costs one transfer fee, paid by the sender, on top of the amount. A
 sender may have 16 envelopes open at once; the node holds 4,096 in total.
@@ -116,8 +131,9 @@ sender may have 16 envelopes open at once; the node holds 4,096 in total.
 `envelope_id` is a BLAKE3 hash over the sender, the sequence number of the
 transaction that sent it, and every term above (`compute_envelope_id`). Spends
 and releases name it, so they can never touch a different envelope. The time
-conditions are encoded only when an envelope carries one, so an envelope with
-only a spending limit has the same id it had before they existed.
+conditions and refunds are encoded only when an envelope carries one, so an
+envelope with only a spending limit has the same id it had before they
+existed.
 
 ## Conditions
 
@@ -159,8 +175,22 @@ quarter hour of UTC. `getenvelope` returns the signed `utc_offset` and
 `windows_read_at` (`UTC+01:00`), and a refusal names the next window in UTC
 and at the offset.
 
-Nobody can change an envelope's conditions after the send, and the sender
-cannot take money back: it can only release the rest to the recipient early.
+### Refunds: `refund_idle` and `at_end`
+
+`refund_idle` returns an envelope nobody uses: when no spend has landed for
+that long (counted from the unlock, then from each spend), the rest goes back
+to the sender at the end of the block that reaches the point (outcome
+`refunded_idle`). With `at_end refund`, what is left at `expires_at` goes back
+to the sender (outcome `refunded`); with `at_end release`, the default, it goes
+to the recipient (outcome `ended`). When the idle point and the end fall on the
+same clock value, the end decides. Combined, `refund_idle` with `at_end
+release` reads "use it or lose it, but what is left at the end is yours".
+
+A refund is the sender's own money coming back, not a payment: it lands in the
+sender's own balance, is fee-free, needs no signature and passes no `o5`
+clause and no receive route. Nobody can change an envelope's conditions after
+the send, and the sender still cannot take money back early: it can only
+release the rest to the recipient (also on an envelope with `at_end refund`).
 
 ## Spending
 
@@ -173,8 +203,8 @@ tau-testnet envelope spend --key child <envelope_id> --to self --amount 60
   (`--to self` moves money from the envelope to the recipient's own balance,
   where it is free of the limit; the limit is on the envelope, not on the
   person).
-- A spend lands only if the envelope is open and has not reached its end, it
-  is unlocked, the block lies in its windows,
+- A spend lands only if the envelope is open and has not reached its due point
+  (its end or its idle point), it is unlocked, the block lies in its windows,
   the amount is at most what it holds, and the period's spent amount plus this
   one stays within the period's cap; refusals come in that order. Spends in
   the same block count in block order, so two spends cannot overrun a cap
@@ -203,20 +233,21 @@ to the recipient at once (outcome `released`). The sender cannot take money
 back. Releasing is the one way it can change its mind, and only in the
 recipient's favour.
 
-## The end
+## The end and refunds
 
-At the end of the block whose clock reaches `expires_at`, the envelope closes
-and the rest goes to the recipient (`ended`). No spend lands in that block: an
-envelope at its end is closed to spends. Due envelopes close after the block's
-transactions and the retractable releases, before the standing-payment sweep,
-block clock first, then by end and id. The miner wakes an idle chain for a due
-envelope (as for a retractable release or a standing payment), so the end does
-not wait for the next transaction.
+At the end of the block whose clock reaches the due point (the end, or the
+idle point), the envelope closes: the rest goes to the recipient (`ended`) or
+back to the sender (`refunded`, `refunded_idle`), as above. No spend lands in
+that block: an envelope at its due point is closed to spends. Due envelopes
+close after the block's transactions and the retractable releases, before the
+standing-payment sweep, block clock first, then by due point and id. The miner
+wakes an idle chain for a due envelope (as for a retractable release or a
+standing payment), so a refund does not wait for the next transaction.
 
 ## Which clock
 
 Every envelope has exactly one clock, and every condition on it is read on
-that clock: the period, the end, `not_before` and `hold`. One
+that clock: the period, the end, `not_before`, `hold` and `refund_idle`. One
 clock per envelope means any two conditions can be compared, which is what lets
 a node refuse an envelope that could never be spent, exactly, when it is sent.
 
@@ -229,8 +260,8 @@ a node refuse an envelope that could never be spent, exactly, when it is sent.
   proposer chooses it: at least the parent's timestamp, at most 120 s
   (`MAX_BLOCK_FUTURE_DRIFT_SECONDS`) past the clock of every node that
   validates the block. So a time condition can be reached up to about two
-  minutes early, and a proposer can hold time back: a lock then opens late and
-  a window stays open late. Time never runs backwards.
+  minutes early, and a proposer can hold time back: a lock then opens late, a
+  window stays open late and a refund comes late. Time never runs backwards.
   Weekdays and hours need this clock and are read at the envelope's
   `utc_offset` (UTC when it has none).
 - Clause-step clocks (a Tau clause counting its own steps, `[t > 3]`) are never
@@ -245,7 +276,8 @@ What a spend pays and what reaches the recipient at a release or the end are
 payments, and they pass through the receive route of the account they land on
 (see [receive_routes.md](receive_routes.md)): credit classes `envelope_spend`
 (the payee) and `envelope_release` (the recipient, at a release or the end).
-The send itself credits nobody, so it is not split.
+The send itself credits nobody, so it is not split. A refund
+(`envelope_refund`) is never routed: it is the sender's own money coming back.
 
 ## Inspecting
 
@@ -260,7 +292,8 @@ tau-testnet rpc "getenvelopes <address> in"
 `getenvelope` answers `open`; for an open envelope `envelope` holds the terms
 and where it stands at the next block: `status` (`locked`, `open` or `ended`),
 `spendable_now`, `remaining`, `spent_total`, `unlocks_at`, `in_window` and
-`next_window`, `period_index`,
+`next_window`, `idle_refund_at`, `due_at` and `due_outcome` (where the rest
+goes then: `ended`, `refunded` or `refunded_idle`), `period_index`,
 `cap_this_period`, `spent_this_period`, `left_this_period` (the most one spend
 may take under the limit) and `next_reset` (when the next period starts, or
 `null` without a limit or once it has lapsed). A closed envelope answers
@@ -279,7 +312,7 @@ queued spend in the payee's `pending_incoming`.
 
 `gettxstatus` adds `envelopes` to a confirmed transaction: what it sent, spent,
 emptied or released, and for a send whether the envelope is still `open` or
-how it closed (`emptied`, `released`, `ended`). `sendtx` and `checktx` answer `envelope`: what the envelope
+how it closed (`emptied`, `released`, `ended`, `refunded`, `refunded_idle`). `sendtx` and `checktx` answer `envelope`: what the envelope
 would hold, and what the period would have left, after the transaction.
 
 ## Limits
@@ -292,7 +325,7 @@ would hold, and what the period would have left, after the transaction.
 | Amount, each cap, each spend | 1 .. 16,777,215 |
 | Period | 1 .. 1,000,000 blocks, or 1 .. 31,622,400 s |
 | End | at most 10,000,000 blocks, or four years of 366 days, ahead |
-| `hold` | 1 .. 10,000,000 blocks, or 1 .. four years of 366 days |
+| `hold`, `refund_idle` | 1 .. 10,000,000 blocks, or 1 .. four years of 366 days |
 | `days`, `hours` | 1 .. 6 weekdays, 1 .. 23 hours (seconds clock) |
 | Envelope transactions per mempool snapshot | 64 |
 
@@ -301,14 +334,14 @@ would hold, and what the period would have left, after the transaction.
 | Code | When |
 |---|---|
 | `INVALID_ENVELOPE` | The transaction is malformed, breaks a limit, sends to the sender itself or to an invalid key, carries no condition, puts windows on the block clock, or its end is not ahead. |
-| `ENVELOPE_NEVER_SPENDABLE` | The envelope would unlock only at or after its end, or no window opens between its unlock and its end. |
+| `ENVELOPE_NEVER_SPENDABLE` | The envelope would unlock only at or after its end, or no window opens between its unlock and its first due point. |
 | `DUPLICATE_ENVELOPE` | This exact envelope is already open. |
 | `TOO_MANY_ENVELOPES` | The sender already has 16 open envelopes. |
 | `ENVELOPE_BOOK_FULL` | 4,096 envelopes are open. |
 | `NO_ENVELOPE` | No open envelope has this id. |
 | `NOT_ENVELOPE_RECIPIENT` | A spend signed by anyone but the recipient. |
 | `NOT_ENVELOPE_SENDER` | A release signed by anyone but the sender. |
-| `ENVELOPE_ENDED` | The envelope has reached its end. |
+| `ENVELOPE_ENDED` | The envelope has reached its end, or its idle point (it goes back to the sender at the end of this block). |
 | `ENVELOPE_LOCKED` | The spend comes before the unlock; the message says until when (a block height, or Unix seconds with the moment in UTC). |
 | `ENVELOPE_OUTSIDE_WINDOW` | The block would fall outside the envelope's weekdays or hours; the message says when the next window opens (Unix seconds and UTC). |
 | `ENVELOPE_LIMIT` | The spend is larger than the period's cap leaves. The message says what was spent this period and what is left. |
@@ -332,7 +365,7 @@ Apply reasons in receipts: `envelope_not_sent`, `envelope_not_spent`,
 {"tx_type": "envelope_send", "sender_pubkey": "<sender>", "sequence_number": 9,
  "expiration_time": 1799999999, "expire_at_height": 5000, "fee_limit": "20",
  "genesis_hash": "<64 hex>", "recipient_pubkey": "<recipient>", "amount": 100, "clock": "seconds",
- "hold": 21600, "expires_at": 1794960000, "signature": "..."}
+ "hold": 21600, "at_end": "refund", "expires_at": 1794960000, "signature": "..."}
 
 {"tx_type": "envelope_spend", "sender_pubkey": "<recipient>", "sequence_number": 3,
  "expiration_time": 1799999999, "expire_at_height": 5000, "fee_limit": "20",
@@ -348,7 +381,7 @@ Every field above is in the signed bytes. `recurring` may be left out (false).
 `genesis_hash` is the hash of block 0 of the network the transaction is for;
 `getsequence <address>` returns it, and the CLI fills it in.
 The optional fields (`clock`, `not_before`, `hold`, `days`, `hours`,
-`utc_offset`) are signed when present and left out of the signed
+`utc_offset`, `refund_idle`, `at_end`) are signed when present and left out of the signed
 bytes when absent, so a spending-limit envelope signed before they existed
 keeps its bytes; adding or stripping one breaks the signature.
 
@@ -356,9 +389,9 @@ keeps its bytes; adding or stripping one breaks the signature.
 
 - The book (one row per open envelope: the id, the terms and where it stands)
   plus a running commitment of every close (`emptied`, `released`, `ended`,
-  with what was paid out) is folded into the
+  `refunded`, `refunded_idle`, with what was paid out) is folded into the
   consensus metadata as `envelopes_root` **only once the book has held an
-  envelope**. An envelope with a time condition also commits the
+  envelope**. An envelope with a time condition or refund also commits the
   clock of its last spend; one without encodes exactly as before, so a node
   upgraded with spending-limit envelopes open computes the same root. Until then the metadata is
   unchanged, so **no regenesis** is needed; nodes must upgrade before the first
@@ -397,9 +430,9 @@ start on a row that does not recompute its id or holds an impossible state
 Ends are closed at the end of the block with no Tau step (the money left the
 sender when it was sent), one credit each; at most 4,096 envelopes are open.
 
-**Idle chains.** The miner also wakes for an envelope whose end is due at the
-next block (at most one attempt every 2 seconds), so the rest reaches the
-recipient on time on a quiet chain.
+**Idle chains.** The miner also wakes for an envelope whose end, refund or
+idle refund is due at the next block (at most one attempt every 2 seconds), so
+a refund lands on time on a quiet chain.
 
 **Network.** `envelope_send`, `envelope_spend` and `envelope_release` gossip on
 `tau/envelopes/1.0.0`; a mempool snapshot carries at most 64 of them.
@@ -409,7 +442,11 @@ recipient on time on a quiet chain.
 - A stolen recipient key can drain an envelope only at the pace of its limit:
   at most one cap per period, only after the unlock and only inside the
   windows. A release does not help (it pays the same key), so choose the
-  conditions and the end with that in mind.
+  conditions and the end with that in mind. With `at_end refund`, what the
+  thief could not spend in time comes back to the sender.
+- A payment to the wrong person, or one a scammer talked the sender into, can
+  be sent with a `hold` and `at_end refund`: if the recipient never spends it,
+  it comes back on its own. Once spent, it is gone; a hold only buys time.
 - A proposer controls the block timestamp within the bounds above, never the
   height. For conditions where minutes matter, use the block clock.
 - A stolen sender key can only release the rest early, to the recipient.
@@ -443,17 +480,23 @@ These are the choices of this build that are easiest to change before release.
 - **One clock per envelope.** Mixing a block-clock hold with a time-clock end
   would make "can this ever be spent" undecidable at the send.
 - **The periods start at the unlock**, not at the send.
+- **The idle timer starts at the unlock** and restarts at each spend; a spend
+  of any size counts as use.
+- **A tie between the idle point and the end goes to the end**, so `at_end`
+  decides what happens on the last day.
 - **Windows are weekdays and whole hours at a fixed offset from UTC.** The
   sender signs the offset (`utc_offset`, quarter hours; UTC when left out). No
   time zone names, no daylight saving, no minutes or dates in the chain; a
   wallet translates.
+- **A refund is never routed and never judged by a clause**: it is the sender's
+  own money coming back.
 
 ## Not in this release
 
-- Refunds to the sender (unused money coming back, or the rest returning at the
-  end): the next stage. The stored conditions keep two free places and the
-  clock of the last spend for it, so adding it changes no stored envelope.
 - Conditions other than these (a list of allowed payees, a co-signer for spends
-  above a size). `semantics` lists the conditions a node supports.
+  above a size, a refund triggered by an event other than time). `semantics`
+  lists the conditions a node supports.
+- A refund back to the sender before the end at the sender's request: the
+  sender can never take money back early.
 - Topping up an open envelope, or a standing payment that pays into one.
 - Partial releases.

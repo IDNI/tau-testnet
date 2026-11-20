@@ -517,7 +517,7 @@ def call(module, line, container):
 
 def test_the_capability_report():
     sem = getenvelope.semantics()
-    assert sem["supported"] is True and sem["version"] == 2
+    assert sem["supported"] is True and sem["version"] == 3
     assert sem["conditions"][0] == "spending_limit"
     assert "nothing carries over" in sem["spending_limit"]
     assert sem["clocks"] == ["blocks", "seconds"]
@@ -564,7 +564,7 @@ def test_getenvelope_tells_how_a_closed_envelope_closed(temp_database, container
     _events_for(eid)
     db.record_envelope_events("blk3", NEXT_HEIGHT + 2, [
         {"outcome": "released", "envelope_id": eid, "sender_pubkey": A,
-         "recipient_pubkey": B, "paid_out": 940, "tx_id": "t3"}])
+         "recipient_pubkey": B, "paid_out": 940, "paid_to": "recipient", "tx_id": "t3"}])
     monkeypatch.setattr(db, "get_canonical_confirmation", lambda h, n: (h != "blk3x", 1))
     data = call(getenvelope, f"getenvelope {eid}", container)["data"]
     assert data["open"] is False and data["closed"] == "released"
@@ -606,7 +606,7 @@ def test_gettxstatus_shows_what_a_transaction_did_to_envelopes(temp_database, mo
     assert sent[0]["outcome"] == "sent" and sent[0]["status"] == "open"
     db.record_envelope_events("blk3", NEXT_HEIGHT + 2, [
         {"outcome": "ended", "envelope_id": eid, "sender_pubkey": A,
-         "recipient_pubkey": B, "paid_out": 940}])
+         "recipient_pubkey": B, "paid_out": 940, "paid_to": "recipient"}])
     assert gettxstatus._envelope_fields(db, "t1", "blk")["envelopes"][0]["status"] == "ended"
     spent = gettxstatus._envelope_fields(db, "t2", "blk2")["envelopes"]
     assert (spent[0]["amount"], spent[0]["to_pubkey"]) == (60, C)

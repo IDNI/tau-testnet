@@ -731,10 +731,10 @@ RPC replies:
 
 ## Envelopes
 
-Send money with conditions: a spending limit, time locks, and weekday and hour
-windows. The recipient spends it, to anyone, as the
+Send money with conditions: a spending limit, time locks, weekday and hour
+windows, and refunds to the sender. The recipient spends it, to anyone, as the
 conditions allow. Semantics are in the
-[README](../README.md#envelopes-spending-limits-time-conditions).
+[README](../README.md#envelopes-spending-limits-time-conditions-refunds).
 Long-form guide: [envelopes.md](envelopes.md).
 
 ```bash
@@ -745,12 +745,12 @@ tau-testnet envelope send --key client --to <contractor_pk> --amount 4000 \
 tau-testnet envelope send --key dao --to <team_pk> --amount 20000 \
     --cap 2000 --recurring --period-blocks 10000 --ends-in-blocks 100000
 tau-testnet envelope send --key alice --to <bob_pk> --amount 100 \
-    --hold 6h --ends-at 2026-11-18
+    --hold 6h --ends-at 2026-11-18 --at-end refund
 tau-testnet envelope send --key alice --to <bob_pk> --amount 5000 \
     --cap 500 --recurring --period 7d --not-before 2026-12-01 --days mon-fri \
-    --ends-at 2027-03-01
+    --refund-idle 30d --ends-at 2027-03-01 --at-end refund
 tau-testnet envelope send --key dao --to <team_pk> --amount 900 \
-    --hold-blocks 100 --ends-in-blocks 50000
+    --hold-blocks 100 --refund-idle-blocks 5000 --ends-in-blocks 50000
 tau-testnet envelope spend --key child <envelope_id> --to <shop_pk> --amount 40
 tau-testnet envelope spend --key child <envelope_id> --to self --amount 60
 tau-testnet envelope release --key parent <envelope_id>
@@ -772,6 +772,8 @@ Flags of `send`:
 | `--days` | time | Weekdays a spend may land on: `mon-fri`, `sat,sun`, `fri-mon`. |
 | `--hours` | time | Hours: `9-17` (09:00 to 17:00), `22-6` (across midnight), `9,12,13`. |
 | `--utc-offset` | time | Where `--days` and `--hours` are read: `+02:00`, `-03:30`, `5:45` (steps of 15 minutes, -12:00 to +14:00). A fixed offset, no daylight saving. Without it they are UTC. |
+| `--refund-idle` / `--refund-idle-blocks` | time / blocks | Unused this long (from the unlock, then from each spend), the rest goes back to the sender. |
+| `--at-end` | either | `release` (default): the rest goes to the recipient at the end; `refund`: back to the sender. |
 
 The end chooses the clock; every other flag must be on the same clock, or the
 CLI stops with "one envelope, one clock". An envelope needs at least one
@@ -782,7 +784,7 @@ Raw transactions (root fields only; a nested `payload` is ignored):
 
 | `tx_type` | Signed fields beyond the envelope |
 |---|---|
-| `envelope_send` | `genesis_hash`, `recipient_pubkey`, `amount`, `expires_at`; optional `caps` with exactly one of `period_blocks` / `period_seconds` and `recurring`; optional `clock` (`blocks`/`seconds`, required without caps), `not_before`, `hold`, `days` (`["mon", ...]`), `hours` (`[0..23]`), `utc_offset` (quarter hours east of UTC) |
+| `envelope_send` | `genesis_hash`, `recipient_pubkey`, `amount`, `expires_at`; optional `caps` with exactly one of `period_blocks` / `period_seconds` and `recurring`; optional `clock` (`blocks`/`seconds`, required without caps), `not_before`, `hold`, `days` (`["mon", ...]`), `hours` (`[0..23]`), `utc_offset` (quarter hours east of UTC), `refund_idle`, `at_end` (`release`/`refund`) |
 | `envelope_spend` | `genesis_hash`, `envelope_id`, `to_pubkey`, `amount` (signed by the recipient) |
 | `envelope_release` | `genesis_hash`, `envelope_id` (signed by the sender; feeless) |
 
@@ -790,11 +792,11 @@ RPC replies:
 
 - `getenvelope` returns `open`; an open envelope's `envelope` (terms,
   `status` (`locked`, `open`), `spendable_now`, `remaining`, `spent_total`,
-  `unlocks_at`, `in_window`, `next_window`, `period_index`,
-  `cap_this_period`, `spent_this_period`,
+  `unlocks_at`, `in_window`, `next_window`, `idle_refund_at`, `due_at`,
+  `due_outcome`, `period_index`, `cap_this_period`, `spent_this_period`,
   `left_this_period`, `next_reset`); a closed one's `closed` (`emptied`,
-  `released` or `ended`); `history` (sent, spend
-  and the closes, each close with `paid_out`; canonical blocks
+  `released`, `ended`, `refunded` or `refunded_idle`); `history` (sent, spend
+  and the closes, each close with `paid_out` and `paid_to`; canonical blocks
   only, newest first), `block_hash`, and `semantics`. An id the chain never saw
   answers `NOT_FOUND`.
 - `getenvelopes` returns the open `envelopes` of the address in that role,

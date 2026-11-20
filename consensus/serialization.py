@@ -1163,21 +1163,21 @@ DOMAIN_ENVELOPE_RESOLVED_V1 = b"tau.envelope.resolved.v1"
 DOMAIN_ENVELOPE_BOOK_V1 = b"tau.envelope.book.v1"
 
 
-# Conditions beyond the spending limit (time conditions) are encoded
+# Conditions beyond the spending limit (time conditions and refunds) are encoded
 # only when an envelope carries one: the clock byte then has ENVELOPE_EXTENDED set
 # and a length-prefixed section follows the end. An envelope without them encodes
 # exactly as before, so its id, its book entry and the book root do not change.
 ENVELOPE_EXTENDED = 0x80
-_COND_NOT_BEFORE, _COND_HOLD, _COND_DAYS, _COND_HOURS = 1, 2, 3, 4
-_COND_UTC_OFFSET = 7     # tags 5 and 6 are left for the refund conditions (next stage)
+_COND_NOT_BEFORE, _COND_HOLD, _COND_DAYS, _COND_HOURS, _COND_REFUND_IDLE, _COND_AT_END = \
+    1, 2, 3, 4, 5, 6
+_COND_UTC_OFFSET = 7
 
 
 def encode_envelope_conditions(conditions: Any) -> bytes:
-    """(not_before, hold, days, hours, -, -, utc_offset) as tag-value pairs, tags
-    strictly increasing, an absent condition (None or 0) left out; u16 length
-    first. utc_offset is one signed byte (quarter hours east of UTC). The two free
-    places belong to the refund conditions of the next stage."""
-    not_before, hold, days, hours, _, _, utc_offset = conditions
+    """(not_before, hold, days, hours, refund_idle, at_end, utc_offset) as tag-value
+    pairs, tags strictly increasing, an absent condition (None or 0) left out; u16
+    length first. utc_offset is one signed byte (quarter hours east of UTC)."""
+    not_before, hold, days, hours, refund_idle, at_end, utc_offset = conditions
     body = bytearray()
     if not_before is not None:
         body.append(_COND_NOT_BEFORE)
@@ -1191,6 +1191,12 @@ def encode_envelope_conditions(conditions: Any) -> bytes:
     if hours:
         body.append(_COND_HOURS)
         body.extend(encode_uint32(int(hours) & 0xFFFFFF))
+    if refund_idle is not None:
+        body.append(_COND_REFUND_IDLE)
+        body.extend(encode_uint64(int(refund_idle)))
+    if at_end:
+        body.append(_COND_AT_END)
+        body.append(int(at_end) & 0xFF)
     if utc_offset:
         body.append(_COND_UTC_OFFSET)
         body.extend(int(utc_offset).to_bytes(1, "big", signed=True))
@@ -1257,8 +1263,8 @@ def compute_envelope_id(
 
 def compute_envelope_resolved_acc(acc: Any, envelope_id: Any, outcome: int,
                                   paid_out: int) -> bytes:
-    """Fold one closed envelope (spent, released, ended) and what its close paid
-    the recipient into the commitment."""
+    """Fold one closed envelope and what its close paid out (to the recipient, or
+    back to the sender for a refund; the outcome says which) into the commitment."""
     out = bytearray()
     out.extend(encode_string(DOMAIN_ENVELOPE_RESOLVED_V1.decode()))
     out.extend(encode_hash32(acc))
@@ -1289,8 +1295,7 @@ def encode_envelope_entry(
     last_clock: int = 0,
 ) -> bytes:
     """One open envelope. An extended envelope (its clock byte says so) also
-    commits the clock of its last spend: the refund stage counts idle time from
-    it, and committing it now means that stage does not change this encoding."""
+    commits the clock of its last spend, which its idle refund counts from."""
     out = bytearray()
     out.extend(encode_hash32(envelope_id))
     out.extend(_encode_envelope_terms(

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""End-to-end envelope time conditions on REAL running nodes with the native Tau engine.
+"""End-to-end envelope time conditions and refunds on REAL running nodes with the native Tau engine.
 
-tests/test_envelope_conditions*.py drive the real block apply in one process; this drives two live nodes (see scripts/e2e_rig.py
+tests/test_envelope_time*.py and tests/test_envelope_refund*.py drive the real
+block apply in one process; this drives two live nodes (see scripts/e2e_rig.py
 and scripts/e2e_envelope_limits.py): node A mines and is driven through its RPC
 port and the `tau-testnet envelope` CLI; node B receives A's blocks only.
 
@@ -15,19 +16,21 @@ included, and on the envelope history every node records)
        (ENVELOPE_OUTSIDE_WINDOW) and says when its next window opens. The same
        with `--utc-offset +05:45`: the hours open there are spent, the UTC hours
        read there are shut.
-    3. The end of a held envelope on the block clock: a spend at the unlock
-       lands, a spend for the block that reaches the end is refused
-       (ENVELOPE_ENDED), and that block pays the rest to the recipient
-       (`ended`).
-    4. An end on the seconds clock on an idle node: node A runs its own miner,
-       nobody sends anything, and the miner's due wake makes the one block
-       that closes the envelope.
-    5. Node B replays A's blocks, restarts, and ends with the same state hash,
+    3. An idle refund on the block clock: a spend moves the idle point; with no
+       spend after it, the rest goes back to the sender at the idle point
+       (`refunded_idle`), fee-free and past the sender's receive route
+       untouched. A spend for the due block itself is refused (ENVELOPE_ENDED).
+    4. `--at-end refund`: what is left at the end goes back to the sender
+       (`refunded`).
+    5. An idle refund on the seconds clock on an idle node: node A runs its own
+       miner, nobody sends anything, and the miner's due wake makes the one
+       block that refunds it.
+    6. Node B replays A's blocks, restarts, and ends with the same state hash,
        the same balances and the same `getenvelope` answers.
 
 USAGE
-    python scripts/e2e_envelope_time.py provision --dir .local/e2e-envelope-time
-    python scripts/e2e_envelope_time.py run --dir .local/e2e-envelope-time
+    python scripts/e2e_envelope_time_refunds.py provision --dir .local/e2e-envelope-time
+    python scripts/e2e_envelope_time_refunds.py run --dir .local/e2e-envelope-time
 
 The native binding comes from $TAU_NATIVE_PATH. Scenario 2 reads the node's
 own clock; a run that crosses a UTC hour while it is in scenario 2 may report a
@@ -45,7 +48,7 @@ from e2e_envelope_limits import closed, code, envelope, held, ok_proc, raw_spend
 from e2e_rig import Oracle, Rig, check, say
 
 NETWORK_ID = "tau-e2e-envelope-time"
-ACTORS = ("miner", "gran", "child", "shop")
+ACTORS = ("miner", "gran", "child", "shop", "piggy")
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
@@ -160,63 +163,89 @@ def scenario_windows(rig, st, retry=True):
     orc.verify("the windows")
 
 
-def scenario_end(rig, st):
-    say("3. The end of a held envelope on the block clock")
-    orc = Oracle(rig, "3", ("gran", "child", "shop"))
-    _p, eid = send(rig, "gran", "child", "--amount", "80", "--hold-blocks", "2",
-                   "--ends-in-blocks", "8")
-    st["end"] = eid
+def scenario_idle_refund(rig, st):
+    say("3. An idle refund on the block clock, past the sender's route")
+    orc = Oracle(rig, "3", ("gran", "child", "shop", "piggy"))
+    ok_proc("gran routes 50% of her income to the piggy bank", rig.cli(
+        "route", "set", "--privkey", rig.privkey("gran"), "--to", rig.pk["piggy"],
+        "--share", "50", "--fee", rig_mod.FEE_LIMIT))
+    rig.mine(empty=False)
+    orc.fee("gran")
+    _p, eid = send(rig, "gran", "child", "--amount", "500", "--refund-idle-blocks", "5",
+                   "--ends-in-blocks", "100")
+    st["idle"] = eid
+    rig.mine(empty=False)
+    orc.fee("gran")
+    orc.add("gran", -500)
+    first = int(env_field(rig, eid, "idle_refund_at") or 0)
+    rig.mine_to(first - 2)
+    ok_proc("a spend before the idle point", spend(rig, "child", eid, "shop", 100))
+    rig.mine(empty=False)
+    orc.fee("child")
+    orc.add("shop", 100)
+    moved = int(env_field(rig, eid, "idle_refund_at") or 0)
+    check("the spend moves the idle point", moved == rig.a.height() + 5, (first, moved))
+    rig.mine_to(moved - 1)
+    res = raw_spend(rig, "child", eid, "shop", 10)
+    check("a spend for the due block is refused ENVELOPE_ENDED", code(res) == "ENVELOPE_ENDED", res)
+    rig.mine()
+    check("at the idle point it closes `refunded_idle`", closed(rig, eid) == "refunded_idle",
+          envelope(rig, eid).get("history", [])[:1])
+    orc.add("gran", 400)
+    orc.verify("the idle refund (400 back to gran whole, fee-free, not routed)")
+
+
+def scenario_end_refund(rig, st):
+    say("4. `--at-end refund`")
+    orc = Oracle(rig, "4", ("gran", "child", "shop", "piggy"))
+    _p, eid = send(rig, "gran", "child", "--amount", "80", "--ends-in-blocks", "4",
+                   "--at-end", "refund")
+    st["end_refund"] = eid
     rig.mine(empty=False)
     orc.fee("gran")
     orc.add("gran", -80)
-    unlock = int(env_field(rig, eid, "unlocks_at") or 0)
-    end = int(env_field(rig, eid, "expires_at") or 0)
-    rig.mine_to(unlock - 1)
-    ok_proc("a spend of 30 for the unlock block", spend(rig, "child", eid, "shop", 30))
+    ok_proc("a spend of 30", spend(rig, "child", eid, "shop", 30))
     rig.mine(empty=False)
     orc.fee("child")
     orc.add("shop", 30)
-    rig.mine_to(end - 1)
-    res = raw_spend(rig, "child", eid, "shop", 10)
-    check("a spend for the block that reaches the end is refused ENVELOPE_ENDED",
-          code(res) == "ENVELOPE_ENDED", res)
-    rig.mine()
-    check("at the end it closes `ended`", closed(rig, eid) == "ended",
+    end = int(env_field(rig, eid, "due_at") or 0)
+    rig.mine_to(end)
+    check("at the end it closes `refunded`", closed(rig, eid) == "refunded",
           envelope(rig, eid).get("history", [])[:1])
-    orc.add("child", 50)
-    orc.verify("the end (50 to the child)")
+    orc.add("gran", 50)
+    orc.verify("the end refund (50 back to gran)")
 
 
 def scenario_idle_wake(rig, st):
-    say("4. A seconds-clock end on an idle node: the miner's wake")
+    say("5. A seconds-clock idle refund on an idle node: the miner's wake")
     if not rig.restart_a(TAU_MINING_ENABLED="true"):
         return
     check("the open envelopes survive the restart",
           held(rig, st["hold"]) == 200 and held(rig, st["window_open"]) == 70,
           (held(rig, st["hold"]), held(rig, st["window_open"])))
-    orc = Oracle(rig, "4", ("gran", "child"))
-    _p, eid = send(rig, "gran", "child", "--amount", "60", "--hold", "2s",
-                   "--ends-in", "30s")
+    orc = Oracle(rig, "5", ("gran", "child"))
+    _p, eid = send(rig, "gran", "child", "--amount", "60", "--refund-idle", "15s",
+                   "--ends-in", "1h")
     st["wake"] = eid
     rig.settle(lambda: envelope(rig, eid).get("open"), "the send to land", tries=3)
     orc.fee("gran")
     orc.add("gran", -60)
-    due = int(env_field(rig, eid, "expires_at") or 0)
+    due = int(env_field(rig, eid, "idle_refund_at") or 0)
     height = rig.a.height()
-    say(f"   idle at height {height}; the end is due at {due} (now {int(time.time())})")
-    done = rig.wait(lambda: closed(rig, eid) == "ended", "the end",
+    say(f"   idle at height {height}; refund due at {due} (now {int(time.time())})")
+    done = rig.wait(lambda: closed(rig, eid) == "refunded_idle", "the refund",
                     timeout=max(60.0, due - time.time() + 40))
-    check("the miner's wake closed it with no transaction sent", done,
+    check("the miner's wake refunded it with no transaction sent", done,
           envelope(rig, eid).get("history", [])[:1])
     check("the wake made exactly one block", rig.a.height() == height + 1,
           (height, rig.a.height()))
-    orc.add("child", 60)
+    orc.add("gran", 60)
     orc.verify("the idle period")
     rig.restart_a()
 
 
 def scenario_follower(rig, st):
-    say("5. Node B replays A's blocks, restarts, and agrees")
+    say("6. Node B replays A's blocks, restarts, and agrees")
     rig.mine()
     reads = [f"getenvelope {eid}" for eid in st.values() if eid]
     reads += [f"getenvelopes {rig.pk[n]} all" for n in ("gran", "child")]
@@ -232,7 +261,8 @@ def run(root: str) -> int:
             rig.mine()
             scenario_locks(rig, st)
             scenario_windows(rig, st)
-            scenario_end(rig, st)
+            scenario_idle_refund(rig, st)
+            scenario_end_refund(rig, st)
             scenario_idle_wake(rig, st)
             scenario_follower(rig, st)
     except Exception:

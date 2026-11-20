@@ -6,9 +6,11 @@ An open envelope answers `open: true` with its terms and progress at the next
 block: whether it is locked (and until when), whether the next block is inside
 its spending window (and when the next one opens), the period it is in, that
 period's cap, what was spent in it, what one spend may still take, when the next
-period starts. A closed one answers `open: false`; its history (newest first,
-canonical blocks only) says how it closed: `emptied`, `released` or `ended`,
-with what was paid out.
+period starts, and its due point (`due_at`, `due_outcome`: where the rest goes
+then). A closed one answers `open: false`; its history (newest first, canonical
+blocks only) says how it closed: `emptied`, `released`, `ended` (rest to the
+recipient), `refunded` or `refunded_idle` (rest back to the sender), with what
+was paid out and to whom.
 
 `semantics` is the capability report a wallet reads before offering envelopes.
 """
@@ -31,7 +33,7 @@ def semantics() -> dict:
             "envelope_send": "one transfer fee, paid by the sender",
             "envelope_spend": "one transfer fee, paid by the recipient who spends",
             "envelope_release": "fee-free",
-            "end": "fee-free, started by the network at the end of a block",
+            "end_and_refunds": "fee-free, started by the network at the end of a block",
         },
         "preview": "sendtx and checktx answer `envelope` with what the envelope would "
                    "hold or have left after the transaction",

@@ -218,7 +218,7 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["period_seconds"] = payload.get("period_seconds")
         signing_dict["recurring"] = payload.get("recurring")
         signing_dict["expires_at"] = payload.get("expires_at")
-        # Time conditions: signed when present, left out when absent,
+        # Time conditions and refunds: signed when present, left out when absent,
         # so a spending-limit envelope signed before they existed keeps its bytes.
         # Present-or-absent is itself in the bytes: adding or stripping one breaks
         # the signature.

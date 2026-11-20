@@ -1,4 +1,4 @@
-"""Envelope time conditions: parsing, ids, signing, the book,
+"""Envelope time conditions and refunds: parsing, ids, signing, the book,
 admission, storage, RPC, the miner wake and the CLI.
 
 The block-apply behaviour is in test_envelope_conditions_apply.py and the random
@@ -7,13 +7,14 @@ search against a reference model in test_envelope_conditions_model.py.
 import argparse
 import hashlib
 import json
+import types
 from unittest.mock import MagicMock
 
 import pytest
 
 import chain_state
 import db
-from commands import getenvelope
+from commands import getenvelope, gettxstatus
 from consensus.admission import (
     validate_envelope_send_payload,
     validate_envelope_spend_payload,
@@ -21,13 +22,17 @@ from consensus.admission import (
 from consensus.envelope import (
     ALL_DAYS,
     ALL_HOURS,
+    AT_END_REFUND,
     KIND_BLOCKS,
     KIND_SECONDS,
     OUTCOME_ENDED,
+    OUTCOME_REFUNDED,
+    OUTCOME_REFUNDED_IDLE,
     EnvelopeBook,
     EnvelopeRefused,
     EnvelopeShapeError,
     EnvelopeSpend,
+    EnvelopeState,
     EnvelopeTerms,
     describe,
     first_spend_point,
@@ -37,6 +42,7 @@ from consensus.envelope import (
 )
 from consensus.facade import TipAdmissionView
 from consensus.governance import ConsensusLifecycleManager
+from consensus.receive_route import ROUTED_CLASSES, UNROUTED_CLASSES
 from consensus.tx_signing import signing_message_bytes
 from errors import DatabaseError
 from network.service import NetworkService
@@ -137,7 +143,7 @@ def test_windows_are_read_at_the_envelopes_offset():
 
 def test_the_first_spend_point_follows_the_offset():
     # Noon at UTC+05:45 opens 06:15 UTC: an envelope ending 06:30 UTC can be spent,
-    # one ending 06:15 UTC cannot (the end itself is never spendable).
+    # one ending 06:15 UTC cannot (the due point itself is never spendable).
     spendable = parse_envelope_send(send(hours=[12], utc_offset=23,
                                          expires_at=TS + 6 * HOUR + 30 * 60))
     assert first_spend_point(spendable, TS) == TS + 6 * HOUR + 15 * 60
@@ -151,7 +157,7 @@ def test_unlock_takes_the_later_of_not_before_and_hold():
     assert t.unlock_at(TS) == TS + HOUR
     t = parse_envelope_send(send(not_before=TS + 5 * HOUR, hold=HOUR))
     assert t.unlock_at(TS) == TS + 5 * HOUR and t.unlock_at(TS + 5 * HOUR) == TS + 6 * HOUR
-    assert parse_envelope_send(send(days=["mon"])).unlock_at(TS) == TS
+    assert parse_envelope_send(send(at_end="refund")).unlock_at(TS) == TS
 
 
 def test_next_window():
@@ -160,16 +166,27 @@ def test_next_window():
     assert t.next_window(TS + 2 * DAY + 10 * HOUR + 3599) == TS + 2 * DAY + 10 * HOUR + 3599
     assert t.next_window(TS + 2 * DAY + 11 * HOUR) == TS + 3 * DAY + 10 * HOUR
     assert t.next_window(TS + 3 * DAY + 11 * HOUR) == TS + 9 * DAY + 10 * HOUR
-    assert parse_envelope_send(send(hold=1)).next_window(TS + 7) == TS + 7
+    assert parse_envelope_send(send(at_end="refund")).next_window(TS + 7) == TS + 7
+
+
+def test_the_due_point_and_how_it_closes():
+    t = parse_envelope_send(send(refund_idle=DAY, expires_at=TS + 3 * DAY))
+    s = EnvelopeState(anchor=TS, remaining=10)
+    assert (s.idle_point(t), s.due_point(t), s.due_outcome(t)) == \
+        (TS + DAY, TS + DAY, OUTCOME_REFUNDED_IDLE)
+    s = EnvelopeState(anchor=TS, remaining=5, spends=1, last_clock=TS + 2 * DAY + 1)
+    assert (s.due_point(t), s.due_outcome(t)) == (TS + 3 * DAY, OUTCOME_ENDED)
+    refund = parse_envelope_send(send(refund_idle=DAY, at_end="refund", expires_at=TS + DAY))
+    assert EnvelopeState(anchor=TS, remaining=1).due_outcome(refund) == OUTCOME_REFUNDED
 
 
 def test_first_spend_point():
     assert first_spend_point(parse_envelope_send(send(hold=HOUR)), TS) == TS + HOUR
-    t = parse_envelope_send(send(days=["mon"], expires_at=TS + 2 * DAY))
+    t = parse_envelope_send(send(days=["mon"], refund_idle=2 * DAY))
     assert first_spend_point(t, TS) is None                  # Thursday + 2 days < Monday
-    t = parse_envelope_send(send(days=["mon"], expires_at=TS + 4 * DAY))
-    assert first_spend_point(t, TS) is None                  # it ends at Monday 00:00
-    t = parse_envelope_send(send(days=["mon"], expires_at=TS + 4 * DAY + 1))
+    t = parse_envelope_send(send(days=["mon"], refund_idle=4 * DAY))
+    assert first_spend_point(t, TS) is None                  # returned at Monday 00:00
+    t = parse_envelope_send(send(days=["mon"], refund_idle=4 * DAY + 1))
     assert first_spend_point(t, TS) == TS + 4 * DAY
 
 
@@ -177,8 +194,8 @@ def test_first_spend_point():
 
 def test_the_conditions_parse():
     t = parse_envelope_send(send(not_before=TS + 5, hold=7, days=["mon", "fri"],
-                                 hours=[0, 9, 23]))
-    assert (t.not_before, t.hold) == (TS + 5, 7)
+                                 hours=[0, 9, 23], refund_idle=60, at_end="refund"))
+    assert (t.not_before, t.hold, t.refund_idle, t.at_end) == (TS + 5, 7, 60, AT_END_REFUND)
     assert t.days == 0b10001 and t.hours == (1 | 1 << 9 | 1 << 23)
     assert t.caps == () and t.period == 0 and t.kind == KIND_SECONDS and t.extended
 
@@ -198,7 +215,9 @@ def test_the_conditions_parse():
     ({"hours": [True]}, "hours must be a list"),
     ({"hours": [9, 8]}, "increasing order"),
     ({"hold": -1}, "hold must be"),
+    ({"refund_idle": "60"}, "refund_idle must be"),
     ({"not_before": 2 ** 64}, "not_before must be"),
+    ({"at_end": "burn"}, "at_end must be one of"),
     ({"hours": [9], "utc_offset": 57}, "utc_offset must be a whole number of quarter hours"),
     ({"hours": [9], "utc_offset": -49}, "utc_offset must be"),
     ({"hours": [9], "utc_offset": 1.5}, "utc_offset must be"),
@@ -212,14 +231,14 @@ def test_malformed_conditions(over, why):
 
 
 def test_every_condition_changes_the_envelope_id():
-    base = parse_envelope_send(send(hold=5)).envelope_id
+    base = parse_envelope_send(send(at_end="refund")).envelope_id
     seen = {base}
     for over in ({"not_before": TS}, {"hold": 1}, {"days": ["mon"]}, {"hours": [1]},
-                 {"clock": "blocks", "expires_at": 900},
+                 {"refund_idle": 9}, {"clock": "blocks", "expires_at": 900},
                  {"days": ["tue"]}, {"hours": [2]}, {"hold": 2}, {"not_before": TS + 1},
                  {"hours": [1], "utc_offset": 8}, {"hours": [1], "utc_offset": -8},
                  {"days": ["mon"], "utc_offset": 8}):
-        eid = parse_envelope_send(send(**{"hold": 5, **over})).envelope_id
+        eid = parse_envelope_send(send(at_end="refund", **over)).envelope_id
         assert eid not in seen, over
         seen.add(eid)
 
@@ -294,10 +313,11 @@ def test_a_time_conditioned_envelope_keeps_its_id_signature_and_root():
 
 @pytest.mark.parametrize("field, value", [
     ("clock", "blocks"), ("not_before", TS + 1), ("hold", 61), ("days", ["tue"]),
-    ("hours", [10]), ("utc_offset", -8),
+    ("hours", [10]), ("refund_idle", 61), ("at_end", "release"), ("utc_offset", -8),
 ])
 def test_every_condition_is_signed_and_cannot_be_stripped(field, value):
-    tx = send(not_before=TS, hold=60, days=["mon"], hours=[9], utc_offset=8)
+    tx = send(not_before=TS, hold=60, days=["mon"], hours=[9], refund_idle=60,
+              at_end="refund", utc_offset=8)
     signed = signing_message_bytes(tx)
     assert signing_message_bytes({**tx, field: value}) != signed
     assert signing_message_bytes({k: v for k, v in tx.items() if k != field}) != signed
@@ -305,14 +325,15 @@ def test_every_condition_is_signed_and_cannot_be_stripped(field, value):
 
 # --- the book -------------------------------------------------------------------------------
 
-def test_the_due_index_holds_the_end_of_each_envelope(book):
-    t = _opened(book, hold=HOUR, expires_at=TS + DAY)
-    assert book.due_points() == {t.envelope_id.hex(): (KIND_SECONDS, TS + DAY)}
-    assert not book.has_due(0, TS + DAY - 1) and book.has_due(0, TS + DAY)
-    book.record_spend(t.envelope_id, 10, NEXT_HEIGHT, TS + 2 * HOUR)
-    assert book.state_of(t.envelope_id).last_clock == TS + 2 * HOUR
-    assert book.due_points() == {t.envelope_id.hex(): (KIND_SECONDS, TS + DAY)}
-    assert book.end_due(0, TS + DAY) == [(t, 990, OUTCOME_ENDED)]
+def test_a_spend_moves_the_idle_point_in_the_due_index(book):
+    t = _opened(book, refund_idle=HOUR, expires_at=TS + DAY)
+    assert book.due_points() == {t.envelope_id.hex(): (KIND_SECONDS, TS + HOUR)}
+    assert not book.has_due(0, TS + HOUR - 1) and book.has_due(0, TS + HOUR)
+    book.record_spend(t.envelope_id, 10, NEXT_HEIGHT, TS + 50 * 60)
+    assert book.state_of(t.envelope_id).last_clock == TS + 50 * 60
+    assert book.due_points() == {t.envelope_id.hex(): (KIND_SECONDS, TS + 110 * 60)}
+    assert not book.has_due(0, TS + HOUR)
+    assert book.end_due(0, TS + 110 * 60) == [(t, 990, OUTCOME_REFUNDED_IDLE)]
     assert book.is_empty() is False and book.escrow_total() == 0
 
 
@@ -335,7 +356,8 @@ def test_a_spending_limit_envelope_keeps_no_last_clock(book):
     ({"days": ["fri"], "utc_offset": -22}, 0, TS,
      f"fri UTC-05:30\\); the next window opens at {TS + DAY + 5 * HOUR + 1800} "
      "\\(Fri 2026-01-02 05:30 UTC, Fri 00:00 UTC-05:30\\)"),
-    ({"hold": 60, "expires_at": TS + HOUR}, 0, TS + HOUR, "reached its end$"),
+    ({"refund_idle": HOUR}, 0, TS + HOUR, "unused for 3600 seconds"),
+    ({"at_end": "refund", "expires_at": TS + HOUR}, 0, TS + HOUR, "reached its end$"),
 ])
 def test_check_spend_reasons(book, over, height, ts, why):
     t = _opened(book, **over)
@@ -344,9 +366,9 @@ def test_check_spend_reasons(book, over, height, ts, why):
 
 
 def test_the_order_of_refusals(book):
-    """The end, then lock, then window, then what it holds, then the cap."""
+    """Due point, then lock, then window, then what it holds, then the cap."""
     t = _opened(book, caps=[5], clock=None, period_seconds=DAY, hold=HOUR, days=["fri"],
-                amount=20)
+                refund_idle=10 * DAY, amount=20)
     sp = EnvelopeSpend(B, t.envelope_id, C, 21)
     with pytest.raises(EnvelopeRefused, match="locked"):
         book.check_spend(sp, 0, TS + 1)
@@ -369,20 +391,24 @@ def test_the_periods_of_a_held_envelope_start_at_the_unlock(book):
 
 
 def test_describe_tells_a_wallet_what_it_may_do(book):
-    t = _opened(book, hold=HOUR, days=["mon", "tue", "wed", "thu", "fri"], hours=[9, 10])
+    t = _opened(book, hold=HOUR, days=["mon", "tue", "wed", "thu", "fri"], hours=[9, 10],
+                refund_idle=3 * DAY, at_end="refund")
     s = book.state_of(t.envelope_id)
     locked = describe(t, s, height=1, ts=TS + 60)
     assert locked["status"] == "locked" and locked["locked"] is True
     assert locked["spendable_now"] is False and locked["next_window"] == TS + 9 * HOUR
-    assert (locked["unlocks_at"], locked["expires_at"]) == (TS + HOUR, TS + 10 * DAY)
-    assert (locked["days"], locked["hours"]) == (["mon", "tue", "wed", "thu", "fri"], [9, 10])
+    assert (locked["unlocks_at"], locked["idle_refund_at"], locked["due_at"]) == \
+        (TS + HOUR, TS + HOUR + 3 * DAY, TS + HOUR + 3 * DAY)
+    assert locked["due_outcome"] == "refunded_idle"
+    assert (locked["days"], locked["hours"], locked["at_end"]) == \
+        (["mon", "tue", "wed", "thu", "fri"], [9, 10], "refund")
     assert locked["caps"] == [] and locked["period"] is None and locked["clock"] == "seconds"
     open_now = describe(t, s, height=1, ts=TS + 9 * HOUR + 5)
     assert open_now["status"] == "open" and open_now["spendable_now"] is True
     closed_hour = describe(t, s, height=1, ts=TS + 12 * HOUR)
     assert closed_hour["in_window"] is False and closed_hour["next_window"] == \
         TS + DAY + 9 * HOUR
-    ended = describe(t, s, height=1, ts=TS + 10 * DAY)
+    ended = describe(t, s, height=1, ts=TS + 5 * DAY)
     assert ended["status"] == "ended" and ended["next_window"] is None
     assert (locked["utc_offset"], locked["windows_read_at"]) == (None, "UTC")
     there = _opened(book, sequence_number=2, hours=[9, 10], utc_offset=-14)
@@ -403,11 +429,11 @@ def _row(terms, anchor, remaining, spends=0, last_clock=0, period_index=0, spent
 
 
 def test_restore_a_conditioned_envelope():
-    t = parse_envelope_send(send(hold=HOUR, days=["fri"]))
+    t = parse_envelope_send(send(hold=HOUR, refund_idle=DAY, at_end="refund"))
     restored = EnvelopeBook.restore([_row(t, TS + HOUR, 900, spends=1,
                                           last_clock=TS + 2 * HOUR)], 0, bytes(32))
     assert restored.get(t.envelope_id) == t
-    assert restored.due_points()[t.envelope_id.hex()] == (KIND_SECONDS, TS + 10 * DAY)
+    assert restored.due_points()[t.envelope_id.hex()] == (KIND_SECONDS, TS + 2 * HOUR + DAY)
 
 
 def test_restore_keeps_the_offset():
@@ -421,7 +447,7 @@ def test_restore_keeps_the_offset():
 
 
 def test_restore_refuses_impossible_conditioned_rows():
-    t = parse_envelope_send(send(hold=HOUR))
+    t = parse_envelope_send(send(hold=HOUR, refund_idle=DAY, at_end="refund"))
     with pytest.raises(ValueError, match="inconsistent"):           # a clock, no spend
         EnvelopeBook.restore([_row(t, TS + HOUR, 1000, last_clock=TS + 9)], 0, bytes(32))
     with pytest.raises(ValueError, match="inconsistent"):           # spent before unlock
@@ -442,10 +468,6 @@ def test_restore_refuses_impossible_conditioned_rows():
     with pytest.raises(ValueError, match="inconsistent"):           # a clock on a 01 row
         EnvelopeBook.restore([_row(limit, TS, 990, spends=1, last_clock=TS + 5, spent=10)],
                              0, bytes(32))
-    for free in ((None, HOUR, 0, 0, DAY, 0, 0), (None, HOUR, 0, 0, None, 1, 0)):
-        row = _row(t, TS + HOUR, 1000)
-        with pytest.raises(ValueError, match="does not know"):      # a free place filled
-            EnvelopeBook.restore([row[:16] + (free,) + row[17:]], 0, bytes(32))
     assert ALL_HOURS == (1 << 24) - 1
 
 
@@ -468,7 +490,8 @@ def _seed():
     lm.recompute_approval_threshold()
     chain_state._lifecycle_manager = lm
     book = lm.envelopes
-    first = _opened(book, hold=HOUR, days=["thu", "fri"], hours=[1, 2], utc_offset=4)
+    first = _opened(book, hold=HOUR, refund_idle=DAY, days=["thu", "fri"], hours=[1, 2],
+                    at_end="refund", utc_offset=4)
     book.record_spend(first.envelope_id, 250, NEXT_HEIGHT, TS + HOUR + 60)
     _opened(book, sequence_number=2, caps=[50], clock=None, period_blocks=10,
             expires_at=NEXT_HEIGHT + 50)
@@ -498,12 +521,11 @@ def test_the_conditioned_book_round_trips(temp_database):
 
 @pytest.mark.usefixtures("isolated_chain_state")
 @pytest.mark.parametrize("column, value", [
-    ("conditions_json", "[null, 7200, 24, 6, null, 0, 4]"),
-    ("conditions_json", "[null, 3600, 24, 6, 86400, 0, 4]"),    # a free place filled
-    ("conditions_json", "[null, 3600, 24, 6, null, 1, 4]"),     # the other one
-    ("conditions_json", "[null, 3600, 24, 6, null, 0, -4]"),    # the offset turned round
-    ("conditions_json", "[null, 3600, 24, 6, null, 0, 0]"),     # the offset removed
-    ("conditions_json", "[null, 3600, 24, 6, null, 0]"),        # a field short
+    ("conditions_json", "[null, 7200, 24, 6, 86400, 1, 4]"),
+    ("conditions_json", "[null, 3600, 24, 6, 86400, 0, 4]"),
+    ("conditions_json", "[null, 3600, 24, 6, 86400, 1, -4]"),   # the offset turned round
+    ("conditions_json", "[null, 3600, 24, 6, 86400, 1, 0]"),    # the offset removed
+    ("conditions_json", "[null, 3600, 24, 6, 86400, 1]"),       # a field short
     ("conditions_json", "not json"),
     ("conditions_json", ""),
     ("last_clock", 5),
@@ -524,9 +546,9 @@ def test_a_tampered_conditioned_row_refuses_to_load(temp_database, column, value
 def test_the_miner_hint_reads_due_points(temp_database):
     lm, first = _seed()
     chain_state.commit_state_to_db("head-hash", 60)
-    end = TS + 10 * DAY
-    assert db.has_due_envelopes(NEXT_HEIGHT, end - 1) is False
-    assert db.has_due_envelopes(NEXT_HEIGHT, end) is True
+    idle = TS + HOUR + 60 + DAY
+    assert db.has_due_envelopes(NEXT_HEIGHT, idle - 1) is False
+    assert db.has_due_envelopes(NEXT_HEIGHT, idle) is True
     assert db.has_due_envelopes(NEXT_HEIGHT + 50, TS) is True     # the block-clock end
 
 
@@ -582,19 +604,20 @@ def test_the_miner_wakes_an_idle_chain_for_envelopes(monkeypatch):
 # --- admission ------------------------------------------------------------------------------
 
 def test_a_conditioned_send_is_admitted_with_its_unlock(tip_view):
-    result = validate_envelope_send_payload(send(hold=HOUR), tip_view)
+    result = validate_envelope_send_payload(send(hold=HOUR, at_end="refund"), tip_view)
     assert result.is_valid, result.error
     assert (result.data["unlocks_at"], result.data["status"]) == (TS + HOUR, "locked")
+    assert result.data["due_outcome"] == "refunded"
 
 
 @pytest.mark.parametrize("over, code", [
     ({"hold": 11 * DAY}, "ENVELOPE_NEVER_SPENDABLE"),
     ({"days": ["sun"], "expires_at": TS + DAY}, "ENVELOPE_NEVER_SPENDABLE"),
     ({"clock": "blocks", "days": ["sun"], "expires_at": NEXT_HEIGHT + 9}, "INVALID_ENVELOPE"),
-    ({}, "INVALID_ENVELOPE"),                                # no condition at all
+    ({"at_end": None}, "INVALID_ENVELOPE"),
     ({"days": ["sundays"]}, "INVALID_ENVELOPE"),
     ({"hold": HOUR, "utc_offset": 8}, "INVALID_ENVELOPE"),
-    ({"clock": "blocks", "utc_offset": 8, "expires_at": NEXT_HEIGHT + 9, "hold": 2},
+    ({"clock": "blocks", "utc_offset": 8, "expires_at": NEXT_HEIGHT + 9, "at_end": "refund"},
      "INVALID_ENVELOPE"),
     ({"hours": [9], "utc_offset": 99}, "INVALID_ENVELOPE"),
     # Noon at UTC+05:45 opens 06:15 UTC, after this envelope's end at 06:00 UTC.
@@ -607,24 +630,75 @@ def test_conditioned_send_refusals_carry_a_code(tip_view, over, code):
 def test_spend_admission_codes(tip_view, book):
     locked = _opened(book, hold=HOUR).envelope_id.hex()
     weekend = _opened(book, sequence_number=2, days=["sat"]).envelope_id.hex()
-    over = _opened(book, sequence_number=3, hold=1, expires_at=TS, ts=TS - 60).envelope_id.hex()
+    idle = _opened(book, sequence_number=3, refund_idle=60, ts=TS - 60).envelope_id.hex()
     assert validate_envelope_spend_payload(spend(locked), tip_view).code == "ENVELOPE_LOCKED"
     assert validate_envelope_spend_payload(spend(weekend), tip_view).code == \
         "ENVELOPE_OUTSIDE_WINDOW"
-    assert validate_envelope_spend_payload(spend(over), tip_view).code == "ENVELOPE_ENDED"
+    assert validate_envelope_spend_payload(spend(idle), tip_view).code == "ENVELOPE_ENDED"
     tip_view.next_block_timestamp = TS + 2 * DAY
     assert validate_envelope_spend_payload(spend(weekend), tip_view).is_valid
 
 
 # --- reads, routes, gossip ------------------------------------------------------------------
 
+def test_refunds_are_an_unrouted_credit_class():
+    assert "envelope_refund" in UNROUTED_CLASSES and "envelope_refund" not in ROUTED_CLASSES
+
+
 def test_the_capability_report_names_every_condition():
     sem = getenvelope.semantics()
-    assert sem["version"] == 2
+    assert sem["version"] == 3
     assert sem["conditions"] == ["spending_limit", "not_before", "hold", "days", "hours",
-                                 "utc_offset"]
-    for word in ("120 s", "UTC", "quarter hours east of UTC", "no daylight saving"):
+                                 "utc_offset", "refund_idle", "at_end"]
+    for word in ("120 s", "UTC", "never through a route", "a tie is the end",
+                 "quarter hours east of UTC", "no daylight saving"):
         assert word in json.dumps(sem), word
+
+
+@pytest.fixture
+def container():
+    return types.SimpleNamespace(db=db, chain_state=chain_state)
+
+
+@pytest.mark.usefixtures("isolated_chain_state")
+def test_getenvelope_and_gettxstatus_tell_a_refund(temp_database, container, monkeypatch):
+    t = parse_envelope_send(send(at_end="refund"))
+    eid = t.envelope_id.hex()
+    db.record_envelope_events("h1", 10, [
+        {"outcome": "sent", "envelope_id": eid, "sender_pubkey": A, "recipient_pubkey": B,
+         "amount": 1000, "tx_id": "t1"}])
+    db.record_envelope_events("h2", 11, [
+        {"outcome": "refunded", "envelope_id": eid, "sender_pubkey": A,
+         "recipient_pubkey": B, "paid_out": 1000, "paid_to": "sender"}])
+    monkeypatch.setattr(db, "get_canonical_envelope_events",
+                        _canonical(db.get_canonical_envelope_events))
+    monkeypatch.setattr(db, "get_canonical_envelope_events_for_tx",
+                        lambda tx, bh: [{"outcome": "sent", "envelope_id": eid,
+                                         "sender_pubkey": A, "recipient_pubkey": B,
+                                         "amount": 1000, "tx_id": "t1"}])
+    monkeypatch.setattr(getenvelope, "tip", lambda: ("h2", EnvelopeBook(), 12, TS))
+    out = json.loads(getenvelope.execute(f"getenvelope {eid}", container))["data"]
+    assert out["open"] is False and out["closed"] == "refunded"
+    assert out["history"][0]["paid_to"] == "sender"
+    status = gettxstatus._envelope_fields(db, "t1", "h1")
+    assert status["envelopes"][0]["status"] == "refunded"
+
+
+def _canonical(real):
+    def wrapped(**kw):
+        rows = []
+        with db._db_lock:
+            for r in db._db_conn.execute(
+                    "SELECT envelope_id, sender_pubkey, recipient_pubkey, block_hash, "
+                    "block_number, event_index, outcome, detail_json FROM envelope_events "
+                    "ORDER BY block_number DESC, event_index DESC").fetchall():
+                if kw.get("envelope_id") in (None, r[0]):
+                    rows.append({"envelope_id": r[0], "sender_pubkey": r[1],
+                                 "recipient_pubkey": r[2], "block_hash": r[3],
+                                 "block_number": r[4], "outcome": r[6],
+                                 **json.loads(r[7])})
+        return rows[:kw["limit"]] if kw.get("limit") else rows
+    return wrapped
 
 
 def test_gossip_takes_a_send_without_caps_when_it_names_its_clock():
@@ -644,11 +718,12 @@ def test_the_cli_builder_makes_what_the_node_parses():
     tx = build_envelope_send_tx(
         sender_pubkey=A, sequence_number=4, expiration_time=FAR, expire_at_height=60,
         recipient_pubkey=B, amount=100, expires_at=TS + DAY, clock="seconds",
-        hold=6 * HOUR, days=["Friday", "mon"], hours=[10, 9, 9])
+        hold=6 * HOUR, days=["Friday", "mon"], hours=[10, 9, 9], refund_idle=HOUR,
+        at_end="refund")
     assert tx["days"] == ["mon", "fri"] and tx["hours"] == [9, 10]
     assert "caps" not in tx and "recurring" not in tx
     t = parse_envelope_send(tx)
-    assert t.hold == 6 * HOUR
+    assert (t.hold, t.refund_idle, t.at_end) == (6 * HOUR, HOUR, AT_END_REFUND)
     assert "utc_offset" not in tx and t.utc_offset == 0
     there = build_envelope_send_tx(
         sender_pubkey=A, sequence_number=4, expiration_time=FAR, expire_at_height=60,
@@ -667,8 +742,9 @@ def test_the_cli_builder_makes_what_the_node_parses():
                 recipient_pubkey=B, amount=100, expires_at=TS + 9 * DAY, clock="seconds", **bad)
     plain = build_envelope_send_tx(
         sender_pubkey=A, sequence_number=4, expiration_time=FAR, expire_at_height=60,
-        recipient_pubkey=B, amount=100, expires_at=900, caps=[10], period_blocks=5)
-    assert "clock" not in plain
+        recipient_pubkey=B, amount=100, expires_at=900, caps=[10], period_blocks=5,
+        at_end="release")
+    assert "at_end" not in plain and "clock" not in plain
     with pytest.raises(ValueError, match="needs clock"):
         build_envelope_send_tx(sender_pubkey=A, sequence_number=4, expiration_time=FAR,
                                expire_at_height=60, recipient_pubkey=B, amount=100,
@@ -706,14 +782,15 @@ def test_the_cli_send_a_day_hold_and_one_clock():
 
     parser = build_parser()
     args = parser.parse_args(["envelope", "send", "--key", "k", "--to", B, "--amount", "100",
-                              "--hold", "6h", "--ends-at", "2026-01-02"])
+                              "--hold", "6h", "--ends-at", "2026-01-02", "--at-end",
+                              "refund"])
     terms = _envelope_terms(args, tip=10, now=TS)
-    assert (terms["clock"], terms["hold"], terms["expires_at"]) == \
-        ("seconds", 6 * HOUR, TS + DAY)
+    assert (terms["clock"], terms["hold"], terms["expires_at"], terms["at_end"]) == \
+        ("seconds", 6 * HOUR, TS + DAY, "refund")
     args = parser.parse_args(["envelope", "send", "--key", "k", "--to", B, "--amount", "9",
                               "--cap", "500", "--period", "7d", "--recurring",
                               "--not-before", "2026-12-01", "--days", "mon-fri",
-                              "--hours", "9-17", "--ends-in", "52w"])
+                              "--hours", "9-17", "--refund-idle", "30d", "--ends-in", "52w"])
     terms = _envelope_terms(args, tip=10, now=TS)
     assert terms["caps"] == [500] and terms["period_seconds"] == 7 * DAY
     assert terms["days"] == ["mon", "tue", "wed", "thu", "fri"] and len(terms["hours"]) == 8
@@ -723,9 +800,11 @@ def test_the_cli_send_a_day_hold_and_one_clock():
                               "+05:45", "--ends-in", "52w"])
     assert _envelope_terms(args, tip=10, now=TS)["utc_offset"] == 23
     args = parser.parse_args(["envelope", "send", "--key", "k", "--to", B, "--amount", "9",
-                              "--hold-blocks", "6", "--ends-in-blocks", "100"])
+                              "--hold-blocks", "6", "--refund-idle-blocks", "20",
+                              "--ends-in-blocks", "100"])
     terms = _envelope_terms(args, tip=10, now=TS)
-    assert (terms["clock"], terms["hold"], terms["expires_at"]) == ("blocks", 6, 111)
+    assert (terms["clock"], terms["hold"], terms["refund_idle"], terms["expires_at"]) == \
+        ("blocks", 6, 20, 111)
     for argv, why in [
         (["--hold", "6h", "--ends-in-blocks", "100"], "--hold"),
         (["--days", "mon", "--ends-in-blocks", "100"], "--days"),

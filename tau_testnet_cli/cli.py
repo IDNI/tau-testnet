@@ -3022,7 +3022,7 @@ def cmd_route_show(args: argparse.Namespace) -> int:
     return _simple_query(args, f"getreceiveroute {address}")
 
 
-# --- Envelopes (spending limits, time conditions) --------------------------------
+# --- Envelopes (spending limits, time conditions, refunds) ------------------------
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
 
@@ -3127,10 +3127,10 @@ def _utc_offset(text: str) -> int:
     return quarters
 
 
-_TIME_FLAGS = ("period", "ends_in", "ends_at", "not_before", "hold", "days", "hours",
-               "utc_offset")
+_TIME_FLAGS = ("period", "ends_in", "ends_at", "not_before", "hold", "refund_idle",
+               "days", "hours", "utc_offset")
 _BLOCK_FLAGS = ("period_blocks", "ends_in_blocks", "ends_at_height", "not_before_height",
-                "hold_blocks")
+                "hold_blocks", "refund_idle_blocks")
 
 
 def _flag(name: str) -> str:
@@ -3158,18 +3158,20 @@ def _envelope_terms(args, tip: int, now: int) -> dict:
         end = (int(args.ends_at_height) if args.ends_at_height is not None
                else tip + 1 + int(args.ends_in_blocks))
         out = {"expires_at": end, "not_before": args.not_before_height,
-               "hold": args.hold_blocks}
+               "hold": args.hold_blocks, "refund_idle": args.refund_idle_blocks}
         out.update({"caps": caps, "period_blocks": period} if caps else {"clock": "blocks"})
     else:
         end = int(args.ends_at) if args.ends_at is not None else now + int(args.ends_in)
         out = {"expires_at": end, "not_before": args.not_before, "hold": args.hold,
-               "days": args.days, "hours": args.hours, "utc_offset": args.utc_offset}
+               "refund_idle": args.refund_idle, "days": args.days, "hours": args.hours,
+               "utc_offset": args.utc_offset}
         if args.utc_offset is not None and not (args.days or args.hours):
             raise _PayloadError("--utc-offset says where --days and --hours are read; "
                                 "give one of them")
         out.update({"caps": caps, "period_seconds": period} if caps
                    else {"clock": "seconds"})
     out["recurring"] = bool(args.recurring)
+    out["at_end"] = args.at_end
     return out
 
 
@@ -3246,11 +3248,11 @@ def cmd_envelope_list(args: argparse.Namespace) -> int:
 
 def _add_envelope_subparsers(sub) -> None:
     """`tau-testnet envelope ...` -- send money someone may spend only under your
-    conditions: so fast, not before, on these days."""
+    conditions: so fast, not before, on these days, or it comes back."""
     p_env = sub.add_parser(
         "envelope",
         parents=[_GLOBAL_PARENT],
-        help="Envelopes: money with conditions: limits, locks, windows "
+        help="Envelopes: money with conditions: limits, locks, windows, refunds "
              "(send, spend, release, show, list)",
     )
     esub = p_env.add_subparsers(dest="envelope_command", required=True)
@@ -3307,6 +3309,9 @@ def _add_envelope_subparsers(sub) -> None:
     ends.add_argument("--ends-in-blocks", type=_block_count, metavar="N",
                       help="End this many blocks after the next one (block clock)")
     ends.add_argument("--ends-at-height", type=int, metavar="HEIGHT")
+    p_send.add_argument("--at-end", choices=["release", "refund"], default=None,
+                        help="What happens to the rest at the end: release (default) gives "
+                             "it to the recipient, refund sends it back to you")
     lock = p_send.add_argument_group("time conditions")
     lock.add_argument("--not-before", type=_utc_time, metavar="TIME",
                       help="No spend before this time (unix seconds or 2026-12-01, UTC)")
@@ -3325,6 +3330,12 @@ def _add_envelope_subparsers(sub) -> None:
     lock.add_argument("--utc-offset", type=_utc_offset, metavar="OFFSET",
                       help="Read --days and --hours at this fixed offset from UTC: "
                            "+02:00, -03:30 (steps of 15 minutes; no daylight saving)")
+    refund = p_send.add_argument_group("refunds")
+    refund.add_argument("--refund-idle", type=_duration_seconds, metavar="DURATION",
+                        help="Unused this long (from the unlock, then from each spend), "
+                             "the rest comes back to you")
+    refund.add_argument("--refund-idle-blocks", type=_block_count, metavar="N",
+                        help="The same, in blocks")
     _tx_flags(p_send)
     p_send.set_defaults(func=cmd_envelope_send)
 

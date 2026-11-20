@@ -1150,6 +1150,8 @@ def build_envelope_send_tx(
     hold: int | None = None,
     days: list | None = None,
     hours: list | None = None,
+    refund_idle: int | None = None,
+    at_end: str | None = None,
     utc_offset: int | None = None,
     fee_limit: str | int = "0",
 ) -> dict:
@@ -1160,9 +1162,10 @@ def build_envelope_send_tx(
     a spending limit (``caps[n]`` in period n, ``recurring`` repeats the last
     cap; exactly one period clock), ``not_before``, ``hold``, ``days`` and
     ``hours`` (seconds clock only; read at ``utc_offset``, quarter hours east
-    of UTC, UTC when left out). Without caps, ``clock`` names the clock.
-    Optional fields are left out when not given, so the signed bytes of a
-    spending-limit envelope do not change.
+    of UTC, UTC when left out), ``refund_idle``, and ``at_end``
+    (``"release"``, the default, or ``"refund"``). Without caps, ``clock`` names
+    the clock. Optional fields are left out when not given, so the signed bytes
+    of a spending-limit envelope do not change.
     """
     if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
         raise ValueError("recipient_pubkey must be a 96-character hex public key")
@@ -1211,6 +1214,12 @@ def build_envelope_send_tx(
         tx["days"] = [d for d in _DAY_ORDER if d in names]
     if hours:
         tx["hours"] = sorted({int(h) for h in hours})
+    if refund_idle is not None:
+        tx["refund_idle"] = int(refund_idle)
+    if at_end is not None and at_end != "release":
+        if at_end != "refund":
+            raise ValueError("at_end must be 'release' or 'refund'")
+        tx["at_end"] = "refund"
     if utc_offset:
         if not isinstance(utc_offset, int) or not -48 <= utc_offset <= 56:
             raise ValueError("utc_offset is in quarter hours east of UTC, -48..56")

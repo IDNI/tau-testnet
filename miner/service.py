@@ -39,7 +39,7 @@ class SoleMiner:
 
     def _due_wake_allowed(self) -> bool:
         """Empty mempool, but a retractable release, a standing payment or an
-        envelope's end is due and the throttle is open."""
+        envelope's end or refund is due and the throttle is open."""
         if time.time() - self._last_due_attempt < _DUE_WAKE_INTERVAL:
             return False
         head = db.get_canonical_head_block()

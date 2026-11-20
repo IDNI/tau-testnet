@@ -470,7 +470,7 @@ def test_the_capability_report():
     assert sem["supported"] is True and sem["version"] == 1
     assert sem["routed_credit_classes"] == list(ROUTED_CLASSES)
     assert set(sem["unrouted_credit_classes"]) == {
-        "retract_refund", "faucet_grant", "fee", "routed_share"}
+        "retract_refund", "envelope_refund", "faucet_grant", "fee", "routed_share"}
     assert sem["rounding"].startswith("routed = floor(gross * share_bps / 10000)")
     assert "no fee of its own" in sem["fees"]
     assert sem["share_bps_max"] == MAX_SHARE_BPS

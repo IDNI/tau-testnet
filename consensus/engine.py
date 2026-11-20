@@ -62,6 +62,7 @@ from .envelope import (
     EnvelopeRefused,
     EnvelopeShapeError,
     OUTCOME_NAMES as ENVELOPE_OUTCOME_NAMES,
+    REFUND_OUTCOMES as ENVELOPE_REFUND_OUTCOMES,
     TX_TYPE_ENVELOPE_SEND,
     TX_TYPE_ENVELOPE_SPEND,
     close_event as envelope_close_event,
@@ -331,7 +332,10 @@ def _end_envelopes(lm, balances, sequences, height, timestamp,
     """Close every envelope whose due point this block reached; their events.
 
     At its end an envelope pays the rest to its recipient, through the recipient's
-    receive route.
+    receive route, or, under `at_end refund`, back to its sender; unused for its
+    `refund_idle` it pays the rest back to its sender. A refund lands in the
+    sender's own balance and is never routed: it is the sender's money coming
+    back, not a payment to them.
     """
     book = _envelope_book(lm)
     if book is None or not book.has_due(int(height), int(timestamp)):
@@ -340,7 +344,9 @@ def _end_envelopes(lm, balances, sequences, height, timestamp,
     events: List[Dict[str, Any]] = []
     for terms, left, outcome in book.end_due(int(height), int(timestamp)):
         eid = terms.envelope_id.hex()
-        if left:
+        if left and outcome in ENVELOPE_REFUND_OUTCOMES:
+            credit(terms.sender_pubkey, left)
+        elif left:
             event = _routed_credit(lm, terms.recipient_pubkey, left, timestamp, credit,
                                    CREDIT_ENVELOPE_RELEASE, payer_pubkey=terms.sender_pubkey,
                                    envelope_id=eid)
@@ -1317,8 +1323,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp,
             route_events=route_block_events,
         )
-        # Envelopes that reached their end pay the rest to their recipients next,
-        # so, like a release, that money can fund a standing payment due now.
+        # Envelopes that reached their due point close next (the rest to the
+        # recipient at the end, or back to the sender for a refund), so, like a
+        # release, that money can fund a standing payment due now.
         envelopes_ended = _end_envelopes(
             lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp,
             route_events=route_block_events,

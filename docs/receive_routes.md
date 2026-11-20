@@ -88,6 +88,7 @@ of each credit is consensus-frozen and appears on every split:
 | `envelope_spend` | yes | A spend from an envelope, credited to its payee (see [envelopes.md](envelopes.md)). |
 | `envelope_release` | yes | What an envelope still holds, reaching its recipient at a release or at its end. |
 | `retract_refund` | no | A retracted transfer returning to its sender: the sender's own money. |
+| `envelope_refund` | no | What an envelope still holds, going back to its sender at an idle refund or an end with `at_end refund`: the sender's own money. |
 | `faucet_grant` | no | The grant of a new account. |
 | `fee` | no | A fee credited to the proposer or the fee beneficiary. |
 | `routed_share` | no | Money that arrives through another account's route. |

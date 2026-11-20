@@ -745,11 +745,11 @@ Semantics:
 
 **Upgrade.** The book root is folded into the consensus metadata as `receive_routes_root` only once the book has held a route, so **no regenesis** is needed. Nodes must upgrade before the first route is set.
 
-## Envelopes (spending limits, time conditions)
+## Envelopes (spending limits, time conditions, refunds)
 
 Long-form guide: [docs/envelopes.md](docs/envelopes.md).
 
-An `envelope_send` sends money with conditions written on it. The amount leaves the sender at once and waits in the envelope; the recipient spends it with `envelope_spend`, to anyone, as the conditions allow: at most a cap per period, not before its unlock, only on some weekdays or hours. Every node enforces the conditions at block apply.
+An `envelope_send` sends money with conditions written on it. The amount leaves the sender at once and waits in the envelope; the recipient spends it with `envelope_spend`, to anyone, as the conditions allow: at most a cap per period, not before its unlock, only on some UTC weekdays or hours. What is left may come back to the sender. Every node enforces the conditions at block apply.
 
 ```bash
 tau-testnet envelope send --key parent --to <child_pubkey> --amount 5200 \
@@ -757,33 +757,33 @@ tau-testnet envelope send --key parent --to <child_pubkey> --amount 5200 \
 tau-testnet envelope send --key client --to <contractor_pubkey> --amount 4000 \
     --cap 1000,500 --recurring --period 30d --ends-in 210d          # an advance, then 500 a month
 tau-testnet envelope send --key alice --to <bob_pubkey> --amount 100 \
-    --hold 6h --ends-at 2026-11-18                                  # nothing for 6 h; it ends at midnight UTC
+    --hold 6h --ends-at 2026-11-18 --at-end refund                  # nothing for 6 h; unspent by midnight UTC comes back
 tau-testnet envelope send --key alice --to <bob_pubkey> --amount 300 \
-    --days mon-fri --hours 11-14 --ends-in 90d                      # weekday lunches
+    --days mon-fri --hours 11-14 --refund-idle 14d --ends-in 90d    # weekday lunches; unused for two weeks comes back
 tau-testnet envelope spend --key child <envelope_id> --to <shop_pubkey> --amount 40
-tau-testnet envelope show <envelope_id>                            # unlock, windows, room this period, history
+tau-testnet envelope show <envelope_id>                            # unlock, windows, room this period, due point, history
 tau-testnet envelope list --key child --role in
 tau-testnet envelope release --key parent <envelope_id>            # the rest to the recipient now
 ```
 
 Semantics:
 
-- **One clock.** Each envelope reads every condition on one clock: block height or block timestamp (never a node's own clock). The period, `expires_at`, `not_before` and `hold` are all on it; weekdays and hours need the time clock and are read at the envelope's `utc_offset` (UTC when it has none).
+- **One clock.** Each envelope reads every condition on one clock: block height or block timestamp (never a node's own clock). The period, `expires_at`, `not_before`, `hold` and `refund_idle` are all on it; weekdays and hours need the time clock and are read at the envelope's `utc_offset` (UTC when it has none).
 - **Unlock.** `unlock = max(sent, not_before, sent + hold)`; no spend lands before it.
 - **Limit** (optional). Period `n = (clock - unlock) // period`. `cap(n) = caps[n]` (up to 12 caps), then `caps[-1]` when `recurring`, else no limit. A spend needs `spent in period n + amount <= cap(n)` and at most what the envelope holds. Nothing carries over.
 - **Windows** (optional). A spend lands only in a block whose weekday is in `days` and whose hour is in `hours`. Both are read at `utc_offset`, a fixed offset the sender signs in quarter hours east of UTC (-48 .. 56, `8` = UTC+02:00; left out = UTC; no daylight saving), so "weekdays 9 to 17" can be the sender's own.
-- **The end.** No spend lands at or after `expires_at`. At the end of the block reaching it, the rest goes to the recipient (`ended`). An envelope spent to zero closes (`emptied`).
+- **Due point.** `min(expires_at, idle)` with `idle = (last spend, or unlock) + refund_idle`; a tie goes to the end. At the end of the block reaching it, the rest goes back to the sender when the idle point came first (`refunded_idle`) or when `at_end` is `refund` (`refunded`), else to the recipient (`ended`). An envelope spent to zero closes (`emptied`).
 - **Who.** Only the recipient spends, to anyone (itself included). Only the sender releases the rest early, to the recipient; it can never take money back early. Nobody changes the conditions after the send.
-- **Never spendable.** A send that would unlock only at or after its end, or whose windows never open before its end, is refused (`ENVELOPE_NEVER_SPENDABLE`).
-- **Policy.** The send is judged by the sender's `o5` clause as "sender pays recipient amount"; each spend by the recipient's own `o5` clause as a transfer it signs. Both stamp the signer's cooldown clock.
-- **Fees.** Send and spend each pay one transfer fee, from the signer's own balance (a spend's payee is credited first, so a spend to oneself can pay its fee); release and the end are fee-free.
-- **Routes.** A spend's payee and the recipient at a release or the end receive through their receive routes (classes `envelope_spend`, `envelope_release`).
+- **Never spendable.** A send that would unlock only at or after its end, or whose windows never open before its first due point, is refused (`ENVELOPE_NEVER_SPENDABLE`).
+- **Policy.** The send is judged by the sender's `o5` clause as "sender pays recipient amount"; each spend by the recipient's own `o5` clause as a transfer it signs. Both stamp the signer's cooldown clock. A refund is the sender's own money coming back and passes no clause.
+- **Fees.** Send and spend each pay one transfer fee, from the signer's own balance (a spend's payee is credited first, so a spend to oneself can pay its fee); release, end and refunds are fee-free.
+- **Routes.** A spend's payee and the recipient at a release or the end receive through their receive routes (classes `envelope_spend`, `envelope_release`); a refund (`envelope_refund`) is never routed.
 - **One network.** All three types sign `genesis_hash`, like standing payments; one signed for another network is refused (`WRONG_NETWORK`).
-- **Caps.** 16 open per sender, 4096 in total; period up to 1,000,000 blocks or 366 days; end and `hold` up to 10,000,000 blocks or four years ahead.
-- **Reads.** `getenvelope <id>` (terms, `status` locked/open, `unlocks_at`, `in_window`, `next_window`, `cap_this_period`, `left_this_period`, `next_reset`, `history`, `semantics`), `getenvelopes <address> [in|out|all]` (with `held_in_envelopes`), `gettxstatus` (`envelopes`), `getaccountstate` (`envelopes_out`, `envelopes_in`), and `sendtx` / `checktx` (`envelope`: what it would hold or have left).
-- **Wake.** The miner wakes an idle chain for a due envelope, so its end does not wait for the next transaction.
+- **Caps.** 16 open per sender, 4096 in total; period up to 1,000,000 blocks or 366 days; end, `hold` and `refund_idle` up to 10,000,000 blocks or four years ahead.
+- **Reads.** `getenvelope <id>` (terms, `status` locked/open, `unlocks_at`, `in_window`, `next_window`, `due_at`, `due_outcome`, `cap_this_period`, `left_this_period`, `next_reset`, `history`, `semantics`), `getenvelopes <address> [in|out|all]` (with `held_in_envelopes`), `gettxstatus` (`envelopes`), `getaccountstate` (`envelopes_out`, `envelopes_in`), and `sendtx` / `checktx` (`envelope`: what it would hold or have left).
+- **Wake.** The miner wakes an idle chain for a due envelope, so an end or a refund does not wait for the next transaction.
 
-**Upgrade.** The book root is folded into the consensus metadata as `envelopes_root` only once the book has held an envelope, so **no regenesis** is needed. Time conditions are encoded only on envelopes that carry them: an envelope with only a spending limit keeps its id, signature bytes and book encoding. Nodes must upgrade before the first envelope with a time condition is sent.
+**Upgrade.** The book root is folded into the consensus metadata as `envelopes_root` only once the book has held an envelope, so **no regenesis** is needed. Time conditions and refunds are encoded only on envelopes that carry them: an envelope with only a spending limit keeps its id, signature bytes and book encoding. Nodes must upgrade before the first envelope with a time condition or refund is sent.
 
 ## Mempool policy
 

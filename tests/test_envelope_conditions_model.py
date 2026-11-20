@@ -1,5 +1,5 @@
 """Random block sequences: the node against a naive reference model (time
-conditions, with the spending limit).
+conditions and refunds, with the spending limit).
 
 The model knows nothing of the book's index, ids or commitments, and reads
 weekdays and hours with Python's own `datetime` at the envelope's offset from
@@ -8,27 +8,29 @@ documented rules directly:
 
   * a send needs what a spending-limit send needs (the limit now optional),
     at least one condition, windows only on the seconds clock and never every
-    day or every hour, hold within the lifetime limit, an unlock before the end,
-    and a second inside the windows between the unlock and the end (found by
-    walking the quarter hours, since an offset may be one); an offset only with
-    days or hours; the amount leaves the sender;
+    day or every hour, hold and refund_idle within the lifetime limit, an unlock
+    before the end, and a second inside the windows between the unlock and the
+    first due point (found by walking the quarter hours, since an offset may be
+    one); an offset only with days or hours; the amount leaves the sender;
   * unlock = max(sent, not_before, sent + hold); the limit's periods start there;
-  * a spend lands when the signer is the recipient, unlock <= clock < end,
+  * a spend lands when the signer is the recipient, unlock <= clock < due point,
     the block's weekday and hour at the envelope's offset are allowed, and the
     amount fits what the
     envelope holds and the period's cap; the payee is credited, the spender
     pays one fee;
-  * at the end of the block whose clock reaches the end the rest goes to the
-    recipient (ended).
+  * due point = min(end, (clock of the last spend, or the unlock) + refund_idle);
+    at the end of the block whose clock reaches it the rest goes back to the
+    sender when the idle point came strictly first (refunded_idle) or when the
+    end came and at_end is refund (refunded); otherwise to the recipient (ended).
 
 Hypothesis drives sends, spends, releases and plain payments through the REAL
-`apply_block` (signature checks stubbed), with the clocks aimed at unlocks,
-ends, period starts and window edges (and one tick before each). After every
+`apply_block` (signature checks stubbed), with the clocks aimed at unlocks, due
+points, period starts and window edges (and one tick before each). After every
 block the balances, the open envelopes and the block's events must equal the
 model's.
 
 The second half proves the model has teeth: each mutant breaks one rule of the
-time conditions in the node, and the same search must catch it.
+time conditions or refunds in the node, and the same search must catch it.
 """
 import datetime as dt
 import itertools
@@ -46,7 +48,10 @@ from consensus.envelope import (
     MAX_PERIOD_BLOCKS,
     MAX_PERIOD_SECONDS,
     OUTCOME_ENDED,
+    OUTCOME_REFUNDED,
+    OUTCOME_REFUNDED_IDLE,
     EnvelopeBook,
+    EnvelopeState,
     EnvelopeTerms,
     parse_envelope_send,
 )
@@ -92,8 +97,10 @@ class Model:
 
     @staticmethod
     def due(e):
-        """The clock at which the envelope closes on its own: its end."""
-        return e["end"]
+        if e["idle"] is None:
+            return e["end"]
+        base = e["last"] if e["last"] is not None else e["unlock"]
+        return min(e["end"], base + e["idle"])
 
     def room(self, e, now):
         if not e["caps"]:
@@ -107,7 +114,7 @@ class Model:
         return max(0, min(e["left"], cap - spent))
 
     def first_spend(self, e):
-        """Walk from the unlock to the end, quarter hour by quarter hour."""
+        """Walk from the unlock to the first due point, quarter hour by quarter hour."""
         due = self.due(e)
         if e["blocks"] or not (e["days"] or e["hours"]):
             return e["unlock"] if e["unlock"] < due else None
@@ -124,7 +131,8 @@ class Model:
                      else (MAX_PERIOD_SECONDS, MAX_LIFETIME_SECONDS))
         mx = tau_defs.MAX_TRANSFER_VALUE
         has_condition = bool(e["caps"] or e["not_before"] is not None or e["hold"] is not None
-                             or e["days"] or e["hours"])
+                             or e["days"] or e["hours"] or e["idle"] is not None
+                             or e["refund"])
         return (e["sender"] != e["recipient"] and 1 <= e["amount"] <= mx
                 and all(1 <= c <= mx for c in e["caps"])
                 and (not e["caps"] or 1 <= e["period"] <= top)
@@ -133,6 +141,7 @@ class Model:
                 and len(e["days"]) < 7 and len(e["hours"]) < 24
                 and (not e.get("offset") or bool(e["days"] or e["hours"]))
                 and (e["hold"] is None or 1 <= e["hold"] <= life)
+                and (e["idle"] is None or 1 <= e["idle"] <= life)
                 and now < e["end"] <= now + life
                 and e["unlock"] < e["end"]
                 and self.first_spend(e) is not None
@@ -154,8 +163,9 @@ class Model:
 
     def close(self, eid, outcome):
         e = self.open.pop(eid)
+        to = e["sender"] if outcome in ("refunded", "refunded_idle") else e["recipient"]
         if e["left"]:
-            self.bal[e["recipient"]] = self.bal.get(e["recipient"], 0) + e["left"]
+            self.bal[to] = self.bal.get(to, 0) + e["left"]
         self.outcomes.append((outcome, eid.hex(), e["left"] if outcome != "emptied" else 0))
 
     def end_of_block(self, height, ts):
@@ -163,7 +173,9 @@ class Model:
                                                     self.due(self.open[k]), k)):
             e = self.open[eid]
             if self.clock(e, height, ts) >= self.due(e):
-                self.close(eid, "ended")
+                idle_first = e["idle"] is not None and self.due(e) < e["end"]
+                self.close(eid, "refunded_idle" if idle_first
+                           else ("refunded" if e["refund"] else "ended"))
 
 
 # --- the program ---------------------------------------------------------------------
@@ -182,6 +194,8 @@ def _envelope(valid_only=False):
         "end": st.sampled_from(rare + [2, 6, 12, 30, 30, 72, 170]),
         "not_before": maybe(0, 1, 4, 40),
         "hold": maybe(*(rare + [1, 2, 6, 30])),
+        "idle": maybe(*(rare + [1, 3, 3, 5, 8, 24])),
+        "refund": st.booleans(),
         "days": st.sampled_from([(), (), ("sat", "sun"), ("mon", "tue", "wed", "thu", "fri"),
                                  ("thu",), ("fri", "sat"), DAYS]),
         "hours": st.sampled_from([(), (), (9, 10, 11, 12, 13, 14, 15, 16), (0, 1, 22, 23),
@@ -201,11 +215,13 @@ def _repair(spec):
     if not (spec["days"] or spec["hours"]):
         spec["offset"] = 0
     if not (spec["caps"] or spec["not_before"] is not None or spec["hold"] is not None
-            or spec["days"] or spec["hours"]):
-        spec["hold"] = 1
+            or spec["days"] or spec["hours"] or spec["idle"] is not None or spec["refund"]):
+        spec["refund"] = True
     lock = max(spec["not_before"] or 0, spec["hold"] or 0)
     if spec["days"] or spec["hours"]:
         spec["end"] = max(spec["end"], 170)
+        if spec["idle"] is not None:
+            spec["idle"] = max(spec["idle"], 170)
     spec["end"] = max(spec["end"], lock + 6)
     return spec
 
@@ -234,10 +250,12 @@ ACTION = st.one_of(
 )
 
 # Where the next block lands: a plain step, or aimed at (or one tick before) one
-# open envelope's unlock, end ("due"), period start or window edge, or halfway to
-# its end.
+# open envelope's unlock, due point, period start or window edge, or halfway to
+# its due point, or at the idle point as it stood before spends moved it. Due
+# points weigh most: every refund and every end is decided there.
 AIMS = ["unlock", "unlock", "unlock-1", "due", "due", "due-1", "due-1", "due-1", "halfway",
-        "halfway", "reset", "reset-1", "edge", "edge", "edge-1", "edge-1"]
+        "halfway", "reset", "reset-1", "edge", "edge", "edge-1", "edge-1", "first-idle",
+        "first-idle"]
 STEP = st.fixed_dictionaries({
     "gap": st.one_of(st.tuples(st.just("plain"), st.sampled_from([1, 1, 2, 5]),
                                st.sampled_from([60, HOUR, 5 * HOUR, DAY, 3 * DAY])),
@@ -277,6 +295,9 @@ def _points(e, now, ts, model):
     start = max(now, e["unlock"])
     if model.due(e) - start > 1:                   # the middle of the spendable time
         out["halfway"] = [start + (model.due(e) - start) // 2]
+    if e["idle"] is not None:
+        # The idle point as it stood before any spend moved it on.
+        out["first-idle"] = [e["unlock"] + e["idle"]]
     return out
 
 
@@ -320,6 +341,10 @@ def _fields(spec, height, ts):
         out["not_before"] = now + spec["not_before"] * unit
     if spec["hold"] is not None:
         out["hold"] = spec["hold"] * unit
+    if spec["idle"] is not None:
+        out["refund_idle"] = spec["idle"] * unit
+    if spec["refund"]:
+        out["at_end"] = "refund"
     if spec["days"]:
         out["days"] = [d for d in DAYS if d in spec["days"]]
     if spec["hours"]:
@@ -369,6 +394,7 @@ def check(program):
                          "blocks": spec["blocks"], "recurring": bool(fields.get("recurring")),
                          "period": terms.period, "end": terms.expires_at,
                          "not_before": fields.get("not_before"), "hold": fields.get("hold"),
+                         "idle": fields.get("refund_idle"), "refund": spec["refund"],
                          "days": set(fields.get("days", ())),
                          "hours": set(fields.get("hours", ())),
                          "offset": fields.get("utc_offset", 0),
@@ -403,6 +429,8 @@ def check(program):
                         e["spent"] = (e["spent"] if e["index"] == n else 0) + amount
                         e["index"] = n
                         e["left"] -= amount
+                        if e["idle"] is not None and now > e["unlock"]:
+                            event("a spend moved an idle point")
                         e["last"] = now
                         model.bal[to] = model.bal.get(to, 0) + amount
                         model.fee(signer, proposer)
@@ -470,6 +498,7 @@ def test_node_equals_the_reference_model(program):
 # --- the model has teeth ----------------------------------------------------------
 
 _check_spend = EnvelopeBook.check_spend
+_due_outcome = EnvelopeState.due_outcome
 _validate = envelope_mod.validate_send_shape
 _unlock = EnvelopeTerms.unlock_at
 
@@ -491,12 +520,34 @@ def _lock_one_short(self, spend, height, ts):
 
 
 def _due_included(self, spend, height, ts):
-    """A spend in the block that reaches the end still lands."""
+    """A spend in the block that reaches the due point still lands."""
     terms = self.open.get(spend.envelope_id)
     if terms is not None and \
             terms.clock(height, ts) == self.state[spend.envelope_id].due_point(terms):
         height, ts = height - 1, ts - 1
     return _check_spend(self, spend, height, ts)
+
+
+def _idle_from_unlock(self, terms):
+    if terms.refund_idle is None:
+        return None
+    return self.anchor + terms.refund_idle
+
+
+def _idle_wins_ties(self, terms):
+    idle = self.idle_point(terms)
+    if idle is not None and idle <= terms.expires_at:
+        return OUTCOME_REFUNDED_IDLE
+    return _due_outcome(self, terms)
+
+
+def _no_refund_at_end(self, terms):
+    outcome = _due_outcome(self, terms)
+    return OUTCOME_ENDED if outcome == OUTCOME_REFUNDED else outcome
+
+
+def _refunds_to_recipient(self, terms):
+    return OUTCOME_ENDED
 
 
 def _no_window_check(terms, height, ts):
@@ -509,8 +560,8 @@ MUTANTS = {
     "not_before ignored": lambda mp: mp.setattr(EnvelopeTerms, "unlock_at", _no_not_before),
     "the lock opens a tick early": lambda mp: mp.setattr(EnvelopeBook, "check_spend",
                                                          _lock_one_short),
-    "a spend lands on the end": lambda mp: mp.setattr(EnvelopeBook, "check_spend",
-                                                      _due_included),
+    "a spend lands on the due point": lambda mp: mp.setattr(EnvelopeBook, "check_spend",
+                                                            _due_included),
     "weeks start on Sunday": lambda mp: mp.setattr(
         envelope_mod, "weekday", lambda ts: (int(ts) // DAY + 4) % 7),
     "hours one off": lambda mp: mp.setattr(
@@ -520,6 +571,14 @@ MUTANTS = {
                                                    lambda self, ts: int(ts)),
     "the offset runs west": lambda mp: mp.setattr(
         EnvelopeTerms, "local", lambda self, ts: int(ts) - self.utc_offset * 900),
+    "the idle clock never restarts": lambda mp: mp.setattr(EnvelopeState, "idle_point",
+                                                           _idle_from_unlock),
+    "idle wins a tie with the end": lambda mp: mp.setattr(EnvelopeState, "due_outcome",
+                                                          _idle_wins_ties),
+    "at_end refund ignored": lambda mp: mp.setattr(EnvelopeState, "due_outcome",
+                                                   _no_refund_at_end),
+    "refunds go to the recipient": lambda mp: mp.setattr(EnvelopeState, "due_outcome",
+                                                         _refunds_to_recipient),
     "never-spendable sends accepted": lambda mp: mp.setattr(
         envelope_mod, "validate_send_shape", _no_window_check),
 }
@@ -530,44 +589,71 @@ MUTANTS = {
 # path can change when unrelated code changes).
 WITNESSES = {
     "hold ignored": [
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 7, "not_before": None, "hold": 1, "days": (), "hours": (), "offset": 0}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 7, "not_before": None, "hold": 1, "days": (), "hours": (), "offset": 0})]},
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, ALICE, {"blocks": False, "amount": 0, "caps": [], "period": 1, "recurring": False, "end": 0, "not_before": None, "hold": None, "days": (), "hours": (), "offset": 0}), ("spend", 0, "recipient", "self", "room")]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": True, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 7, "not_before": None, "hold": 1, "idle": 1, "refund": False, "days": (), "hours": ()})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, ALICE, {"blocks": False, "amount": 0, "caps": [], "period": 1, "recurring": False, "end": 0, "not_before": None, "hold": None, "idle": None, "refund": False, "days": (), "hours": ()})]},
     ],
     "not_before ignored": [
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 7, "not_before": None, "hold": 1, "days": (), "hours": (), "offset": 0}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 7, "not_before": None, "hold": 1, "days": (), "hours": (), "offset": 0})]},
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 2, "not_before": 4, "hold": None, "days": (), "hours": (), "offset": 0})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 7, "not_before": 1, "hold": None, "idle": 1, "refund": False, "days": (), "hours": ()})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, ALICE, {"blocks": False, "amount": 0, "caps": [], "period": 1, "recurring": False, "end": 0, "not_before": None, "hold": None, "idle": None, "refund": False, "days": (), "hours": ()})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "room")]},
+        {"gap": ("plain", 1, 3600), "proposer": PROPOSER, "actions": [("release", 0, "sender")]},
     ],
     "the lock opens a tick early": [
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": True, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 8, "not_before": None, "hold": 2, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "days": (), "hours": ()})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": True, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 8, "not_before": None, "hold": 2, "idle": None, "refund": False, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()})]},
         {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "room")]},
     ],
-    "a spend lands on the end": [
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": True, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 7, "not_before": None, "hold": 1, "days": (), "hours": (), "offset": 0}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 7, "not_before": None, "hold": 1, "days": (), "hours": (), "offset": 0})]},
-        {"gap": ("due-1", 0), "proposer": PROPOSER, "actions": [("pay", ALICE, ALICE, 5)]},
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "room")]},
+    "a spend lands on the due point": [
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"caps": [], "refund": False, "hours": (), "end": 6, "days": (), "not_before": None, "recurring": True, "idle": 1, "period": 1, "blocks": True, "hold": None, "amount": 333}), ("send", CAROL, DAVE, {"recurring": False, "days": ("fri", "sat"), "hours": (0, 1, 22, 23), "idle": None, "not_before": 0, "period": 1, "end": 170, "amount": 40, "hold": None, "refund": False, "blocks": False, "caps": []})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "other", "room")]},
     ],
     "weeks start on Sunday": [
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 170, "not_before": None, "hold": 30, "days": ("thu",), "hours": (9, 10, 11, 12, 13, 14, 15, 16)})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 170, "not_before": None, "hold": 30, "idle": None, "refund": False, "days": ("thu",), "hours": (9, 10, 11, 12, 13, 14, 15, 16)})]},
         {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "room")]},
     ],
     "the offset is ignored": [
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 170, "not_before": None, "hold": None, "days": (), "hours": (12,), "offset": 8}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "days": (), "hours": (), "offset": 0})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 170, "not_before": None, "hold": None, "idle": None, "refund": False, "days": (), "hours": (12,), "offset": 8}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": (), "offset": 0})]},
         {"gap": ("edge", 0), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "room")]},
     ],
     "the offset runs west": [
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 170, "not_before": None, "hold": None, "days": (), "hours": (12,), "offset": 23}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "days": (), "hours": (), "offset": 0})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 170, "not_before": None, "hold": None, "idle": None, "refund": False, "days": (), "hours": (12,), "offset": 23}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": (), "offset": 0})]},
         {"gap": ("edge", 0), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "room")]},
     ],
     "hours one off": [
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 170, "not_before": None, "hold": None, "days": (), "hours": (12,)}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "days": (), "hours": ()})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 170, "not_before": None, "hold": None, "idle": None, "refund": False, "days": (), "hours": (12,)}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()})]},
         {"gap": ("edge", 0), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "room")]},
     ],
     "windows ignored": [
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 170, "not_before": None, "hold": 30, "days": ("thu",), "hours": (9, 10, 11, 12, 13, 14, 15, 16)})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 170, "not_before": None, "hold": 30, "idle": None, "refund": False, "days": ("thu",), "hours": (9, 10, 11, 12, 13, 14, 15, 16)})]},
         {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "room")]},
     ],
+    "the idle clock never restarts": [
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 40, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": 1, "refund": False, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("release", 0, "recipient")]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "one")]},
+        {"gap": ("due-1", 0), "proposer": PROPOSER, "actions": [("send", ALICE, ALICE, {"blocks": False, "amount": 0, "caps": [], "period": 1, "recurring": False, "end": 0, "not_before": None, "hold": None, "idle": None, "refund": False, "days": (), "hours": ()})]},
+    ],
+    "idle wins a tie with the end": [
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 12, "not_before": 4, "hold": None, "idle": 8, "refund": False, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()})]},
+        {"gap": ("plain", 1, 86400), "proposer": PROPOSER, "actions": [("send", ALICE, ALICE, {"blocks": False, "amount": 0, "caps": [], "period": 1, "recurring": False, "end": 0, "not_before": None, "hold": None, "idle": None, "refund": False, "days": (), "hours": ()})]},
+    ],
+    "at_end refund ignored": [
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("release", 0, "sender")]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, ALICE, {"blocks": False, "amount": 0, "caps": [], "period": 1, "recurring": False, "end": 0, "not_before": None, "hold": None, "idle": None, "refund": False, "days": (), "hours": ()})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "room")]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("release", 0, "sender")]},
+        {"gap": ("plain", 1, 86400), "proposer": PROPOSER, "actions": [("release", 0, "sender")]},
+    ],
+    "refunds go to the recipient": [
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("release", 0, "sender")]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, ALICE, {"blocks": False, "amount": 0, "caps": [], "period": 1, "recurring": False, "end": 0, "not_before": None, "hold": None, "idle": None, "refund": False, "days": (), "hours": ()})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "room")]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("release", 0, "sender")]},
+        {"gap": ("plain", 1, 86400), "proposer": PROPOSER, "actions": [("release", 0, "sender")]},
+    ],
     "never-spendable sends accepted": [
-        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 170, "not_before": None, "hold": 30, "days": ("thu",), "hours": (9, 10, 11, 12, 13, 14, 15, 16)})]},
+        {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 6, "not_before": None, "hold": None, "idle": None, "refund": True, "days": (), "hours": ()}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [], "period": 1, "recurring": False, "end": 170, "not_before": None, "hold": 30, "idle": None, "refund": False, "days": ("thu",), "hours": (9, 10, 11, 12, 13, 14, 15, 16)})]},
         {"gap": ("plain", 1, 60), "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "room")]},
     ],
 }
@@ -589,4 +675,4 @@ def test_the_model_catches_a_broken_node(mutant, monkeypatch):
 
 
 def test_the_outcome_names_the_model_uses():
-    assert OUTCOME_ENDED == 3
+    assert (OUTCOME_ENDED, OUTCOME_REFUNDED, OUTCOME_REFUNDED_IDLE) == (3, 4, 5)

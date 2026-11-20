@@ -30,6 +30,7 @@ Routed, because each is a payment someone made to the account:
 Not routed, because none is a payment to the account:
 
     retract_refund       a retracted transfer's money returning to its sender
+    envelope_refund      what an envelope holds going back to its sender
     faucet_grant         the grant of a new account
     fee                  a fee credited to the proposer or fee beneficiary
     routed_share         money that arrives through another account's route
@@ -77,10 +78,12 @@ CREDIT_STANDING_PAYMENT = "standing_payment"
 CREDIT_PAYOUT = "payout"
 CREDIT_ENVELOPE_SPEND = "envelope_spend"
 CREDIT_ENVELOPE_RELEASE = "envelope_release"
+CREDIT_ENVELOPE_REFUND = "envelope_refund"
 ROUTED_CLASSES = (CREDIT_TRANSFER, CREDIT_APPROVED_TRANSFER, CREDIT_RETRACTABLE_RELEASE,
                   CREDIT_STANDING_PAYMENT, CREDIT_PAYOUT, CREDIT_ENVELOPE_SPEND,
                   CREDIT_ENVELOPE_RELEASE)
-UNROUTED_CLASSES = ("retract_refund", "faucet_grant", "fee", "routed_share")
+UNROUTED_CLASSES = ("retract_refund", CREDIT_ENVELOPE_REFUND, "faucet_grant", "fee",
+                    "routed_share")
 
 # Removals folded into the book's commitment.
 OUTCOME_REMOVED = 1

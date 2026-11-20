@@ -1,5 +1,5 @@
 """Envelopes: funds sent with spending conditions (spending limits, time
-conditions).
+conditions, refunds).
 
 Alice sends Bob money in an envelope with `envelope_send`. The money leaves
 Alice at once and waits in the envelope; it is Bob's to spend, under the
@@ -7,7 +7,9 @@ conditions Alice wrote on it. Bob spends with `envelope_spend`, naming the
 envelope, a payee (anyone, himself included) and an amount. Alice cannot take
 the money back early; she can only be more generous and release the rest to Bob
 at once with `envelope_release`. Every envelope ends: when its end is reached
-the rest goes to Bob, and an envelope spent to zero closes on its own.
+the rest goes to Bob, or back to Alice when she wrote `at_end refund` (or when
+Bob left it unused for `refund_idle`), and an envelope spent to zero closes on
+its own.
 
 THE SPENDING LIMIT (CONSENSUS-FROZEN)
 -------------------------------------
@@ -32,8 +34,8 @@ signs: his o5 clause on the same inputs (the money leaves the envelope, not his
 balance), the fee steps, and the fee paid from his own balance. Alice's send is
 judged as the transfer it is: her o5 clause sees "Alice pays Bob amount".
 
-TIME CONDITIONS (CONSENSUS-FROZEN)
-----------------------------------
+TIME CONDITIONS AND REFUNDS (CONSENSUS-FROZEN)
+----------------------------------------------
 An envelope may also carry, each optional, all judged on its one clock:
 
     not_before   no spend before this clock value
@@ -43,12 +45,18 @@ An envelope may also carry, each optional, all judged on its one clock:
     utc_offset   where days and hours are read: quarter hours east of UTC,
                  -48 .. 56 (UTC-12:00 .. UTC+14:00); left out = UTC. A fixed
                  offset: it does not follow daylight saving time
+    refund_idle  unused this long, the rest goes back to the sender
+    at_end       "release" (default): the rest goes to the recipient at the end
+                 "refund": the rest goes back to the sender at the end
 
     unlock       = max(sent, not_before, sent + hold); the limit's periods start here
+    idle point   = (clock of the last spend, or unlock) + refund_idle
+    due point    = min(expires_at, idle point); the earlier decides, a tie is the end
 
-A spend lands only at a clock c with unlock <= c < expires_at, inside the
-windows, within the limit. The block whose clock reaches the end closes the
-envelope after its transactions and pays the rest to the recipient.
+A spend lands only at a clock c with unlock <= c < due point, inside the
+windows, within the limit. The block whose clock reaches the due point closes
+the envelope after its transactions: a refund goes to the sender's own balance
+(never through a receive route), the end under "release" to the recipient.
 
 WHICH CLOCK
 -----------
@@ -59,7 +67,7 @@ exact and no proposer chooses it. Block time is chosen by the proposer: at least
 the parent's time, at most 120 s (MAX_BLOCK_FUTURE_DRIFT_SECONDS) past the
 clock of every node that validates the block. So a seconds condition can be
 reached up to 120 s early, and a proposer can hold time back (a lock opens late,
-a window stays open late), never run it backwards. Weekdays
+a window stays open late, a refund comes late), never run it backwards. Weekdays
 and hours need the seconds clock and are read at the envelope's fixed offset from
 UTC (utc_offset, UTC when left out). Clause-step clocks are never used.
 """
@@ -94,14 +102,24 @@ PERIOD_FIELDS = (("period_blocks", KIND_BLOCKS), ("period_seconds", KIND_SECONDS
 CLOCK_FIELDS = {"blocks": KIND_BLOCKS, "seconds": KIND_SECONDS}
 
 # Signed root fields of `envelope_send` beyond the spending limit, each optional.
-OPTIONAL_FIELDS = ("clock", "not_before", "hold", "days", "hours", "utc_offset")
+OPTIONAL_FIELDS = ("clock", "not_before", "hold", "days", "hours", "refund_idle", "at_end",
+                   "utc_offset")
 
 # How an envelope closed, folded into the book's commitment.
 OUTCOME_EMPTIED = 1      # spent to zero
 OUTCOME_RELEASED = 2     # the sender released the rest to the recipient
 OUTCOME_ENDED = 3        # its end was reached; the rest went to the recipient
+OUTCOME_REFUNDED = 4     # its end was reached; the rest went back to the sender
+OUTCOME_REFUNDED_IDLE = 5  # unused for refund_idle; the rest went back to the sender
 OUTCOME_NAMES = {OUTCOME_EMPTIED: "emptied", OUTCOME_RELEASED: "released",
-                 OUTCOME_ENDED: "ended"}
+                 OUTCOME_ENDED: "ended", OUTCOME_REFUNDED: "refunded",
+                 OUTCOME_REFUNDED_IDLE: "refunded_idle"}
+REFUND_OUTCOMES = frozenset({OUTCOME_REFUNDED, OUTCOME_REFUNDED_IDLE})
+
+# What happens to the rest at the end.
+AT_END_RELEASE = 0
+AT_END_REFUND = 1
+AT_END_NAMES = {AT_END_RELEASE: "release", AT_END_REFUND: "refund"}
 
 DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 ALL_DAYS = (1 << 7) - 1
@@ -174,8 +192,8 @@ class EnvelopeTerms:
     """What the sender signed. Immutable.
 
     `caps` is empty (and `period` 0) for an envelope without a spending limit.
-    The fields after `expires_at` are the time conditions; at their defaults the
-    envelope is exactly a spending-limit envelope, with the same id.
+    The fields after `expires_at` are the time conditions and refunds; at their
+    defaults the envelope is exactly a spending-limit envelope, with the same id.
     """
 
     sender_pubkey: str
@@ -191,15 +209,16 @@ class EnvelopeTerms:
     hold: Optional[int] = None
     days: int = 0                 # bit d = weekday d (0 = Monday); 0 = every day
     hours: int = 0                # bit h = hour h; 0 = every hour
+    refund_idle: Optional[int] = None
+    at_end: int = AT_END_RELEASE
     utc_offset: int = 0           # days and hours are read this many quarter hours east of UTC
 
     @property
     def conditions(self) -> Optional[Tuple]:
-        """The conditions beyond the limit as they are stored and hashed, None when
-        there are none. The fifth and sixth places are kept free for the refund
-        conditions of the next stage, so that stage changes no stored row and no id."""
-        c = (self.not_before, self.hold, self.days, self.hours, None, 0, self.utc_offset)
-        return None if c == (None, None, 0, 0, None, 0, 0) else c
+        """The conditions beyond the limit, None when there are none."""
+        c = (self.not_before, self.hold, self.days, self.hours, self.refund_idle,
+             self.at_end, self.utc_offset)
+        return None if c == (None, None, 0, 0, None, AT_END_RELEASE, 0) else c
 
     @property
     def extended(self) -> bool:
@@ -281,8 +300,7 @@ class EnvelopeState:
     spent_in_period: int = 0
     spends: int = 0
     last_height: int = 0         # height of the last spend, 0 = never
-    last_clock: int = 0          # clock of the last spend (extended envelopes), 0 = never;
-                                 # kept for the refund stage, which counts idle time from it
+    last_clock: int = 0          # clock of the last spend (extended envelopes), 0 = never
 
     def period_at(self, terms: EnvelopeTerms, clock: int) -> int:
         if not terms.limited:
@@ -306,9 +324,23 @@ class EnvelopeState:
             return None
         return self.anchor + (index + 1) * terms.period
 
+    def idle_point(self, terms: EnvelopeTerms) -> Optional[int]:
+        """The clock at which an unused envelope goes back to its sender."""
+        if terms.refund_idle is None:
+            return None
+        return (self.last_clock if self.spends else self.anchor) + terms.refund_idle
+
     def due_point(self, terms: EnvelopeTerms) -> int:
-        """The clock at which the envelope closes on its own: its end."""
-        return terms.expires_at
+        """The clock at which the envelope closes on its own."""
+        idle = self.idle_point(terms)
+        return terms.expires_at if idle is None else min(terms.expires_at, idle)
+
+    def due_outcome(self, terms: EnvelopeTerms) -> int:
+        """How it closes at its due point: the earlier point decides, a tie is the end."""
+        idle = self.idle_point(terms)
+        if idle is not None and idle < terms.expires_at:
+            return OUTCOME_REFUNDED_IDLE
+        return OUTCOME_REFUNDED if terms.at_end == AT_END_REFUND else OUTCOME_ENDED
 
 
 @dataclass(frozen=True)
@@ -428,6 +460,11 @@ def parse_envelope_send(tx: Dict[str, Any]) -> EnvelopeTerms:
             raise EnvelopeShapeError(
                 "an envelope without caps names its clock: blocks or seconds")
         kind, period, caps = CLOCK_FIELDS[clock], 0, []
+    at_end = tx.get("at_end")
+    if at_end is None:
+        at_end = AT_END_NAMES[AT_END_RELEASE]
+    if at_end not in AT_END_NAMES.values():
+        raise EnvelopeShapeError(f"at_end must be one of {sorted(AT_END_NAMES.values())}")
     return EnvelopeTerms(
         sender_pubkey=sender,
         sequence_number=_u64(tx, "sequence_number"),
@@ -442,6 +479,8 @@ def parse_envelope_send(tx: Dict[str, Any]) -> EnvelopeTerms:
         hold=_opt_u64(tx, "hold"),
         days=_days_mask(tx.get("days")),
         hours=_hours_mask(tx.get("hours")),
+        refund_idle=_opt_u64(tx, "refund_idle"),
+        at_end=AT_END_REFUND if at_end == AT_END_NAMES[AT_END_REFUND] else AT_END_RELEASE,
         utc_offset=_utc_offset(tx.get("utc_offset")),
     )
 
@@ -489,8 +528,8 @@ def terms_problem(terms: EnvelopeTerms) -> Optional[str]:
     elif terms.period or terms.recurring:
         return "a period needs caps"
     if not terms.caps and not terms.extended:
-        return ("an envelope needs at least one condition: caps, not_before, hold, days "
-                "or hours (else send a transfer)")
+        return ("an envelope needs at least one condition: caps, not_before, hold, days, "
+                "hours, refund_idle or at_end refund (else send a transfer)")
     if terms.windowed and terms.kind != KIND_SECONDS:
         return "days and hours need the seconds clock"
     if terms.days and not 0 < terms.days < ALL_DAYS:
@@ -503,13 +542,17 @@ def terms_problem(terms: EnvelopeTerms) -> Optional[str]:
         return "utc_offset needs days or hours (it says where they are read)"
     if terms.hold is not None and not 1 <= terms.hold <= life:
         return f"hold must be in 1..{life} {unit}"
+    if terms.refund_idle is not None and not 1 <= terms.refund_idle <= life:
+        return f"refund_idle must be in 1..{life} {unit}"
+    if terms.at_end not in AT_END_NAMES:
+        return "at_end must be release or refund"
     return None
 
 
 def first_spend_point(terms: EnvelopeTerms, sent: int) -> Optional[int]:
     """The earliest clock a spend could land at, for an envelope sent at `sent`;
     None when no spend can ever land (it is locked or outside its windows until its
-    end)."""
+    first due point)."""
     unlock = terms.unlock_at(sent)
     due = EnvelopeState(anchor=unlock, remaining=terms.amount).due_point(terms)
     first = terms.next_window(unlock) if terms.windowed else unlock
@@ -558,7 +601,7 @@ class EnvelopeBook:
     def __init__(self) -> None:
         self.open: Dict[bytes, EnvelopeTerms] = {}
         self.state: Dict[bytes, EnvelopeState] = {}
-        # (due point, id) per clock, kept sorted. The due point is the end.
+        # (due point, id) per clock, kept sorted; a spend moves an idle point.
         self._due: Dict[int, List[Tuple[int, bytes]]] = {KIND_BLOCKS: [], KIND_SECONDS: []}
         self._per_sender: Dict[str, int] = {}
         self._escrow = 0
@@ -601,11 +644,11 @@ class EnvelopeBook:
                 raise ValueError("stored envelope has an unknown clock")
             extra: Dict[str, Any] = {}
             if conditions is not None:
-                not_before, hold, days, hours, free_a, free_b, utc_offset = conditions
-                if free_a is not None or free_b:
-                    raise ValueError("stored envelope has a condition this node does not know")
+                (not_before, hold, days, hours, refund_idle, at_end,
+                 utc_offset) = conditions
                 extra = dict(not_before=not_before, hold=hold, days=int(days or 0),
-                             hours=int(hours or 0), utc_offset=int(utc_offset or 0))
+                             hours=int(hours or 0), refund_idle=refund_idle,
+                             at_end=int(at_end or 0), utc_offset=int(utc_offset or 0))
             terms = EnvelopeTerms(sender, sequence, recipient, amount, tuple(caps), kind,
                                   period, bool(recurring), expires_at, **extra)
             eid = terms.envelope_id
@@ -616,7 +659,7 @@ class EnvelopeBook:
             if conditions is not None and not terms.extended:
                 raise ValueError(f"stored envelope has empty conditions: {eid.hex()}")
             if not all(v is None or (_is_int(v) and v >= 0) for v in (
-                    terms.not_before, terms.hold)) \
+                    terms.not_before, terms.hold, terms.refund_idle)) \
                     or terms_problem(terms) or not _is_int(period):
                 raise ValueError(f"stored envelope has impossible terms: {eid.hex()}")
             state = EnvelopeState(anchor, remaining, period_index, spent, spends,
@@ -726,8 +769,8 @@ class EnvelopeBook:
                    if t.recipient_pubkey == pubkey)
 
     def has_due(self, height: int, ts: int) -> bool:
-        """True when a block at this height and time closes an envelope (its end);
-        the miner wakes an idle chain for it."""
+        """True when a block at this height and time closes an envelope (its end or
+        its idle point); the miner wakes an idle chain for it."""
         h, t = self._due[KIND_BLOCKS], self._due[KIND_SECONDS]
         return bool((h and h[0][0] <= int(height)) or (t and t[0][0] <= int(ts)))
 
@@ -763,7 +806,7 @@ class EnvelopeBook:
                     ts: int) -> Tuple[EnvelopeTerms, EnvelopeState]:
         """The envelope and its state for this spend, or EnvelopeRefused.
 
-        Order: closed -> who -> end reached -> locked -> window -> holds -> limit.
+        Order: closed -> who -> due point reached -> locked -> window -> holds -> limit.
         """
         terms = self.open.get(spend.envelope_id)
         if terms is None:
@@ -773,6 +816,10 @@ class EnvelopeBook:
         state = self.state[spend.envelope_id]
         clock = terms.clock(height, ts)
         if clock >= state.due_point(terms):
+            if state.due_outcome(terms) == OUTCOME_REFUNDED_IDLE:
+                raise EnvelopeRefused(
+                    f"the envelope has reached its end: unused for {terms.refund_idle} "
+                    f"{KIND_NAMES[terms.kind]}, the rest goes back to its sender")
             raise EnvelopeRefused("the envelope has reached its end")
         if clock < state.anchor:
             raise EnvelopeRefused(
@@ -816,11 +863,13 @@ class EnvelopeBook:
         terms, state = self.open[eid], self.state[eid]
         clock = terms.clock(height, ts)
         index = state.period_at(terms, clock)
+        self._unindex(eid)
         state = replace(state, remaining=state.remaining - int(amount), period_index=index,
                         spent_in_period=state.spent_at(terms, clock) + int(amount),
                         spends=state.spends + 1, last_height=int(height),
                         last_clock=clock if terms.extended else 0)
         self.state[eid] = state
+        self._index(eid)
         self._escrow -= int(amount)
         self._root = None
         if state.remaining == 0:
@@ -834,13 +883,16 @@ class EnvelopeBook:
     def end_due(self, height: int, ts: int) -> List[Tuple[EnvelopeTerms, int, int]]:
         """Close every envelope whose due point this block reached, block clock
         first, then by (due point, id); (terms, what was left, outcome) for each.
-        The outcome is ENDED: the rest goes to the recipient."""
+        The outcome says where the rest goes: ENDED to the recipient, REFUNDED and
+        REFUNDED_IDLE back to the sender."""
         gone: List[Tuple[EnvelopeTerms, int, int]] = []
         for kind, clock in ((KIND_BLOCKS, int(height)), (KIND_SECONDS, int(ts))):
             rows = self._due[kind]
             while rows and rows[0][0] <= clock:
-                terms, left = self._close(rows[0][1], OUTCOME_ENDED)
-                gone.append((terms, left, OUTCOME_ENDED))
+                eid = rows[0][1]
+                outcome = self.state[eid].due_outcome(self.open[eid])
+                terms, left = self._close(eid, outcome)
+                gone.append((terms, left, outcome))
         return gone
 
 
@@ -880,6 +932,8 @@ def conditions_json(terms: EnvelopeTerms) -> Optional[Dict[str, Any]]:
         "hold": terms.hold,
         "days": day_names(terms.days) or None,
         "hours": hour_list(terms.hours) or None,
+        "refund_idle": terms.refund_idle,
+        "at_end": AT_END_NAMES[terms.at_end],
         "utc_offset": terms.utc_offset or None,
     }
 
@@ -888,6 +942,7 @@ def describe(terms: EnvelopeTerms, state: EnvelopeState, *, height: int = 0,
              ts: int = 0) -> Dict[str, Any]:
     """One open envelope as a wallet reads it."""
     clock = terms.clock(height, ts) if (height or ts) else None
+    due = state.due_point(terms)
     out: Dict[str, Any] = {
         "envelope_id": terms.envelope_id.hex(),
         "sender_pubkey": terms.sender_pubkey,
@@ -907,16 +962,21 @@ def describe(terms: EnvelopeTerms, state: EnvelopeState, *, height: int = 0,
         "hold": terms.hold,
         "days": day_names(terms.days) or None,
         "hours": hour_list(terms.hours) or None,
+        "refund_idle": terms.refund_idle,
+        "at_end": AT_END_NAMES[terms.at_end],
         "utc_offset": terms.utc_offset or None,
         "windows_read_at": offset_text(terms.utc_offset) if terms.windowed else None,
         "unlocks_at": state.anchor,
+        "idle_refund_at": state.idle_point(terms),
+        "due_at": due,
+        "due_outcome": OUTCOME_NAMES[state.due_outcome(terms)],
         "spends": state.spends,
         "last_height": state.last_height or None,
     }
     if clock is not None:
         index = state.period_at(terms, clock)
         cap = terms.cap_for(index)
-        ended = clock >= terms.expires_at
+        ended = clock >= due
         locked = clock < state.anchor
         in_window = (not terms.windowed) or terms.in_window(ts)
         left = state.left_at(terms, clock)
@@ -937,21 +997,23 @@ def describe(terms: EnvelopeTerms, state: EnvelopeState, *, height: int = 0,
 
 
 def close_event(terms: EnvelopeTerms, outcome: str, paid_out: int, **extra: Any) -> Dict[str, Any]:
+    refund = outcome in (OUTCOME_NAMES[OUTCOME_REFUNDED], OUTCOME_NAMES[OUTCOME_REFUNDED_IDLE])
     return {
         "outcome": outcome,
         "envelope_id": terms.envelope_id.hex(),
         "sender_pubkey": terms.sender_pubkey,
         "recipient_pubkey": terms.recipient_pubkey,
         "paid_out": int(paid_out),
+        "paid_to": "sender" if refund else "recipient",
         **{k: v for k, v in extra.items() if v is not None},
     }
 
 
 SEMANTICS: Dict[str, Any] = {
     "supported": True,
-    "version": 2,
+    "version": 3,
     "conditions": ["spending_limit", "not_before", "hold", "days", "hours",
-                   "utc_offset"],
+                   "utc_offset", "refund_idle", "at_end"],
     "spending_limit": "in period n = (clock - unlock) // period, at most cap(n) may be "
                       "spent: cap(n) = caps[n] while n < len(caps), then caps[-1] when "
                       "recurring, else no limit; nothing carries over. Optional",
@@ -966,23 +1028,30 @@ SEMANTICS: Dict[str, Any] = {
                "at utc_offset, a fixed offset in quarter hours east of UTC (-48..56, "
                "UTC when left out; no daylight saving); a spend lands only in a block "
                "whose time is in both",
+    "refunds": "refund_idle: unused that long (from the unlock, then from each spend) "
+               "the rest goes back to the sender. at_end refund: at expires_at the rest "
+               "goes back to the sender. The earlier point decides, a tie is the end. "
+               "A refund lands in the sender's own balance, never through a route",
     "never_spendable": "an envelope that could never be spent (it unlocks at or after "
-                       "its end, or no window opens before its end) is "
+                       "its end, or no window opens before its first due point) is "
                        "refused when sent",
     "who": "the sender sends and may release the rest early; only the recipient "
            "spends, to anyone (itself included); nobody else touches it. Nobody can "
            "change the conditions after the send",
     "end": "every envelope ends at expires_at (on its clock); the rest then goes to "
-           "the recipient. An envelope spent to zero closes on its own",
-    "order": "a spend is refused once the end is reached, before the unlock, "
+           "the recipient (at_end release, the default) or back to the sender (at_end "
+           "refund). An envelope spent to zero closes on its own",
+    "order": "a spend is refused once the due point is reached, before the unlock, "
              "outside the windows, above what the envelope holds, or above the cap",
     "policy": "a send is judged by the sender's o5 clause as a transfer to the "
               "recipient; a spend by the recipient's o5 clause as a transfer it signs; "
-              "the end is not judged again (the money left the sender at the send)",
+              "refunds and ends are not judged again (the money left the sender at "
+              "the send)",
     "fees": "send and spend pay the fee of a transfer, from the signer's own balance; "
-            "release and the end are fee-free",
+            "release, the end and refunds are fee-free",
     "routing": "a spend's payee and the recipient at release or end receive through "
-               "their receive routes (credit classes envelope_spend, envelope_release)",
+               "their receive routes (credit classes envelope_spend, envelope_release); "
+               "a refund (envelope_refund) is never routed",
     "limits": {
         "caps": MAX_CAPS,
         "open_per_sender": MAX_OPEN_ENVELOPES_PER_SENDER,

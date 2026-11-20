@@ -507,7 +507,7 @@ def test_the_sender_releases_the_rest_fee_free():
     oracle.released(eid, ALICE, BOB)
     oracle.check(ch)
     assert _events(ch) == [{"outcome": "released", "envelope_id": eid, "sender_pubkey": ALICE,
-                            "recipient_pubkey": BOB, "paid_out": 500,
+                            "recipient_pubkey": BOB, "paid_out": 500, "paid_to": "recipient",
                             "tx_id": rel["tx_id"]}]
     assert ALICE not in ch.lts or ch.lts[ALICE] == TS
 
@@ -544,7 +544,7 @@ def test_at_its_end_the_rest_goes_to_the_recipient():
     oracle.ended(eid, BOB)
     oracle.check(ch)
     assert _events(ch) == [{"outcome": "ended", "envelope_id": eid, "sender_pubkey": ALICE,
-                            "recipient_pubkey": BOB, "paid_out": 500}]
+                            "recipient_pubkey": BOB, "paid_out": 500, "paid_to": "recipient"}]
     count, _ = ch.lm.envelopes.resolved_state()
     assert count == 1
 

@@ -644,10 +644,9 @@ def init_db():
                     due_at           INTEGER NOT NULL DEFAULT 0
                 );
             ''')
-            # Time conditions (additive): an envelope without them stores '' and 0.
-            # `due_at` is the clock at which the envelope closes on its own (its end),
-            # a node-local hint for the miner's idle-chain wake; the book recomputes
-            # it on load.
+            # Time conditions and refunds (additive): an envelope without them stores
+            # '' and 0, and its due point is its end. `due_at` is a node-local hint for
+            # the miner's idle-chain wake; the book recomputes it on load.
             envelope_cols = {row[1] for row in conn.execute(
                 "PRAGMA table_info(envelopes_v1);").fetchall()}
             for column, decl in (("conditions_json", "TEXT NOT NULL DEFAULT ''"),
@@ -3341,8 +3340,8 @@ def load_envelope_state() -> tuple[List[tuple], int, bytes]:
 
 
 def has_due_envelopes(next_height: int, now: int) -> bool:
-    """True if an open envelope reaches its end at this height or time (its rest
-    is then paid out).
+    """True if an open envelope reaches its end or its idle point at this height
+    or time (its rest is then paid out or refunded).
 
     A hint for the miner thread, from persisted rows like has_due_retractables;
     the block builder re-checks against the book under the lock.

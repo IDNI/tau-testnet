@@ -1,4 +1,4 @@
-"""Block-apply semantics for envelope time conditions.
+"""Block-apply semantics for envelope time conditions and refunds.
 
 Every scenario runs through the real `apply_block` with a scripted interpreter
 and compares the FULL balance map, sequences and cooldown stamps against an
@@ -6,11 +6,16 @@ oracle that knows only the documented rules:
 
   * unlock = max(sent, not_before, sent + hold): no spend lands before it, and a
     spending limit's periods start there;
-  * days and hours (seconds clock, read at the envelope's offset from UTC): a
-    spend lands only in a block whose timestamp is on an allowed weekday and in
-    an allowed hour;
-  * no spend lands in the block that reaches the end; the rest then goes to the
-    recipient.
+  * days and hours (UTC, seconds clock): a spend lands only in a block whose
+    timestamp is on an allowed weekday and in an allowed hour;
+  * refund_idle: unused that long (counted from the unlock, then from each
+    spend) the rest goes back to the sender at the end of the block that
+    reaches the point;
+  * at_end refund: at expires_at the rest goes back to the sender; at_end
+    release (the default) gives it to the recipient; when the idle point and the
+    end fall together, the end decides;
+  * a refund lands in the sender's own balance, fee-free, never through a route;
+  * no spend lands in the block that reaches the due point.
 
 `apply_block` raises on any supply drift (balances + every escrow), so every
 block here is also a conservation check.
@@ -19,6 +24,8 @@ What the features promise, by test:
   locked until a date ............. test_not_before_on_the_time_clock
   locked for X after arrival ...... test_hold_on_the_block_clock, test_a_hold_moves_the_periods
   only on certain days ............ test_weekdays, test_hours_across_midnight
+  unspent goes back to the sender . test_a_day_hold_then_back_at_the_end_of_the_day,
+                                    test_refund_when_unused, the refund section
   which clock ..................... test_the_proposer_cannot_reach_a_height_early,
                                     test_a_seconds_condition_reads_the_block_timestamp
 """
@@ -27,7 +34,7 @@ import pytest
 from consensus.envelope import parse_envelope_send
 
 from tests.test_envelope_apply import (
-    EnvOracle, _accepted, _events, _reason, eid_of, env_release, env_spend,
+    DAVE, EnvOracle, _accepted, _events, _reason, eid_of, env_release, env_spend,
 )
 from tests.test_standing_apply import (
     ALICE, BOB, CAROL, FAR, HEIGHT, PROPOSER, SKS, TS, Chain, _logs, _sign,
@@ -51,7 +58,9 @@ def cond_tx(sender=ALICE, recipient=BOB, amount=600, seq=0, *, ends, fee_limit="
     return _sign(tx, SKS[sender])
 
 
-CondOracle = EnvOracle
+class CondOracle(EnvOracle):
+    def refunded(self, eid, sender):
+        self.bal[sender] += self.held.pop(eid)
 
 
 def _bal():
@@ -244,14 +253,14 @@ def test_the_proposer_cannot_reach_a_height_early():
     oracle.check(ch)
 
 
-# --- the end --------------------------------------------------------------------------
+# --- refunds --------------------------------------------------------------------------
 
-def test_a_day_hold_then_the_rest_is_his_at_the_end_of_the_day():
-    """100 to Bob; he cannot spend it for six hours; no spend lands in the block
-    that reaches the end, and what is left then is paid to him."""
+def test_a_day_hold_then_back_at_the_end_of_the_day():
+    """100 to Bob; he cannot spend it for six hours; what he has not spent by the
+    end of the day comes back to the sender on its own."""
     midnight = TS + DAY
     ch, oracle, eid = _open(cond_tx(amount=100, clock="seconds", hold=6 * HOUR,
-                                    ends=midnight), ts=TS + 9 * HOUR)
+                                    at_end="refund", ends=midnight), ts=TS + 9 * HOUR)
     early = env_spend(eid, 30, 0)
     result = ch.block([early], height=HEIGHT + 1, ts=TS + 14 * HOUR)
     assert f"locked until {TS + 15 * HOUR} (seconds, Thu 2026-01-01 15:00 UTC)" in _logs(result)
@@ -260,18 +269,135 @@ def test_a_day_hold_then_the_rest_is_his_at_the_end_of_the_day():
     late = env_spend(eid, 10, 1)
     result = ch.block([late], height=HEIGHT + 3, ts=midnight)
     assert "reached its end" in _logs(result)
+    oracle.refunded(eid, ALICE)
+    oracle.check(ch)
+    assert _events(ch) == [{"outcome": "refunded", "envelope_id": eid,
+                            "sender_pubkey": ALICE, "recipient_pubkey": BOB,
+                            "paid_out": 70, "paid_to": "sender"}]
+    assert ch.bal[ALICE] == 10_000 - 100 + 70
+
+
+def test_refund_at_the_end_with_nothing_spent_returns_everything():
+    ch, oracle, eid = _open(cond_tx(clock="blocks", at_end="refund", ends=HEIGHT + 5))
+    ch.block([], height=HEIGHT + 4)
+    assert ch.lm.envelopes.open_count() == 1
+    ch.block([], height=HEIGHT + 5)
+    oracle.refunded(eid, ALICE)
+    oracle.check(ch)
+    assert ch.bal[ALICE] == 10_000
+
+
+def test_refund_when_unused():
+    ch, oracle, eid = _open(cond_tx(clock="blocks", refund_idle=10, ends=HEIGHT + 100))
+    assert _state(ch, eid).idle_point(ch.lm.envelopes.get(bytes.fromhex(eid))) == HEIGHT + 10
+    ch.block([env_spend(eid, 50, 0)], height=HEIGHT + 9)
+    oracle.spent(eid, BOB, CAROL, 50)
+    # The spend moved the idle point to 9 + 10.
+    ch.block([], height=HEIGHT + 18)
+    assert ch.lm.envelopes.open_count() == 1
+    late = env_spend(eid, 50, 1)
+    result = ch.block([late], height=HEIGHT + 19)
+    assert "unused for 10 blocks" in _logs(result)
+    oracle.refunded(eid, ALICE)
+    oracle.check(ch)
+    assert _events(ch)[0]["outcome"] == "refunded_idle"
+
+
+def test_the_idle_clock_starts_at_the_unlock():
+    ch, oracle, eid = _open(cond_tx(clock="blocks", hold=20, refund_idle=5, ends=HEIGHT + 100))
+    early = env_spend(eid, 10, 0)
+    result = ch.block([early], height=HEIGHT + 19)
+    assert "locked until" in _logs(result)
+    # Unused from the unlock at 20 until 24: four blocks, under the five allowed.
+    ch.block([env_spend(eid, 10, 0)], height=HEIGHT + 24)
+    oracle.spent(eid, BOB, CAROL, 10)
+    ch.block([], height=HEIGHT + 29)
+    oracle.refunded(eid, ALICE)
+    oracle.check(ch)
+
+
+def test_idle_and_end_together_the_end_decides():
+    ch, oracle, eid = _open(cond_tx(clock="blocks", refund_idle=10, ends=HEIGHT + 10))
+    ch.block([], height=HEIGHT + 10)
     oracle.ended(eid, BOB)
     oracle.check(ch)
-    assert _events(ch) == [{"outcome": "ended", "envelope_id": eid,
-                            "sender_pubkey": ALICE, "recipient_pubkey": BOB,
-                            "paid_out": 70}]
-    assert ch.bal[ALICE] == 10_000 - 100
+    assert _events(ch)[0]["outcome"] == "ended"
 
 
-def test_the_sender_may_release_a_locked_envelope():
-    ch, oracle, eid = _open(cond_tx(clock="blocks", hold=20, ends=HEIGHT + 50))
+def test_a_block_past_both_points_takes_the_earlier():
+    ch, oracle, eid = _open(cond_tx(clock="seconds", refund_idle=HOUR, ends=TS + 3 * HOUR))
+    ch.block([], height=HEIGHT + 1, ts=TS + 5 * HOUR)
+    oracle.refunded(eid, ALICE)
+    oracle.check(ch)
+    assert _events(ch)[0]["outcome"] == "refunded_idle"
+
+
+def test_use_it_or_lose_it_but_the_end_goes_to_the_recipient():
+    ch, oracle, eid = _open(cond_tx(clock="blocks", refund_idle=10, ends=HEIGHT + 15))
+    ch.block([env_spend(eid, 1, 0)], height=HEIGHT + 8)
+    oracle.spent(eid, BOB, CAROL, 1)
+    ch.block([], height=HEIGHT + 15)
+    oracle.ended(eid, BOB)
+    oracle.check(ch)
+
+
+def test_the_sender_may_still_release_a_refund_envelope():
+    ch, oracle, eid = _open(cond_tx(clock="blocks", at_end="refund", ends=HEIGHT + 50))
     ch.block([env_release(eid, 1)], height=HEIGHT + 1)
     oracle.released(eid, ALICE, BOB)
+    oracle.check(ch)
+
+
+def test_a_refund_is_fee_free_even_with_fees_on():
+    ch, oracle, eid = _open(cond_tx(clock="blocks", at_end="refund", ends=HEIGHT + 3), fee=4)
+    ch.block([], height=HEIGHT + 3)
+    oracle.refunded(eid, ALICE)
+    oracle.check(ch)
+    assert ch.bal[ALICE] == 10_000 - 4
+
+
+def _route(owner, dest, share=2000, seq=0):
+    return _sign({"tx_id": f"cond-route-{next(_N)}", "tx_type": "receive_route_set",
+                  "sender_pubkey": owner, "sequence_number": seq, "expiration_time": FAR,
+                  "expire_at_height": 10_000, "fee_limit": "100",
+                  "destination_pubkey": dest, "share_bps": share}, SKS[owner])
+
+
+def test_a_refund_is_never_routed_but_a_release_at_the_end_is():
+    ch, oracle = Chain(_bal()), CondOracle(_bal())
+    refund = cond_tx(clock="blocks", at_end="refund", ends=HEIGHT + 5)
+    release = cond_tx(seq=1, amount=100, clock="blocks", hold=1, ends=HEIGHT + 5)
+    ch.block([refund, release, _route(ALICE, DAVE, seq=2), _route(BOB, DAVE)])
+    oracle.sent(refund)
+    oracle.sent(release)
+    oracle.seq[ALICE] += 1
+    oracle.seq[BOB] += 1
+    ch.block([], height=HEIGHT + 5)
+    routed = [(e["credit_class"], e["gross"], e["routed"])
+              for e in ch.last.next_snapshot.metadata["route_events"]
+              if e["outcome"] == "routed"]
+    assert routed == [("envelope_release", 100, 20)]
+    oracle.refunded(eid_of(refund), ALICE)
+    oracle.ended(eid_of(release), BOB)
+    oracle.bal[BOB] -= 20
+    oracle.bal[DAVE] += 20
+    oracle.check(ch)
+
+
+def test_refunds_and_ends_close_in_due_order_in_one_block():
+    ch, oracle = Chain(_bal()), CondOracle(_bal())
+    a = cond_tx(seq=0, amount=10, clock="blocks", at_end="refund", ends=HEIGHT + 7)
+    b = cond_tx(seq=1, amount=20, clock="blocks", refund_idle=3, ends=HEIGHT + 30)
+    c = cond_tx(seq=2, amount=30, clock="blocks", hold=2, ends=HEIGHT + 5)
+    ch.block([a, b, c])
+    for tx in (a, b, c):
+        oracle.sent(tx)
+    ch.block([], height=HEIGHT + 9)
+    assert [(e["outcome"], e["paid_out"]) for e in _events(ch)] == \
+        [("refunded_idle", 20), ("ended", 30), ("refunded", 10)]
+    oracle.refunded(eid_of(a), ALICE)
+    oracle.refunded(eid_of(b), ALICE)
+    oracle.ended(eid_of(c), BOB)
     oracle.check(ch)
 
 
@@ -282,10 +408,13 @@ def test_the_sender_may_release_a_locked_envelope():
     ({"clock": "blocks", "days": ["mon"]}, "need the seconds clock"),
     ({"clock": "blocks", "hours": [9]}, "need the seconds clock"),
     ({"clock": "blocks", "hold": 0}, "hold must be in"),
+    ({"clock": "blocks", "refund_idle": 0}, "refund_idle must be in"),
     ({"clock": "blocks", "hold": 50}, "it would unlock at"),
     ({"clock": "blocks", "not_before": HEIGHT + 50}, "it would unlock at"),
     ({"clock": "seconds", "days": ["sat"], "expires_at": TS + DAY}, "could never be spent"),
     ({"clock": "seconds", "hours": [23], "expires_at": TS + 20 * HOUR},
+     "could never be spent"),
+    ({"clock": "seconds", "hours": [5], "refund_idle": HOUR, "expires_at": TS + DAY},
      "could never be spent"),
     ({"clock": "seconds", "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]},
      "leave out at least one day"),
@@ -320,11 +449,11 @@ def test_replay_gives_the_same_state_hashes():
     def run(replay):
         ch = Chain(_bal(), fee=2)
         a = cond_tx(amount=300, caps=[100], period_blocks=10, recurring=True, hold=3,
-                    ends=HEIGHT + 40, fee_limit="2")
+                    refund_idle=8, at_end="refund", ends=HEIGHT + 40, fee_limit="2")
         b = cond_tx(seq=1, amount=50, clock="seconds", days=["fri", "sat"], hours=[9, 10],
-                    ends=TS + 6 * DAY, fee_limit="2")
+                    at_end="refund", ends=TS + 6 * DAY, fee_limit="2")
         c = cond_tx(seq=2, amount=20, clock="seconds", days=["sat"], hours=[14, 15],
-                    utc_offset=23, ends=TS + 6 * DAY, fee_limit="2")
+                    utc_offset=23, at_end="refund", ends=TS + 6 * DAY, fee_limit="2")
         ch.block([a, b, c], replay=replay)
         ea, eb, ec = eid_of(a), eid_of(b), eid_of(c)
         script = {HEIGHT + 3: [env_spend(ea, 60, 0, fee_limit="2")],
@@ -339,21 +468,22 @@ def test_replay_gives_the_same_state_hashes():
 
     first = run(False)
     assert first == run(True)
-    # Every spend landed and the rest of each reached Bob at its end; Alice paid
-    # three send fees.
-    assert first[1][ALICE] == 10_000 - 370 - 3 * 2
+    # Every spend landed, and all three came back in part: 200 of a (unused for 8
+    # blocks), 30 of b and 15 of c (at their end); Alice paid three send fees.
+    assert first[1][ALICE] == 10_000 - 370 - 3 * 2 + 200 + 30 + 15
 
 
-def test_the_book_wakes_an_idle_chain_for_ends():
-    ch, _, eid = _open(cond_tx(clock="blocks", hold=4, ends=HEIGHT + 20))
+def test_the_book_wakes_an_idle_chain_for_ends_and_idle_refunds():
+    ch, _, eid = _open(cond_tx(clock="blocks", refund_idle=4, ends=HEIGHT + 20))
     book = ch.lm.envelopes
-    assert not book.has_due(HEIGHT + 19, TS) and book.has_due(HEIGHT + 20, TS)
-    assert book.due_points() == {eid: (0, HEIGHT + 20)}
+    assert not book.has_due(HEIGHT + 3, TS) and book.has_due(HEIGHT + 4, TS)
+    assert book.due_points() == {eid: (0, HEIGHT + 4)}
 
 
 def test_a_spending_limit_envelope_keeps_its_id():
     """Without the new fields an envelope is exactly a spending-limit envelope."""
     plain = cond_tx(caps=[100], period_blocks=10, ends=HEIGHT + 100)
-    explicit = cond_tx(caps=[100], period_blocks=10, ends=HEIGHT + 100, clock="blocks")
+    explicit = cond_tx(caps=[100], period_blocks=10, ends=HEIGHT + 100, at_end="release",
+                       clock="blocks")
     assert parse_envelope_send(plain).envelope_id == parse_envelope_send(explicit).envelope_id
     assert not parse_envelope_send(plain).extended

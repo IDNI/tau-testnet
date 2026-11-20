@@ -186,13 +186,14 @@ def _route_fields(db, tx_hash: str, block_hash: str) -> dict:
     return {"receive_routes": out}
 
 
-_ENVELOPE_CLOSES = ("emptied", "released", "ended")
+_ENVELOPE_CLOSES = ("emptied", "released", "ended", "refunded", "refunded_idle")
 
 
 def _envelope_fields(db, tx_hash: str, block_hash: str) -> dict:
     """`envelopes`: what this transaction did to envelopes: sent one, spent from
     one, released one, or emptied one. A send also says whether the envelope is
-    still `open` or how it closed (emptied, released, ended)."""
+    still `open` or how it closed (emptied, released, ended, refunded,
+    refunded_idle)."""
     try:
         events = db.get_canonical_envelope_events_for_tx(tx_hash, block_hash)
     except Exception:
