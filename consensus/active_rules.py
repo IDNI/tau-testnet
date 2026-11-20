@@ -12,6 +12,13 @@ the ones that are). This module maintains the corrective view:
   sense -- `tau_manager.get_canonical_spec()`, the full-width text that is
   safe to persist and hash, never the interpreter's possibly shrunk
   `get_current_spec()`.
+* Under worker-backed authority (the production configuration) neither of
+  those is the running spec: the in-process interpreter is an advisory
+  mirror that is never fed application-rule revisions, and the persisted
+  `full_tau_spec` row is the append-only accumulation. There the snapshot
+  text comes from a dedicated interface fed from the committed journal --
+  the same record a reconstruction replays -- maintained by
+  `_authority_spec_text` below.
 * `getactiverules` serves those snapshots and, for an account, attributes
   the effective text's top-level statements by the `i12` guard each one
   carries. Displaced clauses are absent by construction: the source is the
@@ -25,7 +32,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
+import threading
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -63,6 +72,149 @@ def current_spec_revision() -> Optional[int]:
     return None
 
 
+# --- Snapshot source under worker-backed authority -------------------------
+#
+# Production runs the authoritative worker (server.py: authority is enabled
+# unless the mock configuration was requested). In that mode the two sources
+# above are both wrong as snapshot text: `tau_manager.get_canonical_spec()`
+# is the in-process advisory mirror, which is deliberately never fed
+# application-rule revisions (chain_state._sync_inprocess_consensus), and
+# the persisted `full_tau_spec` row is the append-only accumulation of
+# submitted units, displaced fragments included. The committed journal is
+# the codebase's own definition of the evaluator state -- it is what a
+# reconstruction replays -- so the view keeps a dedicated TauInterface (the
+# spec mirror) fed from the journal: REVISION rule texts in seq order, the
+# same consumption pattern _sync_inprocess_consensus uses for the advisory
+# mirror in non-authority mode. The mirror is passive: it evaluates nothing
+# for consensus, and its text depends only on the program file and the
+# committed journal, so a second node and a replay from block 0 produce the
+# same text and hash.
+#
+# The mirror tracks how many committed entries it has consumed, the
+# fingerprint (seq, kind, rule_text, link) of the last one, and the seq of
+# the RESET entry it was built on. A new RESET, a journal that shrank, or a
+# fingerprint mismatch (a discarded/rebuilt journal) forces a full rebuild,
+# so restarts and journal rebuilds self-heal; the first call after boot
+# replays the whole journal once, the same cost class as reconstruction at
+# startup. Any failure poisons the mirror and yields no text: a silently
+# diverged mirror is worse than a missing snapshot.
+
+_mirror_lock = threading.Lock()
+_mirror_iface = None
+_mirror_consumed = 0
+_mirror_fingerprint: Optional[Tuple] = None
+_mirror_reset_seq: Optional[int] = None
+
+
+def _authority_mode() -> bool:
+    """True when this node's evaluator is the authoritative worker."""
+    try:
+        import tau_authority
+
+        return bool(tau_authority.owner().enabled)
+    except Exception:
+        return False
+
+
+def reset_spec_mirror() -> None:
+    """Drop the snapshot spec mirror (tests; rebuilds self-heal anyway)."""
+    global _mirror_iface, _mirror_consumed, _mirror_fingerprint
+    global _mirror_reset_seq
+    with _mirror_lock:
+        _mirror_iface = None
+        _mirror_consumed = 0
+        _mirror_fingerprint = None
+        _mirror_reset_seq = None
+
+
+def _entry_fingerprint(entry) -> Tuple:
+    return (entry.seq, entry.kind, entry.rule_text, entry.link)
+
+
+def _new_mirror_iface():
+    import chain_state
+    import config
+    from tau_native import TauInterface
+
+    path = getattr(config, "TAU_PROGRAM_FILE", None) or "genesis.tau"
+    if not os.path.isabs(path):
+        path = os.path.join(
+            os.path.dirname(os.path.abspath(chain_state.__file__)), path)
+    return TauInterface(path)
+
+
+def _feed_mirror(iface, text: str) -> None:
+    iface.communicate(rule_text=text, target_output_stream_index=0)
+
+
+def _authority_spec_text() -> Optional[str]:
+    """The running spec under worker-backed authority, from the journal.
+
+    Returns None when the mirror cannot be built or fed; the caller then
+    stores no snapshot rather than serving a text that is not in force.
+    """
+    global _mirror_iface, _mirror_consumed, _mirror_fingerprint
+    global _mirror_reset_seq
+    import db
+    import tau_journal
+
+    with _mirror_lock:
+        try:
+            head_link, head_seq = db.committed_journal_head()
+            if _mirror_iface is not None and _mirror_fingerprint is not None \
+                    and (head_link, head_seq) == (
+                        _mirror_fingerprint[3], _mirror_fingerprint[0]):
+                # The committed journal has not grown since the mirror
+                # consumed it (the link chains the whole history, so an
+                # equal head means an equal journal).
+                return _mirror_iface.get_current_spec()
+            entries = tau_journal.journal_from_rows(
+                db.committed_journal_entries()).entries()
+            reset_idx = tau_journal.last_reset_index(entries)
+            reset_seq = entries[reset_idx].seq if reset_idx is not None \
+                else None
+            rebuild = (
+                _mirror_iface is None
+                or reset_seq != _mirror_reset_seq
+                or len(entries) < _mirror_consumed
+                or (_mirror_consumed > 0
+                    and _entry_fingerprint(entries[_mirror_consumed - 1])
+                    != _mirror_fingerprint)
+            )
+            if rebuild:
+                iface = _new_mirror_iface()
+                start = 0
+                if reset_idx is not None:
+                    for text, _persist in entries[reset_idx].units:
+                        if text:
+                            _feed_mirror(iface, text)
+                    start = reset_idx + 1
+                for entry in entries[start:]:
+                    if entry.kind == tau_journal.REVISION \
+                            and entry.rule_text:
+                        _feed_mirror(iface, entry.rule_text)
+                _mirror_iface = iface
+                _mirror_reset_seq = reset_seq
+            else:
+                for entry in entries[_mirror_consumed:]:
+                    if entry.kind == tau_journal.REVISION \
+                            and entry.rule_text:
+                        _feed_mirror(_mirror_iface, entry.rule_text)
+            _mirror_consumed = len(entries)
+            _mirror_fingerprint = _entry_fingerprint(entries[-1]) \
+                if entries else None
+            return _mirror_iface.get_current_spec()
+        except Exception:
+            logger.warning(
+                "active_rules: authority spec mirror failed; no snapshot "
+                "source this block", exc_info=True)
+            _mirror_iface = None
+            _mirror_consumed = 0
+            _mirror_fingerprint = None
+            _mirror_reset_seq = None
+            return None
+
+
 def record_snapshot_after_commit(height: int) -> Optional[Dict]:
     """Snapshot the canonical spec if spec_revision advanced. Best effort.
 
@@ -75,16 +227,25 @@ def record_snapshot_after_commit(height: int) -> Optional[Dict]:
         import db
         import tau_manager
 
-        text = tau_manager.get_canonical_spec()
-        if not text:
-            try:
-                import chain_state
+        if _authority_mode():
+            # Neither the advisory mirror's canonical text nor the
+            # persisted accumulation is the spec the engine runs here;
+            # the journal-fed mirror is. If it cannot speak, store
+            # nothing rather than serve a text that is not in force.
+            text = _authority_spec_text()
+            if not text:
+                return None
+        else:
+            text = tau_manager.get_canonical_spec()
+            if not text:
+                try:
+                    import chain_state
 
-                text = chain_state.get_persisted_full_tau_spec()
-            except Exception:
-                text = None
-        if not text:
-            return None
+                    text = chain_state.get_persisted_full_tau_spec()
+                except Exception:
+                    text = None
+            if not text:
+                return None
         revision = current_spec_revision()
         if revision is None:
             return None

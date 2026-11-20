@@ -513,6 +513,42 @@ def test_view_uses_canonical_full_width_text(temp_database, monkeypatch):
     assert active_rules.record_snapshot_after_commit(31) is None
 
 
+# --- Snapshot source selection under worker-backed authority --------------
+
+def test_snapshot_source_under_authority_uses_journal_mirror(
+        temp_database, monkeypatch):
+    """Production mode: the snapshot text comes from the journal-fed
+    mirror, NOT from tau_manager.get_canonical_spec() (the advisory
+    mirror, never fed application revisions) and NOT from the persisted
+    append-only accumulation."""
+    running = ("always ( o26[t]:bv[24] = { #x000003 }:bv[24] && "
+               "o27[t]:bv[24] = { #x000009 }:bv[24] ).")
+    monkeypatch.setattr(active_rules, "_authority_mode", lambda: True)
+    monkeypatch.setattr(active_rules, "_authority_spec_text",
+                        lambda: running)
+    monkeypatch.setattr(active_rules, "current_spec_revision", lambda: 3)
+    monkeypatch.setattr(tau_manager, "get_canonical_spec",
+                        lambda: "advisory-text-must-not-be-served")
+    stored = active_rules.record_snapshot_after_commit(12)
+    assert stored is not None
+    assert stored["spec_text"] == running
+    assert stored["spec_hash"] == active_rules.spec_hash_of(running)
+
+
+def test_snapshot_skipped_when_authority_mirror_cannot_speak(
+        temp_database, monkeypatch):
+    """Under authority, a silent mirror means NO snapshot: serving the
+    advisory mirror's text or the accumulation instead would publish
+    rules that are not in force."""
+    monkeypatch.setattr(active_rules, "_authority_mode", lambda: True)
+    monkeypatch.setattr(active_rules, "_authority_spec_text", lambda: None)
+    monkeypatch.setattr(active_rules, "current_spec_revision", lambda: 3)
+    monkeypatch.setattr(tau_manager, "get_canonical_spec",
+                        lambda: "advisory-text-must-not-be-served")
+    assert active_rules.record_snapshot_after_commit(12) is None
+    assert db.get_latest_spec_snapshot() is None
+
+
 # --- Account attribution ----------------------------------------------------
 
 def test_account_attribution_from_effective_text(temp_database):
