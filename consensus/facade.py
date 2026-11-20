@@ -479,3 +479,22 @@ class TipAdmissionView:
             "WHERE recipient_pubkey = ?",
             (pubkey,),
         )
+
+    # --- Programmable payments (Bounty 01) ---------------------------------
+    #
+    # The tip books, read from the canonical lifecycle manager -- the
+    # source block apply reads, so admission refuses what apply refuses
+    # (the approval_slots_active precedent). Apply mutates only a copy and
+    # publishes it by swapping the reference, so this read sees one tip.
+
+    def payment_books(self):
+        """The tip ProgrammablePayments, or None when unavailable."""
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        return getattr(lm, "programmable_payments", None)
+
+    def balance_of(self, pubkey: str) -> int:
+        """The tip balance of one account, as the engine's reads see it."""
+        try:
+            return int(chain_state.get_balance(pubkey))
+        except Exception:
+            return 0
