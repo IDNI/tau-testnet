@@ -69,3 +69,28 @@ For a new network, pass `--recipient-controls` to `scripts/gen_genesis.py` when 
 ```
 
 Activation is permanent. If governance activates the update at the end of block H, recipient controls apply to transactions starting in H+1. Older blocks replay under their original rules. Query `getgovernance` after activation before enabling the options in a wallet. A node running this release on an inactive chain refuses an attempted installation with `FEATURE_INACTIVE`.
+
+## Verify a payment from admission through settlement
+
+Use a fresh checkout with the test dependencies and native Tau binding installed. From its root, give the restore helper its genesis file, check that the binding loads and run the three native cases. The miner and importer create their own temporary databases and use disposable keys.
+
+```sh
+mkdir -p data
+if [ ! -f data/genesis.json ]; then
+  cp networks/tau-testnet-v2/genesis.json data/genesis.json
+fi
+TAU_FORCE_TEST=0 python -c 'import tau_native; tau_native.load_tau_module()' &&
+  TAU_FORCE_TEST=0 python -m pytest -q -p no:asyncio tests/test_recipient_controls_native.py
+```
+
+In the seven-block case, Alice, the shop and Carol each begin with 10,000 test units. The shop allows Alice and sets a four-block cap. Alice pays 55. Carol’s payment and an overlong park are refused. Alice then parks 40 within the cap. While another park is queued, the shop switches to instant-only. The queued park is refused at inclusion, and `gettxstatus` returns `RECIPIENT_MAX_HOLD` with the new zero cap. The earlier 40 settles under the terms accepted at park. Rechecking it against the new cap at release would let a receiver change the terms of an already accepted payment.
+
+The closing balances are Alice **9,885**, shop **10,075**, Carol **10,000** and validator **40**. Alice paid two fees of 10, one on the transfer and one on the accepted park. The shop paid two fees of 10 for its policy changes. The test reopens the miner’s state, then passes the public genesis and signed blocks to a separate process with a fresh database. That importer must reproduce the head, state hash, balances, sequences and stored policy. The test transfers blocks by file.
+
+| Issue and acceptance cases | What the tests check |
+| --- | --- |
+| [#47](https://github.com/IDNI/tau-testnet/issues/47), 1 and 4 | One signed update can install both directions. Alice can pay the shop, Carol is refused, and the shop’s own spending limit applies when it pays out. The native cases exercise the inbound clause with and without an explicit owner guard. [Directional checks](../tests/test_recipient_controls.py#L113) · [Native verdicts](../tests/test_recipient_controls_native.py#L23) |
+| #47, 2 and 3 | The ordinary send to an unrestricted recipient succeeds in the [directional checks](../tests/test_recipient_controls.py#L113). In a batch where the second recipient refuses, the error names output 2, the mempool stays empty and block application preserves the entire starting snapshot. [Atomic batch](../tests/test_recipient_controls.py#L140) |
+| [#76](https://github.com/IDNI/tau-testnet/issues/76), 1–3 and 5 | A zero cap admits a plain transfer and refuses both kinds of park. At a 600-second cap, 600 passes and 601 fails. A two-block cap is also inclusive. An account without a cap accepts a one-hour park. The refusal carries the configured limit. [Boundary cases](../tests/test_recipient_controls.py#L160) |
+| #76, 4 | A sender can still retract after the receiver tightens the cap. An unretracted park settles at its original release point. Both outcomes replay consistently. [Release and replay](../tests/test_recipient_controls.py#L194) · [Retraction through the wallet RPCs](../tests/test_recipient_controls.py#L332) |
+| #47, 5 and #76, 6 | Wallets discover activation through `getgovernance`. The activation survives restart and canonical replay. A cap-only rule is also refused by the older rule parser. [Activation and restart](../tests/test_recipient_activation.py#L39) · [Older parser](../tests/test_recipient_policy_format.py#L27) |
