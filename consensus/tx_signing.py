@@ -42,6 +42,11 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_ACCEPT,
     TX_TYPE_RULE_OFFER_REJECT,
 )
+from consensus.standing import (
+    TX_TYPE_STANDING_CANCEL,
+    TX_TYPE_STANDING_CREATE,
+    TX_TYPE_STANDING_EXECUTE,
+)
 
 def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
     """CONSENSUS-FROZEN. Canonical bytes over the signed fields of a transaction.
@@ -123,6 +128,26 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
+    elif tx_type == TX_TYPE_STANDING_CREATE:
+        # EVERY field that fixes the authorization's terms is signed: the
+        # authorization is applied later, over many blocks, by execute
+        # transactions the payer does not sign -- so a proposer who could
+        # rewrite the recipient, the amount or the end condition here
+        # would be redirecting future debits the payer never agreed to.
+        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
+        signing_dict["amount"] = payload.get("amount")
+        signing_dict["period_kind"] = payload.get("period_kind")
+        signing_dict["anchor_timestamp"] = payload.get("anchor_timestamp")
+        signing_dict["window_start_offset"] = payload.get("window_start_offset")
+        signing_dict["window_end_offset"] = payload.get("window_end_offset")
+        signing_dict["final_period"] = payload.get("final_period")
+        signing_dict["max_occurrences"] = payload.get("max_occurrences")
+        signing_dict["max_total"] = payload.get("max_total")
+        signing_dict["supersedes_id"] = payload.get("supersedes_id")
+    elif tx_type == TX_TYPE_STANDING_EXECUTE:
+        signing_dict["standing_id"] = payload.get("standing_id")
+    elif tx_type == TX_TYPE_STANDING_CANCEL:
+        signing_dict["standing_id"] = payload.get("standing_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 
