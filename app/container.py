@@ -14,7 +14,7 @@ import chain_state
 import config
 import db
 import tau_manager
-from commands import checktx, createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks, getallaccounts, gettaustate, getgovernance, getupdateid, getaccountstate, gettxstatus
+from commands import checktx, createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks, getallaccounts, gettaustate, getgovernance, getactiverules, getupdateid, getaccountstate, gettxstatus
 from commands import getofferid, getruleoffers, getruleoffer, getruleconflict
 from commands import (
     getapprovalpreview,
@@ -72,6 +72,7 @@ class ServiceContainer:
             "getallaccounts": getallaccounts,
             "gettaustate": gettaustate,
             "getgovernance": getgovernance,
+            "getactiverules": getactiverules,
             "getupdateid": getupdateid,
             "getofferid": getofferid,
             "getruleoffers": getruleoffers,
