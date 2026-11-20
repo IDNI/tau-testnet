@@ -90,7 +90,14 @@ MAX_CUSTOM_INPUT_STREAMS = 16
 # so recipient-aware and time-aware policy rules are deterministic across both and
 # are permitted. Fee/policy rules may scope on i12 (sender), i3/i4 (from/to), i5
 # (time) and i1 (amount). See tau_defs.py "DETERMINISM CONSTRAINT".
-APPLY_MOCKED_INPUT_STREAMS = ("i2",)
+APPLY_MOCKED_INPUT_STREAMS = ("i2", "i17")
+
+
+def _mocked_stream_label(stream: str) -> str:
+    """Human label for an apply-time-mocked input stream, for rejection text."""
+    if stream == tau_defs.TAU_INPUT_STREAM_HOLD_LENGTH:
+        return "hold length"
+    return "balance"
 
 
 def _strip_tau_comments(rule_text: str) -> str:
@@ -265,17 +272,30 @@ def screen_user_rule_text(
 
     # A balance-reading fee rule is quoted against the current head but charged
     # against the parent block, so the sender pays a different fee than quoted.
+    # A hold-length-reading fee rule is quoted against the next block but
+    # charged against the including block, for the same reason.
     mocked_in = _streams_referenced(rule_text, APPLY_MOCKED_INPUT_STREAMS)
     if mocked_in and _streams_referenced(rule_text, ("o8",)):
-        return UserRuleRejection(
-            f"user_tx FEE rule (o8) references input stream '{mocked_in[0]}' "
-            f"(balance): admission estimates it against the current head while "
-            f"apply uses the parent block, so the fee charged could differ from "
-            f"the estimate quoted to the sender. Balance-reading POLICY rules "
-            f"(o5) are permitted; for fees, tier on i1 instead.",
-            "fee_reads_balance",
-            "TX_REJECTED",
-        )
+        stream = mocked_in[0]
+        if stream == tau_defs.TAU_INPUT_STREAM_HOLD_LENGTH:
+            detail = (
+                f"user_tx FEE rule (o8) references input stream '{stream}' "
+                f"(hold length): admission estimates it against the next block "
+                f"while apply uses the including block, so the fee charged could "
+                f"differ from the estimate quoted to the sender. Hold-reading "
+                f"POLICY rules (o5) are permitted; for fees, tier on i1 instead."
+            )
+            reason = "fee_reads_hold_length"
+        else:
+            detail = (
+                f"user_tx FEE rule (o8) references input stream '{stream}' "
+                f"(balance): admission estimates it against the current head while "
+                f"apply uses the parent block, so the fee charged could differ from "
+                f"the estimate quoted to the sender. Balance-reading POLICY rules "
+                f"(o5) are permitted; for fees, tier on i1 instead."
+            )
+            reason = "fee_reads_balance"
+        return UserRuleRejection(detail, reason, "TX_REJECTED")
 
     # i12 stays readable, since that is how a rule scopes itself. A plain rule is
     # not a registered clause, so typing a reserved input pins its width process-wide.
@@ -453,7 +473,7 @@ def precheck_scheduled_update(update: Any, active_validators: Optional[Any] = No
             return {
                 "status": "fail",
                 "error": (f"revision references apply-time-mocked input stream "
-                          f"'{mocked_in[0]}' (balance)"),
+                          f"'{mocked_in[0]}' ({_mocked_stream_label(mocked_in[0])})"),
             }
 
     return {"status": "ok", "error": None}
@@ -753,17 +773,18 @@ def stage_and_validate_consensus_revisions(
                 logger.warning(f"Revision potentially shadowing {stream_idx}")
 
     # HARD-reject any revision that reads an apply-time-mocked input stream.
-    # Only i2 (balance) is mocked to "0" at block apply. A consensus fee rule (o9)
-    # reading it would compute a different fee at admission than at inclusion — the
-    # same divergence footgun the user o8 screen rejects. i3/i4/i5 are real at both
+    # i2 (balance) is mocked to "0" at block apply and i17 (hold length) is
+    # advisory at admission; a consensus fee rule (o9) reading either would
+    # compute a different fee at admission than at inclusion -- the same
+    # divergence footgun the user o8 screen rejects. i3/i4/i5 are real at both
     # points. Comment-stripped, word-boundary matched.
     for rev in revisions:
         mocked_in = _streams_referenced(rev, APPLY_MOCKED_INPUT_STREAMS)
         if mocked_in:
             return format_error(
                 f"Consensus revision references apply-time-mocked input stream "
-                f"'{mocked_in[0]}' (balance): a fee rule reading i2 diverges between "
-                f"admission and block apply."
+                f"'{mocked_in[0]}' ({_mocked_stream_label(mocked_in[0])}): a fee rule reading "
+                f"{mocked_in[0]} diverges between admission and block apply."
             )
 
     # Per-revision preprocessing (syntax shape). Anything that explodes here
