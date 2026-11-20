@@ -190,7 +190,7 @@ class _PolicyWorker:
                     "error": info["diagnostics"][:_ERROR_LIMIT], **info}
         named = {k.name: str(v) for k, v in outs.items()}
         return {"ok": True, "phase": "step", "o5": named.get("o5"), "asked": names,
-                **info}
+                "outputs": named, **info}
 
     def stats(self) -> dict:
         self.state_revision += 1
