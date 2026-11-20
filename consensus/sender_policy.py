@@ -375,13 +375,54 @@ def recipient_clause_blocks(clause_for, recipient: str, values: dict, *,
     return True, info
 
 
+# A guarded unit scopes on its owner by comparing i12 against the owner's
+# key as a full-width literal: `i12[t] = { #xKEY }:bv[384]` (the stream
+# reference may itself carry a `:bv[N]` annotation). Matching that literal
+# inside a unit's GUARD — never a raw substring of the spec — is what makes
+# the recipient pass judge only recipients who actually have a unit.
+_UNIT_SCOPE_RE = re.compile(
+    r"\bi12\s*\[\s*t\s*\]\s*(?::\s*bv\s*\[\s*\d+\s*\])?\s*=\s*"
+    r"\{\s*#x([0-9a-fA-F]+)\s*\}\s*:\s*bv\s*\[\s*384\s*\]"
+)
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+
+def _padded_key_literal(literal: str) -> str:
+    """A spec key literal normalised to the bare, lower-case, 96-hex-digit
+    public key the rest of the node compares against. Spec text may carry
+    a key in any zero-padded width and either case; a direct string
+    compare would then miss its own unit."""
+    return (literal or "").strip().lower().rjust(96, "0")[-96:]
+
+
 def spec_mentions_account(spec_text, pubkey: str) -> bool:
-    """Pre-screen for the guarded-mode recipient pass: the account's key as
-    a literal in the spec text. A guarded unit scopes on its owner's key, so
-    absence proves there is no unit of theirs to enforce."""
+    """Pre-screen for the guarded-mode recipient pass: True only when the
+    spec carries a unit whose guard binds i12 to this account's key
+    literal — i.e. the account actually has a guarded unit to enforce.
+
+    Units are the top-level `always` statements, comments scrubbed first;
+    the binding must sit in the unit's guard (the text before the unit's
+    first `?`). A key that appears only in a comment, or only inside
+    another unit's body, is not a scope and must not make the pass step
+    for a recipient with no unit of her own: whatever the accumulated spec
+    resolves to under i12 = recipient would otherwise become her verdict,
+    delivered by somebody else's unit. (This is the fix pattern PR #133
+    published against PR #126's identical substring prescreen, ported to
+    this module; the shapes are pinned in
+    tests/test_recipient_guarded_prescreen.py.)"""
     if not spec_text or not pubkey:
         return False
-    return str(pubkey).lower() in spec_text.lower()
+    from consensus.rule_offers import strip_clause_comments
+
+    target = _padded_key_literal(str(pubkey))
+    scrubbed = _BLOCK_COMMENT_RE.sub(
+        " ", strip_clause_comments(str(spec_text)))
+    for chunk in scrubbed.split("always"):
+        guard = chunk.partition("?")[0]
+        for match in _UNIT_SCOPE_RE.finditer(guard):
+            if _padded_key_literal(match.group(1)) == target:
+                return True
+    return False
 
 
 def guarded_pass_inputs(values: dict, recipient: str, *, hold: int,
