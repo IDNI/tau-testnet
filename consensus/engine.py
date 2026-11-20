@@ -2073,6 +2073,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     recipient_values, pool="apply",
                                     timeout=getattr(_session, "request_budget", None),
                                 )
+                                if clause_blocked and not recipient_gate.clause_applies_to_inbound(
+                                        recipient_clause):
+                                    # Outbound-shaped clause (reads the
+                                    # destination i4, never the counterparty
+                                    # i3 or the release pair i17, states no
+                                    # cap): written for the recipient's
+                                    # sends, it does not mention incoming
+                                    # transfers -- the neutral default.
+                                    clause_blocked = False
+                                    tx_receipt["logs"].append(
+                                        "Recipient clause is outbound-only; "
+                                        "not enforced against an inbound transfer"
+                                    )
                                 recipient_blocked = clause_blocked
                                 recipient_detail = clause_o5
                         if recipient_blocked:
