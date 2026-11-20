@@ -15,6 +15,13 @@ Resolution order:
 
 "unknown" is a valid answer, not an error; the envelope stays ok. Only a
 malformed hash / usage yields INVALID_PARAMS.
+
+A "confirmed" answer for a rule transaction additionally carries
+`rule_outcome` when this node recorded the apply outcome at block apply
+(issue #42): the path the rule took (registry vs shared spec), its outcome,
+and the path's evidence (clause-registry root pair, or spec-revision pair).
+The field is absent when no outcome was recorded -- for non-rule
+transactions, and for rule transactions applied before this record existed.
 """
 import json
 import logging
@@ -124,6 +131,9 @@ def execute(raw_command: str, container):
                     "block_number": loc["block_number"],
                     "confirmations": max(1, confirmations),
                 }
+                rule_outcome = db.get_rule_outcome(tx_hash, loc["block_hash"])
+                if rule_outcome is not None:
+                    data["rule_outcome"] = rule_outcome
                 data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
                 return api_response.success_response("gettxstatus", data)
 

@@ -154,6 +154,16 @@ _last_transfer_ts: dict = {}
 # Lock for thread-safe access to rules state
 _rules_lock = threading.Lock()
 
+# Shadow replay state (issue #42, step 2): an isolated TauInterface advanced
+# at commit with exactly the units that entered _application_rules_state,
+# whose normalized spec backs the getaccountrules view. Guarded by its own
+# lock -- it is touched only from the commit-path recorder and the view's
+# accessors, never inside the balance/sequence/rules lock ordering.
+_shadow_lock = threading.Lock()
+_shadow_spec = None
+_shadow_driver_factory = None  # None -> the production TauInterface driver
+_shadow_unavailable = False  # construction failed once; do not retry per block
+
 # In-memory rules state storage
 # In-memory rules state storage
 _application_rules_state = ""
@@ -564,6 +574,265 @@ def _record_retractable_events(block, next_snapshot) -> None:
             )
     except Exception:
         logger.exception("could not record retractable events")
+
+
+def _record_rule_outcomes(block, next_snapshot) -> None:
+    """Best-effort history write, mirroring _record_retractable_events.
+
+    The confirmed rule-tx outcomes _apply_block collected into the snapshot,
+    persisted per block so gettxstatus can answer what a confirmed rule
+    transaction actually did (issue #42). Read from the snapshot, not the
+    apply result, for the same reason as retractable events.
+    """
+    try:
+        outcomes = (getattr(next_snapshot, "metadata", None) or {}).get("rule_outcomes")
+        if outcomes:
+            db.record_rule_outcomes(
+                block.block_hash, block.header.block_number, list(outcomes)
+            )
+    except Exception:
+        logger.exception("could not record rule outcomes")
+
+
+def _default_shadow_driver():
+    """The production shadow driver, or None when the native bindings are
+    unavailable -- the shadow is a view accelerator, never a commit
+    dependency, so a node without a working engine binding simply serves
+    `not_recorded` for the shared-spec half of the view."""
+    try:
+        from consensus.shadow_spec import TauInterfaceShadowDriver
+
+        return TauInterfaceShadowDriver()
+    except Exception:
+        logger.exception("shadow replay unavailable; spec snapshots disabled")
+        return None
+
+
+def set_shadow_driver_factory(factory) -> None:
+    """Install the factory get_shadow_spec() builds drivers from, and drop
+    any shadow already built. Test hook, mirroring
+    consensus.sender_policy.set_evaluator: pass a factory returning a
+    scripted driver to exercise the snapshot machinery without the native
+    engine, or None to restore the production default."""
+    global _shadow_driver_factory, _shadow_spec, _shadow_unavailable
+    with _shadow_lock:
+        _shadow_driver_factory = factory
+        _shadow_spec = None
+        _shadow_unavailable = False
+
+
+def get_shadow_spec():
+    """The node's shadow, built lazily on first use; None when no driver
+    can be constructed (native bindings unavailable)."""
+    global _shadow_spec, _shadow_unavailable
+    with _shadow_lock:
+        if _shadow_spec is None:
+            if _shadow_unavailable:
+                return None
+            factory = _shadow_driver_factory or _default_shadow_driver
+            driver = factory()
+            if driver is None:
+                _shadow_unavailable = True
+                return None
+            from consensus.shadow_spec import ShadowSpec
+
+            _shadow_spec = ShadowSpec(driver)
+        return _shadow_spec
+
+
+def _shared_rule_submissions(block, next_snapshot):
+    """(tx_hash, account, canonical unit) per accepted shared-spec rule
+    transaction in this block, in block order -- the attribution source
+    for the shadow's feed steps.
+
+    The unit is staged exactly as the engine stages it in _apply
+    (`_preprocess_tau_spec_text(rule_text)`, raw text as fallback), so it
+    compares equal to the accumulation line the shadow feeds. Transactions
+    whose rule text cannot be recovered from the block are skipped: their
+    units are still fed and recorded, just unattributed.
+    """
+    outcomes = (getattr(next_snapshot, "metadata", None) or {}).get(
+        "rule_outcomes") or []
+    by_hash = {}
+    txs = getattr(block, "transactions", None) or []
+    tx_ids = getattr(block, "tx_ids", None) or []
+    for i, tx in enumerate(txs):
+        if i < len(tx_ids):
+            tx_hash = tx_ids[i]
+        else:
+            try:
+                from block import compute_tx_hash
+
+                tx_hash = compute_tx_hash(tx)
+            except Exception:
+                continue
+        by_hash[tx_hash] = tx
+    submissions = []
+    for tx_hash, record in outcomes:
+        if not isinstance(record, dict) or record.get("path") != "shared_spec":
+            continue
+        tx = by_hash.get(tx_hash)
+        rule_text = None
+        if isinstance(tx, dict):
+            operations = tx.get("operations")
+            if isinstance(operations, str):
+                try:
+                    operations = json.loads(operations)
+                except Exception:
+                    operations = None
+            if isinstance(operations, dict):
+                rule_text = operations.get("0")
+        if not isinstance(rule_text, str) or not rule_text.strip():
+            continue
+        try:
+            unit = (_preprocess_tau_spec_text(rule_text)
+                    or rule_text).strip()
+        except Exception:
+            unit = rule_text.strip()
+        submissions.append((tx_hash, record.get("account"), unit))
+    return submissions
+
+
+def _record_survival_feeds(block, next_snapshot, shadow, first_advance,
+                           before_text) -> None:
+    """Persist the block's shadow-feed steps for the survival ledger
+    (issue #42, step 3), and enrich the block's shared-spec receipts.
+
+    Each step is attributed to the block transaction that submitted its
+    unit (see _shared_rule_submissions); a step no transaction in this
+    block submitted -- a restarted shadow catching up on the persisted
+    accumulation -- is recorded unattributed, and on the shadow's first
+    advance a baseline row carries the spec it started from, so the
+    ledger's replay (db.get_survival_ledger) can diff from the true
+    initial text.
+
+    The same attribution carries the design's `shadow_revision` receipt
+    field: the revision the shadow took when it fed this transaction's
+    unit exists only here, at commit, so the persisted rule_outcome
+    record is re-recorded with it alongside the live spec-revision pair
+    captured at apply.
+    """
+    steps = shadow.last_steps
+    if not steps:
+        return
+    submissions = _shared_rule_submissions(block, next_snapshot)
+    used = [False] * len(submissions)
+    outcomes = (getattr(next_snapshot, "metadata", None) or {}).get(
+        "rule_outcomes") or []
+    outcome_by_hash = {h: r for h, r in outcomes if isinstance(r, dict)}
+    rows = []
+    if first_advance:
+        rows.append({
+            "unit_text": None, "tx_hash": None, "account": None,
+            "spec_text_after": before_text,
+        })
+    enriched = []
+    for step in steps:
+        tx_hash = account = None
+        for i, (sub_hash, sub_account, sub_unit) in enumerate(submissions):
+            if not used[i] and sub_unit == step["unit"]:
+                used[i] = True
+                tx_hash, account = sub_hash, sub_account
+                break
+        rows.append({
+            "unit_text": step["unit"], "tx_hash": tx_hash,
+            "account": account, "spec_text_after": step["text_after"],
+        })
+        if tx_hash is not None and step.get("revision_after") is not None:
+            record = outcome_by_hash.get(tx_hash)
+            if record is not None:
+                enriched.append((tx_hash, {
+                    **record,
+                    "evidence": {
+                        **(record.get("evidence") or {}),
+                        "shadow_revision": step["revision_after"],
+                    },
+                }))
+    db.record_spec_unit_feeds(
+        block.block_hash, block.header.block_number, rows)
+    if enriched:
+        db.record_rule_outcomes(
+            block.block_hash, block.header.block_number, enriched)
+
+
+def _record_shadow_snapshot(block, next_snapshot) -> None:
+    """Best-effort shadow advance + snapshot write, mirroring
+    _record_rule_outcomes.
+
+    The units are read from the snapshot's tau_bytes -- the post-block
+    application-rules accumulation, i.e. exactly the canonical bytes that
+    entered state in and before this block. The shadow feeds only the ones
+    it has not seen, so a clause-only block (whose snapshot text is
+    unchanged) advances nothing, and a shadow rebuilt after a restart
+    catches up from the full accumulation on the next rule block. When the
+    accumulation changed, the snapshot is persisted per block so the
+    getaccountrules view (and at-height queries) can be served without
+    touching the live interpreter, and the advance's per-unit steps are
+    persisted for the survival ledger (see _record_survival_feeds).
+    """
+    try:
+        shadow = get_shadow_spec()
+        if shadow is None:
+            return
+        raw = getattr(next_snapshot, "tau_bytes", b"") or b""
+        text = raw.decode("utf-8", errors="ignore") if isinstance(
+            raw, (bytes, bytearray)) else str(raw)
+        units = [u for u in text.split("\n") if u.strip()]
+        first_advance = not shadow.fed_units
+        before_text = shadow.normalized_text
+        snap = shadow.advance(
+            units,
+            height=block.header.block_number,
+            block_hash=block.block_hash,
+        )
+        if snap is not None:
+            db.record_spec_snapshot(
+                snap["block_hash"], snap["height"], snap["shadow_revision"],
+                snap["normalized_text"], snap["sha256"],
+            )
+            _record_survival_feeds(
+                block, next_snapshot, shadow, first_advance, before_text)
+    except Exception:
+        logger.exception("could not record spec snapshot")
+
+
+def rebuild_shadow_from_accumulation():
+    """Rebuild the shadow from block 0 over the persisted accumulation and
+    make it the node's shadow. Returns the rebuilt shadow (or None when no
+    driver is available). The snapshots this produces are the same ones
+    the incremental advance recorded -- that equality is the cross-node
+    comparability claim of the design, and it is what a restart relies on
+    instead of trusting process-local interpreter text."""
+    global _shadow_spec
+    from consensus.shadow_spec import ShadowSpec
+
+    factory = _shadow_driver_factory or _default_shadow_driver
+    driver = factory()
+    if driver is None:
+        return None
+    shadow = ShadowSpec(driver)
+    units = [u for u in (get_application_rules_state() or "").split("\n")
+             if u.strip()]
+    with _shadow_lock:
+        _shadow_spec = shadow
+    if units:
+        shadow.advance(
+            units,
+            height=int(db.get_chain_state_value("canonical_head_number", "0")
+                       or 0),
+            block_hash=db.get_chain_state_value("canonical_head_hash", ""),
+        )
+    return shadow
+
+
+def get_clauses_root() -> str | None:
+    """The clause-registry root at the current tip, hex -- the registry
+    half of the state hash, served beside the registry clauses in the
+    getaccountrules view."""
+    try:
+        return _lifecycle_manager.rule_offers.clauses_root().hex()
+    except Exception:
+        return None
 
 
 def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
@@ -1088,6 +1357,8 @@ def _process_new_block_locked(block: Block) -> bool:
                 _swap_in_memory_state(next_snapshot, block)
 
             _record_retractable_events(block, next_snapshot)
+            _record_rule_outcomes(block, next_snapshot)
+            _record_shadow_snapshot(block, next_snapshot)
 
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
@@ -1369,6 +1640,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                                       reason="state_hash invariant mismatch")
 
             _record_retractable_events(block, next_snapshot)
+            _record_rule_outcomes(block, next_snapshot)
+            _record_shadow_snapshot(block, next_snapshot)
 
             if _enabled:
                 # The block's evaluator history becomes durable exactly as a live

@@ -523,6 +523,73 @@ def init_db():
             for col in ("reject_code", "reject_detail"):
                 if col not in dropped_cols:
                     conn.execute(f"ALTER TABLE mempool_dropped ADD COLUMN {col} TEXT;")
+            # rule_outcomes records what a block's apply did to each CONFIRMED
+            # rule transaction (issue #42), so gettxstatus can serve the apply
+            # outcome next to "confirmed" instead of leaving the wallet to
+            # infer it. Node-local diagnostics, keyed per block like
+            # retractable_events so a reorg needs no cleanup; canonicality is
+            # resolved at query time like tx_index. Self-pruning on insert
+            # (TTL + row cap) in the mempool_dropped style.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_outcomes (
+                    tx_hash      TEXT NOT NULL,
+                    block_hash   TEXT NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    outcome_json TEXT NOT NULL,
+                    recorded_at  INTEGER NOT NULL,
+                    PRIMARY KEY (tx_hash, block_hash)
+                );
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_rule_outcomes_hash ON rule_outcomes(tx_hash);')
+            # spec_snapshots records the shadow replay's normalized shared
+            # spec after each block that changed the application-rules
+            # accumulation (issue #42, step 2): the source the getaccountrules
+            # view is served from, so the view is derived from what the
+            # engine runs rather than from the append-only submitted text.
+            # Keyed per block like rule_outcomes (canonicality resolved at
+            # query time). Not pruned: the snapshots ARE the view's history,
+            # and whether a horizon may be pruned is an open design question
+            # for the maintainers.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS spec_snapshots (
+                    block_hash      TEXT PRIMARY KEY,
+                    block_number    INTEGER NOT NULL,
+                    shadow_revision INTEGER,
+                    normalized_text TEXT NOT NULL,
+                    spec_sha256     TEXT NOT NULL,
+                    recorded_at     INTEGER NOT NULL
+                );
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_spec_snapshots_height ON spec_snapshots(block_number);')
+            # spec_unit_feeds records, per block, the shadow replay's
+            # per-unit steps (issue #42, step 3): each accumulation unit the
+            # shadow fed in that block, the submitting transaction it was
+            # attributed to (NULL when the block did not submit it -- a
+            # restarted shadow's catch-up feed, or the baseline row below),
+            # and the shadow's normalized spec right after the feed. A row
+            # with unit_text NULL is the baseline: the shadow's spec before
+            # its first recorded feed. The survival ledger is recomputed
+            # from these rows at query time over canonical blocks only
+            # (keyed per block like rule_outcomes / spec_snapshots), so a
+            # reorg needs no reversal records: a displacing block that
+            # leaves the canonical chain simply drops out of the replay.
+            # Not pruned, like spec_snapshots: the rows ARE the ledger's
+            # history, and the pruning horizon is the same open design
+            # question.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS spec_unit_feeds (
+                    block_hash      TEXT NOT NULL,
+                    block_number    INTEGER NOT NULL,
+                    step_index      INTEGER NOT NULL,
+                    unit_text       TEXT,
+                    tx_hash         TEXT,
+                    account         TEXT,
+                    spec_text_after TEXT NOT NULL,
+                    recorded_at     INTEGER NOT NULL,
+                    PRIMARY KEY (block_hash, step_index)
+                );
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_spec_unit_feeds_height ON spec_unit_feeds(block_number);')
 
             # Backfill tx_index for databases created before it existed: if the
             # index is empty but blocks exist, populate it once from stored block
@@ -1593,6 +1660,340 @@ def get_dropped_tx(tx_hash: str) -> Optional[Dict]:
         "reject_code": row[2],
         "reject_detail": row[3],
     }
+
+
+# --- Confirmed rule-tx outcomes (issue #42: gettxstatus) ---
+_RULE_OUTCOME_TTL_MS = 7 * 24 * 60 * 60 * 1000  # keep outcome records ~7 days
+_RULE_OUTCOME_MAX_ROWS = 20000
+
+
+def record_rule_outcomes(block_hash: str, block_number: int, records) -> None:
+    """Record the rule outcomes a block's apply produced, then self-prune.
+
+    `records` is an iterable of (tx_hash, outcome) pairs, outcome being the
+    rule_outcome dict the apply path put on the transaction's receipt
+    (account / path / outcome / evidence). Patterned on the dropped-tx
+    machinery above (TTL prune, then cap to the newest rows), but keyed per
+    block like retractable_events. Diagnostic only: a failure is logged and
+    never reaches block commit.
+    """
+    records = list(records or [])
+    if not records:
+        return
+    try:
+        if _db_conn is None:
+            init_db()
+        import time as _time
+        now_ms = int(_time.time() * 1000)
+        with _db_lock:
+            cur = _db_conn.cursor()
+            for tx_hash, outcome in records:
+                cur.execute(
+                    "INSERT OR REPLACE INTO rule_outcomes "
+                    "(tx_hash, block_hash, block_number, outcome_json, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (tx_hash, block_hash, int(block_number),
+                     json.dumps(outcome, sort_keys=True), now_ms),
+                )
+            cur.execute(
+                "DELETE FROM rule_outcomes WHERE recorded_at < ?",
+                (now_ms - _RULE_OUTCOME_TTL_MS,),
+            )
+            cur.execute(
+                "DELETE FROM rule_outcomes WHERE rowid IN ("
+                "SELECT rowid FROM rule_outcomes "
+                "ORDER BY recorded_at DESC, tx_hash "
+                "LIMIT -1 OFFSET ?)",
+                (_RULE_OUTCOME_MAX_ROWS,),
+            )
+            _db_conn.commit()
+    except Exception:
+        logger.exception("could not record rule outcomes")
+
+
+def get_rule_outcome(tx_hash: str, block_hash: str) -> Optional[Dict]:
+    """Return the recorded rule outcome for a confirmed tx in a specific
+    block -- {'tx_hash', 'block_height', 'account', 'path', 'outcome',
+    'evidence'} -- or None.
+
+    Keyed by block as well as tx: the same tx applied in a fork block can
+    have a different outcome (its evidence is parent-state-relative), and
+    the caller (gettxstatus) has already resolved which block is canonical.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT block_number, outcome_json FROM rule_outcomes "
+            "WHERE tx_hash = ? AND block_hash = ? LIMIT 1",
+            (tx_hash, block_hash),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        outcome = json.loads(row[1])
+    except (ValueError, TypeError):
+        return None
+    return {"tx_hash": tx_hash, "block_height": row[0], **outcome}
+
+
+def record_spec_snapshot(block_hash: str, block_number: int, shadow_revision,
+                         normalized_text: str, spec_sha256: str) -> None:
+    """Persist one shadow-replay snapshot (issue #42, step 2).
+
+    Diagnostic/view data only, like record_rule_outcomes: a failure is
+    logged and never reaches block commit.
+    """
+    try:
+        if _db_conn is None:
+            init_db()
+        import time as _time
+        now_ms = int(_time.time() * 1000)
+        with _db_lock:
+            _db_conn.execute(
+                "INSERT OR REPLACE INTO spec_snapshots "
+                "(block_hash, block_number, shadow_revision, normalized_text, "
+                "spec_sha256, recorded_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (block_hash, int(block_number),
+                 None if shadow_revision is None else int(shadow_revision),
+                 normalized_text, spec_sha256, now_ms),
+            )
+            _db_conn.commit()
+    except Exception:
+        logger.exception("could not record spec snapshot")
+
+
+def get_spec_snapshot_at(height: Optional[int] = None) -> Optional[Dict]:
+    """Return the newest CANONICAL shadow snapshot at or before `height`
+    (the newest overall when `height` is None), or None.
+
+    A snapshot is recorded only for blocks that changed the accumulation,
+    so the newest snapshot at or before a height IS the shared-spec state
+    at that height. Canonicality is resolved per candidate exactly like
+    tx_index / rule_outcomes: a snapshot recorded for a fork block is
+    skipped, never served. Returns {'height', 'block_hash',
+    'shadow_revision', 'normalized_text', 'sha256'}.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        if height is None:
+            cur.execute(
+                "SELECT block_hash, block_number, shadow_revision, "
+                "normalized_text, spec_sha256 FROM spec_snapshots "
+                "ORDER BY block_number DESC, recorded_at DESC"
+            )
+        else:
+            cur.execute(
+                "SELECT block_hash, block_number, shadow_revision, "
+                "normalized_text, spec_sha256 FROM spec_snapshots "
+                "WHERE block_number <= ? "
+                "ORDER BY block_number DESC, recorded_at DESC",
+                (int(height),),
+            )
+        rows = cur.fetchall()
+    for block_hash, block_number, shadow_revision, text, sha in rows:
+        is_canonical, _head = get_canonical_confirmation(block_hash, block_number)
+        if is_canonical:
+            return {
+                "height": block_number,
+                "block_hash": block_hash,
+                "shadow_revision": shadow_revision,
+                "normalized_text": text,
+                "sha256": sha,
+            }
+    return None
+
+
+def record_spec_unit_feeds(block_hash: str, block_number: int, steps) -> None:
+    """Persist one block's shadow-feed steps (issue #42, step 3).
+
+    `steps` is an iterable of {unit_text, tx_hash, account,
+    spec_text_after} dicts in feed order; a step with unit_text None is
+    the baseline (the shadow's spec before its first recorded feed).
+    Diagnostic/view data only, like record_spec_snapshot: a failure is
+    logged and never reaches block commit.
+    """
+    steps = list(steps or [])
+    if not steps:
+        return
+    try:
+        if _db_conn is None:
+            init_db()
+        import time as _time
+        now_ms = int(_time.time() * 1000)
+        with _db_lock:
+            cur = _db_conn.cursor()
+            for index, step in enumerate(steps):
+                cur.execute(
+                    "INSERT OR REPLACE INTO spec_unit_feeds "
+                    "(block_hash, block_number, step_index, unit_text, "
+                    "tx_hash, account, spec_text_after, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (block_hash, int(block_number), index,
+                     step.get("unit_text"), step.get("tx_hash"),
+                     step.get("account"), step.get("spec_text_after") or "",
+                     now_ms),
+                )
+            _db_conn.commit()
+    except Exception:
+        logger.exception("could not record spec unit feeds")
+
+
+def get_survival_ledger(height: Optional[int] = None,
+                        account: Optional[str] = None) -> List[Dict]:
+    """The per-unit survival ledger (issue #42, step 3), recomputed by
+    replaying the canonical blocks' recorded shadow feeds.
+
+    For every shared-spec unit the shadow ever fed (on the canonical
+    chain, at or before `height` when given), the ledger answers what a
+    current-spec view cannot: is the unit still in force, was part of it
+    displaced (and what fragment survives), or was it displaced entirely
+    -- and which transaction did the displacing. A unit's identity is its
+    canonical text (the accumulation dedups exact units globally); the
+    submitting tx and account recorded at its first feed are attributes
+    of the entry. Registry-routed units never enter the shadow, so they
+    are never in this ledger.
+
+    Statuses are derived, never stored: the replay walks the canonical
+    feed steps in order, diffing each step's normalized text against the
+    previous one at top-level conjunct granularity
+    (consensus.shadow_spec.split_spec_fragments). The fragments a step
+    introduced or changed are its unit's contribution; a contribution
+    fragment whose key later carries different text (or vanishes) is
+    displaced, and the step that changed it names the displacer. Because
+    only canonical blocks are replayed, a reorg that drops a displacing
+    block restores the earlier unit's status exactly -- reversal is a
+    consequence of the replay, not a stored record.
+
+    Returns entries in first-feed order: {'unit', 'tx_hash', 'account',
+    'block_height', 'status', 'surviving_fragment',
+    'displacer_tx_hash', 'displacer_block_height'}. `account` filters to
+    one submitter (entries whose feed could not be attributed to a
+    transaction carry account None and match no filter).
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        if height is None:
+            cur.execute(
+                "SELECT block_hash, block_number, step_index, unit_text, "
+                "tx_hash, account, spec_text_after FROM spec_unit_feeds "
+                "ORDER BY block_number ASC, step_index ASC"
+            )
+        else:
+            cur.execute(
+                "SELECT block_hash, block_number, step_index, unit_text, "
+                "tx_hash, account, spec_text_after FROM spec_unit_feeds "
+                "WHERE block_number <= ? "
+                "ORDER BY block_number ASC, step_index ASC",
+                (int(height),),
+            )
+        rows = cur.fetchall()
+
+    from consensus.shadow_spec import split_spec_fragments
+
+    canonical_cache: Dict[str, bool] = {}
+
+    def _is_canonical(block_hash: str, block_number: int) -> bool:
+        if block_hash not in canonical_cache:
+            canonical_cache[block_hash] = get_canonical_confirmation(
+                block_hash, block_number)[0]
+        return canonical_cache[block_hash]
+
+    fragments: Dict[str, str] = {}   # fragment key -> current text
+    owners: Dict[str, str] = {}      # fragment key -> owning unit text
+    units: Dict[str, Dict] = {}      # unit text -> entry under construction
+    fed = set()
+    started = False
+    for block_hash, block_number, _step, unit_text, tx_hash, acct, \
+            text_after in rows:
+        if not _is_canonical(block_hash, block_number):
+            continue
+        if unit_text is None:
+            # Baseline row. Only the replay's first row may set the
+            # initial fragment map: a later baseline belongs to a
+            # restarted shadow's catch-up block, and honouring it would
+            # rewind the replay to genesis mid-chain.
+            if not started:
+                fragments = dict(split_spec_fragments(text_after))
+                started = True
+            continue
+        started = True
+        if unit_text in fed:
+            # A restarted shadow re-feeding a unit an earlier canonical
+            # block already recorded: the accumulation dedups exact
+            # units, and so does the ledger.
+            continue
+        fed.add(unit_text)
+        new_fragments = dict(split_spec_fragments(text_after))
+        entry = units.setdefault(unit_text, {
+            "unit": unit_text,
+            "tx_hash": tx_hash,
+            "account": acct,
+            "block_height": block_number,
+            "fragments": {},
+            "displacer_tx_hash": None,
+            "displacer_block_height": None,
+        })
+        # Displacement: a fragment another unit owns whose text this step
+        # changed -- or that vanished from the spec -- is displaced, and
+        # this step's transaction is its displacer.
+        for key, old_text in fragments.items():
+            if key not in new_fragments or new_fragments[key] != old_text:
+                owner = owners.get(key)
+                if owner is not None and owner != unit_text:
+                    units[owner]["displacer_tx_hash"] = tx_hash
+                    units[owner]["displacer_block_height"] = block_number
+        # Contribution: the fragments this step introduced or changed are
+        # what the fed unit put into the spec.
+        for key, text in new_fragments.items():
+            if key not in fragments or fragments[key] != text:
+                owners[key] = unit_text
+                entry["fragments"][key] = text
+        for key in list(fragments):
+            if key not in new_fragments:
+                owners.pop(key, None)
+        fragments = new_fragments
+
+    entries: List[Dict] = []
+    for unit_text, entry in units.items():
+        contributed = entry["fragments"]
+        surviving = [text for key, text in contributed.items()
+                     if fragments.get(key) == text]
+        lost = [key for key, text in contributed.items()
+                if fragments.get(key) != text]
+        if not lost:
+            status = "in_force"
+            surviving_fragment = None
+            displacer_tx = displacer_height = None
+        elif surviving:
+            status = "partially_displaced"
+            surviving_fragment = " && ".join(surviving)
+            displacer_tx = entry["displacer_tx_hash"]
+            displacer_height = entry["displacer_block_height"]
+        else:
+            status = "displaced"
+            surviving_fragment = None
+            displacer_tx = entry["displacer_tx_hash"]
+            displacer_height = entry["displacer_block_height"]
+        entries.append({
+            "unit": unit_text,
+            "tx_hash": entry["tx_hash"],
+            "account": entry["account"],
+            "block_height": entry["block_height"],
+            "status": status,
+            "surviving_fragment": surviving_fragment,
+            "displacer_tx_hash": displacer_tx,
+            "displacer_block_height": displacer_height,
+        })
+    if account is not None:
+        entries = [e for e in entries if (e["account"] or "") == account]
+    return entries
 
 
 def get_tx_block_locations(tx_hash: str) -> List[Dict]:

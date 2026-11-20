@@ -15,7 +15,7 @@ import config
 import db
 import tau_manager
 from commands import checktx, createblock, getmempool, gettimestamp, sendtx, getbalance, getsequence, history, getblocks, getallaccounts, gettaustate, getgovernance, getupdateid, getaccountstate, gettxstatus
-from commands import getofferid, getruleoffers, getruleoffer, getruleconflict
+from commands import getofferid, getruleoffers, getruleoffer, getruleconflict, getaccountrules
 from commands import (
     getapprovalpreview,
     getapprovalrequest,
@@ -75,6 +75,7 @@ class ServiceContainer:
             "getupdateid": getupdateid,
             "getofferid": getofferid,
             "getruleoffers": getruleoffers,
+            "getaccountrules": getaccountrules,
             "getruleoffer": getruleoffer,
             "getruleconflict": getruleconflict,
         # Co-signature approvals. `getapprovalrequests` is the approver inbox,
