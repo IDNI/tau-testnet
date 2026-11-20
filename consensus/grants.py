@@ -10,6 +10,14 @@ Conditions attach to the grant and combine by AND:
 - a per-period spending cap on draws (the window is one week of
   604800 seconds from the grant's opening anchor, the same period
   arithmetic as standing payments);
+- optionally, a cap shared across grants: grants naming the same
+  `cap_group` (scoped to their sender) share one per-period draw
+  budget on top of their own caps -- a draw must satisfy both. All
+  grants in a group declare the same group cap and the same opening
+  anchor, so the group's spent-in-period is exactly the sum of the
+  members' own period counters in the current window: the shared
+  counter lives in the same rows that feed the book root and
+  persistence, never in a side channel;
 - time conditions: draws open at `opens_at` and close at
   `deadline`;
 - at expiry the refund wins: the end-of-block sweep returns the
@@ -40,6 +48,7 @@ GRANT_TX_TYPES = frozenset({TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW})
 MAX_GRANTS = 4096
 
 _PUBKEY_RE = re.compile(r"^[0-9a-f]{96}$")
+_GROUP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def _well_formed_pubkey(pk: str) -> bool:
@@ -59,6 +68,11 @@ class GrantTerms:
     opens_at: int
     deadline: int
     sequence_number: int = 0
+    # Shared cap (optional): the group this grant draws against, and
+    # the group's per-period cap. Empty group = no shared cap, and the
+    # grant behaves exactly as a grant always has.
+    cap_group: str = ""
+    cap_group_cap: int = 0
 
     @property
     def grant_id(self) -> str:
@@ -75,6 +89,12 @@ def compute_grant_id(terms: GrantTerms) -> str:
         "deadline": terms.deadline,
         "sequence_number": terms.sequence_number,
     }
+    if terms.cap_group:
+        # Grouped terms hash their group in, so a grouped grant can
+        # never collide with its ungrouped twin; ungrouped ids are
+        # byte-identical to what they have always been.
+        payload["cap_group"] = terms.cap_group
+        payload["cap_group_cap"] = terms.cap_group_cap
     return hashlib.sha256(canonical_json(payload)).hexdigest()
 
 
@@ -93,6 +113,15 @@ def validate_grant_shape(terms: GrantTerms) -> None:
         raise GrantShapeError(
             "a grant whose draws never open before the deadline "
             "could never be drawn")
+    if not terms.cap_group:
+        if terms.cap_group_cap != 0:
+            raise GrantShapeError(
+                "a shared cap amount without a cap group names no budget")
+    else:
+        if not _GROUP_RE.match(terms.cap_group):
+            raise GrantShapeError("cap group name is not well-formed")
+        if terms.cap_group_cap <= 0:
+            raise GrantShapeError("the shared draw cap must be positive")
 
 
 @dataclass
@@ -165,11 +194,71 @@ class GrantBook:
     def get(self, grant_id: str) -> Optional[GrantState]:
         return self._grants.get(grant_id)
 
+    def group_conflict(self, terms: GrantTerms) -> Optional[str]:
+        """Why these terms cannot join their cap group, or None.
+
+        A group is one budget: every member must declare the same
+        group cap and open at the same anchor, or the shared window
+        (and with it the shared counter) would not be well-defined.
+        Groups are scoped to the sender, so another sender reusing
+        the name starts an independent group.
+        """
+        if not terms.cap_group:
+            return None
+        for st in self._grants.values():
+            other = st.terms
+            if other.sender != terms.sender or other.cap_group != terms.cap_group:
+                continue
+            if other.cap_group_cap != terms.cap_group_cap:
+                return "the grant declares a different cap for its group"
+            if other.opens_at != terms.opens_at:
+                return "the grant opens at a different anchor than its group"
+        return None
+
     def create(self, terms: GrantTerms) -> GrantState:
+        conflict = self.group_conflict(terms)
+        if conflict is not None:
+            raise GrantShapeError(conflict)
         state = GrantState(terms=terms)
         self._grants[terms.grant_id] = state
         self._root_cache = None
         return state
+
+    def group_drawn_in_period(self, state: GrantState, *, ts: int) -> int:
+        """The cap group's total draws in the window containing `ts`.
+
+        Members share the opening anchor, so one period index names
+        the same window for all of them; a member whose stored index
+        is that index holds exactly its draws in this window, and a
+        member last rolled in an older window contributes nothing.
+        """
+        terms = state.terms
+        idx = periods.period_index_at(
+            terms.opens_at, periods.PERIOD_WEEK, ts)
+        total = 0
+        for st in self._grants.values():
+            other = st.terms
+            if (other.sender == terms.sender
+                    and other.cap_group == terms.cap_group
+                    and st.period_index == idx):
+                total += st.drawn_in_period
+        return total
+
+    def check_draw(self, grant_id: str, amount: int, *, ts: int) -> None:
+        """The book's draw verdict: the grant's own conditions AND,
+        for a grouped grant, the shared cap. Apply re-checks through
+        here, so the two cannot disagree."""
+        state = self._grants[grant_id]
+        state.check_draw(amount, ts=ts)
+        if state.terms.cap_group:
+            drawn = self.group_drawn_in_period(state, ts=ts)
+            if drawn + amount > state.terms.cap_group_cap:
+                raise GrantShapeError(
+                    "draw exceeds the shared per-period cap")
+
+    def apply_draw(self, grant_id: str, amount: int, *, ts: int) -> None:
+        self.check_draw(grant_id, amount, ts=ts)
+        self._grants[grant_id].apply_draw(amount, ts=ts)
 
     def due_refunds(self, *, ts: int) -> List[Tuple[str, str, int]]:
         """(grant_id, sender, amount) for every grant the sweep settles."""
@@ -191,7 +280,7 @@ class GrantBook:
         rows = []
         for grant_id in sorted(self._grants):
             st = self._grants[grant_id]
-            rows.append({
+            row = {
                 "grant_id": grant_id,
                 "sender": st.terms.sender,
                 "recipient": st.terms.recipient,
@@ -205,7 +294,14 @@ class GrantBook:
                 "drawn_in_period": st.drawn_in_period,
                 "last_draw_ts": st.last_draw_ts,
                 "refunded": st.refunded,
-            })
+            }
+            if st.terms.cap_group:
+                # Only grouped rows carry the group fields, so an
+                # ungrouped book snapshots (and hashes) exactly as
+                # it always has.
+                row["cap_group"] = st.terms.cap_group
+                row["cap_group_cap"] = st.terms.cap_group_cap
+            rows.append(row)
         return rows
 
     @classmethod
@@ -220,6 +316,8 @@ class GrantBook:
                 opens_at=int(row["opens_at"]),
                 deadline=int(row["deadline"]),
                 sequence_number=int(row["sequence_number"]),
+                cap_group=str(row.get("cap_group", "") or ""),
+                cap_group_cap=int(row.get("cap_group_cap", 0)),
             )
             if terms.grant_id != row["grant_id"]:
                 raise ValueError("grant row id does not recompute")
@@ -242,6 +340,8 @@ def parse_grant_create(data: dict) -> GrantTerms:
         opens_at=int(data.get("opens_at", 0)),
         deadline=int(data.get("deadline", 0)),
         sequence_number=int(data.get("sequence_number", 0)),
+        cap_group=str(data.get("cap_group") or ""),
+        cap_group_cap=int(data.get("cap_group_cap") or 0),
     )
 
 

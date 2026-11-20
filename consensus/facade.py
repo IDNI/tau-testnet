@@ -511,7 +511,8 @@ class TipAdmissionView:
                     "SELECT sender_pubkey, recipient_pubkey, total, "
                     "cap_per_period, opens_at, deadline, sequence_number, "
                     "remaining, period_index, drawn_in_period, "
-                    "last_draw_ts, refunded FROM grants_v1 "
+                    "last_draw_ts, refunded, cap_group, cap_group_cap "
+                    "FROM grants_v1 "
                     "WHERE grant_id = ?",
                     (grant_id,),
                 ).fetchone()
@@ -533,6 +534,8 @@ class TipAdmissionView:
             "drawn_in_period": int(row[9]),
             "last_draw_ts": int(row[10]),
             "refunded": bool(row[11]),
+            "cap_group": str(row[12] or ""),
+            "cap_group_cap": int(row[13]),
         }
 
     def grant_count(self) -> int:

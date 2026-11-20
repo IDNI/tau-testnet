@@ -2860,6 +2860,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 "Grant creation ignored: sender balance cannot fund the grant")
                             tx_receipt["reason"] = "grant_not_created"
                             accepted_in_block = False
+                        elif (gterms.cap_group
+                                and _grant_book(lifecycle_mgr) is not None
+                                and _grant_book(lifecycle_mgr).group_conflict(
+                                    gterms) is not None):
+                            tx_receipt["logs"].append(
+                                "Grant creation ignored: the grant conflicts "
+                                "with its cap group's declared terms")
+                            tx_receipt["reason"] = "grant_not_created"
+                            accepted_in_block = False
                         else:
                             staged_writes[sender] = _read_bal(sender) - gterms.total
                             pending_grant_create = gterms
@@ -2885,7 +2894,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             reason = "no balance overlay to draw into"
                         else:
                             try:
-                                gstate.check_draw(amount, ts=int(block_timestamp or 0))
+                                gbook.check_draw(
+                                    grant_id, amount,
+                                    ts=int(block_timestamp or 0))
                             except GrantShapeError as exc:
                                 reason = f"draw refused ({exc})"
                         if reason:
@@ -3465,8 +3476,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         pending_grant_create.grant_id, "created")
                 elif pending_grant_draw is not None:
                     d_id, d_amount, d_ts = pending_grant_draw
-                    _lifecycle_for_write().grants.get(d_id).apply_draw(
-                        d_amount, ts=d_ts)
+                    _lifecycle_for_write().grants.apply_draw(
+                        d_id, d_amount, ts=d_ts)
                     tx_receipt["grant_event"] = (d_id, "drawn")
 
             # Commit staged balance writes only for txs that stay accepted.
