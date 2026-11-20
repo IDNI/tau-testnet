@@ -252,6 +252,8 @@ widths and shape apply.
 | 3 | accept offer | Accept a rule offer as the `o5` clause. |
 | 4 | set guard | Register or replace the guard itself. |
 | 5 | revoke guard | Remove the guard. |
+| 6 | set receive route | Install or replace the account's receive route; `rule_text` is a route spec ([receive-routes.md](receive-routes.md#the-rule-change-guard)). |
+| 7 | clear receive route | The owner removes the account's receive route. |
 
 Because the guard is judged on kind 4 and 5 as well, it protects itself: with a
 guard in force, replacing or removing it needs the same approvals.
@@ -409,13 +411,18 @@ editor menu cover three guards. Replace each placeholder key with the co-signer'
 
 | Template | Slots | Effect |
 |---|---|---|
-| Any policy change needs co-signer X | `i18` | Every kind is blocked until X has voted. |
-| 2 of 3 co-signers for any policy change | `i18`, `i19`, `i20` | Every kind is blocked until any two of the three have voted. |
-| Revoking needs a co-signer (weaker) | `i18` | Only revoking a policy (kind 2) or a guard (kind 5) is blocked. Setting a policy, accepting an offer and setting a guard are allowed with no approval. |
+| Any policy change needs co-signer X | `i18` | Every kind is blocked until X has voted, receive-route changes (kinds 6 and 7) included. |
+| 2 of 3 co-signers for any policy change | `i18`, `i19`, `i20` | Every kind is blocked until any two of the three have voted, receive-route changes included. |
+| Revoking needs a co-signer (weaker) | `i18` | Revoking a policy (kind 2) or a guard (kind 5), and setting or clearing a receive route (kinds 6 and 7), are blocked. Setting a policy, accepting an offer and setting a guard are allowed with no approval. |
 
 The weaker template does **not** stop a thief: they can replace the policy with a
-permissive one, or replace the guard itself, and then drain the account. Use it
-only to stop accidental or lone revocations.
+permissive one, or replace the guard itself, and then drain the account. It does
+stop a lone key from redirecting future receipts with a receive route. Use it only
+to stop accidental or lone revocations.
+
+A guard you wrote yourself sees kinds 6 and 7 on `i1` like any other kind. A clause
+that tests for specific kinds (as the weaker template does) protects receive routes
+only if it names 6 and 7; a clause that ignores `i1` covers them already.
 
 ## Stream and slot map
 

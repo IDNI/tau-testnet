@@ -67,6 +67,14 @@ def execute(raw_command: str, container):
     except Exception:
         escrowed_out = escrowed_in = 0
 
+    # The account's receive route (issue #35). `pending_incoming` stays gross:
+    # the split is made at apply, by the route in force in that block.
+    try:
+        route = tip.receive_route_book().get(address)
+        receive_route = route.to_dict(tip.next_block_timestamp) if route is not None else None
+    except Exception:
+        receive_route = None
+
     pending_outgoing = 0
     pending_incoming = 0
     pending_fees = 0
@@ -117,5 +125,6 @@ def execute(raw_command: str, container):
         "available_balance": str(available_balance),
         "escrowed_out": str(escrowed_out),
         "escrowed_in": str(escrowed_in),
+        "receive_route": receive_route,
         "pending_txs": pending_txs,
     })

@@ -70,6 +70,24 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
         return {}
 
 
+def _receive_route_fields(db, tx_hash: str, block_hash: str) -> dict:
+    """`receive_routes` (gross/net/routed/fee per routed credit) and
+    `receive_route_change` for a confirmed transaction, from node-local history."""
+    try:
+        events = db.get_receive_route_events_for_tx(tx_hash, block_hash)
+    except Exception:
+        logger.exception("Failed to resolve receive-route detail for %s", tx_hash)
+        return {}
+    out = {}
+    splits = [e for e in events if e.get("kind") == "split"]
+    changes = [e for e in events if e.get("kind") != "split"]
+    if splits:
+        out["receive_routes"] = splits
+    if changes:
+        out["receive_route_change"] = changes[0]
+    return out
+
+
 def execute(raw_command: str, container):
     parts = raw_command.split()
     if len(parts) != 2:
@@ -125,6 +143,7 @@ def execute(raw_command: str, container):
                     "confirmations": max(1, confirmations),
                 }
                 data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
+                data.update(_receive_route_fields(db, tx_hash, loc["block_hash"]))
                 return api_response.success_response("gettxstatus", data)
 
         # 3. Dropped without being mined?

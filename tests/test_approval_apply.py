@@ -322,6 +322,26 @@ def test_an_approving_vote_releases_the_transfer():
     assert bal[ALICE] == 100000 - req.amount
 
 
+def test_an_executed_co_signed_transfer_is_split_by_the_recipients_receive_route():
+    """Issue #35: the vote path releases through the same credit as a user_tx,
+    so the recipient's receive route applies to it."""
+    from consensus.receive_routes import ReceiveRoute
+
+    lm = _lm()
+    lm.receive_routes.install(ReceiveRoute(BOB, SCAN, 2000))
+    req = _request()
+    result, _, _ = _apply([request_tx(req), vote_tx(req)], lm=lm)
+    bal = _balances(result)
+    routed = req.amount * 2000 // 10_000
+    assert bal[ALICE] == 100000 - req.amount
+    assert bal[BOB] == req.amount - routed
+    assert bal[SCAN] == 10 + routed
+    (split,) = [e for e in result.governance_changes["receive_route_events"]
+                if e["kind"] == "split"]
+    assert (split["gross"], split["routed"], split["recipient_pubkey"]) == \
+        (req.amount, routed, BOB)
+
+
 def test_the_released_transfer_stamps_the_senders_transfer_history():
     """The generic site keys off this tx's signer (the approver) and its transfer
     list (empty for a vote), so it would skip a released transfer entirely."""

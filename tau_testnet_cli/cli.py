@@ -1219,6 +1219,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_approval_subparsers(sub)
     _add_policy_subparsers(sub)
     _add_retractable_subparsers(sub)
+    _add_route_subparsers(sub)
     _add_node_subparsers(sub)
 
     return parser
@@ -2417,6 +2418,216 @@ def cmd_retractable_id(args: argparse.Namespace) -> int:
     else:
         print(rid)
     return EXIT_OK
+
+
+# --- Receive routes (issue #35) ----------------------------------------------
+
+
+def _percent_to_bps(text: str) -> int:
+    """'20' or '20%' or '12.5' -> basis points; exact to 0.01%."""
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        value = Decimal(str(text).strip().rstrip("%"))
+    except InvalidOperation:
+        raise argparse.ArgumentTypeError(f"not a percentage: {text!r}")
+    if not value.is_finite():
+        raise argparse.ArgumentTypeError(f"not a percentage: {text!r}")
+    bps = value * 100
+    if bps != bps.to_integral_value():
+        raise argparse.ArgumentTypeError("percent has more than two decimals")
+    return int(bps)
+
+
+# A direct route change may land in this many blocks; a parked request defaults
+# to twice the guard's delay so the time escape can still release it.
+_ROUTE_TX_EXPIRE_IN = 1000
+
+
+def _route_request_mode(args: argparse.Namespace) -> bool:
+    """Resolve --expire-in for the mode and refuse --approver without --request."""
+    import tau_defs
+
+    request = bool(getattr(args, "request", False))
+    if getattr(args, "approver", None) and not request:
+        raise _PayloadError("--approver only applies with --request")
+    if args.expire_in is None:
+        args.expire_in = (
+            2 * tau_defs.RULE_CHANGE_DELAY_BLOCKS if request else _ROUTE_TX_EXPIRE_IN
+        )
+    return request
+
+
+def cmd_route_set(args: argparse.Namespace) -> int:
+    import tau_defs
+    from consensus.receive_routes import MAX_ROUTE_BPS, route_spec_text
+
+    bps = args.bps if args.bps is not None else args.percent
+    try:
+        request = _route_request_mode(args)
+        if request:
+            # Parked for the owner's guard: the same route, as a kind-6 spec.
+            if not 1 <= bps <= MAX_ROUTE_BPS:
+                raise _PayloadError(f"route_bps must be in 1..{MAX_ROUTE_BPS}")
+            if args.locked and args.expires_at_time is None:
+                raise _PayloadError("a locked route needs an expiry (--expires-at-time)")
+            spec = route_spec_text(
+                args.to.strip().lower(), bps,
+                min_amount=args.min_amount or 0,
+                active_from_time=args.active_from_time or 0,
+                expires_at_time=args.expires_at_time or 0,
+                locked=bool(args.locked),
+            )
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    if request:
+        return _submit_rule_change(
+            args, tau_defs.RULE_CHANGE_KIND_SET_RECEIVE_ROUTE, spec, ""
+        )
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_receive_route_set_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            destination_pubkey=args.to,
+            route_bps=bps,
+            min_amount=args.min_amount,
+            active_from_time=args.active_from_time,
+            expires_at_time=args.expires_at_time,
+            locked=bool(args.locked),
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_route_clear(args: argparse.Namespace) -> int:
+    import tau_defs
+
+    try:
+        request = _route_request_mode(args)
+        if request and args.owner:
+            raise _PayloadError(
+                "--request parks a clear of your own route; a destination releasing "
+                "a route needs no approval, so drop --request"
+            )
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    if request:
+        return _submit_rule_change(
+            args, tau_defs.RULE_CHANGE_KIND_CLEAR_RECEIVE_ROUTE, "", ""
+        )
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        owner = (args.owner or sender_pubkey).strip().lower()
+        return tx_mod.build_receive_route_clear_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            route_owner_pubkey=owner,
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_route_show(args: argparse.Namespace) -> int:
+    if getattr(args, "capability", False):
+        return _simple_query(args, "getreceiveroute capability")
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getreceiveroute {address} {int(args.limit)}")
+
+
+def _add_route_subparsers(sub) -> None:
+    """`tau-testnet route ...` -- split what an account receives."""
+    p_route = sub.add_parser(
+        "route",
+        parents=[_GLOBAL_PARENT],
+        help="Receive routes: send a share of every incoming credit elsewhere",
+    )
+    rsub = p_route.add_subparsers(dest="route_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser):
+        parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument(
+            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+        parser.add_argument(
+            "--expire-in", type=_block_count, default=None,
+            help=(f"Blocks the transaction may land in, from the next one (default: "
+                  f"{_ROUTE_TX_EXPIRE_IN}; with --request, twice the guard delay)"),
+        )
+        parser.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+        parser.add_argument("--dry-run", action="store_true",
+                            help="Print the signed transaction instead of sending it")
+
+    def _request_flags(parser):
+        parser.add_argument(
+            "--request", action="store_true",
+            help=("Park the change as a rule_change_request for your rule-change "
+                  "guard: approvals or the time escape release it"),
+        )
+        parser.add_argument(
+            "--approver", action="append", metavar="SLOT=PUBKEY",
+            help="With --request: approver for one slot, e.g. --approver 18=<pubkey>. Repeatable.",
+        )
+
+    p_set = rsub.add_parser(
+        "set", parents=common,
+        help="Install or replace your receive route",
+    )
+    _key_group(p_set)
+    p_set.add_argument("--to", required=True, help="Destination public key (96 hex)")
+    share = p_set.add_mutually_exclusive_group(required=True)
+    share.add_argument("--percent", type=_percent_to_bps, metavar="PCT",
+                       help="Share to route, e.g. 20 or 12.5 (max 90)")
+    share.add_argument("--bps", type=int, help="Share in basis points (1..9000)")
+    p_set.add_argument("--min-amount", type=int,
+                       help="Leave credits below this amount whole")
+    p_set.add_argument("--active-from-time", type=int, metavar="UNIX",
+                       help="Start routing at this block time")
+    p_set.add_argument("--expires-at-time", type=int, metavar="UNIX",
+                       help="Stop routing at this block time; the route is then removed")
+    p_set.add_argument("--locked", action="store_true",
+                       help="Binding route: you cannot change or remove it before it "
+                            "expires; its destination can release it")
+    _tx_flags(p_set)
+    _request_flags(p_set)
+    p_set.set_defaults(func=cmd_route_set)
+
+    p_clear = rsub.add_parser(
+        "clear", parents=common,
+        help="Remove a receive route (yours, or one that pays you as destination)",
+    )
+    _key_group(p_clear)
+    p_clear.add_argument("--owner", help="Route owner (default: your key's address)")
+    _tx_flags(p_clear)
+    _request_flags(p_clear)
+    p_clear.set_defaults(func=cmd_route_clear)
+
+    p_show = rsub.add_parser("show", parents=common,
+                             help="An account's route, routes paying it, and its history")
+    p_show.add_argument("--address", help="Address (default: your key's)")
+    _key_group(p_show, required=False)
+    p_show.add_argument("--limit", type=int, default=50, help="History entries (1..500)")
+    p_show.add_argument("--capability", action="store_true",
+                        help="Show what this node supports instead")
+    p_show.set_defaults(func=cmd_route_show)
 
 
 def _add_retractable_subparsers(sub) -> None:

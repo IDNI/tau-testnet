@@ -247,6 +247,9 @@ def test_every_commit_site_persists_rule_offers():
         # Escrowed retractable transfers: the open book and resolved commitment
         # are bound into consensus_meta_hash.
         "retractable_transfers",
+        # Receive routes (issue #35): the book root and the activation flag are
+        # bound into consensus_meta_hash.
+        "receive_routes", "receive_routes_active",
     }
 
     # Names bound from the audited builder, anywhere in the module.

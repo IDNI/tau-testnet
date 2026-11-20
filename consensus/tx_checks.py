@@ -7,8 +7,10 @@ from __future__ import annotations
 
 from typing import Any, Optional, Tuple
 
+import tau_defs
 from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
+from consensus.receive_routes import TX_TYPE_RECEIVE_ROUTE_SET, route_spec_destination
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
 from consensus import bls
 
@@ -56,6 +58,9 @@ def _recipient_keys(tx: dict) -> list:
     tx_type = tx.get("tx_type", "user_tx")
     if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER):
         return [("recipient_pubkey", tx.get("recipient_pubkey"))]
+    if tx_type == TX_TYPE_RECEIVE_ROUTE_SET:
+        # A route to a key no one can hold would burn the routed share.
+        return [("destination_pubkey", tx.get("destination_pubkey"))]
     if tx_type in (TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST):
         keys = (
             [("recipient_pubkey", tx.get("recipient_pubkey"))]
@@ -64,6 +69,12 @@ def _recipient_keys(tx: dict) -> list:
         approvers = tx.get("approvers")
         if isinstance(approvers, dict):
             keys.extend(("approver", key) for key in approvers.values())
+        if (tx_type == TX_TYPE_RULE_CHANGE_REQUEST
+                and tx.get("kind") == tau_defs.RULE_CHANGE_KIND_SET_RECEIVE_ROUTE):
+            # A parked route install names its destination inside rule_text.
+            destination = route_spec_destination(tx.get("rule_text"))
+            if destination is not None:
+                keys.append(("destination_pubkey", destination))
         return keys
     return []
 

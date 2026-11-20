@@ -780,3 +780,48 @@ def compute_retractable_book_root(
     out.extend(encode_uint64(int(resolved_count)))
     out.extend(encode_hash32(resolved_acc))
     return blake3(bytes(out)).digest()
+
+
+# --- Receive routes (issue #35) ----------------------------------------------
+
+DOMAIN_RECEIVE_ROUTE_BOOK_V1 = b"tau.receive_route.book.v1"
+
+
+def encode_receive_route_entry(
+    owner_pubkey: Any,
+    destination_pubkey: Any,
+    bps: int,
+    min_amount: int,
+    active_from: int,
+    expires_at: int,
+    locked: bool,
+    version: int,
+    installed_at: int = 0,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(encode_pubkey48(destination_pubkey))
+    out.extend(encode_uint32(int(bps)))
+    out.extend(encode_uint64(int(min_amount)))
+    out.extend(encode_uint64(int(active_from)))
+    out.extend(encode_uint64(int(expires_at)))
+    out.extend(encode_bool(bool(locked)))
+    out.extend(encode_uint64(int(version)))
+    # Starts a locked route's notice period, so nodes must agree on it.
+    out.extend(encode_uint64(int(installed_at)))
+    return bytes(out)
+
+
+def compute_receive_route_book_root(entries: list) -> bytes:
+    """BLAKE3 of the installed receive routes, sorted by encoding (owner first).
+
+    `entries` are tuples in encode_receive_route_entry argument order. One route
+    per owner, so the owner prefix makes the order total.
+    """
+    encoded = sorted(encode_receive_route_entry(*e) for e in (entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RECEIVE_ROUTE_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    return blake3(bytes(out)).digest()

@@ -36,6 +36,15 @@ def get_args():
     )
     parser.add_argument("--network-id", type=str, default="tau-testnet-v2", help="Network ID")
     parser.add_argument(
+        "--receive-routes", action="store_true",
+        help=(
+            "Activate receive routes (issue #35) from block 0. For a FRESH chain "
+            "only: on an existing chain this is the governance patch "
+            "receive_routes_active. Off by default so a genesis generated without "
+            "it stays byte-identical."
+        ),
+    )
+    parser.add_argument(
         "--approval-slots", action="store_true",
         help=(
             "Activate co-signature approval slots (i18-i25) from block 0. For a "
@@ -319,6 +328,7 @@ def main():
         args.vote_quorum, args.eligibility_mode, args.fee_beneficiary,
         approval_slots_active=bool(getattr(args, "approval_slots", False)),
         faucet_amount=args.faucet_amount,
+        receive_routes_active=bool(getattr(args, "receive_routes", False)),
     )
     consensus_meta = {
         "proof_scheme": "bls_header_sig",

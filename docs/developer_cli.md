@@ -179,6 +179,7 @@ The full registry (28 names, `app/container.py`):
 | `getretractable` | `getretractable <retractable_id>` — 64 hex chars |
 | `getretractables` | `getretractables <address> [in\|out\|all]` (default `all`) |
 | `getretractableid` | `getretractableid <json_payload>` |
+| `getreceiveroute` | `getreceiveroute <address> [limit]` (default 50), or `getreceiveroute capability` |
 
 `gettimestamp` and `getcurrenttimestamp` share one handler, and it hardcodes
 its own name: a `getcurrenttimestamp` request comes back with
@@ -788,3 +789,35 @@ tau-testnet --host 10.0.0.5 --port 65432 governance
 - [`README.md`](../README.md) — high-level overview, standalone Docker node, follower mode.
 - [`WALLET_USAGE.md`](../WALLET_USAGE.md) — original `wallet.py` usage (still supported).
 - `packaging.md` — wheel/sdist builds, GHCR releases, tag workflow.
+
+## Receive routes
+
+Split a share of every credit an account receives to another address. Semantics
+in the [README](../README.md#receive-routes); long-form guide:
+[receive-routes.md](receive-routes.md).
+
+```bash
+tau-testnet route set --key bob --to <pk> --percent 20
+tau-testnet route set --key bob --to <pk> --bps 1000 --min-amount 100 --active-from-time 1790000000
+tau-testnet route set --key bob --to <pk> --percent 10 --expires-at-time 1830000000 --locked
+tau-testnet route clear --key bob
+tau-testnet route clear --key treasury --owner <bob_pk>
+# guard-blocked owner: park the change for approval (rule_change_request kind 6 / 7)
+tau-testnet route set --key bob --to <pk> --percent 20 --request --approver 18=<carol_pk>
+tau-testnet route clear --key bob --request --approver 18=<carol_pk>
+tau-testnet route show --key bob --limit 20
+tau-testnet route show --capability
+```
+
+`--percent` takes up to two decimals; `--bps` is exact. `set` and `clear` pay the
+ordinary fee and take `--fee`, `--expiry`, `--expire-in`, `--expire-at-height` and
+`--dry-run` like the other transaction commands. With `--request`, `--expire-in`
+defaults to twice the guard delay so the time escape can still release it.
+
+Raw transactions (root fields only):
+
+| `tx_type` | Signed fields beyond the envelope |
+|---|---|
+| `receive_route_set` | `destination_pubkey`, `route_bps`, `min_amount`, `active_from_time`, `expires_at_time`, `locked` (each optional field is signed as `null` when absent) |
+| `receive_route_clear` | `route_owner_pubkey` |
+| `rule_change_request` kind 6 / 7 | `rule_text` is a route spec (`receive_route_v1 destination=<hex> bps=<n> ...`) for kind 6, empty for kind 7; see [receive-routes.md](receive-routes.md#the-rule-change-guard) |

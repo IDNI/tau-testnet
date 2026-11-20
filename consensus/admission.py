@@ -60,6 +60,16 @@ from consensus.retractable import (
     validate_park_shape,
 )
 from consensus.tx_checks import check_transfer, validate_bls_pubkey
+from consensus.receive_routes import (
+    CLEARED_BY_OWNER,
+    TX_TYPE_RECEIVE_ROUTE_CLEAR,
+    TX_TYPE_RECEIVE_ROUTE_SET,
+    ReceiveRouteShapeError,
+    RouteClear,
+    parse_route_clear,
+    parse_route_set,
+    parse_route_spec,
+)
 from consensus.governance import (
     normalize_validator_delta,
     normalize_validator_set,
@@ -69,6 +79,7 @@ from consensus.governance import (
     HOST_CONTRACT_PATCH_KEYS,
     validate_fee_beneficiary,
     validate_approval_slots_active,
+    validate_receive_routes_active,
 )
 
 logger = logging.getLogger(__name__)
@@ -534,6 +545,10 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         next_validators = (validators - removals) | additions
         if not next_validators:
             return "Validator delta would leave no active validators."
+    if "receive_routes_active" in patch:
+        err = validate_receive_routes_active(patch["receive_routes_active"])
+        if err:
+            return f"receive_routes_active: {err}"
     if "approval_slots_active" in patch:
         err = validate_approval_slots_active(patch["approval_slots_active"])
         if err:
@@ -1398,13 +1413,34 @@ def _rule_change_precondition_error(request, tip_view: TipAdmissionView) -> Opti
         )
         if rebuilt.hex() != request.offer_id:
             return "rule text does not match the offer digest"
+    elif request.kind in (tau_defs.RULE_CHANGE_KIND_SET_RECEIVE_ROUTE,
+                          tau_defs.RULE_CHANGE_KIND_CLEAR_RECEIVE_ROUTE):
+        # Judged now as well as at release, with the same book methods the
+        # direct path uses: a change that could not be written today is refused
+        # instead of parked to fail later. Release re-checks at its own time.
+        if not receive_routes_active(tip_view):
+            return "receive routes are not active on this chain"
+        book, unavailable = _route_book_or_refusal(tip_view)
+        if unavailable is not None:
+            return "receive route state is unavailable on this node"
+        ts = tip_view.next_block_timestamp
+        if request.kind == tau_defs.RULE_CHANGE_KIND_SET_RECEIVE_ROUTE:
+            route = parse_route_spec(request.body, sender)
+            err = validate_bls_pubkey(route.destination_pubkey, "destination_pubkey")
+            if err:
+                return err
+            check = book.can_install(route, ts)
+        else:
+            check = book.can_clear(RouteClear(sender, sender), ts)
+        if not check.ok:
+            return check.reason
     return None
 
 
 def validate_rule_change_request_payload(
     tx: Dict, tip_view: TipAdmissionView
 ) -> AdmissionResult:
-    """Screens for parking a change to the sender's policy or guard.
+    """Screens for parking a change to the sender's policy, guard or receive route.
 
     The guard is deliberately not consulted: a request is how a change gets
     approved. Bodies are screened, not built; the build happens when the change
@@ -1618,6 +1654,118 @@ def validate_retract_transfer_payload(
     return success({"retractable_id": request.retractable_id.hex()})
 
 
+# --- Receive routes (issue #35) ----------------------------------------------
+
+def _route_refusal(check) -> AdmissionResult:
+    """A refused `can_install` / `can_clear`, with the code the book gave it."""
+    return format_error(f"Receive route rejected: {check.reason}.", code=check.code)
+
+
+def _routes_inactive_error() -> AdmissionResult:
+    return format_error(
+        "Receive routes are not active on this chain. The feature activates by "
+        "governance patch (receive_routes_active).",
+        code="FEATURE_INACTIVE",
+    )
+
+
+def receive_routes_active(tip_view) -> bool:
+    """Whether the canonical tip has receive routes switched on."""
+    return getattr(tip_view, "receive_routes_active", False) is True
+
+
+def _route_book_or_refusal(tip_view: TipAdmissionView):
+    """(book, None), or (None, refusal) when the persisted book cannot be read.
+
+    Fails closed: an unreadable book must not look empty, or a change to a
+    locked route would pass admission.
+    """
+    try:
+        return tip_view.receive_route_book(), None
+    except Exception as exc:
+        logger.error("receive route state unavailable at admission: %s", exc)
+        return None, format_error(
+            "Receive route state is unavailable on this node.",
+            code="RECEIVE_ROUTE_STATE_UNAVAILABLE",
+        )
+
+
+def _route_guard_refusal(tip_view, owner: str, kind: int) -> Optional[AdmissionResult]:
+    """The owner's guard verdict, pointing at the parked-request path."""
+    refusal = _rule_change_refusal(tip_view, owner, kind)
+    if refusal is None:
+        return None
+    return format_error(
+        "Your rule-change guard requires approval for this change: park it as a "
+        f"rule_change_request of kind {kind} (tau-testnet route ... --request).",
+        code="RULE_CHANGE_NEEDS_APPROVAL",
+    )
+
+
+def validate_receive_route_set_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for installing or replacing the sender's receive route.
+
+    The shape and the lock are judged by the same `ReceiveRouteBook.can_install`
+    block apply calls, against the persisted book; the fee runs on the sendtx
+    path. The rule-change guard is consulted last, as for an o5 policy change.
+    """
+    if not receive_routes_active(tip_view):
+        return _routes_inactive_error()
+    try:
+        route = parse_route_set(tx)
+    except ReceiveRouteShapeError as exc:
+        return format_error(f"Malformed receive_route_set: {exc}.", code="INVALID_RECEIVE_ROUTE")
+
+    book, unavailable = _route_book_or_refusal(tip_view)
+    if unavailable is not None:
+        return unavailable
+    check = book.can_install(route, tip_view.next_block_timestamp)
+    if not check.ok:
+        return _route_refusal(check)
+
+    refusal = _route_guard_refusal(
+        tip_view, route.owner_pubkey, tau_defs.RULE_CHANGE_KIND_SET_RECEIVE_ROUTE
+    )
+    if refusal is not None:
+        return refusal
+
+    current = book.get(route.owner_pubkey)
+    return success({
+        "receive_route": route.to_dict(),
+        "replaces": current.to_dict() if current is not None else None,
+    })
+
+
+def validate_receive_route_clear_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for removing a receive route, by its owner or its destination."""
+    if not receive_routes_active(tip_view):
+        return _routes_inactive_error()
+    try:
+        request = parse_route_clear(tx)
+    except ReceiveRouteShapeError as exc:
+        return format_error(f"Malformed receive_route_clear: {exc}.", code="INVALID_RECEIVE_ROUTE")
+
+    book, unavailable = _route_book_or_refusal(tip_view)
+    if unavailable is not None:
+        return unavailable
+    check = book.can_clear(request, tip_view.next_block_timestamp)
+    if not check.ok:
+        return _route_refusal(check)
+
+    if check.cleared_by == CLEARED_BY_OWNER:
+        refusal = _route_guard_refusal(
+            tip_view, request.owner_pubkey, tau_defs.RULE_CHANGE_KIND_CLEAR_RECEIVE_ROUTE
+        )
+        if refusal is not None:
+            return refusal
+
+    return success({"route_owner_pubkey": request.owner_pubkey, "cleared_by": check.cleared_by})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -1728,6 +1876,12 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
          return validate_retract_transfer_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_RECEIVE_ROUTE_SET:
+         return validate_receive_route_set_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_RECEIVE_ROUTE_CLEAR:
+         return validate_receive_route_clear_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

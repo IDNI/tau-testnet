@@ -257,6 +257,8 @@ function init() {
     });
 
     btnRefresh.addEventListener('click', refreshInfo);
+    const btnRouteClear = document.getElementById('btn-route-clear');
+    if (btnRouteClear) btnRouteClear.addEventListener('click', onClearReceiveRoute);
     if (btnGetState) btnGetState.addEventListener('click', () => sendRpc('gettaustate'));
     btnSend.addEventListener('click', onSendTransaction);
     btnClearLogs.addEventListener('click', () => logsDiv.innerHTML = '');
@@ -515,6 +517,11 @@ function handleServerResponse(msg) {
             }));
             break;
 
+        case 'getreceiveroute':
+            // Silent on error: a node with the feature off simply has no route to show.
+            renderReceiveRoute(ok ? data : null);
+            break;
+
         case 'getapprovalrequests':
             if (ok) renderPolicyRequests(data);
             else log(`getapprovalrequests: ${errMsg}`, 'error');
@@ -697,6 +704,7 @@ function setWallet(privKey, pubKey) {
 
     // Reset pending sequence when switching wallets
     pendingSequence = null;
+    renderReceiveRoute(null);
 
     checkGovPanelState();
     if (isConnected) refreshInfo();
@@ -711,6 +719,83 @@ function refreshInfo() {
 
     // Get Sequence
     sendRpc(`getsequence ${pubHex}`);
+
+    // Receive route (issue #35); limit 1 keeps the history part small.
+    sendRpc(`getreceiveroute ${pubHex} 1`);
+}
+
+// --- Receive route status (issue #35) ---
+// The chain cannot tell the owner from someone holding the owner's key, so the
+// wallet shows any route on the open account, and loudly a locked one still in
+// its notice period: that is the only time it can still be cleared.
+const ROUTE_LOCK_NOTICE_SECONDS = 604800; // 7 days, consensus/receive_routes.py LOCK_NOTICE_SECONDS
+
+function formatUnixTimeUtc(t) {
+    return new Date(t * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+}
+
+// What to show for a route as getreceiveroute reports it, or null for nothing.
+// level picks the alert style; clearable says whether the owner can still clear it.
+function receiveRouteNotice(route, nowSec) {
+    if (!route || typeof route !== 'object' || route.status === 'expired') return null;
+    const dest = String(route.destination_pubkey || '');
+    const to = `${Number(route.bps) / 100}% of incoming payments to ${dest.slice(0, 12)}…`;
+    const until = route.expires_at_time ? ` until ${formatUnixTimeUtc(route.expires_at_time)}` : '';
+    if (route.locked && route.status === 'scheduled' && Number.isInteger(route.binds_from_time)) {
+        const left = route.binds_from_time - nowSec;
+        const when = left <= 0 ? 'any moment now'
+            : left < 86400 ? 'in under a day'
+            : `in about ${Math.ceil(left / 86400)} days`;
+        return {
+            level: 'danger',
+            clearable: true,
+            text: `A locked receive route is pending on this account: ${to}${until}. `
+                + `It starts and locks on ${formatUnixTimeUtc(route.binds_from_time)} (${when}); `
+                + `after that only its destination can release it. If you did not set this up, `
+                + `your key may be compromised: clear the route now and move your funds to a new key.`,
+        };
+    }
+    if (route.locked) {
+        return {
+            level: 'secondary',
+            clearable: false,
+            text: `Locked receive route: ${to}${until}. Only its destination can release it early.`,
+        };
+    }
+    const from = route.status === 'scheduled' && route.active_from_time
+        ? ` from ${formatUnixTimeUtc(route.active_from_time)}` : '';
+    return {
+        level: 'info',
+        clearable: true,
+        text: `Receive route: ${to}${from}${until}. You can clear it at any time.`,
+    };
+}
+
+function renderReceiveRoute(data) {
+    const box = document.getElementById('route-notice');
+    const textEl = document.getElementById('route-notice-text');
+    const btn = document.getElementById('btn-route-clear');
+    if (!box || !textEl || !btn) return;
+    const notice = receiveRouteNotice(data && data.route, Math.floor(Date.now() / 1000));
+    if (!notice) {
+        box.style.display = 'none';
+        return;
+    }
+    box.className = `alert alert-${notice.level} py-2 px-2 small mt-2 mb-2`;
+    box.setAttribute('role', notice.level === 'danger' ? 'alert' : 'status');
+    textEl.textContent = notice.text;
+    btn.style.display = notice.clearable ? '' : 'none';
+    box.style.display = '';
+}
+
+// Clears through the usual request path: the review dialog comes first, and an
+// account with a guard parks the request for its approvers.
+function onClearReceiveRoute() {
+    const kindSelect = document.getElementById('pc-kind');
+    if (!kindSelect) return;
+    kindSelect.value = '7';
+    updatePolicyKindFields();
+    onSendPolicyRequest();
 }
 
 
@@ -1999,8 +2084,9 @@ const guardTemplates = {
 # ANY POLICY CHANGE NEEDS A CO-SIGNER
 # ---------------------------------------------------------
 # Every change to your o5 policy -- set, revoke, accept an offer, and
-# any change to this guard -- is blocked until co-signer X has voted
-# to approve the request. A stolen key alone cannot change your policy.
+# any change to this guard or to your receive route -- is blocked until
+# co-signer X has voted to approve the request. A stolen key alone
+# cannot change your policy or redirect what you receive.
 #
 # i18[t] : approval slot, bv[384]. The node writes X's public key here
 #          once X's signed approval vote is verified; otherwise 0.
@@ -2014,8 +2100,9 @@ always ((i18[t]:bv[384] = { #xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 # 2 OF 3 CO-SIGNERS FOR ANY POLICY CHANGE
 # ---------------------------------------------------------
 # Every change to your o5 policy -- set, revoke, accept an offer, and
-# any change to this guard -- is blocked until at least two of your
-# three co-signers have voted to approve the request.
+# any change to this guard or to your receive route -- is blocked until
+# at least two of your three co-signers have voted to approve the
+# request.
 #
 # i18/i19/i20 : approval slots, bv[384]. The node writes an approver's
 #               public key into their slot once their signed approval
@@ -2032,20 +2119,24 @@ always (( ((i18[t]:bv[384] = { #xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 # REVOKING NEEDS A CO-SIGNER, SETTING A NEW POLICY DOES NOT
 # ---------------------------------------------------------
 # WEAKER THAN THE OTHER GUARDS. Revoking your policy (kind 2) or your
-# guard (kind 5) is blocked until co-signer X approves, but SETTING a
-# new policy (kind 1), accepting an offer (kind 3) and setting a guard
+# guard (kind 5), and any change to your receive route (kind 6 set,
+# kind 7 clear), is blocked until co-signer X approves. SETTING a new
+# policy (kind 1), accepting an offer (kind 3) and setting a guard
 # (kind 4) are allowed without anyone. A thief holding your key can
 # therefore replace your policy with a permissive one and then drain
-# the account. Use it only to stop accidental or lone revocations.
+# the account, though not quietly redirect your future receipts. Use
+# it only to stop accidental or lone revocations.
 #
 # i1[t]  : kind of change: 1 set, 2 revoke, 3 accept, 4 set guard,
-#          5 revoke guard (bv[24])
+#          5 revoke guard, 6 set receive route, 7 clear receive
+#          route (bv[24])
 # i18[t] : approval slot, bv[384]; holds X's public key once X's
 #          signed approval vote is verified, otherwise 0
 # o5[t]  : verdict (bv[24]: 0 = block the change, 1 = allow it)
 # ---------------------------------------------------------
 # Replace the key with X's 96-character public key hex.
-always ((( (i1[t]:bv[24] = { #x000002 }:bv[24]) || (i1[t]:bv[24] = { #x000005 }:bv[24]) )
+always ((( (i1[t]:bv[24] = { #x000002 }:bv[24]) || (i1[t]:bv[24] = { #x000005 }:bv[24])
+ || (i1[t]:bv[24] = { #x000006 }:bv[24]) || (i1[t]:bv[24] = { #x000007 }:bv[24]) )
  && !(i18[t]:bv[384] = { #xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa }:bv[384])) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])).`
 };
 
@@ -2080,7 +2171,9 @@ const RULE_CHANGE_KINDS = {
     2: 'Revoke policy',
     3: 'Accept offer',
     4: 'Set guard',
-    5: 'Revoke guard'
+    5: 'Revoke guard',
+    6: 'Set receive route',
+    7: 'Clear receive route'
 };
 const RULE_CHANGE_DELAY_BLOCKS = 1000;
 const MAX_APPROVAL_WINDOW_BLOCKS = 10000;
@@ -2104,15 +2197,52 @@ function parseApproverLines(text) {
     return out;
 }
 
+// A kind-6 request's rule_text is a route spec (issue #35), checked by the same
+// rules as the node's parse_route_spec: the tag, then key=value fields in
+// canonical decimal; destination and bps are required; version is left out
+// because the request's sequence number supplies it. Returns the problem, or ''.
+function routeSpecProblem(text) {
+    const tokens = String(text || '').trim().split(/\s+/);
+    if (tokens[0] !== 'receive_route_v1') return "A route spec starts with receive_route_v1.";
+    const allowed = ['destination', 'bps', 'min_amount', 'active_from_time', 'expires_at_time', 'locked'];
+    const fields = {};
+    for (const token of tokens.slice(1)) {
+        const eq = token.indexOf('=');
+        const key = eq < 0 ? token : token.slice(0, eq);
+        if (key === 'version') return "Leave version out: the request's sequence number is the route version.";
+        if (eq < 0 || !allowed.includes(key)) return `Unknown route spec field: ${token}`;
+        if (key in fields) return `Route spec field ${key} is given twice.`;
+        fields[key] = token.slice(eq + 1);
+    }
+    if (!/^[0-9a-f]{96}$/.test(fields.destination || '')) {
+        return "destination must be a 96-hex public key in lower case.";
+    }
+    if (!('bps' in fields)) return "A route spec needs bps (basis points: 2000 is 20%).";
+    for (const key of ['bps', 'min_amount', 'active_from_time', 'expires_at_time']) {
+        if (key in fields && !/^(0|[1-9][0-9]*)$/.test(fields[key])) {
+            return `${key} must be a whole number without leading zeros.`;
+        }
+        if (key in fields && BigInt(fields[key]) > 18446744073709551615n) {
+            return `${key} is larger than an unsigned 64-bit number.`;
+        }
+    }
+    if ('locked' in fields && fields.locked !== '0' && fields.locked !== '1') return "locked must be 0 or 1.";
+    return '';
+}
+
 // Every consensus-defaulted field is sent explicitly so the signed bytes are the ones the node rebuilds.
 function buildRuleChangeRequestBody(draft) {
     const kind = Number(draft.kind);
-    if (!Number.isInteger(kind) || !(kind in RULE_CHANGE_KINDS)) throw new Error("kind must be 1 to 5.");
-    const hasBody = kind === 1 || kind === 3 || kind === 4;
+    if (!Number.isInteger(kind) || !(kind in RULE_CHANGE_KINDS)) throw new Error("kind must be 1 to 7.");
+    const hasBody = kind === 1 || kind === 3 || kind === 4 || kind === 6;
     const ruleText = draft.rule_text || '';
     const offerId = (draft.offer_id || '').trim().toLowerCase();
     if (hasBody && !ruleText.trim()) throw new Error("This kind needs a rule text.");
     if (!hasBody && ruleText) throw new Error("This kind carries no rule text.");
+    if (kind === 6) {
+        const problem = routeSpecProblem(ruleText);
+        if (problem) throw new Error(problem);
+    }
     if (kind === 3) {
         if (!/^[0-9a-f]{64}$/.test(offerId)) throw new Error("offer_id must be 64 hex digits.");
     } else if (offerId) {
@@ -2151,8 +2281,15 @@ function liveTauLines(text) {
     return String(text).split('\n').filter((l) => !l.trim().startsWith('#')).join('\n');
 }
 
+// Starting points for a parked route install; replace the placeholders.
+const routeSpecTemplates = {
+    "20% of everything received": "receive_route_v1 destination=<96-hex public key> bps=2000",
+    "Locked 10% until a date": "receive_route_v1 destination=<96-hex public key> bps=1000 expires_at_time=<unix time> locked=1",
+};
+
 function policyTemplatesForKind(kind) {
     if (kind === 4) return guardTemplates;
+    if (kind === 6) return routeSpecTemplates;
     if (kind !== 1) return {};
     const out = {};
     for (const [name, text] of Object.entries(ruleTemplates)) {
@@ -2182,6 +2319,13 @@ function formatRuleChangeSummary(body, expireIn, expireAtHeight) {
     let text = `Transaction Type: rule_change_request\n`
         + `Kind: ${RULE_CHANGE_KINDS[body.kind]} (${body.kind})\n`;
     if (body.offer_id) text += `Offer: ${body.offer_id}\n`;
+    if (body.kind === 6) {
+        const f = Object.fromEntries(body.rule_text.trim().split(/\s+/).slice(1).map(t => t.split('=')));
+        text += `Route: ${(Number(f.bps) / 100).toFixed(2)}% of every credit to ${f.destination}\n`;
+        if (f.locked === '1') text += `Locked until ${f.expires_at_time}, after a ${ROUTE_LOCK_NOTICE_SECONDS / 86400}-day notice period\n`;
+    } else if (body.kind === 7) {
+        text += `Removes this account's receive route\n`;
+    }
     if (body.rule_text) {
         text += body.rule_text.length <= 500
             ? `Body:\n${body.rule_text}\n`
@@ -2220,7 +2364,7 @@ async function onSendPolicyRequest() {
         if (!Number.isInteger(fee) || fee < 0) throw new Error("Fee limit must be a non-negative integer.");
 
         if (kind === 3) ruleText = await policyFetchOfferText(offerId.trim().toLowerCase());
-        const body = buildRuleChangeRequestBody({ kind, rule_text: kind === 2 || kind === 5 ? '' : ruleText, offer_id: offerId, approvers });
+        const body = buildRuleChangeRequestBody({ kind, rule_text: kind === 2 || kind === 5 || kind === 7 ? '' : ruleText, offer_id: offerId, approvers });
         const expireAtHeight = tipHeight + 1 + expireIn;
 
         const ok = await customConfirm("Please review the transaction details:\n\n"
@@ -2305,7 +2449,9 @@ function refreshPolicyRequests() {
 
 function updatePolicyKindFields() {
     const kind = Number(document.getElementById('pc-kind').value);
-    document.getElementById('pc-body-group').style.display = (kind === 1 || kind === 4) ? '' : 'none';
+    document.getElementById('pc-body-group').style.display = (kind === 1 || kind === 4 || kind === 6) ? '' : 'none';
+    const bodyLabel = document.getElementById('pc-body-label');
+    if (bodyLabel) bodyLabel.textContent = kind === 6 ? 'Route spec' : 'Rule text';
     document.getElementById('pc-offer-group').style.display = kind === 3 ? '' : 'none';
     const select = document.getElementById('pc-template');
     select.textContent = '';

@@ -95,6 +95,9 @@ def node(temp_database, mock_policy_evaluators, monkeypatch):
         patch.object(TipAdmissionView, "approval_slots_active",
                      new_callable=PropertyMock, return_value=True),
         patch.object(TipAdmissionView, "get_offer", return_value=_offer_row()),
+        patch.object(TipAdmissionView, "receive_route_book", return_value=_route_book()),
+        patch.object(TipAdmissionView, "receive_routes_active",
+                     new_callable=PropertyMock, return_value=True),
     ]
     mocks = [p.start() for p in patches]
     mocks[3].is_set.return_value = True
@@ -115,6 +118,13 @@ def _offer_row():
     return {"offer_id": offer.offer_id_hex, "offerer_pubkey": SENDER,
             "recipient_pubkey": RECIPIENT, "rule_text": OFFER_RULE,
             "expire_at_height": offer.expire_at_height, "status": "offered"}
+
+
+def _route_book():
+    from consensus.receive_routes import ReceiveRoute, ReceiveRouteBook
+    book = ReceiveRouteBook()
+    book.install(ReceiveRoute(RECIPIENT, APPROVER, 2000))
+    return book
 
 
 def _envelope(tx_type, sender, fee_limit, **fields):
@@ -147,6 +157,11 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
+    if kind == "receive_route_set":
+        return _envelope(kind, SENDER, fee_limit, destination_pubkey=RECIPIENT,
+                         route_bps=2000)
+    if kind == "receive_route_clear":
+        return _envelope(kind, RECIPIENT, fee_limit, route_owner_pubkey=RECIPIENT)
     raise AssertionError(kind)
 
 
@@ -158,7 +173,7 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request"]
+               "rule_change_request", "receive_route_set", "receive_route_clear"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

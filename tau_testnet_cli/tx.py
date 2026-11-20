@@ -558,12 +558,14 @@ def build_rule_change_request_tx(
     """Construct a ``tx_type='rule_change_request'`` payload (without signature).
 
     Kinds 1 and 4 carry the clause in ``rule_text``; kind 3 carries the exact
-    offered text and the offer id; kinds 2 and 5 carry neither. Zero approvers is
-    valid: the time escape alone can release the request.
+    offered text and the offer id; kind 6 (set receive route) carries a route
+    spec (see ``consensus.receive_routes.route_spec_text``); kinds 2, 5 and 7
+    carry neither. Zero approvers is valid: the time escape alone can release
+    the request.
     """
-    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5):
-        raise ValueError("kind must be 1..5")
-    has_body = kind in (1, 3, 4)
+    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5, 6, 7):
+        raise ValueError("kind must be 1..7")
+    has_body = kind in (1, 3, 4, 6)
     if has_body and not (isinstance(rule_text, str) and rule_text.strip()):
         raise ValueError("this kind needs a non-empty rule text")
     if not has_body and rule_text:
@@ -742,4 +744,81 @@ def build_retract_transfer_tx(
         "expire_at_height": _check_expire_at_height(expire_at_height),
         "fee_limit": str(fee_limit),
         "retractable_id": retractable_id.lower(),
+    }
+
+
+def build_receive_route_set_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    destination_pubkey: str,
+    route_bps: int,
+    min_amount: int | None = None,
+    active_from_time: int | None = None,
+    expires_at_time: int | None = None,
+    locked: bool = False,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='receive_route_set'`` payload (without signature).
+
+    Installs or replaces the sender's receive route: ``route_bps`` basis points
+    of every eligible credit to the sender go to ``destination_pubkey``.
+    A locked route needs ``expires_at_time``; until then only the destination
+    can remove it.
+    """
+    if not isinstance(destination_pubkey, str) or len(destination_pubkey) != 96:
+        raise ValueError("destination_pubkey must be a 96-character hex public key")
+    if destination_pubkey.lower() == str(sender_pubkey).lower():
+        raise ValueError("the destination must not be the receiving account")
+    if not isinstance(route_bps, int) or isinstance(route_bps, bool) or not 1 <= route_bps <= 9000:
+        raise ValueError("route_bps must be an integer in 1..9000 (0.01% to 90%)")
+    if locked and expires_at_time is None:
+        raise ValueError("a locked route needs an expiry (--expires-at-time)")
+    tx = {
+        "tx_type": "receive_route_set",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "destination_pubkey": destination_pubkey.lower(),
+        "route_bps": route_bps,
+    }
+    for name, value in (("min_amount", min_amount), ("active_from_time", active_from_time),
+                        ("expires_at_time", expires_at_time)):
+        if value is not None:
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+            tx[name] = value
+    if locked:
+        tx["locked"] = True
+    return tx
+
+
+def build_receive_route_clear_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    route_owner_pubkey: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='receive_route_clear'`` payload (without signature).
+
+    Signed by the route's owner (refused while the route is locked) or by its
+    destination (always allowed: it only gives up the destination's share).
+    """
+    if not isinstance(route_owner_pubkey, str) or len(route_owner_pubkey) != 96:
+        raise ValueError("route_owner_pubkey must be a 96-character hex public key")
+    return {
+        "tx_type": "receive_route_clear",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "route_owner_pubkey": route_owner_pubkey.lower(),
     }

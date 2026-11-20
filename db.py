@@ -476,6 +476,61 @@ def init_db():
                     PRIMARY KEY (retractable_id, block_hash, outcome)
                 );
             ''')
+            # Receive routes (issue #35): one row per owner. Bound into
+            # consensus_meta_hash, so written in the same transaction as accounts.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS receive_routes_v1 (
+                    owner_pubkey       TEXT PRIMARY KEY,
+                    destination_pubkey TEXT NOT NULL,
+                    bps                INTEGER NOT NULL,
+                    min_amount         INTEGER NOT NULL DEFAULT 0,
+                    active_from        INTEGER NOT NULL DEFAULT 0,
+                    expires_at         INTEGER NOT NULL DEFAULT 0,
+                    locked             INTEGER NOT NULL DEFAULT 0,
+                    version            INTEGER NOT NULL DEFAULT 0,
+                    installed_at       INTEGER NOT NULL DEFAULT 0
+                );
+            ''')
+            route_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(receive_routes_v1);").fetchall()
+            }
+            if "installed_at" not in route_cols:
+                # A table created by an earlier build of this feature.
+                conn.execute(
+                    "ALTER TABLE receive_routes_v1 ADD COLUMN installed_at "
+                    "INTEGER NOT NULL DEFAULT 0;"
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_receive_routes_destination "
+                "ON receive_routes_v1(destination_pubkey);"
+            )
+            # Node-local history of splits and route changes, keyed per block so a
+            # reorg needs no cleanup; canonicality is resolved at query time.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS receive_route_events (
+                    block_hash   TEXT NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    event_index  INTEGER NOT NULL,
+                    tx_hash      TEXT,
+                    kind         TEXT NOT NULL,
+                    owner_pubkey TEXT NOT NULL,
+                    destination_pubkey TEXT NOT NULL,
+                    payload      TEXT NOT NULL,
+                    PRIMARY KEY (block_hash, event_index)
+                );
+            ''')
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_receive_route_events_owner "
+                "ON receive_route_events(owner_pubkey);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_receive_route_events_destination "
+                "ON receive_route_events(destination_pubkey);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_receive_route_events_tx "
+                "ON receive_route_events(tx_hash);"
+            )
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -2243,7 +2298,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, receive_routes: List[Dict] | None = None, receive_routes_active: bool | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2281,6 +2336,8 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 approval_requests=approval_requests,
                 approval_slots_active=approval_slots_active,
                 retractable_transfers=retractable_transfers,
+                receive_routes=receive_routes,
+                receive_routes_active=receive_routes_active,
                 rule_change_requests=rule_change_requests,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
@@ -2346,7 +2403,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, receive_routes: List[Dict] | None = None, receive_routes_active: bool | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2555,6 +2612,17 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
     if retractable_transfers is not None:
         _write_retractable_rows(retractable_transfers)
 
+    if receive_routes is not None:
+        _write_receive_route_rows(receive_routes)
+
+    if receive_routes_active is not None:
+        # One-way activation flag (issue #35), persisted like
+        # approval_slots_active so a restart keeps the feature on.
+        _db_conn.execute(
+            'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+            ('receive_routes_active', '1' if receive_routes_active else '0')
+        )
+
     if max_rule_txs_per_block is not None:
         # Governance-activated value; persisted verbatim so a reload
         # reproduces the same per-block budget as a from-genesis replay.
@@ -2589,6 +2657,152 @@ def _write_retractable_rows(state: Dict) -> None:
             json.dumps({'count': int(state['resolved_count']), 'acc': state['resolved_acc']}),
         )
     )
+
+
+def _write_receive_route_rows(rows: List[Dict]) -> None:
+    """Full replace of the installed receive routes."""
+    _db_conn.execute('DELETE FROM receive_routes_v1')
+    for row in rows:
+        _db_conn.execute(
+            'INSERT INTO receive_routes_v1 (owner_pubkey, destination_pubkey, bps, '
+            'min_amount, active_from, expires_at, locked, version, installed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                row['owner_pubkey'],
+                row['destination_pubkey'],
+                int(row['bps']),
+                int(row['min_amount']),
+                int(row['active_from']),
+                int(row['expires_at']),
+                1 if row['locked'] else 0,
+                int(row['version']),
+                int(row.get('installed_at', 0)),
+            )
+        )
+
+
+def load_receive_routes() -> List[tuple]:
+    """Installed routes exactly as stored, ordered by owner.
+
+    Rows are (owner, destination, bps, min_amount, active_from, expires_at,
+    locked, version, installed_at).
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT owner_pubkey, destination_pubkey, bps, min_amount, active_from, '
+            'expires_at, locked, version, installed_at FROM receive_routes_v1 '
+            'ORDER BY owner_pubkey'
+        ).fetchall()
+    return [
+        (r[0], r[1], int(r[2]), int(r[3]), int(r[4]), int(r[5]), bool(r[6]), int(r[7]),
+         int(r[8]))
+        for r in rows
+    ]
+
+
+def record_receive_route_events(block_hash: str, block_number: int, events) -> None:
+    """Node-local history of a block's receive-route splits and changes.
+
+    Each event is a dict from the engine plus `tx_hash` (None for a sweep).
+    Diagnostic only: a failure is logged and never reaches block commit.
+    """
+    if not events:
+        return
+    try:
+        if _db_conn is None:
+            init_db()
+        rows = []
+        for index, event in enumerate(events):
+            owner = event.get('recipient_pubkey') or event.get('owner_pubkey') or ''
+            rows.append((
+                block_hash, int(block_number), index, event.get('tx_hash'),
+                str(event.get('kind', '')), owner,
+                event.get('destination_pubkey') or '',
+                json.dumps(event, sort_keys=True),
+            ))
+        with _db_lock:
+            with _db_conn:
+                _db_conn.executemany(
+                    'INSERT OR IGNORE INTO receive_route_events '
+                    '(block_hash, block_number, event_index, tx_hash, kind, owner_pubkey, '
+                    'destination_pubkey, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                    rows,
+                )
+    except Exception:
+        logger.exception("could not record receive route events")
+
+
+def _canonical_route_events(sql: str, params: tuple, limit: int) -> List[Dict]:
+    """Up to `limit` canonical events, read in pages so a busy address costs
+    what the answer needs rather than its whole history."""
+    if _db_conn is None:
+        init_db()
+    page = max(64, 2 * limit)
+    offset = 0
+    out: List[Dict] = []
+    while len(out) < limit:
+        with _db_lock:
+            rows = _db_conn.execute(sql + ' LIMIT ? OFFSET ?', params + (page, offset)).fetchall()
+        for block_hash, block_number, payload in rows:
+            canonical, _ = get_canonical_confirmation(block_hash, int(block_number))
+            if not canonical:
+                continue
+            event = json.loads(payload)
+            event['block_hash'] = block_hash
+            event['block_number'] = int(block_number)
+            out.append(event)
+            if len(out) >= limit:
+                break
+        if len(rows) < page:
+            break
+        offset += page
+    return out
+
+
+def get_mempool_receive_route_payloads() -> List[str]:
+    """Raw payloads of mempool rows that can concern receive routes.
+
+    A substring prefilter in SQL -- the two route tx types, and rule-change
+    requests, which park guarded route changes (kinds 6 and 7) -- so an RPC
+    parses only these instead of the whole mempool. Callers still parse and
+    check each one.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            "SELECT payload FROM mempool "
+            "WHERE payload LIKE '%receive\\_route\\_%' ESCAPE '\\' "
+            "OR payload LIKE '%rule\\_change\\_request%' ESCAPE '\\' "
+            "ORDER BY received_at ASC"
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def get_canonical_receive_route_events(address: str, limit: int = 50) -> List[Dict]:
+    """Canonical events where `address` is the owner/recipient or the destination,
+    newest first."""
+    return _canonical_route_events(
+        'SELECT block_hash, block_number, payload FROM receive_route_events '
+        'WHERE owner_pubkey = ? OR destination_pubkey = ? '
+        'ORDER BY block_number DESC, event_index DESC',
+        (address, address), max(1, int(limit)),
+    )
+
+
+def get_receive_route_events_for_tx(tx_hash: str, block_hash: str) -> List[Dict]:
+    """The events one confirmed transaction made in the block that carries it."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT payload FROM receive_route_events WHERE tx_hash = ? AND block_hash = ? '
+            'ORDER BY event_index ASC',
+            (tx_hash, block_hash),
+        ).fetchall()
+    return [json.loads(r[0]) for r in rows]
 
 
 def load_retractable_state() -> tuple[List[tuple], int, bytes]:

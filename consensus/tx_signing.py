@@ -37,6 +37,10 @@ from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
 )
+from consensus.receive_routes import (
+    TX_TYPE_RECEIVE_ROUTE_CLEAR,
+    TX_TYPE_RECEIVE_ROUTE_SET,
+)
 from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
     TX_TYPE_RULE_OFFER_ACCEPT,
@@ -123,6 +127,17 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
+    elif tx_type == TX_TYPE_RECEIVE_ROUTE_SET:
+        # Every field that decides where future receipts go is signed: the
+        # route is applied later, to credits no signature of the owner covers.
+        signing_dict["destination_pubkey"] = payload.get("destination_pubkey")
+        signing_dict["route_bps"] = payload.get("route_bps")
+        signing_dict["min_amount"] = payload.get("min_amount")
+        signing_dict["active_from_time"] = payload.get("active_from_time")
+        signing_dict["expires_at_time"] = payload.get("expires_at_time")
+        signing_dict["locked"] = payload.get("locked")
+    elif tx_type == TX_TYPE_RECEIVE_ROUTE_CLEAR:
+        signing_dict["route_owner_pubkey"] = payload.get("route_owner_pubkey")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

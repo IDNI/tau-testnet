@@ -66,6 +66,9 @@ TAU_EVALUATING_TX_TYPES = frozenset({
     "transfer_vote",
     "retractable_transfer",
     "rule_change_request",
+    # Fee-bearing, and the owner's rule-change guard is consulted.
+    "receive_route_set",
+    "receive_route_clear",
 })
 
 

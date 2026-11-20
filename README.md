@@ -285,6 +285,11 @@ tau-testnet retractable list --key alice --role out
 tau-testnet retractable show <retractable_id>
 tau-testnet retractable retract --key alice <retractable_id>
 
+# receive routes (split a share of everything an account receives to another address)
+tau-testnet route set --key bob --to <savings_pubkey> --percent 20
+tau-testnet route show --key bob
+tau-testnet route clear --key bob
+
 # target a remote node
 tau-testnet --host testnet.tau.net --port 65432 status
 ```
@@ -639,6 +644,31 @@ Timing caveats:
 - A retract must be **included in a block** before the release point, not merely sent. A feeless retract sorts last in the mempool under backlog, so retract with margin.
 
 **Upgrade.** This adds a field to the consensus metadata hash with no activation flag, so it needs a regenesis and every node on the same build. An older binary forks at the first park block.
+
+## Receive routes
+
+Long-form guide: [docs/receive-routes.md](docs/receive-routes.md).
+
+An account can install one **receive route**: a share (1 to 9000 basis points, at most 90%) of every eligible credit it receives goes to a fixed destination, split by the node in the same atomic write as the credit. The recipient does not need to be online, and senders cannot bypass it: they still sign "send gross to the recipient".
+
+```bash
+tau-testnet route set --key bob --to <savings_pubkey> --percent 20                 # 20% of every credit
+tau-testnet route set --key bob --to <treasury_pubkey> --bps 1000 --min-amount 100 \
+    --expires-at-time 1830000000 --locked                                          # binding, until expiry
+tau-testnet route show --key bob                                                    # route, inbound routes, history
+tau-testnet route clear --key bob                                                   # owner removes an unlocked route
+tau-testnet route clear --key treasury --owner <bob_pubkey>                         # destination releases it
+```
+
+- **Split.** `routed = floor(gross * bps / 10000)`, `net = gross - routed`. A 20% route on 101 sends 20 to the destination and 81 to the owner. The sender pays the one ordinary fee; routing adds none.
+- **Credits routed.** Ordinary transfers (every leg, from any sender) and retractable releases (claimed payments). Not routed: retract refunds, faucet and genesis grants, fees, and the routed share itself (single hop).
+- **Admin.** `receive_route_set` / `receive_route_clear`, fee-bearing. A locked route cannot be changed or removed by its owner before it expires; its destination can always release it. An owner's rule-change guard is consulted for kinds 6 (set route) and 7 (clear route); a change it blocks is parked as a `rule_change_request` of the same kind (`route set|clear ... --request --approver <slot>=<pk>`) and released by approvals or the time escape.
+- **No book-wide cap.** One route per account bounds the book by the account set; a fixed cap would be a squatting target on a faucet network.
+- **Reads.** `getreceiveroute <address>` and `getreceiveroute capability`; `gettxstatus` lists gross/net/routed/fee per routed credit; `checktx` previews the split; `getaccountstate` shows `receive_route`.
+
+- **Locked routes** have a 7-day notice period after install: they route nothing and the owner can still clear or replace them, so a stolen key cannot capture future receipts unnoticed.
+
+**Upgrade.** Off until activated: a governance patch `{"receive_routes_active": true}` (or `gen_genesis.py --receive-routes` on a fresh chain) turns it on, one way. The flag and the route book enter the consensus meta hash only once set, so no regenesis is needed, and no route transaction is accepted before activation, so validators upgrade first and then vote it in.
 
 ## Mempool policy
 

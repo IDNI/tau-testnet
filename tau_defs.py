@@ -136,6 +136,10 @@ RULE_CHANGE_KIND_REVOKE_POLICY = 2
 RULE_CHANGE_KIND_ACCEPT_OFFER = 3
 RULE_CHANGE_KIND_SET_GUARD = 4
 RULE_CHANGE_KIND_REVOKE_GUARD = 5
+# Receive routes (issue #35): judged by the guard like a policy change, so a
+# stolen key alone cannot redirect what the account receives.
+RULE_CHANGE_KIND_SET_RECEIVE_ROUTE = 6
+RULE_CHANGE_KIND_CLEAR_RECEIVE_ROUTE = 7
 
 # Blocks after which a parked rule-change request may release without approvals.
 RULE_CHANGE_DELAY_BLOCKS = 1000

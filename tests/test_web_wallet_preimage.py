@@ -114,6 +114,7 @@ def _js_policy_preimage(builder: str, arg) -> bytes:
         _function_source(src, "asciiJson")
         + _function_source(src, "canonicalize")
         + kinds
+        + _function_source(src, "routeSpecProblem")
         + _function_source(src, "buildRuleChangeRequestBody")
         + _function_source(src, "buildRuleChangeCancelBody")
         + "const fs = require('fs');\n"
@@ -138,6 +139,9 @@ def _js_policy_preimage(builder: str, arg) -> bytes:
     pytest.param({"kind": 2, "approvers": {}}, id="revoke-policy"),
     pytest.param({"kind": 3, "rule_text": "always ( o5[t] = 1 ).", "offer_id": "A" * 64,
                   "approvers": {"19": "c" * 96}}, id="accept-offer"),
+    pytest.param({"kind": 6, "rule_text": f"receive_route_v1 destination={'b' * 96} bps=2000",
+                  "approvers": {"18": "c" * 96}}, id="set-receive-route"),
+    pytest.param({"kind": 7, "approvers": {}}, id="clear-receive-route"),
 ])
 def test_wallet_rule_change_request_builder_matches_the_node_preimage(draft):
     wire = _js_policy_preimage("buildRuleChangeRequestBody", draft)
@@ -152,3 +156,52 @@ def test_wallet_rule_change_cancel_builder_matches_the_node_preimage():
     payload = {**ENVELOPE, **{k: v for k, v in json.loads(wire).items() if k not in ENVELOPE}}
     assert wire == signing_message_bytes(payload)
     assert payload["request_id"] == "e" * 64
+
+
+DEST = "b" * 96
+ROUTE_SPECS = [
+    f"receive_route_v1 destination={DEST} bps=2000",
+    f"receive_route_v1 destination={DEST} bps=1000 min_amount=5 active_from_time=1 "
+    "expires_at_time=1900000000 locked=1",
+    f"  receive_route_v1   destination={DEST}  bps=0  ",
+    f"receive_route_v1 destination={DEST} bps=18446744073709551615",
+    f"receive_route_v1 destination={DEST} bps=18446744073709551616",
+    f"receive_route_v1 destination={DEST} bps=02000",
+    f"receive_route_v1 destination={DEST} bps=2000 version=1",
+    f"receive_route_v1 destination={DEST} bps=2000 bps=2000",
+    f"receive_route_v1 destination={DEST} bps=2000 colour=red",
+    f"receive_route_v1 destination={DEST} bps=2000 locked=yes",
+    f"receive_route_v1 destination={DEST} bps=",
+    f"receive_route_v1 destination={DEST.upper()} bps=2000",
+    f"receive_route_v1 destination={DEST}",
+    "receive_route_v1 bps=2000",
+    f"route destination={DEST} bps=2000",
+    "receive_route_v1 destination=<96-hex public key> bps=2000",
+    "",
+]
+
+
+def test_wallet_route_spec_check_agrees_with_the_node_parser():
+    """Issue #35: the wallet refuses exactly the kind-6 texts the node refuses,
+    so a guarded owner learns of a bad spec before signing, not from a reject."""
+    from consensus.receive_routes import ReceiveRouteShapeError, parse_route_spec
+
+    src = APP_JS.read_text(encoding="utf-8")
+    script = (
+        _function_source(src, "routeSpecProblem")
+        + "const fs = require('fs');\n"
+        + "const specs = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
+        + "process.stdout.write(JSON.stringify(specs.map(routeSpecProblem)));\n"
+    )
+    res = subprocess.run(["node", "-e", script], input=json.dumps(ROUTE_SPECS).encode(),
+                         capture_output=True, check=True, timeout=60)
+    wallet_ok = [problem == "" for problem in json.loads(res.stdout)]
+    node_ok = []
+    for spec in ROUTE_SPECS:
+        try:
+            parse_route_spec(spec, "a" * 96, version=1)
+            node_ok.append(True)
+        except ReceiveRouteShapeError:
+            node_ok.append(False)
+    assert wallet_ok == node_ok
+    assert any(node_ok) and not all(node_ok)

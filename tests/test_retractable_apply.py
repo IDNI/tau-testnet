@@ -608,7 +608,7 @@ def test_a_release_that_skips_its_credit_breaks_conservation():
 
     def lossy(lm, balances, sequences, height, timestamp):
         lm.retractable_transfers.release_due(int(height), int(timestamp))
-        return []
+        return [], []
 
     with patch("consensus.engine._release_due_retractables", lossy):
         with pytest.raises(BlockchainBug):

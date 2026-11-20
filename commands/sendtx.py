@@ -26,6 +26,7 @@ from consensus.rule_offers import (
     RULE_OFFER_TX_TYPES,
 )
 from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
+from consensus.receive_routes import RECEIVE_ROUTE_TX_TYPES
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -44,6 +45,7 @@ KNOWN_TX_TYPES = frozenset(
     | set(APPROVAL_TX_TYPES)
     | set(RULE_CHANGE_TX_TYPES)
     | set(RETRACTABLE_TX_TYPES)
+    | set(RECEIVE_ROUTE_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
 # execution later is free and there is no second fee to drift. `transfer_vote` is
@@ -54,6 +56,9 @@ FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST}
     | set(RULE_OFFER_TX_TYPES)
+    # Receive-route changes pay like a rule offer: user-initiated, and free
+    # route churn would be free spam.
+    | set(RECEIVE_ROUTE_TX_TYPES)
 )
 from db import add_mempool_tx
 from network import bus as network_bus
@@ -792,6 +797,49 @@ def queue_transaction(json_blob: str, propagate: bool = True, *,
     return verdict
 
 
+def _receive_routing_preview(tip_view, tx_type, transfers, admission_data):
+    """What a receive route would do to this transaction, for checktx (issue #35).
+
+    Judged against the tip's routes at the admission clock: apply uses the
+    route in force in the block that carries the transfer, so this is a
+    preview, not a promise. None when nothing is routed or changed.
+    """
+    from consensus.receive_routes import (
+        CREDIT_CLASS_TRANSFER,
+        RECEIVE_ROUTE_TX_TYPES,
+        capability,
+    )
+
+    data = admission_data or {}
+    if tx_type in RECEIVE_ROUTE_TX_TYPES:
+        change = {k: data[k] for k in ("receive_route", "replaces", "route_owner_pubkey",
+                                        "cleared_by") if k in data}
+        return {"change": change, "capability": capability()} if change else None
+    if tx_type not in ("user_tx", TX_TYPE_RETRACTABLE_TRANSFER) or not transfers:
+        return None
+    try:
+        book = tip_view.receive_route_book()
+        ts = tip_view.next_block_timestamp
+    except Exception:
+        return None
+    splits = []
+    for index, (_, to_addr, amount) in enumerate(transfers):
+        if tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+            # Routed when it releases, by the route in force then.
+            continue
+        split = book.split(str(to_addr).lower(), int(amount), ts, CREDIT_CLASS_TRANSFER)
+        if split is not None:
+            splits.append(dict(split.to_dict(), transfer_index=index, routing_fee=0))
+    if not splits:
+        return None
+    caps = capability()
+    return {
+        "splits": splits,
+        "rounding": caps["rounding_rule"],
+        "fee_model": caps["fee_model"],
+    }
+
+
 def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                        skip_tau_eval: bool, estimate: bool, facts: _TauFacts) -> dict:
     if estimate and (not dry_run or skip_tau_eval):
@@ -1464,6 +1512,11 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             update_id = admission_eval.data.get("update_id")
             if update_id:
                 verdict["update_id"] = update_id
+            preview = _receive_routing_preview(
+                tip_view, tx_type, all_validated_transfers, admission_eval.data
+            )
+            if preview is not None:
+                verdict["receive_routing"] = preview
             return verdict
 
         if db.count_mempool_txs() >= config.MAX_MEMPOOL_TXS:

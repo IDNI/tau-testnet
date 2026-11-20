@@ -496,6 +496,7 @@ _genesis_eligibility_mode: str = ""
 _genesis_fee_beneficiary: str = ""
 _genesis_faucet_amount: int = 0
 _genesis_approval_slots_active: bool = False
+_genesis_receive_routes_active: bool = False
 # Genesis rule text, re-seeded on full rebuild so the replayed state hash
 # matches the mined chain (the reorg path replays only the new suffix, not
 # the genesis block, so its rules would otherwise be lost).
@@ -548,6 +549,31 @@ def _retractable_state(lm) -> dict:
         "resolved_count": count,
         "resolved_acc": acc.hex(),
     }
+
+
+def _receive_route_rows(lm) -> list:
+    book = getattr(lm, "receive_routes", None)
+    return book.snapshot_rows() if book is not None else []
+
+
+def _record_receive_route_events(block, next_snapshot) -> None:
+    """Best-effort history write; the apply verdict is already final."""
+    try:
+        events = (getattr(next_snapshot, "metadata", None) or {}).get("receive_route_events")
+        if not events:
+            return
+        tx_ids = list(getattr(block, "tx_ids", None) or [])
+        rows = []
+        for event in events:
+            row = dict(event)
+            index = row.get("tx_index")
+            row["tx_hash"] = (
+                tx_ids[index] if isinstance(index, int) and 0 <= index < len(tx_ids) else None
+            )
+            rows.append(row)
+        db.record_receive_route_events(block.block_hash, block.header.block_number, rows)
+    except Exception:
+        logger.exception("could not record receive route events")
 
 
 def _record_retractable_events(block, next_snapshot) -> None:
@@ -608,6 +634,8 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         rule_change_requests=lm.approval_requests.snapshot_rule_change_requests(),
         approval_slots_active=lm.approval_slots_active,
         retractable_transfers=_retractable_state(lm),
+        receive_routes=_receive_route_rows(lm),
+        receive_routes_active=getattr(lm, "receive_routes_active", False) is True,
         eligibility_mode=lm.eligibility_mode,
         fee_beneficiary=lm.fee_beneficiary,
         last_transfer_ts=merged_ts,
@@ -1088,6 +1116,7 @@ def _process_new_block_locked(block: Block) -> bool:
                 _swap_in_memory_state(next_snapshot, block)
 
             _record_retractable_events(block, next_snapshot)
+            _record_receive_route_events(block, next_snapshot)
 
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
@@ -1161,6 +1190,8 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             _lifecycle_manager.faucet_amount = _genesis_faucet_amount
             if _genesis_approval_slots_active:
                 _lifecycle_manager.activate_approval_slots()
+            if _genesis_receive_routes_active:
+                _lifecycle_manager.activate_receive_routes()
             _lifecycle_manager.recompute_approval_threshold()
             _tau_engine_state_hash = ""
             _canonical_head_hash = ''
@@ -1369,6 +1400,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                                       reason="state_hash invariant mismatch")
 
             _record_retractable_events(block, next_snapshot)
+            _record_receive_route_events(block, next_snapshot)
 
             if _enabled:
                 # The block's evaluator history becomes durable exactly as a live
@@ -1504,7 +1536,7 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     # regardless of whether the DB is fresh or already provisioned.
     global _genesis_accounts_state, _genesis_active_validators, _genesis_vote_quorum
     global _genesis_eligibility_mode, _genesis_fee_beneficiary, _genesis_faucet_amount
-    global _genesis_approval_slots_active
+    global _genesis_approval_slots_active, _genesis_receive_routes_active
     global _genesis_application_rules, _genesis_consensus_rules
     _genesis_accounts_state = {
         k: int(v) for k, v in genesis_data.get("accounts_state", {}).items()
@@ -1523,6 +1555,9 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
     _genesis_faucet_amount = _faucet
     _genesis_approval_slots_active = (
         (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("approval_slots_active") is True
+    )
+    _genesis_receive_routes_active = (
+        (_gmeta.get("mechanism_specific_metadata", {}) or {}).get("receive_routes_active") is True
     )
     _genesis_application_rules = genesis_data.get("application_rules", "")
     _genesis_consensus_rules = genesis_data.get("consensus_rules", "")
@@ -1585,6 +1620,16 @@ def load_genesis(genesis_json_path: str, authority: bool = False):
                 except Exception:
                     logger.warning(
                         "could not persist approval_slots_active from genesis",
+                        exc_info=True)
+            # Receive routes: same one-way genesis switch (gen_genesis.py
+            # --receive-routes), persisted the same way.
+            if _genesis_receive_routes_active:
+                _lifecycle_manager.activate_receive_routes()
+                try:
+                    db.set_chain_state_value("receive_routes_active", "1")
+                except Exception:
+                    logger.warning(
+                        "could not persist receive_routes_active from genesis",
                         exc_info=True)
             _lifecycle_manager.recompute_approval_threshold()
 
@@ -2228,6 +2273,17 @@ def _restore_rule_change_requests(lm) -> None:
     lm.approval_requests.rule_change_requests = entries
 
 
+def _restore_receive_routes(lm) -> None:
+    """Rehydrate the receive-route book; a stored row the node could not have
+    installed is corruption and refuses to load rather than misroute funds."""
+    from consensus.receive_routes import ReceiveRouteBook
+
+    try:
+        lm.receive_routes = ReceiveRouteBook.restore(db.load_receive_routes())
+    except ValueError as exc:
+        raise DatabaseError(f"corrupt receive route state: {exc}") from exc
+
+
 def _restore_retractables(lm) -> None:
     """Rehydrate the escrow book; a stored row that does not recompute its id is
     corruption and refuses to load rather than silently dropping escrowed funds."""
@@ -2372,6 +2428,7 @@ def load_state_from_db() -> bool:
         _restore_approvals(_lifecycle_manager)
         _restore_rule_change_requests(_lifecycle_manager)
         _restore_retractables(_lifecycle_manager)
+        _restore_receive_routes(_lifecycle_manager)
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
         persisted_slots = db.get_chain_state_value("approval_slots_active", _MISSING)
@@ -2387,6 +2444,19 @@ def load_state_from_db() -> bool:
                 except Exception:
                     logger.warning(
                         "could not persist approval_slots_active from genesis",
+                        exc_info=True)
+        # Receive routes: the same one-way flag, read back the same way.
+        persisted_routes_on = db.get_chain_state_value("receive_routes_active", _MISSING)
+        if _genesis_receive_routes_active or (
+            persisted_routes_on is not _MISSING and str(persisted_routes_on) == "1"
+        ):
+            _lifecycle_manager.activate_receive_routes()
+            if str(persisted_routes_on) != "1":
+                try:
+                    db.set_chain_state_value("receive_routes_active", "1")
+                except Exception:
+                    logger.warning(
+                        "could not persist receive_routes_active from genesis",
                         exc_info=True)
 
         for p in pending_updates:
@@ -2439,7 +2509,11 @@ def commit_state_to_db(block_hash: str, block_number: int):
             _lifecycle_manager.approval_requests.snapshot_rule_change_requests()
         )
         approval_slots_active_snapshot = _lifecycle_manager.approval_slots_active
+        receive_routes_active_snapshot = (
+            getattr(_lifecycle_manager, "receive_routes_active", False) is True
+        )
         retractable_snapshot = _retractable_state(_lifecycle_manager)
+        receive_routes_snapshot = _receive_route_rows(_lifecycle_manager)
 
     db.save_canonical_state_atomically(
         block_hash, block_number,
@@ -2458,6 +2532,8 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_change_requests=rule_change_requests_list,
         approval_slots_active=approval_slots_active_snapshot,
         retractable_transfers=retractable_snapshot,
+        receive_routes=receive_routes_snapshot,
+        receive_routes_active=receive_routes_active_snapshot,
     )
 
 def tick_governance(height: int):
@@ -2955,6 +3031,10 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 ),
                 approval_slots_active=_lifecycle_manager.approval_slots_active,
                 retractable_transfers=_retractable_state(_lifecycle_manager),
+                receive_routes=_receive_route_rows(_lifecycle_manager),
+                receive_routes_active=(
+                    getattr(_lifecycle_manager, "receive_routes_active", False) is True
+                ),
             )
     except Exception as exc:
         logger.error(

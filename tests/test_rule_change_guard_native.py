@@ -45,6 +45,8 @@ KINDS = (
     tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
     tau_defs.RULE_CHANGE_KIND_SET_GUARD,
     tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD,
+    tau_defs.RULE_CHANGE_KIND_SET_RECEIVE_ROUTE,
+    tau_defs.RULE_CHANGE_KIND_CLEAR_RECEIVE_ROUTE,
 )
 PLACEHOLDER_A, PLACEHOLDER_B, PLACEHOLDER_C = "a" * 96, "b" * 96, "c" * 96
 
@@ -133,9 +135,14 @@ def test_two_of_three_needs_any_two_of_the_declared_keys(real):
         assert not _blocked(body, kind, {18: X, 19: Y, 20: Z})
 
 
-def test_the_weaker_guard_blocks_only_revokes_and_lets_a_thief_set_a_policy(real):
+def test_the_weaker_guard_blocks_revokes_and_route_changes_and_lets_a_thief_set_a_policy(real):
     body = _guard_body(REVOKE_ONLY, **{PLACEHOLDER_A: X})
-    blocking = {tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY, tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD}
+    blocking = {
+        tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY, tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD,
+        # Receive routes (issue #35): a stolen key must not redirect receipts.
+        tau_defs.RULE_CHANGE_KIND_SET_RECEIVE_ROUTE,
+        tau_defs.RULE_CHANGE_KIND_CLEAR_RECEIVE_ROUTE,
+    }
     for kind in KINDS:
         assert _blocked(body, kind) is (kind in blocking), kind
         assert not _blocked(body, kind, {18: X})

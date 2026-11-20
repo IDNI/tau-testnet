@@ -425,6 +425,39 @@ class TipAdmissionView:
         # Apply judges on the real block timestamp, so the clock cannot split nodes.
         return max(self.tip_timestamp, int(time.time()))
 
+    # --- Receive routes (issue #35) ----------------------------------------
+
+    @property
+    def receive_routes_active(self) -> bool:
+        """Whether receive routes are switched on at the canonical tip; read
+        from the same lifecycle manager block apply reads, as for slots."""
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        return getattr(lm, "receive_routes_active", False) is True
+
+    def receive_route_book(self):
+        """The persisted receive-route book; empty only when the table is absent.
+
+        Read once per view: admission judges one transaction against one book.
+        Any other failure -- a stored row the node could not have installed, a
+        locked or broken database -- raises: an unreadable book must not look
+        empty, or admission would wave through a change to a locked route.
+        """
+        cached = getattr(self, "_receive_route_book", None)
+        if cached is not None:
+            return cached
+        import sqlite3
+
+        from consensus.receive_routes import ReceiveRouteBook
+        try:
+            rows = db.load_receive_routes()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+            rows = []
+        book = ReceiveRouteBook.restore(rows)
+        self._receive_route_book = book
+        return book
+
     def _retractable_scalar(self, sql: str, params: tuple = ()) -> int:
         try:
             with db._db_lock:

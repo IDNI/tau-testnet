@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.retractable import RetractableBook
+from consensus.receive_routes import ReceiveRouteBook
 
 logger = logging.getLogger(__name__)
 from consensus.approvals import (
@@ -93,7 +94,19 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "fee_beneficiary",
     "max_rule_txs_per_block",
     "approval_slots_active",
+    "receive_routes_active",
 })
+
+
+def validate_receive_routes_active(value: Any) -> Optional[str]:
+    """Receive-route activation (issue #35) is a ONE-WAY switch to True.
+
+    Off again would strand installed routes (locked ones included) that the
+    book still applies to every credit, with no way left to clear them.
+    """
+    if value is not True:
+        return "must be true; receive routes cannot be deactivated once active"
+    return None
 
 
 def validate_approval_slots_active(value: Any) -> Optional[str]:
@@ -187,6 +200,17 @@ def validate_max_rule_txs_per_block(value: Any) -> Optional[str]:
     return None
 
 
+def _receive_routes_root(lm) -> str:
+    """Hex root of the installed receive routes, "" while none is installed.
+
+    getattr: a manager unpickled from before the field existed has no book.
+    """
+    book = getattr(lm, "receive_routes", None)
+    if book is None or book.is_empty():
+        return ""
+    return book.root().hex()
+
+
 def build_mechanism_metadata(
     vote_quorum: str,
     eligibility_mode: str = DEFAULT_ELIGIBILITY_MODE,
@@ -198,6 +222,8 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    receive_routes_root: str = "",
+    receive_routes_active: bool = False,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -243,6 +269,13 @@ def build_mechanism_metadata(
     if retractable_transfers_root is None:
         retractable_transfers_root = RetractableBook().root().hex()
     mech["retractable_transfers_root"] = retractable_transfers_root
+    # Receive routes (issue #35): the activation flag and the book root are each
+    # emitted only once set, so a chain that never activates the feature keeps
+    # a byte-identical meta hash and genesis.
+    if receive_routes_active:
+        mech["receive_routes_active"] = True
+    if receive_routes_root:
+        mech["receive_routes_root"] = receive_routes_root
     return mech
 
 
@@ -451,12 +484,19 @@ class ConsensusLifecycleManager:
         # Co-signature approvals. A FIELD for the same reason rule_offers is.
         self.approval_requests = ApprovalRequestLifecycleManager()
         self.retractable_transfers = RetractableBook()
+        # Receive routes. A FIELD for the same reason rule_offers is.
+        self.receive_routes = ReceiveRouteBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
         # rollback, reorg and competing branches. Read from the PARENT snapshot,
         # so an activation recorded in block H governs H+1 onward.
         self.approval_slots_active: bool = False
+        # Receive routes (issue #35): ONE-WAY governance activation, same
+        # reasoning and same parent-snapshot timing as approval_slots_active.
+        # Until it is set no route transaction is accepted, so a node that has
+        # not upgraded cannot be forked by the first route anyone submits.
+        self.receive_routes_active: bool = False
         # Pinned by genesis for the life of the network: no patch sets it.
         # Bound into the meta hash only when non-zero.
         self.faucet_amount: int = 0
@@ -546,6 +586,9 @@ class ConsensusLifecycleManager:
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
+            receive_routes_root=_receive_routes_root(self),
+            # getattr: a manager unpickled from before the field existed.
+            receive_routes_active=getattr(self, "receive_routes_active", False) is True,
         )
         return compute_consensus_meta_hash(
             host_contract={},
@@ -657,6 +700,13 @@ class ConsensusLifecycleManager:
                 )
             else:
                 self.activate_approval_slots()
+
+        if "receive_routes_active" in patch:
+            # Consensus-binding validation, as for approval_slots_active above.
+            err = validate_receive_routes_active(patch["receive_routes_active"])
+            if err:
+                raise ValueError(f"receive_routes_active: {err}")
+            self.activate_receive_routes()
         self.recompute_approval_threshold()
 
     def activate_approval_slots(self) -> None:
@@ -667,6 +717,10 @@ class ConsensusLifecycleManager:
         depend on them, letting a sender write their own approval slots.
         """
         self.approval_slots_active = True
+
+    def activate_receive_routes(self) -> None:
+        """Turn receive routes on. Idempotent, and there is no way back."""
+        self.receive_routes_active = True
 
     def knows_update(self, update_id: bytes) -> bool:
         """Check if an update is currently known in any state."""

@@ -534,6 +534,14 @@ class RuleChangeRequest:
     def body(self) -> str:
         """The normalized clause body (the exact offered text for an accept);
         "" for kinds that carry none."""
+        if self.kind == tau_defs.RULE_CHANGE_KIND_SET_RECEIVE_ROUTE:
+            # The canonical route spec with this request's sequence number as
+            # the route version: everything the release installs is hashed.
+            from consensus.receive_routes import parse_route_spec, route_spec_body
+
+            return route_spec_body(parse_route_spec(
+                self.rule_text, self.sender_pubkey, version=self.sequence_number
+            ))
         if self.kind not in _RULE_CHANGE_BODY_KINDS:
             return ""
         if self.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
@@ -584,7 +592,14 @@ _RULE_CHANGE_BODY_KINDS = frozenset({
 })
 _RULE_CHANGE_KINDS = frozenset(range(
     tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD + 1
-))
+)) | frozenset({
+    # Receive routes (issue #35): the guard judges these kinds, so a blocked
+    # owner needs this path to get one approved.
+    tau_defs.RULE_CHANGE_KIND_SET_RECEIVE_ROUTE,
+    tau_defs.RULE_CHANGE_KIND_CLEAR_RECEIVE_ROUTE,
+})
+# Kinds whose rule_text is a route spec rather than a Tau clause.
+_ROUTE_SPEC_KINDS = frozenset({tau_defs.RULE_CHANGE_KIND_SET_RECEIVE_ROUTE})
 
 
 def parse_rule_change_request_checked(
@@ -609,7 +624,7 @@ def parse_rule_change_request_checked(
         if isinstance(val, bool) or not isinstance(val, int):
             return None, "kind, sequence_number and expire_at_height must be integers"
     if kind not in _RULE_CHANGE_KINDS:
-        return None, "kind must be 1..5"
+        return None, "kind must be 1..7"
 
     rule_text = tx.get("rule_text", "")
     if rule_text is None:
@@ -622,7 +637,7 @@ def parse_rule_change_request_checked(
         return None, "rule_text is not valid UTF-8"
     if text_bytes > MAX_RULE_CHANGE_TEXT_BYTES:
         return None, f"rule_text exceeds {MAX_RULE_CHANGE_TEXT_BYTES} bytes"
-    has_body = kind in _RULE_CHANGE_BODY_KINDS
+    has_body = kind in _RULE_CHANGE_BODY_KINDS or kind in _ROUTE_SPEC_KINDS
     if has_body and not rule_text.strip():
         return None, "this kind needs a non-empty rule_text"
     if not has_body and rule_text != "":
@@ -647,7 +662,14 @@ def parse_rule_change_request_checked(
     except ApprovalShapeError as exc:
         return None, str(exc)
 
-    if has_body:
+    if kind in _ROUTE_SPEC_KINDS:
+        from consensus.receive_routes import ReceiveRouteShapeError, parse_route_spec
+
+        try:
+            parse_route_spec(rule_text, sender_n, version=seq)
+        except ReceiveRouteShapeError as exc:
+            return None, f"rule_text is not a route spec: {exc}"
+    elif has_body:
         try:
             body = clause_body_v1(rule_text)
         except RuleOfferShapeError as exc:

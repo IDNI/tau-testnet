@@ -22,6 +22,8 @@ TAU_GOSSIP_TOPIC_APPROVALS = "tau/approvals/1.0.0"
 # Retractable transfers get their own topic: parks are floods, while a retract
 # is deadline-sensitive and must not queue behind them.
 TAU_GOSSIP_TOPIC_RETRACTABLE = "tau/retractable/1.0.0"
+# Receive-route changes are rare, small admin transactions on their own topic.
+TAU_GOSSIP_TOPIC_RECEIVE_ROUTES = "tau/receive-routes/1.0.0"
 TAU_GOSSIP_TOPIC_PEERS = "tau/peers/2.0.0"
 
 # Mempool & Edge Ingestion Limits
@@ -61,3 +63,5 @@ TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS = 32
 TAU_MAX_RETRACTABLE_TRANSFER_BYTES = 4096
 TAU_MAX_RETRACT_TRANSFER_BYTES = 4096
 TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS = 32
+TAU_MAX_RECEIVE_ROUTE_TX_BYTES = 4096
+TAU_MEMPOOL_SNAPSHOT_MAX_RECEIVE_ROUTE_TXS = 32
