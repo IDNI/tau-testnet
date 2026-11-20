@@ -27,11 +27,15 @@ SCENARIOS
        `running_spec` (in `getgovernance` and `getaccountrules`) says the engine
        runs `o26 = 3` and `o27 = 9` with the hash of that text, at the head the
        answer describes, while the stored application rules still list both
-       units.
+       units. Each confirmed rule transaction says the engine took its
+       revision (`revision.taken`) and gives the revision number after it.
     7. Node A restarts and answers the same (its running spec rebuilt from the
-       journal); node B replays A's blocks, restarts, and gives the same outcome
-       for every transaction, the same rules in force for every account and the
-       same running spec.
+       journal), then applies `o27 = {4}` with that rebuilt engine: taken, its
+       revision number continues, the engine runs `o26 = 3` and `o27 = 4`.
+       Node B replays A's blocks with the engine it has run since block 0,
+       restarts, and gives the same outcome for every transaction (the revision
+       fields included), the same rules in force for every account and the same
+       running spec.
 
 USAGE
     python scripts/e2e_rules_in_force.py provision --dir .local/e2e-rules-in-force
@@ -66,6 +70,8 @@ PROBE_A = "always ( o26[t]:bv[24] = { 7 }:bv[24] && o27[t]:bv[24] = { 9 }:bv[24]
 PROBE_B = "always ( o26[t]:bv[24] = { 3 }:bv[24] )."
 RUNS_3 = "o26[t]:bv[24] = { 3 }:bv[24]"
 RUNS_9 = "o27[t]:bv[24] = { 9 }:bv[24]"
+PROBE_C = "always ( o27[t]:bv[24] = { 4 }:bv[24] )."
+RUNS_4 = "o27[t]:bv[24] = { 4 }:bv[24]"
 
 
 def guard_text(cosigner_pk):
@@ -95,6 +101,13 @@ def rule_tx(rig, who, text):
     payload = rig.common(who)
     payload.update({"tx_type": "user_tx", "fee_limit": FEE_LIMIT, "operations": {"0": text}})
     return rig.submit(who, payload)
+
+
+def revision(rig, h, node=None):
+    """What the confirmed rule transaction says the engine did with its rule."""
+    effects = outcome(rig, h, node).get("rule_effects") or []
+    return next((e.get("revision") or {} for e in effects
+                 if e.get("action") == "accumulated"), {})
 
 
 def landed(rig, res, what):
@@ -295,6 +308,15 @@ def scenario_running_spec(rig, st):
           bool(before.get("text")) and "o26" not in before["text"], before)
     st["txs"].append(landed(rig, rule_tx(rig, "bob", PROBE_A), "`o26 = 7 && o27 = 9`"))
     st["txs"].append(landed(rig, rule_tx(rig, "bob", PROBE_B), "`o26 = 3`"))
+    took_a, took_b = revision(rig, st["txs"][-2]), revision(rig, st["txs"][-1])
+    check("each confirmed rule transaction says the engine took its revision",
+          took_a.get("taken") is True and took_b.get("taken") is True
+          and took_a.get("engine_outcome") == took_b.get("engine_outcome") == "ACCEPTED_CHANGED",
+          (took_a, took_b))
+    check("and gives the engine's revision number after it, in order",
+          isinstance(took_a.get("spec_revision"), int)
+          and took_b.get("spec_revision", -1) > took_a["spec_revision"], (took_a, took_b))
+    st["last_revision"] = took_b.get("spec_revision")
     gov = rig.read("getgovernance") or {}
     running = gov.get("running_spec") or {}
     text = running.get("text") or ""
@@ -324,11 +346,26 @@ def scenario_restart_and_follower(rig, st):
         after = {cmd: rig_mod.stable(rig.read(cmd)) for cmd in reads}
         check("after A's restart every outcome and every account reads the same",
               before == after, [c for c in reads if before[c] != after[c]][:3])
+    # a rule applied by A's engine as rebuilt after the restart; B applies the
+    # same block with the engine it has run since block 0, and the agreement
+    # below compares both answers
+    h = landed(rig, rule_tx(rig, "bob", PROBE_C), "`o27 = 4` after the restart")
+    took = revision(rig, h)
+    check("after the restart the engine takes it and its revision number continues",
+          took.get("taken") is True and st.get("last_revision") is not None
+          and took.get("spec_revision", -1) > st["last_revision"], took)
+    reads.append(f"gettxstatus {h}")
+    st["txs"].append(h)
+    running = (rig.read("getgovernance") or {}).get("running_spec") or {}
+    check("the engine now runs o26 = 3 and o27 = 4",
+          RUNS_3 in (running.get("text") or "") and RUNS_4 in (running.get("text") or "")
+          and RUNS_9 not in (running.get("text") or ""), (running.get("text") or "")[-300:])
+    st["running_sha"] = running.get("sha256")
     rig.mine()
     rig.follower_agrees(reads)
     on_b = (rig.read("getgovernance", rig.b) or {}).get("running_spec") or {}
     check("node B, rebuilt from its own journal, runs the same spec",
-          on_b.get("sha256") == st.get("running_sha") and RUNS_3 in (on_b.get("text") or ""),
+          on_b.get("sha256") == st.get("running_sha") and RUNS_4 in (on_b.get("text") or ""),
           on_b.get("sha256"))
 
 
