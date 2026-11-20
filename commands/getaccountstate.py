@@ -66,6 +66,15 @@ def execute(raw_command: str, container):
         escrowed_in = tip.escrowed_in(address)
     except Exception:
         escrowed_out = escrowed_in = 0
+    try:
+        # What open envelopes this address sent still hold, and what open
+        # envelopes hold for it to spend (spending limits). Neither is balance.
+        envelopes = tip.envelope_book()
+        envelopes_out = sum(envelopes.state_of(e).remaining
+                            for e in envelopes.of(address, "out"))
+        envelopes_in = envelopes.held_for(address)
+    except Exception:
+        envelopes_out = envelopes_in = 0
 
     pending_outgoing = 0
     pending_incoming = 0
@@ -117,5 +126,7 @@ def execute(raw_command: str, container):
         "available_balance": str(available_balance),
         "escrowed_out": str(escrowed_out),
         "escrowed_in": str(escrowed_in),
+        "envelopes_out": str(envelopes_out),
+        "envelopes_in": str(envelopes_in),
         "pending_txs": pending_txs,
     })

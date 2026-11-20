@@ -25,6 +25,8 @@ class MockPolicyEvaluator:
         self._by_body: dict = {}
         self.validate_calls: list = []
         self.verdict_calls: list = []
+        self.output_calls: list = []
+        self._outputs: dict = {}
         self.closed = False
 
     def fail_build(self, body: str, error: str = "mock build failure") -> None:
@@ -59,6 +61,21 @@ class MockPolicyEvaluator:
             value = rule
         o5 = None if value is None else str(value)
         return PolicyVerdict(blocked=parse_o5(o5) == 0, o5=o5, built=True)
+
+    def set_outputs(self, body: str, decide) -> None:
+        """`decide` is a dict of outputs or a callable (inputs) -> dict."""
+        self._outputs[body] = decide
+
+    def outputs(self, body: str, inputs: dict, *, timeout=None) -> dict:
+        self.output_calls.append((body, dict(inputs or {})))
+        error = self._build_error(body)
+        if error:
+            raise PolicyBuildError(error)
+        if body in self._refused:
+            raise PolicyStepError(self._refused[body])
+        rule = self._outputs.get(body, {})
+        value = rule(dict(inputs or {})) if callable(rule) else rule
+        return {str(k): str(v) for k, v in (value or {}).items()}
 
     def stats(self) -> dict:
         return {"pool": self.pool, "builds": len(self.validate_calls),

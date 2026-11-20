@@ -780,3 +780,546 @@ def compute_retractable_book_root(
     out.extend(encode_uint64(int(resolved_count)))
     out.extend(encode_hash32(resolved_acc))
     return blake3(bytes(out)).digest()
+
+
+# --- Standing payments -------------------------------------------------------
+
+DOMAIN_STANDING_PAYMENT_V1 = b"tau.standing.payment.v1"
+DOMAIN_STANDING_RESOLVED_V1 = b"tau.standing.resolved.v1"
+DOMAIN_STANDING_BOOK_V1 = b"tau.standing.book.v1"
+
+
+def _encode_standing_terms(
+    payer_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    sequence_number: int,
+    kind: int,
+    interval: int,
+    first_due: int,
+    periods: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(payer_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(bytes([int(kind) & 0xFF]))
+    out.extend(encode_uint64(int(interval)))
+    out.extend(encode_uint64(int(first_due)))
+    out.extend(encode_uint32(int(periods)))
+    return bytes(out)
+
+
+def compute_standing_id(
+    payer_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    sequence_number: int,
+    kind: int,
+    interval: int,
+    first_due: int,
+    periods: int,
+) -> bytes:
+    """BLAKE3 of the signed terms of a standing payment. Returns 32 bytes.
+
+    Content-derived for the reason the retractable id is: the apply-time tx_id
+    differs between proposer and validators. sequence_number keeps two identical
+    authorizations from colliding.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_PAYMENT_V1.decode()))
+    out.extend(_encode_standing_terms(
+        payer_pubkey, recipient_pubkey, amount, sequence_number,
+        kind, interval, first_due, periods,
+    ))
+    return blake3(bytes(out)).digest()
+
+
+def compute_standing_resolved_acc(acc: Any, standing_id: Any, outcome: int) -> bytes:
+    """Fold one resolution into the running commitment. Order-dependent by design."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(standing_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    return blake3(bytes(out)).digest()
+
+
+def encode_standing_entry(
+    standing_id: Any,
+    payer_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    sequence_number: int,
+    kind: int,
+    interval: int,
+    first_due: int,
+    periods: int,
+    period: int,
+    paid_count: int,
+    missed_count: int,
+    tries: int,
+    queued_at: int,
+    last_paid_height: int,
+    version: int = 1,
+    replaces: Any = bytes(32),
+) -> bytes:
+    """The signed terms, the progress the sweep keeps, then the lineage.
+
+    Progress is committed, not only the terms: which entries the capped sweep
+    reaches in a block depends on it, so two nodes that agreed on the terms but
+    not on the queue would pay different entries in the same block. The lineage
+    (version, id replaced by an update) is committed so a node restored from
+    storage reports the same version history its peers do.
+    """
+    out = bytearray()
+    out.extend(encode_hash32(standing_id))
+    out.extend(_encode_standing_terms(
+        payer_pubkey, recipient_pubkey, amount, sequence_number,
+        kind, interval, first_due, periods,
+    ))
+    out.extend(encode_uint32(int(period)))
+    out.extend(encode_uint32(int(paid_count)))
+    out.extend(encode_uint32(int(missed_count)))
+    out.extend(encode_uint32(int(tries)))
+    out.extend(encode_uint64(int(queued_at)))
+    out.extend(encode_uint64(int(last_paid_height)))
+    out.extend(encode_uint32(int(version)))
+    out.extend(encode_hash32(replaces))
+    return bytes(out)
+
+
+def compute_standing_book_root(
+    open_entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    """BLAKE3 of the book: sorted open entries, then the resolved commitment.
+
+    `open_entries` are tuples in encode_standing_entry argument order. Same
+    layout as the retractable book root, under its own domain.
+    """
+    encoded = sorted(encode_standing_entry(*e) for e in (open_entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()
+
+
+# --- Payout rules (#63) ---------------------------------------------------------
+
+DOMAIN_PAYOUT_RULE_V1 = b"tau.payout.rule.v1"
+DOMAIN_PAYOUT_RESOLVED_V1 = b"tau.payout.resolved.v1"
+DOMAIN_PAYOUT_BOOK_V1 = b"tau.payout.book.v1"
+# A rule that pays per sale has its own id domain, so its id can never equal the
+# id of the same terms without per-sale payment (and ids of every other rule stay
+# what they were).
+DOMAIN_PAYOUT_RULE_PER_SALE_V1 = b"tau.payout.rule.per_sale.v1"
+
+
+def compute_payout_body_hash(body: str) -> bytes:
+    """BLAKE3 of a payout rule body's UTF-8 bytes. Returns 32 bytes."""
+    return blake3(str(body).encode("utf-8")).digest()
+
+
+def _encode_payout_terms(
+    account_pubkey: Any,
+    sequence_number: int,
+    body_hash: Any,
+    slots: Any,
+    cap_per_execution: int,
+    cap_per_period: int,
+    kind: int,
+    period: int,
+    expires_at: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(account_pubkey))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(encode_hash32(body_hash))
+    slots = list(slots or ())
+    out.extend(bytes([len(slots) & 0xFF]))
+    for slot in slots:
+        if slot:
+            out.extend(b"\x01")
+            out.extend(encode_pubkey48(slot))
+        else:
+            out.extend(b"\x00")
+    out.extend(encode_uint64(int(cap_per_execution)))
+    out.extend(encode_uint64(int(cap_per_period)))
+    out.extend(bytes([int(kind) & 0xFF]))
+    out.extend(encode_uint64(int(period)))
+    out.extend(encode_uint64(int(expires_at)))
+    return bytes(out)
+
+
+def compute_payout_rule_id(
+    account_pubkey: Any,
+    sequence_number: int,
+    body_hash: Any,
+    slots: Any,
+    cap_per_execution: int,
+    cap_per_period: int,
+    kind: int,
+    period: int,
+    expires_at: int,
+    per_sale: bool = False,
+) -> bytes:
+    """BLAKE3 of the signed terms of a payout rule. Returns 32 bytes.
+
+    An execution names the id it was signed against, so a rule replaced between
+    signing and inclusion cannot be executed with inputs meant for another one.
+    """
+    out = bytearray()
+    domain = DOMAIN_PAYOUT_RULE_PER_SALE_V1 if per_sale else DOMAIN_PAYOUT_RULE_V1
+    out.extend(encode_string(domain.decode()))
+    out.extend(_encode_payout_terms(
+        account_pubkey, sequence_number, body_hash, slots, cap_per_execution,
+        cap_per_period, kind, period, expires_at,
+    ))
+    return blake3(bytes(out)).digest()
+
+
+def compute_payout_resolved_acc(acc: Any, rule_id: Any, outcome: int) -> bytes:
+    """Fold one removal (revoked, expired, replaced) into the running commitment."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(rule_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    return blake3(bytes(out)).digest()
+
+
+def encode_payout_entry(
+    rule_id: Any,
+    account_pubkey: Any,
+    sequence_number: int,
+    body_hash: Any,
+    slots: Any,
+    cap_per_execution: int,
+    cap_per_period: int,
+    kind: int,
+    period: int,
+    expires_at: int,
+    anchor: int,
+    period_index: int,
+    spent_in_period: int,
+    executions: int,
+    paid_total: int,
+    last_height: int,
+    sales: Any = None,
+) -> bytes:
+    """The signed terms, then where the rule stands: the period caps depend on it.
+
+    `sales`, only for a rule that pays per sale: (missed, open sales), each open
+    sale (sale_id, payer, amount, height). Which sales are still payable is state
+    every node must agree on, so it is part of the entry.
+    """
+    out = bytearray()
+    out.extend(encode_hash32(rule_id))
+    out.extend(_encode_payout_terms(
+        account_pubkey, sequence_number, body_hash, slots, cap_per_execution,
+        cap_per_period, kind, period, expires_at,
+    ))
+    out.extend(encode_uint64(int(anchor)))
+    out.extend(encode_uint64(int(period_index)))
+    out.extend(encode_uint64(int(spent_in_period)))
+    out.extend(encode_uint64(int(executions)))
+    out.extend(encode_uint64(int(paid_total)))
+    out.extend(encode_uint64(int(last_height)))
+    if sales is not None:
+        missed, open_sales = sales
+        out.extend(b"\x01")
+        out.extend(encode_uint64(int(missed)))
+        out.extend(encode_uint32(len(open_sales)))
+        for sale_id, payer, amount, height in open_sales:
+            out.extend(encode_hash32(sale_id))
+            out.extend(encode_pubkey48(payer))
+            out.extend(encode_uint64(int(amount)))
+            out.extend(encode_uint64(int(height)))
+    return bytes(out)
+
+
+def compute_payout_book_root(
+    entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    """BLAKE3 of the payout book: sorted installed rules, then the removals."""
+    encoded = sorted(encode_payout_entry(*e) for e in (entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()
+
+
+# --- Receive routes (#35) -----------------------------------------------------
+
+DOMAIN_RECEIVE_ROUTE_V1 = b"tau.receive_route.v1"
+DOMAIN_RECEIVE_ROUTE_RESOLVED_V1 = b"tau.receive_route.resolved.v1"
+DOMAIN_RECEIVE_ROUTE_BOOK_V1 = b"tau.receive_route.book.v1"
+
+
+def _encode_route_terms(
+    owner_pubkey: Any,
+    sequence_number: int,
+    destination_pubkey: Any,
+    share_bps: int,
+    min_amount: int,
+    active_from: int,
+    expires_at: int,
+    locked: bool,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(encode_pubkey48(destination_pubkey))
+    out.extend(encode_uint32(int(share_bps)))
+    out.extend(encode_uint64(int(min_amount)))
+    out.extend(encode_uint64(int(active_from)))
+    out.extend(encode_uint64(int(expires_at)))
+    out.extend(encode_bool(bool(locked)))
+    return bytes(out)
+
+
+def compute_receive_route_id(
+    owner_pubkey: Any,
+    sequence_number: int,
+    destination_pubkey: Any,
+    share_bps: int,
+    min_amount: int,
+    active_from: int,
+    expires_at: int,
+    locked: bool,
+) -> bytes:
+    """BLAKE3 of the signed terms of a receive route. Returns 32 bytes.
+
+    A destination releasing a route names this id, so a route the owner
+    replaced in between is not released by a signature meant for another one.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RECEIVE_ROUTE_V1.decode()))
+    out.extend(_encode_route_terms(
+        owner_pubkey, sequence_number, destination_pubkey, share_bps, min_amount,
+        active_from, expires_at, locked,
+    ))
+    return blake3(bytes(out)).digest()
+
+
+def compute_receive_route_resolved_acc(acc: Any, route_id: Any, outcome: int) -> bytes:
+    """Fold one removal (removed, released, expired, replaced) into the commitment."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RECEIVE_ROUTE_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(route_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    return blake3(bytes(out)).digest()
+
+
+def encode_receive_route_entry(
+    route_id: Any,
+    owner_pubkey: Any,
+    sequence_number: int,
+    destination_pubkey: Any,
+    share_bps: int,
+    min_amount: int,
+    active_from: int,
+    expires_at: int,
+    locked: bool,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_hash32(route_id))
+    out.extend(_encode_route_terms(
+        owner_pubkey, sequence_number, destination_pubkey, share_bps, min_amount,
+        active_from, expires_at, locked,
+    ))
+    return bytes(out)
+
+
+def compute_receive_route_book_root(
+    entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    """BLAKE3 of the route book: sorted routes in force, then the removals."""
+    encoded = sorted(encode_receive_route_entry(*e) for e in (entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RECEIVE_ROUTE_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()
+
+
+# --- Envelopes: funds with spending conditions (spending limits) ---------------------
+
+DOMAIN_ENVELOPE_V1 = b"tau.envelope.v1"
+DOMAIN_ENVELOPE_RESOLVED_V1 = b"tau.envelope.resolved.v1"
+DOMAIN_ENVELOPE_BOOK_V1 = b"tau.envelope.book.v1"
+
+
+# Conditions beyond the spending limit (time conditions and refunds) are encoded
+# only when an envelope carries one: the clock byte then has ENVELOPE_EXTENDED set
+# and a length-prefixed section follows the end. An envelope without them encodes
+# exactly as before, so its id, its book entry and the book root do not change.
+ENVELOPE_EXTENDED = 0x80
+_COND_NOT_BEFORE, _COND_HOLD, _COND_DAYS, _COND_HOURS, _COND_REFUND_IDLE, _COND_AT_END = \
+    1, 2, 3, 4, 5, 6
+_COND_UTC_OFFSET = 7
+
+
+def encode_envelope_conditions(conditions: Any) -> bytes:
+    """(not_before, hold, days, hours, refund_idle, at_end, utc_offset) as tag-value
+    pairs, tags strictly increasing, an absent condition (None or 0) left out; u16
+    length first. utc_offset is one signed byte (quarter hours east of UTC)."""
+    not_before, hold, days, hours, refund_idle, at_end, utc_offset = conditions
+    body = bytearray()
+    if not_before is not None:
+        body.append(_COND_NOT_BEFORE)
+        body.extend(encode_uint64(int(not_before)))
+    if hold is not None:
+        body.append(_COND_HOLD)
+        body.extend(encode_uint64(int(hold)))
+    if days:
+        body.append(_COND_DAYS)
+        body.append(int(days) & 0x7F)
+    if hours:
+        body.append(_COND_HOURS)
+        body.extend(encode_uint32(int(hours) & 0xFFFFFF))
+    if refund_idle is not None:
+        body.append(_COND_REFUND_IDLE)
+        body.extend(encode_uint64(int(refund_idle)))
+    if at_end:
+        body.append(_COND_AT_END)
+        body.append(int(at_end) & 0xFF)
+    if utc_offset:
+        body.append(_COND_UTC_OFFSET)
+        body.extend(int(utc_offset).to_bytes(1, "big", signed=True))
+    return len(body).to_bytes(2, "big") + bytes(body)
+
+
+def _encode_envelope_terms(
+    sender_pubkey: Any,
+    sequence_number: int,
+    recipient_pubkey: Any,
+    amount: int,
+    caps: Any,
+    kind: int,
+    period: int,
+    recurring: bool,
+    expires_at: int,
+    conditions: Any = None,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(sender_pubkey))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    caps = list(caps)
+    out.extend(encode_uint32(len(caps)))
+    for cap in caps:
+        out.extend(encode_uint64(int(cap)))
+    flag = ENVELOPE_EXTENDED if conditions is not None else 0
+    out.extend(bytes([(int(kind) & 0x7F) | flag]))
+    out.extend(encode_uint64(int(period)))
+    out.extend(encode_bool(bool(recurring)))
+    out.extend(encode_uint64(int(expires_at)))
+    if conditions is not None:
+        out.extend(encode_envelope_conditions(conditions))
+    return bytes(out)
+
+
+def compute_envelope_id(
+    sender_pubkey: Any,
+    sequence_number: int,
+    recipient_pubkey: Any,
+    amount: int,
+    caps: Any,
+    kind: int,
+    period: int,
+    recurring: bool,
+    expires_at: int,
+    conditions: Any = None,
+) -> bytes:
+    """BLAKE3 of the signed terms of an envelope. Returns 32 bytes.
+
+    Every spend and release names this id, so a signature never reaches funds
+    held under other terms. `conditions` is None for an envelope that carries
+    only a spending limit.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ENVELOPE_V1.decode()))
+    out.extend(_encode_envelope_terms(
+        sender_pubkey, sequence_number, recipient_pubkey, amount, caps, kind, period,
+        recurring, expires_at, conditions,
+    ))
+    return blake3(bytes(out)).digest()
+
+
+def compute_envelope_resolved_acc(acc: Any, envelope_id: Any, outcome: int,
+                                  paid_out: int) -> bytes:
+    """Fold one closed envelope and what its close paid out (to the recipient, or
+    back to the sender for a refund; the outcome says which) into the commitment."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ENVELOPE_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(envelope_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    out.extend(encode_uint64(int(paid_out)))
+    return blake3(bytes(out)).digest()
+
+
+def encode_envelope_entry(
+    envelope_id: Any,
+    sender_pubkey: Any,
+    sequence_number: int,
+    recipient_pubkey: Any,
+    amount: int,
+    caps: Any,
+    kind: int,
+    period: int,
+    recurring: bool,
+    expires_at: int,
+    anchor: int,
+    remaining: int,
+    period_index: int,
+    spent_in_period: int,
+    spends: int,
+    last_height: int,
+    conditions: Any = None,
+    last_clock: int = 0,
+) -> bytes:
+    """One open envelope. An extended envelope (its clock byte says so) also
+    commits the clock of its last spend, which its idle refund counts from."""
+    out = bytearray()
+    out.extend(encode_hash32(envelope_id))
+    out.extend(_encode_envelope_terms(
+        sender_pubkey, sequence_number, recipient_pubkey, amount, caps, kind, period,
+        recurring, expires_at, conditions,
+    ))
+    for value in (anchor, remaining, period_index, spent_in_period, spends, last_height):
+        out.extend(encode_uint64(int(value)))
+    if conditions is not None:
+        out.extend(encode_uint64(int(last_clock)))
+    return bytes(out)
+
+
+def compute_envelope_book_root(
+    entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    """BLAKE3 of the envelope book: sorted open envelopes with where each
+    stands, then the closed ones."""
+    encoded = sorted(encode_envelope_entry(*e) for e in (entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ENVELOPE_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()

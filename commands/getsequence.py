@@ -1,5 +1,6 @@
 import db
 import api_response
+from consensus import network_binding
 
 
 def execute(raw_command: str, container):
@@ -19,7 +20,8 @@ def execute(raw_command: str, container):
     # The tip goes out alongside the sequence because a client needs BOTH to
     # build a transaction -- the sequence and the height its expire_at_height is
     # measured from -- and asking for the height any other way means getblocks,
-    # which returns the entire chain.
+    # which returns the entire chain. The genesis hash rides along for the same
+    # reason: the types bound to a network sign it (consensus/network_binding.py).
     head = db.get_canonical_head_block()
     tip_height = 0
     if head:
@@ -30,5 +32,10 @@ def execute(raw_command: str, container):
 
     return api_response.success_response(
         "getsequence",
-        {"address": address, "sequence_number": int(seq), "tip_height": tip_height},
+        {
+            "address": address,
+            "sequence_number": int(seq),
+            "tip_height": tip_height,
+            "genesis_hash": network_binding.chain_genesis_hash(),
+        },
     )
