@@ -243,8 +243,12 @@ def test_the_evaluator_gets_the_values_the_main_step_got():
     ev = _blocking(o5="1")
     sender_policy.set_evaluator("apply", ev)
     _result, _lm, calls = ap._apply([_transfer_tx(500)], lm=_registered())
+    # The recipient gate (#47) evaluates the same transfer a second time
+    # with the recipient as policy owner, so the sender's step is picked
+    # by its i12, not by position.
     main_values = [c["input_stream_values"] for c in calls
-                   if str(c["input_stream_values"].get(1)) == "500"][-1]
+                   if str(c["input_stream_values"].get(1)) == "500"
+                   and ap.ALICE in str(c["input_stream_values"].get(12, ""))][-1]
     body, inputs = ev.verdict_calls[-1]
     assert body == CLAUSE
     assert inputs == sender_policy.clause_inputs(main_values)
