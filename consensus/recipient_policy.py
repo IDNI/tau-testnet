@@ -18,12 +18,14 @@ Two modes, mirroring the sender side:
   in the first pass. The counterparty is read on `i3`, which carries the
   sender's key in both passes. Callers supply the step function, so
   admission (tau_admission session) and apply (engine session) share this
-  one implementation. The pass steps only when the recipient's key
-  appears in the current spec text: a guarded unit scopes on its owner's
-  key as a literal, so absence proves there is no unit to enforce — and
-  an extra step on the shared session is observable by history-reading
-  rules and by the existing step accounting, so it is never spent
-  speculatively.
+  one implementation. The pass steps only when the spec carries a unit
+  scoped on the recipient — a unit whose guard compares `i12` against the
+  recipient's key as a full-width literal (see `spec_units` /
+  `_unit_for_owner`) — so absence proves there is no unit to enforce, and
+  a key that appears only in a comment, or only inside another unit's
+  body, never makes the pass step. An extra step on the shared session is
+  observable by history-reading rules and by the existing step accounting,
+  so it is never spent speculatively.
 
 Input contract (the documented choices the issues leave to the node): the
 recipient pass feeds the SAME per-transfer input map as the sender pass
@@ -61,9 +63,12 @@ carries the recipient's cap whenever the clause declares it in the
 canonical form — a direct comparison of a hold stream against a literal
 (`i17[t]:bv[64] <= { #x258 }:bv[64]`, or `<`, or the reversed forms); the
 cap is extracted textually by `extract_hold_caps`, the same class of
-textual screen the codebase already uses for stream domains. A cap clause
-in a non-canonical shape still enforces (the verdict decides); its
-refusal then reports the measured hold without a numeric cap.
+textual screen the codebase already uses for stream domains. The
+`:bv[...]` annotations are optional in the extraction patterns, as they
+are in the language — Tau infers a literal's type from the stream it is
+compared against — so a cap written `{ 600 }` reports its number too. A
+cap clause in a non-canonical shape still enforces (the verdict decides);
+its refusal then reports the measured hold without a numeric cap.
 
 Opt-in screen (backwards compatibility): the recipient pass enforces only
 clauses whose body reads the counterparty stream i3 or a hold stream
@@ -85,7 +90,11 @@ refused output fails as one transaction and no partial apply is possible.
 Determinism: admission (commands/sendtx.py) and apply (consensus/
 engine.py) call these functions with the same inputs, mirroring
 sender_policy, so the two paths cannot drift apart. Replay runs the same
-apply path, so a replayed block reaches the same verdicts.
+apply path, so a replayed block reaches the same verdicts. At apply the
+guarded pass prescreens on the parent snapshot's rules
+(`resolve_spec_text`), never on the process-global current spec, so a
+block re-applied after the tip moved on is screened against the same
+text that judged it the first time.
 
 Capability: `supported()` reads tau_defs.HOST_CAPABILITIES, which
 getgovernance reports to wallets. On a node built without this gate the
@@ -184,8 +193,9 @@ def hold_values(kind, release_at, height, timestamp) -> dict:
     }
 
 
-_LITERAL = r"\{\s*(?:#x(?P<hex>[0-9a-fA-F]+)|(?P<dec>\d+))\s*\}\s*:\s*bv\s*\[\s*\d+\s*\]"
-_STREAM_REF = r"i(?P<stream>17|27)\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*\d+\s*\]"
+_LITERAL = (r"\{\s*(?:#x(?P<hex>[0-9a-fA-F]+)|(?P<dec>\d+))\s*\}"
+            r"(?:\s*:\s*bv\s*\[\s*\d+\s*\])?")
+_STREAM_REF = r"i(?P<stream>17|27)\s*\[\s*t\s*\]\s*(?::\s*bv\s*\[\s*\d+\s*\])?"
 _CAP_DIRECT = re.compile(_STREAM_REF + r"\s*(?P<op><=|<)\s*" + _LITERAL)
 _CAP_REVERSED = re.compile(_LITERAL + r"\s*(?P<op>>=|>)\s*" + _STREAM_REF)
 
@@ -287,6 +297,100 @@ def recipient_clause_blocks(clause_for, sender_pubkey, recipient_pubkey,
     return True, detail, refusal
 
 
+_SPEC_KEY_LITERAL = (r"\{\s*#x(?P<key>[0-9a-fA-F]+)\s*\}"
+                     r"(?:\s*:\s*bv\s*\[\s*384\s*\])?")
+_UNIT_SCOPE = re.compile(
+    r"\bi12\s*\[\s*t\s*\]\s*(?::\s*bv\s*\[\s*\d+\s*\])?\s*=\s*"
+    + _SPEC_KEY_LITERAL)
+
+
+def _normalise_key(literal: str) -> str:
+    """A spec key literal normalised to the bare, lower-case, 96-hex-digit
+    public key the rest of the node compares against.
+
+    Spec text may carry a key zero-stripped or in upper case; a direct
+    string compare against the canonical key would then miss the
+    recipient's own unit.
+    """
+    return (literal or "").strip().lower().rjust(96, "0")[-96:]
+
+
+def spec_units(spec_text) -> list:
+    """The guarded units of a spec text, each split into (guard, body) on
+    the '?' that separates them, with comments scrubbed first.
+
+    Only chunks carrying an i12 scope comparison are kept — the canonical
+    guarded shape `always ( (i12[t] = { #xKEY }) ? body : body ).` is the
+    same shape the sender pass evaluates. A unit whose split fails (no
+    '?') is kept as its whole scrubbed text, so an unexpected shape still
+    gets evaluated rather than silently skipped.
+    """
+    if not spec_text or not isinstance(spec_text, str):
+        return []
+    scrubbed = strip_clause_comments(spec_text)
+    units = []
+    for chunk in scrubbed.split("always"):
+        chunk = chunk.strip()
+        if _UNIT_SCOPE.search(chunk):
+            guard, sep, body = chunk.partition("?")
+            units.append((guard, body) if sep else (chunk, ""))
+    return units
+
+
+def _unit_for_owner(unit_guard: str, recipient_pubkey: str):
+    """The guard literal if `unit_guard` scopes on `recipient_pubkey`,
+    else None.
+
+    A guard scopes an owner by comparing i12 against that owner's key as
+    a full-width literal. Matching the literal in the guard — not a
+    substring of the spec — is what makes the pass judge only units that
+    can actually be the recipient's: a key that appears in a comment, or
+    inside a *body* (an inbound allow-list naming the key it allows), is
+    not a scope and must not make an unrelated unit speak for the
+    recipient.
+    """
+    if not unit_guard or not recipient_pubkey:
+        return None
+    for match in _UNIT_SCOPE.finditer(unit_guard):
+        if _normalise_key(match.group("key")) == _normalise_key(
+                str(recipient_pubkey)):
+            return match.group("key")
+    return None
+
+
+def _recipient_unit(spec_text, recipient_pubkey):
+    """The body of the recipient's own guarded unit, or None."""
+    for guard, body in spec_units(spec_text):
+        if _unit_for_owner(guard, recipient_pubkey) is not None:
+            return body
+    return None
+
+
+def resolve_spec_text(snapshot=None, parent_snapshot=None) -> str:
+    """The spec text to prescreen with, pinned to the state under apply.
+
+    `apply` must judge a block against the rules its parent carried, not
+    against whatever the process loaded last: the same block re-applied
+    after the tip moved on must reach the same verdict (issue #47's
+    determinism requirement, and replay). A snapshot carries the
+    canonical rules as `tau_bytes`; the caller's live value
+    (tau_manager.last_known_tau_spec — a debug/error-state aid in
+    tau_manager's own words) is read only when no snapshot is at hand
+    (tests, admission's tip view).
+    """
+    for source in (snapshot, parent_snapshot):
+        raw = getattr(source, "tau_bytes", None) if source is not None else None
+        if isinstance(raw, (bytes, bytearray)):
+            text = raw.decode("utf-8", errors="ignore")
+        elif isinstance(raw, str):
+            text = raw
+        else:
+            continue
+        if text:
+            return text
+    return tau_manager.last_known_tau_spec or ""
+
+
 def guarded_recipient_blocks(evaluate, values, sender_pubkey,
                              recipient_pubkey, *, spec_text=None
                              ) -> tuple[bool, Optional[str]]:
@@ -300,20 +404,23 @@ def guarded_recipient_blocks(evaluate, values, sender_pubkey,
     included, is the transfer's own. A missing o5 is the neutral default
     (allow), exactly as in the sender pass.
 
-    Pre-screen: a guarded unit scopes on its owner's key as a literal in
-    the spec text, so the pass steps only when the caller-supplied
-    current spec text (`spec_text`, in production
-    tau_manager.last_known_tau_spec) actually contains the recipient's
-    key. Otherwise the recipient provably has no guarded unit and the
-    pass is skipped without stepping — an extra step on the shared
-    session is not free: history-reading rules (the cooldown stream,
-    say) observe every step, and existing fee/policy accounting counts
-    the main step's roundtrips. An unknown or empty spec text therefore
-    also skips: no spec, no units.
+    Pre-screen: the pass steps only when `spec_text` carries a *unit
+    scoped on the recipient* (see `_unit_for_owner`), because a step on
+    the shared session is not free — history-reading rules (the cooldown
+    stream, say) observe every step, and existing fee/policy accounting
+    counts the main step's roundtrips. A key that is only in a comment,
+    or only inside another unit's body, therefore does not make the pass
+    run: the recipient is judged by her own unit or by nothing, never by
+    a rule that only talks about her somewhere. An unknown or empty spec
+    text also skips: no spec, no units.
+
+    `spec_text` must be the spec of the state being judged (the block's
+    parent rules at apply — see `resolve_spec_text`; the tip view at
+    admission), not a live global.
     """
     if not recipient_pubkey or recipient_pubkey == sender_pubkey:
         return False, None
-    if not spec_text or str(recipient_pubkey) not in spec_text:
+    if _recipient_unit(spec_text, recipient_pubkey) is None:
         return False, None
     recip_values = dict(values or {})
     recip_values[12] = "{ #x" + str(recipient_pubkey) + " }:bv[384]"

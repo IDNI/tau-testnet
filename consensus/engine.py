@@ -2069,7 +2069,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             lambda vals: _session.evaluate(
                                 vals, multi=True, apply_rules_update=False),
                             tau_input_stream_values, from_addr, to_addr,
-                            spec_text=tau_manager.last_known_tau_spec,
+                            # The prescreen spec is pinned to the state
+                            # under apply (the parent snapshot's rules),
+                            # never the live module global: a block
+                            # re-applied after the tip moved on must be
+                            # screened against the same text, or replay
+                            # diverges.
+                            spec_text=recipient_policy.resolve_spec_text(snapshot),
                         )
                         if guarded_blocks:
                             logger.info(
