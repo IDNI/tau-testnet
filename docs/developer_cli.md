@@ -821,3 +821,21 @@ Raw transactions (root fields only):
 | `receive_route_set` | `destination_pubkey`, `route_bps`, `min_amount`, `active_from_time`, `expires_at_time`, `locked` (each optional field is signed as `null` when absent) |
 | `receive_route_clear` | `route_owner_pubkey` |
 | `rule_change_request` kind 6 / 7 | `rule_text` is a route spec (`receive_route_v1 destination=<hex> bps=<n> ...`) for kind 6, empty for kind 7; see [receive-routes.md](receive-routes.md#the-rule-change-guard) |
+
+## Recipient-side policy
+
+An account's o5 clause can also judge incoming payments (issues #47, #76): an
+inbound allow-list, or a cap on how long an incoming retractable transfer may be
+held. Semantics in the [README](../README.md#recipient-side-policy); long-form
+guide: [recipient-policy.md](recipient-policy.md).
+
+A clause opts in by reading `i17[t]:bv[64]` (`0` = the owner's own outgoing
+transfer, `1 + hold seconds` = incoming). Deploy it as any o5 policy (a
+`rule_change_request` of kind 1, or a user rule writing o5); the web wallet's
+policy panel has templates for the allow-list, instant-only and a 10-minute cap.
+
+| Read | Field |
+|---|---|
+| `getaccountstate <address>` | `recipient_policy: {active, inbound_rule}` |
+| `checktx <payload>` | `recipient_policy_active`; `RECIPIENT_POLICY_INACTIVE` for a rule that reads i17 while the feature is off |
+| `sendtx` refusals | `RECIPIENT_POLICY_BLOCK`, `RECIPIENT_MAX_HOLD` (`max_hold_seconds`, `hold_seconds`) |

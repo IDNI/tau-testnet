@@ -167,6 +167,36 @@ def screen_slot_widths(body: str) -> Optional[str]:
     return None
 
 
+def screen_recipient_policy_width(body: str) -> Optional[str]:
+    """None when every i17 mention is typed bv[64], else the reason.
+
+    Applies once recipient-side policy is active (issues #47, #76): the node then
+    feeds i17 to every o5 clause at bv[64], and a clause typing it at any other
+    width (or leaving it untyped, so the engine infers one) would poison the
+    policy worker's process-global typing for every recipient after it. Same
+    reject-unless-annotated contract as the approval slots.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    scrubbed = strip_clause_comments(body or "")
+    idx = tau_defs.RECIPIENT_POLICY_STREAM_INDEX
+    width = tau_defs.RECIPIENT_POLICY_BV_WIDTH
+    for match in re.finditer(r"\bi%d\b" % idx, scrubbed):
+        tail = scrubbed[match.end():]
+        typed = re.match(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*(\d+)\s*\]", tail)
+        if not typed:
+            return (
+                f"every mention of i{idx} must be written i{idx}[t]:bv[{width}]; an "
+                f"untyped mention lets the engine infer a conflicting width"
+            )
+        if int(typed.group(1)) != width:
+            return (
+                f"i{idx} is the recipient-policy input and must be typed bv[{width}], "
+                f"found bv[{typed.group(1)}]"
+            )
+    return None
+
+
 # --- User-policy / custom-fee width screening (o5, o8) ----------------------
 #
 # Same reject-unless-annotated contract as the approval slots, for the shared
@@ -358,6 +388,40 @@ def audit_stream_collisions(spec_texts) -> List[str]:
                 f"registered clauses. Clear it or start from fresh state before "
                 f"activating."
             )
+    return findings
+
+
+def audit_recipient_policy_collisions(spec_texts) -> List[str]:
+    """Reasons recipient-side policy (issues #47, #76) cannot safely be activated.
+
+    Before activation i17 is an ordinary custom stream. A rule or clause that
+    already reads it would, from activation on, either collide with the frozen
+    bv[64] typing the node feeds (poisoning a policy worker) or lose the custom
+    value it was written for (a sender can no longer write i17), so any reference
+    in the effective spec refuses the activation. Same corpus as
+    `audit_stream_collisions`.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    idx = tau_defs.RECIPIENT_POLICY_STREAM_INDEX
+    o5_clause_suffix = "_o%d" % tau_defs.USER_POLICY_STREAM_INDEX
+    findings: List[str] = []
+    for label, text in spec_texts or ():
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if not re.search(r"\bi%d\b" % idx, strip_clause_comments(text)):
+            continue
+        # An o5 clause reading i17 at the frozen width is the feature's own use:
+        # an inbound rule deployed ahead of activation, which starts judging
+        # incoming payments from then on. Anything else (a raw rule, a guard, a
+        # consensus revision, a clause typing i17 at another width) collides.
+        if (str(label).startswith("clause_") and str(label).endswith(o5_clause_suffix)
+                and screen_recipient_policy_width(text) is None):
+            continue
+        findings.append(
+            f"{label} already references i{idx}; activating recipient policy "
+            f"would reserve it and feed it at bv[{tau_defs.RECIPIENT_POLICY_BV_WIDTH}]"
+        )
     return findings
 
 

@@ -57,6 +57,19 @@ _ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _U64_MAX = 0xFFFFFFFFFFFFFFFF
 
 
+def hold_seconds(park, timestamp: int) -> int:
+    """How long a park keeps the funds from its recipient, in seconds, for the
+    recipient's hold cap (issue #76).
+
+    A time-released park holds `release_at_time - timestamp`. A height-released
+    park has no wall-clock bound (blocks can stall), so it reports the longest
+    window a park may have and any finite cap refuses it.
+    """
+    if park.kind == KIND_TIME:
+        return max(0, int(park.release_at) - int(timestamp))
+    return MAX_RELEASE_WINDOW_SECONDS
+
+
 class RetractableShapeError(ValueError):
     """A retractable transaction does not have a shape the node can record."""
 

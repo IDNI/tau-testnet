@@ -314,6 +314,47 @@ APPROVAL_SLOT_BV_WIDTH = 384
 # and a parked request can outlive the mode it was admitted under.
 REQUEST_CUSTOM_INPUT_MIN = APPROVAL_SLOT_BASE + APPROVAL_SLOT_COUNT
 
+
+# --- Recipient-side policy (issues #47, #76) ---------------------------------
+# The node evaluates only the SENDER's o5 clause unless this is on. Once the
+# one-way governance patch `recipient_policy_active` is applied, the node also
+# evaluates the RECIPIENT's o5 clause for every transfer and every retractable
+# park naming it -- but only when that clause reads i17, so an existing
+# outbound-only clause (a whitelist on i4, say) never starts judging incoming
+# money it was not written for.
+#
+# i17 says which side the evaluation is for, and for a park how long it holds:
+#
+#   0          the account's own OUTGOING transfer (the sender pass)
+#   1 + H      an INCOMING transfer held H seconds before the recipient can
+#              spend it: 1 for a plain transfer, 1 + (release_at_time - block
+#              time) for a time-released park. A park released by HEIGHT has no
+#              wall-clock bound, so it reports the longest window there is,
+#              1 + MAX_RELEASE_WINDOW_SECONDS, and any finite cap refuses it.
+#
+#   inbound allow-list:  always ( ((i17[t]:bv[64] > { 0 }:bv[64]) && !(i3[t]:bv[384] = { #xA.. }:bv[384]))
+#                          ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
+#   instant only:        hold above 0 refused, i.e. i17 > 1
+#   at most 600 s held:  i17 > 601 refused
+#
+# Every other input is the transfer's own (i1 amount, i3 sender, i4 recipient,
+# i5 time), so "allow only from A" is a plain comparison on i3.
+#
+# i17 is fed ONLY to o5 clause evaluations (per-account workers), never to the
+# shared Tau program, so its typing cannot collide with a network rule. Like i16
+# and the approval slots it stays an ordinary custom stream until activation;
+# from activation it is write-reserved everywhere, readable only from an o5
+# clause, and its width is frozen at bv[64] (typing is process-global and sticky
+# inside a policy worker).
+RECIPIENT_POLICY_STREAM_INDEX = 17
+RECIPIENT_POLICY_BV_WIDTH = 64
+RECIPIENT_POLICY_OUTBOUND = 0
+
+
+def recipient_policy_inbound_value(hold_seconds: int) -> int:
+    """i17 for the recipient's evaluation of a payment held `hold_seconds`."""
+    return 1 + max(0, int(hold_seconds))
+
 # Rule-text screening contexts. Slots are readable in exactly one of them.
 RULE_TEXT_CONTEXT_USER = "user_rule"
 RULE_TEXT_CONTEXT_O5_CLAUSE = "o5_clause"
@@ -326,7 +367,8 @@ def approval_slot_indices() -> tuple:
 
 
 def reserved_operation_keys(
-    eligibility_mode: str = "", approval_slots_active: bool = False
+    eligibility_mode: str = "", approval_slots_active: bool = False,
+    recipient_policy_active: bool = False,
 ) -> tuple:
     """Operation keys a user_tx may not target, for the given eligibility mode.
 
@@ -349,6 +391,9 @@ def reserved_operation_keys(
         # Reserved exactly when the node starts feeding them, mirroring the i13
         # and i16 precedents.
         keys = keys + approval_slot_indices()
+    if recipient_policy_active:
+        # Same precedent: i17 is reserved from the moment the node feeds it.
+        keys = keys + (RECIPIENT_POLICY_STREAM_INDEX,)
     return keys
 
 
@@ -356,6 +401,7 @@ def rule_text_forbidden_input_streams(
     context: str = RULE_TEXT_CONTEXT_USER,
     eligibility_mode: str = "",
     approval_slots_active: bool = False,
+    recipient_policy_active: bool = False,
 ) -> tuple:
     """Input stream NAMES that rule text of this kind may not reference.
 
@@ -367,9 +413,12 @@ def rule_text_forbidden_input_streams(
     everywhere, readable only from a registered o5 clause.
     """
     keys = reserved_operation_keys(
-        eligibility_mode, approval_slots_active=approval_slots_active
+        eligibility_mode, approval_slots_active=approval_slots_active,
+        recipient_policy_active=recipient_policy_active,
     )
     readable = {12}
     if context == RULE_TEXT_CONTEXT_O5_CLAUSE:
         readable |= set(approval_slot_indices())
+        # The node feeds i17 to o5 clauses only, so only they may read it.
+        readable.add(RECIPIENT_POLICY_STREAM_INDEX)
     return tuple(f"i{idx}" for idx in keys if idx not in readable)

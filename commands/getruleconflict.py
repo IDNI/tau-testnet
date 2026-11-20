@@ -174,9 +174,14 @@ def execute(raw_command: str, container):
 
     # --- L1 reserved domains ---------------------------------------------
     if body is not None:
-        from consensus.admission import _screen_clause_domains
+        from consensus.admission import screen_o5_clause
+        from consensus.facade import TipAdmissionView
 
-        domain_error = _screen_clause_domains(body)
+        try:
+            recipient_on = TipAdmissionView().recipient_policy_active
+        except Exception:
+            recipient_on = False
+        domain_error = screen_o5_clause(body, recipient_on)
         if domain_error:
             layers.append(_layer("reserved_domains", "conflict", domain_error))
             escalate(VERDICT_CONFLICT)

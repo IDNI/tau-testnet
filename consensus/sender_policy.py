@@ -116,3 +116,85 @@ def clause_builds(body, *, pool: str, timeout=_SESSION_DEFAULT) -> tuple[bool, s
     """
     result = evaluator(pool).validate(body, timeout=timeout)
     return result.ok, result.error
+
+
+# --- Recipient-side policy (issues #47, #76) ---------------------------------
+#
+# The same per-account o5 clause, evaluated a second time for the account a
+# payment is going TO. i17 tells the clause which side it is on (see tau_defs):
+# 0 for the owner's own outgoing transfer, 1 + hold seconds for an incoming one.
+# Every other input is the transfer's own, so "allow only from A" is a plain
+# comparison on i3. Only a clause that reads i17 takes part: an existing
+# outbound-only clause was never written to judge incoming money.
+
+def reads_recipient_input(body) -> bool:
+    """Whether a clause body reads i17, i.e. opted in to judging incoming payments."""
+    if not isinstance(body, str) or not body:
+        return False
+    import re
+
+    from consensus.rule_offers import strip_clause_comments
+
+    return re.search(
+        r"\bi%d\b" % tau_defs.RECIPIENT_POLICY_STREAM_INDEX,
+        strip_clause_comments(body),
+    ) is not None
+
+
+def outbound_values(values: dict, recipient_policy_active: bool) -> dict:
+    """The sender pass's inputs: i17 = 0 once recipient policy is on, so a clause
+    with inbound rules reads a defined value on its owner's own transfers."""
+    if not recipient_policy_active:
+        return values
+    out = dict(values)
+    out[tau_defs.RECIPIENT_POLICY_STREAM_INDEX] = str(tau_defs.RECIPIENT_POLICY_OUTBOUND)
+    return out
+
+
+def inbound_values(values: dict, hold_seconds: int) -> dict:
+    """The recipient pass's inputs: the transfer's own, with i17 = 1 + hold."""
+    out = dict(values)
+    out[tau_defs.RECIPIENT_POLICY_STREAM_INDEX] = str(
+        tau_defs.recipient_policy_inbound_value(hold_seconds)
+    )
+    return out
+
+
+def recipient_clause_blocks(clause_for, recipient: str, values: dict,
+                            hold_seconds: int = 0, *, pool: str,
+                            timeout=_SESSION_DEFAULT) -> tuple[bool, str]:
+    """(blocked, detail) from the RECIPIENT's o5 clause for one incoming payment.
+
+    (False, "") when the recipient has no clause or its clause does not read i17.
+    A clause that does not build or step blocks, as on the sender side.
+    """
+    body = clause_for(recipient, tau_defs.USER_POLICY_STREAM_INDEX)
+    if not reads_recipient_input(body):
+        return False, ""
+    return clause_blocks(body, inbound_values(values, hold_seconds),
+                         pool=pool, timeout=timeout)
+
+
+def hold_refusal_cap(clause_for, recipient: str, values: dict, hold_seconds: int, *,
+                     pool: str, timeout=_SESSION_DEFAULT) -> tuple[bool, int | None]:
+    """For a park the recipient refused: (is_hold_refusal, cap_seconds).
+
+    A refusal is about the HOLD when the same payment with no hold passes. The
+    cap is then the longest hold the clause still accepts, found by bisection
+    over 0..hold_seconds-1 (a cap rule is monotonic in the hold). Used only to
+    word the refusal, never to decide it.
+    """
+    blocked_now, _ = recipient_clause_blocks(
+        clause_for, recipient, values, 0, pool=pool, timeout=timeout)
+    if blocked_now:
+        return False, None
+    lo, hi = 0, max(0, int(hold_seconds) - 1)  # lo always passes
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        blocked, _ = recipient_clause_blocks(
+            clause_for, recipient, values, mid, pool=pool, timeout=timeout)
+        if blocked:
+            hi = mid - 1
+        else:
+            lo = mid
+    return True, lo

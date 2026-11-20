@@ -425,6 +425,15 @@ class TipAdmissionView:
         # Apply judges on the real block timestamp, so the clock cannot split nodes.
         return max(self.tip_timestamp, int(time.time()))
 
+    # --- Recipient-side policy (issues #47, #76) ----------------------------
+
+    @property
+    def recipient_policy_active(self) -> bool:
+        """Whether the recipient's o5 clause is evaluated at the canonical tip;
+        read from the lifecycle manager block apply reads, as for slots."""
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        return getattr(lm, "recipient_policy_active", False) is True
+
     # --- Receive routes (issue #35) ----------------------------------------
 
     @property

@@ -15,6 +15,7 @@ let pendingSequence = null;
 let tipHeight = null;
 // Blocks a transaction stays includable for. Mirrors tau_defs.DEFAULT_TX_EXPIRY_BLOCKS.
 const DEFAULT_EXPIRY_BLOCKS = 1000; // Track local sequence to prevent 'expected 1 got 0' on rapid sends
+let recipientPolicyActive = false; // from getaccountstate: recipient-side policy (#47, #76) on the network
 let _pendingPolicyTx = null; // { seq } while a policy-change tx awaits the node's answer
 let _pendingGovTx = null; // { seq, activeTab } — set during gov tx send, consumed on SUCCESS/FAILURE
 let _pendingPreview = null; // { nonce, sentFingerprint } — tracks in-flight preview request
@@ -517,6 +518,13 @@ function handleServerResponse(msg) {
             }));
             break;
 
+        case 'getaccountstate':
+            if (ok) {
+                const rp = data.recipient_policy || {};
+                recipientPolicyActive = rp.active === true;
+            }
+            break;
+
         case 'getreceiveroute':
             // Silent on error: a node with the feature off simply has no route to show.
             renderReceiveRoute(ok ? data : null);
@@ -722,6 +730,9 @@ function refreshInfo() {
 
     // Receive route (issue #35); limit 1 keeps the history part small.
     sendRpc(`getreceiveroute ${pubHex} 1`);
+
+    // Whether the network evaluates recipients' policies (issues #47, #76).
+    sendRpc(`getaccountstate ${pubHex}`);
 }
 
 // --- Receive route status (issue #35) ---
@@ -1515,6 +1526,53 @@ always ((i1[t]:bv[24] > { #x000000 }:bv[24]) ? (o5[t]:bv[24] = { #x000000 }:bv[2
 # ---------------------------------------------------------
 # Replace the key with the ALLOWED recipient's 96-character public key hex.
 always ((i4[t]:bv[384] = { #x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222 }:bv[384]) ? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24])).`,
+
+    "Accept payments only from approved senders (inbound)": `# ---------------------------------------------------------
+# ACCEPT PAYMENTS ONLY FROM APPROVED SENDERS (INBOUND ALLOW-LIST)
+# ---------------------------------------------------------
+# Payments coming in to your account are refused unless the sender
+# (i3) is one of the approved addresses. Your own outgoing transfers
+# are not affected. Needs recipient-side policy to be active on the
+# network.
+#
+# i17[t] : Which side this check is for (bv[64]): 0 = your own outgoing
+#          transfer, 1 or more = a payment coming in to you.
+# i3[t]  : The sender's public key (bv[384]).
+# o5[t]  : Policy signal (bv[24]: 0 = refuse, 1 = allow)
+# ---------------------------------------------------------
+# Replace the two keys with the senders you accept. Remove or repeat
+# a "&& !(...)" part for fewer or more senders.
+always (((i17[t]:bv[64] > { #x0000000000000000 }:bv[64]) && !(i3[t]:bv[384] = { #x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111 }:bv[384]) && !(i3[t]:bv[384] = { #x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222 }:bv[384])) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])).`,
+
+    "Instant payments only, no recall window (inbound)": `# ---------------------------------------------------------
+# INSTANT PAYMENTS ONLY (MAXIMUM HOLD TIME 0)
+# ---------------------------------------------------------
+# A payment to your account must arrive at once: a retractable
+# transfer, which the sender could still take back before it
+# releases, is refused, so "paid" means final. Plain transfers and
+# your own outgoing transfers are not affected. Needs recipient-side
+# policy to be active on the network.
+#
+# i17[t] : 0 = your own outgoing transfer; for a payment coming in,
+#          1 + the seconds it is held (1 = instant).
+# o5[t]  : Policy signal (bv[24]: 0 = refuse, 1 = allow)
+# ---------------------------------------------------------
+always ((i17[t]:bv[64] > { #x0000000000000001 }:bv[64]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])).`,
+
+    "Hold incoming payments at most 10 minutes (inbound)": `# ---------------------------------------------------------
+# MAXIMUM HOLD TIME: 10 MINUTES
+# ---------------------------------------------------------
+# A retractable transfer to your account is accepted only if it
+# releases within 600 seconds; longer ones, and ones released by
+# block height (no time bound), are refused. Needs recipient-side
+# policy to be active on the network.
+#
+# i17[t] : 0 = your own outgoing transfer; for a payment coming in,
+#          1 + the seconds it is held. So "held at most 600 s" is
+#          "i17 at most 601" (#x259).
+# o5[t]  : Policy signal (bv[24]: 0 = refuse, 1 = allow)
+# ---------------------------------------------------------
+always ((i17[t]:bv[64] > { #x0000000000000259 }:bv[64]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])).`,
 
     "Limit transfers to max 5000": `# ---------------------------------------------------------
 # LIMIT TRANSFERS FROM MY ACCOUNT TO MAX 5000
@@ -2315,6 +2373,19 @@ function policyFetchOfferText(offerId) {
     });
 }
 
+// An o5 rule that reads i17 judges INCOMING payments (issues #47, #76). Refused
+// while the network has recipient-side policy off: it would never run.
+function readsRecipientInput(text) {
+    return /\bi17\b/.test(liveTauLines(String(text || '')));
+}
+
+function inboundRuleProblem(kind, ruleText, active) {
+    if (kind !== 1 && kind !== 3) return "";
+    if (!readsRecipientInput(ruleText) || active) return "";
+    return "This rule reads i17 and would judge incoming payments, but recipient-side "
+        + "policy is not active on this network, so it would never run.";
+}
+
 function formatRuleChangeSummary(body, expireIn, expireAtHeight) {
     let text = `Transaction Type: rule_change_request\n`
         + `Kind: ${RULE_CHANGE_KINDS[body.kind]} (${body.kind})\n`;
@@ -2325,6 +2396,8 @@ function formatRuleChangeSummary(body, expireIn, expireAtHeight) {
         if (f.locked === '1') text += `Locked until ${f.expires_at_time}, after a ${ROUTE_LOCK_NOTICE_SECONDS / 86400}-day notice period\n`;
     } else if (body.kind === 7) {
         text += `Removes this account's receive route\n`;
+    } else if (body.kind === 1 && readsRecipientInput(body.rule_text)) {
+        text += `Judges payments coming IN to this account too (recipient-side policy)\n`;
     }
     if (body.rule_text) {
         text += body.rule_text.length <= 500
@@ -2364,6 +2437,8 @@ async function onSendPolicyRequest() {
         if (!Number.isInteger(fee) || fee < 0) throw new Error("Fee limit must be a non-negative integer.");
 
         if (kind === 3) ruleText = await policyFetchOfferText(offerId.trim().toLowerCase());
+        const inboundProblem = inboundRuleProblem(kind, ruleText, recipientPolicyActive);
+        if (inboundProblem) throw new Error(inboundProblem);
         const body = buildRuleChangeRequestBody({ kind, rule_text: kind === 2 || kind === 5 || kind === 7 ? '' : ruleText, offer_id: offerId, approvers });
         const expireAtHeight = tipHeight + 1 + expireIn;
 

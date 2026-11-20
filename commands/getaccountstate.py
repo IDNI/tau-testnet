@@ -22,6 +22,7 @@ import logging
 from datetime import datetime, timezone
 
 import api_response
+import tau_defs
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,20 @@ def execute(raw_command: str, container):
     except Exception:
         receive_route = None
 
+    # Recipient-side policy (issues #47, #76): whether this node evaluates the
+    # recipient's clause at all, and whether this account's clause opted in by
+    # reading i17. Wallets read `active` before offering an inbound rule.
+    try:
+        from consensus import sender_policy
+
+        recipient_policy = {
+            "active": tip.recipient_policy_active,
+            "inbound_rule": sender_policy.reads_recipient_input(
+                tip.clause_for(address, tau_defs.USER_POLICY_STREAM_INDEX)),
+        }
+    except Exception:
+        recipient_policy = {"active": False, "inbound_rule": False}
+
     pending_outgoing = 0
     pending_incoming = 0
     pending_fees = 0
@@ -126,5 +141,6 @@ def execute(raw_command: str, container):
         "escrowed_out": str(escrowed_out),
         "escrowed_in": str(escrowed_in),
         "receive_route": receive_route,
+        "recipient_policy": recipient_policy,
         "pending_txs": pending_txs,
     })

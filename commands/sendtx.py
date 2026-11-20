@@ -518,12 +518,68 @@ def _policy_call(call):
         raise tau_admission.AdmissionUnavailable(str(exc)) from exc
 
 
+def _recipient_policy_on(tip_view) -> bool:
+    """Whether recipient-side policy (issues #47, #76) is on at the tip."""
+    return getattr(tip_view, "recipient_policy_active", False) is True
+
+
 def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
     """(blocked, detail) for the sender's own o5 clause on one transfer's inputs."""
     body = tip_view.clause_for(sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX)
+    values = sender_policy.outbound_values(values, _recipient_policy_on(tip_view))
     return _policy_call(lambda: sender_policy.clause_blocks(
         body, values, pool="admission", timeout=budget
     ))
+
+
+def _admission_hold_seconds(tx_type, admission_data, admission_ts) -> int:
+    """How long the payment would hold the funds from its recipient (issue #76):
+    0 for a plain transfer, the park's window for a retractable transfer."""
+    if tx_type != TX_TYPE_RETRACTABLE_TRANSFER:
+        return 0
+    from consensus.retractable import KIND_TIME, MAX_RELEASE_WINDOW_SECONDS
+
+    data = admission_data or {}
+    if data.get("release_kind") == KIND_TIME:
+        return max(0, int(data.get("release_at", 0)) - int(admission_ts))
+    return MAX_RELEASE_WINDOW_SECONDS
+
+
+def _recipient_refusal(tip_view, recipient, values, hold, budget, transfer_index, details):
+    """The rejection envelope when the recipient's policy refuses the payment, or None.
+
+    RECIPIENT_MAX_HOLD when the same payment with no hold would pass (issue #76),
+    carrying the longest hold the recipient accepts; RECIPIENT_POLICY_BLOCK
+    otherwise (issue #47).
+    """
+    clause_for = tip_view.clause_for
+    blocked, o5 = _policy_call(lambda: sender_policy.recipient_clause_blocks(
+        clause_for, recipient, values, hold, pool="admission", timeout=budget
+    ))
+    if not blocked:
+        return None
+    if hold > 0:
+        is_hold, cap = _policy_call(lambda: sender_policy.hold_refusal_cap(
+            clause_for, recipient, values, hold, pool="admission", timeout=budget
+        ))
+        if is_hold:
+            return _qt_err(
+                "RECIPIENT_MAX_HOLD",
+                f"Transaction rejected by the recipient's policy for transfer "
+                f"#{transfer_index}: the recipient accepts payments held at most "
+                f"{cap} seconds, and this one would be held {hold} seconds.",
+                transfer_index=transfer_index,
+                recipient=recipient,
+                max_hold_seconds=cap,
+                hold_seconds=hold,
+            )
+    return _qt_err(
+        "RECIPIENT_POLICY_BLOCK",
+        f"Transaction rejected by the recipient's policy (o5) for transfer "
+        f"#{transfer_index} ({details}). Policy output: {o5}",
+        transfer_index=transfer_index,
+        recipient=recipient,
+    )
 
 
 def _clause_build_refusal(body, budget):
@@ -984,6 +1040,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         or idx in tau_defs.reserved_operation_keys(
                             tip_view.eligibility_mode,
                             approval_slots_active=approval_slots_active(tip_view),
+                            recipient_policy_active=_recipient_policy_on(tip_view),
                         ):
                     return _qt_err(
                         "TX_INVALID",
@@ -1357,6 +1414,19 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 ),
                                 transfer_index=i + 1,
                             )
+
+                        # Recipient-side policy (issues #47, #76), after the
+                        # sender's checks, as apply runs it.
+                        if _recipient_policy_on(tip_view):
+                            refusal = _recipient_refusal(
+                                tip_view, tau_input_dict['to_addr'],
+                                tau_input_stream_values,
+                                _admission_hold_seconds(
+                                    tx_type, admission_eval.data, admission_ts),
+                                admission_tau.budget, i + 1, transfer_details,
+                            )
+                            if refusal is not None:
+                                return refusal
 
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.

@@ -670,6 +670,18 @@ tau-testnet route clear --key treasury --owner <bob_pubkey>                     
 
 **Upgrade.** Off until activated: a governance patch `{"receive_routes_active": true}` (or `gen_genesis.py --receive-routes` on a fresh chain) turns it on, one way. The flag and the route book enter the consensus meta hash only once set, so no regenesis is needed, and no route transaction is accepted before activation, so validators upgrade first and then vote it in.
 
+## Recipient-side policy
+
+Long-form guide: [docs/recipient-policy.md](docs/recipient-policy.md).
+
+An account's own o5 clause can also judge payments coming **in** to it (issues #47, #76): accept payments only from approved senders, or cap how long an incoming retractable transfer may be held (0 = instant only, so "paid" means final). Once active, the node feeds **i17** to every o5 clause: `0` for the owner's own outgoing transfer, `1 + hold seconds` for an incoming payment. Only a clause that reads i17 is consulted for receipts, so existing outbound rules are untouched.
+
+- **Checked:** every transfer leg, retractable parks (with their hold; a height-released park counts as the longest window), co-signed transfers when they execute. **Not checked:** releases, retracts, routed shares, faucet grants.
+- **Refusal** fails the whole transaction, like a sender-side o5 block (no fee). Codes: `RECIPIENT_POLICY_BLOCK`, `RECIPIENT_MAX_HOLD` (with `max_hold_seconds`).
+- **Reads.** `getaccountstate` shows `recipient_policy: {active, inbound_rule}`; `checktx` reports `recipient_policy_active` and refuses an inbound rule while the feature is off.
+
+**Upgrade.** Off until a governance patch `{"recipient_policy_active": true}` (or `gen_genesis.py --recipient-policy`) turns it on, one way; i17 is then write-reserved and typed bv[64]. The flag enters the meta hash only once set.
+
 ## Mempool policy
 
 - **Lanes** — every tx is classified `fast` (coin transfers) or `slow` (anything carrying Tau rule text: `rule_offer`, `rule_offer_accept`, `consensus_rule_update`, or a `user_tx` with a non-empty `operations["0"]`). A `user_tx` carrying both a rule and transfers is `slow` — the signature covers the whole payload, so it cannot be split. Applying a rule builds or recompiles Tau state, which costs far more than a transfer's one cheap step; without separation a burst of rule work delays every queued transfer. Fee priority cannot express the split, because a rule emits its own `o8` user fee and can therefore price itself to the front of the queue.

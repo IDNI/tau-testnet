@@ -95,6 +95,7 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "max_rule_txs_per_block",
     "approval_slots_active",
     "receive_routes_active",
+    "recipient_policy_active",
 })
 
 
@@ -106,6 +107,18 @@ def validate_receive_routes_active(value: Any) -> Optional[str]:
     """
     if value is not True:
         return "must be true; receive routes cannot be deactivated once active"
+    return None
+
+
+def validate_recipient_policy_active(value: Any) -> Optional[str]:
+    """Recipient-side policy activation (issues #47, #76) is a ONE-WAY switch.
+
+    Off again would un-reserve i17 while recipients' clauses still read it, so a
+    sender could feed i17 themselves and pose as the outgoing side of their own
+    payment, slipping past the recipient's inbound rules.
+    """
+    if value is not True:
+        return "must be true; recipient policy cannot be deactivated once active"
     return None
 
 
@@ -224,6 +237,7 @@ def build_mechanism_metadata(
     faucet_amount: int = 0,
     receive_routes_root: str = "",
     receive_routes_active: bool = False,
+    recipient_policy_active: bool = False,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -276,6 +290,9 @@ def build_mechanism_metadata(
         mech["receive_routes_active"] = True
     if receive_routes_root:
         mech["receive_routes_root"] = receive_routes_root
+    # Recipient-side policy (issues #47, #76): emitted only once activated.
+    if recipient_policy_active:
+        mech["recipient_policy_active"] = True
     return mech
 
 
@@ -497,6 +514,10 @@ class ConsensusLifecycleManager:
         # Until it is set no route transaction is accepted, so a node that has
         # not upgraded cannot be forked by the first route anyone submits.
         self.receive_routes_active: bool = False
+        # Recipient-side policy (issues #47, #76): ONE-WAY governance activation,
+        # parent-snapshot timing as above. Until it is set the node evaluates
+        # only the sender's o5 clause and i17 is an ordinary custom stream.
+        self.recipient_policy_active: bool = False
         # Pinned by genesis for the life of the network: no patch sets it.
         # Bound into the meta hash only when non-zero.
         self.faucet_amount: int = 0
@@ -589,6 +610,7 @@ class ConsensusLifecycleManager:
             receive_routes_root=_receive_routes_root(self),
             # getattr: a manager unpickled from before the field existed.
             receive_routes_active=getattr(self, "receive_routes_active", False) is True,
+            recipient_policy_active=getattr(self, "recipient_policy_active", False) is True,
         )
         return compute_consensus_meta_hash(
             host_contract={},
@@ -707,6 +729,28 @@ class ConsensusLifecycleManager:
             if err:
                 raise ValueError(f"receive_routes_active: {err}")
             self.activate_receive_routes()
+
+        if "recipient_policy_active" in patch:
+            err = validate_recipient_policy_active(patch["recipient_policy_active"])
+            if err:
+                raise ValueError(f"recipient_policy_active: {err}")
+            # Two-phase, like approval_slots_active: a rule or clause that already
+            # reads i17 would either collide with its frozen bv[64] typing or
+            # silently lose the custom value it relied on, so activation is
+            # refused (logged, flag left False on every node alike) rather than
+            # raising and freezing the chain.
+            from consensus.approvals import audit_recipient_policy_collisions
+
+            corpus = effective_spec_texts() if callable(effective_spec_texts) else effective_spec_texts
+            findings = audit_recipient_policy_collisions(corpus or ())
+            if findings:
+                logger.error(
+                    "recipient_policy_active activation REFUSED at this height; the "
+                    "effective spec already reads i17: %s",
+                    "; ".join(findings),
+                )
+            else:
+                self.activate_recipient_policy()
         self.recompute_approval_threshold()
 
     def activate_approval_slots(self) -> None:
@@ -721,6 +765,10 @@ class ConsensusLifecycleManager:
     def activate_receive_routes(self) -> None:
         """Turn receive routes on. Idempotent, and there is no way back."""
         self.receive_routes_active = True
+
+    def activate_recipient_policy(self) -> None:
+        """Turn recipient-side policy on. Idempotent, and there is no way back."""
+        self.recipient_policy_active = True
 
     def knows_update(self, update_id: bytes) -> bool:
         """Check if an update is currently known in any state."""

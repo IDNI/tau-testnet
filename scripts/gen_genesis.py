@@ -45,6 +45,15 @@ def get_args():
         ),
     )
     parser.add_argument(
+        "--recipient-policy", action="store_true",
+        help=(
+            "Activate recipient-side policy (issues #47, #76: inbound allow-lists "
+            "and a cap on how long an incoming payment may be held) from block 0. "
+            "For a FRESH chain only: on an existing chain this is the governance "
+            "patch recipient_policy_active. Off by default."
+        ),
+    )
+    parser.add_argument(
         "--approval-slots", action="store_true",
         help=(
             "Activate co-signature approval slots (i18-i25) from block 0. For a "
@@ -329,6 +338,7 @@ def main():
         approval_slots_active=bool(getattr(args, "approval_slots", False)),
         faucet_amount=args.faucet_amount,
         receive_routes_active=bool(getattr(args, "receive_routes", False)),
+        recipient_policy_active=bool(getattr(args, "recipient_policy", False)),
     )
     consensus_meta = {
         "proof_scheme": "bls_header_sig",

@@ -238,6 +238,14 @@ or `INVALID_RULE_CHANGE_REQUEST` for the parked kinds) and are no-ops at apply.
 `false` is not a legal patch value: turning the feature off would strand
 installed routes, locked ones included, with no way to clear them.
 
+## Recipient-side policy
+
+A routed share is not gated by the destination's inbound allow-list or hold cap
+([recipient-policy.md](recipient-policy.md)): it is the route owner's money moving
+by the owner's own rule, and gating it would let a destination's policy fail every
+payment to the owner. The payment to the owner is checked against the owner's
+policy as usual.
+
 ## Security notes
 
 - **A route redirects future income.** Anyone holding the owner's key can

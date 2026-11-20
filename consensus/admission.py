@@ -80,6 +80,7 @@ from consensus.governance import (
     validate_fee_beneficiary,
     validate_approval_slots_active,
     validate_receive_routes_active,
+    validate_recipient_policy_active,
 )
 
 logger = logging.getLogger(__name__)
@@ -257,7 +258,8 @@ class UserRuleRejection(NamedTuple):
 
 
 def screen_user_rule_text(
-    rule_text: str, eligibility_mode: str, slots_active: bool
+    rule_text: str, eligibility_mode: str, slots_active: bool,
+    recipient_active: bool = False,
 ) -> Optional[UserRuleRejection]:
     """Screens for an accumulated op-0 rule, run by admission and by block apply.
 
@@ -294,6 +296,7 @@ def screen_user_rule_text(
         tau_defs.RULE_TEXT_CONTEXT_USER,
         eligibility_mode,
         approval_slots_active=slots_active,
+        recipient_policy_active=recipient_active,
     )
     typed_reserved_in = _streams_referenced(rule_text, typed_reserved)
     if typed_reserved_in:
@@ -376,6 +379,7 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
     reserved_ops = tau_defs.reserved_operation_keys(
         getattr(tip_view, "eligibility_mode", ""),
         approval_slots_active=slots_active,
+        recipient_policy_active=recipient_policy_active(tip_view),
     )
 
     for key, val in operations.items():
@@ -412,7 +416,10 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         if routing is not None:
             return routing
 
-        rejection = screen_user_rule_text(rule_text, tip_view.eligibility_mode, slots_active)
+        rejection = screen_user_rule_text(
+            rule_text, tip_view.eligibility_mode, slots_active,
+            recipient_active=recipient_policy_active(tip_view),
+        )
         if rejection:
             return format_error(
                 rejection.error, code=rejection.code, **(rejection.details or {})
@@ -549,6 +556,19 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         err = validate_receive_routes_active(patch["receive_routes_active"])
         if err:
             return f"receive_routes_active: {err}"
+    if "recipient_policy_active" in patch:
+        err = validate_recipient_policy_active(patch["recipient_policy_active"])
+        if err:
+            return f"recipient_policy_active: {err}"
+        # First phase of the two-phase activation, as for the approval slots.
+        from consensus.approvals import audit_recipient_policy_collisions
+
+        findings = audit_recipient_policy_collisions(_tip_effective_spec_texts())
+        if findings:
+            return (
+                "recipient_policy_active cannot be activated on this chain: "
+                + "; ".join(findings)
+            )
     if "approval_slots_active" in patch:
         err = validate_approval_slots_active(patch["approval_slots_active"])
         if err:
@@ -932,7 +952,7 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
     except RuleOfferShapeError as exc:
         return format_error(f"Offered rule has an unsupported shape: {exc}")
 
-    domain_error = _screen_clause_domains(body)
+    domain_error = screen_o5_clause(body, recipient_policy_active(tip_view))
     if domain_error:
         return _admission_from_domain_error(domain_error)
 
@@ -984,6 +1004,31 @@ def _screen_clause_domains(body: str) -> Optional[str]:
         )
 
     return _screen_clause_widths_and_structure(body)
+
+
+def _screen_recipient_policy_clause(body: str, recipient_policy_active: bool) -> Optional[str]:
+    """The extra screen an o5 clause clears once recipient policy is active.
+
+    Kept apart from `_screen_clause_domains`, which judges the body alone: this
+    one depends on the activation flag. Once active the node feeds i17 to every
+    o5 clause at bv[64], so its width is frozen like the approval slots'. Before
+    activation i17 is an ordinary custom stream and nothing changes; the
+    activation audit refuses to flip the flag while a stored clause types it
+    at another width. Admission and apply call it at the same places.
+    """
+    if not recipient_policy_active:
+        return None
+    from consensus.approvals import screen_recipient_policy_width
+
+    width_error = screen_recipient_policy_width(body)
+    return ("Shared rules: " + width_error) if width_error else None
+
+
+def screen_o5_clause(body: str, recipient_policy_active: bool = False) -> Optional[str]:
+    """Every screen an o5 clause body must clear: the body-only domain screen,
+    then the recipient-policy width screen when that is active."""
+    return (_screen_clause_domains(body)
+            or _screen_recipient_policy_clause(body, recipient_policy_active))
 
 
 def _screen_clause_widths_and_structure(body: str) -> Optional[str]:
@@ -1126,7 +1171,7 @@ def validate_rule_offer_decision_payload(
     except RuleOfferShapeError as exc:
         return format_error(f"Accepted rule has an unsupported shape: {exc}")
 
-    domain_error = _screen_clause_domains(body)
+    domain_error = screen_o5_clause(body, recipient_policy_active(tip_view))
     if domain_error:
         return _admission_from_domain_error(domain_error)
 
@@ -1201,7 +1246,7 @@ def validate_o5_clause_routing(
             code="CLAUSE_SHAPE",
         )
 
-    domain_error = _screen_clause_domains(body)
+    domain_error = screen_o5_clause(body, recipient_policy_active(tip_view))
     if domain_error:
         return _admission_from_domain_error(
             domain_error, prefix="o5 policy rule rejected: "
@@ -1466,12 +1511,13 @@ def validate_rule_change_request_payload(
     if shape_error:
         return _invalid_rule_change(shape_error)
 
+    recipient_on = recipient_policy_active(tip_view)
     if request.kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
-        domain_error = _screen_clause_domains(request.body)
+        domain_error = screen_o5_clause(request.body, recipient_on)
     elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
         domain_error = _screen_guard_domains(request.body)
     elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
-        domain_error = _screen_clause_domains(clause_body_v1(request.rule_text))
+        domain_error = screen_o5_clause(clause_body_v1(request.rule_text), recipient_on)
     else:
         domain_error = None
     if domain_error:
@@ -1667,6 +1713,11 @@ def _routes_inactive_error() -> AdmissionResult:
         "governance patch (receive_routes_active).",
         code="FEATURE_INACTIVE",
     )
+
+
+def recipient_policy_active(tip_view) -> bool:
+    """Whether recipient-side policy (issues #47, #76) is on at the tip."""
+    return getattr(tip_view, "recipient_policy_active", False) is True
 
 
 def receive_routes_active(tip_view) -> bool:
