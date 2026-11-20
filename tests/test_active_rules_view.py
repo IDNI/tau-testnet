@@ -14,7 +14,11 @@ plus supporting cases (no-op outcome, unrouted rule, non-rule transaction,
 account attribution, pre-snapshot heights, gettaustate compatibility) and
 the follow-up hardening cases: the view's text composed from the persisted
 accumulation with the manager global poisoned, registry-routed rule
-outcomes, and receipt logs in the stored outcome.
+outcomes (with the stored-text hash pinned), receipt logs in the stored
+outcome, a follower serving rule outcomes after rebuild, and the per-unit
+survival ledger derived from the snapshot sequence (partial and full
+displacement with the displacing transaction named, a non-assignment
+conjunct carried, and ledger/view agreement at every height).
 
 Execution path: the native Tau engine cannot run in this environment (no
 tau-lang build is present), so the tests drive the real apply_block with
@@ -60,6 +64,7 @@ RULE_INSTALL = (
     "always ( o26[t]:bv[64] = { 7 }:bv[64] && o27[t]:bv[64] = { 9 }:bv[64] )."
 )
 RULE_DISPLACE = "always ( o26[t]:bv[64] = { 3 }:bv[64] )."
+RULE_DISPLACE_O27 = "always ( o27[t]:bv[64] = { 5 }:bv[64] )."
 # A rule scoped to one sender by an i12 guard (the account-view case).
 RULE_GUARDED_ALICE = (
     "always ( ( i12[t]:bv[384] = { #x" + ALICE + " }:bv[384]"
@@ -255,6 +260,41 @@ def _apply_block(fake, txs, height, parent_snapshot, previous_hash,
     return result, block_obj
 
 
+def _apply_received_block(fake, block_obj, parent_snapshot):
+    """Apply a block this node did not build: the proposer's own block
+    object against this node's state -- the follower / rebuild path, as
+    opposed to _apply_block, which constructs the block it applies."""
+    active_view = ActiveConsensusView(
+        target_height=block_obj.header.block_number,
+        consensus_rules=CONSENSUS_RULES,
+        active_validators=[bytes.fromhex(ALICE)],
+        mechanism_specific_metadata={"poa": True},
+    )
+    engine = TauConsensusEngine()
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("tau_manager.communicate_with_tau", side_effect=fake.communicate))
+        stack.enter_context(
+            patch("tau_manager.communicate_with_tau_multi",
+                  side_effect=fake.communicate_multi))
+        stack.enter_context(
+            patch("tau_manager.get_last_revision_receipt",
+                  side_effect=lambda: fake.last_receipt))
+        stack.enter_context(
+            patch("tau_manager.get_canonical_spec",
+                  side_effect=fake.composed_text))
+        stack.enter_context(
+            patch("chain_state.get_application_rules_state",
+                  side_effect=lambda: "\n".join(fake.accumulation)))
+        stack.enter_context(
+            patch("chain_state.save_application_rules_state",
+                  side_effect=lambda text: None))
+        ready = stack.enter_context(patch("tau_manager.tau_ready"))
+        ready.is_set.return_value = True
+        result = engine.apply_block(active_view, block_obj, parent_snapshot)
+    return result
+
+
 def _use_database(path):
     if db._db_conn is not None:
         db._db_conn.close()
@@ -297,6 +337,24 @@ class _Node:
         self.parent_snapshot = result.next_snapshot
         self.prev_hash = block_obj.block_hash
         return result, block_obj
+
+    def receive_and_commit(self, block_obj):
+        """Commit a block another node built, through the same record
+        step chain_state's rebuild path uses (_record_rule_view_data):
+        apply the received block against this node's own state, store
+        the block, and record what this node's apply observed."""
+        result = _apply_received_block(
+            self.fake, block_obj, self.parent_snapshot
+        )
+        db.add_block(block_obj)
+        _set_canonical_head(
+            block_obj.block_hash, block_obj.header.block_number
+        )
+        chain_state._record_rule_view_data(block_obj, result.next_snapshot)
+        self.parent_snapshot = result.next_snapshot
+        self.prev_hash = block_obj.block_hash
+        self.height = block_obj.header.block_number
+        return result
 
 
 def _status(tx_hash):
@@ -648,6 +706,42 @@ def test_same_block_install_and_replace(temp_database, tmp_path):
     assert "o27[t]:bv[64] = { 9 }:bv[64]" in view["canonical_text"]
 
 
+def test_follower_serves_rule_outcome_after_rebuild(temp_database, tmp_path):
+    """Both commit paths record outcomes -- not only the block builder's.
+    A follower that never built the blocks receives the proposer's block
+    objects, applies them against its own state (the rebuild path), and
+    afterwards serves each rule transaction's stored outcome through
+    gettxstatus, identical to the proposer's own record, logs included.
+    Its view agrees with the proposer's too."""
+    proposer = _Node(tmp_path / "proposer.sqlite")
+    _, block1 = proposer.apply_and_commit(
+        [_rule_tx("install-1", RULE_INSTALL, seq=0)]
+    )
+    _, block2 = proposer.apply_and_commit(
+        [_rule_tx("displace-1", RULE_DISPLACE, seq=1)]
+    )
+    proposer_records = {
+        block1.tx_ids[0]: db.get_rule_outcome(
+            block1.tx_ids[0], block1.block_hash
+        ),
+        block2.tx_ids[0]: db.get_rule_outcome(
+            block2.tx_ids[0], block2.block_hash
+        ),
+    }
+    proposer_view = _view()
+    assert all(record is not None for record in proposer_records.values())
+
+    follower = _Node(tmp_path / "follower.sqlite")
+    follower.receive_and_commit(block1)
+    follower.receive_and_commit(block2)
+
+    for tx_hash, record in proposer_records.items():
+        data = _status(tx_hash)
+        assert data["status"] == "confirmed"
+        assert data["rule_outcome"] == record
+    assert _view() == proposer_view
+
+
 # --- point 1, hardened: the view's text source ------------------------------
 
 
@@ -733,6 +827,14 @@ def test_registry_routed_rule_tx_records_registry_outcome(
         assert "spec_revision_after" not in registered
         # The routing step's own log line rides along, like any outcome.
         assert any("o5 clause" in line for line in registered["logs"])
+        # The stored-text hash pins the exact clause body registered:
+        # the record names its text, not only the registry-wide root.
+        from consensus.rule_offers import clause_body_v1
+
+        register_sha = hashlib.sha256(
+            clause_body_v1(RULE_O5_REGISTER).encode("utf-8")
+        ).hexdigest()
+        assert registered["stored_text_sha256"] == register_sha
         # No revision was taken, so no snapshot exists either.
         assert db.get_latest_spec_snapshot() is None
         assert _view()["available"] is False
@@ -751,6 +853,11 @@ def test_registry_routed_rule_tx_records_registry_outcome(
         assert (
             replaced["registry_root_after"] != replaced["registry_root_before"]
         )
+        replace_sha = hashlib.sha256(
+            clause_body_v1(RULE_O5_REPLACE).encode("utf-8")
+        ).hexdigest()
+        assert replaced["stored_text_sha256"] == replace_sha
+        assert replace_sha != register_sha
 
         result, block3 = node.apply_and_commit(
             [_rule_tx("clause-3", RULE_O5_REVOKE, seq=2)]
@@ -765,6 +872,9 @@ def test_registry_routed_rule_tx_records_registry_outcome(
         assert (
             revoked["registry_root_after"] == registered["registry_root_before"]
         )
+        # A revoke's stored-text hash names the text it removed -- the
+        # replaced clause's body, not the neutral revoking body.
+        assert revoked["stored_text_sha256"] == replace_sha
     finally:
         sender_policy.set_evaluator("apply", None)
 
@@ -799,3 +909,126 @@ def test_bounded_receipt_logs_caps_lines_and_width():
     assert bounded[-1].startswith("line-15 ")
     assert _bounded_receipt_logs(None) == []
     assert _bounded_receipt_logs(["short"]) == ["short"]
+
+
+# --- point 1: the per-unit survival ledger -----------------------------------
+
+
+def test_unit_ledger_probe_unit_partially_displaced(temp_database, tmp_path):
+    """The maintainers' probe, answered per unit: the install unit keeps
+    o27 = {9} in force and loses o26 = {7} to the displacing transaction,
+    which the ledger names -- by revision, by transaction, and by the
+    conjunct that replaced it. The displacing unit stands in force."""
+    node = _Node(tmp_path / "node.sqlite")
+    _, block1 = node.apply_and_commit([_rule_tx("install-1", RULE_INSTALL, seq=0)])
+    _, block2 = node.apply_and_commit([_rule_tx("displace-1", RULE_DISPLACE, seq=1)])
+
+    units = _view()["units"]
+    assert len(units) == 2
+    first, second = units
+    assert first["introduced_at_revision"] == 1
+    assert first["introduced_at_height"] == 1
+    assert first["introduced_by_tx"] == block1.tx_ids[0]
+    assert first["status"] == "partially_displaced"
+    assert first["conjuncts"] == [
+        "o26[t]:bv[64] = { 7 }:bv[64]",
+        "o27[t]:bv[64] = { 9 }:bv[64]",
+    ]
+    assert first["surviving_conjuncts"] == ["o27[t]:bv[64] = { 9 }:bv[64]"]
+    assert first["displaced_conjuncts"] == [{
+        "conjunct": "o26[t]:bv[64] = { 7 }:bv[64]",
+        "displaced_at_revision": 2,
+        "displaced_by_tx": block2.tx_ids[0],
+        "displaced_by": "o26[t]:bv[64] = { 3 }:bv[64]",
+    }]
+    assert second["introduced_at_revision"] == 2
+    assert second["introduced_by_tx"] == block2.tx_ids[0]
+    assert second["status"] == "in_force"
+    assert second["conjuncts"] == ["o26[t]:bv[64] = { 3 }:bv[64]"]
+    assert second["displaced_conjuncts"] == []
+
+    # Asked at height 1, the ledger is derived as of that snapshot: the
+    # same unit was still wholly in force, and no later unit exists.
+    at_one = _view(1)["units"]
+    assert len(at_one) == 1
+    assert at_one[0]["status"] == "in_force"
+    assert at_one[0]["surviving_conjuncts"] == at_one[0]["conjuncts"]
+    assert at_one[0]["displaced_conjuncts"] == []
+
+
+def test_unit_ledger_fully_displaced_and_agrees_with_view(
+    temp_database, tmp_path
+):
+    """A unit whose every conjunct is displaced reads `displaced`, each
+    loss attributed to its own revision and transaction. And at every
+    height the ledger's surviving conjuncts are exactly the conjuncts of
+    the view text served at that height -- the ledger and the view are
+    two readings of the same snapshots, and they agree."""
+    node = _Node(tmp_path / "node.sqlite")
+    _, block1 = node.apply_and_commit([_rule_tx("install-1", RULE_INSTALL, seq=0)])
+    _, block2 = node.apply_and_commit([_rule_tx("displace-1", RULE_DISPLACE, seq=1)])
+    _, block3 = node.apply_and_commit(
+        [_rule_tx("displace-o27", RULE_DISPLACE_O27, seq=2)]
+    )
+
+    units = _view()["units"]
+    assert [u["status"] for u in units] == [
+        "displaced", "in_force", "in_force",
+    ]
+    first = units[0]
+    assert first["surviving_conjuncts"] == []
+    assert first["displaced_conjuncts"] == [
+        {
+            "conjunct": "o26[t]:bv[64] = { 7 }:bv[64]",
+            "displaced_at_revision": 2,
+            "displaced_by_tx": block2.tx_ids[0],
+            "displaced_by": "o26[t]:bv[64] = { 3 }:bv[64]",
+        },
+        {
+            "conjunct": "o27[t]:bv[64] = { 9 }:bv[64]",
+            "displaced_at_revision": 3,
+            "displaced_by_tx": block3.tx_ids[0],
+            "displaced_by": "o27[t]:bv[64] = { 5 }:bv[64]",
+        },
+    ]
+    assert units[1]["introduced_by_tx"] == block2.tx_ids[0]
+    assert units[2]["introduced_by_tx"] == block3.tx_ids[0]
+    assert block1.tx_ids[0] == units[0]["introduced_by_tx"]
+
+    for height in (1, 2, 3):
+        view = _view(height)
+        surviving = []
+        for unit in view["units"]:
+            surviving.extend(unit["surviving_conjuncts"])
+        assert sorted(surviving) == sorted(
+            getactiverules.top_level_conjuncts(view["canonical_text"])
+        )
+
+
+def test_unit_ledger_non_assignment_conjunct_survives(
+    temp_database, tmp_path
+):
+    """A unit carried as a non-assignment conjunct -- the guarded unit,
+    an implication rather than a stream definition -- is carried
+    verbatim by every later revision: nothing displaces it, and the
+    ledger keeps it in force at the tip while the plain assignments
+    around it are displaced."""
+    node = _Node(tmp_path / "node.sqlite")
+    node.apply_and_commit([_rule_tx("guarded-1", RULE_GUARDED_ALICE, seq=0)])
+    node.apply_and_commit([_rule_tx("install-1", RULE_INSTALL, seq=1)])
+    node.apply_and_commit([_rule_tx("displace-1", RULE_DISPLACE, seq=2)])
+
+    units = _view()["units"]
+    assert len(units) == 3
+    guarded = units[0]
+    assert guarded["introduced_at_revision"] == 1
+    assert guarded["status"] == "in_force"
+    assert len(guarded["conjuncts"]) == 1
+    assert "i12[t]" in guarded["conjuncts"][0]
+    assert guarded["surviving_conjuncts"] == guarded["conjuncts"]
+    assert guarded["displaced_conjuncts"] == []
+    # The conjunct itself is still in the text the view serves.
+    assert guarded["conjuncts"][0] in _view()["canonical_text"]
+    # The assignment unit beside it was partially displaced as usual.
+    assert units[1]["status"] == "partially_displaced"
+    assert units[2]["status"] == "in_force"
