@@ -409,6 +409,68 @@ def _run_standing_payments(lm, balances, sequences, last_ts, parent_meta, height
     return book.sweep(int(height), int(timestamp), attempt)
 
 
+def _run_due_payouts(lm, balances, sequences, last_ts, height, timestamp, *, timeout=None,
+                     replay_mode=False) -> List[Dict[str, Any]]:
+    """Run every payout rule whose due point this block reached; their events.
+
+    Runs after the transaction loop, the retractable release and the standing
+    sweep, and before the expiries, at most MAX_PAYOUT_DUE_RUNS_PER_BLOCK rules
+    a block. A run reads the balance the block has reached so far, steps the
+    rule once with no executor and no named recipient, and pays all of its
+    slots or none, under the rule's own caps, and a paid run stamps the
+    account's cooldown clock like any execution. A due point runs once, whether
+    it paid or not; nobody signs for it, and its only charge was the fee of the
+    transaction that installed the rule.
+    """
+    book = _payout_book(lm)
+    if book is None or not book.has_due(int(height), int(timestamp)):
+        return []
+    grant = faucet.amount(lm)
+    events: List[Dict[str, Any]] = []
+    for account in book.due(int(height), int(timestamp)):
+        rule, state, exe = book.due_execution(account)
+        have = faucet.spendable(balances, sequences, account, grant)
+        reason, legs = "", []
+        try:
+            values = payout_execution_inputs(
+                rule, state, exe, parent_balance=have, height=int(height), ts=int(timestamp))
+            try:
+                outputs = sender_policy.payout_outputs(
+                    rule.body, values, pool=PAYOUT_POOL_APPLY, timeout=timeout)
+            except PayoutRefused:
+                raise
+            except Exception:
+                if not replay_mode:
+                    raise
+                # Tau-less replay, as for an execution a transaction sent: the
+                # legs are unknowable, nothing moves, the state hash says so.
+                logger.warning(
+                    "Replay without a policy evaluator: due payout %s not re-run.",
+                    rule.rule_id.hex()[:16])
+                raise PayoutRefused("no evaluator during replay")
+            legs = settle_payout(rule, state, exe, outputs, height=int(height),
+                                 ts=int(timestamp), balance=have)
+        except PayoutRefused as exc:
+            reason = str(exc)
+        book.due_ran(account)
+        event = {"account_pubkey": account, "rule_id": rule.rule_id.hex(), "due_at": rule.due_at}
+        if reason:
+            events.append(dict(event, outcome="due_not_paid", reason=reason))
+            continue
+        total = sum(a for _, _, a in legs)
+        balances[account] = have - total
+        for _, who, amount in legs:
+            balances[who] = faucet.spendable(balances, sequences, who, grant) + amount
+        book.record(account, total, int(height), int(timestamp))
+        if last_ts is not None:
+            last_ts[account] = int(timestamp)
+        events.append(dict(
+            event, outcome="executed", executor_pubkey=None, total=total,
+            legs=[{"slot": k, "recipient_pubkey": who, "amount": amount}
+                  for k, who, amount in legs]))
+    return events
+
+
 TEMPORAL_REFERENCE_REASON = "temporal_reference"
 RULE_CHANGE_NEEDS_APPROVAL_REASON = "rule_change_needs_approval"
 
@@ -1131,6 +1193,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             timeout=getattr(_block_session, "request_budget", None),
             replay_mode=replay_mode,
         )
+        payout_due = _run_due_payouts(
+            lm, t_bals, t_seqs, t_lts, block.header.block_number, block.header.timestamp,
+            timeout=getattr(_block_session, "request_budget", None),
+            replay_mode=replay_mode,
+        )
         payout_expired = _expire_payout_rules(
             lm, block.header.block_number, block.header.timestamp
         )
@@ -1206,12 +1273,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         standing_events.extend(standing_sweep)
 
         # Payout rules: installs, revokes and executions from the kept
-        # transactions, rules a guarded release installed or revoked, then expiries.
+        # transactions, the runs the node made at due points, expiries, then the
+        # rules a guarded release installed or revoked.
         payout_events = []
         for i, tx in enumerate(block.transactions):
             event = (exec_result.receipts.get(tx.get('tx_id', str(i))) or {}).get("payout_event")
             if event and tx in exec_result.accepted_transactions:
                 payout_events.append(event)
+        payout_events.extend(payout_due)
         payout_events.extend(payout_expired)
         payout_events.extend(payout_released)
 

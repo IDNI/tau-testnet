@@ -884,12 +884,18 @@ def build_payout_rule_set_tx(
     period_blocks: int | None = None,
     period_seconds: int | None = None,
     per_sale: bool = False,
+    periods_from: int | None = None,
+    due_at: int | None = None,
     fee_limit: str | int = "0",
 ) -> dict:
     """Construct a ``tx_type='payout_rule_set'`` payload (without signature).
 
     ``per_sale``: the rule pays only against sales the chain recorded (signed
     transfers into the account), once per sale; executions name one.
+
+    ``periods_from`` and ``due_at`` are on the period's clock like
+    ``expires_at``: where the periods count from (default: the install), and a
+    point at which the node runs the rule itself, once.
 
     ``slots`` lists one entry per slot: a recipient's 96-hex key, or "" for an
     open slot the executor names. ``expires_at`` is on the period's clock: a
@@ -924,6 +930,10 @@ def build_payout_rule_set_tx(
         tx["period_seconds"] = int(period_seconds)
     if per_sale:
         tx["per_sale"] = True
+    if periods_from is not None:
+        tx["periods_from"] = int(periods_from)
+    if due_at is not None:
+        tx["due_at"] = int(due_at)
     return tx
 
 

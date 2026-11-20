@@ -544,7 +544,7 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
     block_timestamp = int(time.time())
     empty_ok = allow_empty
     if wake_if_due and not empty_ok:
-        for name in ("retractable_transfers", "standing_payments"):
+        for name in ("retractable_transfers", "standing_payments", "payout_rules"):
             book = getattr(lm, name, None)
             has_due = getattr(book, "has_due", None)
             if has_due is not None and has_due(block_number, block_timestamp) is True:

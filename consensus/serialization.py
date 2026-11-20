@@ -950,6 +950,18 @@ def _encode_payout_terms(
     return bytes(out)
 
 
+def _encode_payout_options(periods_from: Any, due_at: Any) -> bytes:
+    """The optional terms of a payout rule: one byte saying which are there
+    (bit 0 `periods_from`, bit 1 `due_at`), then each one present as a uint64."""
+    flags = (1 if periods_from is not None else 0) | (2 if due_at is not None else 0)
+    out = bytearray([flags])
+    if periods_from is not None:
+        out.extend(encode_uint64(int(periods_from)))
+    if due_at is not None:
+        out.extend(encode_uint64(int(due_at)))
+    return bytes(out)
+
+
 def compute_payout_rule_id(
     account_pubkey: Any,
     sequence_number: int,
@@ -961,11 +973,17 @@ def compute_payout_rule_id(
     period: int,
     expires_at: int,
     per_sale: bool = False,
+    periods_from: Any = None,
+    due_at: Any = None,
 ) -> bytes:
     """BLAKE3 of the signed terms of a payout rule. Returns 32 bytes.
 
     An execution names the id it was signed against, so a rule replaced between
     signing and inclusion cannot be executed with inputs meant for another one.
+
+    The optional terms follow the fixed ones only when one of them is there, so
+    a rule without them keeps the id it always had. The fixed terms delimit
+    themselves, so the longer preimage is no other rule's.
     """
     out = bytearray()
     domain = DOMAIN_PAYOUT_RULE_PER_SALE_V1 if per_sale else DOMAIN_PAYOUT_RULE_V1
@@ -974,6 +992,8 @@ def compute_payout_rule_id(
         account_pubkey, sequence_number, body_hash, slots, cap_per_execution,
         cap_per_period, kind, period, expires_at,
     ))
+    if periods_from is not None or due_at is not None:
+        out.extend(_encode_payout_options(periods_from, due_at))
     return blake3(bytes(out)).digest()
 
 
@@ -1005,12 +1025,17 @@ def encode_payout_entry(
     paid_total: int,
     last_height: int,
     sales: Any = None,
+    more: Any = None,
 ) -> bytes:
     """The signed terms, then where the rule stands: the period caps depend on it.
 
     `sales`, only for a rule that pays per sale: (missed, open sales), each open
     sale (sale_id, payer, amount, height). Which sales are still payable is state
     every node must agree on, so it is part of the entry.
+
+    `more`, only for a rule that carries an optional term or reads the clocks the
+    node keeps for it: (periods_from, due_at, last_clock, due_done). A rule with
+    neither keeps the entry it always had.
     """
     out = bytearray()
     out.extend(encode_hash32(rule_id))
@@ -1034,6 +1059,12 @@ def encode_payout_entry(
             out.extend(encode_pubkey48(payer))
             out.extend(encode_uint64(int(amount)))
             out.extend(encode_uint64(int(height)))
+    if more is not None:
+        periods_from, due_at, last_clock, due_done = more
+        out.extend(b"\x02")
+        out.extend(_encode_payout_options(periods_from, due_at))
+        out.extend(encode_uint64(int(last_clock)))
+        out.extend(b"\x01" if due_done else b"\x00")
     return bytes(out)
 
 

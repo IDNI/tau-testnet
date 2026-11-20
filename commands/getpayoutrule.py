@@ -36,12 +36,25 @@ def semantics() -> dict:
             "i26": "paid by the rule in the current period, bv[24]",
             "i30..i37": "recipient of slot k, bv[384] (0 for an open slot nobody named)",
             "i40..i47": "executor data k, bv[24] (0 when not given)",
+            "i48": "the clock at which the rule was installed, bv[64], on the "
+                   "rule's own clock",
+            "i49": "the clock of the rule's last paid execution, bv[64] (the "
+                   "install clock until one has paid)",
             "o30..o37": "amount for slot k, bv[24] (0 when not written)",
         },
         "periods": {
             "blocks": [1, payout.MAX_PERIOD_BLOCKS],
             "seconds": [1, payout.MAX_PERIOD_SECONDS],
-            "anchor": "the period count starts where the rule was installed",
+            "anchor": "the period count starts where the rule was installed, or "
+                      "at the signed periods_from",
+        },
+        "due_point": {
+            "term": "due_at, on the rule's own clock, signed with the rule",
+            "run": "the node steps the rule once in the first block that reaches "
+                   "it, after the block's transactions, with no executor (i13 = 0) "
+                   "and no named recipient; i2 is the balance the block has reached",
+            "runs_per_block": payout.MAX_PAYOUT_DUE_RUNS_PER_BLOCK,
+            "fee": "none beyond the fee of the transaction that installed the rule",
         },
         "lifetime_max": {"blocks": payout.MAX_LIFETIME_BLOCKS,
                          "seconds": payout.MAX_LIFETIME_SECONDS},

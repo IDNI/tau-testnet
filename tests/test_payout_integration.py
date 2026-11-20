@@ -126,7 +126,8 @@ def test_the_abi_widths():
     assert abi_width("i2") == 24 and abi_width("i13") == 384 and abi_width("i26") == 24
     assert abi_width("i30", 2) == 384 and abi_width("i32", 2) is None
     assert abi_width("o31", 2) == 24 and abi_width("o32", 2) is None
-    assert abi_width("i40") == abi_width("i47") == 24 and abi_width("i48") is None
+    assert abi_width("i40") == abi_width("i47") == 24
+    assert abi_width("i48") == abi_width("i49") == 64 and abi_width("i50") is None
     assert abi_width("o5") is None and abi_width("i1") is None and abi_width("i0") is None
 
 

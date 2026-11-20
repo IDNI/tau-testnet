@@ -50,13 +50,16 @@ from consensus.approvals import (
 )
 from consensus import network_binding
 from consensus.payout import (
+    KIND_BLOCKS as PAYOUT_KIND_BLOCKS,
     KIND_NAMES as PAYOUT_KIND_NAMES,
     POOL_ADMISSION as PAYOUT_POOL_ADMISSION,
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_RULE_REVOKE,
     TX_TYPE_PAYOUT_RULE_SET,
+    PayoutExecution,
     PayoutRefused,
     PayoutShapeError,
+    PayoutState,
     execution_inputs as payout_execution_inputs,
     parse_payout_execute,
     parse_payout_rule_revoke,
@@ -1784,7 +1787,8 @@ def validate_payout_rule_set_payload(
 
     Shape, ABI screen and book checks are apply's own (`can_admit_set`); the
     rule is built in the payout admission pool, and the sender's rule-change
-    guard is consulted (kind 6), as apply does.
+    guard is consulted (kind 6), as apply does. A rule with a due point is also
+    stepped once, on the inputs of the run the node will make.
     """
     from consensus import sender_policy
 
@@ -1815,6 +1819,31 @@ def validate_payout_rule_set_payload(
             f"payout_rule_set rejected: the rule does not build: {built.error[:300]}",
             code="PAYOUT_RULE_DOES_NOT_BUILD",
         )
+    if terms.due_at is not None:
+        # The node steps this rule by itself at the due point, and no transaction
+        # passes admission first then. So step it once here, on the inputs such a
+        # run hands it: a rule the evaluator cannot answer within its budget stops
+        # here, as an execution that times out does. The answer itself is not
+        # judged; the block that reaches the due point decides that.
+        import chain_state
+
+        height, ts = tip_view.next_block_height, tip_view.next_block_timestamp
+        state = PayoutState(anchor=terms.clock(height, ts))
+        if terms.kind == PAYOUT_KIND_BLOCKS:
+            height = terms.due_at
+        else:
+            ts = terms.due_at
+        trial = PayoutExecution("", terms.account_pubkey, terms.rule_id, (), ())
+        values = payout_execution_inputs(
+            terms, state, trial,
+            parent_balance=int(chain_state.get_balance(terms.account_pubkey) or 0),
+            height=height, ts=ts)
+        try:
+            _payout_evaluator_call(
+                lambda budget: sender_policy.payout_outputs(
+                    terms.body, values, pool=PAYOUT_POOL_ADMISSION, timeout=budget))
+        except PayoutRefused:
+            pass
     refusal = _rule_change_refusal(tip_view, sender, tau_defs.RULE_CHANGE_KIND_SET_PAYOUT)
     if refusal is not None:
         return refusal
@@ -1826,6 +1855,8 @@ def validate_payout_rule_set_payload(
         "period_clock": PAYOUT_KIND_NAMES[terms.kind],
         "period": terms.period,
         "expires_at": terms.expires_at,
+        **({"periods_from": terms.periods_from} if terms.periods_from is not None else {}),
+        **({"due_at": terms.due_at} if terms.due_at is not None else {}),
     })
 
 

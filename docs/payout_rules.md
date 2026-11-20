@@ -54,6 +54,8 @@ tau-testnet payout set --key treasury --file payout.tau \
 | `period_blocks` or `period_seconds` | Exactly one. The period clock: block height (1 .. 1,000,000) or block time (1 .. 366 days). |
 | `expires_at` | The end, on the period's clock (a height, or a unix time), at most 10,000,000 blocks or four years ahead. |
 | `per_sale` | Optional, `true` or left out. The rule pays only against sales the chain recorded, once per sale ([Per sale](#per-sale-royalties)). |
+| `periods_from` | Optional, a number or left out. The periods count from this point on the period's clock instead of the install ([Optional terms](#optional-terms)). |
+| `due_at` | Optional, a number or left out. At this point on the period's clock the node runs the rule itself, once ([Optional terms](#optional-terms)). |
 
 Admission and apply refuse a rule that pays the account itself in a fixed slot,
 names one fixed recipient in two slots, or does not fit the ABI. The rule is
@@ -68,9 +70,10 @@ its own period count where it is installed. There is no edit.
 
 `rule_id` is a BLAKE3 hash over the account, the install's sequence number, the
 hash of the normalized rule body, the slots, both caps, the period clock and
-length, and `expires_at` (`compute_payout_rule_id`). Every execution names the
-id, so an execution signed against a rule the account has since replaced is
-refused instead of running the new rule.
+length, and `expires_at` (`compute_payout_rule_id`), followed by `periods_from`
+and `due_at` when the rule carries one. Every execution names the id, so an
+execution signed against a rule the account has since replaced is refused
+instead of running the new rule.
 
 ## The payout ABI (v1)
 
@@ -92,6 +95,8 @@ what let any number of payout rules share one worker.
 | `o30+k` | `bv[24]` | Amount for slot k (0 when the rule does not write it). |
 | `i27` | `bv[24]` | Only with `per_sale`: the amount of the sale the execution names. |
 | `i28` | `bv[384]` | Only with `per_sale`: who paid it. |
+| `i48` | `bv[64]` | The clock at which the rule was installed, on the rule's own clock (a height with `period_blocks`, a unix time with `period_seconds`). |
+| `i49` | `bv[64]` | The clock of the rule's last paid execution, on the same clock; the install clock until one has paid. |
 
 A rule reads `[t]` only, reads at least one input, writes at least one slot
 amount, and mentions no slot it does not have. Anything else is refused at
@@ -195,9 +200,9 @@ executor pays nothing either. At most 16 executions are included per block.
 ### Periods
 
 Period `n` covers clock values `anchor + n * period .. anchor + (n+1) * period - 1`,
-where `anchor` is the height (or block time) the rule was installed at. What was
-paid in an earlier period does not count against the current one, and nothing
-carries over.
+where `anchor` is the height (or block time) the rule was installed at, or the
+signed `periods_from` when the rule carries one. What was paid in an earlier
+period does not count against the current one, and nothing carries over.
 
 ### Per sale (royalties)
 
@@ -352,9 +357,11 @@ with the lock and the guard in place.
 Know the limits before relying on it:
 
 - The periods count from the block that installed the rule, not from the start
-  date.
+  date, unless the rule is installed with `periods_from`
+  ([Optional terms](#optional-terms)).
 - The return needs one execution. Anyone may send it and it can pay only Alice,
-  but the node does not send it by itself.
+  but the node does not send it by itself, unless the rule is installed with a
+  due point (`due_at`, same section).
 - The guard has a time escape (see [approvals.md](approvals.md#the-time-escape)):
   whoever holds the grant account's key can file a rule change and wait
   1,000 blocks. Until wallet rules can be made tamper-proof, the conditions are
@@ -365,6 +372,84 @@ Know the limits before relying on it:
   itself has expired, what is still in the account moves only by a co-signed
   rule change.
 - Amounts are `bv[24]`: one account carries at most 16,777,215.
+
+## Optional terms
+
+Two more numbers a rule may be signed with, and two clocks it may read. None of
+them belongs to one kind of payment: they are open to every rule. A rule that
+uses none of them has the id, the book entry and the stored row it always had.
+
+```bash
+tau-testnet payout set --key grant --file conditions.tau \
+    --slot open --slot <alice_pubkey> \
+    --cap-per-execution 20000 --cap-per-period 40000 \
+    --period-seconds 604800 --ends-at 1829952000 \
+    --periods-from 1796083200 --due-at 1798502400
+```
+
+**`periods_from`: where the periods count from.** A point on the period's clock.
+With it "500 a week from 1 December" counts its weeks from 1 December, whatever
+block installed the rule. It may lie in the past, which lines the periods up
+with a fixed day or hour. Everything before the point belongs to the first
+period. It must be before `expires_at`.
+
+**`due_at`: the node runs the rule itself.** A point on the period's clock, in
+the future and before `expires_at`. In the first block whose clock reaches it,
+the node steps the rule once, with nobody sending a transaction:
+
+- It runs after the block's transactions and the standing-payment sweep, and
+  before expiries.
+- There is no executor (`i13` is 0), no named recipient and no executor data
+  (`i40+k` are 0). So only fixed slots can be paid, and a rule whose first line
+  asks for a certain executor does not pay on that line.
+- `i2` is the balance the block has reached, not the parent block's. A rule
+  that pays "everything that is left" pays exactly what is there, also after a
+  spend in the same block.
+- Everything else is an execution like any other: all slots are paid or none,
+  both caps and the balance hold, the paid total counts in the period, and the
+  account's cooldown clock is stamped.
+- It runs once, whether it paid or not (`due_done` in `getpayoutrule`; the
+  history shows `executed` with `executor_pubkey: null`, or `due_not_paid` with
+  the reason).
+- It costs nothing beyond the fee of the transaction that installed the rule.
+- At most 16 rules are run this way per block, earliest due point first; the
+  rest follow in the next blocks, and a rule whose due point has not run yet is
+  kept past its end until it has. An idle chain seals a block for a due point
+  like it does for a due standing payment.
+
+A rule that pays per sale cannot carry a due point (the node names no sale),
+nor can a rule with only open slots. A node that takes the installing
+transaction steps the rule once on the inputs of that run before it queues it,
+so a rule its evaluator cannot answer in time is stopped there, the way an
+execution that times out is.
+
+For the grant of the section above, `--periods-from` the start and `--due-at`
+the deadline are all it takes: the rule text stays the same, its weeks count
+from 1 December, and at the deadline what Bob has not spent is back with Alice
+in the first block after it, with no transaction from anyone.
+
+**`i48` and `i49`: two clocks the node keeps for the rule.** Both are on the
+rule's own clock. `i48` is the clock of the install. `i49` is the clock of the
+rule's last paid execution, and the install clock until one has paid; a refused
+execution does not move it. Two conditions they make possible:
+
+```
+# nothing may be spent for six hours after the money was set up
+(i5[t]:bv[64] >= (i48[t]:bv[64] + { 21600 }:bv[64]))
+
+# what has not been touched for 30 days goes back
+(i5[t]:bv[64] >= (i49[t]:bv[64] + { 2592000 }:bv[64]))
+```
+
+The node hands them only to a rule that mentions them, and keeps the last paid
+clock only for such a rule.
+
+`tests/test_payout_options.py` pins the arithmetic and the block apply without
+an engine, including that a rule without any of this is byte for byte the rule
+it was. `tests/test_payout_options_native.py` runs the grant with both terms
+and both clock conditions on the real engine, and `scripts/e2e_payout_due.py`
+runs them on two live nodes: the deadline arrives in an empty block and the
+money is back.
 
 ## Inspecting
 
@@ -390,6 +475,7 @@ account's).
 | Slots per rule | 8 |
 | Executor data inputs | 8 |
 | Executions per block | 16 |
+| Due points run per block | 16 |
 | Rule text | 4,096 bytes |
 | Open sales per rule (`per_sale`) | 64 |
 
@@ -435,7 +521,7 @@ Apply reasons in receipts: `payout_rule_not_set`, `payout_rule_not_revoked`,
  "signature": "..."}
 ```
 
-Every field above is in the signed bytes (`per_sale` and `sale_id` when present). `recipients` keys are slot numbers,
+Every field above is in the signed bytes (`per_sale`, `periods_from`, `due_at` and `sale_id` when present). `recipients` keys are slot numbers,
 `data` keys are k for input `i40+k`. `genesis_hash` is the hash of block 0 of the
 network (`getsequence` returns it, the CLI fills it in): all three types are bound to
 one network like standing payments (`consensus/network_binding.py`), so a rule or an
@@ -454,6 +540,13 @@ execution signed for another network is refused here.
   nothing, and the state hash shows it.
 - Expiry runs after the block's transactions, before rule-change releases; an
   execution in the expiry block is refused by its clock check.
+- Due points run after the block's transactions and the standing-payment sweep,
+  before expiries, in the order (due point, account) with rules on the block
+  clock first. Such a run reads the balance the block has reached, which every
+  node has computed the same way by then.
+- A rule with an optional term, or one that reads `i48` or `i49`, carries a
+  second part in its book entry (the terms, the last paid clock, whether the
+  due point has run). Every other rule hashes exactly as before.
 
 ## Operator notes
 
@@ -501,6 +594,6 @@ replay could not run the rule; nothing moves, and the state hash says so.
 ## Not in this release
 
 - More than one rule per account.
-- Paying a rule's amounts in the end-of-block sweep without an execution (that
-  is what standing payments are for).
+- Running a rule by itself more than once (a due point runs one time; a
+  payment that repeats is what standing payments are for).
 - Executor data wider than `bv[24]`.

@@ -2928,14 +2928,22 @@ def _write_payout_rows(state: Dict) -> None:
     _db_conn.execute('DELETE FROM payout_rules_v1')
     # Rules that pay per sale (a 17th element: missed count and open sales) keep
     # that part in one chain_state value, so the table keeps its columns.
-    sales = {}
+    # Optional terms and kept clocks (an 18th element) likewise: a rule without
+    # them is stored exactly as before.
+    sales, more = {}, {}
     for row in state['rows']:
         (rule_id, account, sequence, body, slots), rest = row[:5], row[5:16]
-        if len(row) > 16:
+        if len(row) > 16 and row[16] is not None:
             missed, open_sales = row[16]
             sales[account] = {'missed': int(missed), 'open': [
                 [bytes(sid).hex(), payer, int(amount), int(height)]
                 for sid, payer, amount, height in open_sales]}
+        if len(row) > 17 and row[17] is not None:
+            periods_from, due_at, last_clock, due_done = row[17]
+            more[account] = {
+                'periods_from': None if periods_from is None else int(periods_from),
+                'due_at': None if due_at is None else int(due_at),
+                'last_clock': int(last_clock), 'due_done': bool(due_done)}
         _db_conn.execute(
             f'INSERT INTO payout_rules_v1 ({_PAYOUT_COLUMNS}) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -2945,6 +2953,10 @@ def _write_payout_rows(state: Dict) -> None:
     _db_conn.execute(
         'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
         ('payout_sales', json.dumps(sales, sort_keys=True)),
+    )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        ('payout_more', json.dumps(more, sort_keys=True)),
     )
     _db_conn.execute(
         'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
@@ -2969,7 +2981,11 @@ def load_payout_state() -> tuple[List[tuple], int, bytes]:
         raw_sales = _db_conn.execute(
             "SELECT value FROM chain_state WHERE key = 'payout_sales'"
         ).fetchone()
+        raw_more = _db_conn.execute(
+            "SELECT value FROM chain_state WHERE key = 'payout_more'"
+        ).fetchone()
     sales = json.loads(raw_sales[0]) if raw_sales and raw_sales[0] else {}
+    more = json.loads(raw_more[0]) if raw_more and raw_more[0] else {}
     count, acc = 0, bytes(32)
     if raw and raw[0]:
         parsed = json.loads(raw[0])
@@ -2978,9 +2994,16 @@ def load_payout_state() -> tuple[List[tuple], int, bytes]:
     for r in rows:
         row = ((bytes.fromhex(r[0]), r[1], int(r[2]), r[3], tuple(json.loads(r[4])))
                + tuple(int(v) for v in r[5:]))
+        kept = None
         if r[1] in sales:
             entry = sales[r[1]]
-            row += ((entry['missed'], tuple(tuple(e) for e in entry['open'])),)
+            kept = (entry['missed'], tuple(tuple(e) for e in entry['open']))
+        if r[1] in more:
+            entry = more[r[1]]
+            row += (kept, (entry['periods_from'], entry['due_at'],
+                           entry['last_clock'], entry['due_done']))
+        elif kept is not None:
+            row += (kept,)
         out.append(row)
     return out, count, acc
 
@@ -3066,6 +3089,39 @@ def has_due_standing_payments(next_height: int, now: int) -> bool:
         else:
             due = int(first_due) + int(period) * int(interval)
         if due <= (next_height if kind == KIND_BLOCKS else now):
+            return True
+    return False
+
+
+def has_due_payouts(next_height: int, now: int) -> bool:
+    """True if a payout rule has a due point this height or time reaches and that
+    has not run yet.
+
+    A hint for the miner thread, from persisted rows like has_due_retractables;
+    the block builder re-checks against the book under the lock.
+    """
+    if _db_conn is None:
+        init_db()
+    try:
+        with _db_lock:
+            raw = _db_conn.execute(
+                "SELECT value FROM chain_state WHERE key = 'payout_more'"
+            ).fetchone()
+            if not raw or not raw[0]:
+                return False
+            pending = {account: entry['due_at'] for account, entry in json.loads(raw[0]).items()
+                       if entry.get('due_at') is not None and not entry.get('due_done')}
+            if not pending:
+                return False
+            rows = _db_conn.execute(
+                'SELECT account_pubkey, kind FROM payout_rules_v1'
+            ).fetchall()
+    except Exception:
+        return False
+    for account, kind in rows:
+        due = pending.get(account)
+        # kind 0 counts blocks, kind 1 seconds (consensus.payout.KIND_BLOCKS / KIND_SECONDS)
+        if due is not None and int(due) <= (next_height if int(kind) == 0 else now):
             return True
     return False
 

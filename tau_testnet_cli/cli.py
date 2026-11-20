@@ -2623,6 +2623,9 @@ def _payout_fields(args, tip: int, now: int) -> dict:
         "cap_per_period": int(args.cap_per_period),
         "expires_at": expires_at, **period,
         **({"per_sale": True} if getattr(args, "per_sale", False) else {}),
+        **({"periods_from": int(args.periods_from)}
+           if getattr(args, "periods_from", None) is not None else {}),
+        **({"due_at": int(args.due_at)} if getattr(args, "due_at", None) is not None else {}),
     }
 
 
@@ -2810,6 +2813,12 @@ def _add_payout_subparsers(sub) -> None:
     p_set.add_argument("--per-sale", action="store_true",
                        help="Pay only against sales the chain recorded (transfers into "
                             "the account), once per sale; the rule reads i27 and i28")
+    p_set.add_argument("--periods-from", type=int, metavar="HEIGHT|UNIX",
+                       help="Count the periods from here, on the period's clock "
+                            "(default: from the block that installs the rule)")
+    p_set.add_argument("--due-at", type=int, metavar="HEIGHT|UNIX",
+                       help="The node runs the rule itself once at this point, on the "
+                            "period's clock, with no executor: only fixed slots are paid")
     _tx_flags(p_set, request=True)
     p_set.set_defaults(func=cmd_payout_set)
 

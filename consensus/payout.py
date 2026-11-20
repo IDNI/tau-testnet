@@ -46,6 +46,34 @@ let any number of payout rules share one worker.
 A rule reads [t] only, reads at least one input and writes at least one slot
 amount, and mentions no slot it does not have.
 
+  two clocks the node keeps for a rule that reads them, on the rule's own clock
+  (heights with `period_blocks`, unix seconds with `period_seconds`):
+    i48  bv[64]   the clock at which the rule was installed
+    i49  bv[64]   the clock of its last paid execution (the install clock
+                  until one has paid)
+
+OPTIONAL TERMS
+--------------
+Two signed terms a rule may carry. A rule without them, and that reads neither
+i48 nor i49, has the id, the book entry and the stored row it always had.
+
+`periods_from`: the clock value the periods count from, in place of the install
+clock. "500 a week from 1 December" then counts its weeks from 1 December,
+whenever the rule was installed. Everything before that point belongs to the
+first period.
+
+`due_at`: a point on the rule's clock at which the node runs the rule itself,
+once, with no executor and no named recipient: in the first block whose clock
+reaches it, after the block's transactions and the standing-payment sweep, at
+most MAX_PAYOUT_DUE_RUNS_PER_BLOCK rules a block (the rest wait for the next
+blocks, earliest due point first). The run is an execution like any other (the
+rule is stepped once, all slots are paid or none, both caps and the balance
+hold) with three differences: i13 is 0, only fixed slots can be paid, and i2 is
+the balance the block has reached, not the parent block's, so a rule that pays
+"everything that is left" pays exactly what is there. It costs nothing beyond
+the fee of the transaction that installed the rule. A rule whose due point has
+not run yet is kept past its end until it has.
+
 PER SALE
 --------
 A royalty is owed once per sale, and the sale's amount must not be the
@@ -111,6 +139,8 @@ STREAM_EXECUTOR = 13
 STREAM_SPENT = 26
 SLOT_BASE = 30
 DATA_BASE = 40
+STREAM_INSTALLED = 48
+STREAM_LAST_PAID = 49
 STREAM_SALE_AMOUNT = 27
 STREAM_SALE_PAYER = 28
 MAX_OPEN_SALES = 64
@@ -122,6 +152,7 @@ CLOCK_WIDTH = 64
 MAX_RULE_BYTES = 4096
 MAX_PAYOUT_RULES_TOTAL = 4096
 MAX_PAYOUT_EXECUTIONS_PER_BLOCK = 16
+MAX_PAYOUT_DUE_RUNS_PER_BLOCK = 16
 MAX_PERIOD_BLOCKS = 1_000_000
 MAX_PERIOD_SECONDS = 31_622_400            # 366 days
 MAX_LIFETIME_BLOCKS = 10_000_000
@@ -133,6 +164,7 @@ _PUBKEY_RE = re.compile(r"^[0-9a-f]{96}$")
 _ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _U64_MAX = 0xFFFFFFFFFFFFFFFF
 _MENTION_RE = re.compile(r"\b([io])(\d+)\b")
+_CLOCKS_RE = re.compile(r"\bi(?:%d|%d)\b" % (STREAM_INSTALLED, STREAM_LAST_PAID))
 _TYPED_RE = re.compile(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*(\d+)\s*\]")
 
 
@@ -156,7 +188,7 @@ def abi_width(name: str, slot_count: int = MAX_SLOTS, per_sale: bool = False) ->
         return AMOUNT_WIDTH
     if per_sale and index == STREAM_SALE_PAYER:
         return KEY_WIDTH
-    if index in (STREAM_TIME, STREAM_HEIGHT):
+    if index in (STREAM_TIME, STREAM_HEIGHT, STREAM_INSTALLED, STREAM_LAST_PAID):
         return CLOCK_WIDTH
     if index == STREAM_EXECUTOR:
         return KEY_WIDTH
@@ -184,6 +216,8 @@ class PayoutTerms:
     period: int
     expires_at: int
     per_sale: bool = False          # pays only against sales the chain recorded
+    periods_from: Optional[int] = None   # the periods count from here, not the install
+    due_at: Optional[int] = None         # the node runs the rule itself at this point
 
     @property
     def body_hash(self) -> bytes:
@@ -194,8 +228,21 @@ class PayoutTerms:
         return compute_payout_rule_id(
             self.account_pubkey, self.sequence_number, self.body_hash, self.slots,
             self.cap_per_execution, self.cap_per_period, self.kind, self.period,
-            self.expires_at, self.per_sale,
+            self.expires_at, self.per_sale, self.periods_from, self.due_at,
         )
+
+    @property
+    def reads_clocks(self) -> bool:
+        """The rule reads i48 or i49, so the node keeps its last paid clock."""
+        from consensus.rule_offers import strip_clause_comments
+
+        return _CLOCKS_RE.search(strip_clause_comments(self.body)) is not None
+
+    @property
+    def extended(self) -> bool:
+        """Carries an optional term or reads the kept clocks: its entry and its
+        stored row hold `more` (see serialization.encode_payout_entry)."""
+        return self.periods_from is not None or self.due_at is not None or self.reads_clocks
 
     def clock(self, height: int, ts: int) -> int:
         return height if self.kind == KIND_BLOCKS else ts
@@ -214,6 +261,9 @@ class PayoutState:
     # per-sale rules only: (sale_id, payer, amount, height) in arrival order
     open_sales: Tuple[Tuple[bytes, str, int, int], ...] = ()
     sales_missed: int = 0
+    # kept only for a rule that is `extended`:
+    last_clock: int = 0          # the rule's clock at its last paid execution, 0 = never
+    due_done: bool = False       # the node has run the rule at its due point
 
     def sale(self, sale_id: bytes) -> Optional[Tuple[bytes, str, int, int]]:
         for entry in self.open_sales:
@@ -222,7 +272,17 @@ class PayoutState:
         return None
 
     def period_at(self, terms: PayoutTerms, clock: int) -> int:
-        return max(0, int(clock) - self.anchor) // terms.period
+        base = self.anchor if terms.periods_from is None else terms.periods_from
+        return max(0, int(clock) - base) // terms.period
+
+    def due_pending(self, terms: PayoutTerms) -> bool:
+        return terms.due_at is not None and not self.due_done
+
+    def more(self, terms: PayoutTerms) -> Optional[Tuple]:
+        """(periods_from, due_at, last_clock, due_done) for an extended rule."""
+        if not terms.extended:
+            return None
+        return (terms.periods_from, terms.due_at, self.last_clock, self.due_done)
 
     def spent_at(self, terms: PayoutTerms, clock: int) -> int:
         return self.spent_in_period if self.period_index == self.period_at(terms, clock) else 0
@@ -230,7 +290,7 @@ class PayoutState:
 
 @dataclass(frozen=True)
 class PayoutExecution:
-    executor_pubkey: str
+    executor_pubkey: str                      # "" for a run by the node at a due point
     account_pubkey: str
     rule_id: bytes
     recipients: Tuple[Tuple[int, str], ...]   # (slot, pubkey) for open slots, sorted
@@ -292,6 +352,12 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
         # one spelling per meaning: leave the field out for a rule that does not
         # pay per sale, so equal terms always sign and hash the same
         raise PayoutShapeError("per_sale must be true or left out")
+    # Optional terms: a number, or left out. `null` is refused so equal terms
+    # always sign and hash the same.
+    optional = {}
+    for field in ("periods_from", "due_at"):
+        if field in fields:
+            optional[field] = _u64(fields, field)
     return PayoutTerms(
         account_pubkey=account,
         sequence_number=sequence,
@@ -303,11 +369,13 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
         period=_u64(fields, name),
         expires_at=_u64(fields, "expires_at"),
         per_sale=per_sale is True,
+        **optional,
     )
 
 
 SPEC_FIELDS = ("rule_text", "slots", "cap_per_execution", "cap_per_period",
-               "period_blocks", "period_seconds", "expires_at", "per_sale")
+               "period_blocks", "period_seconds", "expires_at", "per_sale",
+               "periods_from", "due_at")
 
 
 def parse_payout_rule_set(tx: Dict[str, Any]) -> PayoutTerms:
@@ -640,6 +708,15 @@ def validate_terms_shape(terms: PayoutTerms, height: int, ts: int) -> Optional[s
         return "expires_at must be in the future"
     if terms.expires_at > now + life:
         return f"expires_at is more than {life} {KIND_NAMES[terms.kind]} ahead"
+    if terms.periods_from is not None and terms.periods_from >= terms.expires_at:
+        return "periods_from must be before expires_at"
+    if terms.due_at is not None:
+        if terms.per_sale:
+            return "a rule that pays per sale has no due point"
+        if not fixed:
+            return "a due point needs a fixed slot: the node names no recipient"
+        if not now < terms.due_at < terms.expires_at:
+            return "due_at must be in the future and before expires_at"
     return None
 
 
@@ -659,9 +736,12 @@ def execution_inputs(terms: PayoutTerms, state: PayoutState, exe: PayoutExecutio
         STREAM_BALANCE: str(max(0, min(int(parent_balance), tau_defs.MAX_TRANSFER_VALUE))),
         STREAM_TIME: str(int(ts)),
         STREAM_HEIGHT: str(int(height)),
-        STREAM_EXECUTOR: _key_literal(exe.executor_pubkey),
+        STREAM_EXECUTOR: _key_literal(exe.executor_pubkey) if exe.executor_pubkey else "0",
         STREAM_SPENT: str(state.spent_at(terms, terms.clock(height, ts))),
     }
+    if terms.reads_clocks:
+        values[STREAM_INSTALLED] = str(state.anchor)
+        values[STREAM_LAST_PAID] = str(state.last_clock or state.anchor)
     for k, slot in enumerate(terms.slots):
         who = slot or named.get(k, "")
         values[SLOT_BASE + k] = _key_literal(who) if who else "0"
@@ -721,7 +801,35 @@ def settle(terms: PayoutTerms, state: PayoutState, exe: PayoutExecution,
 
 # --- The book --------------------------------------------------------------------
 
-_Row = Tuple  # the 16 fields of encode_payout_entry, plus `sales` for a per-sale rule
+# The 16 fields of encode_payout_entry; then `sales` for a per-sale rule; then
+# `more` for an extended rule (with `sales` None before it when it is not per-sale).
+_Row = Tuple
+
+
+def _with_extras(row: Tuple, terms: "PayoutTerms", state: "PayoutState") -> Tuple:
+    sales = (state.sales_missed, state.open_sales) if terms.per_sale else None
+    more = state.more(terms)
+    if more is not None:
+        return row + (sales, more)
+    return row + (sales,) if sales is not None else row
+
+
+def _restore_more(more: Any, rid: bytes) -> Tuple[Optional[int], Optional[int], int, bool]:
+    """A stored `more`, checked; (None, None, 0, False) for a rule without it."""
+    if more is None:
+        return None, None, 0, False
+    try:
+        periods_from, due_at, last_clock, due_done = more
+    except (TypeError, ValueError):
+        raise ValueError(f"stored payout rule has malformed optional terms: {rid.hex()}") from None
+    for value in (periods_from, due_at):
+        if value is not None and not (_is_int(value) and 0 <= value <= _U64_MAX):
+            raise ValueError(f"stored payout rule has a bad optional term: {rid.hex()}")
+    if not (_is_int(last_clock) and last_clock >= 0) or due_done not in (0, 1, False, True):
+        raise ValueError(f"stored payout rule has bad clocks: {rid.hex()}")
+    if due_done and due_at is None:
+        raise ValueError(f"stored payout rule ran a due point it does not have: {rid.hex()}")
+    return periods_from, due_at, int(last_clock), bool(due_done)
 
 
 def _restore_sales(sales: Any, rid: bytes) -> Tuple[Tuple[Tuple[bytes, str, int, int], ...], int]:
@@ -755,6 +863,8 @@ class PayoutBook:
         self.state: Dict[str, PayoutState] = {}
         # (expires_at, account), sorted, per clock.
         self._expiry: Dict[int, List[Tuple[int, str]]] = {KIND_BLOCKS: [], KIND_SECONDS: []}
+        # (due_at, account) of the rules whose due point has not run, sorted, per clock.
+        self._due: Dict[int, List[Tuple[int, str]]] = {KIND_BLOCKS: [], KIND_SECONDS: []}
         self.resolved_count = 0
         self.resolved_acc = ZERO_ACC
         self._root: Optional[bytes] = None
@@ -764,6 +874,7 @@ class PayoutBook:
         clone.terms = dict(self.terms)
         clone.state = dict(self.state)
         clone._expiry = {k: list(rows) for k, rows in self._expiry.items()}
+        clone._due = {k: list(rows) for k, rows in self._due.items()}
         clone.resolved_count = self.resolved_count
         clone.resolved_acc = self.resolved_acc
         clone._root = self._root
@@ -784,6 +895,7 @@ class PayoutBook:
         for row in rows:
             row = tuple(row)
             sales = row[16] if len(row) > 16 else None
+            more = row[17] if len(row) > 17 else None
             (stored_id, account, sequence, body, slots, cap_exec, cap_period, kind,
              period, expires_at, anchor, period_index, spent, executions, paid_total,
              last_height) = row[:16]
@@ -791,16 +903,20 @@ class PayoutBook:
                 raise ValueError("stored payout rule has an unknown period clock")
             if not (_is_int(period) and period >= 1):
                 raise ValueError("stored payout rule has a bad period")
+            periods_from, due_at, last_clock, due_done = _restore_more(more, bytes(stored_id))
             terms = PayoutTerms(account, sequence, body, tuple(slots), cap_exec,
-                                cap_period, kind, period, expires_at, sales is not None)
+                                cap_period, kind, period, expires_at, sales is not None,
+                                periods_from, due_at)
             rid = terms.rule_id
             if rid != bytes(stored_id):
                 raise ValueError(f"stored payout rule id does not match its terms: {rid.hex()}")
             if account in book.terms:
                 raise ValueError(f"two stored payout rules for one account: {account[:16]}")
+            if (more is not None) != terms.extended:
+                raise ValueError(f"stored payout rule and its optional terms disagree: {rid.hex()}")
             open_sales, missed = _restore_sales(sales, rid)
             state = PayoutState(anchor, period_index, spent, executions, paid_total,
-                                last_height, open_sales, missed)
+                                last_height, open_sales, missed, last_clock, due_done)
             if not all(_is_int(v) and v >= 0 for v in (anchor, period_index, spent,
                                                         executions, paid_total, last_height)):
                 raise ValueError(f"stored payout rule has bad progress: {rid.hex()}")
@@ -817,13 +933,18 @@ class PayoutBook:
         self.terms[terms.account_pubkey] = terms
         self.state[terms.account_pubkey] = state
         bisect.insort(self._expiry[terms.kind], (terms.expires_at, terms.account_pubkey))
+        if state.due_pending(terms):
+            bisect.insort(self._due[terms.kind], (terms.due_at, terms.account_pubkey))
         self._root = None
 
     def _remove(self, account: str, outcome: int) -> PayoutTerms:
         terms = self.terms.pop(account)
-        del self.state[account]
+        state = self.state.pop(account)
         rows = self._expiry[terms.kind]
         del rows[bisect.bisect_left(rows, (terms.expires_at, account))]
+        if state.due_pending(terms):
+            due = self._due[terms.kind]
+            del due[bisect.bisect_left(due, (terms.due_at, account))]
         self.resolved_acc = compute_payout_resolved_acc(self.resolved_acc, terms.rule_id, outcome)
         self.resolved_count += 1
         self._root = None
@@ -837,7 +958,7 @@ class PayoutBook:
                t.cap_per_execution, t.cap_per_period, t.kind, t.period, t.expires_at,
                s.anchor, s.period_index, s.spent_in_period, s.executions,
                s.paid_total, s.last_height)
-        return row + ((s.sales_missed, s.open_sales),) if t.per_sale else row
+        return _with_extras(row, t, s)
 
     def root(self) -> bytes:
         if self._root is None:
@@ -862,6 +983,41 @@ class PayoutBook:
         h, t = self._expiry[KIND_BLOCKS], self._expiry[KIND_SECONDS]
         return bool((h and h[0][0] <= height) or (t and t[0][0] <= ts))
 
+    def has_due(self, height: int, ts: int) -> bool:
+        h, t = self._due[KIND_BLOCKS], self._due[KIND_SECONDS]
+        return bool((h and h[0][0] <= height) or (t and t[0][0] <= ts))
+
+    def due(self, height: int, ts: int,
+            cap: int = MAX_PAYOUT_DUE_RUNS_PER_BLOCK) -> List[str]:
+        """The accounts whose rule the node runs in this block: every due point
+        this block's clock reached and that has not run, earliest first (rules
+        on the block clock before rules on the time clock), at most `cap`."""
+        out: List[str] = []
+        for kind, clock in ((KIND_BLOCKS, height), (KIND_SECONDS, ts)):
+            for due_at, account in self._due[kind]:
+                if due_at > clock or len(out) >= cap:
+                    break
+                out.append(account)
+        return out
+
+    def due_execution(self, account: str) -> Tuple[PayoutTerms, PayoutState, PayoutExecution]:
+        """The run the node makes at a rule's due point: no executor, no named
+        recipient, no data."""
+        terms, state = self.terms[account], self.state[account]
+        if not state.due_pending(terms):
+            raise KeyError(account)
+        return terms, state, PayoutExecution("", account, terms.rule_id, (), ())
+
+    def due_ran(self, account: str) -> None:
+        """The due point of `account`'s rule has run, paid or not: it runs once."""
+        terms, state = self.terms[account], self.state[account]
+        if not state.due_pending(terms):
+            raise KeyError(account)
+        rows = self._due[terms.kind]
+        del rows[bisect.bisect_left(rows, (terms.due_at, account))]
+        self.state[account] = replace(state, due_done=True)
+        self._root = None
+
     def store_rows(self) -> List[Tuple]:
         """Rows for persistence: the body text instead of its hash."""
         out = []
@@ -871,7 +1027,7 @@ class PayoutBook:
                    t.cap_per_execution, t.cap_per_period, t.kind, t.period,
                    t.expires_at, s.anchor, s.period_index, s.spent_in_period,
                    s.executions, s.paid_total, s.last_height)
-            out.append(row + ((s.sales_missed, s.open_sales),) if t.per_sale else row)
+            out.append(_with_extras(row, t, s))
         return out
 
     def resolved_state(self) -> Tuple[int, bytes]:
@@ -953,7 +1109,8 @@ class PayoutBook:
         state = replace(state, period_index=index, spent_in_period=spent + total,
                         executions=state.executions + 1,
                         paid_total=state.paid_total + total, last_height=int(height),
-                        open_sales=open_sales)
+                        open_sales=open_sales,
+                        last_clock=int(clock) if terms.extended else 0)
         self.state[account] = state
         self._root = None
         return state
@@ -986,12 +1143,16 @@ class PayoutBook:
         return "recorded"
 
     def expire(self, height: int, ts: int) -> List[PayoutTerms]:
-        """Remove every rule whose end this block reached, earliest first."""
+        """Remove every rule whose end this block reached, earliest first. A rule
+        whose due point has not run yet stays until it has: the node owes it."""
         gone: List[PayoutTerms] = []
         for kind, clock in ((KIND_BLOCKS, height), (KIND_SECONDS, ts)):
             rows = self._expiry[kind]
-            while rows and rows[0][0] <= clock:
-                gone.append(self._remove(rows[0][1], OUTCOME_EXPIRED))
+            # keys are lowercase hex, so "g" sorts after every account at `clock`
+            ended = [account for _, account in rows[:bisect.bisect_right(rows, (clock, "g"))]]
+            for account in ended:
+                if not self.state[account].due_pending(self.terms[account]):
+                    gone.append(self._remove(account, OUTCOME_EXPIRED))
         return gone
 
 
@@ -1013,6 +1174,10 @@ def describe(terms: PayoutTerms, state: PayoutState, *, height: int = 0,
         "period_clock": KIND_NAMES[terms.kind],
         "period": terms.period,
         "anchor": state.anchor,
+        **({"periods_from": terms.periods_from} if terms.periods_from is not None else {}),
+        **({"due_at": terms.due_at, "due_done": state.due_done}
+           if terms.due_at is not None else {}),
+        **({"last_paid_clock": state.last_clock or None} if terms.extended else {}),
         "expires_at": terms.expires_at,
         "spent_this_period": spent,
         "left_this_period": terms.cap_per_period - spent,
