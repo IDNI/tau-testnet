@@ -98,9 +98,11 @@ receipt as `reason: "recipient_max_hold"` with
 the payer's wallet can print "this recipient accepts payments held for
 up to N". The cap is read from the clause's canonical comparisons (a
 hold stream compared against a literal, `<=`, `<`, or the reversed
-forms; the most restrictive wins). A cap written in another shape still
-enforces — the Tau verdict decides — but its refusal reports the
-measured hold without a numeric cap.
+forms; the most restrictive wins). The `:bv[...]` annotations are
+optional in those comparisons, as they are in the language — a cap
+written `{ 600 }` or `{ #x258 }` without one reports its number too. A
+cap written in another shape still enforces — the Tau verdict decides —
+but its refusal reports the measured hold without a numeric cap.
 
 Only parks are capped. A **retract** never passes this gate, and a
 **release** is not re-checked: at release the money simply arrives, so
