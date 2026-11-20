@@ -1328,7 +1328,10 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         # with no published policy (no accepted clause on
                         # o5, and for a park none on the cap stream o10)
                         # is judged by nobody -- the transfer keeps the
-                        # single sender step it has always had.
+                        # single sender step it has always had. And
+                        # activation-triggered, also mirroring apply:
+                        # before governance turns the gate on, no
+                        # recipient is judged at all.
                         to_addr = tau_input_dict['to_addr']
                         _recip_clause = tip_view.clause_for(
                             to_addr, tau_defs.USER_POLICY_STREAM_INDEX)
@@ -1337,7 +1340,9 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 to_addr, tau_defs.RECIPIENT_HOLD_CAP_STREAM_INDEX)
                             if tx_type == TX_TYPE_RETRACTABLE_TRANSFER else None
                         )
-                        if _recip_clause is not None or _recip_cap_clause is not None:
+                        if recipient_gate.gate_active(tip_view) and (
+                                _recip_clause is not None
+                                or _recip_cap_clause is not None):
                             # --- Recipient Policy Check (o5, #47) ---
                             # The recipient is judged by its OWN policy on the
                             # same inputs with the policy owner changed
@@ -1574,6 +1579,11 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                 "message": "Transaction would be admitted.",
                 "admissible": True,
                 "tx_type": tx_type,
+                # The activation state this dry run actually judged
+                # under, read from the same tip view admission used --
+                # checktx's capability surface formats it, so the flags
+                # say what really ran.
+                "recipient_gate_active": recipient_gate.gate_active(tip_view),
             }
             if facts.fee_estimated:
                 verdict["estimated_fee"] = str(estimated_fee_total)
