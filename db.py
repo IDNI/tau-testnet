@@ -1655,10 +1655,12 @@ def record_rule_outcomes(block_hash: str, block_number: int, outcomes) -> None:
     """Persist one block's confirmed rule outcomes.
 
     `outcomes` is an iterable of (tx_hash, outcome) pairs, where `outcome` is
-    the revision receipt dict captured at apply (see
-    `tau_native._build_revision_receipt`), stored verbatim as JSON. Replaced
-    on re-record: replaying a block re-observes the same apply, and the newest
-    observation is the one the node stands behind.
+    the outcome dict captured at apply -- the revision receipt of the rule
+    step (see `tau_native._build_revision_receipt`) or, for a rule routed to
+    the clause registry, the registry record -- with the transaction
+    receipt's bounded log lines attached under `logs`. Stored verbatim as
+    JSON. Replaced on re-record: replaying a block re-observes the same
+    apply, and the newest observation is the one the node stands behind.
     """
     rows = [
         (tx_hash, block_hash, int(block_number), json.dumps(outcome))
