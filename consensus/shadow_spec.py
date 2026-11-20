@@ -29,16 +29,80 @@ The driver sits behind the same interface the node already uses for the
 live engine (`TauInterface.communicate` / `get_current_spec`), so the
 snapshot, persistence and view logic is testable against a scripted driver
 where the native bindings are unavailable.
+
+Step 3 (the survival ledger) reuses the same replay: `advance` records
+the per-unit steps of each block (the normalized text right after each
+unit was fed), the commit path persists them with the submitting tx's
+attribution (db.spec_unit_feeds), and the ledger is recomputed from the
+canonical blocks' steps by diffing consecutive texts at top-level
+conjunct granularity (`split_spec_fragments`). Because only canonical
+blocks are replayed, a reorg that drops a displacing block restores the
+displaced unit's status with no explicit reversal records.
 """
 import hashlib
 import logging
-from typing import Callable, Dict, Iterable, List, Optional
+import re
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+# --- normalized-spec fragments (the survival ledger's diff granularity) ---
+
+_ASSIGN_FRAGMENT_RE = re.compile(r"^(o\d+\[t\](?::[A-Za-z]+\[\d+\])?)\s*=")
+_ALWAYS_LINE_RE = re.compile(r"^always\s*\((?P<body>.*)\)\s*\.\s*$", re.DOTALL)
+
+
+def _split_top_level(body: str, separator: str = "&&") -> List[str]:
+    """Split `body` on `separator` occurrences at bracket depth 0."""
+    parts: List[str] = []
+    depth = 0
+    start = 0
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and body.startswith(separator, i):
+            parts.append(body[start:i])
+            i += len(separator)
+            start = i
+            continue
+        i += 1
+    parts.append(body[start:])
+    return [p.strip() for p in parts if p.strip()]
+
+
+def split_spec_fragments(text: str) -> List[Tuple[str, str]]:
+    """Split a normalized spec text into its top-level conjunct fragments.
+
+    Returns [(key, fragment)] in text order. A fragment that assigns one
+    output stream (`oN[t]... = ...`) is keyed by its left-hand side: that
+    stream assignment is the identity pointwise revision overwrites, so a
+    later unit assigning the same stream displaces exactly that fragment.
+    Any other fragment (a condition, an implication, ...) is keyed by its
+    own text: it survives verbatim or not at all. This is the granularity
+    at which the survival ledger (db.get_survival_ledger) decides what of
+    a submitted unit is still in force.
+    """
+    fragments: List[Tuple[str, str]] = []
+    for line in (text or "").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        match = _ALWAYS_LINE_RE.match(line)
+        body = match.group("body") if match else line
+        for fragment in _split_top_level(body):
+            assign = _ASSIGN_FRAGMENT_RE.match(fragment)
+            key = assign.group(1) if assign else fragment
+            fragments.append((key, fragment))
+    return fragments
 
 
 class TauInterfaceShadowDriver:
@@ -104,12 +168,22 @@ class ShadowSpec:
         self._fed_set = set()
         self._revision: Optional[int] = driver.spec_revision()
         self._text: str = driver.current_spec() or ""
+        self._last_steps: List[Dict] = []
 
     # -- introspection ----------------------------------------------------
 
     @property
     def fed_units(self) -> List[str]:
         return list(self._fed_units)
+
+    @property
+    def last_steps(self) -> List[Dict]:
+        """The per-unit steps of the most recent `advance`: one
+        {unit, text_after, revision_after} per unit actually fed, in feed
+        order. `text_after` is the shadow's normalized spec immediately
+        after that unit -- the survival ledger's diff input, persisted per
+        block by the commit path (db.spec_unit_feeds)."""
+        return list(self._last_steps)
 
     @property
     def revision(self) -> Optional[int]:
@@ -142,6 +216,7 @@ class ShadowSpec:
             if unit and unit not in seen:
                 seen.add(unit)
                 fresh.append(unit)
+        self._last_steps = []
         if not fresh:
             return None
 
@@ -158,6 +233,11 @@ class ShadowSpec:
                 self._revision = revision
             elif self._revision is not None:
                 self._revision += 1
+            self._last_steps.append({
+                "unit": unit,
+                "text_after": self._driver.current_spec() or "",
+                "revision_after": self._revision,
+            })
 
         self._text = self._driver.current_spec() or ""
         return {
