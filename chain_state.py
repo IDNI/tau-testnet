@@ -550,6 +550,17 @@ def _retractable_state(lm) -> dict:
     }
 
 
+def _payments_state(lm) -> dict:
+    """The programmable-payments books as persistable snapshot rows.
+
+    The books' ids are content-derived from the stored terms themselves,
+    so restore recomputes every id from what is stored -- a tampered row
+    changes its entry's id (and the book root), it cannot alias another
+    entry, the same validation style as the retractable restore.
+    """
+    return lm.programmable_payments.snapshot_rows()
+
+
 def _record_retractable_events(block, next_snapshot) -> None:
     """Best-effort history write; the apply verdict is already final.
 
@@ -608,6 +619,7 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         rule_change_requests=lm.approval_requests.snapshot_rule_change_requests(),
         approval_slots_active=lm.approval_slots_active,
         retractable_transfers=_retractable_state(lm),
+        programmable_payments=_payments_state(lm),
         eligibility_mode=lm.eligibility_mode,
         fee_beneficiary=lm.fee_beneficiary,
         last_transfer_ts=merged_ts,
@@ -2240,6 +2252,21 @@ def _restore_retractables(lm) -> None:
         raise DatabaseError(f"corrupt retractable transfer state: {exc}") from exc
 
 
+def _restore_payments(lm) -> None:
+    """Rehydrate the programmable-payments books. Restore recomputes every
+    entry id from the stored terms and refuses duplicates, so corrupt rows
+    fail the load instead of silently dropping a payment book."""
+    from consensus.payments import ProgrammablePayments
+
+    rows = db.load_payments_state()
+    network_id = lm.programmable_payments.standing.network_id
+    try:
+        lm.programmable_payments = ProgrammablePayments.restore(
+            rows, network_id=network_id)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise DatabaseError(f"corrupt programmable payments state: {exc}") from exc
+
+
 def save_effective_tau_spec(canonical_rule_text: str):
     """
     Append ONE canonical (full-width, pre-shrink) application rule to the raw
@@ -2372,6 +2399,7 @@ def load_state_from_db() -> bool:
         _restore_approvals(_lifecycle_manager)
         _restore_rule_change_requests(_lifecycle_manager)
         _restore_retractables(_lifecycle_manager)
+        _restore_payments(_lifecycle_manager)
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
         persisted_slots = db.get_chain_state_value("approval_slots_active", _MISSING)
@@ -2440,6 +2468,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         )
         approval_slots_active_snapshot = _lifecycle_manager.approval_slots_active
         retractable_snapshot = _retractable_state(_lifecycle_manager)
+        payments_snapshot = _payments_state(_lifecycle_manager)
 
     db.save_canonical_state_atomically(
         block_hash, block_number,
@@ -2458,6 +2487,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_change_requests=rule_change_requests_list,
         approval_slots_active=approval_slots_active_snapshot,
         retractable_transfers=retractable_snapshot,
+        programmable_payments=payments_snapshot,
     )
 
 def tick_governance(height: int):
@@ -2955,6 +2985,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 ),
                 approval_slots_active=_lifecycle_manager.approval_slots_active,
                 retractable_transfers=_retractable_state(_lifecycle_manager),
+                programmable_payments=_payments_state(_lifecycle_manager),
             )
     except Exception as exc:
         logger.error(
