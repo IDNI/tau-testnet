@@ -81,7 +81,7 @@ PAYEE, BACK = 0, 1                           # the slots: whoever Bob names, and
 def real():
     env = dict(os.environ)
     env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
-    ev = tau_policy.PolicyEvaluator(cwd=REPO, env=env, timeout=TIMEOUT)
+    ev = tau_policy.pool_evaluator(POOL_APPLY, cwd=REPO, env=env, timeout=TIMEOUT)
     sender_policy.set_evaluator(POOL_APPLY, ev)
     yield ev
     sender_policy.set_evaluator(POOL_APPLY, None)

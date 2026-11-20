@@ -64,7 +64,7 @@ SPLIT = (
 def real():
     env = dict(os.environ)
     env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
-    ev = tau_policy.PolicyEvaluator(cwd=REPO, env=env, timeout=TIMEOUT)
+    ev = tau_policy.pool_evaluator(POOL_APPLY, cwd=REPO, env=env, timeout=TIMEOUT)
     sender_policy.set_evaluator(POOL_APPLY, ev)
     yield ev
     sender_policy.set_evaluator(POOL_APPLY, None)
@@ -365,3 +365,51 @@ def test_the_work_escrow_refuses_everything_else(real):
     # held part to the worker
     assert escrow.execute({0: 1}, WARRANTY_END) == {SLOT_WORKER: 100}
     assert escrow.balance == 0
+
+
+# --- one rule at a time in the pool -------------------------------------------------
+#
+# On the pinned engine (tau-lang c3ea334) an interpreter that is stepped after another
+# one was built and probed in the same process sometimes refused the step, about 5
+# steps in 100 for the first rule below. The payout pools keep one interpreter at a
+# time (`tau_policy.pool_options`), so these never fail.
+
+
+def _divide(by):
+    return "o30[t]:bv[24] = i27[t]:bv[24] / { %d }:bv[24]" % by
+
+
+def test_a_rule_answers_the_same_after_every_other_rule_that_is_built(real):
+    fifth = _divide(5)
+    assert real.outputs(fifth, {"i27": "100"})["o30"] == "20"
+    for by in range(6, 66):
+        assert real.validate(_divide(by)).ok
+        assert real.outputs(fifth, {"i27": "100"})["o30"] == "20", by
+        assert real.outputs(fifth, {"i27": "101"})["o30"] == "20", by
+    assert real.stats()["live"] == 1
+
+
+def test_rules_in_turn_in_one_pool_all_answer_like_their_model(real):
+    import random
+
+    def c(n):
+        return "{ %d }:bv[24]" % n
+
+    rules = [
+        (_divide(5), lambda v: v // 5),
+        (_divide(2), lambda v: v // 2),
+        (f"(i27[t]:bv[24] > {c(50)}) ? (o30[t]:bv[24] = {c(7)}) : (o30[t]:bv[24] = {c(0)})",
+         lambda v: 7 if v > 50 else 0),
+        (f"o30[t]:bv[24] = i27[t]:bv[24] + {c(3)}", lambda v: v + 3),
+        (f"(i27[t]:bv[24] < {c(10)}) ? (o30[t]:bv[24] = {c(0)}) : "
+         f"(o30[t]:bv[24] = i27[t]:bv[24] / {c(10)})", lambda v: 0 if v < 10 else v // 10),
+        (f"(o30[t]:bv[24] = i27[t]:bv[24] / {c(4)}) && (o31[t]:bv[24] = i27[t]:bv[24] / {c(8)})",
+         lambda v: v // 4),
+    ]
+    rng = random.Random(63)
+    for n in range(400):
+        if rng.random() < 0.3:
+            assert real.validate(rng.choice(rules)[0]).ok
+        body, model = rng.choice(rules)
+        value = rng.choice([0, 1, 4, 9, 10, 25, 50, 51, 100, 101, 999, 65_535, 1_000_000])
+        assert real.outputs(body, {"i27": str(value)})["o30"] == str(model(value)), (n, body)
