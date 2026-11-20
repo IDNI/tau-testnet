@@ -33,6 +33,12 @@ from consensus.approvals import (
     TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
+from consensus.payouts import (
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_INSTALL,
+    TX_TYPE_PAYOUT_REMOVE,
+)
+from consensus.grants import TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW
 from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
@@ -123,6 +129,37 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
+    elif tx_type == TX_TYPE_PAYOUT_INSTALL:
+        # Every field that fixes the rule's caps and recipient set is
+        # signed: executions move the owner's money by node action
+        # under these caps, with no further signature from the owner,
+        # so a proposer who could rewrite a cap or a recipient would
+        # be spending money the owner never agreed to expose.
+        signing_dict["max_per_execution"] = payload.get("max_per_execution")
+        signing_dict["max_per_period"] = payload.get("max_per_period")
+        signing_dict["recipients"] = payload.get("recipients")
+        signing_dict["period_kind"] = payload.get("period_kind")
+        signing_dict["anchor_ts"] = payload.get("anchor_ts")
+    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+        # The executor signs the settlement it claims: the rule owner,
+        # the settlement id (the idempotency key) and the gross input
+        # the rule is stepped with.
+        signing_dict["owner"] = payload.get("owner")
+        signing_dict["settlement_id"] = payload.get("settlement_id")
+        signing_dict["gross"] = payload.get("gross")
+    elif tx_type == TX_TYPE_PAYOUT_REMOVE:
+        signing_dict["rule_id"] = payload.get("rule_id")
+    elif tx_type == TX_TYPE_GRANT_CREATE:
+        # The full grant terms are signed: the sender's money is held
+        # under exactly these conditions from creation.
+        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
+        signing_dict["total"] = payload.get("total")
+        signing_dict["cap_per_period"] = payload.get("cap_per_period")
+        signing_dict["opens_at"] = payload.get("opens_at")
+        signing_dict["deadline"] = payload.get("deadline")
+    elif tx_type == TX_TYPE_GRANT_DRAW:
+        signing_dict["grant_id"] = payload.get("grant_id")
+        signing_dict["amount"] = payload.get("amount")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

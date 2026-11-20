@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.retractable import RetractableBook
+from consensus.payouts import PayoutBook
+from consensus.grants import GrantBook
 
 logger = logging.getLogger(__name__)
 from consensus.approvals import (
@@ -198,6 +200,8 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    payout_rules_root: str = "",
+    grants_root: str = "",
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -243,6 +247,12 @@ def build_mechanism_metadata(
     if retractable_transfers_root is None:
         retractable_transfers_root = RetractableBook().root().hex()
     mech["retractable_transfers_root"] = retractable_transfers_root
+    # Programmable payments (#63): emitted ONLY once a rule or grant
+    # exists, so a chain that never uses them hashes exactly as before.
+    if payout_rules_root:
+        mech["payout_rules_root"] = payout_rules_root
+    if grants_root:
+        mech["grants_root"] = grants_root
     return mech
 
 
@@ -451,6 +461,8 @@ class ConsensusLifecycleManager:
         # Co-signature approvals. A FIELD for the same reason rule_offers is.
         self.approval_requests = ApprovalRequestLifecycleManager()
         self.retractable_transfers = RetractableBook()
+        self.payout_rules = PayoutBook()
+        self.grants = GrantBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
@@ -545,6 +557,12 @@ class ConsensusLifecycleManager:
             ),
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
+            payout_rules_root=(
+                "" if self.payout_rules.is_empty() else self.payout_rules.root()
+            ),
+            grants_root=(
+                "" if self.grants.is_empty() else self.grants.root()
+            ),
             faucet_amount=self.faucet_amount,
         )
         return compute_consensus_meta_hash(
