@@ -1659,6 +1659,36 @@ def record_rule_outcomes(block_hash: str, block_number: int, outcomes) -> None:
         _db_conn.commit()
 
 
+def list_rule_outcomes() -> List[Dict]:
+    """Every recorded rule outcome, in apply order.
+
+    Ordered by block, then by the revision each apply step produced, so
+    the sequence matches the order the units took effect. Keys mirror
+    get_rule_outcome, plus the transaction and block identifiers the
+    survival ledger (consensus/active_rules.py) keys units by."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT tx_hash, block_hash, block_number, outcome, "
+            "spec_revision_before, spec_revision_after FROM rule_outcomes "
+            "ORDER BY block_number ASC, spec_revision_after ASC, tx_hash ASC"
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "tx_hash": r[0],
+            "block_hash": r[1],
+            "block_number": r[2],
+            "outcome": r[3],
+            "spec_revision_before": r[4],
+            "spec_revision_after": r[5],
+        }
+        for r in rows
+    ]
+
+
 def get_rule_outcome(tx_hash: str, block_hash: str = None) -> Optional[Dict]:
     """Return the recorded apply outcome for a confirmed rule tx, or None.
 
@@ -1770,6 +1800,19 @@ def get_spec_snapshot_by_revision(spec_revision: int) -> Optional[Dict]:
             (int(spec_revision),),
         )
         return _spec_snapshot_dict(cur.fetchone())
+
+
+def list_spec_snapshots() -> List[Dict]:
+    """Every stored spec snapshot, oldest revision first."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT spec_revision, height, spec_hash, spec_text "
+            "FROM spec_snapshots ORDER BY spec_revision ASC"
+        )
+        return [_spec_snapshot_dict(r) for r in cur.fetchall()]
 
 
 def get_tx_block_locations(tx_hash: str) -> List[Dict]:

@@ -177,6 +177,233 @@ def normalize_account(account: str) -> str:
     return acct
 
 
+def _unwrap_statement(statement: str) -> str:
+    """The body of one top-level statement.
+
+    Strips the terminating '.' and, for the `always ( ... )` shape rule
+    units take, the wrapper itself (one level, matched parens). Anything
+    else is returned with only the '.' removed.
+    """
+    text = (statement or "").strip()
+    if text.endswith("."):
+        text = text[:-1].strip()
+    if text.startswith("always"):
+        rest = text[len("always"):].lstrip()
+        if rest.startswith("("):
+            depth = 0
+            for i, ch in enumerate(rest):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        if not rest[i + 1:].strip():
+                            return rest[1:i]
+                        break
+    return text
+
+
+def _split_conjuncts(body: str) -> List[str]:
+    """Split a statement body on its top-level `&&` conjuncts.
+
+    "Top-level" is the shallowest bracket depth at which `&&` occurs in
+    the body, so a conjunction inside a guarded conditional stays inside
+    its fragment while the assignments of a plain `always ( A && B )`
+    unit become separate fragments.
+    """
+    depths = []
+    depth = 0
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "&" and body[i + 1:i + 2] == "&":
+            depths.append(depth)
+            i += 1
+        i += 1
+    if not depths:
+        return [body]
+    top = min(depths)
+    parts = []
+    depth = 0
+    start = 0
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "&" and body[i + 1:i + 2] == "&" and depth == top:
+            parts.append(body[start:i])
+            i += 2
+            start = i
+            continue
+        i += 1
+    parts.append(body[start:])
+    return parts
+
+
+def spec_fragments(spec_text: str) -> List[str]:
+    """Decompose a canonical spec into its rule fragments.
+
+    A fragment is one top-level conjunct of one top-level statement,
+    whitespace-normalised. Pointwise revision displaces fragments, not
+    whole statements -- one `always (...)` statement can carry several
+    assignments, of which a later unit may displace only one -- so the
+    survival ledger below is kept at this granularity. Order is spec
+    order; duplicates collapse (a fragment is either in force or not).
+    """
+    fragments: List[str] = []
+    seen = set()
+    for stmt in split_statements(spec_text):
+        for part in _split_conjuncts(_unwrap_statement(stmt)):
+            frag = " ".join(part.split())
+            if frag and frag not in seen:
+                seen.add(frag)
+                fragments.append(frag)
+    return fragments
+
+
+# --- Survival ledger -------------------------------------------------------
+#
+# getactiverules answers what the spec runs NOW. The ledger answers the
+# complementary question for every confirmed rule unit: is what it
+# installed still in force, partly displaced, or gone -- and which later
+# transaction displaced it. It is derived entirely from stored data (the
+# spec snapshots and the rule_outcome receipts), never from the
+# append-only accumulation and never by re-running the engine.
+#
+# A unit's footprint is the fragments its apply step installed: the
+# fragments of the first snapshot at or after its spec_revision_after,
+# minus the fragments of the last snapshot at or before its
+# spec_revision_before (the empty spec when there is none). Survival is
+# footprint membership in the target snapshot. A fragment lost between
+# two consecutive snapshots is attributed to the accepted units whose
+# apply step produced a revision inside that interval.
+
+def survival_ledger(target: Optional[Dict] = None) -> List[Dict]:
+    """Per-unit survival at `target` (default: the latest snapshot).
+
+    One entry per ACCEPTED rule outcome whose revision is in force at
+    the target, in apply order. Entries carry the unit's transaction
+    hash, block number, the revision interval its apply step took, its
+    recorded outcome, its status ("in_force", "partially_displaced" or
+    "displaced"), the fragments it installed / still has in force / lost
+    (each lost fragment with its displacing transaction hashes), and the
+    unit-level union of displacers. A unit that installed no new
+    fragments (an ACCEPTED_NOOP receipt) is in_force with an empty
+    footprint: it asserted nothing the spec did not already run.
+    """
+    import db
+
+    if target is None:
+        target = db.get_latest_spec_snapshot()
+    if target is None:
+        return []
+    target_revision = target["spec_revision"]
+    snapshots = db.list_spec_snapshots()
+    if not snapshots:
+        return []
+    frag_sets = {
+        snap["spec_revision"]: set(spec_fragments(snap["spec_text"]))
+        for snap in snapshots
+    }
+    target_frags = frag_sets.get(target_revision, set())
+
+    units = [
+        row for row in db.list_rule_outcomes()
+        if row.get("spec_revision_after") is not None
+        and row["spec_revision_after"] <= target_revision
+        and (row.get("outcome") or "").startswith("ACCEPTED")
+    ]
+
+    def snapshot_at_or_before(revision: int) -> Optional[Dict]:
+        found = None
+        for snap in snapshots:
+            if snap["spec_revision"] <= revision:
+                found = snap
+            else:
+                break
+        return found
+
+    def snapshot_at_or_after(revision: int) -> Optional[Dict]:
+        for snap in snapshots:
+            if snap["spec_revision"] >= revision:
+                return snap
+        return None
+
+    def displacers_of(fragment: str, installed_after_revision: int) -> List[str]:
+        """Accepted units whose step first removed `fragment` from the
+        spec, considering only snapshot transitions after the snapshot
+        the fragment was installed into, up to the target."""
+        found: List[str] = []
+        pairs = zip(snapshots, snapshots[1:])
+        for earlier, later in pairs:
+            if later["spec_revision"] <= installed_after_revision:
+                continue
+            if earlier["spec_revision"] >= target_revision:
+                break
+            if fragment in frag_sets[earlier["spec_revision"]] \
+                    and fragment not in frag_sets[later["spec_revision"]]:
+                for unit in units:
+                    if earlier["spec_revision"] < unit["spec_revision_after"] \
+                            <= later["spec_revision"]:
+                        if unit["tx_hash"] not in found:
+                            found.append(unit["tx_hash"])
+                break
+        return found
+
+    ledger: List[Dict] = []
+    for unit in units:
+        after_snap = snapshot_at_or_after(unit["spec_revision_after"])
+        before_rev = unit["spec_revision_before"]
+        before_snap = snapshot_at_or_before(
+            before_rev if before_rev is not None else -1)
+        after_frags = frag_sets.get(after_snap["spec_revision"], set()) \
+            if after_snap else set()
+        before_frags = frag_sets.get(before_snap["spec_revision"], set()) \
+            if before_snap else set()
+        installed = [f for f in spec_fragments(after_snap["spec_text"])
+                     if f in after_frags - before_frags] if after_snap else []
+        surviving = [f for f in installed if f in target_frags]
+        lost = []
+        displaced_by: List[str] = []
+        for frag in installed:
+            if frag in target_frags:
+                continue
+            killers = displacers_of(
+                frag, after_snap["spec_revision"] if after_snap else 0)
+            # A unit never displaces its own footprint.
+            killers = [k for k in killers if k != unit["tx_hash"]]
+            lost.append({"fragment": frag, "displaced_by": killers})
+            for k in killers:
+                if k not in displaced_by:
+                    displaced_by.append(k)
+        if not lost:
+            status = "in_force"
+        elif not surviving:
+            status = "displaced"
+        else:
+            status = "partially_displaced"
+        ledger.append({
+            "tx_hash": unit["tx_hash"],
+            "block_number": unit["block_number"],
+            "spec_revision_before": unit["spec_revision_before"],
+            "spec_revision_after": unit["spec_revision_after"],
+            "outcome": unit["outcome"],
+            "status": status,
+            "displaced_by": displaced_by,
+            "installed_fragments": installed,
+            "surviving_fragments": surviving,
+            "displaced_fragments": lost,
+        })
+    return ledger
+
+
 def attribute_rules(spec_text: str, account: str) -> Tuple[List[str], List[str]]:
     """Split the effective spec for one account.
 

@@ -16,6 +16,13 @@ the effective spec guarded by that account (`account_rules`) and the
 statements no single account can be attributed to (`unattributed`).
 Statements guarded by exactly one other account are omitted.
 
+Every answer with a snapshot also carries `survival_ledger`: one entry
+per confirmed rule unit in force at the snapshot's revision -- what its
+apply step installed, whether that is still in force, partly displaced
+or displaced at this snapshot, and which later transaction displaced the
+parts that are gone (derived in consensus/active_rules.py from the
+stored snapshots and rule_outcome receipts).
+
 When no snapshot exists yet (no rule-bearing block committed since this
 view was introduced), the answer carries `available: false` rather than
 substituting the accumulation text -- a truthful "not available" over a
@@ -80,6 +87,14 @@ def execute(raw_command: str, container):
         "spec_hash": snapshot["spec_hash"],
         "effective_spec": snapshot["spec_text"],
     })
+    try:
+        data["survival_ledger"] = active_rules.survival_ledger(snapshot)
+    except Exception as exc:
+        logger.exception("Failed to derive survival ledger")
+        return api_response.error_response(
+            "getactiverules", f"Failed to derive survival ledger: {exc}",
+            "INTERNAL_ERROR",
+        )
     if account:
         mine, unattributed = active_rules.attribute_rules(
             snapshot["spec_text"], account
