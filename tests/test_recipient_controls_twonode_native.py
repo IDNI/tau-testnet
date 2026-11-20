@@ -377,7 +377,12 @@ def main():
         with the miner key as createblock does."""
         head = head_dict()
         height = int(head["header"]["block_number"]) + 1
-        ts = int(head["header"]["timestamp"]) + 10
+        # The candidate carries its parent's timestamp: hand-built blocks
+        # interleave with createblock's wall-clock blocks here, and a
+        # timestamp ahead of the wall clock would make the NEXT real block
+        # fail ingestion as a timestamp regression. Equal is valid (the
+        # validator rejects only strictly-less).
+        ts = int(head["header"]["timestamp"])
         candidate = Block.create(
             block_number=height, previous_hash=head["block_hash"],
             transactions=[tx], proposer_pubkey=config.MINER_PUBKEY,
@@ -482,7 +487,7 @@ def main():
         # candidate, is refused by the engine under the tightened cap.
         head = head_dict()
         tx = sign_payload(park_payload(
-            SENDER, 100, int(head["header"]["timestamp"]) + 10 + 540,
+            SENDER, 100, int(head["header"]["timestamp"]) + 540,
             tx_id="twonode-tightened-park"), SK_ALICE)
         candidate = build_refusal_candidate(tx, "c_apply")
         result["ingest"]["c_apply"] = bool(
