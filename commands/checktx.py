@@ -52,6 +52,11 @@ def execute(raw_command: str, container):
             "tx_type": result.get("tx_type"),
             "tau_evaluated": tau_evaluated,
             "checks_skipped": checks_skipped,
+            # Capability surface (#47): this node enforces the recipient
+            # policy gate and the park hold cap in the same dry run, so a
+            # recipient refusal above carries sendtx's reason verbatim.
+            "recipient_policy_gate": "enforced",
+            "recipient_hold_cap": "enforced",
         }
         if estimate and "estimated_fee" in result:
             data["estimated_fee"] = result["estimated_fee"]

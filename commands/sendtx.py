@@ -14,7 +14,7 @@ import tau_manager
 from tau_manager import parse_tau_output
 import utils
 from errors import TauCommunicationError
-from consensus import fees, sender_policy
+from consensus import fees, recipient_gate, sender_policy
 from consensus.fees import FeeRuleError
 from consensus.lanes import classify_lane
 from consensus.tx_checks import check_transfer, validate_bls_pubkey
@@ -25,7 +25,7 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_REJECT,
     RULE_OFFER_TX_TYPES,
 )
-from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
+from consensus.retractable import KIND_HEIGHT, TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -516,6 +516,20 @@ def _policy_call(call):
 def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
     """(blocked, detail) for the sender's own o5 clause on one transfer's inputs."""
     body = tip_view.clause_for(sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX)
+    return _policy_call(lambda: sender_policy.clause_blocks(
+        body, values, pool="admission", timeout=budget
+    ))
+
+
+def _recipient_clause_blocks(tip_view, recipient_pubkey, values, budget):
+    """(blocked, detail) for the recipient's own o5 clause (#47).
+
+    The mirror of _sender_clause_blocks with the policy owner changed:
+    the recipient's clause is judged on the recipient evaluation's
+    inputs (consensus/recipient_gate.py). A recipient with no clause
+    does not block -- the neutral default.
+    """
+    body = tip_view.clause_for(recipient_pubkey, tau_defs.USER_POLICY_STREAM_INDEX)
     return _policy_call(lambda: sender_policy.clause_blocks(
         body, values, pool="admission", timeout=budget
     ))
@@ -1309,6 +1323,89 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 ),
                                 transfer_index=i + 1,
                             )
+
+                        # --- Recipient Policy Check (o5, #47) ---
+                        # The recipient is judged by its OWN policy on the
+                        # same inputs with the policy owner changed
+                        # (consensus/recipient_gate.py), mirroring apply in
+                        # consensus/engine.py: the multi result first, then
+                        # the isolated clause. A refusal names the recipient
+                        # reason, distinct from a sender-policy block.
+                        from tau_manager import parse_tau_output as _parse_recipient
+                        to_addr = tau_input_dict['to_addr']
+                        # A park is judged as the transfer leg it will
+                        # become, so its recipient evaluation carries the
+                        # park's absolute release point on i17 (#76); a
+                        # plain transfer carries 0 ("no hold").
+                        release_pair = 0
+                        park_kind = park_release_at = None
+                        if tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+                            park_kind = (admission_eval.data or {}).get("release_kind")
+                            park_release_at = (admission_eval.data or {}).get("release_at")
+                            if park_kind is not None and park_release_at is not None:
+                                release_pair = recipient_gate.pack_release_pair(
+                                    release_ts=park_release_at if park_kind != KIND_HEIGHT else 0,
+                                    release_height=park_release_at if park_kind == KIND_HEIGHT else 0,
+                                )
+                        recipient_values = recipient_gate.recipient_values(
+                            tau_input_stream_values, to_addr,
+                            _admission_i2(to_addr), tip_view.next_block_height,
+                            release_pair=release_pair,
+                        )
+                        recipient_outputs = admission_tau.step_multi(
+                            recipient_values, source=to_addr,
+                        )
+                        if recipient_gate.policy_blocked(
+                                recipient_outputs, _parse_recipient):
+                            return _qt_err(
+                                "TX_REJECTED",
+                                (
+                                    f"Transaction rejected by recipient policy (o5) for transfer #{i+1} "
+                                    f"({transfer_details}). Policy output: "
+                                    f"{recipient_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)}"
+                                ),
+                                transfer_index=i + 1,
+                                reason=recipient_gate.REASON_POLICY_BLOCK,
+                            )
+                        recip_blocks, recip_o5 = _recipient_clause_blocks(
+                            tip_view, to_addr,
+                            recipient_values, admission_tau.budget,
+                        )
+                        if recip_blocks:
+                            return _qt_err(
+                                "TX_REJECTED",
+                                (
+                                    f"Transaction rejected: the recipient's own policy clause "
+                                    f"blocked transfer #{i+1} ({transfer_details}). "
+                                    f"Policy output: {recip_o5}"
+                                ),
+                                transfer_index=i + 1,
+                                reason=recipient_gate.REASON_POLICY_BLOCK,
+                            )
+                        if park_kind is not None and park_release_at is not None:
+                            # --- Recipient Hold Cap (o10, #76) ---
+                            # Read in the park's own unit against the
+                            # admission clock/height; apply recomputes it
+                            # against the block's, from the same signed
+                            # release point.
+                            cap = recipient_gate.hold_cap(
+                                recipient_outputs, _parse_recipient)
+                            if cap is not None:
+                                now = (tip_view.next_block_height
+                                       if park_kind == KIND_HEIGHT
+                                       else tip_view.next_block_timestamp)
+                                if park_release_at - now > cap:
+                                    return _qt_err(
+                                        "TX_REJECTED",
+                                        (
+                                            f"Transaction rejected: the park's hold exceeds the "
+                                            f"recipient's hold cap for transfer #{i+1} "
+                                            f"({transfer_details}). Cap: {cap}"
+                                        ),
+                                        transfer_index=i + 1,
+                                        reason=recipient_gate.REASON_HOLD_CAP,
+                                        recipient_hold_cap=cap,
+                                    )
 
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.
