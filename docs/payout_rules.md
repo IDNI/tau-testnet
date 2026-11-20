@@ -407,6 +407,17 @@ evaluator's apply pool, never in the main interpreter, within the same time
 budget as a transfer's policy step. A block carries at most 16 executes; the
 block builder leaves the rest in the mempool for the next block.
 
+Each payout pool keeps one built rule at a time (`tau_policy.pool_options`).
+On the pinned engine (tau-lang `c3ea334`) a rule that is stepped after another
+rule was built in the same worker sometimes refuses the step, and in a few
+runs answered 0: about 5 steps in 100 for `o30 = i27 / 5` after a second rule
+was validated (21 of 400), and never on tau-lang 0.8.5. Two nodes could then
+disagree about a payout. With one rule at a time a rule is always stepped on
+an interpreter built after every other build; 6,000 steps of six rules in
+turn, with 1,807 validations mixed in, all answered right. The price is one
+build of about 10 ms each time the rule changes. Once the pin moves to an
+engine without the fault the pools can keep the default cache again.
+
 **Network.** `payout_rule_set`, `payout_rule_revoke` and `payout_execute` gossip on
 `tau/payout/1.0.0`; a mempool snapshot carries at most 32 of them.
 

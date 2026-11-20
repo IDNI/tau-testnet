@@ -29,6 +29,18 @@ RECYCLE_STEPS = 20_000
 RECYCLE_RSS_BYTES = 1 << 30
 POOL_NAMES = ("apply", "admission", "payout_apply", "payout_admission")
 
+# The payout pools keep one interpreter at a time and never pin one. On the
+# pinned engine (tau-lang c3ea334) an interpreter that is stepped after another
+# one was built and probed in the same process sometimes refuses the step, and
+# in a few runs answered 0: about 5 steps in 100 for `o30 = i27 / 5` after a
+# second rule was validated, and never on tau-lang 0.8.5. Two nodes could then
+# disagree about a payout. With one interpreter at a time a rule is stepped on
+# an interpreter built after every other build, and every run answered right.
+# The price is one build each time the rule changes. Once the pin moves to an
+# engine without the fault this can go back to the default.
+SINGLE_INTERPRETER_POOLS = ("payout_apply", "payout_admission")
+NEVER_PIN_SECONDS = float("inf")
+
 # Without an injected probe, worker memory is read this often (in requests).
 RSS_PROBE_EVERY = 64
 
@@ -320,12 +332,26 @@ _pools: dict = {}
 _pools_lock = threading.Lock()
 
 
+def pool_options(pool: str) -> dict:
+    """The evaluator options the node uses for `pool`."""
+    if pool in SINGLE_INTERPRETER_POOLS:
+        return {"cache_size": 1, "pin_build_seconds": NEVER_PIN_SECONDS}
+    return {}
+
+
+def pool_evaluator(pool: str, **options) -> PolicyEvaluator:
+    """A new evaluator built the way the node builds the one of `pool`."""
+    if pool not in POOL_NAMES:
+        raise ValueError(f"unknown policy pool {pool!r}; expected one of {POOL_NAMES}")
+    return PolicyEvaluator(pool=pool, **{**pool_options(pool), **options})
+
+
 def get_policy_evaluator(pool: str) -> PolicyEvaluator:
     if pool not in POOL_NAMES:
         raise ValueError(f"unknown policy pool {pool!r}; expected one of {POOL_NAMES}")
     with _pools_lock:
         if pool not in _pools:
-            _pools[pool] = PolicyEvaluator(pool=pool)
+            _pools[pool] = pool_evaluator(pool)
         return _pools[pool]
 
 
