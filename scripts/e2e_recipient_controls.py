@@ -310,7 +310,7 @@ def _err_code(res):
 
 
 def _recipient_policy(res):
-    return (res.get("details") or {}).get("recipient_policy") or {}
+    return ((res.get("error") or {}).get("details") or {}).get("recipient_policy") or {}
 
 
 def scenario_capabilities(rig):
