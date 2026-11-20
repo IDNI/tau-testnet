@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.retractable import RetractableBook
+from consensus.standing import StandingBook
 
 logger = logging.getLogger(__name__)
 from consensus.approvals import (
@@ -198,6 +199,7 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    standing_payments_root: str = "",
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -243,6 +245,12 @@ def build_mechanism_metadata(
     if retractable_transfers_root is None:
         retractable_transfers_root = RetractableBook().root().hex()
     mech["retractable_transfers_root"] = retractable_transfers_root
+    # Standing payments (Bounty 01): non-default gate, like rule offers --
+    # emitted only once the book has been touched, so a chain that never
+    # uses the feature keeps a byte-identical meta hash and gen_genesis
+    # (which calls this without it) is unaffected.
+    if standing_payments_root:
+        mech["standing_payments_root"] = standing_payments_root
     return mech
 
 
@@ -451,6 +459,9 @@ class ConsensusLifecycleManager:
         # Co-signature approvals. A FIELD for the same reason rule_offers is.
         self.approval_requests = ApprovalRequestLifecycleManager()
         self.retractable_transfers = RetractableBook()
+        # Standing payments (Bounty 01). A FIELD for the same reason
+        # rule_offers is: consensus_meta_hash() picks it up automatically.
+        self.standing_payments = StandingBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
@@ -546,6 +557,10 @@ class ConsensusLifecycleManager:
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
+            standing_payments_root=(
+                "" if self.standing_payments.is_empty()
+                else self.standing_payments.root().hex()
+            ),
         )
         return compute_consensus_meta_hash(
             host_contract={},

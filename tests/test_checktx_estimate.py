@@ -14,7 +14,9 @@ import db
 import tau_admission
 from commands import checktx
 from consensus.admission import TipAdmissionView
+from consensus.periods import PERIOD_DAY, PERIOD_MONTH
 from consensus.rule_offers import RuleOffer
+from consensus.standing import END_MAX_OCCURRENCES, StandingBook, StandingTerms
 from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
 
 SENDER = pubkey_hex(SK_ALICE)
@@ -95,6 +97,8 @@ def node(temp_database, mock_policy_evaluators, monkeypatch):
         patch.object(TipAdmissionView, "approval_slots_active",
                      new_callable=PropertyMock, return_value=True),
         patch.object(TipAdmissionView, "get_offer", return_value=_offer_row()),
+        patch.object(TipAdmissionView, "get_standing",
+                     side_effect=_get_standing),
     ]
     mocks = [p.start() for p in patches]
     mocks[3].is_set.return_value = True
@@ -115,6 +119,32 @@ def _offer_row():
     return {"offer_id": offer.offer_id_hex, "offerer_pubkey": SENDER,
             "recipient_pubkey": RECIPIENT, "rule_text": OFFER_RULE,
             "expire_at_height": offer.expire_at_height, "status": "offered"}
+
+
+def _standing_terms():
+    # A daily authorization whose window is the whole day, so an occurrence
+    # is due at any wall-clock time the estimate runs at.
+    return StandingTerms(
+        payer=SENDER, recipient=RECIPIENT, amount=100, kind=PERIOD_DAY,
+        anchor_ts=0, window_start_offset=0, window_end_offset=86_400,
+        end_kind=END_MAX_OCCURRENCES, end_value=10**9, sequence_number=1)
+
+
+def _standing_row():
+    terms = _standing_terms()
+    book = StandingBook()
+    book.create(terms, 10**12)
+    return book.snapshot_rows()[0]
+
+
+STANDING_ROW = _standing_row()
+STANDING_ID = _standing_terms().standing_id.hex()
+
+
+def _get_standing(standing_id):
+    sid = (standing_id.hex() if isinstance(standing_id, (bytes, bytearray))
+           else str(standing_id))
+    return STANDING_ROW if sid.lower() == STANDING_ID else None
 
 
 def _envelope(tx_type, sender, fee_limit, **fields):
@@ -147,6 +177,13 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
+    if kind == "standing_payment_create":
+        return _envelope(kind, SENDER, fee_limit, recipient_pubkey=RECIPIENT,
+                         amount=100, period_kind=PERIOD_MONTH,
+                         anchor_timestamp=1_800_000_000, window_start_offset=0,
+                         window_end_offset=86_400, max_occurrences=12)
+    if kind == "standing_payment_execute":
+        return _envelope(kind, SENDER, fee_limit, standing_id=STANDING_ID)
     raise AssertionError(kind)
 
 
@@ -158,7 +195,8 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request"]
+               "rule_change_request", "standing_payment_create",
+               "standing_payment_execute"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

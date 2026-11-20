@@ -466,6 +466,73 @@ class TipAdmissionView:
     def open_retractable_count(self) -> int:
         return self._retractable_scalar("SELECT COUNT(*) FROM retractable_transfers_v1")
 
+    # --- Standing payments (Bounty 01) -------------------------------------
+    # Same read-from-tables discipline as the retractable accessors.
+
+    def get_standing(self, standing_id: bytes) -> Optional[dict]:
+        """The open authorization with this id, or None."""
+        try:
+            with db._db_lock:
+                row = db._db_conn.execute(
+                    "SELECT payer_pubkey, recipient_pubkey, amount, period_kind, "
+                    "anchor_timestamp, window_start_offset, window_end_offset, "
+                    "end_kind, end_value, sequence_number, supersedes_id, "
+                    "executed_count, total_executed, settled_periods, "
+                    "last_executed_period FROM standing_payments_v1 "
+                    "WHERE standing_id = ?",
+                    (bytes(standing_id).hex(),),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        return {
+            "standing_id": bytes(standing_id).hex(),
+            "payer_pubkey": row[0],
+            "recipient_pubkey": row[1],
+            "amount": int(row[2]),
+            "period_kind": int(row[3]),
+            "anchor_timestamp": int(row[4]),
+            "window_start_offset": int(row[5]),
+            "window_end_offset": int(row[6]),
+            "end_kind": int(row[7]),
+            "end_value": int(row[8]),
+            "sequence_number": int(row[9]),
+            "supersedes_id": row[10],
+            "executed_count": int(row[11]),
+            "total_executed": int(row[12]),
+            "settled_periods": json.loads(row[13]),
+            "last_executed_period": int(row[14]),
+        }
+
+    def standings_for(self, pubkey: str) -> list:
+        """Open authorizations where the account is payer or recipient."""
+        try:
+            with db._db_lock:
+                rows = db._db_conn.execute(
+                    "SELECT standing_id FROM standing_payments_v1 "
+                    "WHERE payer_pubkey = ? OR recipient_pubkey = ? "
+                    "ORDER BY standing_id",
+                    (pubkey, pubkey),
+                ).fetchall()
+        except Exception:
+            return []
+        out = []
+        for (sid_hex,) in rows:
+            row = self.get_standing(bytes.fromhex(sid_hex))
+            if row is not None:
+                out.append(row)
+        return out
+
+    def open_standing_count_for_payer(self, payer_pubkey: str) -> int:
+        return self._retractable_scalar(
+            "SELECT COUNT(*) FROM standing_payments_v1 WHERE payer_pubkey = ?",
+            (payer_pubkey,),
+        )
+
+    def open_standing_count(self) -> int:
+        return self._retractable_scalar("SELECT COUNT(*) FROM standing_payments_v1")
+
     def escrowed_out(self, pubkey: str) -> int:
         return self._retractable_scalar(
             "SELECT COALESCE(SUM(amount), 0) FROM retractable_transfers_v1 "

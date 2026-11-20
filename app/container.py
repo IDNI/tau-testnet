@@ -23,6 +23,7 @@ from commands import (
     getapprovalslots,
     getrequestid,
     getretractable,
+    getstandingpayments,
     getretractableid,
     getretractables,
 )
@@ -84,6 +85,7 @@ class ServiceContainer:
         "getapprovalrequest": getapprovalrequest,
         "getrequestid": getrequestid,
         "getretractable": getretractable,
+        "getstandingpayments": getstandingpayments,
         "getretractables": getretractables,
         "getretractableid": getretractableid,
         # Advisory, node-local, and engine-driving -- rate-limited accordingly

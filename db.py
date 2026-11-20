@@ -465,6 +465,37 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_retractable_release "
                 "ON retractable_transfers_v1(release_kind, release_at);"
             )
+            # Standing payments (Bounty 01): the open authorization book.
+            # Bound into consensus_meta_hash, so written in the same
+            # transaction as accounts, like the retractable book.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS standing_payments_v1 (
+                    standing_id         TEXT PRIMARY KEY,
+                    payer_pubkey        TEXT NOT NULL,
+                    recipient_pubkey    TEXT NOT NULL,
+                    amount              INTEGER NOT NULL,
+                    period_kind         INTEGER NOT NULL,
+                    anchor_timestamp    INTEGER NOT NULL,
+                    window_start_offset INTEGER NOT NULL,
+                    window_end_offset   INTEGER NOT NULL,
+                    end_kind            INTEGER NOT NULL,
+                    end_value           INTEGER NOT NULL,
+                    sequence_number     INTEGER NOT NULL,
+                    supersedes_id       TEXT,
+                    executed_count      INTEGER NOT NULL,
+                    total_executed      INTEGER NOT NULL,
+                    settled_periods     TEXT NOT NULL,
+                    last_executed_period INTEGER NOT NULL
+                );
+            ''')
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_standing_payer "
+                "ON standing_payments_v1(payer_pubkey);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_standing_recipient "
+                "ON standing_payments_v1(recipient_pubkey);"
+            )
             # Node-local diagnostics, keyed per block so a reorg needs no cleanup;
             # canonicality is resolved at query time like tx_index.
             conn.execute('''
@@ -2243,7 +2274,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2282,6 +2313,7 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 approval_slots_active=approval_slots_active,
                 retractable_transfers=retractable_transfers,
                 rule_change_requests=rule_change_requests,
+                standing_payments=standing_payments,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
 
@@ -2346,7 +2378,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2554,6 +2586,8 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
 
     if retractable_transfers is not None:
         _write_retractable_rows(retractable_transfers)
+    if standing_payments is not None:
+        _write_standing_rows(standing_payments)
 
     if max_rule_txs_per_block is not None:
         # Governance-activated value; persisted verbatim so a reload
@@ -2589,6 +2623,80 @@ def _write_retractable_rows(state: Dict) -> None:
             json.dumps({'count': int(state['resolved_count']), 'acc': state['resolved_acc']}),
         )
     )
+
+
+
+def _write_standing_rows(state: Dict) -> None:
+    """Full replace of the open standing rows plus the resolved commitment."""
+    _db_conn.execute('DELETE FROM standing_payments_v1')
+    for row in state['rows']:
+        _db_conn.execute(
+            'INSERT INTO standing_payments_v1 '
+            '(standing_id, payer_pubkey, recipient_pubkey, amount, period_kind, '
+            'anchor_timestamp, window_start_offset, window_end_offset, end_kind, '
+            'end_value, sequence_number, supersedes_id, executed_count, '
+            'total_executed, settled_periods, last_executed_period) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                row['standing_id'],
+                row['payer_pubkey'],
+                row['recipient_pubkey'],
+                int(row['amount']),
+                int(row['period_kind']),
+                int(row['anchor_timestamp']),
+                int(row['window_start_offset']),
+                int(row['window_end_offset']),
+                int(row['end_kind']),
+                int(row['end_value']),
+                int(row['sequence_number']),
+                row.get('supersedes_id'),
+                int(row['executed_count']),
+                int(row['total_executed']),
+                json.dumps([int(x) for x in row['settled_periods']]),
+                int(row['last_executed_period']),
+            )
+        )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        (
+            'standing_resolved',
+            json.dumps({'count': int(state['resolved_count']), 'acc': state['resolved_acc']}),
+        )
+    )
+
+
+def load_standing_state() -> tuple[List[Dict], int, bytes]:
+    """(open rows as dicts, resolved_count, resolved_acc) exactly as stored."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT standing_id, payer_pubkey, recipient_pubkey, amount, '
+            'period_kind, anchor_timestamp, window_start_offset, '
+            'window_end_offset, end_kind, end_value, sequence_number, '
+            'supersedes_id, executed_count, total_executed, settled_periods, '
+            'last_executed_period FROM standing_payments_v1 ORDER BY standing_id'
+        ).fetchall()
+        raw = _db_conn.execute(
+            "SELECT value FROM chain_state WHERE key = 'standing_resolved'"
+        ).fetchone()
+    count, acc = 0, bytes(32)
+    if raw and raw[0]:
+        parsed = json.loads(raw[0])
+        count, acc = int(parsed['count']), bytes.fromhex(parsed['acc'])
+    keys = (
+        'standing_id', 'payer_pubkey', 'recipient_pubkey', 'amount',
+        'period_kind', 'anchor_timestamp', 'window_start_offset',
+        'window_end_offset', 'end_kind', 'end_value', 'sequence_number',
+        'supersedes_id', 'executed_count', 'total_executed', 'settled_periods',
+        'last_executed_period',
+    )
+    out = []
+    for r in rows:
+        row = dict(zip(keys, r))
+        row['settled_periods'] = json.loads(row['settled_periods'])
+        out.append(row)
+    return out, count, acc
 
 
 def load_retractable_state() -> tuple[List[tuple], int, bytes]:

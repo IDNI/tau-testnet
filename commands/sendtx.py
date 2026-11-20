@@ -26,6 +26,11 @@ from consensus.rule_offers import (
     RULE_OFFER_TX_TYPES,
 )
 from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
+from consensus.standing import (
+    STANDING_TX_TYPES,
+    TX_TYPE_STANDING_CREATE,
+    TX_TYPE_STANDING_EXECUTE,
+)
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -44,6 +49,7 @@ KNOWN_TX_TYPES = frozenset(
     | set(APPROVAL_TX_TYPES)
     | set(RULE_CHANGE_TX_TYPES)
     | set(RETRACTABLE_TX_TYPES)
+    | set(STANDING_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
 # execution later is free and there is no second fee to drift. `transfer_vote` is
@@ -52,7 +58,8 @@ KNOWN_TX_TYPES = frozenset(
 # set instead.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST}
+     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_STANDING_CREATE,
+     TX_TYPE_STANDING_EXECUTE}
     | set(RULE_OFFER_TX_TYPES)
 )
 from db import add_mempool_tx

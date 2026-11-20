@@ -41,6 +41,17 @@ from .retractable import (
     parse_retract_transfer,
     parse_retractable_transfer,
 )
+from .standing import (
+    STANDING_TX_TYPES,
+    TX_TYPE_STANDING_CANCEL,
+    TX_TYPE_STANDING_CREATE,
+    TX_TYPE_STANDING_EXECUTE,
+    StandingShapeError,
+    parse_standing_cancel,
+    parse_standing_create,
+    parse_standing_execute,
+    validate_standing_shape,
+)
 from .rule_offers import (
     RULE_OFFER_TX_TYPES,
     RuleOfferDecision,
@@ -70,7 +81,8 @@ from .rule_offers import (
 # at inclusion.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST}
+     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_STANDING_CREATE,
+     TX_TYPE_STANDING_EXECUTE}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -87,6 +99,7 @@ _LIFECYCLE_TX_TYPES = frozenset(
     | set(RULE_OFFER_TX_TYPES)
     | set(APPROVAL_TX_TYPES)
     | set(RULE_CHANGE_TX_TYPES)
+    | set(STANDING_TX_TYPES)
 )
 from consensus.tx_checks import apply_tx_error
 from consensus import bls
@@ -963,6 +976,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
 
+        standing_events = []
+        for i, tx in enumerate(block.transactions):
+            event = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "standing_event"
+            )
+            if event and id(tx) in accepted_obj:
+                standing_events.append(event)
+
         # 3. Post-State Materialization Layer
         
         # The rules are updated by self.apply (it returns a generic snapshot with tau_bytes).
@@ -1118,6 +1139,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "standing_events": standing_events,
             }
         )
         
@@ -1131,6 +1153,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "activated_updates": [u.update_id_hex for u in newly_active],
                 "released_retractables": released_retractables,
                 "retractable_events": retractable_events,
+                "standing_events": standing_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -1664,6 +1687,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             parked_rule_change_id: Optional[bytes] = None
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
+            pending_standing_create = None
+            pending_standing_settle = None
+            pending_standing_cancel_id: Optional[bytes] = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2628,6 +2654,118 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 "Retractable transfer retracted: " + request.retractable_id.hex()
                             )
 
+            elif tx_type in STANDING_TX_TYPES:
+                # Standing payments (Bounty 01, issue #34). Root fields only,
+                # like the retractable branch: anything nested is unsigned.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    book = lifecycle_mgr.standing_payments
+                    if tx_type == TX_TYPE_STANDING_CREATE:
+                        try:
+                            terms = parse_standing_create(tx)
+                        except StandingShapeError as exc:
+                            terms = None
+                            reason = f"invalid standing payment ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != terms.payer:
+                                reason = "sender is not the signer"
+                            else:
+                                reason = validate_standing_shape(
+                                    terms, int(block_timestamp or 0)
+                                ) or (
+                                    None
+                                    if book.can_admit_create(
+                                        terms, tau_defs.MAX_TRANSFER_VALUE
+                                    )
+                                    else "standing authorization not admissible"
+                                )
+                        if terms is None or reason:
+                            tx_receipt["logs"].append(
+                                f"Standing payment ignored: {reason}"
+                            )
+                            tx_receipt["reason"] = "standing_not_created"
+                            accepted_in_block = False
+                        else:
+                            pending_standing_create = terms
+                            tx_receipt["logs"].append(
+                                "Standing payment created: " + terms.standing_id.hex()
+                            )
+                    elif tx_type == TX_TYPE_STANDING_EXECUTE:
+                        try:
+                            request = parse_standing_execute(tx)
+                        except StandingShapeError as exc:
+                            request = None
+                            reason = f"invalid standing execution ({exc})"
+                        else:
+                            record = book.get(request.standing_id)
+                            if record is None:
+                                reason = "unknown standing authorization"
+                            elif target_balances is None:
+                                reason = "no balance overlay to execute from"
+                            elif book.due_period(
+                                request.standing_id, int(block_timestamp or 0)
+                            ) is None:
+                                reason = "no occurrence is due"
+                            else:
+                                reason = None
+                        if request is None or reason:
+                            tx_receipt["logs"].append(
+                                f"Standing execution ignored: {reason}"
+                            )
+                            tx_receipt["reason"] = "standing_not_executed"
+                            accepted_in_block = False
+                        else:
+                            # The transfer runs through the fee-era closure:
+                            # the payer's CURRENT o5 policy and balance gate
+                            # it, the fee is measured into fee_components and
+                            # settled on the executor (the tx signer) under
+                            # the tx's own fee_limit. Only a successful move
+                            # settles the occurrence -- insufficient funds or
+                            # a policy block leave the marker untouched.
+                            moved = _execute_fee_era_transfer(
+                                record.terms.payer,
+                                record.terms.recipient,
+                                record.terms.amount,
+                                slot_values=_approval_slot_values(),
+                                overrides={},
+                            )
+                            fee_already_measured = True
+                            if moved and accepted_in_block and not hard_reject:
+                                pending_standing_settle = (
+                                    request.standing_id,
+                                    int(block_timestamp or 0),
+                                )
+                                tx_receipt["logs"].append(
+                                    "Standing payment executed: "
+                                    + request.standing_id.hex()
+                                )
+                    else:  # TX_TYPE_STANDING_CANCEL
+                        try:
+                            request = parse_standing_cancel(tx)
+                        except StandingShapeError as exc:
+                            request = None
+                            reason = f"invalid standing cancellation ({exc})"
+                        else:
+                            record = book.get(request.standing_id)
+                            if record is None:
+                                reason = "unknown standing authorization"
+                            elif not isinstance(sender, str) or record.terms.payer != sender:
+                                reason = "sender is not the payer"
+                            else:
+                                reason = None
+                        if request is None or reason:
+                            tx_receipt["logs"].append(
+                                f"Standing cancellation ignored: {reason}"
+                            )
+                            tx_receipt["reason"] = "standing_not_cancelled"
+                            accepted_in_block = False
+                        else:
+                            pending_standing_cancel_id = request.standing_id
+                            tx_receipt["logs"].append(
+                                "Standing payment cancelled: "
+                                + request.standing_id.hex()
+                            )
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3174,6 +3312,32 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 elif pending_retract_id is not None:
                     tx_receipt["retractable_event"] = (pending_retract_id.hex(), "retracted")
                     book.retract(pending_retract_id)
+
+            if accepted_in_block and not hard_reject:
+                if (
+                    pending_standing_create is not None
+                    or pending_standing_settle is not None
+                    or pending_standing_cancel_id is not None
+                ):
+                    standing_book = _lifecycle_for_write().standing_payments
+                    if pending_standing_create is not None:
+                        tx_receipt["standing_event"] = (
+                            pending_standing_create.standing_id.hex(),
+                            "created",
+                        )
+                        standing_book.create(
+                            pending_standing_create, tau_defs.MAX_TRANSFER_VALUE
+                        )
+                    elif pending_standing_settle is not None:
+                        settle_id, settle_ts = pending_standing_settle
+                        standing_book.settle(settle_id, settle_ts)
+                        tx_receipt["standing_event"] = (settle_id.hex(), "executed")
+                    elif pending_standing_cancel_id is not None:
+                        standing_book.cancel(pending_standing_cancel_id, sender)
+                        tx_receipt["standing_event"] = (
+                            pending_standing_cancel_id.hex(),
+                            "cancelled",
+                        )
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same
