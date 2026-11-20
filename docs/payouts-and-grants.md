@@ -43,6 +43,17 @@ Conditions combine by AND:
 - a per-period draw cap; the period is one week (604800 s) from the
   grant's opening anchor, the same period arithmetic as standing
   payments;
+- optionally, a shared cap: `grant_create` may name a `cap_group`
+  and a `cap_group_cap`, and every grant of the same sender in that
+  group then shares one per-period draw budget on top of the
+  per-grant caps -- a draw must satisfy both. All grants in a group
+  declare the same group cap and open at the same anchor (a grant
+  that disagrees is refused at creation), so the group's
+  spent-in-period is exactly the sum of the members' own period
+  counters in the current window: the shared counter lives in the
+  same book rows that feed the consensus root and persistence,
+  never in a side channel. Grants without a group behave exactly
+  as before;
 - draws open at `opens_at` and close at `deadline`.
 
 A grant whose draws could never open before its deadline is refused
