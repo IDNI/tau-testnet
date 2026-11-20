@@ -19,6 +19,17 @@ hash, shadow revision and sha256 of the normalized text -- so two nodes'
 answers can be compared byte-for-byte. An optional height serves the
 newest snapshot at or before it; a height the node has no snapshot for is
 answered `not_recorded`, never reconstructed from submitted text.
+
+The shared-spec half also carries `unit_status`: this account's
+per-submitted-unit survival ledger (db.get_survival_ledger, recomputed
+from the canonical shadow feeds at the served snapshot's height) -- each
+unit the account submitted, whether it is still `in_force`, was
+`partially_displaced` (with the surviving normalized fragment) or was
+`displaced`, and the transaction that displaced it. Displaced units
+appear here even though they are gone from the in-force text: that
+absence, made explicit, is the answer to "is my rule still protecting
+me?". Registry-routed units are never in the ledger -- they never enter
+the shadow -- and stay reported in the registry half only.
 """
 import api_response
 import db
@@ -115,6 +126,33 @@ def execute(raw_command: str, container):
         data["shared_spec"] = None
         return api_response.success_response(_CMD, data)
 
+    # --- survival ledger: this account's submitted units, at the same
+    # height the snapshot serves, so the two halves of the answer always
+    # describe the same chain state ---
+    try:
+        ledger = database.get_survival_ledger(
+            height=snap["height"], account=address)
+    except Exception as exc:
+        return api_response.error_response(
+            _CMD, f"Failed to read survival ledger: {exc}", "INTERNAL_ERROR"
+        )
+    unit_status = []
+    for entry in ledger:
+        item = {
+            "unit": entry["unit"],
+            "tx_hash": entry["tx_hash"],
+            "block_height": entry["block_height"],
+            "status": entry["status"],
+        }
+        if entry["surviving_fragment"] is not None:
+            item["surviving_fragment"] = entry["surviving_fragment"]
+        if entry["status"] != "in_force":
+            item["displacer"] = {
+                "tx_hash": entry["displacer_tx_hash"],
+                "block_height": entry["displacer_block_height"],
+            }
+        unit_status.append(item)
+
     text = snap["normalized_text"] or ""
     data["status"] = "recorded"
     data["height"] = snap["height"]
@@ -129,5 +167,8 @@ def execute(raw_command: str, container):
         # the in-force text; the units are its top-level lines.
         "normalized_text": text,
         "units": [line for line in text.split("\n") if line.strip()],
+        # The survival ledger for the units THIS account submitted,
+        # including ones no longer in the text above.
+        "unit_status": unit_status,
     }
     return api_response.success_response(_CMD, data)
