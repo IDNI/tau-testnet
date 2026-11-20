@@ -26,6 +26,24 @@ from consensus.rule_offers import (
     RULE_OFFER_TX_TYPES,
 )
 from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
+from consensus.payout import (
+    PAYOUT_TX_TYPES,
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_RULE_SET,
+)
+from consensus.receive_route import ROUTE_TX_TYPES, TX_TYPE_RECEIVE_ROUTE_SET
+from consensus.envelope import (
+    ENVELOPE_TX_TYPES,
+    TX_TYPE_ENVELOPE_SEND,
+    TX_TYPE_ENVELOPE_SPEND,
+)
+from consensus.standing import (
+    STANDING_TX_TYPES,
+    TX_TYPE_STANDING_PAYMENT_CANCEL,
+    TX_TYPE_STANDING_PAYMENT_CREATE,
+    TX_TYPE_STANDING_PAYMENT_EXECUTE,
+    TX_TYPE_STANDING_PAYMENT_UPDATE,
+)
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -44,15 +62,30 @@ KNOWN_TX_TYPES = frozenset(
     | set(APPROVAL_TX_TYPES)
     | set(RULE_CHANGE_TX_TYPES)
     | set(RETRACTABLE_TX_TYPES)
+    | set(STANDING_TX_TYPES)
+    | set(PAYOUT_TX_TYPES)
+    | set(ROUTE_TX_TYPES)
+    | set(ENVELOPE_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
 # execution later is free and there is no second fee to drift. `transfer_vote` is
 # exempt like a governance vote -- approver bots would otherwise all need funding
 # and a fee strategy, and the vote is bounded by the request's declared approver
-# set instead.
+# set instead. `standing_payment_create` pays once for every payment the sweep
+# later makes, and `standing_payment_update` once for the new version it starts;
+# `standing_payment_execute` is paid by its executor;
+# `standing_payment_cancel` is free like `retract_transfer`.
+# `payout_rule_set` pays for its build; `payout_execute` is paid by its executor;
+# `payout_rule_revoke` is free like a cancel. `receive_route_set` pays because it
+# adds to a bounded book; `receive_route_remove` and `receive_route_release` are
+# free because they only shrink it. `envelope_send` and `envelope_spend` are each
+# one transfer and pay as one; `envelope_release` is free like a retract.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST}
+     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_STANDING_PAYMENT_CREATE,
+     TX_TYPE_STANDING_PAYMENT_UPDATE, TX_TYPE_STANDING_PAYMENT_EXECUTE,
+     TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_RECEIVE_ROUTE_SET,
+     TX_TYPE_ENVELOPE_SEND, TX_TYPE_ENVELOPE_SPEND}
     | set(RULE_OFFER_TX_TYPES)
 )
 from db import add_mempool_tx
@@ -146,10 +179,17 @@ def _parse_bitvector_string(bv_str: str) -> int:
         return int(bv_str)
 
 
-def _prepare_transfer_inputs(transfer_entry, sender_pubkey, sender_balance: int) -> dict:
-    """Tau inputs for one transfer. Raises ValueError for a transfer that block apply refuses."""
+_SELF_TRANSFER = "'to' address is the sender"
+
+
+def _prepare_transfer_inputs(transfer_entry, sender_pubkey, sender_balance: int,
+                             allow_self: bool = False) -> dict:
+    """Tau inputs for one transfer. Raises ValueError for a transfer that block apply refuses.
+
+    `allow_self`: an envelope spend may pay the spender itself (spending limits): the
+    money comes out of the envelope, so the leg is not a no-op."""
     transfer_error = check_transfer(transfer_entry, sender_pubkey)
-    if transfer_error:
+    if transfer_error and not (allow_self and transfer_error == _SELF_TRANSFER):
         raise ValueError(transfer_error)
     from_addr_key, to_addr_key, amount_value = transfer_entry
 
@@ -245,7 +285,7 @@ def _get_signing_message_bytes(payload: dict) -> bytes:
     return signing_message_bytes(payload)
 
 
-def _process_transfers_operation(transfers, sender_pubkey):
+def _process_transfers_operation(transfers, sender_pubkey, allow_self=False):
     """
     Process and validate transfers (operation "1").
     Returns (success, result_data, error_message).
@@ -270,7 +310,7 @@ def _process_transfers_operation(transfers, sender_pubkey):
         logger.debug("Available balance for %s: %s", sender_pubkey, available_balance)
         try:
             transfer_input_dict = _prepare_transfer_inputs(
-                transfer_entry, sender_pubkey, available_balance)
+                transfer_entry, sender_pubkey, available_balance, allow_self=allow_self)
             logger.debug("Transfer input dictionary: %s", transfer_input_dict)
             # Store the full integer amount for post-validation balance updates
             amount_int = transfer_input_dict['amount']
@@ -416,6 +456,21 @@ def _preflight_prepared_rule(rule_text: str):
             "Rule validation is temporarily unavailable; please resubmit.",
         )
     return None
+
+
+def _route_preview(payload) -> list:
+    """How the receive routes in force now would split this transaction's
+    credits (#35), so a payer sees the split before the block does. Advisory:
+    the block it lands in decides."""
+    try:
+        from consensus.facade import TipAdmissionView
+        from consensus.receive_route import preview_credits
+
+        view = TipAdmissionView()
+        return preview_credits(payload, view.route_book(), view.next_block_timestamp)
+    except Exception:
+        logger.debug("receive route preview unavailable", exc_info=True)
+        return []
 
 
 def _admission_timestamp() -> int:
@@ -878,6 +933,26 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                 pending_tx_hash=rivals[0],
             )
 
+    if tx_type in (TX_TYPE_STANDING_PAYMENT_CANCEL, TX_TYPE_STANDING_PAYMENT_EXECUTE):
+        # One pending cancel per authorization, as for a retract: it is free.
+        # One pending execute per authorization and sender: a second one can
+        # only be refused in its block, and the refusal would leave a gap in
+        # that sender's sequence for every transaction queued after it.
+        own_hash, _ = _compute_transaction_message_id(payload)
+        rivals = [
+            h for h in db.pending_tx_hashes_naming(
+                sender_pubkey, tx_type, "standing_id", payload["standing_id"],
+            )
+            if h != own_hash
+        ]
+        if rivals:
+            what = "A cancel" if tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL else "An execute"
+            return _qt_err(
+                "DUPLICATE_STANDING_" + what.split()[1].upper(),
+                f"{what} for this standing payment is already pending.",
+                pending_tx_hash=rivals[0],
+            )
+
     if tx_type == "user_tx":
         operations = payload.get("operations", {})
         has_transfers = "1" in operations
@@ -893,6 +968,20 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             admission_eval.data["recipient_pubkey"],
             str(admission_eval.data["amount"]),
         ]]
+    elif tx_type in (TX_TYPE_ENVELOPE_SEND, TX_TYPE_ENVELOPE_SPEND):
+        # A send is judged as the one transfer sender -> recipient whose money
+        # the envelope then holds; a spend as the one transfer spender -> payee
+        # (the recipient's own o5 judges what it spends). Apply feeds
+        # exactly these inputs.
+        operations = {}
+        has_transfers = True
+        has_rules = False
+        to_key = "recipient_pubkey" if tx_type == TX_TYPE_ENVELOPE_SEND else "to_pubkey"
+        operations["1"] = [[
+            sender_pubkey,
+            admission_eval.data[to_key],
+            str(admission_eval.data["amount"]),
+        ]]
     else:
         has_transfers = False
         has_rules = False
@@ -902,7 +991,9 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
         if not transfers_list:
             empty_transfer_list = True
         else:
-            success, transfer_result, err_msg = _process_transfers_operation(transfers_list, sender_pubkey)
+            success, transfer_result, err_msg = _process_transfers_operation(
+                transfers_list, sender_pubkey,
+                allow_self=tx_type == TX_TYPE_ENVELOPE_SPEND)
             logger.debug("Transfer result: %s", transfer_result)
             if not success:
                 return _qt_err("TX_INVALID", f"Transaction invalid. {err_msg}")
@@ -986,10 +1077,19 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             "ADMISSION_UNAVAILABLE",
             "This node has no isolated admission context, so it cannot estimate a fee.",
         )
+    # What the sender's own balance must cover besides the fee. A spend's
+    # money comes out of the envelope, and a spend to oneself lands before the
+    # fee is charged, so it can pay its own fee.
+    debited_total = sum(amt for _, _, amt in all_validated_transfers)
+    if tx_type == TX_TYPE_ENVELOPE_SPEND:
+        debited_total = (
+            -int(admission_eval.data["amount"])
+            if admission_eval.data["to_pubkey"] == sender_pubkey else 0
+        )
     if estimate and tx_type in FEE_BEARING_TX_TYPES:
         # Refused before the one estimate slot is taken, so unfunded keys cannot hold it.
         # The floor assumes a fee of at least 1. On a network with no fee rule, give --fee 0.
-        floor = sum(amt for _, _, amt in all_validated_transfers) + 1
+        floor = debited_total + 1
         sender_balance = chain_state.get_balance(sender_pubkey)
         if sender_balance < floor:
             return _qt_err(
@@ -1027,7 +1127,8 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                 if refusal is not None:
                     return refusal
 
-        elif tx_type in ("user_tx", TX_TYPE_RETRACTABLE_TRANSFER):
+        elif tx_type in ("user_tx", TX_TYPE_RETRACTABLE_TRANSFER,
+                         TX_TYPE_ENVELOPE_SEND, TX_TYPE_ENVELOPE_SPEND):
             # --- Tau Validation (Deterministic Two-Step) ---
 
             # Step 1: Rule Validation (if present)
@@ -1431,7 +1532,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                     required_fee=estimated_fee_total,
                     fee_limit=fee_limit_int,
                 )
-            sum_amounts = sum(amt for _, _, amt in all_validated_transfers)
+            sum_amounts = debited_total
             sender_balance = chain_state.get_balance(sender_pubkey)
             if sender_balance < sum_amounts + estimated_fee_total:
                 return _qt_err(
@@ -1464,6 +1565,11 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             update_id = admission_eval.data.get("update_id")
             if update_id:
                 verdict["update_id"] = update_id
+            routes = _route_preview(payload)
+            if routes:
+                verdict["receive_routes"] = routes
+            if tx_type in ENVELOPE_TX_TYPES:
+                verdict["envelope"] = dict(admission_eval.data)
             return verdict
 
         if db.count_mempool_txs() >= config.MAX_MEMPOOL_TXS:
@@ -1501,6 +1607,11 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
         update_id = admission_eval.data.get("update_id")
         if update_id:
             extra["update_id"] = update_id
+        routes = _route_preview(payload)
+        if routes:
+            extra["receive_routes"] = routes
+        if tx_type in ENVELOPE_TX_TYPES:
+            extra["envelope"] = dict(admission_eval.data)
         return _qt_ok(tx_message_id, message=msg, **extra)
 
     except ValueError as e:
@@ -1574,6 +1685,10 @@ def execute(raw_command: str, container):
         }
         if result.get("update_id"):
             data["update_id"] = result["update_id"]
+        if result.get("receive_routes"):
+            data["receive_routes"] = result["receive_routes"]
+        if result.get("envelope"):
+            data["envelope"] = result["envelope"]
         return api_response.success_response("sendtx", data)
     return api_response.error_response(
         "sendtx",

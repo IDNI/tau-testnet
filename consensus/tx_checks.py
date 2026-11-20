@@ -5,11 +5,19 @@ admission does not bind it. Admission and apply call the same functions here.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Optional, Tuple
 
+import tau_defs
+
+from consensus import network_binding
 from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST
+from consensus.envelope import TX_TYPE_ENVELOPE_SEND, TX_TYPE_ENVELOPE_SPEND
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
+from consensus.payout import TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_PAYOUT_RULE_SET
+from consensus.receive_route import TX_TYPE_RECEIVE_ROUTE_RELEASE, TX_TYPE_RECEIVE_ROUTE_SET
+from consensus.standing import TX_TYPE_STANDING_PAYMENT_CREATE, TX_TYPE_STANDING_PAYMENT_UPDATE
 from consensus import bls
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -54,8 +62,26 @@ def check_transfer(transfer: Any, sender_pubkey: Any) -> Optional[str]:
 
 def _recipient_keys(tx: dict) -> list:
     tx_type = tx.get("tx_type", "user_tx")
-    if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER):
+    if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER,
+                   TX_TYPE_STANDING_PAYMENT_CREATE, TX_TYPE_STANDING_PAYMENT_UPDATE,
+                   TX_TYPE_ENVELOPE_SEND):
         return [("recipient_pubkey", tx.get("recipient_pubkey"))]
+    if tx_type == TX_TYPE_ENVELOPE_SPEND:
+        return [("to_pubkey", tx.get("to_pubkey"))]
+    if tx_type == TX_TYPE_PAYOUT_RULE_SET:
+        slots = tx.get("slots")
+        return [(f"slots[{k}]", key) for k, key in enumerate(slots or [])
+                if key != ""] if isinstance(slots, list) else []
+    if tx_type == TX_TYPE_RECEIVE_ROUTE_SET:
+        return [("destination_pubkey", tx.get("destination_pubkey"))]
+    if tx_type == TX_TYPE_RECEIVE_ROUTE_RELEASE:
+        return [("owner_pubkey", tx.get("owner_pubkey"))]
+    if tx_type == TX_TYPE_PAYOUT_EXECUTE:
+        recipients = tx.get("recipients")
+        keys = [("account_pubkey", tx.get("account_pubkey"))]
+        if isinstance(recipients, dict):
+            keys.extend((f"recipients[{k}]", v) for k, v in sorted(recipients.items()))
+        return keys
     if tx_type in (TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST):
         keys = (
             [("recipient_pubkey", tx.get("recipient_pubkey"))]
@@ -64,6 +90,14 @@ def _recipient_keys(tx: dict) -> list:
         approvers = tx.get("approvers")
         if isinstance(approvers, dict):
             keys.extend(("approver", key) for key in approvers.values())
+        if tx_type == TX_TYPE_RULE_CHANGE_REQUEST and tx.get("kind") == tau_defs.RULE_CHANGE_KIND_SET_ROUTE:
+            # A receive route's destination travels inside its spec (kind 8).
+            try:
+                spec = json.loads(tx.get("rule_text") or "")
+            except (TypeError, ValueError):
+                spec = None
+            if isinstance(spec, dict) and "destination_pubkey" in spec:
+                keys.append(("destination_pubkey", spec["destination_pubkey"]))
         return keys
     return []
 
@@ -71,9 +105,13 @@ def _recipient_keys(tx: dict) -> list:
 def apply_tx_error(tx: dict) -> Optional[Tuple[str, str]]:
     """(receipt reason, detail) when block apply must refuse `tx`, else None.
 
-    Checks each transfer of a user_tx and the recipient keys of the other types.
-    The signature check runs before this one, in the apply loop.
+    Checks each transfer of a user_tx, the recipient keys of the other types and,
+    for the types bound to a network, that the network is this one. The signature
+    check runs before this one, in the apply loop.
     """
+    network_error = network_binding.problem(tx)
+    if network_error:
+        return network_binding.APPLY_REASON_WRONG_NETWORK, network_error
     if tx.get("tx_type", "user_tx") == "user_tx":
         operations = tx.get("operations")
         transfers = operations.get("1") if isinstance(operations, dict) else None
