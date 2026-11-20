@@ -1,0 +1,350 @@
+"""Bounty 01, issue #63 (G4): the Tau-form payout rule on the native engine.
+
+Kept in its own file so the real-Tau CI job can register exactly this
+file: the proof steps a REAL Tau clause through the real policy-evaluation
+path, which needs the native bindings the mock job does not have. The
+skip is environment-driven, exactly as the other Bounty 01 native suites.
+
+The scenario is the maintainer's official grant example (issue #34's
+named case 5, restated for #63's form) expressed as a Tau payout rule —
+the strongest form of gmikeyg's W2: the payout policy is not a declared
+program the node interprets, it is the owner's own Tau clause, and the
+node only builds its inputs, reads its outputs, checks them against the
+declared set and caps, and applies the legs.
+
+- A grant account (the rule owner) holds exactly 5,000, stocked by the
+  funder. The declared recipient set is {Bob, the funder}; the declared
+  caps are 3,500 per execution and 5,000 per period; the book period is
+  the grant's four-week accounting window.
+- The clause carries the grant's own terms as configuration: anchored
+  three weeks in the past (a Dec-1-shaped schedule whose wall-clock
+  blocks land in its third week — the anchoring is stated here plainly
+  because a native block carries the wall-clock timestamp; the first two
+  weeks' branches are the same release arithmetic, carried but not
+  landed on), it releases 500 per week cumulatively — computed from the
+  block timestamp at i5 minus what the rule already paid at i26 — and
+  pays Bob the draw; at the schedule's deadline (anchor + 3 weeks, ~60
+  seconds after the test starts) its time condition selects the refund
+  leg instead: everything unpaid goes back to the funder.
+- A third party submits every execution (anyone may execute — W2). Bob
+  draws 500 in each of three settlements (the release schedule is
+  cumulative, so the three draws land against the third week's full
+  1,500 release; a fourth draw is refused — the release is exhausted).
+  After the deadline the third party executes once more, with base 1 —
+  the refund amount comes from the clause's state inputs, not from
+  anything the submitter supplies — and the funder receives exactly
+  3,500. The grant account ends at 0.
+
+A second test pins cap enforcement at engine level: a clause naming a
+600 leg under a declared 500 per-execution cap settles nothing — refused
+at admission, and refused again at inclusion with admission bypassed.
+Assertions are deltas around the measured blocks, so faucet grants at
+account creation cannot pollute them.
+"""
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+import pytest
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+try:
+    import tau_native
+    tau_native.load_tau_module()
+    _NATIVE_TAU = True
+except Exception:
+    _NATIVE_TAU = False
+
+import config
+import chain_state
+import db
+import tau_manager
+from errors import TauEngineCrash
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, SK_MALLORY, pubkey_hex, sign_payload
+from commands import sendtx, createblock
+from consensus.payout_rules import FORM_TAU_RULE, PayoutRuleEntry
+
+GENESIS_TAU = os.path.join(project_root, "genesis.tau")
+TRANSFER_RULE_PATH = os.path.join(project_root, "rules", "04_handle_valid_transfer.tau")
+
+FUNDER = pubkey_hex(SK_ALICE)
+BOB = pubkey_hex(SK_BOB)
+EXECUTOR = pubkey_hex(SK_CAROL)
+OWNER = pubkey_hex(SK_MALLORY)  # the grant account holding the 5,000
+
+WEEK = 604_800
+TOTAL = 5000
+WEEKLY = 500
+
+
+def _grant_clause(anchor, bob_idx, funder_idx):
+    """The grant's terms as a Tau clause body (sender_policy wraps it).
+
+    Every branch assigns all three leg outputs (o30 count, o31 candidate
+    index, o32 amount), so the outputs are fully determined on every
+    path. Draws: cumulative release 500/week from the anchor, minus what
+    i26 says the rule already paid, capped by the submitted base at i1.
+    At/after the deadline: the unpaid remainder to the funder.
+    """
+    a1 = anchor + WEEK
+    a2 = anchor + 2 * WEEK
+    deadline = anchor + 3 * WEEK
+
+    def no_legs():
+        return ("((o30[t]:bv[64] = { 0 }:bv[64]) "
+                "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+                "&& (o32[t]:bv[64] = { 0 }:bv[64]))")
+
+    def one_leg(idx, amount_expr):
+        return (f"((o30[t]:bv[64] = {{ 1 }}:bv[64]) "
+                f"&& (o31[t]:bv[64] = {{ {idx} }}:bv[64]) "
+                f"&& (o32[t]:bv[64] = {amount_expr}))")
+
+    def draw(release):
+        return (
+            f"((i26[t]:bv[64] < {{ {release} }}:bv[64]) "
+            f"? ((i1[t]:bv[64] <= ({{ {release} }}:bv[64] - i26[t]:bv[64])) "
+            f"? {one_leg(bob_idx, 'i1[t]:bv[64]')} "
+            f": {one_leg(bob_idx, f'({{ {release} }}:bv[64] - i26[t]:bv[64])')}) "
+            f": {no_legs()})"
+        )
+
+    refund = (
+        f"((i26[t]:bv[64] < {{ {TOTAL} }}:bv[64]) "
+        f"? {one_leg(funder_idx, f'({{ {TOTAL} }}:bv[64] - i26[t]:bv[64])')} "
+        f": {no_legs()})"
+    )
+    return (
+        f"((i5[t]:bv[64] < {{ {deadline} }}:bv[64]) "
+        f"? ((i5[t]:bv[64] < {{ {a1} }}:bv[64]) "
+        f"? {draw(WEEKLY)} "
+        f": ((i5[t]:bv[64] < {{ {a2} }}:bv[64]) "
+        f"? {draw(2 * WEEKLY)} "
+        f": {draw(3 * WEEKLY)})) "
+        f": {refund})"
+    )
+
+
+@pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
+class TestPayoutTauRuleNativeE2E(unittest.TestCase):
+    """Full pipeline with a live Tau interpreter (the fee-native pattern)."""
+
+    def setUp(self):
+        try:
+            iface = tau_native.TauInterface(GENESIS_TAU)
+        except TauEngineCrash:
+            self.skipTest(
+                "native interpreter unavailable in this process (polluted by an "
+                "earlier in-process interpreter); run this file on its own"
+            )
+        self._tmpdir = tempfile.mkdtemp()
+        self.test_db = os.path.join(self._tmpdir, "test_payout_tau_native_db.sqlite")
+        self.original_db = config.STRING_DB_PATH
+        config.set_database_path(self.test_db)
+        if not config.MINER_PRIVKEY:
+            # The CI job's config profile leaves MINER_PRIVKEY unset; the
+            # job preamble generates the miner identity into data_local/,
+            # so load it with config's own loaders (after set_database_path,
+            # whose re-sync would wipe it otherwise) and skip only when the
+            # identity genuinely does not exist.
+            _priv = config._load_miner_privkey_from_path(
+                os.path.join(config.DATA_LOCAL_DIR, "test_miner.key"))
+            _pub = config._load_miner_pubkey_from_path(
+                os.path.join(config.DATA_LOCAL_DIR, "test_miner.pub"))
+            if not _priv or not _pub:
+                self.skipTest(
+                    "data_local/test_miner.key absent; local miner identity required "
+                    "for real PoA mining (see config.DATA_LOCAL_DIR)"
+                )
+            config.MINER_PRIVKEY = _priv
+            config.MINER_PUBKEY = _pub
+        if db._db_conn:
+            db._db_conn.close()
+        db._db_conn = None
+
+        chain_state._balances.clear()
+        chain_state._sequence_numbers.clear()
+        db.init_db()
+        chain_state.load_genesis("data/genesis.json")
+        db.clear_mempool()
+
+        chain_state._balances[OWNER] = TOTAL  # stocked by the funder
+        chain_state._balances[EXECUTOR] = 1000
+        chain_state._lifecycle_manager.active_validators = {config.MINER_PUBKEY.lower()}
+        chain_state._lifecycle_manager.recompute_approval_threshold()
+
+        tau_manager.tau_direct_interface = iface
+        tau_manager.tau_ready.set()
+        self._seed_rule(open(TRANSFER_RULE_PATH).read(), "transfer-rule")
+        self._seed_rule(
+            chain_state._preprocess_tau_spec_text(
+                json.load(open("data/genesis.json"))["consensus_rules"]
+            ),
+            "genesis-consensus",
+        )
+        patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}).start()
+        patch("commands.createblock._BLS_AVAILABLE", True).start()
+        patch("block.bls_signing_available", return_value=True).start()
+        patch("consensus.engine.TauConsensusEngine.verify_block_header", return_value=True).start()
+        patch("consensus.engine.TauConsensusEngine.query_eligibility", return_value=True).start()
+
+    def tearDown(self):
+        patch.stopall()
+        tau_manager.tau_ready.clear()
+        tau_manager.tau_direct_interface = None
+        if db._db_conn:
+            db._db_conn.close()
+            db._db_conn = None
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        config.set_database_path(self.original_db)
+
+    def _seed_rule(self, rule_text, label):
+        out = tau_manager.communicate_with_tau(
+            rule_text=rule_text,
+            target_output_stream_index=0,
+            apply_rules_update=False,
+            source=f"seed-{label}",
+        )
+        self.assertNotIn("error", str(out).lower(), f"seeding {label} failed: {out}")
+
+    def _mine(self):
+        out = createblock.create_block_from_mempool()
+        self.assertNotIn("error", out, out)
+        return out
+
+    def _force_queue(self, blob):
+        """Put a signed tx in the mempool WITHOUT admission, to ask what
+        inclusion does with it on its own (the isolation-suite pattern)."""
+        payload = json.loads(blob)
+        tx_hash, raw = sendtx._compute_transaction_message_id(payload)
+        db.add_mempool_tx(raw, tx_hash, int(time.time() * 1000))
+        return tx_hash
+
+    def _included(self, tx_hash):
+        head = db.get_canonical_head_block() or {}
+        return tx_hash in (head.get("tx_ids") or [])
+
+    def _execute_tx(self, rule_id, settlement_id, base):
+        return json.dumps(sign_payload({
+            "sender_pubkey": EXECUTOR,
+            "tx_type": "execute_payout_rule",
+            "sequence_number": chain_state.get_sequence_number(EXECUTOR),
+            "expiration_time": int(time.time()) + 3600,
+            "expire_at_height": 5000,
+            "payout_rule_id": rule_id.hex(),
+            "payout_settlement_id": settlement_id,
+            "payout_base_amount": base,
+            "fee_limit": "50",
+        }, SK_CAROL))
+
+    def _balances(self):
+        return {pk: chain_state._balances.get(pk, 0)
+                for pk in (OWNER, BOB, FUNDER, EXECUTOR)}
+
+    def test_grant_example_as_a_tau_payout_rule(self):
+        start = int(time.time())
+        anchor = start - 3 * WEEK + 60
+        deadline = anchor + 3 * WEEK
+        recipients = tuple(sorted([BOB, FUNDER]))
+        entry = PayoutRuleEntry(
+            owner_pubkey=OWNER, recipients=recipients, legs=(),
+            max_per_execution=3500, max_per_period=TOTAL,
+            period_seconds=4 * WEEK, period_anchor_ts=anchor, version=1,
+            form=FORM_TAU_RULE,
+            clause_text=_grant_clause(
+                anchor, recipients.index(BOB), recipients.index(FUNDER)),
+        )
+        chain_state._lifecycle_manager.payout_rules.install(entry, start)
+        book = chain_state._lifecycle_manager.payout_rules
+        self.assertEqual(book.get(OWNER).form, FORM_TAU_RULE)
+
+        # Three draws of 500, submitted by a third party (anyone may
+        # execute): each settles exactly 500 to Bob from the grant
+        # account, against the third week's cumulative 1,500 release.
+        for k, sid in enumerate(("11" * 32, "22" * 32, "33" * 32)):
+            before = self._balances()
+            res = sendtx.queue_transaction(
+                self._execute_tx(entry.rule_id, sid, WEEKLY), propagate=False)
+            self.assertTrue(res["ok"], f"draw {k + 1} rejected: {res}")
+            self._mine()
+            after = self._balances()
+            self.assertEqual(after[BOB] - before[BOB], WEEKLY)
+            self.assertEqual(after[OWNER] - before[OWNER], -WEEKLY)
+            self.assertLess(after[EXECUTOR], before[EXECUTOR])  # the fee
+
+        # A fourth draw is refused at admission: the release is exhausted
+        # (1,500 paid of the 1,500 released), so the clause computes no
+        # payment and nothing settles.
+        before = self._balances()
+        res = sendtx.queue_transaction(
+            self._execute_tx(entry.rule_id, "44" * 32, WEEKLY),
+            propagate=False)
+        self.assertFalse(res["ok"], f"fourth draw admitted: {res}")
+        self.assertEqual(self._balances(), before)
+
+        # Past the deadline, the clause's time condition selects the
+        # refund leg: a third party executes with base 1 and the funder
+        # receives the unpaid remainder — exactly 3,500.
+        while time.time() < deadline + 2:
+            time.sleep(1)
+        before = self._balances()
+        res = sendtx.queue_transaction(
+            self._execute_tx(entry.rule_id, "55" * 32, 1), propagate=False)
+        self.assertTrue(res["ok"], f"refund execution rejected: {res}")
+        self._mine()
+        after = self._balances()
+        self.assertEqual(after[FUNDER] - before[FUNDER], 3500)
+        self.assertEqual(after[OWNER] - before[OWNER], -3500)
+        self.assertEqual(after[OWNER], 0)
+        self.assertEqual(after[BOB], 1500)
+
+        # Re-read the book from the canonical manager: block apply forks
+        # the lifecycle manager, so the pre-block object is not the state
+        # the settlements landed in.
+        book = chain_state._lifecycle_manager.payout_rules
+        self.assertEqual(book.period_total(entry.rule_id, 0), TOTAL)
+        record = book.settlement(entry.rule_id, bytes.fromhex("55" * 32))
+        self.assertIsNotNone(record)
+        self.assertEqual(record.total, 3500)
+
+    def test_clause_leg_above_per_execution_cap_settles_nothing(self):
+        now = int(time.time())
+        clause = (
+            "((o30[t]:bv[64] = { 1 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 600 }:bv[64]))"
+        )
+        entry = PayoutRuleEntry(
+            owner_pubkey=OWNER, recipients=(BOB,), legs=(),
+            max_per_execution=500, max_per_period=0,
+            period_seconds=WEEK, period_anchor_ts=now - 100, version=1,
+            form=FORM_TAU_RULE, clause_text=clause,
+        )
+        chain_state._lifecycle_manager.payout_rules.install(entry, now)
+
+        blob = self._execute_tx(entry.rule_id, "66" * 32, 1)
+        before = self._balances()
+        res = sendtx.queue_transaction(blob, propagate=False)
+        self.assertFalse(res["ok"], f"over-cap execution admitted: {res}")
+        # Inclusion on its own refuses it too, with admission bypassed.
+        forced = self._force_queue(blob)
+        self._mine()
+        self.assertFalse(self._included(forced),
+                         "inclusion settled a leg above the declared cap")
+        after = self._balances()
+        self.assertEqual(after[BOB] - before[BOB], 0)
+        self.assertEqual(after[OWNER] - before[OWNER], 0)
+        book = chain_state._lifecycle_manager.payout_rules
+        self.assertFalse(book.is_settled(entry.rule_id, bytes.fromhex("66" * 32)))
+
+
+if __name__ == "__main__":
+    unittest.main()
