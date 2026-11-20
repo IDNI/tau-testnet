@@ -453,6 +453,16 @@ def test_a_rule_the_engine_already_implied_is_accepted_but_not_taken():
                                   "spec_revision": 5}
 
 
+def test_a_clause_names_no_revision_even_beside_an_engine_receipt():
+    """An o5 clause goes to the clause registry, not into the engine's
+    specification, so its effect never claims a revision was taken, even when
+    the engine's last receipt (from another step) says one was."""
+    (effect,) = _apply_with_engine_receipt(ap.rule_tx(ap.UNGUARDED_RULE), {
+        "outcome": "ACCEPTED_CHANGED", "accepted": True, "changed": True,
+        "spec_revision_before": 4, "spec_revision_after": 5})
+    assert effect["kind"] == "clause" and effect["action"] == "registered"
+    assert "revision" not in effect
+
 def test_the_worker_receipt_gives_the_revision_after_the_unit():
     # the authoritative worker reports its counter once, after the revision
     assert engine_module._engine_revision({"outcome": "ACCEPTED_CHANGED", "accepted": True,
