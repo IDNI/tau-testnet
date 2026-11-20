@@ -29,6 +29,7 @@ from consensus.rule_offers import (
 from consensus.facade import TipAdmissionView
 from consensus.approvals import (
     MAX_APPROVAL_WINDOW_BLOCKS,
+    audit_recipient_stream_collisions,
     audit_stream_collisions,
     MAX_PENDING_REQUESTS_PER_APPROVER,
     approval_slots_active,
@@ -42,7 +43,9 @@ from consensus.approvals import (
     parse_rule_change_cancel,
     parse_rule_change_request_checked,
     parse_transfer_vote,
+    recipient_policy_active,
     screen_policy_widths,
+    screen_recipient_stream_widths,
     screen_slot_widths,
     screen_stream_widths,
     validate_request_shape,
@@ -69,6 +72,7 @@ from consensus.governance import (
     HOST_CONTRACT_PATCH_KEYS,
     validate_fee_beneficiary,
     validate_approval_slots_active,
+    validate_recipient_policy_active,
 )
 
 logger = logging.getLogger(__name__)
@@ -246,7 +250,8 @@ class UserRuleRejection(NamedTuple):
 
 
 def screen_user_rule_text(
-    rule_text: str, eligibility_mode: str, slots_active: bool
+    rule_text: str, eligibility_mode: str, slots_active: bool,
+    recipient_policy_active: bool = False,
 ) -> Optional[UserRuleRejection]:
     """Screens for an accumulated op-0 rule, run by admission and by block apply.
 
@@ -279,10 +284,14 @@ def screen_user_rule_text(
 
     # i12 stays readable, since that is how a rule scopes itself. A plain rule is
     # not a registered clause, so typing a reserved input pins its width process-wide.
+    # The recipient-control streams i17/i16 join the forbidden set exactly when
+    # the gate is active: before that they are ordinary custom streams, and
+    # after it the host forces them on every transfer step.
     typed_reserved = tau_defs.rule_text_forbidden_input_streams(
         tau_defs.RULE_TEXT_CONTEXT_USER,
         eligibility_mode,
         approval_slots_active=slots_active,
+        recipient_policy_active=recipient_policy_active,
     )
     typed_reserved_in = _streams_referenced(rule_text, typed_reserved)
     if typed_reserved_in:
@@ -362,9 +371,11 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
     # The slot reservation is what makes a co-signature unforgeable: without it a
     # sender could put "18" in `operations` and write their own approval.
     slots_active = approval_slots_active(tip_view)
+    recipient_active = recipient_policy_active(tip_view)
     reserved_ops = tau_defs.reserved_operation_keys(
         getattr(tip_view, "eligibility_mode", ""),
         approval_slots_active=slots_active,
+        recipient_policy_active=recipient_active,
     )
 
     for key, val in operations.items():
@@ -401,7 +412,10 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         if routing is not None:
             return routing
 
-        rejection = screen_user_rule_text(rule_text, tip_view.eligibility_mode, slots_active)
+        rejection = screen_user_rule_text(
+            rule_text, tip_view.eligibility_mode, slots_active,
+            recipient_policy_active=recipient_active,
+        )
         if rejection:
             return format_error(
                 rejection.error, code=rejection.code, **(rejection.details or {})
@@ -546,6 +560,19 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         if findings:
             return (
                 "approval_slots_active cannot be activated on this chain: "
+                + "; ".join(findings)
+            )
+    if "recipient_policy_active" in patch:
+        err = validate_recipient_policy_active(patch["recipient_policy_active"])
+        if err:
+            return f"recipient_policy_active: {err}"
+        # First phase of the two-phase activation, same as the approval
+        # slots above: refuse the proposal loudly here, because at the
+        # activation height the second phase can only decline to flip.
+        findings = audit_recipient_stream_collisions(_tip_effective_spec_texts())
+        if findings:
+            return (
+                "recipient_policy_active cannot be activated on this chain: "
                 + "; ".join(findings)
             )
     if "vote_quorum" in patch:
@@ -921,6 +948,10 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
     if domain_error:
         return _admission_from_domain_error(domain_error)
 
+    inactive = _recipient_policy_inactive_refusal(tip_view, body)
+    if inactive is not None:
+        return inactive
+
     return success({
         "offer_id": offer_id_hex,
         "clause_body": body,
@@ -956,10 +987,19 @@ def _screen_clause_domains(body: str) -> Optional[str]:
     # clause outlives the mode that was active when it was accepted, so admitting
     # one that types i13 under validator_set would turn into a reserved-stream
     # collision the moment governance switches to tau_validator_set.
+    #
+    # The recipient-control streams i17/i16 are screened the same way, with the
+    # feature ON: an o5 clause must be able to read them (that is the whole
+    # inbound gate), so they are readable here. Whether the clause may DEPLOY
+    # while the feature is off is a separate, tip-dependent refusal
+    # (_recipient_policy_inactive_refusal, at the registration call sites) —
+    # the width screen below still pins them at bv[64] either way, so no
+    # pre-activation clause can poison process-global stream typing.
     reserved_inputs = tau_defs.rule_text_forbidden_input_streams(
         tau_defs.RULE_TEXT_CONTEXT_O5_CLAUSE,
         "tau_validator_set",
         approval_slots_active=True,
+        recipient_policy_active=True,
     )
     typed = _streams_referenced(body, reserved_inputs)
     if typed:
@@ -982,6 +1022,30 @@ def _screen_clause_widths_and_structure(body: str) -> Optional[str]:
     if slot_error:
         return "Shared rules: " + slot_error
 
+    # Same contract for the recipient-control streams the gate feeds: every
+    # i17/i16 mention typed bv[64], or the gate's own feed can be poisoned.
+    recipient_error = screen_recipient_stream_widths(body)
+    if recipient_error:
+        return "Shared rules: " + recipient_error
+
+    # A hold rule that reads i17 (the hold length) but never i16 (which unit
+    # the hold is denominated in) would judge seconds and blocks with one
+    # number: a 90-day height park would reach a seconds cap as a large
+    # number of "seconds", or a 10-minute time park would reach a blocks cap
+    # as 600 "blocks". Unit-blind hold rules are therefore undeployable —
+    # the author must branch on i16, which is also what makes the clause
+    # statically recognisable as inbound-capable.
+    from consensus import sender_policy
+
+    if sender_policy.clause_reads_hold_without_context(body):
+        return (
+            "Shared rules: a unit-blind recipient hold rule reads i17 (hold "
+            "length) without ever reading i16 (hold unit/context). i17 is "
+            "denominated in seconds for a time park and in blocks for a "
+            "height park, so the clause must branch on i16 to say which "
+            "unit its cap means."
+        )
+
     # Same contract for o5 itself: an unguarded clause body still types the
     # shared policy stream, and a bv[16] unit here poisons the interpreter
     # the same way a raw accumulated one does.
@@ -997,6 +1061,27 @@ def _screen_clause_widths_and_structure(body: str) -> Optional[str]:
     if structure_error:
         return "Shared rules: " + structure_error
     return None
+
+
+def _recipient_policy_inactive_refusal(
+    tip_view: TipAdmissionView, body: str
+) -> Optional[AdmissionResult]:
+    """RECIPIENT_POLICY_INACTIVE refusal for an inbound-capable clause body
+    on a chain where recipient controls are not active, else None.
+
+    Acceptance #47.5 / #76.6: a node without the gate must refuse an
+    inbound rule at deploy with a clear reason rather than silently admit
+    a rule that never runs. The predicate lives in consensus/sender_policy
+    so block apply refuses the same bodies.
+    """
+    from consensus import sender_policy
+
+    reason = sender_policy.inactive_refusal_reason(
+        body, recipient_policy_active(tip_view)
+    )
+    if reason is None:
+        return None
+    return format_error(reason, code="RECIPIENT_POLICY_INACTIVE")
 
 
 # i1 = change kind, i5 = timestamp, i18..i25 = approval slots.
@@ -1115,6 +1200,10 @@ def validate_rule_offer_decision_payload(
     if domain_error:
         return _admission_from_domain_error(domain_error)
 
+    inactive = _recipient_policy_inactive_refusal(tip_view, body)
+    if inactive is not None:
+        return inactive
+
     refusal = _rule_change_refusal(
         tip_view, decision.actor_pubkey, tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER
     )
@@ -1191,6 +1280,10 @@ def validate_o5_clause_routing(
         return _admission_from_domain_error(
             domain_error, prefix="o5 policy rule rejected: "
         )
+
+    inactive = _recipient_policy_inactive_refusal(tip_view, body)
+    if inactive is not None:
+        return inactive
 
     sender = tx.get("sender_pubkey")
     if not isinstance(sender, str):
@@ -1442,6 +1535,17 @@ def validate_rule_change_request_payload(
         return _admission_from_domain_error(
             domain_error, prefix="rule_change_request rejected: "
         )
+
+    # Inbound-capable bodies (SET_POLICY and ACCEPT_OFFER kinds) cannot deploy
+    # while the gate is off. Guard bodies never reach here as inbound-capable:
+    # the guard domain screen refuses i16/i17 reads first.
+    if request.kind in (
+        tau_defs.RULE_CHANGE_KIND_SET_POLICY,
+        tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
+    ):
+        inactive = _recipient_policy_inactive_refusal(tip_view, request.body)
+        if inactive is not None:
+            return inactive
 
     precondition = _rule_change_precondition_error(request, tip_view)
     if precondition:

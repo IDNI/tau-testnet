@@ -58,13 +58,15 @@ _EXPENSIVE_BURST = 2.0
 _EXPENSIVE_REFILL_PER_SEC = 0.5
 # getapprovalpreview enumerates up to 64 engine steps under the global Tau lock,
 # and getapprovalslots is unauthenticated text inspection; both are advisory
-# conveniences. getblocks/getallaccounts/gettaustate/getgovernance/history are
+# conveniences. getrecipientpolicy evaluates a clause (up to 4 engine steps
+# when reporting a verified cap) and is advisory too. getblocks/getallaccounts/gettaustate/getgovernance/history are
 # cheap for the caller and hold the process-wide DB or state lock, so a poller
 # can stall mining and admission.
 _EXPENSIVE_COMMANDS = frozenset({
     "checktx",
     "getapprovalpreview",
     "getapprovalslots",
+    "getrecipientpolicy",
     "getblocks",
     "getallaccounts",
     "gettaustate",
