@@ -797,6 +797,7 @@ _OWNERS = {
     "tau_advisory.py": "WorkerLost",
     "tau_authority.py": "WorkerLost",
     "tau_preflight.py": "WorkerLost",
+    "tau_running_spec.py": "WorkerLost",
     "tau_policy.py": "WorkerLost",
     # These go through an AdmissionContext, which turns the loss into
     # AdmissionUnavailable at its own edge.

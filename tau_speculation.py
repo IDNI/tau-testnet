@@ -206,6 +206,13 @@ class SpeculationSession:
     def state(self, *, timeout=_SESSION_DEFAULT) -> dict:
         return self._request({"op": "state"}, timeout=timeout)
 
+    def current_spec(self, *, timeout=_SESSION_DEFAULT) -> str:
+        """The specification the engine runs now, as it revised it."""
+        resp = self._request({"op": "spec"}, timeout=timeout)
+        if not resp.get("ok"):
+            raise SpeculationError("the worker holds no interpreter")
+        return resp["spec"]
+
     # --- disposal -------------------------------------------------------------
 
     def close(self, *, timeout: float = 5.0) -> int | None:

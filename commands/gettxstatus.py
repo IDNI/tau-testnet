@@ -7,6 +7,14 @@ Resolution order:
                  (with block_hash/number and confirmation depth). Fork-only
                  locations fall through (a reorged-out tx is re-queued into the
                  mempool, so step 1 usually catches it).
+                 "confirmed" means included. What the transaction DID is in
+                 `outcome` (issue #42): `status` "applied" or "skipped" (a
+                 valid no-op), the receipt `reason`, `fee_charged`, the
+                 receipt `logs`, and for rule transactions `rule_effects`
+                 (registered / replaced / revoked / accumulated, with the
+                 sha256 of the stored text). Every node records it for each
+                 block it applies or replays; `{"status": "not_recorded"}` for
+                 blocks applied before the node began recording.
   3. mempool_dropped -> "expired" / "evicted" / "rejected". A "rejected" row
                  may carry the apply receipt's `reason` code and a `detail`
                  log trail. Only the node that built the block records these;
@@ -70,6 +78,16 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
         return {}
 
 
+def _outcome(db, tx_hash: str, block_hash: str) -> dict:
+    """What the confirmed transaction did in its block (issue #42)."""
+    try:
+        recorded = db.get_tx_outcome(tx_hash, block_hash)
+    except Exception:
+        logger.exception("Failed to read outcome for %s", tx_hash)
+        recorded = None
+    return recorded if recorded is not None else {"status": "not_recorded"}
+
+
 def execute(raw_command: str, container):
     parts = raw_command.split()
     if len(parts) != 2:
@@ -124,6 +142,7 @@ def execute(raw_command: str, container):
                     "block_number": loc["block_number"],
                     "confirmations": max(1, confirmations),
                 }
+                data["outcome"] = _outcome(db, tx_hash, loc["block_hash"])
                 data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
                 return api_response.success_response("gettxstatus", data)
 
