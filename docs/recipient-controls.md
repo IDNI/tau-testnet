@@ -21,6 +21,15 @@ Admission (sendtx, and checktx as its dry run) runs the identical
 check with the identical helper (`consensus/recipient_gate.py`), so
 admission and apply cannot disagree about a recipient.
 
+The gate is clause-triggered: it runs only when the recipient has
+published a policy — an accepted clause on o5, or (for a park) on the
+hold-cap stream o10. Per-account policy enters the specification
+only through accepted clauses, so the trigger misses no policy that
+exists; and a neutral recipient costs exactly what it cost before
+this feature — one evaluation per transfer, the same fed streams,
+the same fee. The fee model's one-evaluation-per-transfer contract
+is preserved for every transfer whose recipient has not opted in.
+
 ## How the recipient is judged
 
 The recipient evaluation reuses the transfer input map unchanged —
