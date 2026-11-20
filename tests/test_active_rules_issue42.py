@@ -544,6 +544,150 @@ def test_split_statements_respects_bracket_depth():
     assert active_rules.guard_accounts("always ( i12[t] = { #x" + "cd" * 48 + " } ).") == {"cd" * 48}
 
 
+# --- Survival ledger ---------------------------------------------------------
+#
+# Per-unit survival derived from the stored snapshots + outcome receipts:
+# what a confirmed unit installed, whether it is still in force, partly
+# displaced or displaced at the viewed revision, and which later
+# transaction displaced the parts that are gone.
+
+SPEC_V1 = ("always ( o26[t]:bv[24] = { #x000007 }:bv[24] && "
+           "o27[t]:bv[24] = { #x000009 }:bv[24] ).")
+SPEC_V2 = ("always ( o26[t]:bv[24] = { #x000003 }:bv[24] && "
+           "o27[t]:bv[24] = { #x000009 }:bv[24] ).")
+SPEC_SINGLE_V1 = "always ( o26[t]:bv[24] = { #x000007 }:bv[24] )."
+SPEC_SINGLE_V2 = "always ( o26[t]:bv[24] = { #x000003 }:bv[24] )."
+
+FRAG_O26_7 = "o26[t]:bv[24] = { #x000007 }:bv[24]"
+FRAG_O26_3 = "o26[t]:bv[24] = { #x000003 }:bv[24]"
+FRAG_O27_9 = "o27[t]:bv[24] = { #x000009 }:bv[24]"
+
+UNIT_A = "aa" * 32
+UNIT_B = "bb" * 32
+
+
+def _record_unit(tx_hash, block, before, after, outcome="ACCEPTED_CHANGED"):
+    db.record_rule_outcomes(f"{block:064x}", block, {tx_hash: {
+        "outcome": outcome,
+        "spec_revision_before": before,
+        "spec_revision_after": after,
+    }})
+
+
+def _snap(revision, height, text):
+    db.record_spec_snapshot(revision, height, text,
+                            active_rules.spec_hash_of(text))
+
+
+def test_spec_fragments_split_top_level_conjuncts():
+    assert active_rules.spec_fragments(SPEC_V1) == [FRAG_O26_7, FRAG_O27_9]
+    assert active_rules.spec_fragments(SPEC_SINGLE_V1) == [FRAG_O26_7]
+    # A guarded conditional is one fragment: its parts are not top-level
+    # conjuncts, and a conjunction nested inside it stays nested.
+    guarded = (
+        "always ( ( i12[t] = { #x" + "ab" * 48 + " }:bv[384] ) ? "
+        "o5[t]:bv[24] = { #x000001 }:bv[24] : o5[t]:bv[24] = { #x000000 }:bv[24] )."
+    )
+    frags = active_rules.spec_fragments(guarded)
+    assert len(frags) == 1
+    assert "i12[t]" in frags[0]
+
+
+def test_survival_ledger_unit_in_force(temp_database):
+    _snap(1, 10, SPEC_V1)
+    _record_unit(UNIT_A, 10, 0, 1)
+    ledger = active_rules.survival_ledger()
+    assert len(ledger) == 1
+    entry = ledger[0]
+    assert entry["tx_hash"] == UNIT_A
+    assert entry["block_number"] == 10
+    assert entry["spec_revision_before"] == 0
+    assert entry["spec_revision_after"] == 1
+    assert entry["status"] == "in_force"
+    assert entry["installed_fragments"] == [FRAG_O26_7, FRAG_O27_9]
+    assert entry["surviving_fragments"] == [FRAG_O26_7, FRAG_O27_9]
+    assert entry["displaced_fragments"] == []
+    assert entry["displaced_by"] == []
+
+
+def test_survival_ledger_unit_fully_displaced(temp_database):
+    _snap(1, 10, SPEC_SINGLE_V1)
+    _snap(2, 11, SPEC_SINGLE_V2)
+    _record_unit(UNIT_A, 10, 0, 1)
+    _record_unit(UNIT_B, 11, 1, 2)
+    ledger = {e["tx_hash"]: e for e in active_rules.survival_ledger()}
+    a = ledger[UNIT_A]
+    assert a["status"] == "displaced"
+    assert a["surviving_fragments"] == []
+    assert a["displaced_fragments"] == [
+        {"fragment": FRAG_O26_7, "displaced_by": [UNIT_B]}]
+    assert a["displaced_by"] == [UNIT_B]
+    b = ledger[UNIT_B]
+    assert b["status"] == "in_force"
+    assert b["installed_fragments"] == [FRAG_O26_3]
+
+
+def test_survival_ledger_unit_partially_displaced(temp_database):
+    """The maintainers' displacement scenario at the data layer: unit A
+    installs o26 = {7} && o27 = {9}; unit B then installs o26 = {3}. The
+    o27 fragment of A survives, the o26 fragment is displaced by B."""
+    _snap(1, 10, SPEC_V1)
+    _snap(2, 11, SPEC_V2)
+    _record_unit(UNIT_A, 10, 0, 1)
+    _record_unit(UNIT_B, 11, 1, 2)
+    ledger = {e["tx_hash"]: e for e in active_rules.survival_ledger()}
+    a = ledger[UNIT_A]
+    assert a["status"] == "partially_displaced"
+    assert a["surviving_fragments"] == [FRAG_O27_9]
+    assert a["displaced_fragments"] == [
+        {"fragment": FRAG_O26_7, "displaced_by": [UNIT_B]}]
+    assert a["displaced_by"] == [UNIT_B]
+    assert ledger[UNIT_B]["status"] == "in_force"
+
+    # At the earlier snapshot the same unit was fully in force, and the
+    # later unit is not part of that revision's ledger at all.
+    at_rev1 = active_rules.survival_ledger(db.get_spec_snapshot_by_revision(1))
+    assert [e["tx_hash"] for e in at_rev1] == [UNIT_A]
+    assert at_rev1[0]["status"] == "in_force"
+
+
+def test_survival_ledger_empty_without_outcomes(temp_database):
+    _snap(1, 10, SPEC_V1)
+    assert active_rules.survival_ledger() == []
+    container = SimpleNamespace(db=db, chain_state=chain_state)
+    data = _exec(getactiverules, "getactiverules", container)["data"]
+    assert data["survival_ledger"] == []
+
+
+def test_survival_ledger_maintainer_scenario_via_engine(temp_database):
+    """End to end through block apply: the probe's two transactions land,
+    their receipts are persisted as createblock persists them, and the
+    getactiverules answer's ledger shows the first unit partially
+    displaced by the second -- the same story the effective_spec text
+    tells, per unit."""
+    session = _PointwiseSession()
+    r1 = _apply_block(session, [_rule_tx("p1", PROBE_TX1, 0)], height=1,
+                      sequences={})
+    _record_snapshot(session, 1)
+    db.record_rule_outcomes("aa" * 32, 1,
+                            {"p1": r1.receipts["p1"]["rule_outcome"]})
+    r2 = _apply_block(session, [_rule_tx("p2", PROBE_TX2, 1)], height=2,
+                      sequences={SENDER: 1}, snapshot=r1.snapshot)
+    _record_snapshot(session, 2)
+    db.record_rule_outcomes("bb" * 32, 2,
+                            {"p2": r2.receipts["p2"]["rule_outcome"]})
+
+    container = SimpleNamespace(db=db, chain_state=chain_state)
+    data = _exec(getactiverules, "getactiverules", container)["data"]
+    ledger = {e["tx_hash"]: e for e in data["survival_ledger"]}
+    assert set(ledger) == {"p1", "p2"}
+    assert ledger["p1"]["status"] == "partially_displaced"
+    assert ledger["p1"]["displaced_by"] == ["p2"]
+    assert ledger["p1"]["surviving_fragments"] == [FRAG_O27_9]
+    assert ledger["p2"]["status"] == "in_force"
+    assert ledger["p2"]["installed_fragments"] == [FRAG_O26_3]
+
+
 # --- The maintainers' probe on the native engine ----------------------------
 
 def _native_available():
