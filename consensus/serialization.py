@@ -1006,6 +1006,7 @@ def compute_standing_payment_book_root(records: list, facts: list) -> bytes:
 # --- Payout rules (Bounty 01, issue #63) -------------------------------------
 
 DOMAIN_PAYOUT_RULE_V1 = b"tau.payout_rule.v1"
+DOMAIN_PAYOUT_RULE_TAU_V1 = b"tau.payout_rule.tau.v1"
 DOMAIN_PAYOUT_RULE_BOOK_V1 = b"tau.payout_rule.book.v1"
 
 
@@ -1060,6 +1061,37 @@ def compute_payout_rule_id(
     return blake3(bytes(out)).digest()
 
 
+def compute_payout_rule_tau_id(
+    owner_pubkey: Any,
+    recipients: Any,
+    clause_text: str,
+    max_per_execution: int,
+    max_per_period: int,
+    period_seconds: int,
+    period_anchor_ts: int,
+    version: int,
+) -> bytes:
+    """BLAKE3 of a Tau-form payout rule. Returns 32 bytes.
+
+    The Tau-form counterpart of compute_payout_rule_id, under its own
+    domain: where the declared form hashes a leg PROGRAM, this form hashes
+    the owner's clause TEXT — the clause is a signed field of the rule, so
+    a tampered clause is a different, unknown rule, and no Tau-form id can
+    ever collide with a declared-form id over the same terms.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_RULE_TAU_V1.decode()))
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(_encode_pubkey_list(sorted(recipients or ())))
+    out.extend(encode_string(str(clause_text or "")))
+    out.extend(encode_uint64(int(max_per_execution)))
+    out.extend(encode_uint64(int(max_per_period)))
+    out.extend(encode_uint64(int(period_seconds)))
+    out.extend(encode_uint64(int(period_anchor_ts)))
+    out.extend(encode_uint64(int(version)))
+    return blake3(bytes(out)).digest()
+
+
 def encode_payout_rule_record(
     rule_id: Any,
     owner_pubkey: Any,
@@ -1071,12 +1103,17 @@ def encode_payout_rule_record(
     period_anchor_ts: int,
     version: int,
     period_totals: Any,
+    form: int = 1,
+    clause_text: str = "",
 ) -> bytes:
     """One payout rule for the book root: signed fields + live period totals.
 
     The per-period paid totals are consensus state exactly like the terms:
     two nodes that disagree about how much a rule already paid this period
-    disagree about whether the next execution is within its cap.
+    disagree about whether the next execution is within its cap. The form
+    and (for the Tau form) the clause text are signed fields of the rule,
+    so they are rooted too — appended after the totals so the declared
+    form's field order is untouched.
     """
     out = bytearray()
     out.extend(encode_hash32(rule_id))
@@ -1093,6 +1130,8 @@ def encode_payout_rule_record(
     for index, total in totals:
         out.extend(encode_uint64(index))
         out.extend(encode_uint64(total))
+    out.extend(encode_uint64(int(form)))
+    out.extend(encode_string(str(clause_text or "")))
     return bytes(out)
 
 

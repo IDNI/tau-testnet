@@ -291,6 +291,26 @@ COOLDOWN_STREAM_ACTIVE = False
 TAU_INPUT_STREAM_STANDING_PAID = "i17"
 STANDING_PAID_STREAM_INDEX = 17
 
+# --- Payout-rule per-period paid total (issue #63, Bounty 01) ----------------
+# i26: the total the payout rule being executed has already paid in the
+# period containing the execution timestamp, fed ONLY into a Tau-form
+# payout rule's own input map (consensus/payout_rules.payout_clause_inputs)
+# at execution — admission and apply build that map through the same
+# function, so the value cannot differ between them. A payout clause
+# computes its remaining allowance from it (release schedule minus i26),
+# the same fact jimb000o's published #141 ABI feeds at i26.
+#
+# Deliberately NOT in RESERVED_STREAMS: that set screens the TRANSFER
+# input merge, where i26 is live sender custom-input space for parked
+# requests (REQUEST_CUSTOM_INPUT_MIN) — reserving it there would break
+# parked-request custom inputs. The payout evaluation never merges sender
+# operations into its map (the execute branch carries no operations and
+# the map is built solely from book/engine state), so no sender channel
+# can write this stream in a payout evaluation: write protection here is
+# by construction, not by the reservation screen.
+TAU_INPUT_STREAM_PAYOUT_PERIOD_PAID = "i26"
+PAYOUT_PERIOD_PAID_STREAM_INDEX = 26
+
 # --- Tau Consensus ABI v1.2 additions (Tau-encoded validator membership) ---
 # Proposer BLS pubkey fed so a consensus rule can test set membership itself
 # (o7 = 1 iff i13 equals one of the validator pubkey constants baked into the

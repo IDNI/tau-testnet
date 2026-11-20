@@ -1,11 +1,22 @@
 """Payout rules: rule-computed payouts under declared caps (#63).
 
-An owner installs one payout rule: a declared recipient set, a declared leg
-program, and declared caps (a maximum per execution and a maximum per
-period). Anyone may then submit an execution carrying the rule's inputs;
-the node — never the submitter — runs the stored program over those inputs,
-checks the computed legs against the declared set, both caps and the
-owner's balance, and settles every leg atomically or none.
+An owner installs one payout rule: a declared recipient set, declared caps
+(a maximum per execution and a maximum per period), and ONE of two forms
+for computing the legs of an execution:
+
+- the DECLARED PROGRAM form (the original): a stored leg program the node
+  computes from the execution's submitted base amount;
+- the TAU RULE form: the owner's own Tau clause, which the node steps
+  through the real policy-evaluation path (sender_policy.clause_outputs)
+  over a node-built input map — the form gmikeyg's payout shape asks for
+  (the node runs the rule, the rule outputs recipients and amounts) and
+  the form andrei-idni's acceptance criterion names: a new payout policy
+  is a new CLAUSE, not a new execution path in the node.
+
+Anyone may then submit an execution carrying the rule's inputs; the node —
+never the submitter — computes the legs, checks them against the declared
+set, both caps and the owner's balance, and settles every leg atomically
+or none. Which form an entry is is a signed field, inside its rule id.
 
 CONSENSUS-FROZEN SURFACE
 ------------------------
@@ -19,6 +30,24 @@ make two honest nodes disagree about admissibility, which forks.
   bps of a 101 base pays exactly 5). The submitter supplies only the base
   amount and the settlement id; it cannot steer recipients or amounts
   beyond what the signed program computes.
+- The Tau form's clause is data the owner signed the same way: the clause
+  text is stored in the entry and inside the rule id (its own hash
+  domain), so a tampered clause is a different, unknown rule. At execution
+  the node builds the clause's input map itself (payout_clause_inputs:
+  base amount, owner balance, owner, executor, block timestamp, and the
+  rule's per-period paid total at i26) — the submitter supplies only the
+  base amount and the settlement id, exactly as in the declared form, and
+  cannot write any stream of the map. The clause's outputs name the legs
+  under the encoding pinned in payout_rule_capabilities() (o30 = leg
+  count; per leg a recipient CANDIDATE INDEX into the declared set and an
+  amount). The node then applies the SAME checks as the declared form —
+  declared set, both caps, balance — so the clause decides and the node
+  checks and applies; a clause that does not build, cannot be stepped, or
+  writes a blocking o5 computes no legs and the execution settles
+  nothing, deterministically on every node. The book itself never steps
+  a clause: callers (engine at apply, admission at the tip) step it and
+  hand the decoded legs in, which keeps this module Tau-free and its
+  decision path reusable verbatim at both sites.
 - Settlement is recorded in the book keyed by the execution's settlement
   id — that is what makes "pays 5, once" a consensus property, not a
   client property. A second execution carrying an already-settled
@@ -56,6 +85,7 @@ from consensus.payment_calendar import SECONDS_PER_DAY
 from consensus.serialization import (
     compute_payout_rule_book_root,
     compute_payout_rule_id,
+    compute_payout_rule_tau_id,
 )
 
 TX_TYPE_INSTALL_PAYOUT_RULE = "install_payout_rule"
@@ -76,6 +106,24 @@ LEG_FIXED = 1
 LEG_BPS_OF_BASE = 2
 LEG_MODES = frozenset({LEG_FIXED, LEG_BPS_OF_BASE})
 MAX_LEG_BPS = 10_000
+
+# The two forms an entry can take. The form is a signed field of the rule:
+# it is inside the install signature and the rule id, so the form an
+# execution runs under is the form the owner signed.
+FORM_DECLARED_PROGRAM = 1
+FORM_TAU_RULE = 2
+PAYOUT_FORMS = frozenset({FORM_DECLARED_PROGRAM, FORM_TAU_RULE})
+
+# The Tau form's clause text bound, in UTF-8 bytes — the same bound the
+# rule-offer path puts on rule text (consensus/rule_offers
+# MAX_OFFER_RULE_BYTES), so a payout clause is no larger than a rule the
+# node already carries.
+MAX_PAYOUT_CLAUSE_BYTES = 8192
+
+# The Tau form's output encoding: o30 carries the leg count, then each leg
+# is a (recipient candidate index, amount) pair on consecutive streams.
+PAYOUT_OUTPUT_COUNT_STREAM = 30
+PAYOUT_OUTPUT_FIRST_STREAM = 31
 
 # Bounded state: one rule per owner, and the rule itself is small.
 MAX_RECIPIENTS = 32
@@ -107,7 +155,12 @@ class PayoutLeg:
 
 @dataclass(frozen=True)
 class PayoutRuleEntry:
-    """The signed terms of one payout rule version. Nothing here mutates."""
+    """The signed terms of one payout rule version. Nothing here mutates.
+
+    `form` and `clause_text` default to the declared-program form, so every
+    entry constructed before the Tau form existed — and every declared-form
+    entry constructed now — is byte-identical to what it was.
+    """
 
     owner_pubkey: str
     recipients: Tuple[str, ...]
@@ -117,9 +170,22 @@ class PayoutRuleEntry:
     period_seconds: int
     period_anchor_ts: int
     version: int
+    form: int = FORM_DECLARED_PROGRAM
+    clause_text: str = ""
 
     @property
     def rule_id(self) -> bytes:
+        if self.form == FORM_TAU_RULE:
+            return compute_payout_rule_tau_id(
+                self.owner_pubkey,
+                self.recipients,
+                self.clause_text,
+                self.max_per_execution,
+                self.max_per_period,
+                self.period_seconds,
+                self.period_anchor_ts,
+                self.version,
+            )
         return compute_payout_rule_id(
             self.owner_pubkey,
             self.recipients,
@@ -188,6 +254,111 @@ def compute_legs(
     return tuple(out)
 
 
+# --- The Tau form: input map and output decoding --------------------------------
+
+_OUTPUT_VALUE_RE = re.compile(
+    r"^\{?\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}?(?::bv\[\d+\])?$"
+)
+
+
+def _parse_output_value(value: Any) -> Optional[int]:
+    """One clause output as an integer, or None when it is not one.
+
+    The worker reports outputs as Tau value strings; this reads them with
+    the same grammar tau_policy.parse_o5 reads o5 with (hex / binary /
+    decimal, optional braces and :bv[N] annotation).
+    """
+    if value is None:
+        return None
+    match = _OUTPUT_VALUE_RE.match(str(value).strip())
+    if not match:
+        return None
+    hex_digits, bin_digits, dec_digits = match.groups()
+    if hex_digits is not None:
+        return int(hex_digits, 16)
+    if bin_digits is not None:
+        return int(bin_digits, 2)
+    return int(dec_digits)
+
+
+def payout_clause_inputs(
+    entry: PayoutRuleEntry,
+    executor_pubkey: str,
+    base_amount: int,
+    ts: int,
+    owner_balance: int,
+    period_paid_total: int,
+) -> Dict[int, Any]:
+    """The input map a Tau-form execution steps the owner's clause over.
+
+    ONE definition, called by the engine at apply and by admission at the
+    tip with their own site values — the construction cannot drift between
+    them. The value formats mirror the transfer input map
+    (consensus/engine._transfer_input_map) exactly: amounts and the
+    timestamp as decimal strings, accounts as `{ #x.. }:bv[384]` literals.
+
+    - i1: the execution's submitted base amount
+    - i2: the rule owner's balance
+    - i3: the rule owner's pubkey
+    - i4: the execution submitter's pubkey (anyone may execute)
+    - i5: the block timestamp
+    - i26 (tau_defs.PAYOUT_PERIOD_PAID_STREAM_INDEX): what this rule has
+      already paid in the period containing `ts`, from the book's recorded
+      totals — the release-schedule input a grant or vesting clause
+      computes its remaining allowance from
+
+    Nothing in the map comes from the execution transaction beyond the
+    base amount: the map is node-built, so no submitter can steer the
+    clause by writing a stream.
+    """
+    return {
+        1: str(int(base_amount)),
+        2: str(int(owner_balance)),
+        3: "{ #x" + str(entry.owner_pubkey) + " }:bv[384]",
+        4: "{ #x" + str(executor_pubkey) + " }:bv[384]",
+        5: str(int(ts)),
+        tau_defs.PAYOUT_PERIOD_PAID_STREAM_INDEX: str(int(period_paid_total)),
+    }
+
+
+def decode_clause_legs(
+    entry: PayoutRuleEntry, outputs: Dict[str, Any]
+) -> Tuple[Optional[Tuple[Tuple[str, int], ...]], str]:
+    """The legs a stepped clause named, or (None, why not).
+
+    The encoding (pinned in payout_rule_capabilities): o30 is the leg
+    count; leg k reads its recipient candidate index — 0-based into the
+    entry's canonical recipients tuple — from o(31+2k) and its amount from
+    o(32+2k). Zero-amount legs are dropped, as compute_legs drops them. A
+    count above MAX_LEGS, a missing or unreadable value, or an index
+    outside the declared set means the clause named something the node
+    cannot settle: no legs, and the execution settles nothing.
+    """
+    count = _parse_output_value(outputs.get(f"o{PAYOUT_OUTPUT_COUNT_STREAM}"))
+    if count is None:
+        return None, "the rule's clause did not report a leg count"
+    if count < 0 or count > MAX_LEGS:
+        return None, f"the rule's clause reported {count} legs"
+    legs: List[Tuple[str, int]] = []
+    for k in range(count):
+        index = _parse_output_value(
+            outputs.get(f"o{PAYOUT_OUTPUT_FIRST_STREAM + 2 * k}")
+        )
+        amount = _parse_output_value(
+            outputs.get(f"o{PAYOUT_OUTPUT_FIRST_STREAM + 2 * k + 1}")
+        )
+        if index is None or amount is None:
+            return None, "the rule's clause reported an unreadable leg"
+        if not 0 <= index < len(entry.recipients):
+            return None, (
+                "the rule's clause named recipient candidate "
+                f"{index}, outside the declared set"
+            )
+        if amount > 0:
+            legs.append((entry.recipients[index], amount))
+    return tuple(legs), ""
+
+
 # --- Parsing -------------------------------------------------------------------
 
 
@@ -253,19 +424,62 @@ def _legs_field(tx: Dict[str, Any]) -> Tuple[PayoutLeg, ...]:
     return tuple(out)
 
 
+def _form_field(tx: Dict[str, Any]) -> int:
+    value = tx.get("payout_form", FORM_DECLARED_PROGRAM)
+    if not _is_int(value) or value not in PAYOUT_FORMS:
+        raise PayoutRuleShapeError(
+            "payout_form must be 1 (declared program) or 2 (Tau rule)"
+        )
+    return value
+
+
+def _clause_field(tx: Dict[str, Any]) -> str:
+    value = tx.get("payout_clause", "")
+    if not isinstance(value, str):
+        raise PayoutRuleShapeError("payout_clause must be a string")
+    return value
+
+
 def parse_install_payout_rule(tx: Dict[str, Any]) -> PayoutRuleEntry:
-    """Read an installation from ROOT fields only; a nested `payload` is unsigned data."""
+    """Read an installation from ROOT fields only; a nested `payload` is unsigned data.
+
+    The form selects which leg source the root fields must carry: the
+    declared form reads `payout_legs` and refuses a clause; the Tau form
+    reads `payout_clause` and refuses a leg program. A transaction that
+    carries both (or neither) does not have a shape the node can record.
+    """
     if not isinstance(tx, dict):
         raise PayoutRuleShapeError("transaction must be an object")
+    form = _form_field(tx)
+    clause_text = _clause_field(tx)
+    if form == FORM_TAU_RULE:
+        if not clause_text:
+            raise PayoutRuleShapeError(
+                "a Tau-form payout rule must carry payout_clause"
+            )
+        raw_legs = tx.get("payout_legs")
+        if raw_legs:
+            raise PayoutRuleShapeError(
+                "a Tau-form payout rule carries no payout_legs program"
+            )
+        legs: Tuple[PayoutLeg, ...] = ()
+    else:
+        if clause_text:
+            raise PayoutRuleShapeError(
+                "payout_clause is only for the Tau form (payout_form 2)"
+            )
+        legs = _legs_field(tx)
     return PayoutRuleEntry(
         owner_pubkey=_pubkey_field(tx, "sender_pubkey"),
         recipients=_recipients_field(tx),
-        legs=_legs_field(tx),
+        legs=legs,
         max_per_execution=_u64_field(tx, "payout_max_per_execution"),
         max_per_period=_u64_field(tx, "payout_max_per_period"),
         period_seconds=_u64_field(tx, "payout_period_seconds"),
         period_anchor_ts=_u64_field(tx, "payout_period_anchor_ts"),
         version=_u64_field(tx, "payout_version", default=1),
+        form=form,
+        clause_text=clause_text,
     )
 
 
@@ -303,19 +517,33 @@ def validate_payout_rule_shape(
         return "the declared recipient set names an account twice"
     if entry.owner_pubkey in entry.recipients:
         return "a payout rule cannot pay its own owner"
-    if not 1 <= len(entry.legs) <= MAX_LEGS:
-        return f"a payout rule's program has 1..{MAX_LEGS} legs"
-    declared = set(entry.recipients)
-    for leg in entry.legs:
-        if leg.recipient_pubkey not in declared:
-            return "a leg pays a recipient outside the declared set"
-        if leg.mode not in LEG_MODES:
-            return "unknown leg mode"
-        if leg.mode == LEG_FIXED:
-            if not 1 <= leg.value <= tau_defs.MAX_TRANSFER_VALUE:
-                return "a fixed leg must be in 1..MAX_TRANSFER_VALUE"
-        elif not 1 <= leg.value <= MAX_LEG_BPS:
-            return "a basis-point leg must be in 1..10000"
+    if entry.form not in PAYOUT_FORMS:
+        return "unknown payout form"
+    if entry.form == FORM_TAU_RULE:
+        if entry.legs:
+            return "a Tau-form payout rule carries no leg program"
+        if not entry.clause_text:
+            return "a Tau-form payout rule must carry a clause"
+        if len(entry.clause_text.encode("utf-8")) > MAX_PAYOUT_CLAUSE_BYTES:
+            return (
+                f"a payout clause is at most {MAX_PAYOUT_CLAUSE_BYTES} bytes"
+            )
+    else:
+        if entry.clause_text:
+            return "a declared-form payout rule carries no clause"
+        if not 1 <= len(entry.legs) <= MAX_LEGS:
+            return f"a payout rule's program has 1..{MAX_LEGS} legs"
+        declared = set(entry.recipients)
+        for leg in entry.legs:
+            if leg.recipient_pubkey not in declared:
+                return "a leg pays a recipient outside the declared set"
+            if leg.mode not in LEG_MODES:
+                return "unknown leg mode"
+            if leg.mode == LEG_FIXED:
+                if not 1 <= leg.value <= tau_defs.MAX_TRANSFER_VALUE:
+                    return "a fixed leg must be in 1..MAX_TRANSFER_VALUE"
+            elif not 1 <= leg.value <= MAX_LEG_BPS:
+                return "a basis-point leg must be in 1..10000"
     if entry.max_per_execution > tau_defs.MAX_TRANSFER_VALUE:
         return "payout_max_per_execution exceeds the maximum transfer value"
     if entry.max_per_period > tau_defs.MAX_TRANSFER_VALUE:
@@ -331,7 +559,7 @@ def validate_payout_rule_shape(
 
 _EntryRow = Tuple[
     bytes, str, Tuple[str, ...], Tuple[Tuple[str, int, int], ...],
-    int, int, int, int, int, Tuple[Tuple[int, int], ...],
+    int, int, int, int, int, Tuple[Tuple[int, int], ...], int, str,
 ]
 _SettlementRow = Tuple[bytes, bytes, int, int, int]
 
@@ -376,12 +604,14 @@ class PayoutRuleBook:
         book = cls()
         for row in rows:
             (rule_id, owner, recipients, legs, max_exec, max_period,
-             period_seconds, anchor, version, period_totals) = row
+             period_seconds, anchor, version, period_totals,
+             form, clause_text) = row
             entry = PayoutRuleEntry(
                 owner,
                 tuple(recipients),
                 tuple(PayoutLeg(r, m, v) for r, m, v in legs),
                 max_exec, max_period, period_seconds, anchor, version,
+                form, clause_text,
             )
             if entry.rule_id != bytes(rule_id):
                 raise ValueError(
@@ -428,6 +658,8 @@ class PayoutRuleBook:
                     entry.period_anchor_ts,
                     entry.version,
                     tuple(sorted(totals.items())),
+                    entry.form,
+                    entry.clause_text,
                 )
             )
         return out
@@ -489,6 +721,19 @@ class PayoutRuleBook:
 
     def period_total(self, rule_id: bytes, period_index: int) -> int:
         return self._period_totals.get(bytes(rule_id), {}).get(period_index, 0)
+
+    def period_paid_total(self, entry: PayoutRuleEntry, ts: int) -> int:
+        """What `entry` has already paid in the period containing `ts`.
+
+        The value payout_clause_inputs feeds at i26: the book's recorded
+        total for that period, 0 before the first period. One definition
+        for admission and apply, so the clause sees the same paid total
+        at both sites (each site's own book state, as with the balance).
+        """
+        period = period_index_at(entry, ts)
+        if period < 0:
+            return 0
+        return self.period_total(entry.rule_id, period)
 
     # -- installation / removal ----------------------------------------------------
 
@@ -558,8 +803,17 @@ class PayoutRuleBook:
         base_amount: int,
         ts: int,
         owner_balance: int,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
     ) -> PayoutDecision:
-        """Pure evaluation: the decision an execution would produce."""
+        """Pure evaluation: the decision an execution would produce.
+
+        `clause_legs` is the Tau form's leg source: the legs the caller
+        decoded from stepping the entry's clause (the book never steps a
+        clause itself). A Tau-form entry evaluated without them refuses —
+        there is no second way to compute its legs. A declared-form entry
+        never consults the parameter; its legs come from compute_legs.
+        Every check below the leg computation is shared by both forms.
+        """
 
         def refuse(reason: str, period_index: int = -1) -> PayoutDecision:
             current = period_index_at(entry, ts) if period_index < 0 else period_index
@@ -577,7 +831,12 @@ class PayoutRuleBook:
         period = period_index_at(entry, ts)
         if period < 0:
             return refuse("the execution precedes the rule's first period")
-        legs = compute_legs(entry, base_amount)
+        if entry.form == FORM_TAU_RULE:
+            if clause_legs is None:
+                return refuse("the rule's clause was not evaluated", period)
+            legs = tuple(clause_legs)
+        else:
+            legs = compute_legs(entry, base_amount)
         if not legs:
             return refuse("the rule computes no payment for these inputs", period)
         declared = set(entry.recipients)
@@ -613,11 +872,13 @@ class PayoutRuleBook:
         base_amount: int,
         ts: int,
         owner_balance: int,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
     ) -> PayoutDecision:
         """What an execution would do, without doing it."""
         entry = self._entry(rule_id)
         return self._evaluate(
-            entry, bytes(settlement_id), base_amount, ts, owner_balance
+            entry, bytes(settlement_id), base_amount, ts, owner_balance,
+            clause_legs,
         )
 
     def execute(
@@ -627,6 +888,7 @@ class PayoutRuleBook:
         base_amount: int,
         ts: int,
         owner_balance: int,
+        clause_legs: Optional[Tuple[Tuple[str, int], ...]] = None,
     ) -> PayoutDecision:
         """Settle an execution, or settle nothing.
 
@@ -637,7 +899,9 @@ class PayoutRuleBook:
         """
         entry = self._entry(rule_id)
         settlement_id = bytes(settlement_id)
-        decision = self._evaluate(entry, settlement_id, base_amount, ts, owner_balance)
+        decision = self._evaluate(
+            entry, settlement_id, base_amount, ts, owner_balance, clause_legs
+        )
         if not decision.executed:
             return decision
         self._settlements[(entry.rule_id, settlement_id)] = PayoutSettlement(
@@ -669,8 +933,33 @@ def payout_rule_capabilities() -> Dict[str, Any]:
     """
     return {
         "supported": True,
+        "forms": {
+            "declared_program": FORM_DECLARED_PROGRAM,
+            "tau_rule": FORM_TAU_RULE,
+        },
         "leg_modes": {"fixed": LEG_FIXED, "bps_of_base": LEG_BPS_OF_BASE},
         "rounding": "floor on basis-point legs",
+        "tau_rule": {
+            "inputs": {
+                "i1": "the execution's base amount",
+                "i2": "the rule owner's balance",
+                "i3": "the rule owner's pubkey",
+                "i4": "the execution submitter's pubkey",
+                "i5": "the block timestamp",
+                tau_defs.TAU_INPUT_STREAM_PAYOUT_PERIOD_PAID: (
+                    "what this rule already paid in the current period"
+                ),
+            },
+            "outputs": {
+                f"o{PAYOUT_OUTPUT_COUNT_STREAM}": "the leg count",
+                "pairs": (
+                    f"from o{PAYOUT_OUTPUT_FIRST_STREAM}: per leg, a "
+                    "recipient candidate index (0-based into the declared "
+                    "recipient set) and an amount"
+                ),
+            },
+            "max_clause_bytes": MAX_PAYOUT_CLAUSE_BYTES,
+        },
         "caps": (
             "declared per execution and per period; 0 leaves that "
             "dimension uncapped"
