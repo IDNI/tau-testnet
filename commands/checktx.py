@@ -68,6 +68,8 @@ def execute(raw_command: str, container):
             data["note"] = "The fee check was skipped: no fee was evaluated."
         if result.get("update_id"):
             data["update_id"] = result["update_id"]
+        if result.get("route_previews"):
+            data["route_previews"] = result["route_previews"]
         return api_response.success_response("checktx", data)
 
     # Rejection: forward sendtx's own code and details unchanged, and say which
