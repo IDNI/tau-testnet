@@ -517,6 +517,35 @@ def init_db():
                     reject_detail TEXT
                 );
             ''')
+            # rule_outcomes records the engine's apply outcome for CONFIRMED
+            # op-0 (rule) transactions (issue #42): the revision receipt the
+            # block's proposer captured at apply time, so gettxstatus can show
+            # a confirmed rule took effect instead of only reporting
+            # rejections. Keyed by the transaction hash users query with.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_outcomes (
+                    tx_hash              TEXT NOT NULL,
+                    block_hash           TEXT NOT NULL,
+                    block_number         INTEGER NOT NULL,
+                    outcome              TEXT,
+                    spec_revision_before INTEGER,
+                    spec_revision_after  INTEGER,
+                    PRIMARY KEY (tx_hash, block_hash)
+                );
+            ''')
+            # spec_snapshots holds the canonical spec text the engine runs,
+            # captured at block commit whenever spec_revision advances
+            # (issue #42): the source for getactiverules. Sparse by design --
+            # blocks that do not move the spec store nothing.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS spec_snapshots (
+                    spec_revision INTEGER PRIMARY KEY,
+                    height        INTEGER NOT NULL,
+                    spec_hash     TEXT NOT NULL,
+                    spec_text     TEXT NOT NULL
+                );
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_spec_snapshots_height ON spec_snapshots(height);')
             dropped_cols = {
                 row[1] for row in conn.execute("PRAGMA table_info(mempool_dropped);").fetchall()
             }
@@ -1593,6 +1622,154 @@ def get_dropped_tx(tx_hash: str) -> Optional[Dict]:
         "reject_code": row[2],
         "reject_detail": row[3],
     }
+
+
+# --- Confirmed rule outcomes + spec snapshots (issue #42) ---
+
+def record_rule_outcomes(block_hash: str, block_number: int, outcomes) -> None:
+    """Persist apply outcomes for a committed block's confirmed rule txs.
+
+    `outcomes` maps tx_hash -> {"outcome", "spec_revision_before",
+    "spec_revision_after"} as captured from the engine's revision receipt at
+    apply time. Only the node that built the block records these; other
+    nodes see the transaction as confirmed without an outcome, exactly as
+    with rejection details."""
+    if not outcomes:
+        return
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        for tx_hash, outcome in outcomes.items():
+            outcome = outcome or {}
+            cur.execute(
+                "INSERT OR REPLACE INTO rule_outcomes "
+                "(tx_hash, block_hash, block_number, outcome, "
+                "spec_revision_before, spec_revision_after) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    tx_hash,
+                    block_hash,
+                    int(block_number),
+                    outcome.get("outcome"),
+                    outcome.get("spec_revision_before"),
+                    outcome.get("spec_revision_after"),
+                ),
+            )
+        _db_conn.commit()
+
+
+def get_rule_outcome(tx_hash: str, block_hash: str = None) -> Optional[Dict]:
+    """Return the recorded apply outcome for a confirmed rule tx, or None.
+
+    With `block_hash`, the row for that block; without it, the first recorded
+    row for the hash. Keys mirror the revision receipt fields gettxstatus
+    merges into its confirmed branch."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        if block_hash:
+            cur.execute(
+                "SELECT outcome, spec_revision_before, spec_revision_after "
+                "FROM rule_outcomes WHERE tx_hash = ? AND block_hash = ? LIMIT 1",
+                (tx_hash, block_hash),
+            )
+        else:
+            cur.execute(
+                "SELECT outcome, spec_revision_before, spec_revision_after "
+                "FROM rule_outcomes WHERE tx_hash = ? LIMIT 1",
+                (tx_hash,),
+            )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "outcome": row[0],
+        "spec_revision_before": row[1],
+        "spec_revision_after": row[2],
+    }
+
+
+def record_spec_snapshot(spec_revision: int, height: int, spec_text: str,
+                         spec_hash: str) -> None:
+    """Store the canonical spec text at a spec_revision (idempotent)."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO spec_snapshots "
+            "(spec_revision, height, spec_hash, spec_text) VALUES (?, ?, ?, ?)",
+            (int(spec_revision), int(height), spec_hash, spec_text),
+        )
+        _db_conn.commit()
+
+
+def _spec_snapshot_dict(row) -> Optional[Dict]:
+    if not row:
+        return None
+    return {
+        "spec_revision": row[0],
+        "height": row[1],
+        "spec_hash": row[2],
+        "spec_text": row[3],
+    }
+
+
+def get_latest_spec_snapshot() -> Optional[Dict]:
+    """The snapshot with the highest spec_revision, or None."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT spec_revision, height, spec_hash, spec_text "
+            "FROM spec_snapshots ORDER BY spec_revision DESC LIMIT 1"
+        )
+        return _spec_snapshot_dict(cur.fetchone())
+
+
+def get_spec_snapshot_at_or_before(height: int) -> Optional[Dict]:
+    """The newest snapshot committed at or before `height`, or None."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT spec_revision, height, spec_hash, spec_text "
+            "FROM spec_snapshots WHERE height <= ? "
+            "ORDER BY spec_revision DESC LIMIT 1",
+            (int(height),),
+        )
+        return _spec_snapshot_dict(cur.fetchone())
+
+
+def get_earliest_spec_snapshot() -> Optional[Dict]:
+    """The snapshot with the lowest spec_revision, or None."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT spec_revision, height, spec_hash, spec_text "
+            "FROM spec_snapshots ORDER BY spec_revision ASC LIMIT 1"
+        )
+        return _spec_snapshot_dict(cur.fetchone())
+
+
+def get_spec_snapshot_by_revision(spec_revision: int) -> Optional[Dict]:
+    """The snapshot recorded for exactly `spec_revision`, or None."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT spec_revision, height, spec_hash, spec_text "
+            "FROM spec_snapshots WHERE spec_revision = ? LIMIT 1",
+            (int(spec_revision),),
+        )
+        return _spec_snapshot_dict(cur.fetchone())
 
 
 def get_tx_block_locations(tx_hash: str) -> List[Dict]:
