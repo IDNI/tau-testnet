@@ -109,6 +109,36 @@ def clause_blocks(body, values: dict, *, pool: str,
     return verdict.blocked, str(verdict.o5)
 
 
+def clause_outputs(body, values: dict, *, pool: str,
+                   timeout=_SESSION_DEFAULT) -> tuple[dict | None, str]:
+    """(outputs, detail) for `body` against one purpose-built input map.
+
+    The outputs counterpart of clause_blocks, for clauses that COMPUTE a
+    decision rather than only allow/block it (payout rules read their legs
+    from the outputs). outputs is None when the clause does not build,
+    cannot be stepped, or writes a blocking o5 (parse_o5 == 0) — the
+    clause's own gate; the detail says which. An absent o5 does not block.
+    Loss of the evaluator propagates, exactly as in clause_blocks.
+    """
+    if not body:
+        return None, "empty clause body"
+    try:
+        result = evaluator(pool).outputs(
+            body, clause_inputs(values), timeout=timeout
+        )
+    except (PolicyBuildError, PolicyStepError) as exc:
+        return None, str(exc)
+    outputs = dict(result.outputs or {})
+    o5 = outputs.get("o5")
+    if o5 is not None:
+        try:
+            if tau_policy.parse_o5(o5) == 0:
+                return None, f"the clause returned a blocking o5 ({o5})"
+        except Exception as exc:  # an unreadable o5 says nothing usable
+            return None, f"the clause returned an unreadable o5 ({exc})"
+    return outputs, ""
+
+
 def clause_builds(body, *, pool: str, timeout=_SESSION_DEFAULT) -> tuple[bool, str]:
     """(ok, engine_error) for building `always ( body ).` in the pool's evaluator.
 

@@ -176,7 +176,8 @@ class _PolicyWorker:
         self.state_revision += 1
         itp, info = self._build(key, text)
         if itp is None:
-            return {"ok": False, "phase": "build", "o5": None, "asked": [], **info}
+            return {"ok": False, "phase": "build", "o5": None, "outputs": {},
+                    "asked": [], **info}
         reports = []
         with _Capture() as cap:
             outs, asked = self._step_interpreter(itp, inputs, reports)
@@ -186,11 +187,15 @@ class _PolicyWorker:
         info["report"] = _report_summary(*reports)
         info["capture_complete"] = bool(info["capture_complete"] and cap.complete)
         if outs is None:
-            return {"ok": False, "phase": "step", "o5": None, "asked": names,
+            return {"ok": False, "phase": "step", "o5": None, "outputs": {},
+                    "asked": names,
                     "error": info["diagnostics"][:_ERROR_LIMIT], **info}
         named = {k.name: str(v) for k, v in outs.items()}
-        return {"ok": True, "phase": "step", "o5": named.get("o5"), "asked": names,
-                **info}
+        # "outputs" carries every stream the clause wrote, not just o5:
+        # callers that execute clause-computed decisions (payout rules)
+        # read their legs from it. verdict() keeps reading only o5.
+        return {"ok": True, "phase": "step", "o5": named.get("o5"),
+                "outputs": named, "asked": names, **info}
 
     def stats(self) -> dict:
         self.state_revision += 1

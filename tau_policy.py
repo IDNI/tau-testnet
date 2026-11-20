@@ -73,6 +73,19 @@ class PolicyVerdict:
     built: bool
 
 
+@dataclass(frozen=True)
+class PolicyOutputs:
+    """Every output stream a stepped clause wrote, keyed by stream name.
+
+    verdict() reads only o5; outputs() is the same step with the worker's
+    full output map, for callers whose clause computes a decision richer
+    than allow/block (payout rules read their legs from it).
+    """
+
+    outputs: dict
+    built: bool
+
+
 def clause_key(body: str) -> str:
     return blake3(body.encode("utf-8")).hexdigest()
 
@@ -181,6 +194,28 @@ class PolicyEvaluator:
         o5 = resp.get("o5")
         value = parse_o5(o5)
         return PolicyVerdict(blocked=value == 0, o5=o5, built=bool(resp.get("built")))
+
+    def outputs(self, body: str, inputs: dict, *,
+                timeout=_SESSION_DEFAULT) -> PolicyOutputs:
+        """Step a clause and return ALL of its outputs, not just o5.
+
+        Same build/step failure discipline as verdict(): a clause that
+        does not build raises PolicyBuildError, one that cannot be
+        stepped raises PolicyStepError, and evaluator loss propagates.
+        """
+        resp = self._run(
+            {"op": "step", "key": clause_key(body), "text": body,
+             "inputs": dict(inputs or {})},
+            timeout,
+        )
+        if not resp.get("ok"):
+            if resp.get("phase") == "build":
+                raise PolicyBuildError(str(resp.get("error") or ""))
+            if resp.get("phase") == "step":
+                raise PolicyStepError(str(resp.get("error") or ""))
+            raise SpeculationError(f"policy step failed: {_failure_text(resp)}")
+        return PolicyOutputs(outputs=dict(resp.get("outputs") or {}),
+                             built=bool(resp.get("built")))
 
     def stats(self) -> dict:
         with self._lock:

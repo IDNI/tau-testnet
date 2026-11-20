@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional
 from tau_policy import (
     PolicyBuild,
     PolicyBuildError,
+    PolicyOutputs,
     PolicyStepError,
     PolicyVerdict,
     parse_o5,
@@ -23,8 +24,10 @@ class MockPolicyEvaluator:
         self._failing: dict = {}
         self._refused: dict = {}
         self._by_body: dict = {}
+        self._outputs_by_body: dict = {}
         self.validate_calls: list = []
         self.verdict_calls: list = []
+        self.outputs_calls: list = []
         self.closed = False
 
     def fail_build(self, body: str, error: str = "mock build failure") -> None:
@@ -37,6 +40,12 @@ class MockPolicyEvaluator:
     def set_verdict(self, body: str, decide) -> None:
         """`decide` is a constant o5 value (or None) or a callable (inputs) -> o5."""
         self._by_body[body] = decide
+
+    def set_outputs(self, body: str, decide) -> None:
+        """`decide` is a dict of output values or a callable (inputs) -> dict,
+        served by outputs() for this body (mirrors the real worker returning
+        every stream the clause wrote)."""
+        self._outputs_by_body[body] = decide
 
     def validate(self, body: str, *, timeout=None) -> PolicyBuild:
         self.validate_calls.append(body)
@@ -59,6 +68,27 @@ class MockPolicyEvaluator:
             value = rule
         o5 = None if value is None else str(value)
         return PolicyVerdict(blocked=parse_o5(o5) == 0, o5=o5, built=True)
+
+    def outputs(self, body: str, inputs: dict, *, timeout=None) -> PolicyOutputs:
+        """The mock's outputs(): same build/step failure discipline as
+        verdict(). Without a set_outputs hook for the body, the outputs are
+        whatever the verdict path decided ({"o5": ...} or {})."""
+        self.outputs_calls.append((body, dict(inputs or {})))
+        error = self._build_error(body)
+        if error:
+            raise PolicyBuildError(error)
+        if body in self._refused:
+            raise PolicyStepError(self._refused[body])
+        if body in self._outputs_by_body:
+            rule = self._outputs_by_body[body]
+            produced = rule(inputs) if callable(rule) else rule
+            return PolicyOutputs(
+                outputs={str(k): str(v) for k, v in dict(produced or {}).items()},
+                built=True)
+        verdict = self.verdict(body, inputs)
+        return PolicyOutputs(
+            outputs={} if verdict.o5 is None else {"o5": verdict.o5},
+            built=True)
 
     def stats(self) -> dict:
         return {"pool": self.pool, "builds": len(self.validate_calls),
