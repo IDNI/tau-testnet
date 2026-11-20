@@ -15,8 +15,9 @@ engine-level tests therefore drive apply() through a scripted session that
 models pointwise revision exactly as the probe defines it, and through the
 live InProcessSession with tau_manager patched (the pattern of
 test_apply_rejection_atomicity.py). The maintainers' probe on the real
-engine is included as test_displacement_probe_on_native_engine and skips
-when the bindings are absent.
+engine lives in test_active_rules_issue42_native.py, so the real-Tau CI
+job can register exactly that file; it skips when the bindings are
+absent.
 """
 import hashlib
 import json
@@ -687,40 +688,3 @@ def test_survival_ledger_maintainer_scenario_via_engine(temp_database):
     assert ledger["p2"]["status"] == "in_force"
     assert ledger["p2"]["installed_fragments"] == [FRAG_O26_3]
 
-
-# --- The maintainers' probe on the native engine ----------------------------
-
-def _native_available():
-    try:
-        from tau_native import load_tau_module
-
-        load_tau_module()
-        return True
-    except Exception:
-        return False
-
-
-@pytest.mark.skipif(
-    not _native_available(),
-    reason="native tau-lang bindings not available in this environment",
-)
-def test_displacement_probe_on_native_engine(tmp_path):
-    """The Sep 27 probe on the real engine: two fresh interpreters fed the
-    same units must run the same spec (o26 = 3, o27 = 9), with identical
-    text and hash -- the determinism premise the snapshot view relies on."""
-    from tau_native import TauInterface
-
-    unit1 = ("always ( o26[t]:bv[24] = { 7 }:bv[24] && "
-             "o27[t]:bv[24] = { 9 }:bv[24] ).")
-    unit2 = "always ( o26[t]:bv[24] = { 3 }:bv[24] )."
-    specs = []
-    for _ in range(2):
-        ti = TauInterface("genesis.tau")
-        ti.communicate(rule_text=unit1, target_output_stream_index=0)
-        ti.communicate(rule_text=unit2, target_output_stream_index=0)
-        specs.append(ti.get_current_spec())
-    assert specs[0] == specs[1]
-    assert hashlib.sha256(specs[0].encode()).hexdigest() == \
-        hashlib.sha256(specs[1].encode()).hexdigest()
-    assert "o26" in specs[0] and "{ 3 }" in specs[0]
-    assert "{ 7 }" not in specs[0].split("o27")[0]
