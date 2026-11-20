@@ -476,6 +476,19 @@ def init_db():
                     PRIMARY KEY (retractable_id, block_hash, outcome)
                 );
             ''')
+            # Programmable payments (Bounty 01): the four payment books.
+            # Bound into consensus_meta_hash, so written in the same
+            # transaction as accounts. One row per book section, holding the
+            # book's snapshot_rows() as JSON: the books' rows are nested
+            # (terms, settled periods, period counters), and the JSON form
+            # is exactly what ProgrammablePayments.restore consumes, so the
+            # stored form and the restore form cannot drift apart.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS programmable_payments_v1 (
+                    section  TEXT PRIMARY KEY,
+                    row_json TEXT NOT NULL
+                );
+            ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -2243,7 +2256,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, programmable_payments: Dict | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2282,6 +2295,7 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 approval_slots_active=approval_slots_active,
                 retractable_transfers=retractable_transfers,
                 rule_change_requests=rule_change_requests,
+                programmable_payments=programmable_payments,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
 
@@ -2346,7 +2360,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, programmable_payments: Dict | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2555,6 +2569,9 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
     if retractable_transfers is not None:
         _write_retractable_rows(retractable_transfers)
 
+    if programmable_payments is not None:
+        _write_payments_rows(programmable_payments)
+
     if max_rule_txs_per_block is not None:
         # Governance-activated value; persisted verbatim so a reload
         # reproduces the same per-block budget as a from-genesis replay.
@@ -2620,6 +2637,44 @@ def load_retractable_state() -> tuple[List[tuple], int, bytes]:
         count,
         acc,
     )
+
+
+# Section names of the programmable-payments snapshot, in the shape
+# ProgrammablePayments.snapshot_rows() produces and .restore() consumes.
+_PAYMENT_SECTIONS = ("standing", "routes", "payouts", "grants")
+
+
+def _write_payments_rows(state: Dict) -> None:
+    """Full replace of the payment books' snapshot rows, one row per section."""
+    _db_conn.execute('DELETE FROM programmable_payments_v1')
+    for section in _PAYMENT_SECTIONS:
+        _db_conn.execute(
+            'INSERT INTO programmable_payments_v1 (section, row_json) '
+            'VALUES (?, ?)',
+            (section, json.dumps(state.get(section), sort_keys=True)),
+        )
+
+
+def load_payments_state() -> Dict:
+    """The payment books' snapshot rows exactly as stored.
+
+    Absent sections mean empty books: the returned dict always has the
+    full ProgrammablePayments.restore shape, with empty standing / routes
+    / payouts lists and an empty grants section.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT section, row_json FROM programmable_payments_v1'
+        ).fetchall()
+    stored = {section: json.loads(raw) for section, raw in rows}
+    return {
+        "standing": stored.get("standing") or [],
+        "routes": stored.get("routes") or [],
+        "payouts": stored.get("payouts") or [],
+        "grants": stored.get("grants") or {"grants": [], "shared_caps": []},
+    }
 
 
 def get_open_retractables(address: str, role: str = "all") -> List[Dict]:

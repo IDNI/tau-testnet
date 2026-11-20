@@ -780,3 +780,44 @@ def compute_retractable_book_root(
     out.extend(encode_uint64(int(resolved_count)))
     out.extend(encode_hash32(resolved_acc))
     return blake3(bytes(out)).digest()
+
+
+# --- Programmable payments (issues #34, #35, #63) ----------------------------
+
+DOMAIN_PAYMENTS_BOOK_V1 = b"tau.payments.book.v1"
+
+
+def compute_payment_entry_id(entry_domain: str, encoded_fields: bytes) -> bytes:
+    """BLAKE3 id of one payment-book entry.
+
+    `entry_domain` separates the entry types (authorization, route, payout
+    rule, grant, shared cap); `encoded_fields` is the caller-built canonical
+    encoding of the entry's signed fields, in field order. Content-derived,
+    like the retractable id: the apply-time tx_id differs between proposer
+    and validators, so identity must come from the signed content itself.
+    """
+    out = bytearray()
+    out.extend(encode_string(entry_domain))
+    out.extend(encoded_fields)
+    return blake3(bytes(out)).digest()
+
+
+def compute_payments_book_root(section_blobs: list) -> bytes:
+    """BLAKE3 root of the programmable-payments books.
+
+    `section_blobs` is a list of sections (one per book); each section is a
+    list of canonical entry encodings (entry id followed by the entry's full
+    canonical state encoding). Sections are emitted in caller order; entries
+    within a section are sorted; every section is count-prefixed so a blob
+    can never migrate between sections without changing the root.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYMENTS_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(section_blobs)))
+    for blobs in section_blobs:
+        encoded = sorted(blobs or [])
+        out.extend(encode_uint32(len(encoded)))
+        for blob in encoded:
+            out.extend(encode_uint32(len(blob)))
+            out.extend(blob)
+    return blake3(bytes(out)).digest()
