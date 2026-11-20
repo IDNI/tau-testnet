@@ -118,7 +118,19 @@ def _parent(lm, balances=None):
 
 
 def _apply(txs, lm, *, parent=None, height=HEIGHT, blocked=frozenset(),
-           caps=None, decide=None, clause_decide=None):
+           caps=None, decide=None, clause_decide=None, recipient_policy=False):
+    # The gate is clause-triggered: a recipient the script gives a
+    # policy (blocked, recipient_policy) or a cap (caps) is a recipient
+    # who published one, modelled by registering the trigger clauses
+    # for BOB -- unless the test registered its own clause already.
+    if blocked or recipient_policy:
+        lm.rule_offers.accepted_clauses.setdefault(
+            (BOB, tau_defs.USER_POLICY_STREAM_INDEX),
+            "always ( o5[t]:bv[24] = { #x000001 }:bv[24] ).")
+    if caps:
+        lm.rule_offers.accepted_clauses.setdefault(
+            (BOB, tau_defs.RECIPIENT_HOLD_CAP_STREAM_INDEX),
+            "always ( o10[t]:bv[24] = { #x000000 }:bv[24] ).")
     if parent is None:
         parent = _parent(lm)
     view = ActiveConsensusView(
@@ -220,18 +232,18 @@ def test_recipient_rule_reads_counterparty_and_amount():
 
     lm = _lifecycle()
     big = _transfer(BOB, 600, SK_CAROL, sender=CAROL)
-    applied = _apply([big], lm, decide=decide)
+    applied = _apply([big], lm, decide=decide, recipient_policy=True)
     assert _outcome(applied, big["tx_id"]).reason == recipient_gate.REASON_POLICY_BLOCK
 
     lm = _lifecycle()
     small = _transfer(BOB, 400, SK_CAROL, sender=CAROL)
-    applied = _apply([small], lm, decide=decide)
+    applied = _apply([small], lm, decide=decide, recipient_policy=True)
     assert small["tx_id"] in applied.result.accepted_tx_ids
     assert _balances(applied)[BOB] == 400 - FEE or _balances(applied)[BOB] == 400
 
     lm = _lifecycle()
     other_sender = _transfer(BOB, 600, SK_ALICE)
-    applied = _apply([other_sender], lm, decide=decide)
+    applied = _apply([other_sender], lm, decide=decide, recipient_policy=True)
     assert other_sender["tx_id"] in applied.result.accepted_tx_ids
 
 
@@ -467,6 +479,12 @@ def admission_node(temp_database, mock_policy_evaluators, monkeypatch):
         patch.object(TipAdmissionView, "approval_slots_active",
                      new_callable=PropertyMock, return_value=True),
         patch.object(TipAdmissionView, "get_offer", return_value=None),
+        patch.object(TipAdmissionView, "clause_for",
+                     side_effect=lambda pk, stream: (
+                         "always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."
+                         if pk == BOB and (
+                             BOB in script["blocked"] or BOB in script["caps"])
+                         else None)),
     ]
     mocks = [p.start() for p in patches]
     mocks[3].is_set.return_value = True
