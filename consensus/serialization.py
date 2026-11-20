@@ -780,3 +780,264 @@ def compute_retractable_book_root(
     out.extend(encode_uint64(int(resolved_count)))
     out.extend(encode_hash32(resolved_acc))
     return blake3(bytes(out)).digest()
+
+
+# --- Conditional grants ------------------------------------------------------
+
+DOMAIN_GRANT_V1 = b"tau.grant.v1"
+DOMAIN_GRANT_RESOLVED_V1 = b"tau.grant.resolved.v1"
+DOMAIN_GRANT_BOOK_V1 = b"tau.grant.book.v1"
+
+
+def _encode_grant_terms(
+    grantor_pubkey: Any,
+    grantee_pubkey: Any,
+    refund_to_pubkey: Any,
+    amount: int,
+    sequence_number: int,
+    start_at: int,
+    expires_at: int,
+    spend_cap: int,
+    cap_period_kind: int,
+    cap_period_seconds: int,
+    per_payment_cap: int,
+    weekday_mask: int,
+    hour_mask: int,
+    revocable: bool,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(grantor_pubkey))
+    out.extend(encode_pubkey48(grantee_pubkey))
+    out.extend(encode_pubkey48(refund_to_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(encode_uint64(int(start_at)))
+    out.extend(encode_uint64(int(expires_at)))
+    out.extend(encode_uint64(int(spend_cap)))
+    out.extend(bytes([int(cap_period_kind) & 0xFF]))
+    out.extend(encode_uint64(int(cap_period_seconds)))
+    out.extend(encode_uint64(int(per_payment_cap)))
+    out.extend(bytes([int(weekday_mask) & 0x7F]))
+    out.extend(encode_uint32(int(hour_mask)))
+    out.extend(encode_bool(bool(revocable)))
+    return bytes(out)
+
+
+def compute_grant_id(*terms: Any) -> bytes:
+    """BLAKE3 of a grant's signed terms (``_encode_grant_terms`` order). 32 bytes.
+
+    Content-derived like the retractable id; sequence_number keeps two identical
+    grants from the same grantor apart.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_GRANT_V1.decode()))
+    out.extend(_encode_grant_terms(*terms))
+    return blake3(bytes(out)).digest()
+
+
+def compute_grant_resolved_acc(acc: Any, grant_id: Any, outcome: int) -> bytes:
+    """Fold one grant resolution into the running commitment. Order-dependent."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_GRANT_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(grant_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    return blake3(bytes(out)).digest()
+
+
+def encode_grant_entry(
+    grant_id: Any,
+    terms: tuple,
+    remaining: int,
+    cap_period_index: int,
+    spent_in_period: int,
+) -> bytes:
+    """One open grant: id, signed terms, then the mutable spending state."""
+    out = bytearray()
+    out.extend(encode_hash32(grant_id))
+    out.extend(_encode_grant_terms(*terms))
+    out.extend(encode_uint64(int(remaining)))
+    out.extend(encode_uint64(int(cap_period_index)))
+    out.extend(encode_uint64(int(spent_in_period)))
+    return bytes(out)
+
+
+def compute_grant_book_root(
+    open_entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    """BLAKE3 of the grant book: sorted open entries, then the resolved commitment."""
+    encoded = sorted(encode_grant_entry(*e) for e in (open_entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_GRANT_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()
+
+
+# --- Standing payments -------------------------------------------------------
+
+DOMAIN_STANDING_V1 = b"tau.standing.v1"
+DOMAIN_STANDING_RESOLVED_V1 = b"tau.standing.resolved.v1"
+DOMAIN_STANDING_BOOK_V1 = b"tau.standing.book.v1"
+
+
+def _encode_standing_terms(
+    payer_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    sequence_number: int,
+    period_kind: int,
+    period_seconds: int,
+    start_at: int,
+    due_day: int,
+    due_offset_seconds: int,
+    window_seconds: int,
+    end_at: int,
+    max_occurrences: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(payer_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(bytes([int(period_kind) & 0xFF]))
+    out.extend(encode_uint64(int(period_seconds)))
+    out.extend(encode_uint64(int(start_at)))
+    out.extend(bytes([int(due_day) & 0xFF]))
+    out.extend(encode_uint64(int(due_offset_seconds)))
+    out.extend(encode_uint64(int(window_seconds)))
+    out.extend(encode_uint64(int(end_at)))
+    out.extend(encode_uint64(int(max_occurrences)))
+    return bytes(out)
+
+
+def compute_standing_id(*terms: Any) -> bytes:
+    """BLAKE3 of a standing payment's signed terms. 32 bytes."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_V1.decode()))
+    out.extend(_encode_standing_terms(*terms))
+    return blake3(bytes(out)).digest()
+
+
+def compute_standing_resolved_acc(acc: Any, standing_id: Any, outcome: int) -> bytes:
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(standing_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    return blake3(bytes(out)).digest()
+
+
+def encode_standing_entry(
+    standing_id: Any, terms: tuple, next_period: int, executions: int, total_executed: int
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_hash32(standing_id))
+    out.extend(_encode_standing_terms(*terms))
+    out.extend(encode_uint64(int(next_period)))
+    out.extend(encode_uint64(int(executions)))
+    out.extend(encode_uint64(int(total_executed)))
+    return bytes(out)
+
+
+def compute_standing_book_root(
+    open_entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    encoded = sorted(encode_standing_entry(*e) for e in (open_entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()
+
+
+# --- Receive routes ----------------------------------------------------------
+
+DOMAIN_ROUTE_BOOK_V1 = b"tau.route.book.v1"
+
+
+def encode_route_entry(
+    owner_pubkey: Any, destination_pubkey: Any, bps: int, min_incoming: int,
+    activate_at: int, expires_at: int, locked_until: int, version: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(encode_pubkey48(destination_pubkey))
+    out.extend(encode_uint32(int(bps)))
+    out.extend(encode_uint64(int(min_incoming)))
+    out.extend(encode_uint64(int(activate_at)))
+    out.extend(encode_uint64(int(expires_at)))
+    out.extend(encode_uint64(int(locked_until)))
+    out.extend(encode_uint64(int(version)))
+    return bytes(out)
+
+
+def compute_route_book_root(entries: list, changes: int) -> bytes:
+    """BLAKE3 of the installed routes (sorted) and the count of changes so far."""
+    encoded = sorted(encode_route_entry(*e) for e in (entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ROUTE_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(changes)))
+    return blake3(bytes(out)).digest()
+
+
+# --- Payout rules ------------------------------------------------------------
+
+DOMAIN_PAYOUT_RULE_V1 = b"tau.payout.rule.v1"
+DOMAIN_PAYOUT_BOOK_V1 = b"tau.payout.book.v1"
+
+
+def _encode_payout_terms(owner_pubkey: Any, rule_text: str, recipients: tuple,
+                         max_per_execution: int, max_per_period: int,
+                         period_kind: int, period_seconds: int, start_at: int,
+                         expires_at: int, sequence_number: int) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(encode_string(rule_text))
+    out.extend(encode_uint32(len(recipients)))
+    for r in recipients:
+        out.extend(encode_pubkey48(r))
+    out.extend(encode_uint64(int(max_per_execution)))
+    out.extend(encode_uint64(int(max_per_period)))
+    out.extend(bytes([int(period_kind) & 0xFF]))
+    out.extend(encode_uint64(int(period_seconds)))
+    out.extend(encode_uint64(int(start_at)))
+    out.extend(encode_uint64(int(expires_at)))
+    out.extend(encode_uint64(int(sequence_number)))
+    return bytes(out)
+
+
+def compute_payout_rule_id(*terms: Any) -> bytes:
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_RULE_V1.decode()))
+    out.extend(_encode_payout_terms(*terms))
+    return blake3(bytes(out)).digest()
+
+
+def compute_payout_book_root(entries: list, changes: int) -> bytes:
+    """entries: (rule_id, terms_tuple, period_index, paid_in_period, executions, total)."""
+    encoded = []
+    for rid, terms, period_index, paid, executions, total in entries or []:
+        blob = bytearray()
+        blob.extend(encode_hash32(rid))
+        blob.extend(_encode_payout_terms(*terms))
+        for v in (period_index, paid, executions, total):
+            blob.extend(encode_uint64(int(v)))
+        encoded.append(bytes(blob))
+    encoded.sort()
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(changes)))
+    return blake3(bytes(out)).digest()

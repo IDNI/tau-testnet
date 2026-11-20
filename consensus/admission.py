@@ -48,6 +48,42 @@ from consensus.approvals import (
     validate_request_shape,
     validate_rule_change_shape,
 )
+from consensus.chain_binding import check_chain_id
+from consensus.payouts import (
+    PAYOUT_POLICY_POOL,
+    PayoutShapeError,
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_INSTALL,
+    TX_TYPE_PAYOUT_REMOVE,
+    parse_payout_execute,
+    parse_payout_install,
+    parse_payout_remove,
+)
+from consensus.routes import (
+    RouteShapeError,
+    TX_TYPE_ROUTE_REMOVE,
+    TX_TYPE_ROUTE_SET,
+    parse_route_remove,
+    parse_route_set,
+)
+from consensus.standing import (
+    StandingShapeError,
+    TX_TYPE_STANDING_CANCEL,
+    TX_TYPE_STANDING_CREATE,
+    TX_TYPE_STANDING_EXECUTE,
+    parse_standing_cancel,
+    parse_standing_create,
+    parse_standing_execute,
+)
+from consensus.grants import (
+    GrantShapeError,
+    TX_TYPE_GRANT_CANCEL,
+    TX_TYPE_GRANT_CREATE,
+    TX_TYPE_GRANT_DRAW,
+    parse_grant_cancel,
+    parse_grant_create,
+    parse_grant_draw,
+)
 from consensus.retractable import (
     KIND_HEIGHT,
     MAX_OPEN_RETRACTABLE_PER_SENDER,
@@ -1618,6 +1654,187 @@ def validate_retract_transfer_payload(
     return success({"retractable_id": request.retractable_id.hex()})
 
 
+# --- Conditional grants --------------------------------------------------------
+
+def validate_grant_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+    """Tau-free screens for grant_create / grant_draw / grant_cancel.
+
+    The book checks are the same functions block apply runs, against the
+    committed book and the advisory next-block timestamp; apply re-judges on the
+    real block timestamp. For grant_create the o5 verdict, fee and funds checks
+    run on the sendtx path, as for a retractable park.
+    """
+    chain_error = check_chain_id(tx)
+    if chain_error:
+        return format_error(f"{tx.get('tx_type')} rejected: {chain_error}", code="WRONG_CHAIN_ID")
+    tx_type = tx.get("tx_type")
+    sender = tx.get("sender_pubkey")
+    ts = tip_view.next_block_timestamp
+    book = tip_view.grant_book()
+    try:
+        if tx_type == TX_TYPE_GRANT_CREATE:
+            terms = parse_grant_create(tx)
+            signer = terms.grantor_pubkey
+        elif tx_type == TX_TYPE_GRANT_DRAW:
+            draw = parse_grant_draw(tx)
+            signer = draw.grantee_pubkey
+        else:
+            cancel = parse_grant_cancel(tx)
+            signer = cancel.grantor_pubkey
+    except GrantShapeError as exc:
+        return format_error(f"Malformed {tx_type}: {exc}.")
+    if not isinstance(sender, str) or sender != signer:
+        return format_error(f"{tx_type} sender_pubkey must match the signer.")
+
+    if tx_type == TX_TYPE_GRANT_CREATE:
+        for name in ("grantee_pubkey", "refund_to_pubkey"):
+            err = validate_bls_pubkey(getattr(terms, name), name)
+            if err:
+                return format_error(f"grant_create rejected: {err}")
+        ok, reason = book.can_admit_create(terms, ts)
+        if not ok:
+            return format_error(f"grant_create rejected: {reason}", code="GRANT_REJECTED")
+        return success({
+            "grant_id": terms.grant_id.hex(),
+            "amount": terms.amount,
+            "grantee_pubkey": terms.grantee_pubkey,
+        })
+    if tx_type == TX_TYPE_GRANT_DRAW:
+        err = validate_bls_pubkey(draw.recipient_pubkey, "recipient_pubkey")
+        if err:
+            return format_error(f"grant_draw rejected: {err}")
+        ok, reason = book.can_admit_draw(draw, ts)
+        if not ok:
+            return format_error(f"grant_draw rejected: {reason}", code="GRANT_DRAW_REJECTED")
+        return success({"grant_id": draw.grant_id.hex(), "amount": draw.amount})
+    ok, reason = book.can_admit_cancel(cancel, ts)
+    if not ok:
+        return format_error(f"grant_cancel rejected: {reason}", code="GRANT_CANCEL_REJECTED")
+    return success({"grant_id": cancel.grant_id.hex()})
+
+
+def validate_payout_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+    """Screens for payout_rule_install / payout_execute / payout_rule_remove.
+
+    An install must build in the payout policy pool (anti-spam: a rule that can
+    never run is refused up front). An execution's amounts are computed and
+    judged at apply, on the real block and balances.
+    """
+    chain_error = check_chain_id(tx)
+    if chain_error:
+        return format_error(f"{tx.get('tx_type')} rejected: {chain_error}", code="WRONG_CHAIN_ID")
+    tx_type = tx.get("tx_type")
+    ts = tip_view.next_block_timestamp
+    book = tip_view.payout_book()
+    try:
+        if tx_type == TX_TYPE_PAYOUT_INSTALL:
+            obj = parse_payout_install(tx)
+            signer = obj.owner_pubkey
+        elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+            obj = parse_payout_execute(tx)
+            signer = obj.executor_pubkey
+        else:
+            obj = parse_payout_remove(tx)
+            signer = obj.owner_pubkey
+    except PayoutShapeError as exc:
+        return format_error(f"Malformed {tx_type}: {exc}.")
+    if tx.get("sender_pubkey") != signer:
+        return format_error(f"{tx_type} sender_pubkey must match the signer.")
+    if tx_type == TX_TYPE_PAYOUT_INSTALL:
+        for r in obj.recipients:
+            err = validate_bls_pubkey(r, "recipient")
+            if err:
+                return format_error(f"{tx_type} rejected: {err}")
+        ok, reason = book.can_admit_install(obj, ts)
+        if ok:
+            from consensus import sender_policy
+            builds, build_error = sender_policy.clause_builds(obj.rule_text, pool=PAYOUT_POLICY_POOL)
+            if not builds:
+                return format_error(f"{tx_type} rejected: rule does not build ({build_error})",
+                                    code="PAYOUT_RULE_INVALID")
+        rid = obj.rule_id.hex()
+    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+        ok, reason = book.can_admit_execute(obj, ts)
+        rid = obj.rule_id.hex()
+    else:
+        ok, reason = book.can_admit_remove(obj, ts)
+        rid = obj.rule_id.hex()
+    if not ok:
+        return format_error(f"{tx_type} rejected: {reason}", code="PAYOUT_REJECTED")
+    return success({"rule_id": rid})
+
+
+def validate_route_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+    """Screens for receive_route_set / receive_route_remove, shared with apply."""
+    chain_error = check_chain_id(tx)
+    if chain_error:
+        return format_error(f"{tx.get('tx_type')} rejected: {chain_error}", code="WRONG_CHAIN_ID")
+    tx_type = tx.get("tx_type")
+    ts = tip_view.next_block_timestamp
+    book = tip_view.route_book()
+    try:
+        obj = parse_route_set(tx) if tx_type == TX_TYPE_ROUTE_SET else parse_route_remove(tx)
+    except RouteShapeError as exc:
+        return format_error(f"Malformed {tx_type}: {exc}.")
+    if tx.get("sender_pubkey") != obj.owner_pubkey:
+        return format_error(f"{tx_type} sender_pubkey must match the signer.")
+    if tx_type == TX_TYPE_ROUTE_SET:
+        err = validate_bls_pubkey(obj.destination_pubkey, "destination_pubkey")
+        if err:
+            return format_error(f"{tx_type} rejected: {err}")
+        ok, reason = book.can_admit_set(obj, ts)
+    else:
+        ok, reason = book.can_admit_remove(obj, ts)
+    if not ok:
+        return format_error(f"{tx_type} rejected: {reason}", code="ROUTE_REJECTED")
+    return success({"owner_pubkey": obj.owner_pubkey})
+
+
+def validate_standing_payload(tx: Dict, tip_view: TipAdmissionView) -> AdmissionResult:
+    """Tau-free screens for standing_payment_create / _execute / _cancel.
+
+    Same book checks as block apply, against the committed book and the
+    advisory next-block timestamp. The payer's o5 verdict and funds for an
+    execution are judged at apply, on the real block.
+    """
+    chain_error = check_chain_id(tx)
+    if chain_error:
+        return format_error(f"{tx.get('tx_type')} rejected: {chain_error}", code="WRONG_CHAIN_ID")
+    tx_type = tx.get("tx_type")
+    sender = tx.get("sender_pubkey")
+    ts = tip_view.next_block_timestamp
+    book = tip_view.standing_book()
+    try:
+        if tx_type == TX_TYPE_STANDING_CREATE:
+            obj = parse_standing_create(tx)
+            signer = obj.payer_pubkey
+        elif tx_type == TX_TYPE_STANDING_EXECUTE:
+            obj = parse_standing_execute(tx)
+            signer = obj.executor_pubkey
+        else:
+            obj = parse_standing_cancel(tx)
+            signer = obj.payer_pubkey
+    except StandingShapeError as exc:
+        return format_error(f"Malformed {tx_type}: {exc}.")
+    if not isinstance(sender, str) or sender != signer:
+        return format_error(f"{tx_type} sender_pubkey must match the signer.")
+    if tx_type == TX_TYPE_STANDING_CREATE:
+        err = validate_bls_pubkey(obj.recipient_pubkey, "recipient_pubkey")
+        if err:
+            return format_error(f"{tx_type} rejected: {err}")
+        ok, reason = book.can_admit_create(obj, ts)
+        code = "STANDING_REJECTED"
+    elif tx_type == TX_TYPE_STANDING_EXECUTE:
+        ok, reason = book.can_admit_execute(obj, ts)
+        code = "STANDING_NOT_DUE"
+    else:
+        ok, reason = book.can_admit_cancel(obj, ts)
+        code = "STANDING_CANCEL_REJECTED"
+    if not ok:
+        return format_error(f"{tx_type} rejected: {reason}", code=code)
+    return success({"standing_id": obj.standing_id.hex()})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -1728,6 +1945,18 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
          return validate_retract_transfer_payload(payload, tip_view)
+
+    elif tx_type in (TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW, TX_TYPE_GRANT_CANCEL):
+         return validate_grant_payload(payload, tip_view)
+
+    elif tx_type in (TX_TYPE_STANDING_CREATE, TX_TYPE_STANDING_EXECUTE, TX_TYPE_STANDING_CANCEL):
+         return validate_standing_payload(payload, tip_view)
+
+    elif tx_type in (TX_TYPE_ROUTE_SET, TX_TYPE_ROUTE_REMOVE):
+         return validate_route_payload(payload, tip_view)
+
+    elif tx_type in (TX_TYPE_PAYOUT_INSTALL, TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_PAYOUT_REMOVE):
+         return validate_payout_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

@@ -189,8 +189,10 @@ class _PolicyWorker:
             return {"ok": False, "phase": "step", "o5": None, "asked": names,
                     "error": info["diagnostics"][:_ERROR_LIMIT], **info}
         named = {k.name: str(v) for k, v in outs.items()}
-        return {"ok": True, "phase": "step", "o5": named.get("o5"), "asked": names,
-                **info}
+        # `outputs` carries every output stream the clause wrote, for callers
+        # that read more than o5 (payout rules, #63); `o5` is kept as before.
+        return {"ok": True, "phase": "step", "o5": named.get("o5"), "outputs": named,
+                "asked": names, **info}
 
     def stats(self) -> dict:
         self.state_revision += 1

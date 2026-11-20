@@ -27,7 +27,9 @@ PIN_BUILD_SECONDS = 0.100
 RECYCLE_BUILDS = 500
 RECYCLE_STEPS = 20_000
 RECYCLE_RSS_BYTES = 1 << 30
-POOL_NAMES = ("apply", "admission")
+# "payout" steps rule-computed payout clauses (#63) in a worker of its own, so
+# their stream typing never meets an o5 clause's.
+POOL_NAMES = ("apply", "admission", "payout")
 
 # Without an injected probe, worker memory is read this often (in requests).
 RSS_PROBE_EVERY = 64
@@ -180,6 +182,28 @@ class PolicyEvaluator:
         o5 = resp.get("o5")
         value = parse_o5(o5)
         return PolicyVerdict(blocked=value == 0, o5=o5, built=bool(resp.get("built")))
+
+    def outputs(self, body: str, inputs: dict, *,
+                timeout=_SESSION_DEFAULT) -> dict:
+        """Every output stream one step of `body` wrote, as {"oN": value-text}.
+
+        Same build/step failure mapping as `verdict`.
+        """
+        resp = self._run(
+            {"op": "step", "key": clause_key(body), "text": body,
+             "inputs": dict(inputs or {})},
+            timeout,
+        )
+        if not resp.get("ok"):
+            if resp.get("phase") == "build":
+                raise PolicyBuildError(str(resp.get("error") or ""))
+            if resp.get("phase") == "step":
+                raise PolicyStepError(str(resp.get("error") or ""))
+            raise SpeculationError(f"policy step failed: {_failure_text(resp)}")
+        outs = resp.get("outputs")
+        if not isinstance(outs, dict):
+            raise SpeculationProtocolError("policy worker returned no outputs map")
+        return {str(k): str(v) for k, v in outs.items()}
 
     def stats(self) -> dict:
         with self._lock:
