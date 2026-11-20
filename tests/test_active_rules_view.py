@@ -11,7 +11,10 @@ The seven tests named in the design are here verbatim:
              test_same_block_install_and_replace
 
 plus supporting cases (no-op outcome, unrouted rule, non-rule transaction,
-account attribution, pre-snapshot heights, gettaustate compatibility).
+account attribution, pre-snapshot heights, gettaustate compatibility) and
+the follow-up hardening cases: the view's text composed from the persisted
+accumulation with the manager global poisoned, registry-routed rule
+outcomes, and receipt logs in the stored outcome.
 
 Execution path: the native Tau engine cannot run in this environment (no
 tau-lang build is present), so the tests drive the real apply_block with
@@ -31,6 +34,7 @@ import hashlib
 import json
 import re
 import types
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import pytest
@@ -210,7 +214,8 @@ def _genesis_snapshot():
     )
 
 
-def _apply_block(fake, txs, height, parent_snapshot, previous_hash):
+def _apply_block(fake, txs, height, parent_snapshot, previous_hash,
+                 patch_canonical=True):
     active_view = ActiveConsensusView(
         target_height=height,
         consensus_rules=CONSENSUS_RULES,
@@ -222,17 +227,29 @@ def _apply_block(fake, txs, height, parent_snapshot, previous_hash):
         proposer_pubkey=ALICE, timestamp=GENESIS_TS + height * 10,
     )
     engine = TauConsensusEngine()
-    with patch("tau_manager.communicate_with_tau", side_effect=fake.communicate), \
-         patch("tau_manager.communicate_with_tau_multi",
-               side_effect=fake.communicate_multi), \
-         patch("tau_manager.get_last_revision_receipt",
-               side_effect=lambda: fake.last_receipt), \
-         patch("tau_manager.get_canonical_spec", side_effect=fake.composed_text), \
-         patch("chain_state.get_application_rules_state",
-               side_effect=lambda: "\n".join(fake.accumulation)), \
-         patch("chain_state.save_application_rules_state",
-               side_effect=lambda text: None), \
-         patch("tau_manager.tau_ready") as ready:
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("tau_manager.communicate_with_tau", side_effect=fake.communicate))
+        stack.enter_context(
+            patch("tau_manager.communicate_with_tau_multi",
+                  side_effect=fake.communicate_multi))
+        stack.enter_context(
+            patch("tau_manager.get_last_revision_receipt",
+                  side_effect=lambda: fake.last_receipt))
+        if patch_canonical:
+            # The historical seam: the fake's composed text served as the
+            # manager's canonical spec. One test opts out to prove the view
+            # no longer reads this slot at all.
+            stack.enter_context(
+                patch("tau_manager.get_canonical_spec",
+                      side_effect=fake.composed_text))
+        stack.enter_context(
+            patch("chain_state.get_application_rules_state",
+                  side_effect=lambda: "\n".join(fake.accumulation)))
+        stack.enter_context(
+            patch("chain_state.save_application_rules_state",
+                  side_effect=lambda text: None))
+        ready = stack.enter_context(patch("tau_manager.tau_ready"))
         ready.is_set.return_value = True
         result = engine.apply_block(active_view, block_obj, parent_snapshot)
     return result, block_obj
@@ -267,11 +284,12 @@ class _Node:
         self.prev_hash = genesis.block_hash
         self.height = 0
 
-    def apply_and_commit(self, txs):
+    def apply_and_commit(self, txs, patch_canonical=True):
         """Apply a block and persist it the way chain_state commit does."""
         self.height += 1
         result, block_obj = _apply_block(
-            self.fake, txs, self.height, self.parent_snapshot, self.prev_hash
+            self.fake, txs, self.height, self.parent_snapshot, self.prev_hash,
+            patch_canonical=patch_canonical,
         )
         db.add_block(block_obj)
         _set_canonical_head(block_obj.block_hash, self.height)
@@ -466,6 +484,56 @@ def test_view_uses_canonical_full_width_text(temp_database, tmp_path):
     ).hexdigest()
 
 
+def test_live_apply_path_ends_on_the_snapshot_spec(temp_database, tmp_path):
+    """The evaluator that actually applied the blocks ends on exactly the
+    text the view serves for the final revision: the snapshot is the spec
+    the engine runs, read back through the view -- not a parallel
+    reconstruction that merely agrees on the probe values. The revision
+    counter advances once per applied rule unit."""
+    node = _Node(tmp_path / "node.sqlite")
+    node.apply_and_commit([_rule_tx("install-1", RULE_INSTALL, seq=0)])
+    node.apply_and_commit([_rule_tx("displace-1", RULE_DISPLACE, seq=1)])
+
+    view = _view()
+    assert view["available"] is True
+    assert view["spec_revision"] == 2
+    assert view["canonical_text"] == node.fake.composed_text()
+    assert view["sha256"] == hashlib.sha256(
+        node.fake.composed_text().encode("utf-8")
+    ).hexdigest()
+    # The probe reads what the engine runs: 3 and 9, no trace of 7.
+    assert "o26[t]:bv[64] = { 3 }:bv[64]" in view["canonical_text"]
+    assert "o27[t]:bv[64] = { 9 }:bv[64]" in view["canonical_text"]
+    assert "{ 7 }:bv[64]" not in view["canonical_text"]
+
+
+def test_accumulation_rebuilds_the_engine_spec(temp_database, tmp_path):
+    """The persisted accumulation alone is enough to rebuild the spec the
+    engine runs: feed the recorded units, one by one, into a FRESH
+    evaluator -- the same seeding the node's startup restore performs
+    from the persisted full spec -- and its composed spec is exactly the
+    snapshot text the view serves, at every revision. This is why the
+    snapshot source IS the spec the engine runs, not submitted text and
+    not the tau_manager debug global: the accumulation is the engine's
+    seed."""
+    node = _Node(tmp_path / "node.sqlite")
+    node.apply_and_commit([_rule_tx("install-1", RULE_INSTALL, seq=0)])
+    node.apply_and_commit([_rule_tx("displace-1", RULE_DISPLACE, seq=1)])
+
+    rebuilt = FakeTauEngine()
+    for height, unit in enumerate(node.fake.accumulation, start=1):
+        rebuilt.communicate(rule_text=unit)
+        snapshot = db.get_spec_snapshot_at_height(height)
+        assert snapshot["canonical_text"] == rebuilt.composed_text()
+        assert snapshot["sha256"] == hashlib.sha256(
+            rebuilt.composed_text().encode("utf-8")
+        ).hexdigest()
+
+    view = _view()
+    assert view["canonical_text"] == rebuilt.composed_text()
+    assert view["canonical_text"] == node.fake.composed_text()
+
+
 def test_height_before_first_snapshot_is_not_available(temp_database, tmp_path):
     # Nothing recorded at all.
     assert _view()["available"] is False
@@ -578,3 +646,156 @@ def test_same_block_install_and_replace(temp_database, tmp_path):
     assert view["spec_revision"] == 2
     assert "o26[t]:bv[64] = { 7 }:bv[64]" not in view["canonical_text"]
     assert "o27[t]:bv[64] = { 9 }:bv[64]" in view["canonical_text"]
+
+
+# --- point 1, hardened: the view's text source ------------------------------
+
+
+def test_view_ignores_manager_global_spec(temp_database, tmp_path):
+    """The snapshot text is composed from the persisted canonical
+    accumulation, NOT read from tau_manager's process global. Poison the
+    global -- the slot tau_manager itself documents as a debug aid that
+    is "NEVER hashed or persisted", holding the interpreter's composed
+    (possibly shrunk) spec -- and leave the real get_canonical_spec in
+    place to read it: the displacement probe's view is unaffected, still
+    reporting o26 = {3} and o27 = {9}."""
+    import tau_manager
+
+    node = _Node(tmp_path / "node.sqlite")
+    poisoned = "always ( o26[t]:bv[8] = { 99 }:bv[8] )."
+    with patch.object(tau_manager, "last_known_tau_spec", poisoned):
+        node.apply_and_commit(
+            [_rule_tx("install-1", RULE_INSTALL, seq=0)], patch_canonical=False
+        )
+        node.apply_and_commit(
+            [_rule_tx("displace-1", RULE_DISPLACE, seq=1)], patch_canonical=False
+        )
+    # Sanity: the poisoned slot really is what get_canonical_spec serves.
+    with patch.object(tau_manager, "last_known_tau_spec", poisoned):
+        assert tau_manager.get_canonical_spec() == poisoned
+
+    view = _view()
+    assert view["available"] is True
+    assert view["spec_revision"] == 2
+    assert view["canonical_text"] == node.fake.composed_text()
+    assert "o26[t]:bv[64] = { 3 }:bv[64]" in view["canonical_text"]
+    assert "o27[t]:bv[64] = { 9 }:bv[64]" in view["canonical_text"]
+    assert "o26[t]:bv[64] = { 7 }:bv[64]" not in view["canonical_text"]
+    assert "99" not in view["canonical_text"]
+    assert view["sha256"] == hashlib.sha256(
+        view["canonical_text"].encode("utf-8")
+    ).hexdigest()
+
+
+# --- point 2, registry-routed rules ------------------------------------------
+
+# User o5 rules land in the per-account clause registry, not the shared
+# spec. The second replaces the first; the third is the neutral body,
+# which revokes.
+RULE_O5_REGISTER = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
+RULE_O5_REPLACE = (
+    "always ( (i1[t]:bv[24] > { #x0003e8 }:bv[24]) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
+)
+RULE_O5_REVOKE = "always ( (o5[t]:bv[24] = { #x000001 }:bv[24]) )."
+
+
+def test_registry_routed_rule_tx_records_registry_outcome(
+    temp_database, tmp_path
+):
+    """A registry-routed rule transaction takes no spec revision, so no
+    engine receipt and no snapshot exist for it. Its confirmed outcome is
+    registry evidence instead: the clause-registry root before/after,
+    explicitly marked -- and it never claims a spec revision."""
+    from consensus import sender_policy
+    from consensus.policy_mock import MockPolicyEvaluator
+
+    sender_policy.set_evaluator("apply", MockPolicyEvaluator(pool="apply"))
+    try:
+        node = _Node(tmp_path / "node.sqlite")
+
+        result, block1 = node.apply_and_commit(
+            [_rule_tx("clause-1", RULE_O5_REGISTER, seq=0)]
+        )
+        assert result.accepted_tx_ids == ["clause-1"]
+        registered = _status(block1.tx_ids[0])["rule_outcome"]
+        assert registered["outcome"] == "CLAUSE_REGISTERED"
+        assert registered["evidence"] == "clause_registry"
+        assert registered["account"] == ALICE.lower()
+        assert registered["stream"] == 5
+        assert (
+            registered["registry_root_before"]
+            != registered["registry_root_after"]
+        )
+        # The invariant: registry evidence never claims a spec revision.
+        assert "spec_revision" not in registered
+        assert "spec_revision_before" not in registered
+        assert "spec_revision_after" not in registered
+        # The routing step's own log line rides along, like any outcome.
+        assert any("o5 clause" in line for line in registered["logs"])
+        # No revision was taken, so no snapshot exists either.
+        assert db.get_latest_spec_snapshot() is None
+        assert _view()["available"] is False
+
+        result, block2 = node.apply_and_commit(
+            [_rule_tx("clause-2", RULE_O5_REPLACE, seq=1)]
+        )
+        assert result.accepted_tx_ids == ["clause-2"]
+        replaced = _status(block2.tx_ids[0])["rule_outcome"]
+        assert replaced["outcome"] == "CLAUSE_REPLACED"
+        assert replaced["evidence"] == "clause_registry"
+        assert (
+            replaced["registry_root_before"]
+            == registered["registry_root_after"]
+        )
+        assert (
+            replaced["registry_root_after"] != replaced["registry_root_before"]
+        )
+
+        result, block3 = node.apply_and_commit(
+            [_rule_tx("clause-3", RULE_O5_REVOKE, seq=2)]
+        )
+        assert result.accepted_tx_ids == ["clause-3"]
+        revoked = _status(block3.tx_ids[0])["rule_outcome"]
+        assert revoked["outcome"] == "CLAUSE_REVOKED"
+        assert (
+            revoked["registry_root_before"] == replaced["registry_root_after"]
+        )
+        # Revoking the only clause returns the registry to its empty root.
+        assert (
+            revoked["registry_root_after"] == registered["registry_root_before"]
+        )
+    finally:
+        sender_policy.set_evaluator("apply", None)
+
+
+# --- point 2, receipt logs in the stored outcome -----------------------------
+
+
+def test_confirmed_rule_outcome_carries_receipt_logs(temp_database, tmp_path):
+    """Ask 1 names the receipt logs: the stored outcome carries the
+    transaction receipt's log lines -- the rule step's own trail among
+    them -- bounded to 16 lines of 400 chars."""
+    node = _Node(tmp_path / "node.sqlite")
+    _, block_obj = node.apply_and_commit(
+        [_rule_tx("install-1", RULE_INSTALL, seq=0)]
+    )
+    outcome = _status(block_obj.tx_ids[0])["rule_outcome"]
+    logs = outcome["logs"]
+    assert any(line.startswith("Tau(rule) o0:") for line in logs)
+    assert any("Rule applied" in line for line in logs)
+    assert len(logs) <= 16
+    assert all(len(line) <= 400 for line in logs)
+
+
+def test_bounded_receipt_logs_caps_lines_and_width():
+    from consensus.engine import _bounded_receipt_logs
+
+    lines = [f"line-{i} " + "x" * 500 for i in range(20)]
+    bounded = _bounded_receipt_logs(lines)
+    assert len(bounded) == 16
+    assert all(len(line) == 400 for line in bounded)
+    assert bounded[0].startswith("line-0 ")
+    assert bounded[-1].startswith("line-15 ")
+    assert _bounded_receipt_logs(None) == []
+    assert _bounded_receipt_logs(["short"]) == ["short"]
