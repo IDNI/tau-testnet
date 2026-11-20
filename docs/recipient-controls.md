@@ -78,14 +78,41 @@ deadline that cannot be proven is not assumed.
 
 ## Fees
 
-A recipient refusal at apply behaves like a sender-policy block: the
-transaction fails, no funds move, and the sender pays the fee steps
-measured for the transfers that were evaluated. A refusal at admission
-pays nothing.
+A recipient refusal costs exactly what a sender-policy block costs:
+nothing. A transaction refused by either policy is rejected before
+any fee is charged — no funds move and `fee_charged` is 0 — at apply
+and at admission alike. The fee is paid only by transactions that
+execute.
+
+## Activation
+
+The gate is a governance-activated feature, in the same shape as
+approval slots. A chain whose governance has never set the host
+contract patch key `recipient_gate_active` does not run the gate:
+recipient clauses judge nobody, and transfers behave exactly as they
+did before the feature. The patch accepts only `true` — activation
+is one-way, because switching the gate off would silently un-govern
+recipient clauses that are already deployed.
+
+While the gate is inactive, deploying the feature is refused rather
+than silently admitted: a clause that targets the hold-cap stream
+o10 or whose body reads the release-pair stream i17 is rejected at
+admission and at apply — on every surface that registers a clause —
+with reason `recipient_gate_inactive` (code `FEATURE_INACTIVE`).
+Ordinary o5 clauses — sender policies the chain already enforces —
+deploy exactly as they always have. Accumulated spec units are not
+refused: o10 is a free output stream for user rules with
+pre-existing uses, and the deploy refusal covers the surfaces that
+register recipient policy, not the general spec. The flag enters
+the consensus mechanism metadata only once set, so a chain that
+never activates hashes exactly as it did before the feature existed.
 
 ## Capability reporting
 
-checktx reports `recipient_policy_gate: "enforced"` and
-`recipient_hold_cap: "enforced"` in its result data, and a refusal in
-the dry run carries sendtx's reason verbatim, so a client can tell a
-recipient refusal from a sender one before broadcasting.
+checktx reports the activation state the dry run actually judged
+under: `recipient_policy_gate` and `recipient_hold_cap` are
+`"enforced"` once the gate is active and `"inactive"` before it, so
+a wallet can detect the feature's state before offering an inbound
+rule. A refusal in the dry run carries sendtx's reason verbatim, so
+a client can tell a recipient refusal from a sender one before
+broadcasting.
