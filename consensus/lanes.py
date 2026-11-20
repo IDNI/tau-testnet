@@ -38,10 +38,21 @@ SLOW_TX_TYPES = frozenset({
     "rule_offer_accept",
     "rule_change_request",
     "consensus_rule_update",
+    # Builds the payout rule at admission and at apply, like an offered clause.
+    "payout_rule_set",
 })
 
 # `retractable_transfer` and `retract_transfer` are absent too, i.e. FAST: a park
 # costs one transfer step and a retract needs no Tau evaluation at all.
+# `receive_route_set`, `receive_route_remove` and `receive_route_release` are
+# FAST: a set costs one fee-query step, the other two need no Tau evaluation, and
+# the split itself is arithmetic on credits the block makes anyway.
+# `payout_execute` and `payout_rule_revoke` are FAST: an execution steps one
+# cached payout rule in its own pool, and a revoke needs no Tau evaluation.
+# The standing payment types are all FAST: a create or an update costs one
+# fee-query step, an execute that and at most one o5 clause step in the policy
+# pool, and a cancel needs no Tau evaluation. Payments the sweep makes run at the
+# end of the block under their own per-block cap.
 # `approval_request` and `transfer_vote` are deliberately absent, i.e. FAST.
 # Neither routes text through i0, so neither rebuilds the interpreter: a request
 # costs one cheap Tau step like a transfer, and a vote costs one more only when
@@ -66,6 +77,15 @@ TAU_EVALUATING_TX_TYPES = frozenset({
     "transfer_vote",
     "retractable_transfer",
     "rule_change_request",
+    "standing_payment_create",
+    "standing_payment_update",
+    # The fee step, and the payer's o5 clause in the policy pool.
+    "standing_payment_execute",
+    # Both step Tau: the fee step, and the payout rule in its own pool.
+    "payout_rule_set",
+    "payout_execute",
+    # The fee step.
+    "receive_route_set",
 })
 
 

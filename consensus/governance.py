@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.retractable import RetractableBook
+from consensus.standing import StandingBook
+from consensus.payout import PayoutBook
+from consensus.receive_route import ReceiveRouteBook
 
 logger = logging.getLogger(__name__)
 from consensus.approvals import (
@@ -198,6 +201,9 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    standing_payments_root: str = "",
+    payout_rules_root: str = "",
+    receive_routes_root: str = "",
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -243,6 +249,20 @@ def build_mechanism_metadata(
     if retractable_transfers_root is None:
         retractable_transfers_root = RetractableBook().root().hex()
     mech["retractable_transfers_root"] = retractable_transfers_root
+    # Standing payments: emitted only once the book has held something (an open
+    # authorization or a resolved one), like rule sharing, so a chain that never
+    # uses them keeps a byte-identical meta hash and needs no regenesis. The
+    # first authorization makes the key appear, and a node still running a binary
+    # without the feature diverges loudly (state-hash mismatch) rather than
+    # silently.
+    if standing_payments_root:
+        mech["standing_payments_root"] = standing_payments_root
+    # Payout rules (#63): the same gate, for the same reason.
+    if payout_rules_root:
+        mech["payout_rules_root"] = payout_rules_root
+    # Receive routes (#35): the same gate, for the same reason.
+    if receive_routes_root:
+        mech["receive_routes_root"] = receive_routes_root
     return mech
 
 
@@ -451,6 +471,12 @@ class ConsensusLifecycleManager:
         # Co-signature approvals. A FIELD for the same reason rule_offers is.
         self.approval_requests = ApprovalRequestLifecycleManager()
         self.retractable_transfers = RetractableBook()
+        # Standing payments (#34). A FIELD for the same reason rule_offers is.
+        self.standing_payments = StandingBook()
+        # Payout rules (#63). A FIELD for the same reason rule_offers is.
+        self.payout_rules = PayoutBook()
+        # Receive routes (#35). A FIELD for the same reason rule_offers is.
+        self.receive_routes = ReceiveRouteBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
@@ -546,6 +572,18 @@ class ConsensusLifecycleManager:
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
+            standing_payments_root=(
+                "" if self.standing_payments.is_empty()
+                else self.standing_payments.root().hex()
+            ),
+            payout_rules_root=(
+                "" if self.payout_rules.is_empty()
+                else self.payout_rules.root().hex()
+            ),
+            receive_routes_root=(
+                "" if self.receive_routes.is_empty()
+                else self.receive_routes.root().hex()
+            ),
         )
         return compute_consensus_meta_hash(
             host_contract={},

@@ -110,6 +110,25 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "transfer_vote",
     "retractable_transfer",
     "retract_transfer",
+    "standing_payment_create",
+    "standing_payment_cancel",
+    "standing_payment_update",
+    "standing_payment_execute",
+    "payout_rule_set",
+    "payout_rule_revoke",
+    "payout_execute",
+    "receive_route_set",
+    "receive_route_remove",
+    "receive_route_release",
+})
+
+
+# The standing payment types share one gossip topic and one snapshot sub-quota.
+_STANDING_TX_TYPES = frozenset({
+    "standing_payment_create",
+    "standing_payment_update",
+    "standing_payment_cancel",
+    "standing_payment_execute",
 })
 
 
@@ -580,6 +599,9 @@ class NetworkService:
             TAU_MEMPOOL_SNAPSHOT_MAX_RULE_TXS,
             TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS,
             TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS,
+            TAU_MEMPOOL_SNAPSHOT_MAX_STANDING_TXS,
+            TAU_MEMPOOL_SNAPSHOT_MAX_PAYOUT_TXS,
+            TAU_MEMPOOL_SNAPSHOT_MAX_ROUTE_TXS,
             TAU_GOSSIP_MAX_RAW_TX_BYTES
         )
         try:
@@ -592,6 +614,9 @@ class NetworkService:
             rule_txs_count = 0
             approval_txs_count = 0
             retractable_txs_count = 0
+            standing_txs_count = 0
+            payout_txs_count = 0
+            route_txs_count = 0
 
             for tx in txs:
                 if total_count >= TAU_MEMPOOL_SNAPSHOT_MAX_TOTAL:
@@ -639,6 +664,19 @@ class NetworkService:
                     if retractable_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS:
                         continue
                     retractable_txs_count += 1
+                elif tx_type in _STANDING_TX_TYPES:
+                    if standing_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_STANDING_TXS:
+                        continue
+                    standing_txs_count += 1
+                elif tx_type in ("payout_rule_set", "payout_rule_revoke", "payout_execute"):
+                    if payout_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_PAYOUT_TXS:
+                        continue
+                    payout_txs_count += 1
+                elif tx_type in ("receive_route_set", "receive_route_remove",
+                                 "receive_route_release"):
+                    if route_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_ROUTE_TXS:
+                        continue
+                    route_txs_count += 1
                 topic = self.topic_for_tx_type(tx_type)
                     
                 # 4. Optional partial decode
@@ -666,6 +704,9 @@ class NetworkService:
             TAU_GOSSIP_TOPIC_RULES,
             TAU_GOSSIP_TOPIC_APPROVALS,
             TAU_GOSSIP_TOPIC_RETRACTABLE,
+            TAU_GOSSIP_TOPIC_STANDING,
+            TAU_GOSSIP_TOPIC_PAYOUT,
+            TAU_GOSSIP_TOPIC_ROUTES,
             TAU_GOSSIP_TOPIC_BLOCKS,
             TAU_GOSSIP_TOPIC_PEERS,
         )
@@ -675,6 +716,9 @@ class NetworkService:
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_RULES, self._on_rule_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_APPROVALS, self._on_approval_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_RETRACTABLE, self._on_retractable_gossip)
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_STANDING, self._on_standing_gossip)
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PAYOUT, self._on_payout_gossip)
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_ROUTES, self._on_route_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PEERS, self._on_peer_advertisement)
 
@@ -882,6 +926,57 @@ class NetworkService:
             },
         )
 
+    async def _on_standing_gossip(self, envelope: Dict[str, Any]) -> None:
+        from .protocols import (
+            TAU_MAX_STANDING_PAYMENT_CANCEL_BYTES,
+            TAU_MAX_STANDING_PAYMENT_CREATE_BYTES,
+            TAU_MAX_STANDING_PAYMENT_EXECUTE_BYTES,
+            TAU_MAX_STANDING_PAYMENT_UPDATE_BYTES,
+        )
+        await self._process_gossip_payload(
+            envelope,
+            allowed_types=set(_STANDING_TX_TYPES),
+            type_limits={
+                "standing_payment_create": TAU_MAX_STANDING_PAYMENT_CREATE_BYTES,
+                "standing_payment_update": TAU_MAX_STANDING_PAYMENT_UPDATE_BYTES,
+                "standing_payment_cancel": TAU_MAX_STANDING_PAYMENT_CANCEL_BYTES,
+                "standing_payment_execute": TAU_MAX_STANDING_PAYMENT_EXECUTE_BYTES,
+            },
+        )
+
+    async def _on_payout_gossip(self, envelope: Dict[str, Any]) -> None:
+        from .protocols import (
+            TAU_MAX_PAYOUT_EXECUTE_BYTES,
+            TAU_MAX_PAYOUT_RULE_REVOKE_BYTES,
+            TAU_MAX_PAYOUT_RULE_SET_BYTES,
+        )
+        await self._process_gossip_payload(
+            envelope,
+            allowed_types={"payout_rule_set", "payout_rule_revoke", "payout_execute"},
+            type_limits={
+                "payout_rule_set": TAU_MAX_PAYOUT_RULE_SET_BYTES,
+                "payout_rule_revoke": TAU_MAX_PAYOUT_RULE_REVOKE_BYTES,
+                "payout_execute": TAU_MAX_PAYOUT_EXECUTE_BYTES,
+            },
+        )
+
+    async def _on_route_gossip(self, envelope: Dict[str, Any]) -> None:
+        from .protocols import (
+            TAU_MAX_RECEIVE_ROUTE_RELEASE_BYTES,
+            TAU_MAX_RECEIVE_ROUTE_REMOVE_BYTES,
+            TAU_MAX_RECEIVE_ROUTE_SET_BYTES,
+        )
+        await self._process_gossip_payload(
+            envelope,
+            allowed_types={"receive_route_set", "receive_route_remove",
+                           "receive_route_release"},
+            type_limits={
+                "receive_route_set": TAU_MAX_RECEIVE_ROUTE_SET_BYTES,
+                "receive_route_remove": TAU_MAX_RECEIVE_ROUTE_REMOVE_BYTES,
+                "receive_route_release": TAU_MAX_RECEIVE_ROUTE_RELEASE_BYTES,
+            },
+        )
+
     async def _process_gossip_payload(self, envelope: Dict[str, Any], allowed_types: set, type_limits: dict) -> None:
         import json
         from .protocols import TAU_GOSSIP_MAX_RAW_TX_BYTES
@@ -980,6 +1075,42 @@ class NetworkService:
         elif tx_type == "retract_transfer":
             if "retractable_id" not in p_dict:
                 logger.debug("Gossip rejected: retract_transfer missing retractable_id")
+                return
+        elif tx_type in ("standing_payment_create", "standing_payment_update"):
+            missing = [f for f in ("recipient_pubkey", "amount", "first_due", "periods")
+                       if f not in p_dict]
+            intervals = [f for f in ("interval_blocks", "interval_seconds", "interval_months")
+                         if p_dict.get(f) is not None]
+            if tx_type == "standing_payment_update" and "standing_id" not in p_dict:
+                missing.append("standing_id")
+            if missing or len(intervals) != 1:
+                logger.debug("Gossip rejected: %s missing %s or not exactly one interval",
+                             tx_type, missing)
+                return
+        elif tx_type in ("standing_payment_cancel", "standing_payment_execute"):
+            if "standing_id" not in p_dict:
+                logger.debug("Gossip rejected: %s missing standing_id", tx_type)
+                return
+        elif tx_type == "payout_rule_set":
+            missing = [f for f in ("rule_text", "slots", "cap_per_execution",
+                                   "cap_per_period", "expires_at") if f not in p_dict]
+            periods = [f for f in ("period_blocks", "period_seconds")
+                       if p_dict.get(f) is not None]
+            if missing or len(periods) != 1:
+                logger.debug("Gossip rejected: payout_rule_set missing %s or "
+                             "not exactly one period", missing)
+                return
+        elif tx_type == "payout_execute":
+            if "account_pubkey" not in p_dict or "rule_id" not in p_dict:
+                logger.debug("Gossip rejected: payout_execute missing account_pubkey or rule_id")
+                return
+        elif tx_type == "receive_route_set":
+            if "destination_pubkey" not in p_dict or "share_bps" not in p_dict:
+                logger.debug("Gossip rejected: receive_route_set missing destination or share")
+                return
+        elif tx_type == "receive_route_release":
+            if "owner_pubkey" not in p_dict or "route_id" not in p_dict:
+                logger.debug("Gossip rejected: receive_route_release missing owner or route_id")
                 return
 
         try:
@@ -1597,6 +1728,9 @@ class NetworkService:
             TAU_GOSSIP_TOPIC_GOVERNANCE,
             TAU_GOSSIP_TOPIC_RETRACTABLE,
             TAU_GOSSIP_TOPIC_RULES,
+            TAU_GOSSIP_TOPIC_STANDING,
+            TAU_GOSSIP_TOPIC_PAYOUT,
+            TAU_GOSSIP_TOPIC_ROUTES,
             TAU_GOSSIP_TOPIC_TRANSACTIONS,
         )
         if tx_type in ("consensus_rule_update", "consensus_rule_vote"):
@@ -1607,6 +1741,12 @@ class NetworkService:
             return TAU_GOSSIP_TOPIC_APPROVALS
         if tx_type in ("retractable_transfer", "retract_transfer"):
             return TAU_GOSSIP_TOPIC_RETRACTABLE
+        if tx_type in _STANDING_TX_TYPES:
+            return TAU_GOSSIP_TOPIC_STANDING
+        if tx_type in ("payout_rule_set", "payout_rule_revoke", "payout_execute"):
+            return TAU_GOSSIP_TOPIC_PAYOUT
+        if tx_type in ("receive_route_set", "receive_route_remove", "receive_route_release"):
+            return TAU_GOSSIP_TOPIC_ROUTES
         return TAU_GOSSIP_TOPIC_TRANSACTIONS
 
     def broadcast_transaction(self, payload: str, message_id: str) -> None:

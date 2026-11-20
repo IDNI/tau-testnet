@@ -44,6 +44,9 @@ MagicMock
 !docs/developer_cli.md
 !docs/approvals.md
 !docs/retractable.md
+!docs/standing_payments.md
+!docs/payout_rules.md
+!docs/receive_routes.md
 !docs/packaging.md
 
 # Python
