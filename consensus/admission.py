@@ -59,14 +59,17 @@ from consensus.grants import (
     parse_set_grant_shared_cap,
 )
 from consensus.payout_rules import (
+    FORM_TAU_RULE,
     TX_TYPE_EXECUTE_PAYOUT_RULE,
     TX_TYPE_INSTALL_PAYOUT_RULE,
     TX_TYPE_REMOVE_PAYOUT_RULE,
     PayoutRuleBook,
     PayoutRuleShapeError,
+    decode_clause_legs,
     parse_execute_payout_rule,
     parse_install_payout_rule,
     parse_remove_payout_rule,
+    payout_clause_inputs,
 )
 from consensus.receive_routes import (
     TX_TYPE_INSTALL_RECEIVE_ROUTE,
@@ -1991,6 +1994,8 @@ def _tip_payout_book(row: Optional[Dict]) -> PayoutRuleBook:
             (int(t["period_index"]), int(t["total"]))
             for t in row.get("period_totals", [])
         ),
+        int(row.get("form", 1)),
+        str(row.get("clause_text", "")),
     )
     settlement_rows = [
         (
@@ -2074,7 +2079,7 @@ def validate_remove_payout_rule_payload(
 def validate_execute_payout_rule_payload(
     tx: Dict, tip_view: TipAdmissionView
 ) -> AdmissionResult:
-    """Tau-free screens for executing a payout rule (#63).
+    """Screens for executing a payout rule (#63).
 
     Anyone may submit an execution with the rule's inputs. What the rule
     computes and whether it may settle is the book's evaluate_execution
@@ -2082,6 +2087,11 @@ def validate_execute_payout_rule_payload(
     block apply makes, so the two agree on identical state. The owner's
     o5 re-check per leg and the fee are apply-side (they need the engine's
     evaluation), exactly as for an ordinary transfer.
+
+    A Tau-form rule's legs come from stepping its clause, so this screen
+    steps it too — the same clause, the same input-map builder, the
+    admission pool — mirroring the apply site's construction step for
+    step; the declared form stays Tau-free, as before.
     """
     try:
         rule_id, settlement_id, base_amount = parse_execute_payout_rule(tx)
@@ -2094,10 +2104,35 @@ def validate_execute_payout_rule_payload(
             "Unknown payout rule.",
             code="UNKNOWN_PAYOUT_RULE",
         )
-    decision = _tip_payout_book(row).evaluate_execution(
-        rule_id, settlement_id, base_amount,
-        tip_view.next_block_timestamp,
-        tip_view.get_balance(row["owner_pubkey"]),
+    book = _tip_payout_book(row)
+    ts = tip_view.next_block_timestamp
+    balance = tip_view.get_balance(row["owner_pubkey"])
+    clause_legs = None
+    entry = book.get_by_id(rule_id)
+    if entry is not None and entry.form == FORM_TAU_RULE:
+        from consensus import sender_policy
+
+        sender = tx.get("sender_pubkey")
+        outputs, detail = sender_policy.clause_outputs(
+            entry.clause_text,
+            payout_clause_inputs(
+                entry,
+                sender if isinstance(sender, str) else "",
+                base_amount, ts, balance,
+                book.period_paid_total(entry, ts),
+            ),
+            pool="admission",
+        )
+        if outputs is None:
+            return format_error(
+                f"execute_payout_rule rejected: the payout rule's clause "
+                f"did not produce legs ({detail})")
+        clause_legs, why = decode_clause_legs(entry, outputs)
+        if clause_legs is None:
+            return format_error(f"execute_payout_rule rejected: {why}")
+    decision = book.evaluate_execution(
+        rule_id, settlement_id, base_amount, ts, balance,
+        clause_legs=clause_legs,
     )
     if not decision.executed:
         return format_error(

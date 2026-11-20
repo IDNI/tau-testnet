@@ -45,15 +45,18 @@ from .grants import (
     parse_set_grant_shared_cap,
 )
 from .payout_rules import (
+    FORM_TAU_RULE,
     PAYOUT_RULE_TX_TYPES,
     TX_TYPE_EXECUTE_PAYOUT_RULE,
     TX_TYPE_INSTALL_PAYOUT_RULE,
     TX_TYPE_REMOVE_PAYOUT_RULE,
     PayoutRuleBook,
     PayoutRuleShapeError,
+    decode_clause_legs,
     parse_execute_payout_rule,
     parse_install_payout_rule,
     parse_remove_payout_rule,
+    payout_clause_inputs,
 )
 from .receive_routes import (
     CREDIT_ORDINARY_TRANSFER,
@@ -3200,9 +3203,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 pr_balance = 0
                                 reason = "no payout rule with this id"
                             else:
-                                # The book computes the legs from the
-                                # stored program and the submitted inputs,
-                                # and checks them against the declared set,
+                                # The book computes the legs — from the
+                                # stored program (declared form) or from
+                                # stepping the owner's clause over the
+                                # node-built input map (Tau form) — and
+                                # checks them against the declared set,
                                 # both caps and the owner's balance as this
                                 # tx sees it; the transfers below then move
                                 # exactly those legs through the ordinary
@@ -3211,11 +3216,46 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 # same evaluation an ordinary transfer of
                                 # theirs would face.
                                 pr_balance = _read_bal(pr_entry.owner_pubkey)
-                                pr_decision = pr_book.evaluate_execution(
-                                    pr_rule_id, pr_settlement_id, pr_base,
-                                    pr_ts, pr_balance,
-                                )
-                                reason = "" if pr_decision.executed else pr_decision.reason
+                                pr_decision = None
+                                reason = ""
+                                pr_clause_legs = None
+                                if pr_entry.form == FORM_TAU_RULE:
+                                    outputs, detail = (
+                                        sender_policy.clause_outputs(
+                                            pr_entry.clause_text,
+                                            payout_clause_inputs(
+                                                pr_entry,
+                                                sender if isinstance(
+                                                    sender, str) else "",
+                                                pr_base, pr_ts, pr_balance,
+                                                pr_book.period_paid_total(
+                                                    pr_entry, pr_ts),
+                                            ),
+                                            pool="apply",
+                                        )
+                                    )
+                                    if outputs is None:
+                                        reason = (
+                                            "the payout rule's clause did "
+                                            f"not produce legs ({detail})"
+                                        )
+                                    else:
+                                        pr_clause_legs, why = (
+                                            decode_clause_legs(
+                                                pr_entry, outputs)
+                                        )
+                                        if pr_clause_legs is None:
+                                            reason = why
+                                if not reason:
+                                    pr_decision = pr_book.evaluate_execution(
+                                        pr_rule_id, pr_settlement_id, pr_base,
+                                        pr_ts, pr_balance,
+                                        clause_legs=pr_clause_legs,
+                                    )
+                                    reason = (
+                                        "" if pr_decision.executed
+                                        else pr_decision.reason
+                                    )
                         if pr_rule_id is None or reason:
                             tx_receipt["logs"].append(f"Payout rule execution ignored: {reason}")
                             tx_receipt["reason"] = "payout_rule_not_executed"
@@ -4064,6 +4104,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         "rule_id": pending_payout_install.rule_id.hex(),
                         "action": "installed",
                         "owner_pubkey": pending_payout_install.owner_pubkey,
+                        "form": pending_payout_install.form,
                         "version": pending_payout_install.version,
                     }
                     tx_receipt["logs"].append(
@@ -4088,15 +4129,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                      pr_settlement_id, pr_base) = pending_payout_execution
                     # Same fork, same inputs as the branch's
                     # evaluate_execution: the settled decision is the staged
-                    # one by construction.
+                    # one by construction. For a Tau-form rule the staged
+                    # decision's legs are handed back in — the clause is
+                    # not stepped a second time, so the commit cannot
+                    # compute different legs than the branch validated.
                     settled = pr_book.execute(
                         pr_entry.rule_id, pr_settlement_id, pr_base,
                         int(block_timestamp or 0), pr_balance,
+                        clause_legs=(
+                            _pr_decision.legs
+                            if pr_entry.form == FORM_TAU_RULE else None
+                        ),
                     )
                     tx_receipt["payout_event"] = {
                         "rule_id": pr_entry.rule_id.hex(),
                         "action": "executed",
                         "owner_pubkey": pr_entry.owner_pubkey,
+                        "form": pr_entry.form,
                         "settlement_id": pr_settlement_id.hex(),
                         "base_amount": pr_base,
                         "legs": [
