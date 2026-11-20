@@ -963,6 +963,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
 
+        # Issue #42: confirmed rule-tx outcomes, collected exactly like the
+        # retractable events above -- from the ACCEPTED transactions' receipts
+        # only -- and carried on the snapshot so the commit path can persist
+        # them per block (chain_state._record_rule_outcomes).
+        rule_outcomes = []
+        for i, tx in enumerate(block.transactions):
+            record = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "rule_outcome"
+            )
+            if record and id(tx) in accepted_obj:
+                tx_ids = getattr(block, "tx_ids", None) or []
+                if i < len(tx_ids):
+                    tx_hash = tx_ids[i]
+                else:
+                    from block import compute_tx_hash
+                    tx_hash = compute_tx_hash(tx)
+                rule_outcomes.append((tx_hash, record))
+
         # 3. Post-State Materialization Layer
         
         # The rules are updated by self.apply (it returns a generic snapshot with tau_bytes).
@@ -1118,6 +1136,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "rule_outcomes": rule_outcomes,
             }
         )
         
@@ -1773,10 +1792,44 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     tx_receipt["logs"].append(
                         "Policy change failed %d open approval request(s)" % len(doomed))
 
+                def _clauses_root_hex():
+                    # The manager's clauses_root() IS the registry's root();
+                    # fall back to the registry itself, then to None for
+                    # lifecycle doubles that model no root at all.
+                    root_fn = getattr(offers, "clauses_root", None)
+                    if callable(root_fn):
+                        return root_fn().hex()
+                    registry_root = getattr(
+                        offers.accepted_clauses, "root", None)
+                    if callable(registry_root):
+                        return registry_root().hex()
+                    return None
+
+                clauses_root_before = _clauses_root_hex()
                 if revoking:
                     offers.accepted_clauses.pop(key, None)
                 else:
                     offers.accepted_clauses[key] = body
+                clauses_root_after = _clauses_root_hex()
+
+                # Issue #42 point 2: the confirmed-tx rule outcome for the
+                # registry path. Evidence is the clause-registry root pair --
+                # NEVER a spec revision: a registry install takes no revision,
+                # and a receipt claiming one would tell the wallet a lie the
+                # original bug report is about.
+                tx_receipt["rule_outcome"] = {
+                    "account": sender_n,
+                    "path": "registry",
+                    "outcome": (
+                        "CLAUSE_REVOKED" if revoking
+                        else "CLAUSE_REPLACED" if registered
+                        else "CLAUSE_REGISTERED"
+                    ),
+                    "evidence": {
+                        "rule_clauses_root_before": clauses_root_before,
+                        "rule_clauses_root_after": clauses_root_after,
+                    },
+                }
 
                 tx_receipt["logs"].append(
                     "o5 clause %s for %s"
@@ -2785,6 +2838,34 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     tx_receipt["logs"].append(
                                         f"Tau(rule) outcome: {receipt.get('outcome')}"
                                     )
+                                    if not tau_failed:
+                                        # Issue #42 point 2: the confirmed-tx
+                                        # rule outcome, captured NOW, while
+                                        # last_receipt() still describes THIS
+                                        # transaction (the manager global is
+                                        # reset by the next Tau call). It
+                                        # reaches the receipts map only if the
+                                        # tx stays accepted, and _apply_block
+                                        # persists it from there. Evidence is
+                                        # the spec-revision pair: this path
+                                        # really did take a revision.
+                                        tx_receipt["rule_outcome"] = {
+                                            "account": (
+                                                sender.lower()
+                                                if isinstance(sender, str)
+                                                else sender
+                                            ),
+                                            "path": "shared_spec",
+                                            "outcome": receipt.get("outcome"),
+                                            "evidence": {
+                                                "spec_revision_before":
+                                                    receipt.get(
+                                                        "spec_revision_before"),
+                                                "spec_revision_after":
+                                                    receipt.get(
+                                                        "spec_revision_after"),
+                                            },
+                                        }
                                 else:
                                     tau_failed = (
                                         isinstance(output, str)
