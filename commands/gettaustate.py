@@ -1,3 +1,11 @@
+"""The raw application-rules accumulation, kept for compatibility.
+
+This is the submitted rule text, append-only: it is NOT the rules in
+force, because a later revision can displace part of an earlier one and
+the accumulation still shows both. For the effective spec -- the engine's
+normalized text after pointwise revision -- use `getactiverules`
+(issue #42).
+"""
 import api_response
 
 
