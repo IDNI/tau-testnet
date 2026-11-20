@@ -21,6 +21,8 @@ from commands import (
     getapprovalrequest,
     getapprovalrequests,
     getapprovalslots,
+    getpayoutrule,
+    getstandingpayment,
     getrequestid,
     getretractable,
     getretractableid,
@@ -86,6 +88,8 @@ class ServiceContainer:
         "getretractable": getretractable,
         "getretractables": getretractables,
         "getretractableid": getretractableid,
+        "getstandingpayment": getstandingpayment,
+        "getpayoutrule": getpayoutrule,
         # Advisory, node-local, and engine-driving -- rate-limited accordingly
         # in server.py.
         "getapprovalslots": getapprovalslots,
