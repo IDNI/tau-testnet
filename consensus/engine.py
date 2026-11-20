@@ -2076,10 +2076,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     "gross": amount,
                                     "routed": share,
                                     "net": credit,
+                                    "bps": route.bps,
                                 }
                                 tx_receipt["logs"].append(
-                                    f"Receive route: {share} of {amount} "
-                                    f"diverted to {route.destination[:10]}..."
+                                    f"Receive route: gross {amount}, "
+                                    f"net {credit}, routed {share} "
+                                    f"at {route.bps} bps to "
+                                    f"{route.destination}"
                                 )
                         staged_writes[to_addr] = _read_bal(to_addr) + credit
                 except FeeRuleError:
