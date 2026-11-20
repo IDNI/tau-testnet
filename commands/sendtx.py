@@ -29,7 +29,7 @@ from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_
 from consensus.grants import GRANT_TX_TYPES
 from consensus.payout_rules import PAYOUT_RULE_TX_TYPES
 from consensus.receive_routes import RECEIVE_ROUTE_TX_TYPES
-from consensus.standing_payments import STANDING_PAYMENT_TX_TYPES
+from consensus.standing_payments import STANDING_PAYMENT_TX_TYPES, StandingPaymentBook
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -124,6 +124,28 @@ def _admission_i2(address: str) -> str:
     except (TypeError, ValueError):
         value = 0
     return str(max(0, min(value, tau_defs.MAX_TRANSFER_VALUE)))
+
+
+def _admission_standing_paid(sender_pubkey: str, admission_ts: int) -> str:
+    """i17 (standing-paid fact) for the admission-time Tau steps.
+
+    The tip standing book's recorded paid-for-period facts, projected
+    per account: "1" when the sender has at least one authorization
+    whose period containing the admission timestamp is recorded paid,
+    else "0". Mirrors consensus.engine's `_standing_paid_current_period`
+    so admission and apply feed the same value for the same state;
+    admission's is an estimate against the tip (the tx may be included
+    several blocks later), exactly like the advisory i5 timestamp and
+    the head i2. The book read mirrors
+    consensus.facade.TipAdmissionView._tip_standing_book's guard: a
+    manager without a real standing book means "no standing payments".
+    """
+    lm = getattr(chain_state, "_lifecycle_manager", None)
+    book = getattr(lm, "standing_payments", None)
+    if not isinstance(book, StandingPaymentBook):
+        return "0"
+    return "1" if book.has_paid_period_containing(
+        sender_pubkey, admission_ts) else "0"
 
 
 def _validate_tau_bv_range(value: int, name: str) -> None:
@@ -236,6 +258,10 @@ def _parked_transfer_inputs(sender_pubkey: str, request: dict, tip_view,
     values = {
         1: str(request["amount"]),
         2: _admission_i2(sender_pubkey),
+        # i17 (standing-paid fact) for the sender, in the same position
+        # and with the same value as the apply-side _transfer_input_map.
+        tau_defs.STANDING_PAID_STREAM_INDEX:
+            _admission_standing_paid(sender_pubkey, admission_ts),
         3: "{ #x" + sender_pubkey + " }:bv[384]",
         4: "{ #x" + request["recipient_pubkey"] + " }:bv[384]",
         12: "{ #x" + sender_pubkey + " }:bv[384]",
@@ -931,6 +957,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                     continue
                 # Reject ALL reserved streams uniformly: i2-i5 are transfer
                 # context / clock, i6-i11 are consensus ABI inputs the node injects,
+                # i17 is the node-fed standing-paid fact (RESERVED_STREAMS),
                 # i12 is the sender pubkey the node sets at apply, i14/i15 are the
                 # consensus stake/mode inputs fed at consensus evaluation, and i13
                 # joins them only under tau_validator_set (the one mode that feeds
@@ -1241,6 +1268,12 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         # authoritative. `remaining_balances` still drives the
                         # affordability pre-check below.
                         tau_input_stream_values[2] = _admission_i2(sender_pubkey)
+                        # i17: the standing-paid fact for the sender, fed
+                        # always like i2 and in the same position as the
+                        # apply-time input map (after i2, before i3).
+                        # Reserved upstream, so a sender cannot pre-fill it.
+                        tau_input_stream_values[tau_defs.STANDING_PAID_STREAM_INDEX] = \
+                            _admission_standing_paid(sender_pubkey, admission_ts)
                         # i3/i4: full 384-bit from/to pubkeys. The bv-shrink layer
                         # interns these equality-only address streams to a small bv
                         # for evaluation; the canonical full-width rule text is hashed.
@@ -1362,6 +1395,11 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                     # engine's transfer-less fee-query step (issue #20).
                     fee_query_inputs = {1: "0", 2: _admission_i2(sender_pubkey),
                                         3: "0", 4: "0"}
+                    # i17 (standing-paid fact) for the sender, in the
+                    # engine's fee-query overlay position (after the
+                    # transfer fields, before i5).
+                    fee_query_inputs[tau_defs.STANDING_PAID_STREAM_INDEX] = \
+                        _admission_standing_paid(sender_pubkey, admission_ts)
                     fee_query_inputs[5] = str(admission_ts)
                     fee_query_inputs[12] = "{ #x" + sender_pubkey + " }:bv[384]"
                     # Custom streams (i13+) last, matching the apply-time

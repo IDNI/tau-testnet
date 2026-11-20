@@ -1704,6 +1704,30 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # would wrap to a huge bv value and silently satisfy the cooldown).
             return str(max(0, min(elapsed, tau_defs.COOLDOWN_NEVER_SENT)))
 
+        def _standing_paid_current_period(addr: Optional[str]) -> str:
+            """i17: "1" when `addr`'s current standing period is recorded paid.
+
+            The rule-readable projection of the standing book's
+            paid-for-period facts (tau_defs.STANDING_PAID_STREAM_INDEX):
+            1 when at least one of the sender's authorizations has the
+            period containing the block timestamp recorded paid, else 0
+            — per account, across all its authorizations. Read through
+            the same lifecycle view the transfer seam reads its books
+            from: the parent snapshot plus this block's earlier
+            transactions (standing mutations land at each transaction's
+            own end-of-tx site, so a transfer never sees its own
+            transaction's uncommitted standing changes), and proposer
+            and verifier walking the same block compute the same value.
+            Fed always, like i2.
+            """
+            if not addr:
+                return "0"
+            book = _standing_payment_book(lifecycle_mgr)
+            if book is None:
+                return "0"
+            return "1" if book.has_paid_period_containing(
+                addr, int(block_timestamp or 0)) else "0"
+
         def _lifecycle_for_write():
             """This transaction's fork of the block lifecycle, made on the first write.
 
@@ -2023,6 +2047,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     # is deterministic across both (issue #20).
                     2: _parent_bal(from_addr),
                     **({16: _since_last_transfer(from_addr)} if cooldown_active else {}),
+                    # i17 (standing-paid fact): fed ALWAYS, like i2 — the
+                    # sender's current standing period, recorded paid or
+                    # not. Reserved (RESERVED_STREAMS), so the custom
+                    # merge below can never override the node's value.
+                    tau_defs.STANDING_PAID_STREAM_INDEX:
+                        _standing_paid_current_period(from_addr),
                     # i3/i4 are the real from/to pubkeys (immutable in
                     # the transfer tuple -> identical at admission and
                     # apply), so recipient-aware policy/fee rules are
@@ -3664,6 +3694,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         # here would diverge replay from mining.
                                         2: _parent_bal(from_addr),
                                         **({16: _since_last_transfer(from_addr)} if cooldown_active else {}),
+                                        # i17 (standing-paid fact), fed
+                                        # always like the fee-era path.
+                                        tau_defs.STANDING_PAID_STREAM_INDEX:
+                                            _standing_paid_current_period(from_addr),
                                         # Real from/to pubkeys for eval/width parity
                                         # with the fee-era path.
                                         3: "{ #x" + str(from_addr) + " }:bv[384]",
@@ -3757,6 +3791,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     fee_query_inputs = {
                         1: "0", 2: _parent_bal(sender), 3: "0", 4: "0",
                         **({16: _since_last_transfer(sender)} if cooldown_active else {}),
+                        # i17 (standing-paid fact) for the sender, fed
+                        # always like i2.
+                        tau_defs.STANDING_PAID_STREAM_INDEX:
+                            _standing_paid_current_period(sender),
                         # NOTE: key order here (5 before 12) intentionally
                         # matches commands/sendtx.py's transfer-less fee query,
                         # since insertion order is what the shrink layer sees.
