@@ -59,6 +59,21 @@ from consensus.retractable import (
     parse_retractable_transfer,
     validate_park_shape,
 )
+from consensus.standing import (
+    MAX_OPEN_STANDING_PER_PAYER,
+    MAX_OPEN_STANDING_TOTAL,
+    TX_TYPE_STANDING_CANCEL,
+    TX_TYPE_STANDING_CREATE,
+    TX_TYPE_STANDING_EXECUTE,
+    StandingBook,
+    StandingRecord,
+    StandingShapeError,
+    StandingTerms,
+    parse_standing_cancel,
+    parse_standing_create,
+    parse_standing_execute,
+    validate_standing_shape,
+)
 from consensus.tx_checks import check_transfer, validate_bls_pubkey
 from consensus.governance import (
     normalize_validator_delta,
@@ -1582,6 +1597,141 @@ def validate_retractable_transfer_payload(
     })
 
 
+
+def validate_standing_create_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for signing a standing payment authorization.
+
+    Shape is shared with block apply through `validate_standing_shape`;
+    the book bounds are checked against the persisted tip tables.
+    """
+    try:
+        terms = parse_standing_create(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment_create: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != terms.payer:
+        return format_error("standing_payment_create sender_pubkey must match the signer.")
+
+    err = validate_bls_pubkey(terms.recipient, "recipient_pubkey")
+    if err:
+        return format_error(f"standing_payment_create rejected: {err}")
+
+    shape_error = validate_standing_shape(terms, tip_view.next_block_timestamp)
+    if shape_error:
+        return format_error(f"standing_payment_create rejected: {shape_error}")
+
+    standing_id = terms.standing_id
+    if tip_view.get_standing(standing_id) is not None:
+        return format_error(
+            "Duplicate standing_payment_create (identical signed terms).",
+            code="DUPLICATE_STANDING",
+        )
+    if tip_view.open_standing_count_for_payer(terms.payer) >= MAX_OPEN_STANDING_PER_PAYER:
+        return format_error(
+            f"Payer already has {MAX_OPEN_STANDING_PER_PAYER} open standing payments.",
+            code="TOO_MANY_STANDING",
+        )
+    if tip_view.open_standing_count() >= MAX_OPEN_STANDING_TOTAL:
+        return format_error(
+            "The standing payment book is full.", code="STANDING_BOOK_FULL"
+        )
+    if terms.supersedes is not None:
+        prev = tip_view.get_standing(terms.supersedes)
+        if prev is None or prev["payer_pubkey"] != terms.payer:
+            return format_error(
+                "supersedes_id does not name an open authorization of this payer.",
+                code="UNKNOWN_SUPERSEDES",
+            )
+
+    return success({
+        "standing_id": standing_id.hex(),
+        "amount": terms.amount,
+        "recipient_pubkey": terms.recipient,
+        "period_kind": terms.kind,
+        "anchor_timestamp": terms.anchor_ts,
+    })
+
+
+def _standing_record_from_row(row: Dict) -> StandingRecord:
+    terms = StandingTerms(
+        payer=row["payer_pubkey"],
+        recipient=row["recipient_pubkey"],
+        amount=row["amount"],
+        kind=row["period_kind"],
+        anchor_ts=row["anchor_timestamp"],
+        window_start_offset=row["window_start_offset"],
+        window_end_offset=row["window_end_offset"],
+        end_kind=row["end_kind"],
+        end_value=row["end_value"],
+        sequence_number=row["sequence_number"],
+        supersedes=(
+            bytes.fromhex(row["supersedes_id"]) if row.get("supersedes_id") else None
+        ),
+    )
+    return StandingRecord(
+        terms=terms,
+        executed_count=row["executed_count"],
+        total_executed=row["total_executed"],
+        settled_periods=set(row["settled_periods"]),
+        last_executed_period=row["last_executed_period"],
+    )
+
+
+def validate_standing_execute_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for executing one due occurrence of an authorization."""
+    try:
+        request = parse_standing_execute(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment_execute: {exc}.")
+
+    row = tip_view.get_standing(request.standing_id)
+    if row is None:
+        return format_error(
+            "Unknown or already resolved standing payment.",
+            code="UNKNOWN_STANDING",
+        )
+    record = _standing_record_from_row(row)
+    probe = StandingBook()
+    probe.open[record.standing_id] = record
+    if probe.due_period(request.standing_id, tip_view.next_block_timestamp) is None:
+        return format_error(
+            "No occurrence of this standing payment is due.",
+            code="STANDING_NOT_DUE",
+        )
+    return success({"standing_id": request.standing_id.hex()})
+
+
+def validate_standing_cancel_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for the payer cancelling their own authorization."""
+    try:
+        request = parse_standing_cancel(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment_cancel: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != request.payer_pubkey:
+        return format_error("standing_payment_cancel sender_pubkey must match the signer.")
+
+    row = tip_view.get_standing(request.standing_id)
+    if row is None:
+        return format_error(
+            "Unknown or already resolved standing payment.",
+            code="UNKNOWN_STANDING",
+        )
+    if row["payer_pubkey"] != request.payer_pubkey:
+        return format_error(
+            "Only the payer may cancel.", code="NOT_STANDING_PAYER"
+        )
+    return success({"standing_id": request.standing_id.hex()})
+
+
 def validate_retract_transfer_payload(
     tx: Dict, tip_view: TipAdmissionView
 ) -> AdmissionResult:
@@ -1728,6 +1878,15 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
          return validate_retract_transfer_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_CREATE:
+        return validate_standing_create_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_EXECUTE:
+        return validate_standing_execute_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_CANCEL:
+        return validate_standing_cancel_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

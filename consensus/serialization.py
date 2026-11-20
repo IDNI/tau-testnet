@@ -780,3 +780,148 @@ def compute_retractable_book_root(
     out.extend(encode_uint64(int(resolved_count)))
     out.extend(encode_hash32(resolved_acc))
     return blake3(bytes(out)).digest()
+
+
+# --- Standing payments (Bounty 01, issue #34) --------------------------------
+
+DOMAIN_STANDING_AUTHORIZATION_V1 = b"tau.standing.authorization.v1"
+DOMAIN_STANDING_RESOLVED_V1 = b"tau.standing.resolved.v1"
+DOMAIN_STANDING_BOOK_V1 = b"tau.standing.book.v1"
+
+
+def _encode_standing_terms(
+    out: bytearray,
+    payer_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    kind: int,
+    anchor_ts: int,
+    window_start_offset: int,
+    window_end_offset: int,
+    end_kind: int,
+    end_value: int,
+    sequence_number: int,
+    supersedes: Any,
+) -> None:
+    out.extend(encode_pubkey48(payer_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(bytes([int(kind) & 0xFF]))
+    out.extend(encode_uint64(int(anchor_ts)))
+    out.extend(encode_uint64(int(window_start_offset)))
+    out.extend(encode_uint64(int(window_end_offset)))
+    out.extend(bytes([int(end_kind) & 0xFF]))
+    out.extend(encode_uint64(int(end_value)))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(bytes([1 if supersedes else 0]))
+    out.extend(encode_hash32(supersedes if supersedes else bytes(32)))
+
+
+def compute_standing_id(
+    payer_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    kind: int,
+    anchor_ts: int,
+    window_start_offset: int,
+    window_end_offset: int,
+    end_kind: int,
+    end_value: int,
+    sequence_number: int,
+    supersedes: Any,
+) -> bytes:
+    """BLAKE3 of the canonical signed authorization terms. Returns 32 bytes.
+
+    Content-derived for the same reason retractable ids are: the apply-time
+    tx_id differs between proposer and validators.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_AUTHORIZATION_V1.decode()))
+    _encode_standing_terms(
+        out,
+        payer_pubkey,
+        recipient_pubkey,
+        amount,
+        kind,
+        anchor_ts,
+        window_start_offset,
+        window_end_offset,
+        end_kind,
+        end_value,
+        sequence_number,
+        supersedes,
+    )
+    return blake3(bytes(out)).digest()
+
+
+def compute_standing_resolved_acc(acc: Any, standing_id: Any, outcome: int) -> bytes:
+    """Fold one closed authorization into the running commitment."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(standing_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    return blake3(bytes(out)).digest()
+
+
+def encode_standing_entry(
+    standing_id: Any,
+    payer_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    kind: int,
+    anchor_ts: int,
+    window_start_offset: int,
+    window_end_offset: int,
+    end_kind: int,
+    end_value: int,
+    sequence_number: int,
+    supersedes: Any,
+    executed_count: int,
+    total_executed: int,
+    settled_periods: Any,
+) -> bytes:
+    """One open authorization for the book root: terms AND progress.
+
+    Progress is part of the entry (unlike a parked transfer, a standing
+    authorization lives across periods), so the root binds how much has
+    executed and which periods settled, not just that the entry exists.
+    """
+    out = bytearray()
+    out.extend(encode_hash32(standing_id))
+    _encode_standing_terms(
+        out,
+        payer_pubkey,
+        recipient_pubkey,
+        amount,
+        kind,
+        anchor_ts,
+        window_start_offset,
+        window_end_offset,
+        end_kind,
+        end_value,
+        sequence_number,
+        supersedes,
+    )
+    out.extend(encode_uint64(int(executed_count)))
+    out.extend(encode_uint64(int(total_executed)))
+    periods = sorted(int(p) for p in (settled_periods or []))
+    out.extend(encode_uint32(len(periods)))
+    for period in periods:
+        out.extend(encode_uint64(period))
+    return bytes(out)
+
+
+def compute_standing_book_root(
+    open_entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    """BLAKE3 of the standing book: sorted open entries, then resolved."""
+    encoded = sorted(encode_standing_entry(*e) for e in (open_entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()
