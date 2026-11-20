@@ -142,6 +142,28 @@ def _application_rule_landed(rule_text: str) -> bool:
     return unit in app or raw in app
 
 
+def _rule_outcome_from_receipt(receipt) -> Optional[Dict[str, Any]]:
+    """The apply outcome of one rule step, projected from its revision receipt.
+
+    Issue #42, milestone 1: this is what a wallet needs to confirm a rule took
+    effect -- the engine's revision counter before and after the step, and the
+    o0 verdict (`revision_taken`: 'F' means the revision branch was taken, the
+    candidate was consumed). Projected at the rule step itself because the
+    manager's last-receipt global is overwritten by every later Tau step of
+    the same transaction (the fee steps included); nothing here is read back
+    at receipt or query time.
+    """
+    if not isinstance(receipt, dict):
+        return None
+    outputs = receipt.get("outputs") or {}
+    return {
+        "spec_revision_before": receipt.get("spec_revision_before"),
+        "spec_revision_after": receipt.get("spec_revision_after"),
+        "revision_taken": outputs.get("o0"),
+        "outcome": receipt.get("outcome"),
+    }
+
+
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 
@@ -963,6 +985,25 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
 
+        # Issue #42, milestone 1: the apply outcome of every accepted rule
+        # transaction in this block, keyed by the block's own tx id so
+        # gettxstatus can find it by the hash a wallet knows. The receipt's
+        # logs are attached here, at the end of apply, when they are complete;
+        # the outcome scalars were captured at the rule step itself.
+        rule_outcomes = []
+        block_tx_ids = getattr(block, "tx_ids", None) or []
+        for i, tx in enumerate(block.transactions):
+            receipt = exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}
+            outcome = receipt.get("rule_outcome")
+            if outcome and id(tx) in accepted_obj:
+                record = dict(outcome)
+                record["logs"] = receipt.get("logs", [])
+                tx_hash = (
+                    block_tx_ids[i] if i < len(block_tx_ids)
+                    else _receipt_lookup_key(tx, i)
+                )
+                rule_outcomes.append((tx_hash, record))
+
         # 3. Post-State Materialization Layer
         
         # The rules are updated by self.apply (it returns a generic snapshot with tau_bytes).
@@ -1118,6 +1159,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "rule_outcomes": rule_outcomes,
             }
         )
         
@@ -2781,6 +2823,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 # string heuristic reads as success.
                                 receipt = _session.last_receipt()
                                 if receipt is not None:
+                                    # Issue #42, milestone 1: copy the apply
+                                    # outcome out NOW, while the session's last
+                                    # receipt still describes THIS rule step.
+                                    # Later steps of this transaction (fees
+                                    # included) overwrite it, so a confirmed
+                                    # rule transaction could otherwise never be
+                                    # attributed its own verdict. The outcome
+                                    # rides the tx receipt and is persisted for
+                                    # accepted transactions only (see
+                                    # apply_block's rule_outcomes harvest).
+                                    rule_outcome = _rule_outcome_from_receipt(receipt)
+                                    if rule_outcome is not None:
+                                        tx_receipt["rule_outcome"] = rule_outcome
                                     tau_failed = not receipt.get("accepted", False)
                                     tx_receipt["logs"].append(
                                         f"Tau(rule) outcome: {receipt.get('outcome')}"
