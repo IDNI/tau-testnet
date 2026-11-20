@@ -28,6 +28,13 @@ if str(PROJECT_ROOT) not in sys.path:
 import config
 import db
 import tau_logging
+from consensus import network_binding
+
+# The network every test runs on. Transactions of the types bound to a network
+# sign this value; a real node reads the hash of its block 0 instead. Set at
+# import as well as per test, so helpers called while tests are collected see it.
+TEST_GENESIS_HASH = "5a" * 32
+network_binding._known = TEST_GENESIS_HASH
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -95,6 +102,12 @@ def _fail_on_new_tau_manager_threads(before: set, where: str) -> None:
         + (f"; these did not stop: {stuck}" if stuck else ""),
         pytrace=False,
     )
+
+
+@pytest.fixture(autouse=True)
+def one_network_for_every_test(monkeypatch) -> None:
+    """Pin the node's own network, so a test that reads another one cannot leak it."""
+    monkeypatch.setattr(network_binding, "_known", TEST_GENESIS_HASH)
 
 
 @pytest.fixture(autouse=True)

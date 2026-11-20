@@ -41,6 +41,17 @@ from .retractable import (
     parse_retract_transfer,
     parse_retractable_transfer,
 )
+from .standing import (
+    ATTEMPT_BLOCKED,
+    ATTEMPT_NO_FUNDS,
+    ATTEMPT_PAID,
+    STANDING_TX_TYPES,
+    StandingBook,
+    StandingShapeError,
+    TX_TYPE_STANDING_PAYMENT_CREATE,
+    parse_standing_payment_cancel,
+    parse_standing_payment_create,
+)
 from .rule_offers import (
     RULE_OFFER_TX_TYPES,
     RuleOfferDecision,
@@ -64,13 +75,16 @@ from .rule_offers import (
 # rule that changed while the request sat open. `transfer_vote` is exempt like a
 # governance vote, so approver bots need no funding.
 #
+# `standing_payment_create` pays for the same reason: it is the ONLY charge
+# for every payment the authorization later makes from the end-of-block sweep.
+#
 # MUST stay in step with commands.sendtx.FEE_BEARING_TX_TYPES -- the same
 # constant is deliberately duplicated there to keep the admission path free of
 # an engine import, and a divergence charges a different fee at admission than
 # at inclusion.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST}
+     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_STANDING_PAYMENT_CREATE}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -243,6 +257,111 @@ def _release_due_retractables(lm, balances, sequences, height, timestamp) -> Lis
             balances, sequences, entry.recipient_pubkey, grant
         ) + entry.amount
     return [entry.retractable_id.hex() for entry in released]
+
+
+def _standing_book(lm) -> Optional[StandingBook]:
+    book = getattr(lm, "standing_payments", None)
+    return book if isinstance(book, StandingBook) else None
+
+
+def standing_payment_inputs(payer, recipient, amount, *, parent_balance, since_last,
+                            slots_active, timestamp) -> Dict[int, str]:
+    """The o5 input map for one standing payment.
+
+    The same keys, values and order an ordinary transfer from `payer` is judged
+    on (`_transfer_input_map`): i1 amount, i2 the payer's PARENT balance, i16
+    the cooldown clock when active, i3/i4 the real payer and recipient, i12 the
+    payer, the approval slots all empty, then i5 the block timestamp. Empty slots
+    mean a clause that demands a co-signature keeps blocking: nobody co-signs a
+    payment the network makes on its own.
+    """
+    values: Dict[int, str] = {1: str(amount), 2: parent_balance}
+    if since_last is not None:
+        values[16] = since_last
+    values[3] = "{ #x" + str(payer) + " }:bv[384]"
+    values[4] = "{ #x" + str(recipient) + " }:bv[384]"
+    values[12] = "{ #x" + str(payer) + " }:bv[384]"
+    if slots_active:
+        for idx in tau_defs.approval_slot_indices():
+            values[idx] = "0"
+    values[5] = str(timestamp)
+    return values
+
+
+def _run_standing_payments(lm, balances, sequences, last_ts, parent_meta, height,
+                           timestamp, *, timeout=None, replay_mode=False) -> List[Dict[str, Any]]:
+    """Pay what the standing-payment book says is due in this block; its events.
+
+    Runs after the transaction loop and the retractable release, so a cancel in
+    this block always wins over a payment due in it, and money released to the
+    payer in this block can fund it. Each attempt reads the balance the block has
+    reached so far, re-checks the payer's current o5 clause, and on success
+    moves the amount payer -> recipient (with the grant of a recipient that has
+    no record yet, exactly as a transfer does) and stamps the payer's cooldown
+    clock. A payment is a send: it counts once, like any transfer.
+    """
+    book = _standing_book(lm)
+    if book is None or not book.terms:
+        return []
+    grant = faucet.amount(lm)
+    parent_bals = parent_meta.get("balances") or {}
+    parent_seqs = parent_meta.get("sequence_numbers") or {}
+    parent_lts = parent_meta.get("last_transfer_ts") or {}
+    slots_active = getattr(lm, "approval_slots_active", False) is True
+    cooldown = getattr(tau_defs, "COOLDOWN_STREAM_ACTIVE", False)
+    offers = lm.rule_offers
+
+    def since_last(payer) -> Optional[str]:
+        if not cooldown:
+            return None
+        try:
+            previous = int(parent_lts.get(payer, 0))
+        except (TypeError, ValueError):
+            previous = 0
+        if previous <= 0:
+            return str(tau_defs.COOLDOWN_NEVER_SENT)
+        return str(max(0, min(int(timestamp) - previous, tau_defs.COOLDOWN_NEVER_SENT)))
+
+    def attempt(terms) -> str:
+        payer, recipient, amount = terms.payer_pubkey, terms.recipient_pubkey, terms.amount
+        have = faucet.spendable(balances, sequences, payer, grant)
+        if have < amount:
+            return ATTEMPT_NO_FUNDS
+        clause = offers.clause_for(payer, tau_defs.USER_POLICY_STREAM_INDEX)
+        if clause:
+            parent_balance = str(max(0, min(
+                faucet.spendable(parent_bals, parent_seqs, payer, grant),
+                tau_defs.MAX_TRANSFER_VALUE,
+            )))
+            inputs = standing_payment_inputs(
+                payer, recipient, amount, parent_balance=parent_balance,
+                since_last=since_last(payer), slots_active=slots_active,
+                timestamp=timestamp,
+            )
+            try:
+                blocked, _detail = sender_policy.clause_blocks(
+                    clause, inputs, pool="apply", timeout=timeout,
+                )
+            except Exception:
+                if not replay_mode:
+                    raise
+                # The concession a Tau-less replay makes for transfers: the
+                # verdict is unknowable here, and the state hash catches a
+                # divergence.
+                logger.warning(
+                    "Replay without a policy evaluator: standing payment %s assumed allowed.",
+                    terms.standing_id.hex()[:16],
+                )
+                blocked = False
+            if blocked:
+                return ATTEMPT_BLOCKED
+        balances[payer] = have - amount
+        balances[recipient] = faucet.spendable(balances, sequences, recipient, grant) + amount
+        if last_ts is not None:
+            last_ts[payer] = int(timestamp)
+        return ATTEMPT_PAID
+
+    return book.sweep(int(height), int(timestamp), attempt)
 
 
 TEMPORAL_REFERENCE_REASON = "temporal_reference"
@@ -903,6 +1022,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         released_retractables = _release_due_retractables(
             lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
         )
+        _block_session = session if session is not None else getattr(proposal, "session", None)
+        standing_sweep = _run_standing_payments(
+            lm, t_bals, t_seqs, t_lts, metadata,
+            block.header.block_number, block.header.timestamp,
+            timeout=getattr(_block_session, "request_budget", None),
+            replay_mode=replay_mode,
+        )
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
             getattr(
@@ -962,6 +1088,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if event and id(tx) in accepted_obj:
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
+
+        # What the block did to standing payments: creations and cancels from
+        # the transactions it kept, then the sweep, in that order.
+        standing_events = []
+        for i, tx in enumerate(block.transactions):
+            event = (exec_result.receipts.get(tx.get('tx_id', str(i))) or {}).get("standing_event")
+            if event and tx in exec_result.accepted_transactions:
+                standing_events.append(event)
+        standing_events.extend(standing_sweep)
 
         # 3. Post-State Materialization Layer
         
@@ -1118,6 +1253,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "standing_events": standing_events,
             }
         )
         
@@ -1131,6 +1267,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "activated_updates": [u.update_id_hex for u in newly_active],
                 "released_retractables": released_retractables,
                 "retractable_events": retractable_events,
+                "standing_events": standing_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -1664,6 +1801,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             parked_rule_change_id: Optional[bytes] = None
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
+            pending_standing_create = None
+            pending_standing_cancel: Optional[bytes] = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2628,6 +2767,58 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 "Retractable transfer retracted: " + request.retractable_id.hex()
                             )
 
+            elif tx_type in STANDING_TX_TYPES:
+                # Root fields only, as for retractable transfers: only they are signed.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    book = lifecycle_mgr.standing_payments
+                    if tx_type == TX_TYPE_STANDING_PAYMENT_CREATE:
+                        try:
+                            terms = parse_standing_payment_create(tx)
+                        except StandingShapeError as exc:
+                            terms = None
+                            reason = f"invalid standing payment ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != terms.payer_pubkey:
+                                reason = "sender is not the signer"
+                            elif target_balances is None:
+                                reason = "no balance overlay"
+                            else:
+                                _, reason = book.can_admit_create(
+                                    terms, int(block_height or 0), int(block_timestamp or 0)
+                                )
+                        if terms is None or reason:
+                            tx_receipt["logs"].append(f"Standing payment ignored: {reason}")
+                            tx_receipt["reason"] = "standing_payment_not_created"
+                            accepted_in_block = False
+                        else:
+                            # Priced by the generic transfer-less fee-query step
+                            # below: creating moves no money, like a rule-only tx.
+                            pending_standing_create = terms
+                            tx_receipt["logs"].append(
+                                "Standing payment created: " + terms.standing_id.hex()
+                            )
+                    else:  # TX_TYPE_STANDING_PAYMENT_CANCEL
+                        try:
+                            signer, standing_id = parse_standing_payment_cancel(tx)
+                        except StandingShapeError as exc:
+                            standing_id = None
+                            reason = f"invalid standing payment cancel ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != signer:
+                                reason = "sender is not the signer"
+                            else:
+                                _, reason = book.can_admit_cancel(standing_id, signer)
+                        if standing_id is None or reason:
+                            tx_receipt["logs"].append(f"Standing payment cancel ignored: {reason}")
+                            tx_receipt["reason"] = "standing_payment_not_cancelled"
+                            accepted_in_block = False
+                        else:
+                            pending_standing_cancel = standing_id
+                            tx_receipt["logs"].append(
+                                "Standing payment cancelled: " + standing_id.hex()
+                            )
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3174,6 +3365,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 elif pending_retract_id is not None:
                     tx_receipt["retractable_event"] = (pending_retract_id.hex(), "retracted")
                     book.retract(pending_retract_id)
+                if pending_standing_create is not None:
+                    sid = _lifecycle_for_write().standing_payments.create(pending_standing_create)
+                    tx_receipt["standing_event"] = {
+                        "standing_id": sid.hex(), "outcome": "created", "period": 0, "amount": 0,
+                    }
+                elif pending_standing_cancel is not None:
+                    _lifecycle_for_write().standing_payments.cancel(pending_standing_cancel)
+                    tx_receipt["standing_event"] = {
+                        "standing_id": pending_standing_cancel.hex(), "outcome": "cancelled",
+                        "period": 0, "amount": 0,
+                    }
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same

@@ -14,6 +14,7 @@ import db
 import tau_admission
 from commands import checktx
 from consensus.admission import TipAdmissionView
+from consensus.network_binding import chain_genesis_hash
 from consensus.rule_offers import RuleOffer
 from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex, sign_payload
 
@@ -147,6 +148,11 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
+    if kind == "standing_payment_create":
+        return _envelope(kind, SENDER, fee_limit, recipient_pubkey=RECIPIENT,
+                         amount=100, interval_blocks=128,
+                         first_due=NEXT_HEIGHT + 20, periods=3,
+                         genesis_hash=chain_genesis_hash())
     raise AssertionError(kind)
 
 
@@ -158,7 +164,7 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request"]
+               "rule_change_request", "standing_payment_create"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():
