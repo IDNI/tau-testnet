@@ -49,6 +49,22 @@ def test_grant_5000_week_cap_refund_returns_remainder():
     assert book.due_refunds(ts=DEC1 + 5 * WEEK) == []
 
 
+def test_grant_5000_returns_3800_after_1200_drawn():
+    # The maintainer's canonical framing of the grant case: a 5,000
+    # grant at 500/week from Dec 1, 1,200 drawn in total across three
+    # weeks, and exactly 3,800 returned to the grantor at the deadline.
+    book = GrantBook()
+    state = book.create(_terms())
+    state.apply_draw(500, ts=DEC1 + 60)
+    state.apply_draw(500, ts=DEC1 + WEEK + 60)
+    state.apply_draw(200, ts=DEC1 + 2 * WEEK + 60)
+    assert state.remaining == 3800
+    due = book.due_refunds(ts=DEC1 + 4 * WEEK)
+    assert due == [(state.terms.grant_id, A, 3800)]
+    assert state.apply_refund() == 3800
+    assert state.remaining == 0
+
+
 def test_grant_draw_window():
     book = GrantBook()
     state = book.create(_terms())

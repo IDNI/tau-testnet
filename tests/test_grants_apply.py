@@ -195,3 +195,35 @@ def test_grant_5000_week_cap_refund_returns_remainder():
     # 5,000 - 1,000 drawn = 4,000 back to the sender, in full.
     assert ch.bal[ALICE] == 5_000 + 4_000
     assert ch.bal[BOB] == 1000
+
+
+def test_grant_shared_cap_binds_across_grants():
+    # Two grants in one cap group: each has its own 500/week cap,
+    # and together they may draw at most 600/week.
+    ch = Chain({ALICE: 20_000, BOB: 0, CAROL: 0, PROPOSER: 0})
+    group = {"cap_group": "team-budget", "cap_group_cap": 600}
+    c1 = create_tx(seq=0, total=5000, cap=500, extra=group)
+    ch.block([c1], height=20, ts=DEC1 - 60)
+    assert ch.accepted(c1), ch.receipt(c1)
+    c2 = create_tx(seq=1, total=5000, cap=500,
+                   extra={**group, "recipient_pubkey": CAROL})
+    ch.block([c2], height=21, ts=DEC1 - 60)
+    assert ch.accepted(c2), ch.receipt(c2)
+    g1 = parse_grant_create(c1).grant_id
+    g2 = parse_grant_create(c2).grant_id
+
+    d1 = draw_tx(g1, 500, seq=0)
+    ch.block([d1], height=22, ts=DEC1 + 60)
+    assert ch.accepted(d1), ch.receipt(d1)
+    assert ch.bal[BOB] == 500
+
+    # Carol's grant has drawn nothing and its own cap is 500, but
+    # the shared budget has only 100 left this week.
+    over = draw_tx(g2, 101, seq=0, sk=SK_CAROL, sender=CAROL)
+    ch.block([over], height=23, ts=DEC1 + 120)
+    assert not ch.accepted(over)
+    assert ch.bal[CAROL] == 0
+    d2 = draw_tx(g2, 100, seq=0, sk=SK_CAROL, sender=CAROL)
+    ch.block([d2], height=24, ts=DEC1 + 180)
+    assert ch.accepted(d2), ch.receipt(d2)
+    assert ch.bal[CAROL] == 100
