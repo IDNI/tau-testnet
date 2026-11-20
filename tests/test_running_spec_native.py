@@ -153,6 +153,12 @@ def test_the_probe_of_sep_27_reads_what_the_engine_runs(authority, monkeypatch):
         "o27[t]:bv[24] = { 9 }:bv[24]", "o26[t]:bv[24] = { 3 }:bv[24]"]
     assert "i3[t]:bv[384]" in text and "i3[t]:bv[384]" not in worker_text
 
+    # nor the in-process interpreter's text: a node outside test mode runs the
+    # authoritative evaluator (server.py), so tau_manager.get_canonical_spec()
+    # holds none of the committed rules
+    import tau_manager
+    assert "o26" not in (tau_manager.get_canonical_spec() or "")
+
     # rebuilt from the committed journal alone, the same text and hash
     rs.reset_cache()
     again = rs.at_head()
