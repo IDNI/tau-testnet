@@ -163,6 +163,10 @@ class TransactionOutcome:
     status: str # "applied", "skipped", "invalid"
     reason: Optional[str] = None
     receipt_logs: List[str] = None
+    # Issue #42: the engine's revision receipt for a confirmed op-0 rule
+    # transaction ({outcome, spec_revision_before, spec_revision_after}),
+    # captured at the apply site; None for every other transaction.
+    rule_outcome: Optional[Dict[str, Any]] = None
 
 @dataclass
 class ApplyBlockResult:
@@ -947,7 +951,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 else:
                     accepted_ids.append(tx_id)
                     
-                outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, receipt_logs=logs))
+                outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, receipt_logs=logs, rule_outcome=receipt.get("rule_outcome")))
             elif id(tx) in rejected_obj:
                 status = "invalid"
                 receipt = exec_result.receipts.get(tx_id, {})
@@ -2791,6 +2795,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         and "error" in output.lower()
                                         and "x1001" not in output.lower()
                                     )
+                                # Issue #42: capture the revision receipt NOW,
+                                # while it is still this rule step's own. The
+                                # manager keeps only the LAST receipt, so any
+                                # later Tau step in this block apply (fee
+                                # settlement included) would overwrite it; the
+                                # success branches below copy this into the
+                                # transaction receipt, from where createblock
+                                # persists it for gettxstatus.
+                                _rule_outcome = None
+                                if receipt is not None:
+                                    _rule_outcome = {
+                                        "outcome": receipt.get("outcome"),
+                                        "spec_revision_before": receipt.get("spec_revision_before"),
+                                        "spec_revision_after": receipt.get("spec_revision_after"),
+                                    }
                                 if tau_failed:
                                     logger.warning("Tau rejected rule: %s", output)
                                     execution_success = False
@@ -2822,6 +2841,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     _set_rules_state("\n".join(units))
                                     current_tau_bytes = "\n".join(units).encode("utf-8")
                                     _rule_touched_canonical = True
+                                    if _rule_outcome is not None:
+                                        tx_receipt["rule_outcome"] = _rule_outcome
                                     tx_receipt["logs"].append("Rule applied (staged)")
                                 elif not _application_rule_landed(rule_text):
                                     # Live apply: the handler did not persist, so
@@ -2855,6 +2876,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     else:
                                         current_tau_bytes += rule_op_data.encode("utf-8")
                                     _rule_touched_canonical = True
+                                    if _rule_outcome is not None:
+                                        tx_receipt["rule_outcome"] = _rule_outcome
                                     tx_receipt["logs"].append("Rule applied")
 
                           except tau_shrink.ShrinkTypeConflict as e:
