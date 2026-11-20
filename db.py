@@ -509,9 +509,22 @@ def init_db():
                     period_index    INTEGER NOT NULL,
                     drawn_in_period INTEGER NOT NULL,
                     last_draw_ts    INTEGER NOT NULL,
-                    refunded        INTEGER NOT NULL
+                    refunded        INTEGER NOT NULL,
+                    cap_group       TEXT NOT NULL DEFAULT '',
+                    cap_group_cap   INTEGER NOT NULL DEFAULT 0
                 );
             ''')
+            cur = conn.execute("PRAGMA table_info(grants_v1);")
+            grant_cols = {row[1] for row in cur.fetchall()}
+            if grant_cols and "cap_group" not in grant_cols:
+                # Additive: existing rows default to no cap group,
+                # which reads as an ungrouped grant.
+                conn.execute(
+                    "ALTER TABLE grants_v1 ADD COLUMN cap_group TEXT NOT NULL DEFAULT '';"
+                )
+                conn.execute(
+                    "ALTER TABLE grants_v1 ADD COLUMN cap_group_cap INTEGER NOT NULL DEFAULT 0;"
+                )
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS payout_events (
                     entry_id     TEXT NOT NULL,
@@ -2741,7 +2754,8 @@ def _write_grant_rows(state: Dict) -> None:
             '(grant_id, sender_pubkey, recipient_pubkey, total, '
             'cap_per_period, opens_at, deadline, sequence_number, '
             'remaining, period_index, drawn_in_period, last_draw_ts, '
-            'refunded) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'refunded, cap_group, cap_group_cap) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 row['grant_id'],
                 row['sender'],
@@ -2756,6 +2770,8 @@ def _write_grant_rows(state: Dict) -> None:
                 int(row['drawn_in_period']),
                 int(row['last_draw_ts']),
                 int(row['refunded']),
+                str(row.get('cap_group', '') or ''),
+                int(row.get('cap_group_cap', 0)),
             )
         )
 
@@ -2769,18 +2785,23 @@ def load_grant_state() -> List[Dict]:
             'SELECT grant_id, sender_pubkey, recipient_pubkey, total, '
             'cap_per_period, opens_at, deadline, sequence_number, '
             'remaining, period_index, drawn_in_period, last_draw_ts, '
-            'refunded FROM grants_v1 ORDER BY grant_id'
+            'refunded, cap_group, cap_group_cap '
+            'FROM grants_v1 ORDER BY grant_id'
         ).fetchall()
     keys = (
         'grant_id', 'sender', 'recipient', 'total', 'cap_per_period',
         'opens_at', 'deadline', 'sequence_number', 'remaining',
         'period_index', 'drawn_in_period', 'last_draw_ts', 'refunded',
+        'cap_group', 'cap_group_cap',
     )
     out = []
     for r in rows:
         d = dict(zip(keys, r))
         for k in keys[3:]:
-            d[k] = int(d[k])
+            if k == 'cap_group':
+                d[k] = str(d[k] or '')
+            else:
+                d[k] = int(d[k])
         d['refunded'] = bool(d['refunded'])
         out.append(d)
     return out
