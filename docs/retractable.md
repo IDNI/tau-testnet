@@ -156,6 +156,13 @@ model, or the sender's balance dropping to zero does not block it. This is also
 why the funds are removed from the sender up front: the recipient is guaranteed
 to be paid, and nothing the sender does afterwards can fail the release.
 
+The recipient's policy is also consulted at park: a park is a transfer
+into escrow, so the recipient gate (see
+[recipient-controls.md](recipient-controls.md)) judges it like one, with
+the park's hold length fed on `i17`/`i27`. A recipient may therefore cap
+how long a payment to it may be held; a park over the cap is refused
+with `RECIPIENT_MAX_HOLD`. A retract is never gated by the cap.
+
 ## Inspecting
 
 ```bash

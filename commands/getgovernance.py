@@ -181,6 +181,10 @@ def execute(raw_command: str, container):
             "votes": sorted(votes, key=lambda entry: (entry["update_id"], entry["voter_pubkey"])),
             "lifecycle": lifecycle,
             "stream_widths": dict(tau_defs.HOST_STREAM_WIDTHS),
+            # Node-software capability flags (issues #47/#76), frozen like
+            # stream_widths: a wallet asks whether this node enforces
+            # recipient-side policy before offering an inbound rule.
+            "capabilities": dict(tau_defs.HOST_CAPABILITIES),
         }
 
     return api_response.success_response("getgovernance", payload)
