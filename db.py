@@ -1706,6 +1706,49 @@ def get_rule_outcome(tx_hash: str, block_hash: str) -> Optional[Dict]:
         return None
 
 
+def get_rule_tx_by_revision() -> Dict[int, str]:
+    """Map spec_revision -> the transaction whose rule step landed on it.
+
+    Built from the recorded rule outcomes: a shared-spec outcome carries
+    `spec_revision_after`, the revision its own step produced, so the map
+    names the transaction responsible for each revision -- the attribution
+    the active-rules ledger uses to say which transaction introduced a
+    unit and which one displaced it. Registry outcomes carry no revision
+    and never appear here. A step that advanced onto the revision
+    (before < after) always wins the attribution over a no-op outcome
+    that merely landed on it; remaining ties break by earliest block,
+    deterministically.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT tx_hash, outcome FROM rule_outcomes "
+            "ORDER BY block_number ASC, tx_hash ASC"
+        )
+        rows = cur.fetchall()
+    parsed = []
+    for tx_hash, payload in rows:
+        try:
+            outcome = json.loads(payload)
+        except Exception:
+            continue
+        after = outcome.get("spec_revision_after")
+        if isinstance(after, int):
+            parsed.append((tx_hash, outcome.get("spec_revision_before"), after))
+    by_revision: Dict[int, str] = {}
+    for advancing_pass in (True, False):
+        for tx_hash, before, after in parsed:
+            if advancing_pass and not (
+                isinstance(before, int) and before < after
+            ):
+                continue
+            if after not in by_revision:
+                by_revision[after] = tx_hash
+    return by_revision
+
+
 def record_spec_snapshots(height: int, snapshots) -> None:
     """Persist canonical spec snapshots for the revisions a block advanced.
 
@@ -1797,6 +1840,35 @@ def get_latest_spec_snapshot() -> Optional[Dict]:
             "FROM spec_snapshots ORDER BY spec_revision DESC LIMIT 1"
         )
         return _spec_snapshot_row(cur.fetchone())
+
+
+def get_all_spec_snapshots(upto_revision: Optional[int] = None) -> list:
+    """Every recorded spec snapshot, oldest revision first.
+
+    The sequence the active-rules ledger is derived from: successive
+    snapshots are the successive composed specs, so the difference
+    between neighbours is exactly what one revision's step introduced
+    and displaced. `upto_revision` bounds the sequence to the history
+    of the snapshot being served, so a view at a past height derives
+    its ledger as of that height, never from later state.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        if upto_revision is None:
+            cur.execute(
+                "SELECT spec_revision, height, canonical_text, sha256 "
+                "FROM spec_snapshots ORDER BY spec_revision ASC"
+            )
+        else:
+            cur.execute(
+                "SELECT spec_revision, height, canonical_text, sha256 "
+                "FROM spec_snapshots WHERE spec_revision <= ? "
+                "ORDER BY spec_revision ASC",
+                (int(upto_revision),),
+            )
+        return [_spec_snapshot_row(row) for row in cur.fetchall()]
 
 
 def get_canonical_confirmation(block_hash: str, block_number: int) -> tuple[bool, int]:
