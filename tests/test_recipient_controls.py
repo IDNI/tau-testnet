@@ -22,9 +22,11 @@ by the fake step / scripted o5 here; the same verdicts against the real
 engine are proven in test_recipient_controls_native.py (guarded units
 pre-deployed into a real WorkerSession, evaluated by the native engine).
 Clause mode is additionally proven on two live nodes running the native
-engine; guarded units seeded via genesis did NOT enforce on those nodes
-(see "Verification" in docs/recipient-controls.md), so guarded mode is
-proven in-process only until its live deployment path is established.
+engine. Guarded mode is proven live on two nodes too, with ONE combined
+guarded unit (allowlist + cap nested) seeded at genesis: two separate
+guarded units for one recipient do NOT combine -- the last-applied unit's
+o5 verdict wins and silently masks the earlier policy (see COMBINED_UNIT
+and test_native_two_separate_guarded_units_last_wins).
 """
 import itertools
 import json
@@ -72,6 +74,21 @@ CAP600_UNIT = (
     "always ((i12[t]:bv[384] = { #x" + RECIPIENT + " }:bv[384]) ? "
     "((i17[t]:bv[64] <= {600}:bv[64]) "
     "? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24])) "
+    ": (o5[t]:bv[24] = { #x000001 }:bv[24]))."
+)
+# ONE guarded unit combining the allowlist AND the hold cap (allowlist
+# outside, cap inside): the only way to have both policies for one
+# recipient. Two separate guarded units for one recipient do NOT combine:
+# each `always` revision of o5 supersedes the previous one, so the
+# LAST-applied unit's verdict wins and the earlier policy is silently
+# masked (proven by test_native_two_separate_guarded_units_last_wins in
+# test_recipient_controls_native.py). Deploy one combined unit, never two.
+COMBINED_UNIT = (
+    "always ((i12[t]:bv[384] = { #x" + RECIPIENT + " }:bv[384]) ? "
+    "((i3[t]:bv[384] = { #x" + ALLOWED + " }:bv[384]) "
+    "? ((i17[t]:bv[64] <= {600}:bv[64]) "
+    "? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24])) "
+    ": (o5[t]:bv[24] = { #x000000 }:bv[24])) "
     ": (o5[t]:bv[24] = { #x000001 }:bv[24]))."
 )
 ALLOWLIST_CLAUSE = clause_body_v1(

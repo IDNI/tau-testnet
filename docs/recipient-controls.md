@@ -79,6 +79,13 @@ check inside. The `i12` guard is what makes the unit guarded — without
 it, the unit would judge every transfer in the chain, not just ones
 to you. The cap literal must be `bv[64]`, the width `i17` is fed at.
 
+Deploy ONE combined unit per recipient, never two separate units: each
+`always` revision of `o5` supersedes the previous one, so the
+last-applied unit's verdict wins and the earlier policy is silently
+masked. Two guarded units for one recipient do NOT AND-combine
+(proven by `test_native_two_separate_guarded_units_last_wins` in
+`tests/test_recipient_controls_native.py`).
+
 ### Clause mode (your own o5 clause)
 
 Register the rule as your own `o5` policy clause: send a `user_tx`
@@ -134,13 +141,18 @@ enforces:
 ## Verification (real engine, not mock)
 
 Guarded-mode verdicts are proven against the real native Tau engine
-(`tests/test_recipient_controls_native.py`, 4 tests, all passing): the
+(`tests/test_recipient_controls_native.py`, 9 tests, all passing): the
 recipient's guarded unit is deployed into a real `WorkerSession` spawned
 from the router, and `engine.apply` refuses/allows through the gate's
 second pass (`i12` = recipient) plus the zero-hold probe -- an unknown
 sender is refused with `recipient_policy_block`, a known sender is
 accepted, a 3600 s park against a 600 cap is refused with
-`recipient_max_hold`, and a 600 s park is accepted and escrowed. No
+`recipient_max_hold`, and a 600 s park is accepted and escrowed. The
+same four verdicts are proven for the single COMBINED unit (allowlist
+outside, cap inside), and a ninth test pins the composition rule: two
+separate guarded units for one recipient do NOT combine -- the
+last-applied unit's `o5` verdict wins
+(`test_native_two_separate_guarded_units_last_wins`). No
 `communicate_with_tau*` patching anywhere in those tests.
 
 Clause mode is proven end to end on TWO LIVE NODES running the native
@@ -154,16 +166,36 @@ seconds"), and a 600 s park is accepted and escrowed. Both nodes agree
 on every block and balance (7 blocks, Alice 999,720 / Bob 1,000,230 /
 Stranger 999,890 at the end of the run).
 
-Caveat -- guarded units on a live node: seeding a guarded unit into the
-genesis `application_rules` puts it in the rules-state text (visible in
-`gettaustate`, capabilities reported) but did NOT enforce it on the live
-nodes in that run: a Stranger transfer to the guarded recipient was
-accepted. The gate logic itself is proven correct by the native tests
-above, so this is a deployment-path gap for guarded units on a live
-network (how the unit reaches the evaluator's spec, and how its
-literals are interned relative to transfer inputs), not a verdict bug.
-Until that path is established, deploy recipient policies as clauses
-on a live network; guarded mode is proven in-process only.
+Guarded mode is also proven end to end on TWO LIVE NODES running the
+native engine (same isolated dev chain, `tau-recipient-e2e`, Direct
+Bindings Mode), with ONE combined guarded unit (allowlist outside,
+600 cap inside) seeded into the genesis `application_rules`: a
+Stranger transfer to Bob is refused at admission with
+`RECIPIENT_POLICY_BLOCK` ("The recipient only accepts payments from
+approved senders"); Alice's 100 transfer is accepted (block 1,
+tx `6dd2d0ac…`); Alice's 3600 s park is refused with
+`RECIPIENT_MAX_HOLD` ("only accepts payments held for up to 600
+seconds"); Alice's 600 s park is accepted and escrowed (block 2,
+tx `79bdb137…`, retractable `1d8b1d25…` open on both nodes). Both nodes
+agree on all 3 blocks and final balances (Alice 999,780 / Bob
+1,000,100 / Stranger 1,000,000).
+
+Root cause of the FIRST live run's failure (Stranger accepted despite
+a seeded guarded unit): composition, not deployment. That run seeded
+TWO separate guarded units for Bob (allowlist + cap); the cap unit
+applied last, so its `o5` verdict -- accept for any sender when the
+hold is within cap -- silently masked the allowlist. Genesis seeding
+itself works: the unit reaches the evaluator's spec and enforces.
+That is why the rule is one combined unit per recipient.
+
+Deployment paths for guarded units, as the code stands: genesis
+seeding is the ONLY path. A rule tx cannot deploy one -- operations
+`{"0"}` routes `o5` rules to the clause registry, which rejects `i12`
+guards -- and a rule offer is screened the same way, so an offer
+cannot deploy one either. Governance applies consensus rules only.
+If a guarded unit must be added after genesis, it has to be a clause
+instead (clause mode above), or the chain needs a new deployment path
+-- that is a platform question for Tau/IDNI, not part of this change.
 
 ## What is not gated
 

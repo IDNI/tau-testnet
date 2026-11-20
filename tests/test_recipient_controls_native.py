@@ -12,9 +12,20 @@ o5 verdicts below come out of the native interpreter.
 A guarded unit cannot be deployed by a rule tx inside the block:
 operations {"0"} routes o5 rules to the clause registry, which rejects
 i12 guards ("a clause is evaluated only for its owner, so it must not
-carry a sender guard"). Deployment itself (rule offer + acceptance) is
-covered by the rule-offer tests; what the real engine proves here is the
-VERDICT of an already-deployed guarded unit.
+carry a sender guard") -- and a rule offer is screened the same way, so
+an offer cannot deploy one either. The only deployment path for a
+guarded unit in this codebase is genesis seeding (the unit is baked
+into the genesis application_rules). What the real engine proves here
+is the VERDICT of an already-deployed guarded unit.
+
+One guarded unit per recipient: the allowlist and the hold cap combine
+by NESTING into a single unit (COMBINED_UNIT). Two separate guarded
+units for one recipient do NOT combine -- each `always` revision of o5
+supersedes the previous one, so the last-applied unit's verdict wins
+and the earlier policy is silently masked (test_native_two_separate_
+guarded_units_last_wins below pins this). That is what the first
+two-live-node run hit: an allowlist unit plus a cap unit seeded at
+genesis, cap applied last, so the allowlist never refused anything.
 
 Skipped when the native module is not built (same gate as
 test_apply_block_abcd_native.py).
@@ -37,6 +48,7 @@ from consensus.state import TauStateSnapshot
 from test_recipient_controls import (
     ALLOWLIST_UNIT,
     CAP600_UNIT,
+    COMBINED_UNIT,
     RECIPIENT,
     SENDER,
     STRANGER,
@@ -94,18 +106,18 @@ def _lifecycle():
     return lm
 
 
-def _proposal(lifecycle, unit):
-    # The guarded unit is a candidate rule so the plan's representation
-    # knows the streams it uses (i12/i17/i3/o5). It is DEPLOYED into the
-    # worker's evaluator here, the way a rule that landed in an earlier
-    # block would be: the session's spec is the router plus every rule
-    # applied to it, and the plan alone does not compile rules into the
-    # spec. (A guarded unit cannot be deployed by a rule tx in THIS block:
-    # operations {"0"} routes o5 rules to the clause registry, which
-    # rejects i12 guards.) The snapshot's application-rules text carries
-    # the same unit, so the gate's scan and the session's spec agree --
+def _proposal(lifecycle, units):
+    # The guarded unit(s) are candidate rules so the plan's representation
+    # knows the streams they use (i12/i3/i17/i3/o5). They are DEPLOYED into
+    # the worker's evaluator here, the way rules that landed in an earlier
+    # block (or at genesis) would be: the session's spec is the router plus
+    # every rule applied to it, and the plan alone does not compile rules
+    # into the spec. (A guarded unit cannot be deployed by a rule tx in THIS
+    # block: operations {"0"} routes o5 rules to the clause registry, which
+    # rejects i12 guards.) The snapshot's application-rules text carries the
+    # same units, so the gate's scan and the session's spec agree --
     # exactly the post-deployment state on a live node.
-    plan = tr.plan_representation(candidate_rules=[unit])
+    plan = tr.plan_representation(candidate_rules=list(units))
     snapshot = alloc.DbMappingSnapshot()
 
     def rebuild(proposal_journal, current_plan):
@@ -127,15 +139,18 @@ def _proposal(lifecycle, unit):
         allocator=alloc.Allocator(snapshot, width=plan.width, label="proposal"),
         plan=plan, rebuild=rebuild, lifecycle=lifecycle,
     )
-    # Apply the unit AFTER the ProposalContext is built: its __init__
+    # Apply the units AFTER the ProposalContext is built: its __init__
     # rebinds session.allocation to the context's own allocator
-    # (_bind_session), so a unit applied before that is interned under a
+    # (_bind_session), so units applied before that are interned under a
     # discarded overlay -- and the inputs, encoded under the bound
     # allocator, re-assign the same ids to different values (ALICE
     # collides with STRANGER's id 1) and the gate reads the wrong verdict.
-    # Applying here interns the rule under the allocator the evaluations
+    # Applying here interns the rules under the allocator the evaluations
     # will use, so rule literals and input values share one mapping.
-    ctx.session.apply_rule(unit, record=False, accumulate=True)
+    # Order matters: each `always` revision of o5 supersedes the previous
+    # one, so the LAST unit applied wins the o5 verdict.
+    for unit in units:
+        ctx.session.apply_rule(unit, record=False, accumulate=True)
     return ctx
 
 
@@ -158,9 +173,11 @@ def _park_tx(tx_id, sender, recipient, amount, seq=0, release_at_time=None,
     return sign_payload(tx, _SK[sender])
 
 
-def _run(transactions, unit):
+def _run(transactions, unit_or_units):
+    units = (unit_or_units if isinstance(unit_or_units, (list, tuple))
+             else [unit_or_units])
     lifecycle = _lifecycle()
-    proposal = _proposal(lifecycle, unit)
+    proposal = _proposal(lifecycle, units)
     engine = TauConsensusEngine(state_store=MagicMock())
     balances = dict(BALANCES)
     sequences = {}
@@ -168,17 +185,18 @@ def _run(transactions, unit):
     watcher = tau_guard.ProposalIsolationGuard(strict=False)
     with watcher:
         result = engine.apply(
-            # The unit is ALREADY DEPLOYED here: its text is the
+            # The unit(s) are ALREADY DEPLOYED here: their text is the
             # application-rules state (so the gate's scan finds the
-            # recipient's key), and the plan's spec was built from it as a
-            # candidate rule. A guarded unit cannot be deployed by a rule
+            # recipient's key), and the plan's spec was built from them as
+            # candidate rules. A guarded unit cannot be deployed by a rule
             # tx: operations {"0"} routes o5 rules to the clause registry,
             # which rejects i12 guards ("a clause is evaluated only for
-            # its owner, so it must not carry a sender guard"). Deployment
-            # itself (rule offer + acceptance) is covered by the rule-offer
-            # tests; what the real engine proves here is the VERDICT of an
-            # already-deployed guarded unit, in both passes.
-            TauStateSnapshot(b"hash", unit.encode("utf-8"), {}),
+            # its owner, so it must not carry a sender guard"), and a rule
+            # offer is screened the same way -- so the only deployment path
+            # for a guarded unit is genesis seeding. What the real engine
+            # proves here is the VERDICT of an already-deployed guarded
+            # unit, in both passes.
+            TauStateSnapshot(b"hash", "\n".join(units).encode("utf-8"), {}),
             transactions, TS,
             target_balances=balances,
             target_sequences=sequences,
@@ -250,3 +268,77 @@ def test_native_guarded_cap_allows_short_park(temp_database):
     assert balances[SENDER] == (
         5000 - 100 - result.receipts["P"]["fee_charged"])
     assert balances[RECIPIENT] == 5000
+
+
+# --- one combined unit: allowlist + cap nested -------------------------------
+#
+# The only way to have both policies for one recipient. The docs say "the
+# two combine by nesting"; these tests prove the nested unit enforces BOTH
+# refusals on the real engine, and the last-wins test below proves why two
+# separate units cannot.
+
+
+def test_native_combined_unit_blocks_unknown_sender(temp_database):
+    tx = _transfer_tx("T", STRANGER, RECIPIENT, 100)
+    proposal, result, balances, lifecycle, watcher = _run([tx], COMBINED_UNIT)
+    assert _accepted(result) == [], result.receipts
+    assert _rejected(result) == ["T"], result.receipts
+    assert result.receipts["T"]["reason"] == "recipient_policy_block"
+    assert COMBINED_UNIT in proposal.state.get("application_rules", "")
+    assert balances[STRANGER] == 5000
+    assert balances[RECIPIENT] == 5000
+
+
+def test_native_combined_unit_allows_known_sender(temp_database):
+    tx = _transfer_tx("T", SENDER, RECIPIENT, 100)
+    proposal, result, balances, lifecycle, watcher = _run([tx], COMBINED_UNIT)
+    assert _accepted(result) == ["T"], result.receipts
+    assert _rejected(result) == []
+    assert balances[RECIPIENT] == 5100
+    assert balances[SENDER] == (
+        5000 - 100 - result.receipts["T"]["fee_charged"])
+
+
+def test_native_combined_unit_blocks_long_park_for_known_sender(temp_database):
+    tx = _park_tx("P", SENDER, RECIPIENT, 100, release_at_time=TS + 3600)
+    proposal, result, balances, lifecycle, watcher = _run([tx], COMBINED_UNIT)
+    assert _accepted(result) == [], result.receipts
+    assert _rejected(result) == ["P"], result.receipts
+    assert result.receipts["P"]["reason"] == "recipient_max_hold"
+    assert lifecycle.retractable_transfers.open == {}
+    assert balances[SENDER] == 5000
+    assert balances[RECIPIENT] == 5000
+
+
+def test_native_combined_unit_allows_short_park_for_known_sender(temp_database):
+    tx = _park_tx("P", SENDER, RECIPIENT, 100, release_at_time=TS + 600)
+    proposal, result, balances, lifecycle, watcher = _run([tx], COMBINED_UNIT)
+    assert _accepted(result) == ["P"], result.receipts
+    assert _rejected(result) == []
+    assert len(lifecycle.retractable_transfers.open) == 1
+    assert balances[SENDER] == (
+        5000 - 100 - result.receipts["P"]["fee_charged"])
+    assert balances[RECIPIENT] == 5000
+
+
+def test_native_two_separate_guarded_units_last_wins(temp_database):
+    """Two separate guarded units for one recipient do NOT combine.
+
+    Each `always` revision of o5 supersedes the previous one, so the
+    LAST-applied unit's verdict wins and the earlier policy is silently
+    masked. This is what the first two-live-node run hit: an allowlist
+    unit plus a cap unit seeded at genesis, cap applied last, so a
+    Stranger transfer was accepted even though the allowlist refused it.
+    Deploy ONE combined unit (COMBINED_UNIT) instead -- never two.
+    """
+    # Allowlist first, cap last (the genesis order of the first live run):
+    # the cap masks the allowlist, so the unknown sender is accepted.
+    tx = _transfer_tx("T", STRANGER, RECIPIENT, 100)
+    _, result, _, _, _ = _run([tx], [ALLOWLIST_UNIT, CAP600_UNIT])
+    assert _accepted(result) == ["T"], result.receipts
+    assert _rejected(result) == []
+    # Reversed: the allowlist masks the cap, so the long park is accepted.
+    park = _park_tx("P", SENDER, RECIPIENT, 100, release_at_time=TS + 3600)
+    _, result, _, _, _ = _run([park], [CAP600_UNIT, ALLOWLIST_UNIT])
+    assert _accepted(result) == ["P"], result.receipts
+    assert _rejected(result) == []
