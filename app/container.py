@@ -21,6 +21,7 @@ from commands import (
     getapprovalrequest,
     getapprovalrequests,
     getapprovalslots,
+    getrecipientpolicy,
     getrequestid,
     getretractable,
     getretractableid,
@@ -90,6 +91,9 @@ class ServiceContainer:
         # in server.py.
         "getapprovalslots": getapprovalslots,
         "getapprovalpreview": getapprovalpreview,
+        # Recipient-side policy: whether an address judges payments made to it.
+        # The probe form drives the policy evaluator -- rate-limited in server.py.
+        "getrecipientpolicy": getrecipientpolicy,
         }
 
         mempool = override_map.get("mempool") or []

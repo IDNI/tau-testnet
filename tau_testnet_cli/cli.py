@@ -2166,6 +2166,23 @@ def cmd_policy_guard_show(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_policy_receive(args: argparse.Namespace) -> int:
+    """Whether an address judges the payments made to it, and one probe."""
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    payer, amount = getattr(args, "payer", None), getattr(args, "amount", None)
+    if (payer is None) != (amount is None):
+        print_error("--from and --amount go together")
+        return EXIT_LOCAL
+    command = f"getrecipientpolicy {address}"
+    if payer is not None:
+        command += f" {payer} {amount}"
+    return _simple_query(args, command)
+
+
 def cmd_policy_change_request(args: argparse.Namespace) -> int:
     kind = _KIND_BY_NAME[args.kind]
     rule_text, offer_id = "", ""
@@ -2276,6 +2293,17 @@ def _add_policy_subparsers(sub) -> None:
     p_gshow.add_argument("address", nargs="?", help="Address (default: your key's)")
     _key_group(p_gshow, required=False)
     p_gshow.set_defaults(func=cmd_policy_guard_show)
+
+    p_recv = psub.add_parser(
+        "receive", parents=common,
+        help="Does this address judge payments made to it? (recipient-side policy)",
+    )
+    p_recv.add_argument("address", nargs="?", help="Address (default: your key's)")
+    _key_group(p_recv, required=False)
+    p_recv.add_argument("--from", dest="payer", metavar="PUBKEY",
+                        help="Ask the rule about a payment from this sender (advisory)")
+    p_recv.add_argument("--amount", type=int, help="Amount of that payment")
+    p_recv.set_defaults(func=cmd_policy_receive)
 
     p_change = psub.add_parser("change", parents=common,
                                help="Request or cancel a policy change")

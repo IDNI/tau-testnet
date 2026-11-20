@@ -206,6 +206,11 @@ in the future or is outside the window is rejected with a descriptive message
 the generic error code. A park that fails the sender's `o5` policy, the fee step
 or the balance surfaces as for an ordinary transfer.
 
+A recipient can cap how long a payment to it may be held, down to "final at
+once". A park over the cap is refused with `RECIPIENT_MAX_HOLD`, which carries
+the cap as `max_hold_seconds` (or `max_hold_blocks` for a height release); a retract is never refused. See
+[recipient_controls.md](recipient_controls.md).
+
 ## Timing caveats
 
 - **Block timestamps are proposer-chosen**, within the parent's timestamp and the
@@ -247,7 +252,9 @@ fields are unsigned 64-bit integers. `sender_pubkey` must be the signer.
 
 - Custom inputs (`--input`) on a retractable transfer.
 - Co-signed retractable transfers.
-- Recipient refusal: the recipient cannot decline an open entry.
+- Recipient refusal of an open entry: a recipient's policy can refuse a park
+  before it opens ([recipient_controls.md](recipient_controls.md)), but it cannot
+  decline an entry that is already open.
 - Partial retraction or editing an open entry.
 - Multi-leg or split payments.
 - Heartbeat blocks: the chain does not mine empty blocks on a schedule.

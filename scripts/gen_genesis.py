@@ -45,6 +45,15 @@ def get_args():
         ),
     )
     parser.add_argument(
+        "--recipient-policy", action="store_true",
+        help=(
+            "Activate recipient-side policy (the receive stream i17) from block "
+            "0. For a FRESH chain only: on an existing chain this is a "
+            "governance patch, which audits the live spec first. Off by default "
+            "so a genesis generated without it stays byte-identical."
+        ),
+    )
+    parser.add_argument(
         "--faucet-amount", type=int, default=0,
         help=(
             "Coins that each new account receives one time, at the first "
@@ -319,6 +328,7 @@ def main():
         args.vote_quorum, args.eligibility_mode, args.fee_beneficiary,
         approval_slots_active=bool(getattr(args, "approval_slots", False)),
         faucet_amount=args.faucet_amount,
+        recipient_policy_active=bool(getattr(args, "recipient_policy", False)),
     )
     consensus_meta = {
         "proof_scheme": "bls_header_sig",

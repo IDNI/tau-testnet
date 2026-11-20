@@ -285,6 +285,10 @@ tau-testnet retractable list --key alice --role out
 tau-testnet retractable show <retractable_id>
 tau-testnet retractable retract --key alice <retractable_id>
 
+# recipient controls (an account's own rule judging the payments made to it)
+tau-testnet policy receive <address>
+tau-testnet policy receive <address> --from <sender_pubkey> --amount 25
+
 # target a remote node
 tau-testnet --host testnet.tau.net --port 65432 status
 ```
@@ -420,7 +424,7 @@ Per-account `o5` policy clauses are evaluated in separate policy worker processe
 - `o9` — consensus base fee (strict); `o8` — optional user fee (lenient).
 - `o5` — user policy on a transfer (`0` = block, `1`/absent = allow). A user's `o5` rule is registered as that account's own policy clause and judges only that account's transfers; **consensus-enforced** at both admission and block apply. A block on any transfer rejects the whole `user_tx`. Lets users express recipient whitelists (`i4`), time-locks (`i5`), and spending limits (`i1`). See [WALLET_USAGE.md](WALLET_USAGE.md).
   Tiered co-signature approvals build on `o5`: a sender requires an approver's signature above an amount threshold, and the transfer parks on-chain until the rule is satisfied. See [docs/approvals.md](docs/approvals.md).
-  **An `o5` rule is a per-account clause.** A user rule (`operations["0"]`) that writes `o5` is registered as the sender's clause in a per-account registry, replacing the one already registered, and never joins the shared specification. A clause carries no `i12` guard (a reference to `i12` is refused, `CLAUSE_SHAPE`): it is evaluated on its own, only for transfers sent by its owner. See [Rule sharing](#rule-sharing).
+  **An `o5` rule is a per-account clause.** A user rule (`operations["0"]`) that writes `o5` is registered as the sender's clause in a per-account registry, replacing the one already registered, and never joins the shared specification. A clause carries no `i12` guard (a reference to `i12` is refused, `CLAUSE_SHAPE`): it is evaluated on its own, only for transfers sent by its owner, and, once recipient-side policy is active and the clause reads `i17`, for payments made to its owner ([Recipient controls](#recipient-controls)). See [Rule sharing](#rule-sharing).
   **Fee rules (`o8`) are scoped to the sender** (`UNSCOPED_USER_RULE`, enforced at admission and at block apply): `o8` rules accumulate in one shared specification, so rule text writing `o8` must reference `i12` (sender pubkey) or `i3` (from address). Without that, one unconditional `o8` rule would levy its fee on every account on the network. The screen is textual — a reference is not proof the rule is genuinely gated by it.
   **User rules reference `[t]` only** (`TEMPORAL_REFERENCE`): `i1[t-1]` or `i1[0]` is refused at admission and again at block apply, on every stream and for rules offered, accepted or routed as clauses. One unit that reads another step gives the whole evaluator a lookback, and every output is then 0 for the steps after each later revision or rebuild, for every account.
 
@@ -561,19 +565,19 @@ A clause is judged on its own rather than guarded and appended to the shared spe
 1. An output stream that no rule constrains for a given input still **materializes**, with an arbitrary witness — observed as `0`, which for `o5` is exactly `USER_POLICY_BLOCK_VALUE`. So `always ( (i12 = A) -> (o5 = 1) ).` gives A its intended value and gives **everyone else** a materialized block.
 2. Two total-form rules on the same stream do not compose: conjoined the spec is unsatisfiable and the interpreter fails to build; fed sequentially through `i0` the later one silently **supersedes** the earlier.
 
-**How a clause judges a transfer.** The clause is evaluated as `always ( <body> ).`, in a policy worker, and only for transfers sent by its owner, so it carries no sender guard. A transfer is blocked when the main interpreter yields `o5 = 0` (the consensus rules) or the sender's registered clause yields `o5 = 0` on the same transfer inputs; an account with no clause adds nothing. The check runs at admission, at block apply (ordinary and parked approval transfers alike) and in the approval preview. If the engine refuses to evaluate a registered clause for particular inputs — for example a value that does not fit the width the clause declared for that stream — the transfer is blocked.
+**How a clause judges a transfer.** The clause is evaluated as `always ( <body> ).`, in a policy worker, and only for transfers sent by its owner, so it carries no sender guard. (A clause that reads the receive stream `i17` is also asked about payments made **to** its owner; see [Recipient controls](#recipient-controls).) A transfer is blocked when the main interpreter yields `o5 = 0` (the consensus rules) or the sender's registered clause yields `o5 = 0` on the same transfer inputs; an account with no clause adds nothing. The check runs at admission, at block apply (ordinary and parked approval transfers alike) and in the approval preview. If the engine refuses to evaluate a registered clause for particular inputs — for example a value that does not fit the width the clause declared for that stream — the transfer is blocked.
 
 **What a clause must satisfy.** The same screens run at admission and at block apply, for offered, accepted and self-submitted clauses:
 
 - exactly one `always ( ... ).` unit with balanced parentheses and no nested temporal operator;
 - no reference to `i12`;
 - no reference to any step but `[t]`;
-- every stream mention written `xN[t]:bv[W]` with an explicit width, and one width per stream within the body; `o5` at `bv[24]`, approval slots (`i18`–`i25`) at `bv[384]`;
+- every stream mention written `xN[t]:bv[W]` with an explicit width, and one width per stream within the body; `o5` at `bv[24]`, approval slots (`i18`–`i25`) at `bv[384]`, the receive stream (`i17`) at `bv[64]` once recipient-side policy is active;
 - writes `o5` and no other stream; consensus-owned streams (`o0`–`o4`, `o6`–`o9`) are refused;
 - no reference to the reserved input streams `i13`–`i15`;
 - at most 32 comparisons and 32 levels of parentheses, and at most 8 KiB of rule text.
 
-A clause may read `i1` (amount), `i2` (sender balance at the parent block), `i3`/`i4` (from/to pubkeys), `i5` (block timestamp), the approval slots and custom inputs. Custom inputs for a clause start at `i26`; a parked approval request takes its custom inputs from key 26 up.
+A clause may read `i1` (amount), `i2` (sender balance at the parent block), `i3`/`i4` (from/to pubkeys), `i5` (block timestamp), the approval slots, the receive stream `i17` (see [Recipient controls](#recipient-controls)) and custom inputs. Custom inputs for a clause start at `i26`; a parked approval request takes its custom inputs from key 26 up.
 
 Registration also needs the engine to build the clause and step it once. A clause that does not build, or that reads no input stream (a constant such as an unconditional block), is refused: `TX_REJECTED` at admission, a hard reject with receipt reason `rule_not_applied` at block apply. To block everything, test a condition on an input, such as amount above zero.
 
@@ -639,6 +643,38 @@ Timing caveats:
 - A retract must be **included in a block** before the release point, not merely sent. A feeless retract sorts last in the mempool under backlog, so retract with margin.
 
 **Upgrade.** This adds a field to the consensus metadata hash with no activation flag, so it needs a regenesis and every node on the same build. An older binary forks at the first park block.
+
+## Recipient controls
+
+Long-form guide: [docs/recipient_controls.md](docs/recipient_controls.md).
+
+An account's own `o5` policy clause can also judge the payments made **to** it. One node-fed input, the receive stream `i17` (`bv[64]`), tells the clause which side it is judging: `0` for a payment its owner sends, `1` for an incoming payment that is final in this block, `1 + N` for an incoming retractable transfer that releases N seconds after the block's timestamp, `10^18 + N` for one that releases at a height N blocks ahead. A clause that reads `i17` is asked about every payment to its owner; a clause that does not is never asked, and an account with no clause is paid by everyone.
+
+```
+# Inbound allow-list: only Alice may pay me. What I send is not restricted.
+always ( ( (i17[t]:bv[64] = { 0 }:bv[64]) || (i3[t]:bv[384] = { #x<ALICE> }:bv[384]) )
+         ? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24]) ).
+
+# Maximum hold time: a payment to me may be held for 600 seconds at most.
+# { 1 } instead of { 601 } means final at once: no retractable transfer at all.
+always ( (i17[t]:bv[64] > { 601 }:bv[64])
+         ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
+```
+
+```bash
+tau-testnet policy receive <address>                                    # does this address judge incoming payments?
+tau-testnet policy receive <address> --from <sender_pubkey> --amount 25 # would it take this payment, and held for how long?
+```
+
+Semantics:
+
+- **When.** The recipient's clause is asked at admission and at block apply, after every check on the sender's side, for each transfer of a `user_tx` (by its own recipient), for a retractable transfer when it parks, and for a co-signed transfer when it executes. A retract is never gated and a release is not asked again. Rule offers and the creation of approval requests are not judged.
+- **Refusal.** One refusing recipient fails the whole transaction. At admission the code is `RECIPIENT_POLICY`, or `RECIPIENT_MAX_HOLD` with the cap as `max_hold_seconds` (or `max_hold_blocks` for a height release) when a shorter hold would be accepted. At block apply the transaction is not included, so **no fee is charged**; the receipt reason is `recipient_policy_block`.
+- **Hold length.** Seconds from the block's timestamp to `release_at_time` (admission uses its estimate of the next block's timestamp), or blocks from the block's height to `release_at_height`. The two are never converted: a cap written in seconds alone refuses every height release, and a rule that takes height releases names its cap in blocks.
+- **One unit.** Outbound rules, the inbound allow-list and the hold cap are one clause, registered, replaced, guarded and revoked like any `o5` policy.
+- **Reads.** `getrecipientpolicy <address> [<sender> <amount>]`; `getgovernance` reports `recipient_policy_active`.
+
+**Upgrade.** `recipient_policy_active` is a one-way flag in consensus state, like `approval_slots_active`: no regenesis and no restart. A chain that never sets it hashes and applies exactly as before. It activates by a governance update with `"host_contract_patch": {"recipient_policy_active": true}` that carries the consensus rules in force unchanged (refused while any rule in force already mentions `i17`), or from block 0 with `gen_genesis.py --recipient-policy`. From activation on, `"17"` is a reserved operation key, only a policy clause may read `i17`, and every mention must be typed `i17[t]:bv[64]`. Until then, a node refuses a clause that reads `i17` at deploy with `RECIPIENT_POLICY_INACTIVE`, because it would never be asked.
 
 ## Mempool policy
 
