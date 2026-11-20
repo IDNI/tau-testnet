@@ -34,6 +34,7 @@ from .approvals import (
     parse_transfer_vote,
 )
 from .retractable import (
+    KIND_HEIGHT,
     RETRACTABLE_TX_TYPES,
     RetractableBook,
     TX_TYPE_RETRACTABLE_TRANSFER,
@@ -41,6 +42,7 @@ from .retractable import (
     parse_retract_transfer,
     parse_retractable_transfer,
 )
+from . import recipient_gate
 from .rule_offers import (
     RULE_OFFER_TX_TYPES,
     RuleOfferDecision,
@@ -1882,7 +1884,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
-                                          escrow=False):
+                                          escrow=False, park_release=None):
                 """Execute ONE transfer under the fee model. True to continue.
 
                 Extracted verbatim from the user_tx transfer loop so the
@@ -2003,6 +2005,87 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 f"Transfer rejected by the sender's own policy clause (o5={own_o5})"
                             )
                             return False
+
+                        # --- Recipient policy (o5) + park hold cap (#47/#76) ---
+                        # The recipient is judged by its OWN policy on the
+                        # SAME input map with the policy owner changed
+                        # (consensus/recipient_gate.py): one extra evaluate,
+                        # then the isolated clause, mirroring the two sender
+                        # checks above. Because the gate lives in this
+                        # closure, it also covers transfers no transaction
+                        # carries -- an approval completion pays out here,
+                        # never as a user_tx output. Releases and retracts
+                        # never pass through this closure and are never
+                        # gated (#76).
+                        release_pair = 0
+                        if park_release is not None:
+                            park_kind, park_release_at = park_release
+                            release_pair = recipient_gate.pack_release_pair(
+                                release_ts=park_release_at if park_kind != KIND_HEIGHT else 0,
+                                release_height=park_release_at if park_kind == KIND_HEIGHT else 0,
+                            )
+                        recipient_values = recipient_gate.recipient_values(
+                            tau_input_stream_values, to_addr,
+                            _parent_bal(to_addr), int(block_height or 0),
+                            release_pair=release_pair,
+                        )
+                        with tau_manager.tau_comm_lock:
+                            recipient_outputs = _session.evaluate(
+                                recipient_values, multi=True,
+                                apply_rules_update=False,
+                            )
+                        tx_receipt["logs"].append(
+                            f"Tau(recipient) o5: {recipient_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)}"
+                        )
+                        recipient_blocked = recipient_gate.policy_blocked(
+                            recipient_outputs, tau_manager.parse_tau_output)
+                        recipient_detail = recipient_outputs.get(
+                            tau_defs.USER_POLICY_STREAM_INDEX)
+                        if not recipient_blocked:
+                            clause_blocked, clause_o5 = sender_policy.clause_blocks(
+                                lifecycle_mgr.rule_offers.clause_for(
+                                    to_addr, tau_defs.USER_POLICY_STREAM_INDEX),
+                                recipient_values, pool="apply",
+                                timeout=getattr(_session, "request_budget", None),
+                            )
+                            recipient_blocked = clause_blocked
+                            recipient_detail = clause_o5
+                        if recipient_blocked:
+                            logger.info(
+                                "Transfer rejected by recipient policy (o5) for %s->%s (o5=%s)",
+                                str(from_addr)[:10], str(to_addr)[:10], recipient_detail,
+                            )
+                            if not replay_mode:
+                                accepted_in_block = False
+                                hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = recipient_gate.REASON_POLICY_BLOCK
+                            tx_receipt["logs"].append(
+                                f"Transfer rejected by recipient policy (o5={recipient_detail})"
+                            )
+                            return False
+                        if park_release is not None:
+                            cap = recipient_gate.hold_cap(
+                                recipient_outputs, tau_manager.parse_tau_output)
+                            if cap is not None:
+                                park_kind, park_release_at = park_release
+                                now = (int(block_height or 0) if park_kind == KIND_HEIGHT
+                                       else int(block_timestamp or 0))
+                                if park_release_at - now > cap:
+                                    logger.info(
+                                        "Park rejected by recipient hold cap for %s->%s (cap=%s)",
+                                        str(from_addr)[:10], str(to_addr)[:10], cap,
+                                    )
+                                    if not replay_mode:
+                                        accepted_in_block = False
+                                        hard_reject = True
+                                    execution_success = False
+                                    tx_receipt["reason"] = recipient_gate.REASON_HOLD_CAP
+                                    tx_receipt["recipient_hold_cap"] = cap
+                                    tx_receipt["logs"].append(
+                                        f"Park rejected by recipient hold cap (cap={cap})"
+                                    )
+                                    return False
 
                     current_from = _read_bal(from_addr)
                     if current_from < amount:
@@ -2593,6 +2676,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 slot_values=_approval_slot_values(),
                                 overrides={},
                                 escrow=True,
+                                park_release=(park.kind, park.release_at),
                             )
                             fee_already_measured = True
                             if escrowed and accepted_in_block and not hard_reject:
