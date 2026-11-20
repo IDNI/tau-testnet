@@ -453,8 +453,12 @@ def screen_payout_body(body: str, slot_count: int, per_sale: bool = False) -> Op
 #    `oN = <expression over inputs>`. Definitions are joined with `&&`, or chosen
 #    by `(condition) ? (...) : (...)` whose condition reads inputs only; both
 #    branches fix the same amounts. Anything else that mentions an amount (`<=`,
-#    `||`, `!`, `!=`, an amount on the right side) is refused. A condition over
-#    inputs that does not hold leaves no solution, which refuses the execution.
+#    `||`, `!`, `!=`, an amount on the right side) is refused. So is a bare
+#    condition over inputs beside a definition (`(i40 > 0) && o30 = i40`): where
+#    it does not hold the clause has no answer, and the engine does not build a
+#    clause that cannot answer every input (measured in test_payout_native.py).
+#    A rule that pays nothing for some inputs writes zero there, on the other
+#    side of a choice; an execution that pays nothing is refused.
 # 2. Anything whose answer depends on earlier steps. Policy interpreters are kept
 #    and stepped again, so a temporal operator (always/G/[], sometimes/F/<>,
 #    until/U, release/R, weak_until/W, since/S, trigger/T, A, E), a step
@@ -550,13 +554,19 @@ def _fixed(tok, lo: int, hi: int) -> set:
         raise _Open(f"put parentheses around the part with {sorted(joins)[0]!r} before joining it with &&")
     fixed = set()
     for a, b in parts:
+        if len(parts) > 1 and not _amounts(tok, a, b):
+            # A condition on inputs beside a definition. Where it does not hold
+            # the clause has no answer at all, and the engine builds only
+            # clauses that answer every input.
+            raise _Open("a bare condition on inputs leaves no answer where it does not hold; "
+                        "choose with (c) ? (...) : (...) and write zero where nothing is paid")
         fixed |= _fixed_part(tok, a, b)
     return fixed
 
 
 def _fixed_part(tok, lo: int, hi: int) -> set:
     if not _amounts(tok, lo, hi):
-        return set()  # a condition on inputs only
+        return set()  # a condition on inputs only: it fixes nothing
     if tok[lo][1] == "(":
         close = _match_paren(tok, lo)
         if close == hi - 1:

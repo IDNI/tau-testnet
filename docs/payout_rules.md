@@ -110,9 +110,14 @@ narrow shape, checked at install:
   amounts, and which one an engine picks is the engine's choice, not the
   account's (an equation fixes its unknown only in this definitional form; see
   Rudeanu, *Boolean Functions and Equations*, Thm 6.6).
-- **Conditions on inputs are allowed** next to the definitions, for example
-  `(i40[t]:bv[24] > { #x000000 }:bv[24]) && o30[t]:bv[24] = i40[t]:bv[24]`.
-  When one does not hold, the rule has no solution and the execution is refused.
+- **A condition chooses; it does not stand alone.** A rule has to answer every
+  input. A bare condition beside a definition, such as
+  `(i40[t]:bv[24] > { 100 }:bv[24]) && (o30[t]:bv[24] = i40[t]:bv[24])`, has no
+  answer where the condition fails; the engine does not build such a clause, so
+  it is refused at install with that reason. Write the choice and pay nothing on
+  the other side:
+  `(i40[t]:bv[24] > { 100 }:bv[24]) ? (o30[t]:bv[24] = i40[t]:bv[24]) : (o30[t]:bv[24] = { 0 }:bv[24])`.
+  An execution for which the rule pays nothing is refused and costs nothing.
 - **Nothing that reads earlier steps:** no temporal operator in any spelling
   (`always`/`G`/`[]`, `sometimes`/`F`/`<>`, `until`/`U`, `release`/`R`,
   `weak_until`/`W`, `since`/`S`, `trigger`/`T`, `A`, `E`), no step constraint

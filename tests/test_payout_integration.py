@@ -151,14 +151,18 @@ _KEY = "{ #x" + "ab" * 48 + " }:bv[384]"
 
 
 @pytest.mark.parametrize("body, problem", [
-    # every amount fixed: definitions, conditions on inputs, a choice on inputs
+    # every amount fixed: definitions, a choice on inputs
     (f"{_O} = {_X}", None),
     (f"({_O} = {_X}) && ({_P} = {_Y})", None),
     (f"(i13[t]:bv[384] = {_KEY}) ? ({_O} = {_X}) : ({_O} = {_Z})", None),
     (f"(i13[t]:bv[384] = {_KEY}) ? (({_O} = {_X}) && ({_P} = {_Z})) : (({_O} = {_Z}) && ({_P} = {_X}))", None),
-    (f"({_X} > {_Z}) && {_O} = min({_X}, i2[t]:bv[24])", None),
-    (f"({_X} > {_Z} || {_Y} > {_Z}) && {_O} = {_X} - {_Y}", None),
+    (f"({_X} > {_Z}) ? ({_O} = min({_X}, i2[t]:bv[24])) : ({_O} = {_Z})", None),
+    (f"({_X} > {_Z} || {_Y} > {_Z}) ? ({_O} = {_X} - {_Y}) : ({_O} = {_Z})", None),
     (f"{_O} = {{ 5 }}:bv[24] + {_X}'", None),
+    # a bare condition beside an amount: no answer where it does not hold
+    (f"({_X} > {_Z}) && {_O} = min({_X}, i2[t]:bv[24])", "a bare condition on inputs"),
+    (f"({_X} > {_Z} || {_Y} > {_Z}) && {_O} = {_X} - {_Y}", "a bare condition on inputs"),
+    (f"({_X} > {_Z}) ? (({_Y} > {_Z}) && {_O} = {_X}) : ({_O} = {_Z})", "a bare condition on inputs"),
     # an amount the rule leaves open: the engine would pick one
     (f"{_O} <= {_X}", "o30 is not fixed"),
     (f"{_O} > {_Z} && {_O} < i2[t]:bv[24]", "o30 is not fixed"),
