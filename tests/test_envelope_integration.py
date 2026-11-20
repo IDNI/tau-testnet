@@ -34,6 +34,7 @@ from consensus.envelope import (
     MAX_OPEN_ENVELOPES_PER_SENDER,
     MAX_PERIOD_BLOCKS,
     MAX_PERIOD_SECONDS,
+    OUTCOME_ENDED,
     EnvelopeBook,
     EnvelopeRefused,
     EnvelopeShapeError,
@@ -398,9 +399,10 @@ def test_ends_close_in_order_on_each_clock(book):
                  expires_at=TS + 100)
     assert not book.has_ending(NEXT_HEIGHT + 4, TS + 99)
     gone = book.end_due(NEXT_HEIGHT + 9, TS + 99)
-    assert [t.envelope_id for t, _ in gone] == [t2.envelope_id, t1.envelope_id]
+    assert [t.envelope_id for t, _, _ in gone] == [t2.envelope_id, t1.envelope_id]
+    assert [outcome for _, _, outcome in gone] == [OUTCOME_ENDED, OUTCOME_ENDED]
     assert book.get(t3.envelope_id) is not None
-    assert [t.envelope_id for t, _ in book.end_due(0, TS + 100)] == [t3.envelope_id]
+    assert [t.envelope_id for t, _, _ in book.end_due(0, TS + 100)] == [t3.envelope_id]
 
 
 def test_check_spend_reasons(book):
@@ -463,7 +465,7 @@ def test_the_book_round_trips(temp_database):
     assert reloaded.store_rows() == book.store_rows()
     assert reloaded.resolved_state() == book.resolved_state()
     assert reloaded.escrow_total() == book.escrow_total() == 1000 - 250 + 1000
-    assert reloaded._ends == book._ends
+    assert reloaded._due == book._due
     assert chain_state._lifecycle_manager.consensus_meta_hash() == meta
 
 
@@ -515,8 +517,8 @@ def call(module, line, container):
 
 def test_the_capability_report():
     sem = getenvelope.semantics()
-    assert sem["supported"] is True and sem["version"] == 1
-    assert sem["conditions"] == ["spending_limit"]
+    assert sem["supported"] is True and sem["version"] == 2
+    assert sem["conditions"][0] == "spending_limit"
     assert "nothing carries over" in sem["spending_limit"]
     assert sem["clocks"] == ["blocks", "seconds"]
     assert sem["fee_by_tx_type"]["envelope_release"] == "fee-free"
@@ -661,8 +663,13 @@ def test_the_cli_builders_make_what_the_node_parses():
 
 def test_the_cli_parses_the_envelope_commands():
     from tau_testnet_cli.cli import (
-        _PayloadError, _duration_seconds, _envelope_caps, _envelope_clock, build_parser,
+        _PayloadError, _duration_seconds, _envelope_caps, _envelope_terms, build_parser,
     )
+
+    def _envelope_clock(args, tip, now):
+        terms = _envelope_terms(args, tip, now)
+        return {k: terms[k] for k in ("period_seconds", "period_blocks", "expires_at")
+                if k in terms}
 
     parser = build_parser()
     args = parser.parse_args(["envelope", "send", "--key", "k", "--to", B, "--amount", "3000",
@@ -678,7 +685,7 @@ def test_the_cli_parses_the_envelope_commands():
                                                      "expires_at": 10 + 1 + 1000}
     args = parser.parse_args(["envelope", "send", "--key", "k", "--to", B, "--amount", "9",
                               "--cap", "3", "--period-blocks", "100", "--ends-in", "1h"])
-    with pytest.raises(_PayloadError, match="block clock"):
+    with pytest.raises(_PayloadError, match="one envelope, one clock.*--period-blocks"):
         _envelope_clock(args, tip=10, now=TS)
     with pytest.raises(_PayloadError, match="whole amounts"):
         _envelope_caps(["1.5"])

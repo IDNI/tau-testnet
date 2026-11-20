@@ -43,6 +43,7 @@ from consensus.payout import (
     TX_TYPE_PAYOUT_RULE_SET,
 )
 from consensus.envelope import (
+    OPTIONAL_FIELDS as ENVELOPE_OPTIONAL_FIELDS,
     TX_TYPE_ENVELOPE_RELEASE,
     TX_TYPE_ENVELOPE_SEND,
     TX_TYPE_ENVELOPE_SPEND,
@@ -217,6 +218,13 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["period_seconds"] = payload.get("period_seconds")
         signing_dict["recurring"] = payload.get("recurring")
         signing_dict["expires_at"] = payload.get("expires_at")
+        # Time conditions: signed when present, left out when absent,
+        # so a spending-limit envelope signed before they existed keeps its bytes.
+        # Present-or-absent is itself in the bytes: adding or stripping one breaks
+        # the signature.
+        for name in ENVELOPE_OPTIONAL_FIELDS:
+            if payload.get(name) is not None:
+                signing_dict[name] = payload.get(name)
     elif tx_type == TX_TYPE_ENVELOPE_SPEND:
         signing_dict["envelope_id"] = payload.get("envelope_id")
         signing_dict["to_pubkey"] = payload.get("to_pubkey")

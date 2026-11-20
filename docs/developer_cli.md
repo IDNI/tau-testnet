@@ -731,10 +731,11 @@ RPC replies:
 
 ## Envelopes
 
-Send money with a spending limit: the recipient spends it, to anyone, at most
-a cap per period. Semantics are in the
-[README](../README.md#envelopes-spending-limits). Long-form guide:
-[envelopes.md](envelopes.md).
+Send money with conditions: a spending limit, time locks, and weekday and hour
+windows. The recipient spends it, to anyone, as the
+conditions allow. Semantics are in the
+[README](../README.md#envelopes-spending-limits-time-conditions).
+Long-form guide: [envelopes.md](envelopes.md).
 
 ```bash
 tau-testnet envelope send --key parent --to <child_pk> --amount 5200 \
@@ -743,6 +744,13 @@ tau-testnet envelope send --key client --to <contractor_pk> --amount 4000 \
     --cap 1000 --cap 500 --recurring --period 30d --ends-in 210d
 tau-testnet envelope send --key dao --to <team_pk> --amount 20000 \
     --cap 2000 --recurring --period-blocks 10000 --ends-in-blocks 100000
+tau-testnet envelope send --key alice --to <bob_pk> --amount 100 \
+    --hold 6h --ends-at 2026-11-18
+tau-testnet envelope send --key alice --to <bob_pk> --amount 5000 \
+    --cap 500 --recurring --period 7d --not-before 2026-12-01 --days mon-fri \
+    --ends-at 2027-03-01
+tau-testnet envelope send --key dao --to <team_pk> --amount 900 \
+    --hold-blocks 100 --ends-in-blocks 50000
 tau-testnet envelope spend --key child <envelope_id> --to <shop_pk> --amount 40
 tau-testnet envelope spend --key child <envelope_id> --to self --amount 60
 tau-testnet envelope release --key parent <envelope_id>
@@ -750,29 +758,45 @@ tau-testnet envelope show <envelope_id>
 tau-testnet envelope list [<address>] [--key k] [--role in|out|all]
 ```
 
-`--cap` is repeatable and takes comma-separated lists, first period first.
-Without `--recurring` the limit stops after the last cap. One of `--period`
-(a duration: `3600`, `90s`, `15m`, `12h`, `7d`, `2w`) and `--period-blocks`;
-the end on the same clock: `--ends-in` (duration) or `--ends-at` (unix) for a
-time period, `--ends-in-blocks` or `--ends-at-height` for a block period.
-`send` prints the envelope id. `spend --to self` pays the signer's own balance.
+Flags of `send`:
+
+| Flag | Clock | Meaning |
+|---|---|---|
+| `--ends-in` / `--ends-at` | time | The end: a duration, or unix seconds / `2027-01-01[T08:30]` (UTC). |
+| `--ends-in-blocks` / `--ends-at-height` | blocks | The end: a number of blocks, or a height. |
+| `--cap` | either | The spending limit, repeatable or comma-separated, first period first. Needs a period. |
+| `--period` / `--period-blocks` | time / blocks | The limit's period: a duration (`3600`, `90s`, `15m`, `12h`, `7d`, `2w`) or blocks. |
+| `--recurring` | either | After the last cap, it repeats; without it the limit stops after the list. |
+| `--not-before` / `--not-before-height` | time / blocks | No spend before this time or height. |
+| `--hold` / `--hold-blocks` | time / blocks | No spend for this long after the envelope arrives. |
+| `--days` | time | Weekdays a spend may land on: `mon-fri`, `sat,sun`, `fri-mon`. |
+| `--hours` | time | Hours: `9-17` (09:00 to 17:00), `22-6` (across midnight), `9,12,13`. |
+| `--utc-offset` | time | Where `--days` and `--hours` are read: `+02:00`, `-03:30`, `5:45` (steps of 15 minutes, -12:00 to +14:00). A fixed offset, no daylight saving. Without it they are UTC. |
+
+The end chooses the clock; every other flag must be on the same clock, or the
+CLI stops with "one envelope, one clock". An envelope needs at least one
+condition. `send` prints the envelope id. `spend --to self` pays the signer's
+own balance.
 
 Raw transactions (root fields only; a nested `payload` is ignored):
 
 | `tx_type` | Signed fields beyond the envelope |
 |---|---|
-| `envelope_send` | `genesis_hash`, `recipient_pubkey`, `amount`, `caps`, exactly one of `period_blocks` / `period_seconds`, optional `recurring`, `expires_at` |
+| `envelope_send` | `genesis_hash`, `recipient_pubkey`, `amount`, `expires_at`; optional `caps` with exactly one of `period_blocks` / `period_seconds` and `recurring`; optional `clock` (`blocks`/`seconds`, required without caps), `not_before`, `hold`, `days` (`["mon", ...]`), `hours` (`[0..23]`), `utc_offset` (quarter hours east of UTC) |
 | `envelope_spend` | `genesis_hash`, `envelope_id`, `to_pubkey`, `amount` (signed by the recipient) |
 | `envelope_release` | `genesis_hash`, `envelope_id` (signed by the sender; feeless) |
 
 RPC replies:
 
 - `getenvelope` returns `open`; an open envelope's `envelope` (terms,
-  `remaining`, `spent_total`, `period_index`, `cap_this_period`,
-  `spent_this_period`, `left_this_period`, `next_reset`, `status`); a closed
-  one's `closed` (`emptied`, `released` or `ended`); `history` (sent, spend,
-  emptied, released, ended; canonical blocks only, newest first),
-  `block_hash`, and `semantics`. An id the chain never saw answers `NOT_FOUND`.
+  `status` (`locked`, `open`), `spendable_now`, `remaining`, `spent_total`,
+  `unlocks_at`, `in_window`, `next_window`, `period_index`,
+  `cap_this_period`, `spent_this_period`,
+  `left_this_period`, `next_reset`); a closed one's `closed` (`emptied`,
+  `released` or `ended`); `history` (sent, spend
+  and the closes, each close with `paid_out`; canonical blocks
+  only, newest first), `block_hash`, and `semantics`. An id the chain never saw
+  answers `NOT_FOUND`.
 - `getenvelopes` returns the open `envelopes` of the address in that role,
   `held_in_envelopes` and `history`.
 - `getaccountstate` adds `envelopes_out` and `envelopes_in` (what open
@@ -780,7 +804,10 @@ RPC replies:
 - `gettxstatus` adds `envelopes` to a confirmed transaction: what it did, and
   for a send whether the envelope is still `open` or how it closed.
 - `sendtx` and `checktx` add `envelope`: the envelope id and what it would
-  hold, and what the period would have left, after the transaction.
+  hold, and what the period would have left, after the transaction. A refused
+  spend names the reason: `ENVELOPE_LOCKED` (until when),
+  `ENVELOPE_OUTSIDE_WINDOW` (when the next window opens), `ENVELOPE_ENDED`,
+  `ENVELOPE_LIMIT`; a refused send `ENVELOPE_NEVER_SPENDABLE`.
 
 ## Governance
 

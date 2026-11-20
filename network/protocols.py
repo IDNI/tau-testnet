@@ -29,7 +29,7 @@ TAU_GOSSIP_TOPIC_STANDING = "tau/standing/1.0.0"
 TAU_GOSSIP_TOPIC_PAYOUT = "tau/payout/1.0.0"
 # Receive routes: small, rare, and a release by a destination is time-sensitive.
 TAU_GOSSIP_TOPIC_ROUTES = "tau/routes/1.0.0"
-# Envelopes (spending limits): a spend is an everyday payment, and a release by
+# Envelopes: a spend is an everyday payment, and a release by
 # the sender should not wait behind a burst of sends.
 TAU_GOSSIP_TOPIC_ENVELOPES = "tau/envelopes/1.0.0"
 TAU_GOSSIP_TOPIC_PEERS = "tau/peers/2.0.0"

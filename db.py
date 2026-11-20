@@ -618,7 +618,7 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_route_events_destination "
                 "ON route_events(destination_pubkey, block_number);"
             )
-            # Envelopes (spending limits): open envelopes and where each stands. Bound
+            # Envelopes: open envelopes and where each stands. Bound
             # into consensus_meta_hash once the book has held anything, so
             # written in the same transaction as accounts.
             conn.execute('''
@@ -638,9 +638,23 @@ def init_db():
                     period_index     INTEGER NOT NULL,
                     spent_in_period  INTEGER NOT NULL,
                     spends           INTEGER NOT NULL,
-                    last_height      INTEGER NOT NULL
+                    last_height      INTEGER NOT NULL,
+                    conditions_json  TEXT NOT NULL DEFAULT '',
+                    last_clock       INTEGER NOT NULL DEFAULT 0,
+                    due_at           INTEGER NOT NULL DEFAULT 0
                 );
             ''')
+            # Time conditions (additive): an envelope without them stores '' and 0.
+            # `due_at` is the clock at which the envelope closes on its own (its end),
+            # a node-local hint for the miner's idle-chain wake; the book recomputes
+            # it on load.
+            envelope_cols = {row[1] for row in conn.execute(
+                "PRAGMA table_info(envelopes_v1);").fetchall()}
+            for column, decl in (("conditions_json", "TEXT NOT NULL DEFAULT ''"),
+                                 ("last_clock", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("due_at", "INTEGER NOT NULL DEFAULT 0")):
+                if column not in envelope_cols:
+                    conn.execute(f"ALTER TABLE envelopes_v1 ADD COLUMN {column} {decl};")
             # Node-local history: sends, every spend and every close. Read by
             # envelope, by sender and by recipient.
             conn.execute('''
@@ -3258,23 +3272,31 @@ def get_canonical_route_events_for_tx(tx_hash: str, block_hash: str) -> List[Dic
 _ENVELOPE_COLUMNS = (
     'envelope_id, sender_pubkey, sequence_number, recipient_pubkey, amount, caps_json, '
     'period_kind, period, recurring, expires_at, anchor, remaining, period_index, '
-    'spent_in_period, spends, last_height'
+    'spent_in_period, spends, last_height, conditions_json, last_clock, due_at'
 )
 
 
 def _write_envelope_rows(state: Dict) -> None:
     """Full replace of the open envelopes plus the commitment of closed ones."""
     _db_conn.execute('DELETE FROM envelopes_v1')
+    due = state.get('due') or {}
     for row in state['rows']:
+        row = tuple(row)
+        if len(row) == 16:
+            row = row + (None, 0)
         (eid, sender, sequence, recipient, amount, caps, kind, period, recurring,
-         expires_at, anchor, remaining, period_index, spent, spends, last_height) = row
+         expires_at, anchor, remaining, period_index, spent, spends, last_height,
+         conditions, last_clock) = row
+        eid_hex = bytes(eid).hex()
         _db_conn.execute(
             f'INSERT INTO envelopes_v1 ({_ENVELOPE_COLUMNS}) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (bytes(eid).hex(), sender, int(sequence), recipient, int(amount),
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (eid_hex, sender, int(sequence), recipient, int(amount),
              json.dumps([int(c) for c in caps]), int(kind), int(period),
              1 if recurring else 0, int(expires_at), int(anchor), int(remaining),
-             int(period_index), int(spent), int(spends), int(last_height)),
+             int(period_index), int(spent), int(spends), int(last_height),
+             json.dumps(list(conditions)) if conditions is not None else '',
+             int(last_clock), int(due.get(eid_hex, (kind, expires_at))[1])),
         )
     _db_conn.execute(
         'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
@@ -3305,10 +3327,40 @@ def load_envelope_state() -> tuple[List[tuple], int, bytes]:
         caps = json.loads(r[5])
         if not isinstance(caps, list):
             caps = []
+        conditions = None
+        if r[16]:
+            parsed_conditions = json.loads(r[16])
+            if not isinstance(parsed_conditions, list) or len(parsed_conditions) != 7:
+                raise ValueError(f"stored envelope has malformed conditions: {r[0]}")
+            conditions = tuple(parsed_conditions)
         out.append((bytes.fromhex(r[0]), r[1], int(r[2]), r[3], int(r[4]), tuple(caps),
                     int(r[6]), int(r[7]), bool(r[8]), int(r[9]), int(r[10]), int(r[11]),
-                    int(r[12]), int(r[13]), int(r[14]), int(r[15])))
+                    int(r[12]), int(r[13]), int(r[14]), int(r[15]), conditions,
+                    int(r[17])))
     return out, count, acc
+
+
+def has_due_envelopes(next_height: int, now: int) -> bool:
+    """True if an open envelope reaches its end at this height or time (its rest
+    is then paid out).
+
+    A hint for the miner thread, from persisted rows like has_due_retractables;
+    the block builder re-checks against the book under the lock.
+    """
+    if _db_conn is None:
+        init_db()
+    try:
+        with _db_lock:
+            row = _db_conn.execute(
+                'SELECT 1 FROM envelopes_v1 WHERE '
+                '(period_kind = 0 AND (CASE WHEN due_at > 0 THEN due_at ELSE expires_at END) <= ?) OR '
+                '(period_kind = 1 AND (CASE WHEN due_at > 0 THEN due_at ELSE expires_at END) <= ?) '
+                'LIMIT 1',
+                (int(next_height), int(now)),
+            ).fetchone()
+    except Exception:
+        return False
+    return row is not None
 
 
 def record_envelope_events(block_hash: str, block_number: int, events) -> None:

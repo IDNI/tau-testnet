@@ -186,10 +186,13 @@ def _route_fields(db, tx_hash: str, block_hash: str) -> dict:
     return {"receive_routes": out}
 
 
+_ENVELOPE_CLOSES = ("emptied", "released", "ended")
+
+
 def _envelope_fields(db, tx_hash: str, block_hash: str) -> dict:
-    """`envelopes`: what this transaction did to envelopes (spending limits): sent one,
-    spent from one, released one, or emptied one. A send also says whether the
-    envelope is still `open` or how it closed (emptied, released, ended)."""
+    """`envelopes`: what this transaction did to envelopes: sent one, spent from
+    one, released one, or emptied one. A send also says whether the envelope is
+    still `open` or how it closed (emptied, released, ended)."""
     try:
         events = db.get_canonical_envelope_events_for_tx(tx_hash, block_hash)
     except Exception:
@@ -206,7 +209,7 @@ def _envelope_fields(db, tx_hash: str, block_hash: str) -> dict:
             except Exception:
                 latest = []
             last = latest[0].get("outcome") if latest else None
-            item["status"] = last if last in ("emptied", "released", "ended") else "open"
+            item["status"] = last if last in _ENVELOPE_CLOSES else "open"
         out.append(item)
     return {"envelopes": out}
 

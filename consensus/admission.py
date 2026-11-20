@@ -2150,6 +2150,12 @@ def validate_receive_route_release_payload(
 
 
 def _envelope_code(reason: str) -> str:
+    if "locked until" in reason:
+        return "ENVELOPE_LOCKED"
+    if "outside its spending window" in reason:
+        return "ENVELOPE_OUTSIDE_WINDOW"
+    if "could never be spent" in reason or "would unlock at" in reason:
+        return "ENVELOPE_NEVER_SPENDABLE"
     if "full" in reason:
         return "ENVELOPE_BOOK_FULL"
     if "already open" in reason:
@@ -2197,7 +2203,8 @@ def validate_envelope_send_payload(
     from consensus.envelope import EnvelopeState
 
     described = describe_envelope(
-        terms, EnvelopeState(anchor=terms.clock(height, ts), remaining=terms.amount),
+        terms, EnvelopeState(anchor=terms.unlock_at(terms.clock(height, ts)),
+                             remaining=terms.amount),
         height=height, ts=ts)
     return success({**described, "recipient_pubkey": terms.recipient_pubkey,
                     "amount": terms.amount})

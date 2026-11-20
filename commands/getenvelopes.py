@@ -1,4 +1,4 @@
-"""The envelopes an account sent or holds (spending limits).
+"""The envelopes an account sent or holds.
 
     getenvelopes <address> [in|out|all]
 

@@ -1140,13 +1140,16 @@ class NetworkService:
                 logger.debug("Gossip rejected: receive_route_release missing owner or route_id")
                 return
         elif tx_type == "envelope_send":
-            missing = [f for f in ("recipient_pubkey", "amount", "caps", "expires_at")
+            missing = [f for f in ("recipient_pubkey", "amount", "expires_at")
                        if f not in p_dict]
             periods = [f for f in ("period_blocks", "period_seconds")
                        if p_dict.get(f) is not None]
-            if missing or len(periods) != 1:
-                logger.debug("Gossip rejected: envelope_send missing %s or "
-                             "not exactly one period", missing)
+            # With caps exactly one period; without caps a named clock.
+            limited = p_dict.get("caps") is not None
+            if missing or (len(periods) != 1 if limited
+                           else (periods or p_dict.get("clock") is None)):
+                logger.debug("Gossip rejected: envelope_send missing %s, or caps without "
+                             "exactly one period, or no clock", missing)
                 return
         elif tx_type == "envelope_spend":
             if any(f not in p_dict for f in ("envelope_id", "to_pubkey", "amount")):

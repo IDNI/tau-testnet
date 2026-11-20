@@ -1129,6 +1129,9 @@ def build_receive_route_release_tx(
     }
 
 
+_DAY_ORDER = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
 def build_envelope_send_tx(
     *,
     sender_pubkey: str,
@@ -1137,25 +1140,45 @@ def build_envelope_send_tx(
     expire_at_height: int,
     recipient_pubkey: str,
     amount: int,
-    caps: list,
     expires_at: int,
+    caps: list | None = None,
     period_blocks: int | None = None,
     period_seconds: int | None = None,
     recurring: bool = False,
+    clock: str | None = None,
+    not_before: int | None = None,
+    hold: int | None = None,
+    days: list | None = None,
+    hours: list | None = None,
+    utc_offset: int | None = None,
     fee_limit: str | int = "0",
 ) -> dict:
     """Construct a ``tx_type='envelope_send'`` payload (without signature).
 
     ``amount`` leaves the sender at once and waits in the envelope for the
-    recipient to spend, at most ``caps[n]`` in period n (``recurring`` repeats
-    the last cap). Exactly one period clock; ``expires_at`` is on that clock.
+    recipient to spend. Optional conditions, all on the envelope's one clock:
+    a spending limit (``caps[n]`` in period n, ``recurring`` repeats the last
+    cap; exactly one period clock), ``not_before``, ``hold``, ``days`` and
+    ``hours`` (seconds clock only; read at ``utc_offset``, quarter hours east
+    of UTC, UTC when left out). Without caps, ``clock`` names the clock.
+    Optional fields are left out when not given, so the signed bytes of a
+    spending-limit envelope do not change.
     """
     if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
         raise ValueError("recipient_pubkey must be a 96-character hex public key")
-    if (period_blocks is None) == (period_seconds is None):
-        raise ValueError("give exactly one of period_blocks and period_seconds")
-    if not isinstance(caps, (list, tuple)) or not caps:
-        raise ValueError("caps must be a non-empty list of amounts")
+    if caps is not None:
+        if (period_blocks is None) == (period_seconds is None):
+            raise ValueError("give exactly one of period_blocks and period_seconds")
+        if not isinstance(caps, (list, tuple)) or not caps:
+            raise ValueError("caps must be a non-empty list of amounts")
+        kind = "blocks" if period_blocks is not None else "seconds"
+        if clock is not None and clock != kind:
+            raise ValueError(f"clock {clock} does not match the period's clock {kind}")
+    else:
+        if period_blocks is not None or period_seconds is not None or recurring:
+            raise ValueError("a period and recurring need caps")
+        if clock not in ("blocks", "seconds"):
+            raise ValueError("an envelope without caps needs clock 'blocks' or 'seconds'")
     tx = {
         "tx_type": "envelope_send",
         "sender_pubkey": sender_pubkey,
@@ -1165,15 +1188,35 @@ def build_envelope_send_tx(
         "fee_limit": str(fee_limit),
         "recipient_pubkey": recipient_pubkey.lower(),
         "amount": int(amount),
-        "caps": [int(c) for c in caps],
         "expires_at": int(expires_at),
     }
-    if period_blocks is not None:
-        tx["period_blocks"] = int(period_blocks)
+    if caps is not None:
+        tx["caps"] = [int(c) for c in caps]
+        if period_blocks is not None:
+            tx["period_blocks"] = int(period_blocks)
+        else:
+            tx["period_seconds"] = int(period_seconds)
+        if recurring:
+            tx["recurring"] = True
     else:
-        tx["period_seconds"] = int(period_seconds)
-    if recurring:
-        tx["recurring"] = True
+        tx["clock"] = clock
+    if not_before is not None:
+        tx["not_before"] = int(not_before)
+    if hold is not None:
+        tx["hold"] = int(hold)
+    if days:
+        names = [str(d).lower()[:3] for d in days]
+        if any(d not in _DAY_ORDER for d in names):
+            raise ValueError(f"days must be among {list(_DAY_ORDER)}")
+        tx["days"] = [d for d in _DAY_ORDER if d in names]
+    if hours:
+        tx["hours"] = sorted({int(h) for h in hours})
+    if utc_offset:
+        if not isinstance(utc_offset, int) or not -48 <= utc_offset <= 56:
+            raise ValueError("utc_offset is in quarter hours east of UTC, -48..56")
+        if not (days or hours):
+            raise ValueError("utc_offset needs days or hours")
+        tx["utc_offset"] = int(utc_offset)
     return tx
 
 

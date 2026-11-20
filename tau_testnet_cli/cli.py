@@ -3022,7 +3022,7 @@ def cmd_route_show(args: argparse.Namespace) -> int:
     return _simple_query(args, f"getreceiveroute {address}")
 
 
-# --- Envelopes (spending limits) -------------------------------------------------
+# --- Envelopes (spending limits, time conditions) --------------------------------
 
 _DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
 
@@ -3038,7 +3038,7 @@ def _duration_seconds(text: str) -> int:
     return int(number) * (unit or 1)
 
 
-def _envelope_caps(values) -> list:
+def _envelope_caps(values) -> list | None:
     caps = []
     for value in values or []:
         for part in str(value).split(","):
@@ -3046,34 +3046,131 @@ def _envelope_caps(values) -> list:
             if not part.isdigit():
                 raise _PayloadError(f"--cap {value!r}: caps are whole amounts")
             caps.append(int(part))
-    if not caps:
-        raise _PayloadError("give at least one --cap")
-    return caps
+    return caps or None
 
 
-def _envelope_clock(args, tip: int, now: int) -> dict:
-    """The period and end of an envelope, both on one clock."""
-    if args.period_blocks is not None:
-        if args.ends_at is not None or args.ends_in is not None:
-            raise _PayloadError("a block period ends on the block clock: "
-                                "give --ends-at-height or --ends-in-blocks")
-        if args.ends_at_height is not None:
-            end = int(args.ends_at_height)
-        elif args.ends_in_blocks is not None:
-            end = tip + 1 + int(args.ends_in_blocks)
+def _utc_time(text: str) -> int:
+    """Unix seconds from `1767225600`, `2027-01-01` or `2027-01-01T08:30` (UTC)."""
+    import datetime as _dt
+
+    raw = str(text).strip()
+    if raw.isdigit():
+        return int(raw)
+    try:
+        parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a time (unix seconds, 2027-01-01 or 2027-01-01T08:30, UTC)")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return int(parsed.timestamp())
+
+
+_DAY_ORDER = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _day_list(text: str) -> list:
+    """`mon,wed,fri`, `mon-fri` or `sat-sun` -> day names, Monday first."""
+    days = set()
+    for part in str(text).lower().split(","):
+        part = part.strip()
+        if "-" in part:
+            first, last = (p.strip()[:3] for p in part.split("-", 1))
+            if first not in _DAY_ORDER or last not in _DAY_ORDER:
+                raise argparse.ArgumentTypeError(f"{text!r}: days are mon..sun")
+            a, b = _DAY_ORDER.index(first), _DAY_ORDER.index(last)
+            span = range(a, b + 1) if a <= b else list(range(a, 7)) + list(range(0, b + 1))
+            days.update(_DAY_ORDER[d] for d in span)
+        elif part[:3] in _DAY_ORDER:
+            days.add(part[:3])
         else:
-            raise _PayloadError("give --ends-at-height or --ends-in-blocks")
-        return {"period_blocks": int(args.period_blocks), "expires_at": end}
-    if args.ends_at_height is not None or args.ends_in_blocks is not None:
-        raise _PayloadError("a time period ends on the time clock: "
-                            "give --ends-at or --ends-in")
-    if args.ends_at is not None:
-        end = int(args.ends_at)
-    elif args.ends_in is not None:
-        end = now + int(args.ends_in)
+            raise argparse.ArgumentTypeError(f"{text!r}: days are mon..sun")
+    return [d for d in _DAY_ORDER if d in days]
+
+
+def _hour_list(text: str) -> list:
+    """`9-17` (09:00 to 17:00, so hours 9..16), `22-6` (across midnight) or
+    `9,10,14` -> the hours a spend may land in (UTC, or at --utc-offset)."""
+    hours = set()
+    for part in str(text).split(","):
+        part = part.strip()
+        if "-" in part:
+            first, last = (p.strip() for p in part.split("-", 1))
+            if not (first.isdigit() and last.isdigit()) or int(first) > 23 \
+                    or not 1 <= int(last) <= 24 or int(first) == int(last):
+                raise argparse.ArgumentTypeError(f"{text!r}: give ranges like 9-17 or 22-6")
+            a, b = int(first), int(last) % 24
+            span = range(a, b) if a < b else list(range(a, 24)) + list(range(0, b))
+            hours.update(span)
+        elif part.isdigit() and int(part) <= 23:
+            hours.add(int(part))
+        else:
+            raise argparse.ArgumentTypeError(f"{text!r}: hours are 0..23")
+    return sorted(hours)
+
+
+def _utc_offset(text: str) -> int:
+    """`+02:00`, `-03:30`, `5:45` or plain hours `2`, `-5` -> quarter hours east of
+    UTC (UTC-12:00 to UTC+14:00, in steps of 15 minutes)."""
+    raw = str(text).strip()
+    sign = -1 if raw.startswith("-") else 1
+    body = raw.lstrip("+-")
+    hours, _, minutes = body.partition(":")
+    if not hours.isdigit() or (minutes and not minutes.isdigit()):
+        raise argparse.ArgumentTypeError(f"{text!r}: give an offset like +02:00 or -03:30")
+    total = int(hours) * 60 + int(minutes or 0)
+    if int(minutes or 0) >= 60 or total % 15:
+        raise argparse.ArgumentTypeError(f"{text!r}: offsets come in steps of 15 minutes")
+    quarters = sign * total // 15
+    if not -48 <= quarters <= 56:
+        raise argparse.ArgumentTypeError(f"{text!r}: offsets run from -12:00 to +14:00")
+    return quarters
+
+
+_TIME_FLAGS = ("period", "ends_in", "ends_at", "not_before", "hold", "days", "hours",
+               "utc_offset")
+_BLOCK_FLAGS = ("period_blocks", "ends_in_blocks", "ends_at_height", "not_before_height",
+                "hold_blocks")
+
+
+def _flag(name: str) -> str:
+    return "--" + name.replace("_", "-")
+
+
+def _envelope_terms(args, tip: int, now: int) -> dict:
+    """Every condition of an envelope, on its one clock (the clock its end is on)."""
+    blocks = args.ends_in_blocks is not None or args.ends_at_height is not None
+    used = [f for f in (_TIME_FLAGS if blocks else _BLOCK_FLAGS)
+            if getattr(args, f, None) is not None]
+    if used:
+        clock = "block" if blocks else "time"
+        raise _PayloadError(
+            f"one envelope, one clock: it ends on the {clock} clock, so "
+            f"{', '.join(_flag(f) for f in used)} cannot be used "
+            f"({'heights and block counts' if blocks else 'times and durations'} only)")
+    caps = _envelope_caps(args.cap)
+    period = args.period_blocks if blocks else args.period
+    if caps is None and (period is not None or args.recurring):
+        raise _PayloadError("a period and --recurring need --cap")
+    if caps is not None and period is None:
+        raise _PayloadError(f"--cap needs {'--period-blocks' if blocks else '--period'}")
+    if blocks:
+        end = (int(args.ends_at_height) if args.ends_at_height is not None
+               else tip + 1 + int(args.ends_in_blocks))
+        out = {"expires_at": end, "not_before": args.not_before_height,
+               "hold": args.hold_blocks}
+        out.update({"caps": caps, "period_blocks": period} if caps else {"clock": "blocks"})
     else:
-        raise _PayloadError("give --ends-at or --ends-in")
-    return {"period_seconds": int(args.period), "expires_at": end}
+        end = int(args.ends_at) if args.ends_at is not None else now + int(args.ends_in)
+        out = {"expires_at": end, "not_before": args.not_before, "hold": args.hold,
+               "days": args.days, "hours": args.hours, "utc_offset": args.utc_offset}
+        if args.utc_offset is not None and not (args.days or args.hours):
+            raise _PayloadError("--utc-offset says where --days and --hours are read; "
+                                "give one of them")
+        out.update({"caps": caps, "period_seconds": period} if caps
+                   else {"clock": "seconds"})
+    out["recurring"] = bool(args.recurring)
+    return out
 
 
 def cmd_envelope_send(args: argparse.Namespace) -> int:
@@ -3083,20 +3180,18 @@ def cmd_envelope_send(args: argparse.Namespace) -> int:
 
     def _build(sender_pubkey, sequence_number, expire_at_height, tip):
         now = int(_now())
-        payload = tx_mod.build_envelope_send_tx(
-            sender_pubkey=sender_pubkey,
-            sequence_number=sequence_number,
-            expiration_time=now + args.expiry,
-            expire_at_height=expire_at_height,
-            recipient_pubkey=args.to.strip().lower(),
-            amount=int(args.amount),
-            caps=_envelope_caps(args.cap),
-            recurring=bool(args.recurring),
-            **_envelope_clock(args, tip, now),
-        )
         try:
+            payload = tx_mod.build_envelope_send_tx(
+                sender_pubkey=sender_pubkey,
+                sequence_number=sequence_number,
+                expiration_time=now + args.expiry,
+                expire_at_height=expire_at_height,
+                recipient_pubkey=args.to.strip().lower(),
+                amount=int(args.amount),
+                **_envelope_terms(args, tip, now),
+            )
             created["id"] = parse_envelope_send(payload).envelope_id.hex()
-        except EnvelopeShapeError as exc:
+        except (EnvelopeShapeError, ValueError) as exc:
             raise _PayloadError(str(exc))
         return payload
 
@@ -3150,11 +3245,13 @@ def cmd_envelope_list(args: argparse.Namespace) -> int:
 
 
 def _add_envelope_subparsers(sub) -> None:
-    """`tau-testnet envelope ...` -- send money someone may spend only so fast."""
+    """`tau-testnet envelope ...` -- send money someone may spend only under your
+    conditions: so fast, not before, on these days."""
     p_env = sub.add_parser(
         "envelope",
         parents=[_GLOBAL_PARENT],
-        help="Envelopes: money with a spending limit (send, spend, release, show, list)",
+        help="Envelopes: money with conditions: limits, locks, windows "
+             "(send, spend, release, show, list)",
     )
     esub = p_env.add_subparsers(dest="envelope_command", required=True)
     common = [_GLOBAL_PARENT]
@@ -3181,31 +3278,53 @@ def _add_envelope_subparsers(sub) -> None:
 
     p_send = esub.add_parser(
         "send", parents=common,
-        help="Send money in an envelope: the recipient may spend at most a cap per period",
+        help="Send money in an envelope: the recipient spends it under your conditions",
+        description="Money leaves you at once and waits in the envelope for the recipient. "
+                    "Every condition is optional; give at least one. Every condition is "
+                    "on one clock: the clock the end is on (--ends-in/--ends-at: time, "
+                    "UTC; --ends-in-blocks/--ends-at-height: blocks).",
     )
     _key_group(p_send)
     p_send.add_argument("--to", required=True, metavar="PUBKEY", help="The recipient (96 hex)")
     p_send.add_argument("--amount", required=True, type=int, help="What the envelope holds")
     p_send.add_argument(
-        "--cap", action="append", required=True, metavar="N[,N...]",
-        help="Most the recipient may spend in one period; repeat or comma-separate "
-             "for a schedule, first period first (--cap 1000,500)")
+        "--cap", action="append", metavar="N[,N...]",
+        help="Spending limit: most the recipient may spend in one period; repeat or "
+             "comma-separate for a schedule, first period first (--cap 1000,500)")
     p_send.add_argument("--recurring", action="store_true",
                         help="After the list, the last cap repeats every period "
                              "(without it, the limit stops after the list)")
-    period = p_send.add_mutually_exclusive_group(required=True)
+    period = p_send.add_mutually_exclusive_group()
     period.add_argument("--period", type=_duration_seconds, metavar="DURATION",
                         help="Period on the time clock: 3600, 12h, 7d, 2w")
     period.add_argument("--period-blocks", type=_block_count, metavar="N",
                         help="Period on the block clock")
     ends = p_send.add_mutually_exclusive_group(required=True)
     ends.add_argument("--ends-in", type=_duration_seconds, metavar="DURATION",
-                      help="End this long from now (time clock); the rest then goes "
-                           "to the recipient")
-    ends.add_argument("--ends-at", type=int, metavar="UNIX")
+                      help="End this long from now (time clock)")
+    ends.add_argument("--ends-at", type=_utc_time, metavar="TIME",
+                      help="End at this time: unix seconds or 2027-01-01[T08:30] UTC")
     ends.add_argument("--ends-in-blocks", type=_block_count, metavar="N",
                       help="End this many blocks after the next one (block clock)")
     ends.add_argument("--ends-at-height", type=int, metavar="HEIGHT")
+    lock = p_send.add_argument_group("time conditions")
+    lock.add_argument("--not-before", type=_utc_time, metavar="TIME",
+                      help="No spend before this time (unix seconds or 2026-12-01, UTC)")
+    lock.add_argument("--not-before-height", type=int, metavar="HEIGHT",
+                      help="No spend before this height (block clock)")
+    lock.add_argument("--hold", type=_duration_seconds, metavar="DURATION",
+                      help="No spend for this long after it arrives (6h, 2d)")
+    lock.add_argument("--hold-blocks", type=_block_count, metavar="N",
+                      help="No spend for this many blocks after it arrives")
+    lock.add_argument("--days", type=_day_list, metavar="DAYS",
+                      help="Spends only on these weekdays: mon-fri, sat,sun "
+                           "(UTC, or at --utc-offset)")
+    lock.add_argument("--hours", type=_hour_list, metavar="HOURS",
+                      help="Spends only in these hours: 9-17 (09:00 to 17:00), 22-6 "
+                           "(UTC, or at --utc-offset)")
+    lock.add_argument("--utc-offset", type=_utc_offset, metavar="OFFSET",
+                      help="Read --days and --hours at this fixed offset from UTC: "
+                           "+02:00, -03:30 (steps of 15 minutes; no daylight saving)")
     _tx_flags(p_send)
     p_send.set_defaults(func=cmd_envelope_send)
 
@@ -3231,7 +3350,8 @@ def _add_envelope_subparsers(sub) -> None:
     p_rel.set_defaults(func=cmd_envelope_release)
 
     p_show = esub.add_parser("show", parents=common,
-                             help="One envelope: terms, this period's room, history")
+                             help="One envelope: terms, locked or open, this period's "
+                                  "room, due point, history")
     p_show.add_argument("envelope_id", help="Envelope id (64 hex)")
     p_show.set_defaults(func=cmd_envelope_show)
 

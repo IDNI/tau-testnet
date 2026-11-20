@@ -265,7 +265,7 @@ def build_mechanism_metadata(
     # Receive routes (#35): the same gate, for the same reason.
     if receive_routes_root:
         mech["receive_routes_root"] = receive_routes_root
-    # Envelopes (spending limits): the same gate, for the same reason.
+    # Envelopes: the same gate, for the same reason.
     if envelopes_root:
         mech["envelopes_root"] = envelopes_root
     return mech
@@ -482,7 +482,7 @@ class ConsensusLifecycleManager:
         self.payout_rules = PayoutBook()
         # Receive routes (#35). A FIELD for the same reason rule_offers is.
         self.receive_routes = ReceiveRouteBook()
-        # Envelopes (spending limits). A FIELD for the same reason rule_offers is.
+        # Envelopes. A FIELD for the same reason rule_offers is.
         self.envelopes = EnvelopeBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block

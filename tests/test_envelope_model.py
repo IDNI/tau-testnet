@@ -35,6 +35,7 @@ from hypothesis import HealthCheck, Phase, event, example, given, settings, stra
 
 import tau_defs
 from consensus.envelope import (
+    KIND_BLOCKS,
     MAX_LIFETIME_BLOCKS,
     MAX_LIFETIME_SECONDS,
     MAX_OPEN_ENVELOPES_PER_SENDER,
@@ -363,6 +364,18 @@ def _anyone_releases(self, release):
     return _can_release(self, release)
 
 
+def _end_included(self, spend, height, ts):
+    """A spend in the block that reaches the end still lands (judged one tick earlier)."""
+    terms = self.open.get(spend.envelope_id)
+    if terms is not None and \
+            terms.clock(height, ts) == self.state[spend.envelope_id].due_point(terms):
+        if terms.kind == KIND_BLOCKS:
+            height -= 1
+        else:
+            ts -= 1
+    return _check_spend(self, spend, height, ts)
+
+
 def _anchor_at_zero(self, terms, height, ts):
     return self._insert(terms, EnvelopeState(anchor=0, remaining=terms.amount))
 
@@ -386,8 +399,7 @@ MUTANTS = {
         lambda self, n: self.caps[n] if n < len(self.caps) else None),
     "the limit never lapses": lambda mp: mp.setattr(
         EnvelopeTerms, "cap_for", lambda self, n: self.caps[min(n, len(self.caps) - 1)]),
-    "end included": lambda mp: mp.setattr(
-        EnvelopeTerms, "ended", lambda self, h, ts: self.clock(h, ts) > self.expires_at),
+    "end included": lambda mp: mp.setattr(EnvelopeBook, "check_spend", _end_included),
     "envelopes never end": lambda mp: mp.setattr(EnvelopeBook, "end_due", lambda self, h, ts: []),
     "the sender may spend": lambda mp: mp.setattr(EnvelopeBook, "check_spend",
                                                   _sender_may_spend),
@@ -438,8 +450,13 @@ WITNESSES = {
         {"gap": 2, "proposer": PROPOSER, "actions": [("spend", 1, "recipient", "self", "room")]},
     ],
     "end included": [
-        {"gap": 1, "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [1], "period": 1, "recurring": False, "end": 1}), ("send", CAROL, DAVE, {"blocks": True, "amount": 40, "caps": [1], "period": 1, "recurring": False, "end": 1})]},
-        {"gap": 1, "proposer": PROPOSER, "actions": [("spend", 1, "recipient", "self", "room")]},
+        {"gap": 1, "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [1], "period": 1, "recurring": False, "end": 1}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [1], "period": 1, "recurring": False, "end": 1})]},
+        {"gap": 1, "proposer": PROPOSER, "actions": []},
+        {"gap": 1, "proposer": PROPOSER, "actions": []},
+        {"gap": 1, "proposer": PROPOSER, "actions": []},
+        {"gap": 1, "proposer": PROPOSER, "actions": [("send", ALICE, ALICE, {"blocks": False, "amount": 0, "caps": [0], "period": 0, "recurring": False, "end": 0}), ("spend", 0, "recipient", "self", "room"), ("spend", 0, "recipient", "self", "room")]},
+        {"gap": 1, "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": False, "amount": 1, "caps": [1], "period": 1, "recurring": False, "end": 1}), ("send", ALICE, ALICE, {"blocks": False, "amount": 0, "caps": [0], "period": 0, "recurring": False, "end": 0})]},
+        {"gap": "reset", "proposer": PROPOSER, "actions": [("spend", 0, "recipient", "self", "room"), ("spend", 3, "recipient", "self", "room")]},
     ],
     "envelopes never end": [
         {"gap": 1, "proposer": PROPOSER, "actions": [("send", ALICE, BOB, {"blocks": True, "amount": 1, "caps": [1], "period": 1, "recurring": False, "end": 1}), ("send", CAROL, DAVE, {"blocks": False, "amount": 1, "caps": [1], "period": 1, "recurring": False, "end": 1})]},

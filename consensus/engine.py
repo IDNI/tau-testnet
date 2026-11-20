@@ -61,6 +61,7 @@ from .envelope import (
     EnvelopeBook,
     EnvelopeRefused,
     EnvelopeShapeError,
+    OUTCOME_NAMES as ENVELOPE_OUTCOME_NAMES,
     TX_TYPE_ENVELOPE_SEND,
     TX_TYPE_ENVELOPE_SPEND,
     close_event as envelope_close_event,
@@ -327,14 +328,17 @@ def _escrow_total(lm) -> int:
 def _end_envelopes(lm, balances, sequences, height, timestamp,
                    route_events: Optional[List[Dict[str, Any]]] = None
                    ) -> List[Dict[str, Any]]:
-    """Close every envelope whose end this block reached and pay what it held to
-    its recipient, through the recipient's receive route; their events."""
+    """Close every envelope whose due point this block reached; their events.
+
+    At its end an envelope pays the rest to its recipient, through the recipient's
+    receive route.
+    """
     book = _envelope_book(lm)
-    if book is None or not book.has_ending(int(height), int(timestamp)):
+    if book is None or not book.has_due(int(height), int(timestamp)):
         return []
     credit = _balance_credit(balances, sequences, faucet.amount(lm))
     events: List[Dict[str, Any]] = []
-    for terms, left in book.end_due(int(height), int(timestamp)):
+    for terms, left, outcome in book.end_due(int(height), int(timestamp)):
         eid = terms.envelope_id.hex()
         if left:
             event = _routed_credit(lm, terms.recipient_pubkey, left, timestamp, credit,
@@ -342,7 +346,7 @@ def _end_envelopes(lm, balances, sequences, height, timestamp,
                                    envelope_id=eid)
             if event is not None and route_events is not None:
                 route_events.append(event)
-        events.append(envelope_close_event(terms, "ended", left))
+        events.append(envelope_close_event(terms, ENVELOPE_OUTCOME_NAMES[outcome], left))
     return events
 
 

@@ -606,6 +606,7 @@ def _envelope_state(lm) -> dict:
         "rows": book.store_rows(),
         "resolved_count": count,
         "resolved_acc": acc.hex(),
+        "due": book.due_points(),
     }
 
 
@@ -2391,8 +2392,8 @@ def _restore_envelopes(lm) -> None:
     progress no block could reach, refuses to load rather than lose held funds."""
     from consensus.envelope import EnvelopeBook
 
-    rows, resolved_count, resolved_acc = db.load_envelope_state()
     try:
+        rows, resolved_count, resolved_acc = db.load_envelope_state()
         lm.envelopes = EnvelopeBook.restore(rows, resolved_count, resolved_acc)
     except ValueError as exc:
         raise DatabaseError(f"corrupt envelope state: {exc}") from exc

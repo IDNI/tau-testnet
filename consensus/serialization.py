@@ -1163,6 +1163,40 @@ DOMAIN_ENVELOPE_RESOLVED_V1 = b"tau.envelope.resolved.v1"
 DOMAIN_ENVELOPE_BOOK_V1 = b"tau.envelope.book.v1"
 
 
+# Conditions beyond the spending limit (time conditions) are encoded
+# only when an envelope carries one: the clock byte then has ENVELOPE_EXTENDED set
+# and a length-prefixed section follows the end. An envelope without them encodes
+# exactly as before, so its id, its book entry and the book root do not change.
+ENVELOPE_EXTENDED = 0x80
+_COND_NOT_BEFORE, _COND_HOLD, _COND_DAYS, _COND_HOURS = 1, 2, 3, 4
+_COND_UTC_OFFSET = 7     # tags 5 and 6 are left for the refund conditions (next stage)
+
+
+def encode_envelope_conditions(conditions: Any) -> bytes:
+    """(not_before, hold, days, hours, -, -, utc_offset) as tag-value pairs, tags
+    strictly increasing, an absent condition (None or 0) left out; u16 length
+    first. utc_offset is one signed byte (quarter hours east of UTC). The two free
+    places belong to the refund conditions of the next stage."""
+    not_before, hold, days, hours, _, _, utc_offset = conditions
+    body = bytearray()
+    if not_before is not None:
+        body.append(_COND_NOT_BEFORE)
+        body.extend(encode_uint64(int(not_before)))
+    if hold is not None:
+        body.append(_COND_HOLD)
+        body.extend(encode_uint64(int(hold)))
+    if days:
+        body.append(_COND_DAYS)
+        body.append(int(days) & 0x7F)
+    if hours:
+        body.append(_COND_HOURS)
+        body.extend(encode_uint32(int(hours) & 0xFFFFFF))
+    if utc_offset:
+        body.append(_COND_UTC_OFFSET)
+        body.extend(int(utc_offset).to_bytes(1, "big", signed=True))
+    return len(body).to_bytes(2, "big") + bytes(body)
+
+
 def _encode_envelope_terms(
     sender_pubkey: Any,
     sequence_number: int,
@@ -1173,6 +1207,7 @@ def _encode_envelope_terms(
     period: int,
     recurring: bool,
     expires_at: int,
+    conditions: Any = None,
 ) -> bytes:
     out = bytearray()
     out.extend(encode_pubkey48(sender_pubkey))
@@ -1183,10 +1218,13 @@ def _encode_envelope_terms(
     out.extend(encode_uint32(len(caps)))
     for cap in caps:
         out.extend(encode_uint64(int(cap)))
-    out.extend(bytes([int(kind) & 0xFF]))
+    flag = ENVELOPE_EXTENDED if conditions is not None else 0
+    out.extend(bytes([(int(kind) & 0x7F) | flag]))
     out.extend(encode_uint64(int(period)))
     out.extend(encode_bool(bool(recurring)))
     out.extend(encode_uint64(int(expires_at)))
+    if conditions is not None:
+        out.extend(encode_envelope_conditions(conditions))
     return bytes(out)
 
 
@@ -1200,17 +1238,19 @@ def compute_envelope_id(
     period: int,
     recurring: bool,
     expires_at: int,
+    conditions: Any = None,
 ) -> bytes:
     """BLAKE3 of the signed terms of an envelope. Returns 32 bytes.
 
     Every spend and release names this id, so a signature never reaches funds
-    held under other terms.
+    held under other terms. `conditions` is None for an envelope that carries
+    only a spending limit.
     """
     out = bytearray()
     out.extend(encode_string(DOMAIN_ENVELOPE_V1.decode()))
     out.extend(_encode_envelope_terms(
         sender_pubkey, sequence_number, recipient_pubkey, amount, caps, kind, period,
-        recurring, expires_at,
+        recurring, expires_at, conditions,
     ))
     return blake3(bytes(out)).digest()
 
@@ -1245,15 +1285,22 @@ def encode_envelope_entry(
     spent_in_period: int,
     spends: int,
     last_height: int,
+    conditions: Any = None,
+    last_clock: int = 0,
 ) -> bytes:
+    """One open envelope. An extended envelope (its clock byte says so) also
+    commits the clock of its last spend: the refund stage counts idle time from
+    it, and committing it now means that stage does not change this encoding."""
     out = bytearray()
     out.extend(encode_hash32(envelope_id))
     out.extend(_encode_envelope_terms(
         sender_pubkey, sequence_number, recipient_pubkey, amount, caps, kind, period,
-        recurring, expires_at,
+        recurring, expires_at, conditions,
     ))
     for value in (anchor, remaining, period_index, spent_in_period, spends, last_height):
         out.extend(encode_uint64(int(value)))
+    if conditions is not None:
+        out.extend(encode_uint64(int(last_clock)))
     return bytes(out)
 
 
