@@ -202,9 +202,9 @@ def test_the_supply_check_finds_an_injected_mint(temp_database, monkeypatch, pat
     import consensus.engine as eng
     orig = eng._release_due_retractables
 
-    def mint(lm, balances, sequences, height, timestamp):
+    def mint(lm, balances, sequences, height, timestamp, **kw):
         balances[ALICE] = int(balances.get(ALICE, 0)) + 7
-        return orig(lm, balances, sequences, height, timestamp)
+        return orig(lm, balances, sequences, height, timestamp, **kw)
 
     tx = spend_tx(ALICE, BOB, 5001, 0, fee_limit="10")
     ok = _run(path, [tx], _parent({ALICE: 200000}), fee="10")
