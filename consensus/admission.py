@@ -26,7 +26,21 @@ from consensus.rule_offers import (
     parse_rule_offer_reject,
     screen_clause_structure,
 )
+from consensus.chain_binding import WRONG_CHAIN_ID, check_chain_binding
 from consensus.facade import TipAdmissionView
+from consensus.grants import (
+    MAX_OPEN_GRANTS_PER_GRANTER,
+    MAX_OPEN_GRANTS_TOTAL,
+    TX_TYPE_GRANT_CANCEL,
+    TX_TYPE_GRANT_CREATE,
+    TX_TYPE_GRANT_DRAW,
+    GrantBook,
+    GrantShapeError,
+    parse_grant_cancel,
+    parse_grant_create,
+    parse_grant_draw,
+    validate_grant_shape,
+)
 from consensus.approvals import (
     MAX_APPROVAL_WINDOW_BLOCKS,
     audit_stream_collisions,
@@ -1618,6 +1632,124 @@ def validate_retract_transfer_payload(
     return success({"retractable_id": request.retractable_id.hex()})
 
 
+def _grant_book_from_row(row: Dict) -> GrantBook:
+    """A one-grant book rebuilt from a stored row, so admission judges a
+    draw/cancel with the same code the engine applies."""
+    return GrantBook.restore([row], 0, bytes(32))
+
+
+def validate_grant_create_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for creating a conditional grant."""
+    try:
+        entry = parse_grant_create(tx)
+    except GrantShapeError as exc:
+        return format_error(f"Malformed grant_create: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != entry.granter_pubkey:
+        return format_error("grant_create sender_pubkey must match the granter.")
+
+    chain_error = check_chain_binding(tx, tip_view.genesis_hash)
+    if chain_error is not None:
+        return format_error(
+            f"grant_create rejected: {chain_error}.", code=WRONG_CHAIN_ID
+        )
+
+    shape_error = validate_grant_shape(
+        entry, tip_view.next_block_height, tip_view.next_block_timestamp
+    )
+    if shape_error:
+        return format_error(f"grant_create rejected: {shape_error}")
+
+    if tip_view.get_grant(entry.grant_id) is not None:
+        return format_error(
+            "Duplicate grant_create (same granter, grantee, amount, sequence "
+            "and terms).",
+            code="DUPLICATE_GRANT",
+        )
+    if tip_view.open_grant_count_for_granter(entry.granter_pubkey) >= MAX_OPEN_GRANTS_PER_GRANTER:
+        return format_error(
+            f"Granter already has {MAX_OPEN_GRANTS_PER_GRANTER} open grants.",
+            code="TOO_MANY_GRANTS",
+        )
+    if tip_view.open_grant_count() >= MAX_OPEN_GRANTS_TOTAL:
+        return format_error("The grant book is full.", code="GRANT_BOOK_FULL")
+
+    return success({
+        "grant_id": entry.grant_id.hex(),
+        "amount": entry.amount,
+        "grantee_pubkey": entry.grantee_pubkey,
+        "refund_to": entry.refund_to,
+        "expires_at": entry.expires_at,
+    })
+
+
+def validate_grant_draw_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for drawing from a grant."""
+    try:
+        request = parse_grant_draw(tx)
+    except GrantShapeError as exc:
+        return format_error(f"Malformed grant_draw: {exc}.")
+
+    chain_error = check_chain_binding(tx, tip_view.genesis_hash)
+    if chain_error is not None:
+        return format_error(
+            f"grant_draw rejected: {chain_error}.", code=WRONG_CHAIN_ID
+        )
+
+    row = tip_view.get_grant(request.grant_id)
+    if row is None:
+        return format_error(
+            "Unknown or already resolved grant.", code="UNKNOWN_GRANT"
+        )
+    book = _grant_book_from_row(row)
+    ok, reason = book.can_admit_draw(
+        request.grant_id, tx.get("sender_pubkey"), request.amount,
+        tip_view.next_block_height, tip_view.next_block_timestamp,
+    )
+    if not ok:
+        return format_error(
+            f"grant_draw rejected: {reason}", code="GRANT_DRAW_REJECTED"
+        )
+    return success({"grant_id": request.grant_id.hex(), "amount": request.amount})
+
+
+def validate_grant_cancel_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for cancelling a grant."""
+    try:
+        request = parse_grant_cancel(tx)
+    except GrantShapeError as exc:
+        return format_error(f"Malformed grant_cancel: {exc}.")
+
+    chain_error = check_chain_binding(tx, tip_view.genesis_hash)
+    if chain_error is not None:
+        return format_error(
+            f"grant_cancel rejected: {chain_error}.", code=WRONG_CHAIN_ID
+        )
+
+    row = tip_view.get_grant(request.grant_id)
+    if row is None:
+        return format_error(
+            "Unknown or already resolved grant.", code="UNKNOWN_GRANT"
+        )
+    book = _grant_book_from_row(row)
+    ok, reason = book.can_admit_cancel(
+        request.grant_id, tx.get("sender_pubkey"),
+        tip_view.next_block_height, tip_view.next_block_timestamp,
+    )
+    if not ok:
+        return format_error(
+            f"grant_cancel rejected: {reason}", code="GRANT_CANCEL_REJECTED"
+        )
+    return success({"grant_id": request.grant_id.hex()})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -1728,6 +1860,15 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
          return validate_retract_transfer_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_GRANT_CREATE:
+         return validate_grant_create_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_GRANT_DRAW:
+         return validate_grant_draw_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_GRANT_CANCEL:
+         return validate_grant_cancel_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

@@ -24,6 +24,7 @@ from commands import (
     getrequestid,
     getretractable,
     getretractableid,
+    getchainid,
     getretractables,
 )
 from errors import DependencyError
@@ -86,6 +87,7 @@ class ServiceContainer:
         "getretractable": getretractable,
         "getretractables": getretractables,
         "getretractableid": getretractableid,
+        "getchainid": getchainid,
         # Advisory, node-local, and engine-driving -- rate-limited accordingly
         # in server.py.
         "getapprovalslots": getapprovalslots,

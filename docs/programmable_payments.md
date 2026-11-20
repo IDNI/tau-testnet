@@ -113,3 +113,47 @@ class `CREDIT_RETRACTABLE_RELEASE`.
   are built on the framework above.
 - No execution transaction: that is Stage 5, the fallback for anything the
   sweep and the routes do not cover.
+
+## Stage 2 — conditional grants + chain binding
+
+A grant is a funded promise with spending rules. Alice locks `amount` coins
+for Bob; Bob draws them down with explicit `grant_draw` transactions, but
+only inside the rules Alice wrote at creation:
+
+- `spend_cap` — the most Bob may draw in one period (day / ISO week /
+  calendar month / fixed window, from `consensus.periods`);
+- `per_payment_cap` — the most Bob may draw in a single transaction;
+- `weekday_mask` / `hour_mask` (UTC) — the times draws are allowed;
+- `start_at` — draws are locked before this timestamp;
+- `expires_at` — the grant dies at this timestamp; whatever Bob has not
+  drawn is refunded to `refund_to` (usually the granter) by the sweep.
+
+Lifecycle: open -> exhausted | expired | cancelled. The grant is exhausted
+when Bob has drawn the full amount; it expires when the sweep sees
+`expires_at` pass; the granter may cancel it at any time (a revocable
+promise). A cancelled or expired grant refunds the remainder; an exhausted
+grant refunds nothing.
+
+The funds are escrowed in the book, exactly like a retractable park: the
+create transaction debits the granter and credits nobody (`escrow=True`); a
+draw credits the grantee from the book's escrow; a cancel or an expiry
+refund credits `refund_to` from the escrow. The grantee never holds the
+un-drawn funds, so they cannot spend them outside the grant's rules. The
+book's escrow counter is part of the supply: `engine._escrow_total` sums
+every book that holds escrow.
+
+Demo: Alice grants Bob 5,000, 500/week from Dec 1, refund at deadline
+(`tests/test_grants.py::test_demo_alice_bob_5000_500_per_week_from_dec_1`).
+
+### Chain binding
+
+Every new transaction type carries `chain_id` — the genesis block hash of
+the network it was signed for. Admission and the engine reject a
+transaction whose `chain_id` does not match this node's genesis hash
+(`WRONG_CHAIN_ID`, see `consensus/chain_binding.py`), so a grant signed on
+one Tau network cannot be replayed on another. The genesis hash is pinned
+on the lifecycle manager by `chain_state` at genesis load (the same way
+`faucet_amount` is pinned) and bound into the consensus meta hash only
+when set, so a chain that predates the field keeps a byte-identical hash.
+Clients read it with the `getchainid` command. `grant_create` is
+fee-bearing; `grant_draw` and `grant_cancel` are fee-exempt, like a retract.

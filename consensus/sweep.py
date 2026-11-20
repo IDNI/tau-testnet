@@ -77,6 +77,9 @@ class SweepContext:
     ``balances`` / ``sequences`` are the block's mutable overlays (the same
     maps ``_release_due_retractables`` writes into); ``lm`` is the block's
     lifecycle manager; ``height`` / ``timestamp`` are the block header's.
+    ``faucet_grant`` is the network's faucet grant for reading balances with
+    no overlay record; ``credit_records`` is the block's credit ledger, when
+    the caller wants sweep-produced credits recorded.
     """
 
     lm: Any
@@ -84,6 +87,13 @@ class SweepContext:
     sequences: Dict[str, int]
     height: int
     timestamp: int
+    # The faucet grant of the network (0 when there is none): handlers use
+    # it to read a balance the overlay has no record for, the same way the
+    # retractable release does.
+    faucet_grant: int = 0
+    # The block's credit ledger, when the caller wants sweep-produced
+    # credits recorded (the engine passes its ledger); None records nothing.
+    credit_records: Optional[Any] = None
 
 
 class SweepHandler(Protocol):
@@ -186,6 +196,8 @@ def run_programmable_sweep(
     *,
     registry: Optional[SweepRegistry] = None,
     cap: int = MAX_SWEEP_ACTIONS_PER_BLOCK,
+    faucet_grant: int = 0,
+    credit_records: Optional[Any] = None,
 ) -> SweepReport:
     """Engine hook: run the post-transaction programmable sweep for a block.
 
@@ -200,5 +212,7 @@ def run_programmable_sweep(
         sequences=sequences,
         height=int(height),
         timestamp=int(timestamp),
+        faucet_grant=faucet_grant,
+        credit_records=credit_records,
     )
     return (registry or DEFAULT_SWEEP_REGISTRY).run(ctx, cap=cap)

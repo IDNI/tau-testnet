@@ -34,6 +34,16 @@ from .approvals import (
     parse_rule_change_request_checked,
     parse_transfer_vote,
 )
+from .grants import (
+    GRANT_TX_TYPES,
+    GrantShapeError,
+    TX_TYPE_GRANT_CANCEL,
+    TX_TYPE_GRANT_CREATE,
+    TX_TYPE_GRANT_DRAW,
+    parse_grant_cancel,
+    parse_grant_create,
+    parse_grant_draw,
+)
 from .retractable import (
     RETRACTABLE_TX_TYPES,
     RetractableBook,
@@ -45,11 +55,14 @@ from .retractable import (
 from .credits import (
     CREDIT_FAUCET,
     CREDIT_FEE_REWARD,
+    CREDIT_GRANT_DRAW,
+    CREDIT_GRANT_REFUND,
     CREDIT_RETRACTABLE_RELEASE,
     CREDIT_TRANSFER,
     CreditLedger,
     CreditRecord,
 )
+from .chain_binding import check_chain_binding
 from .sweep import run_programmable_sweep
 from .rule_offers import (
     RULE_OFFER_TX_TYPES,
@@ -80,7 +93,7 @@ from .rule_offers import (
 # at inclusion.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST}
+     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_GRANT_CREATE}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -241,8 +254,21 @@ def _retractable_book(lm) -> Optional[RetractableBook]:
 
 
 def _escrow_total(lm) -> int:
+    """Coins held in escrow by every programmable-payments book.
+
+    The supply-conservation check adds this to the balance sum, so a book
+    that escrows funds (retractable parks, grants, and later standing
+    payments and payout rules) must be counted here or the block fails the
+    check the moment it escrows anything.
+    """
+    total = 0
     book = _retractable_book(lm)
-    return book.escrow_total() if book is not None else 0
+    if book is not None:
+        total += book.escrow_total()
+    grants = getattr(lm, "grants", None)
+    if grants is not None:
+        total += grants.escrowed_total()
+    return total
 
 
 def _release_due_retractables(lm, balances, sequences, height, timestamp, credit_records=None) -> List[str]:
@@ -963,7 +989,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # (design 1.3: time is trigger #1). No handlers are registered yet,
         # so this is a no-op until Stage 2 registers the grant book.
         programmable_sweep_report = run_programmable_sweep(
-            lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
+            lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp,
+            credit_records=release_credit_records,
+            faucet_grant=faucet.amount(lm),
         )
 
         minted = faucet.granted(
@@ -1726,6 +1754,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             parked_rule_change_id: Optional[bytes] = None
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
+            pending_grant_create = None
+            pending_grant_draw = None
+            pending_grant_cancel: Optional[bytes] = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2693,6 +2724,113 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 "Retractable transfer retracted: " + request.retractable_id.hex()
                             )
 
+            elif tx_type in GRANT_TX_TYPES:
+                # Nothing here reads nested `payload` or `operations`: only root
+                # fields are signed, so anything else is unsigned data.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    grant_book = lifecycle_mgr.grants
+                    if tx_type == TX_TYPE_GRANT_CREATE:
+                        try:
+                            entry = parse_grant_create(tx)
+                        except GrantShapeError as exc:
+                            entry = None
+                            reason = f"invalid grant create ({exc})"
+                        else:
+                            chain_error = check_chain_binding(tx, lifecycle_mgr.genesis_hash)
+                            if not isinstance(sender, str) or sender != entry.granter_pubkey:
+                                reason = "sender is not the granter"
+                            elif chain_error is not None:
+                                reason = f"chain binding failed: {chain_error}"
+                            elif target_balances is None:
+                                reason = "no balance overlay to escrow from"
+                            else:
+                                _, reason = grant_book.can_admit_create(
+                                    entry, int(block_height or 0), int(block_timestamp or 0)
+                                )
+                        if entry is None or reason:
+                            tx_receipt["logs"].append(f"Grant ignored: {reason}")
+                            tx_receipt["reason"] = "grant_not_created"
+                            accepted_in_block = False
+                        else:
+                            escrowed = _execute_fee_era_transfer(
+                                entry.granter_pubkey, entry.grantee_pubkey, entry.amount,
+                                slot_values=_approval_slot_values(),
+                                overrides={},
+                                escrow=True,
+                            )
+                            fee_already_measured = True
+                            if escrowed and accepted_in_block and not hard_reject:
+                                pending_grant_create = entry
+                                tx_receipt["logs"].append(
+                                    "Grant created: " + entry.grant_id.hex()
+                                )
+                    elif tx_type == TX_TYPE_GRANT_DRAW:
+                        try:
+                            request = parse_grant_draw(tx)
+                        except GrantShapeError as exc:
+                            request = None
+                            reason = f"invalid grant draw ({exc})"
+                        else:
+                            chain_error = check_chain_binding(tx, lifecycle_mgr.genesis_hash)
+                            if chain_error is not None:
+                                reason = f"chain binding failed: {chain_error}"
+                            elif target_balances is None:
+                                reason = "no balance overlay to pay into"
+                            else:
+                                _, reason = grant_book.can_admit_draw(
+                                    request.grant_id, sender, request.amount,
+                                    int(block_height or 0), int(block_timestamp or 0),
+                                )
+                        if request is None or reason:
+                            tx_receipt["logs"].append(f"Grant draw ignored: {reason}")
+                            tx_receipt["reason"] = "grant_draw_not_applied"
+                            accepted_in_block = False
+                        else:
+                            staged_writes[sender] = _read_bal(sender) + request.amount
+                            credit_records.record(
+                                sender, request.amount, CREDIT_GRANT_DRAW, tx_id
+                            )
+                            pending_grant_draw = request
+                            tx_receipt["logs"].append(
+                                "Grant drawn: " + request.grant_id.hex()
+                            )
+                    else:  # TX_TYPE_GRANT_CANCEL
+                        try:
+                            request = parse_grant_cancel(tx)
+                        except GrantShapeError as exc:
+                            request = None
+                            reason = f"invalid grant cancel ({exc})"
+                        else:
+                            chain_error = check_chain_binding(tx, lifecycle_mgr.genesis_hash)
+                            if chain_error is not None:
+                                reason = f"chain binding failed: {chain_error}"
+                            elif target_balances is None:
+                                reason = "no balance overlay to refund into"
+                            else:
+                                _, reason = grant_book.can_admit_cancel(
+                                    request.grant_id, sender,
+                                    int(block_height or 0), int(block_timestamp or 0),
+                                )
+                        if request is None or reason:
+                            tx_receipt["logs"].append(f"Grant cancel ignored: {reason}")
+                            tx_receipt["reason"] = "grant_cancel_not_applied"
+                            accepted_in_block = False
+                        else:
+                            entry = grant_book.get(request.grant_id)
+                            remaining = grant_book.remaining_for(request.grant_id)
+                            if remaining > 0:
+                                staged_writes[entry.refund_to] = (
+                                    _read_bal(entry.refund_to) + remaining
+                                )
+                                credit_records.record(
+                                    entry.refund_to, remaining, CREDIT_GRANT_REFUND, tx_id
+                                )
+                            pending_grant_cancel = request.grant_id
+                            tx_receipt["logs"].append(
+                                "Grant cancelled: " + request.grant_id.hex()
+                            )
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3243,6 +3381,28 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 elif pending_retract_id is not None:
                     tx_receipt["retractable_event"] = (pending_retract_id.hex(), "retracted")
                     book.retract(pending_retract_id)
+
+            if accepted_in_block and not hard_reject:
+                if (pending_grant_create is not None
+                        or pending_grant_draw is not None
+                        or pending_grant_cancel is not None):
+                    grant_book = _lifecycle_for_write().grants
+                if pending_grant_create is not None:
+                    tx_receipt["grant_event"] = (
+                        pending_grant_create.grant_id.hex(), "created"
+                    )
+                    grant_book.submit(pending_grant_create)
+                elif pending_grant_draw is not None:
+                    tx_receipt["grant_event"] = (
+                        pending_grant_draw.grant_id.hex(), "drawn"
+                    )
+                    grant_book.draw(
+                        pending_grant_draw.grant_id, pending_grant_draw.amount,
+                        int(block_timestamp or 0),
+                    )
+                elif pending_grant_cancel is not None:
+                    tx_receipt["grant_event"] = (pending_grant_cancel.hex(), "cancelled")
+                    grant_book.cancel(pending_grant_cancel)
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same

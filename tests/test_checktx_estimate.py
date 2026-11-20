@@ -5,12 +5,14 @@ single slot apart from the sendtx slots, and never touches the standby. The plai
 form runs no Tau and says that the fee check was skipped.
 """
 import json
+import time
 from unittest.mock import PropertyMock, patch
 
 import pytest
 
 import chain_state
 import db
+from block import Block
 import tau_admission
 from commands import checktx
 from consensus.admission import TipAdmissionView
@@ -147,6 +149,22 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
+    if kind == "grant_create":
+        # The fixture provisions no genesis block, so the chain id has
+        # nothing to match; create a block 0 lazily (only this case needs
+        # one) and sign chain_id from it.
+        if not db.get_genesis_hash():
+            db.add_block(Block.create(
+                block_number=0, previous_hash="00" * 32, transactions=[],
+                proposer_pubkey=SENDER, timestamp=TIP_TS,
+            ))
+        now = int(time.time())
+        return _envelope(kind, SENDER, fee_limit, grantee_pubkey=RECIPIENT,
+                         refund_to=SENDER, amount=5000,
+                         period_kind=2, period_anchor=0,
+                         spend_cap=500, per_payment_cap=500,
+                         start_at=now, expires_at=now + 28 * 86400,
+                         chain_id=db.get_genesis_hash())
     raise AssertionError(kind)
 
 
@@ -158,7 +176,7 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request"]
+               "rule_change_request", "grant_create"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

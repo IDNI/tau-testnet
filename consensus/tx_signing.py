@@ -33,6 +33,11 @@ from consensus.approvals import (
     TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
+from consensus.grants import (
+    TX_TYPE_GRANT_CANCEL,
+    TX_TYPE_GRANT_CREATE,
+    TX_TYPE_GRANT_DRAW,
+)
 from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
@@ -123,6 +128,29 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
+    elif tx_type == TX_TYPE_GRANT_CREATE:
+        # Every field that fixes the grant's terms is signed; the grant id
+        # is derived from them, so a proposer cannot rewrite the terms.
+        signing_dict["grantee_pubkey"] = payload.get("grantee_pubkey")
+        signing_dict["refund_to"] = payload.get("refund_to")
+        signing_dict["amount"] = payload.get("amount")
+        signing_dict["period_kind"] = payload.get("period_kind")
+        signing_dict["period_length"] = payload.get("period_length")
+        signing_dict["period_anchor"] = payload.get("period_anchor")
+        signing_dict["spend_cap"] = payload.get("spend_cap")
+        signing_dict["per_payment_cap"] = payload.get("per_payment_cap")
+        signing_dict["weekday_mask"] = payload.get("weekday_mask")
+        signing_dict["hour_mask"] = payload.get("hour_mask")
+        signing_dict["start_at"] = payload.get("start_at")
+        signing_dict["expires_at"] = payload.get("expires_at")
+        signing_dict["chain_id"] = payload.get("chain_id")
+    elif tx_type == TX_TYPE_GRANT_DRAW:
+        signing_dict["grant_id"] = payload.get("grant_id")
+        signing_dict["amount"] = payload.get("amount")
+        signing_dict["chain_id"] = payload.get("chain_id")
+    elif tx_type == TX_TYPE_GRANT_CANCEL:
+        signing_dict["grant_id"] = payload.get("grant_id")
+        signing_dict["chain_id"] = payload.get("chain_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

@@ -433,6 +433,60 @@ class TipAdmissionView:
             return 0
         return int(row[0] or 0) if row else 0
 
+    @property
+    def genesis_hash(self) -> str:
+        """This network's genesis block hash (the chain id), or "" when unknown."""
+        try:
+            return db.get_genesis_hash() or ""
+        except Exception:
+            return ""
+
+    def get_grant(self, grant_id: bytes) -> Optional[dict]:
+        """The open grant with this id, or None (unknown or already resolved)."""
+        try:
+            with db._db_lock:
+                row = db._db_conn.execute(
+                    "SELECT granter_pubkey, grantee_pubkey, refund_to, amount, "
+                    "sequence_number, period_kind, period_length, period_anchor, "
+                    "spend_cap, per_payment_cap, weekday_mask, hour_mask, start_at, "
+                    "expires_at, drawn_total, period_index, drawn_in_period "
+                    "FROM grants_v1 WHERE grant_id = ?",
+                    (bytes(grant_id).hex(),),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        return {
+            "grant_id": bytes(grant_id).hex(),
+            "granter_pubkey": row[0],
+            "grantee_pubkey": row[1],
+            "refund_to": row[2],
+            "amount": int(row[3]),
+            "sequence_number": int(row[4]),
+            "period_kind": int(row[5]),
+            "period_length": None if row[6] is None else int(row[6]),
+            "period_anchor": int(row[7]),
+            "spend_cap": int(row[8]),
+            "per_payment_cap": int(row[9]),
+            "weekday_mask": int(row[10]),
+            "hour_mask": int(row[11]),
+            "start_at": int(row[12]),
+            "expires_at": int(row[13]),
+            "drawn_total": int(row[14]),
+            "period_index": None if row[15] is None else int(row[15]),
+            "drawn_in_period": int(row[16]),
+        }
+
+    def open_grant_count_for_granter(self, granter_pubkey: str) -> int:
+        return self._retractable_scalar(
+            "SELECT COUNT(*) FROM grants_v1 WHERE granter_pubkey = ?",
+            (granter_pubkey,),
+        )
+
+    def open_grant_count(self) -> int:
+        return self._retractable_scalar("SELECT COUNT(*) FROM grants_v1")
+
     def get_retractable(self, retractable_id: bytes) -> Optional[dict]:
         """The open entry with this id, or None (unknown or already resolved)."""
         try:
