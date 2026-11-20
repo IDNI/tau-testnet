@@ -26,6 +26,7 @@ from consensus.rule_offers import (
     parse_rule_offer_reject,
     screen_clause_structure,
 )
+from consensus import recipient_policy
 from consensus.facade import TipAdmissionView
 from consensus.approvals import (
     MAX_APPROVAL_WINDOW_BLOCKS,
@@ -966,6 +967,24 @@ def _screen_clause_domains(body: str) -> Optional[str]:
         return (
             "Shared rules may not reference reserved input streams: "
             + ", ".join(typed)
+        )
+
+    # Recipient hold-cap capability (issues #47/#76): a clause that reads
+    # i17/i27 is a hold cap, and ONLY the recipient gate ever feeds those
+    # streams. On a node built without the gate the rule would deploy and
+    # never run — the worst failure for a control whose whole point is
+    # refusing money — so admission refuses it here, with the reason
+    # getgovernance's `capabilities` report mirrors. A clause reading only
+    # i3 is NOT refused: statically it is indistinguishable from a
+    # sender-pass clause (the counterparty is a first-class sender input
+    # too); the capabilities report is how a wallet learns whether the
+    # recipient pass will also enforce it inbound.
+    if not recipient_policy.supported("recipient_max_hold") and \
+            recipient_policy.clause_reads_hold_stream(body):
+        return (
+            "clause reads a recipient hold stream (i17/i27) but this node "
+            "does not enforce recipient policy (capabilities."
+            "recipient_max_hold is off): the rule would never run"
         )
 
     return _screen_clause_widths_and_structure(body)
