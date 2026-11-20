@@ -300,3 +300,42 @@ def test_restore_refuses_id_mismatch():
     rows[0]["amount"] = 999  # stored fields no longer hash to the stored id
     with pytest.raises(ValueError):
         StandingBook.restore(rows, 0, bytes(32))
+
+
+def test_create_terms_are_inside_the_signing_preimage():
+    # The authorization is executed later by transactions the payer does
+    # not sign, so every terms field must be authenticated by the create
+    # signature: changing any of them must change the signing digest.
+    import hashlib
+
+    from consensus.tx_signing import signing_message_bytes
+
+    base = {
+        "tx_type": "standing_payment_create",
+        "sender_pubkey": PAYER,
+        "sequence_number": 0,
+        "expiration_time": 0,
+        "fee_limit": 0,
+        "recipient_pubkey": RECIPIENT,
+        "amount": 500,
+        "period_kind": 0,
+        "anchor_timestamp": 1_700_000_000,
+        "window_start_offset": 0,
+        "window_end_offset": 3600,
+        "final_period": None,
+        "max_occurrences": 12,
+        "max_total": None,
+        "supersedes_id": None,
+    }
+    digest = hashlib.sha256(signing_message_bytes(base)).digest()
+    for field_name, mutated in (
+        ("recipient_pubkey", OTHER),
+        ("amount", 501),
+        ("period_kind", 1),
+        ("anchor_timestamp", 1_700_000_001),
+        ("window_end_offset", 3601),
+        ("max_occurrences", 13),
+        ("supersedes_id", "ab" * 32),
+    ):
+        changed = dict(base, **{field_name: mutated})
+        assert hashlib.sha256(signing_message_bytes(changed)).digest() != digest, field_name
