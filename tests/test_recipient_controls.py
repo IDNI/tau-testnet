@@ -18,8 +18,13 @@ Coverage, in increasing realism:
 
 Mock evaluator throughout for the clause path; the real one is in
 test_clause_registration_native.py. The guarded-mode second pass is scripted
-by the fake step / scripted o5, because the native engine is not built in
-this environment (see the module docstring of the design doc).
+by the fake step / scripted o5 here; the same verdicts against the real
+engine are proven in test_recipient_controls_native.py (guarded units
+pre-deployed into a real WorkerSession, evaluated by the native engine).
+Clause mode is additionally proven on two live nodes running the native
+engine; guarded units seeded via genesis did NOT enforce on those nodes
+(see "Verification" in docs/recipient-controls.md), so guarded mode is
+proven in-process only until its live deployment path is established.
 """
 import itertools
 import json

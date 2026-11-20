@@ -131,6 +131,40 @@ enforces:
           "capabilities": ["recipient_policy", "recipient_max_hold"]}}
 ```
 
+## Verification (real engine, not mock)
+
+Guarded-mode verdicts are proven against the real native Tau engine
+(`tests/test_recipient_controls_native.py`, 4 tests, all passing): the
+recipient's guarded unit is deployed into a real `WorkerSession` spawned
+from the router, and `engine.apply` refuses/allows through the gate's
+second pass (`i12` = recipient) plus the zero-hold probe -- an unknown
+sender is refused with `recipient_policy_block`, a known sender is
+accepted, a 3600 s park against a 600 cap is refused with
+`recipient_max_hold`, and a 600 s park is accepted and escrowed. No
+`communicate_with_tau*` patching anywhere in those tests.
+
+Clause mode is proven end to end on TWO LIVE NODES running the native
+engine (isolated dev chain, `tau-recipient-e2e`, Direct Bindings Mode):
+Bob registers an allowlist clause (only Alice) by rule tx, then a
+`RECIPIENT_POLICY_BLOCK` refusal is returned at admission for a
+Stranger transfer, while Alice's transfer is accepted; Bob then
+registers a 600 cap clause, a 3600 s park is refused with
+`RECIPIENT_MAX_HOLD` ("only accepts payments held for up to 600
+seconds"), and a 600 s park is accepted and escrowed. Both nodes agree
+on every block and balance (7 blocks, Alice 999,720 / Bob 1,000,230 /
+Stranger 999,890 at the end of the run).
+
+Caveat -- guarded units on a live node: seeding a guarded unit into the
+genesis `application_rules` puts it in the rules-state text (visible in
+`gettaustate`, capabilities reported) but did NOT enforce it on the live
+nodes in that run: a Stranger transfer to the guarded recipient was
+accepted. The gate logic itself is proven correct by the native tests
+above, so this is a deployment-path gap for guarded units on a live
+network (how the unit reaches the evaluator's spec, and how its
+literals are interned relative to transfer inputs), not a verdict bug.
+Until that path is established, deploy recipient policies as clauses
+on a live network; guarded mode is proven in-process only.
+
 ## What is not gated
 
 - **Retracts** (`retract_transfer`): never gated. A sender can always
