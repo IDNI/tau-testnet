@@ -3,12 +3,20 @@
     getactiverules [account] [height]
 
 Serves the rules actually in force from the node's canonical spec
-snapshots -- the engine's normalized spec text after pointwise revision,
-snapshotted at block commit whenever the spec revision advanced (see
-db.record_spec_snapshots). This is deliberately NOT the append-only
-accumulation `gettaustate` returns: submitted text is not rules in force,
-because a later revision can displace part of an earlier one, and only the
-composed spec shows what survived.
+snapshots -- the canonical spec text composed pointwise from the
+persisted application-rules accumulation, captured at apply time
+whenever a rule step advances the spec revision (see
+db.record_spec_snapshots). The text is composed from the accumulation
+itself (the units `save_effective_tau_spec` maintains), never read from
+the live interpreter or its process-global spec cache: that cache holds
+a possibly shrunk, process-local form, and under worker-backed
+authority it need not describe the executing session at all. The
+accumulation is the same text the node's startup restore seeds the
+interpreter with, so its composition is the spec the engine runs. And it is
+the composition, NOT the raw append-only accumulation `gettaustate`
+returns: submitted text is not rules in force, because a later revision
+can displace part of an earlier one, and only the composed spec shows
+what survived.
 
 Resolution: `height` selects the latest snapshot at or before it; with no
 height, the newest snapshot is served. A height before the first snapshot
