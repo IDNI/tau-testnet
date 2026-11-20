@@ -21,10 +21,15 @@ from block import Block
 from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, SK_MALLORY, pubkey_hex, sign_payload
 from commands import checktx
 from consensus import recipient_gate, sender_policy
-from consensus.admission import TipAdmissionView
+from consensus.admission import (
+    TipAdmissionView,
+    _check_host_contract_patch,
+    screen_user_rule_text,
+    validate_rule_offer_payload,
+)
 from consensus.approvals import ApprovalRequest
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
-from consensus.governance import ConsensusLifecycleManager
+from consensus.governance import ConsensusLifecycleManager, build_mechanism_metadata
 from consensus.policy_mock import MockPolicyEvaluator
 from consensus.retractable import parse_retractable_transfer
 from consensus.rule_offers import RuleOffer
@@ -95,6 +100,11 @@ def _owner_of(vals):
 def _lifecycle(*, clause=None, request=None):
     lm = ConsensusLifecycleManager(active_validators=[MALLORY, ALICE])
     lm.activate_approval_slots()
+    # The gate tests run in the ACTIVE configuration: the recipient
+    # gate is governance-activated, exactly as approval slots are
+    # activated one line above. The inactive configuration has its
+    # own tests at the bottom of this file.
+    lm.activate_recipient_gate()
     if clause is not None:
         lm.rule_offers.accepted_clauses[(BOB, tau_defs.USER_POLICY_STREAM_INDEX)] = clause
     if request is not None:
@@ -703,6 +713,8 @@ def admission_node(temp_database, mock_policy_evaluators, monkeypatch):
                      new_callable=PropertyMock, return_value=TIP_TS),
         patch.object(TipAdmissionView, "approval_slots_active",
                      new_callable=PropertyMock, return_value=True),
+        patch.object(TipAdmissionView, "recipient_gate_active",
+                     new_callable=PropertyMock, return_value=True),
         patch.object(TipAdmissionView, "get_offer", return_value=None),
         patch.object(TipAdmissionView, "clause_for",
                      side_effect=lambda pk, stream: (
@@ -770,3 +782,172 @@ def test_checktx_reports_recipient_capabilities_enforced(admission_node):
     assert result["status"] == "ok"
     assert result["data"]["recipient_policy_gate"] == "enforced"
     assert result["data"]["recipient_hold_cap"] == "enforced"
+
+
+# --- activation: the gate is governance-activated (#47 case 5 / #76 case 6) -----
+#
+# Until a host-contract patch sets recipient_gate_active, the gate does
+# not run and a clause that would deploy the feature is refused at
+# deploy -- the behaviour DESIGN section 3.3 promises a pre-feature
+# deployment. The tests above run in the active configuration (the
+# harness activates, like it does for approval slots); these pin the
+# inactive one and the activation path itself.
+
+_I17_CLAUSE = (
+    "always ( o5[t]:bv[24] = { #x000001 }:bv[24] "
+    "&& i17[t]:bv[64] = { 0 }:bv[64] )."
+)
+_PLAIN_CLAUSE = "always ( o5[t]:bv[24] = { #x000001 }:bv[24] )."
+
+
+def _lifecycle_inactive():
+    lm = ConsensusLifecycleManager(active_validators=[MALLORY, ALICE])
+    lm.activate_approval_slots()
+    return lm
+
+
+class _TipStub:
+    """The slice of the tip view validate_rule_offer_payload reads."""
+
+    def __init__(self, *, gate):
+        self.recipient_gate_active = gate
+        self.next_block_height = HEIGHT
+
+    def get_offer_lifecycle_state(self, offer_id_hex):
+        return None
+
+    def pending_offers_for_recipient(self, pubkey):
+        return 0
+
+    def pending_offers_for_offerer(self, pubkey):
+        return 0
+
+
+def _offer_tx(rule_text):
+    return sign_payload(_envelope(
+        "rule_offer", ALICE, 0, fee_limit="100000",
+        recipient_pubkey=BOB, rule_text=rule_text,
+        expire_at_height=HEIGHT + 100), SK_ALICE)
+
+
+def test_feature_detection_reads_only_the_features_own_streams():
+    uses = recipient_gate.clause_uses_recipient_feature
+    assert uses(_I17_CLAUSE) is True
+    assert uses("always ( o10[t]:bv[64] = { 3600 }:bv[64] ).") is True
+    assert uses(_PLAIN_CLAUSE, target_stream=10) is True
+    assert uses(_PLAIN_CLAUSE) is False
+    assert uses(_PLAIN_CLAUSE, target_stream=5) is False
+    # A stream named only in a comment is not a reference the clause
+    # makes -- the same flaw class as the prescreen PoCs above.
+    assert uses(_PLAIN_CLAUSE + " # park pair on i17[t]") is False
+    assert uses("") is False
+    assert uses(None) is False
+
+
+def test_deploy_refused_while_gate_inactive():
+    # A clause reading i17 deploys the recipient feature: refused at
+    # admission while the gate is off, with the inactive error that
+    # names the governance patch -- not silently admitted and never
+    # enforced.
+    result = validate_rule_offer_payload(
+        _offer_tx(_I17_CLAUSE), _TipStub(gate=False))
+    assert not result.is_valid
+    assert result.code == "FEATURE_INACTIVE"
+    assert "recipient_gate_active" in result.error
+
+    # An ordinary o5 clause is a sender policy the chain already
+    # enforces; it deploys exactly as it always has.
+    result = validate_rule_offer_payload(
+        _offer_tx(_PLAIN_CLAUSE), _TipStub(gate=False))
+    assert result.is_valid
+
+    # Once active, the same recipient clause deploys.
+    result = validate_rule_offer_payload(
+        _offer_tx(_I17_CLAUSE), _TipStub(gate=True))
+    assert result.is_valid
+
+
+def test_spec_units_are_not_deploy_refused():
+    # The boundary of the deploy refusal, pinned deliberately: the
+    # refusal covers the surfaces that REGISTER recipient policy (the
+    # clause registry), not accumulated spec units. o10 is a free
+    # output stream for user rules -- the codebase's own suite pins
+    # that (test_approval_admission.py's free-output-streams test,
+    # test_launch_hardening.py's word-boundary test) -- so a guarded
+    # unit writing o10 is admitted exactly as it was before the
+    # feature, whatever the gate's state. A first version of this
+    # activation refused such units; those two tests failed, and the
+    # refusal was removed rather than the contract broken.
+    unit = (
+        "always ( (i12[t]:bv[384] = { #x" + BOB + " }:bv[384]) "
+        "-> o10[t]:bv[64] = { 3600 }:bv[64] )."
+    )
+    assert screen_user_rule_text(unit, "", True) is None
+
+
+def test_gate_inactive_at_apply():
+    # The offer is refused in the block too, under the named reason,
+    # so a proposer cannot include what admission refused.
+    lm = _lifecycle_inactive()
+    tx = _offer_tx(_I17_CLAUSE)
+    applied = _apply([tx], lm)
+    assert _outcome(applied, tx["tx_id"]).reason == recipient_gate.REASON_GATE_INACTIVE
+    assert tx["tx_id"] not in applied.result.accepted_tx_ids
+
+    # And the gate itself does not run: BOB's registered clause --
+    # modelled here as deployed before the feature existed -- judges
+    # nobody, and the transfer lands exactly as it did pre-feature.
+    lm = _lifecycle_inactive()
+    tx = _transfer(BOB, 100, SK_ALICE)
+    applied = _apply([tx], lm, blocked={BOB})
+    assert tx["tx_id"] in applied.result.accepted_tx_ids
+    assert _balances(applied)[BOB] == 100
+
+
+def test_governance_patch_activates_the_gate():
+    lm = _lifecycle_inactive()
+    assert lm.recipient_gate_active is False
+    hash_before = lm.consensus_meta_hash()
+
+    # The flag enters the mechanism metadata only once active, so the
+    # pre-activation hash is the pre-feature hash.
+    assert "recipient_gate_active" not in build_mechanism_metadata("supermajority")
+    assert build_mechanism_metadata(
+        "supermajority", recipient_gate_active=True)["recipient_gate_active"] is True
+
+    # Admission screens the patch value; apply enforces it again --
+    # deactivation is not a legal value on either path.
+    err = _check_host_contract_patch({"recipient_gate_active": False})
+    assert err is not None and "recipient_gate_active" in err
+    assert _check_host_contract_patch({"recipient_gate_active": True}) is None
+    with pytest.raises(ValueError, match="recipient_gate_active"):
+        lm.apply_host_contract_patch({"recipient_gate_active": False})
+    assert lm.recipient_gate_active is False
+
+    # The activation path itself: one governance patch, one-way.
+    lm.apply_host_contract_patch({"recipient_gate_active": True})
+    assert lm.recipient_gate_active is True
+    assert lm.consensus_meta_hash() != hash_before
+
+    # From the next block the gate enforces, unchanged: the same
+    # transfer the inactive test above let through is now refused
+    # under the recipient reason.
+    tx = _transfer(BOB, 100, SK_ALICE)
+    applied = _apply([tx], lm, blocked={BOB})
+    assert _outcome(applied, tx["tx_id"]).reason == recipient_gate.REASON_POLICY_BLOCK
+    assert _balances(applied)[BOB] == 0
+
+
+def test_checktx_reports_inactive_and_judges_nobody_when_gate_off(admission_node):
+    # The reporting half, inactive side: the capability surface says
+    # "inactive", and the dry run admits a transfer to a recipient
+    # whose policy would refuse it on an activated chain.
+    admission_node["blocked"] = {BOB}
+    tx = _signed_draft("user_tx", ALICE, SK_ALICE,
+                       operations={"1": [[ALICE, BOB, "100"]]})
+    with patch.object(TipAdmissionView, "recipient_gate_active",
+                      new_callable=PropertyMock, return_value=False):
+        result = json.loads(checktx.execute(_draft(tx), None))
+    assert result["status"] == "ok"
+    assert result["data"]["recipient_policy_gate"] == "inactive"
+    assert result["data"]["recipient_hold_cap"] == "inactive"
