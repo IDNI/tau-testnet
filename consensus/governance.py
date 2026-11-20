@@ -4,6 +4,7 @@ import logging
 import re
 from dataclasses import dataclass
 
+import tau_defs
 from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.retractable import RetractableBook
@@ -118,9 +119,21 @@ def validate_recipient_policy_active(value: Any) -> Optional[str]:
     read them as the host-forced hold/context streams: a sender could then
     supply both values and forge the recipient gate's own inputs. So only
     `True` is a legal patch value, exactly as for the approval slots.
+
+    Activation is also refused while the i16 cooldown feed is live: i16
+    carries the recipient context tag, and the two feeds are mutually
+    exclusive (see the stream notes in tau_defs.py). The flag is a code
+    constant, so this refusal is identical on every node — admission
+    rejects the patch here, and block apply raises on the same string.
     """
     if value is not True:
         return "must be true; recipient controls cannot be deactivated once active"
+    if getattr(tau_defs, "COOLDOWN_STREAM_ACTIVE", False):
+        return (
+            "cannot activate while the i16 cooldown feed is live "
+            "(COOLDOWN_STREAM_ACTIVE): i16 is the recipient context "
+            "stream, and the two feeds are mutually exclusive"
+        )
     return None
 
 
@@ -724,6 +737,16 @@ class ConsensusLifecycleManager:
         hold/context streams, letting a sender supply both values and forge
         the recipient gate's own inputs.
         """
+        if getattr(tau_defs, "COOLDOWN_STREAM_ACTIVE", False):
+            # Backstop behind validate_recipient_policy_active: replay,
+            # restore and genesis paths reach this method without the
+            # patch validator, and no path may ever switch the gate on
+            # while the cooldown feed owns i16.
+            raise ValueError(
+                "recipient controls cannot activate while the i16 "
+                "cooldown feed is live (COOLDOWN_STREAM_ACTIVE): i16 is "
+                "the recipient context stream"
+            )
         self.recipient_policy_active = True
 
     def knows_update(self, update_id: bytes) -> bool:

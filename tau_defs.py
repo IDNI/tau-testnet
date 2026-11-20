@@ -344,7 +344,12 @@ REQUEST_CUSTOM_INPUT_MIN = APPROVAL_SLOT_BASE + APPROVAL_SLOT_COUNT
 # cooldown clause; claiming it follows the same reserve-when-fed
 # precedent as i13 and the slots. The two activations are mutually
 # exclusive on i16: if the cooldown is ever switched on it must take
-# another stream, and each activation audits the live spec first.
+# another stream, and each activation audits the live spec first. The
+# exclusion is enforced in code, not only stated here: activation refuses
+# while COOLDOWN_STREAM_ACTIVE is set (consensus/governance.py),
+# reserved_operation_keys below raises if the two are ever live together,
+# and the engine suppresses the cooldown feed at every feed site while
+# recipient controls are active.
 #
 # Both streams are bv[64], host-forced into the transfer input map AFTER the
 # custom-input merge (where the approval slots are overlaid), so a value the
@@ -391,6 +396,16 @@ def reserved_operation_keys(
     controls (issues #47/#76): i17 (hold) and i16 (context) become reserved
     exactly when the node starts forcing them into the transfer input map.
     """
+    if COOLDOWN_STREAM_ACTIVE and recipient_policy_active:
+        # i16 is claimed by both feeds: the cooldown value (issue #21) and
+        # the recipient context tag. The two activations are mutually
+        # exclusive — activation refuses the combination in
+        # consensus/governance.py, and this is the backstop for every other
+        # caller, so the index is never silently reserved for both.
+        raise ValueError(
+            "i16 is claimed by both the cooldown feed and the recipient "
+            "context stream; the two activations are mutually exclusive"
+        )
     keys = EXTRA_RESERVED_OPERATION_KEYS
     if eligibility_mode == "tau_validator_set":
         keys = keys + TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS

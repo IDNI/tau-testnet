@@ -1468,6 +1468,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         parent_lts = dict(parent_last_transfer_ts or {})
 
         cooldown_active = getattr(tau_defs, "COOLDOWN_STREAM_ACTIVE", False)
+        # Mutual exclusion on i16 (see tau_defs): while recipient controls
+        # are active the index carries the context tag, so every cooldown
+        # feed below is conditioned on `not recipient_policy_on` — the
+        # seconds value must never be fed under the tag's index. Two of
+        # the feed sites (the replay map and the transfer-less fee query)
+        # have no later overwrite that would mask it.
 
         # Co-signature approval slots. Read from the lifecycle manager this apply
         # is mutating -- which is the deep copy of the PARENT manager, so an
@@ -1815,7 +1821,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     # the same value and a balance-reading policy rule
                     # is deterministic across both (issue #20).
                     2: _parent_bal(from_addr),
-                    **({16: _since_last_transfer(from_addr)} if cooldown_active else {}),
+                    **({16: _since_last_transfer(from_addr)} if cooldown_active and not recipient_policy_on else {}),
                     # i3/i4 are the real from/to pubkeys (immutable in
                     # the transfer tuple -> identical at admission and
                     # apply), so recipient-aware policy/fee rules are
@@ -3102,7 +3108,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         # pre-fee-era blocks, and a different value
                                         # here would diverge replay from mining.
                                         2: _parent_bal(from_addr),
-                                        **({16: _since_last_transfer(from_addr)} if cooldown_active else {}),
+                                        **({16: _since_last_transfer(from_addr)} if cooldown_active and not recipient_policy_on else {}),
                                         # Real from/to pubkeys for eval/width parity
                                         # with the fee-era path.
                                         3: "{ #x" + str(from_addr) + " }:bv[384]",
@@ -3195,7 +3201,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 try:
                     fee_query_inputs = {
                         1: "0", 2: _parent_bal(sender), 3: "0", 4: "0",
-                        **({16: _since_last_transfer(sender)} if cooldown_active else {}),
+                        **({16: _since_last_transfer(sender)} if cooldown_active and not recipient_policy_on else {}),
                         # NOTE: key order here (5 before 12) intentionally
                         # matches commands/sendtx.py's transfer-less fee query,
                         # since insertion order is what the shrink layer sees.
