@@ -294,6 +294,78 @@ after a late defect, to its finder and the poster. The rule reads what it has
 already paid (`i26`) to tell the two executions apart. On the real engine every
 settlement path pays exactly the locked price, and nothing after it.
 
+## Money with conditions
+
+The same three pieces carry the conditions of money given to someone. Alice
+gives Bob 5,000 he may spend at most 500 a week, not before 1 December, and what
+he has not spent by 29 December goes back to her. The money sits in an account
+of its own, a grant account, and ONE rule on that account is all of the
+conditions:
+
+```
+always ( ( (i13[t]:bv[384] = { #x<bob_pubkey> }:bv[384])
+           && (i5[t]:bv[64] >= { 1796083200 }:bv[64])
+           && (i5[t]:bv[64] <  { 1798502400 }:bv[64])
+           && (i40[t]:bv[24] <= { 500 }:bv[24]) && (i26[t]:bv[24] <= { 500 }:bv[24])
+           && (i40[t]:bv[24] <= ({ 500 }:bv[24] - i26[t]:bv[24])) )
+         ? ((o30[t]:bv[24] = i40[t]:bv[24]) && (o31[t]:bv[24] = { 0 }:bv[24]))
+         : ( (i5[t]:bv[64] >= { 1798502400 }:bv[64])
+             ? ((o30[t]:bv[24] = { 0 }:bv[24]) && (o31[t]:bv[24] = i2[t]:bv[24]))
+             : ((o30[t]:bv[24] = { 0 }:bv[24]) && (o31[t]:bv[24] = { 0 }:bv[24])) ) ).
+```
+
+Slot 0 is open and slot 1 is Alice; the rule is installed with a period of one
+week. Reading it top to bottom:
+
+- **Who spends.** Only an execution Bob signs pays slot 0, to the payee he names.
+- **When.** From 1 December until the deadline, on the block's time (`i5`).
+  A weekday or an hour is arithmetic on the same input:
+  `((i5 / 86400) + 3) % 7` is the weekday (0 = Monday) and `(i5 % 86400) / 3600`
+  the hour, both UTC.
+- **How much.** What he asks (`i40`) plus what the rule has paid this period
+  (`i26`) stays inside 500. The count starts again with every period and nothing
+  carries over.
+- **What is left.** From the deadline on, whoever sends the execution, the
+  account's whole balance (`i2`) goes to Alice. Bob's own late execution does
+  the same.
+
+The account is set up like an escrow: the rule, an `o5` clause that blocks every
+transfer the account could sign, and a guard that needs Alice's and Bob's
+co-signature for any rule change. `cap_per_execution` and `cap_per_period` only
+have to be large enough for the return; the rule holds Bob to his cap.
+
+What follows from the form:
+
+- **A cap shared by several payments.** A second payment of Alice to Bob under
+  the same cap is a second transfer into the same account: one account, one
+  rule, one count.
+- **A cap per recipient or per payment.** Another account with another rule.
+- **Another condition** is another line of the rule. The node has no code for
+  any of the conditions above.
+
+`tests/test_payout_conditions_native.py` runs this rule on the real engine: each
+condition alone, the example (Bob spends 500 in each of three weeks, 3,500 go
+back), every history of two spends under a shared cap, and random histories
+against a model. `scripts/e2e_payout_grant.py` runs it on two live nodes,
+with the lock and the guard in place.
+
+Know the limits before relying on it:
+
+- The periods count from the block that installed the rule, not from the start
+  date.
+- The return needs one execution. Anyone may send it and it can pay only Alice,
+  but the node does not send it by itself.
+- The guard has a time escape (see [approvals.md](approvals.md#the-time-escape)):
+  whoever holds the grant account's key can file a rule change and wait
+  1,000 blocks. Until wallet rules can be made tamper-proof, the conditions are
+  as strong as that delay and the co-signers' attention.
+- Whoever holds that key can also spend the account's balance on the fees of
+  transactions it signs.
+- Give the rule an end (`expires_at`) well after the deadline. Once the rule
+  itself has expired, what is still in the account moves only by a co-signed
+  rule change.
+- Amounts are `bv[24]`: one account carries at most 16,777,215.
+
 ## Inspecting
 
 ```bash
