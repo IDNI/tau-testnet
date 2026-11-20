@@ -6,6 +6,7 @@ inputs, the failure mapping and the evaluator choice cannot drift apart.
 from __future__ import annotations
 
 import atexit
+import re
 import threading
 
 import tau_defs
@@ -116,3 +117,278 @@ def clause_builds(body, *, pool: str, timeout=_SESSION_DEFAULT) -> tuple[bool, s
     """
     result = evaluator(pool).validate(body, timeout=timeout)
     return result.ok, result.error
+
+
+# --- Recipient gate (issues #47 + #76) ---------------------------------------
+#
+# The recipient's own o5 clause as a second, independent block condition,
+# evaluated through the SAME machinery as the sender's clause above — same
+# input-map builder upstream, same evaluator pools, same failure mapping — so
+# the two directions cannot drift apart. The only differences are the ones the
+# feature is made of: the clause is the RECIPIENT's, and the input map carries
+# the hold/context overlay (i17/i26) the gate forces in.
+
+
+def _streams_read(body) -> set:
+    """Input stream indices a clause body reads (comments stripped)."""
+    if not body:
+        return set()
+    from consensus.rule_offers import strip_clause_comments
+
+    scrubbed = strip_clause_comments(body)
+    return {int(m.group(1)) for m in re.finditer(r"\bi(\d+)\b", scrubbed)}
+
+
+def clause_is_inbound_capable(body) -> bool:
+    """True when a clause opts into inbound judging by reading i17 or i26.
+
+    The opt-in is what makes the set of inbound-capable clauses statically
+    decidable at deploy: a clause reading neither stream is never invoked
+    inbound (the neutral default), and a clause reading only i3 keeps exactly
+    its outbound meaning.
+    """
+    read = _streams_read(body)
+    return (
+        tau_defs.HOLD_STREAM_INDEX in read
+        or tau_defs.CONTEXT_STREAM_INDEX in read
+    )
+
+
+def clause_reads_hold_without_context(body) -> bool:
+    """True for a unit-blind hold rule: reads i17 but never i26.
+
+    Such a rule would have to judge seconds and blocks with one number — a
+    height park would reach it denominated in blocks while its cap was
+    written for seconds (or the reverse). Refused at deploy
+    (consensus/admission.py), so no deployed hold rule can silently admit
+    the other unit.
+    """
+    read = _streams_read(body)
+    return (
+        tau_defs.HOLD_STREAM_INDEX in read
+        and tau_defs.CONTEXT_STREAM_INDEX not in read
+    )
+
+
+def recipient_hold_inputs(values: dict, *, hold: int, context: int) -> dict:
+    """A copy of a transfer input map with the gate's overlay forced in.
+
+    i17 = the hold in its native unit, i26 = the judgment context. Forced —
+    never merged — so a sender-supplied value on either stream (possible in
+    a parked request's custom inputs before activation) never reaches the
+    recipient's clause.
+    """
+    out = dict(values or {})
+    out[tau_defs.HOLD_STREAM_INDEX] = str(int(hold))
+    out[tau_defs.CONTEXT_STREAM_INDEX] = str(int(context))
+    return out
+
+
+def sender_pass_inputs(values: dict) -> dict:
+    """The overlay the SENDER pass always carries while the gate is active:
+    i17 = 0, i26 = 0 ("judging an outgoing payment"), so an owner's inbound
+    rules can never fire on their own outgoing payments."""
+    return recipient_hold_inputs(
+        values, hold=0, context=tau_defs.CONTEXT_OUTGOING
+    )
+
+
+def park_hold(kind: int, release_at: int, block_height: int,
+              block_timestamp: int) -> tuple[int, int]:
+    """(hold, context) for a park, measured against the given block clock.
+
+    The hold is denominated in the park's own unit — seconds against the
+    block timestamp for a time park, blocks against the block height for a
+    height park — and saturates at 0 rather than going negative (a park
+    whose release is not in the future is refused by the park shape screen
+    before the gate ever sees it; this is the belt on those braces).
+    """
+    from consensus.retractable import KIND_HEIGHT
+
+    if kind == KIND_HEIGHT:
+        return max(0, int(release_at) - int(block_height)), \
+            tau_defs.CONTEXT_INCOMING_HEIGHT_PARK
+    return max(0, int(release_at) - int(block_timestamp)), \
+        tau_defs.CONTEXT_INCOMING_TIME_PARK
+
+
+_HOLD_CMP_RE = re.compile(
+    r"\bi17\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*(<=|>=|<|>)\s*"
+    r"\{\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}\s*:\s*bv\s*\[\s*64\s*\]"
+)
+_HOLD_CMP_FLIPPED_RE = re.compile(
+    r"\{\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}\s*:\s*bv\s*\[\s*64\s*\]"
+    r"\s*(<=|>=|<|>)\s*\bi17\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
+)
+_CONTEXT_GUARD_RE = re.compile(
+    r"\bi26\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*=\s*"
+    r"\{\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}\s*:\s*bv\s*\[\s*64\s*\]"
+)
+
+
+def _literal_value(match, base: int) -> int:
+    hex_part, bin_part, dec_part = match.group(base), match.group(base + 1), \
+        match.group(base + 2)
+    if hex_part is not None:
+        return int(hex_part, 16)
+    if bin_part is not None:
+        return int(bin_part, 2)
+    return int(dec_part)
+
+
+def extract_candidate_cap(body, context: int):
+    """A candidate hold cap for `context` from canonical i17 comparisons.
+
+    A HINT, never a verdict: the caller verifies the candidate against the
+    clause's actual evaluation before printing it (see
+    `recipient_clause_blocks`). Extraction is branch-aware — a comparison is
+    attributed to the i26 branch whose guard most recently precedes it in
+    the ternary chain — and per-branch restrictive (the minimum bound in the
+    branch), never a global "most restrictive wins" over the whole clause,
+    which would print one counterparty's cap to another.
+    """
+    if not body:
+        return None
+    from consensus.rule_offers import strip_clause_comments
+
+    scrubbed = strip_clause_comments(body)
+    guards = [
+        (m.start(), _literal_value(m, 1)) for m in _CONTEXT_GUARD_RE.finditer(scrubbed)
+    ]
+
+    def branch_of(pos: int):
+        branch = None
+        for gpos, gval in guards:
+            if gpos < pos:
+                branch = gval
+            else:
+                break
+        return branch
+
+    # The operator-to-cap mapping assumes the comparison bounds the hold
+    # from above in whichever polarity the rule writes it (allow form
+    # `i17 <= cap`, refusal form `i17 > cap`). It only ever produces a
+    # candidate; `_cap_verified` decides.
+    caps = []
+    for m in _HOLD_CMP_RE.finditer(scrubbed):
+        if guards and branch_of(m.start()) != context:
+            continue
+        bound = _literal_value(m, 2)
+        caps.append(bound - 1 if m.group(1) in ("<", ">=") else bound)
+    for m in _HOLD_CMP_FLIPPED_RE.finditer(scrubbed):
+        if guards and branch_of(m.start()) != context:
+            continue
+        bound = _literal_value(m, 1)
+        caps.append(bound - 1 if m.group(4) in (">", "<") else bound)
+    caps = [c for c in caps if c >= 0]
+    if not caps:
+        return None
+    return min(caps)
+
+
+def _cap_verified(body, values: dict, *, cap: int, context: int,
+                  pool: str, timeout) -> bool:
+    """True when the clause admits hold == cap and refuses hold == cap + 1
+    for THIS counterparty (the actual sender, amount and context in
+    `values`). A non-monotonic rule (admits 0 and 2, refuses 1) fails here
+    and is honestly reported without a number."""
+    blocked_at_cap, _ = clause_blocks(
+        body, recipient_hold_inputs(values, hold=cap, context=context),
+        pool=pool, timeout=timeout,
+    )
+    if blocked_at_cap:
+        return False
+    blocked_above_cap, _ = clause_blocks(
+        body, recipient_hold_inputs(values, hold=cap + 1, context=context),
+        pool=pool, timeout=timeout,
+    )
+    return blocked_above_cap
+
+
+def recipient_clause_blocks(clause_for, recipient: str, values: dict, *,
+                            hold: int, context: int, pool: str,
+                            timeout=_SESSION_DEFAULT):
+    """(blocked, info) for the recipient's clause on one inbound transfer.
+
+    `values` is the transfer input map BEFORE the gate overlay; the overlay
+    is forced in here. `info` is None when the recipient has no
+    inbound-capable clause (the neutral default — nothing was evaluated).
+    On a block, `info` carries the receipt fields:
+
+    - reason "recipient_policy_block" (allow-list refusal), or
+      "recipient_max_hold" when re-judging the same transfer at hold 0
+      admits it — the block was caused by the hold alone;
+    - for a hold refusal: the measured `hold` and its `unit`, plus the cap
+      ONLY when verified against this payer's actual evaluation
+      (`cap_kind` "threshold" with `max_hold_seconds`/`max_hold_blocks`),
+      else `cap_kind` "rule" and no number.
+    """
+    body = clause_for(recipient, tau_defs.USER_POLICY_STREAM_INDEX)
+    if not body or not clause_is_inbound_capable(body):
+        return False, None
+
+    judged = recipient_hold_inputs(values, hold=hold, context=context)
+    blocked, o5 = clause_blocks(body, judged, pool=pool, timeout=timeout)
+    if not blocked:
+        return False, {"o5": o5}
+
+    info = {
+        "o5": o5,
+        "recipient": recipient,
+        "reason": "recipient_policy_block",
+    }
+    if context == tau_defs.CONTEXT_OUTGOING or int(hold) <= 0:
+        return True, info
+
+    # Was it the hold that refused, or the allow-list? Re-judge at hold 0 in
+    # the same context: an allow-list block refuses at every hold.
+    at_zero, _ = clause_blocks(
+        body, recipient_hold_inputs(values, hold=0, context=context),
+        pool=pool, timeout=timeout,
+    )
+    if at_zero:
+        return True, info
+
+    unit = "seconds" if context == tau_defs.CONTEXT_INCOMING_TIME_PARK \
+        else "blocks"
+    info.update({
+        "reason": "recipient_max_hold",
+        # The code the issues name for this refusal, carried alongside the
+        # measured hold and its unit so a wallet can always print the
+        # sentence ("accepts payments held for up to ...") — with the cap
+        # itself present only when verified below.
+        "code": "RECIPIENT_MAX_HOLD",
+        "hold": int(hold),
+        "unit": unit,
+    })
+    candidate = extract_candidate_cap(body, context)
+    if candidate is not None and candidate >= 0 and _cap_verified(
+        body, values, cap=candidate, context=context,
+        pool=pool, timeout=timeout,
+    ):
+        info["cap_kind"] = "threshold"
+        info["max_hold_seconds" if unit == "seconds"
+             else "max_hold_blocks"] = candidate
+    else:
+        info["cap_kind"] = "rule"
+    return True, info
+
+
+def spec_mentions_account(spec_text, pubkey: str) -> bool:
+    """Pre-screen for the guarded-mode recipient pass: the account's key as
+    a literal in the spec text. A guarded unit scopes on its owner's key, so
+    absence proves there is no unit of theirs to enforce."""
+    if not spec_text or not pubkey:
+        return False
+    return str(pubkey).lower() in spec_text.lower()
+
+
+def guarded_pass_inputs(values: dict, recipient: str, *, hold: int,
+                        context: int) -> dict:
+    """Input map for the guarded-mode recipient pass: the transfer map with
+    i12 set to the RECIPIENT (the 'acting-as / policy owner' reading), plus
+    the gate overlay. i3 stays the sender — the counterparty the recipient's
+    guard matches on."""
+    out = recipient_hold_inputs(values, hold=hold, context=context)
+    out[12] = "{ #x" + str(recipient) + " }:bv[384]"
+    return out

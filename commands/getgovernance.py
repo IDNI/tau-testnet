@@ -181,6 +181,35 @@ def execute(raw_command: str, container):
             "votes": sorted(votes, key=lambda entry: (entry["update_id"], entry["voter_pubkey"])),
             "lifecycle": lifecycle,
             "stream_widths": dict(tau_defs.HOST_STREAM_WIDTHS),
+            # Recipient controls (issues #47/#76): whether i17/i26 are
+            # reserved and the recipient gate runs, plus the capability
+            # summary a wallet needs to phrase the ask ("accepts payments
+            # held for up to ..."). The i17/i26 widths live here, in
+            # capabilities, NOT in HOST_STREAM_WIDTHS: that dict feeds
+            # clause-domain and width screens for live rules, and widening
+            # it would silently change what pre-existing rules may declare.
+            "recipient_policy_active": bool(
+                getattr(chain_state._lifecycle_manager, "recipient_policy_active", False)
+            ),
+            "capabilities": {
+                "recipient_controls": {
+                    "active": bool(
+                        getattr(chain_state._lifecycle_manager, "recipient_policy_active", False)
+                    ),
+                    "hold_stream": tau_defs.HOLD_STREAM_INDEX,
+                    "context_stream": tau_defs.CONTEXT_STREAM_INDEX,
+                    "hold_stream_width": tau_defs.RECIPIENT_STREAM_BV_WIDTH,
+                    "context_stream_width": tau_defs.RECIPIENT_STREAM_BV_WIDTH,
+                    "contexts": {
+                        "outgoing": tau_defs.CONTEXT_OUTGOING,
+                        "incoming_final": tau_defs.CONTEXT_INCOMING_FINAL,
+                        "incoming_time_park": tau_defs.CONTEXT_INCOMING_TIME_PARK,
+                        "incoming_height_park": tau_defs.CONTEXT_INCOMING_HEIGHT_PARK,
+                    },
+                    "guarded_mode": True,
+                    "preflight_command": "getrecipientpolicy",
+                },
+            },
         }
 
     return api_response.success_response("getgovernance", payload)
