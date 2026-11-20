@@ -566,6 +566,23 @@ def _record_retractable_events(block, next_snapshot) -> None:
         logger.exception("could not record retractable events")
 
 
+def _record_rule_outcomes(block, next_snapshot) -> None:
+    """Best-effort history write; the apply verdict is already final.
+
+    Same discipline as _record_retractable_events: read from the snapshot,
+    not the apply result, so a block that reuses its own evaluation still
+    records what its apply observed (issue #42, milestone 1).
+    """
+    try:
+        outcomes = (getattr(next_snapshot, "metadata", None) or {}).get("rule_outcomes")
+        if outcomes:
+            db.record_rule_outcomes(
+                block.block_hash, block.header.block_number, list(outcomes)
+            )
+    except Exception:
+        logger.exception("could not record rule outcomes")
+
+
 def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
     """The canonical rows for a block, computed from its SNAPSHOT.
 
@@ -1088,6 +1105,7 @@ def _process_new_block_locked(block: Block) -> bool:
                 _swap_in_memory_state(next_snapshot, block)
 
             _record_retractable_events(block, next_snapshot)
+            _record_rule_outcomes(block, next_snapshot)
 
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
@@ -1369,6 +1387,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                                       reason="state_hash invariant mismatch")
 
             _record_retractable_events(block, next_snapshot)
+            _record_rule_outcomes(block, next_snapshot)
 
             if _enabled:
                 # The block's evaluator history becomes durable exactly as a live

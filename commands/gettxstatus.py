@@ -6,7 +6,13 @@ Resolution order:
   2. tx_index -> "confirmed" for the first location on the canonical chain
                  (with block_hash/number and confirmation depth). Fork-only
                  locations fall through (a reorged-out tx is re-queued into the
-                 mempool, so step 1 usually catches it).
+                 mempool, so step 1 usually catches it). A confirmed rule
+                 transaction (user_tx op-"0") also carries `rule_outcome`
+                 when this node recorded one at apply (issue #42): the
+                 engine's spec_revision before/after its rule step, the o0
+                 verdict (`revision_taken`), the outcome classification and
+                 the apply logs -- so a wallet can confirm a rule took effect
+                 without re-running the engine.
   3. mempool_dropped -> "expired" / "evicted" / "rejected". A "rejected" row
                  may carry the apply receipt's `reason` code and a `detail`
                  log trail. Only the node that built the block records these;
@@ -124,6 +130,21 @@ def execute(raw_command: str, container):
                     "block_number": loc["block_number"],
                     "confirmations": max(1, confirmations),
                 }
+                # Issue #42, milestone 1: the apply outcome of a confirmed
+                # rule transaction, recorded by this node when it applied the
+                # block at this very location. Absent when nothing was
+                # recorded (non-rule tx, pre-record history, a node that
+                # never applied the block) -- absence says "not recorded",
+                # never "the rule did nothing".
+                try:
+                    rule_outcome = db.get_rule_outcome(tx_hash, loc["block_hash"])
+                except Exception:
+                    logger.exception(
+                        "Failed to resolve rule outcome for %s", tx_hash
+                    )
+                    rule_outcome = None
+                if rule_outcome is not None:
+                    data["rule_outcome"] = rule_outcome
                 data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
                 return api_response.success_response("gettxstatus", data)
 

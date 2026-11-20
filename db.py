@@ -476,6 +476,21 @@ def init_db():
                     PRIMARY KEY (retractable_id, block_hash, outcome)
                 );
             ''')
+            # Issue #42, milestone 1: the apply outcome of each confirmed rule
+            # transaction (spec_revision before/after, the o0 verdict, the
+            # outcome classification, the apply logs), recorded by the node
+            # that applied the block. Node-local, keyed per block like
+            # retractable_events so a reorg needs no cleanup; canonicality is
+            # resolved at query time via the block location, like tx_index.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_outcomes (
+                    tx_hash      TEXT NOT NULL,
+                    block_hash   TEXT NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    outcome      TEXT NOT NULL,
+                    PRIMARY KEY (tx_hash, block_hash)
+                );
+            ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -2689,6 +2704,57 @@ def get_canonical_retractable_events(retractable_id: str) -> List[Dict]:
                 {"block_hash": block_hash, "block_number": int(block_number), "outcome": outcome}
             )
     return out
+
+
+def record_rule_outcomes(block_hash: str, block_number: int, outcomes) -> None:
+    """Node-local record of what a block's rule transactions did at apply.
+
+    `outcomes` is a list of (tx_hash, outcome dict) pairs harvested from the
+    block's apply receipts (issue #42, milestone 1). Diagnostic only, like
+    retractable_events: a failure is logged and never reaches block commit.
+    """
+    if not outcomes:
+        return
+    try:
+        if _db_conn is None:
+            init_db()
+        with _db_lock:
+            with _db_conn:
+                _db_conn.executemany(
+                    'INSERT OR IGNORE INTO rule_outcomes '
+                    '(tx_hash, block_hash, block_number, outcome) VALUES (?, ?, ?, ?)',
+                    [
+                        (tx_hash, block_hash, int(block_number), json.dumps(outcome))
+                        for tx_hash, outcome in outcomes
+                    ],
+                )
+    except Exception:
+        logger.exception("could not record rule outcomes")
+
+
+def get_rule_outcome(tx_hash: str, block_hash: str) -> Optional[Dict]:
+    """The recorded apply outcome for a rule tx in one specific block.
+
+    Keyed by block as well as tx: the same transaction can sit in more than
+    one fork block, and only the canonical location's outcome may be served
+    (gettxstatus passes the location it already confirmed). None when this
+    node recorded nothing for that pair -- a non-rule transaction, a block
+    applied before this record existed, or a node that never applied it.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        row = _db_conn.execute(
+            'SELECT outcome FROM rule_outcomes WHERE tx_hash = ? AND block_hash = ? '
+            'LIMIT 1',
+            (tx_hash, block_hash),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return None
 
 
 def has_due_retractables(next_height: int, now: int) -> bool:
