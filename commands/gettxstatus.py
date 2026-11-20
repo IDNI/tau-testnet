@@ -15,8 +15,11 @@ Resolution order:
                  per-account clause registry, a registry record instead
                  (the registry root before/after, marked
                  `evidence: "clause_registry"`, never claiming a spec
-                 revision). Either form carries the transaction receipt's
-                 log lines under `logs`, bounded to 16 lines of 400 chars.
+                 revision; the registry form also carries
+                 `stored_text_sha256`, the hash of the clause text the
+                 transaction stored or, on a revoke, removed). Either form
+                 carries the transaction receipt's log lines under `logs`,
+                 bounded to 16 lines of 400 chars.
                  So a wallet can confirm a rule took effect without
                  re-running the engine.
   3. mempool_dropped -> "expired" / "evicted" / "rejected". A "rejected" row
