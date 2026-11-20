@@ -14,9 +14,12 @@ tests/test_clause_registration.py:
 4. An inbound amount cap ("refuse incoming above N") blocks above N.
 5. A self-transfer is not judged by this gate (the sender pass owns it).
 """
+import types
+
 import pytest
 
 import tau_defs
+import tau_manager
 from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex
 from consensus import recipient_policy, sender_policy
 from consensus.policy_mock import MockPolicyEvaluator
@@ -373,6 +376,56 @@ def test_guarded_pass_prescreen_skips_stepping_without_a_unit():
         evaluate, _values(ALICE, CAROL, 100), ALICE, CAROL,
         spec_text="always ( (i12[t]:bv[384] = { #x" + CAROL + " }:bv[384]) ).")
     assert blocked is True
+
+
+# --- Spec source of the guarded prescreen ----------------------------------
+# Apply pins the prescreen to the parent snapshot (resolve_spec_text in
+# consensus/engine.py); admission reads the live tip view (commands/
+# sendtx.py passes tau_manager.last_known_tau_spec). That the snapshot
+# wins over a moved-on live global is exercised by the adopted PoCs
+# (tests/test_poc_live_spec.py); the fallback itself, and the agreement
+# of the two entry points on the same state, are ours to keep green here.
+
+def _snapshot(text):
+    """Just the attribute resolve_spec_text reads off a snapshot."""
+    return types.SimpleNamespace(tau_bytes=text.encode())
+
+
+def test_resolve_spec_text_falls_back_to_the_live_value(monkeypatch):
+    monkeypatch.setattr(tau_manager, "last_known_tau_spec", _SPEC_WITH_CAROL)
+    assert recipient_policy.resolve_spec_text(None) == _SPEC_WITH_CAROL
+    assert recipient_policy.resolve_spec_text() == _SPEC_WITH_CAROL
+    # A snapshot carrying no text falls through to the live value too.
+    empty = types.SimpleNamespace(tau_bytes=b"")
+    assert recipient_policy.resolve_spec_text(empty) == _SPEC_WITH_CAROL
+
+
+def test_resolve_spec_text_snapshot_wins_over_the_live_value(monkeypatch):
+    monkeypatch.setattr(
+        tau_manager, "last_known_tau_spec",
+        "always ( o5[t]:bv[24] = { #x000001 }:bv[24] ).")
+    assert recipient_policy.resolve_spec_text(
+        _snapshot(_SPEC_WITH_CAROL)) == _SPEC_WITH_CAROL
+
+
+def test_admission_and_apply_entry_points_agree(monkeypatch):
+    # The same state judged through both call shapes — admission's
+    # (spec_text = the live global) and apply's (spec_text =
+    # resolve_spec_text(parent snapshot)). While the tip still matches
+    # the block, the two must reach the same verdict.
+    monkeypatch.setattr(tau_manager, "last_known_tau_spec", _SPEC_WITH_CAROL)
+    for owner_blocks, expected in (({CAROL}, True), ({BOB}, False)):
+        admission_eval, _ = _guarded_spec(owner_blocks)
+        admission = recipient_policy.guarded_recipient_blocks(
+            admission_eval, _values(ALICE, CAROL, 100), ALICE, CAROL,
+            spec_text=tau_manager.last_known_tau_spec)
+        apply_eval, _ = _guarded_spec(owner_blocks)
+        applied = recipient_policy.guarded_recipient_blocks(
+            apply_eval, _values(ALICE, CAROL, 100), ALICE, CAROL,
+            spec_text=recipient_policy.resolve_spec_text(
+                _snapshot(_SPEC_WITH_CAROL)))
+        assert admission[0] is expected
+        assert applied == admission
 
 
 # --- Capability report (issues #47/#76) ------------------------------------
