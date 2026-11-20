@@ -192,6 +192,160 @@ clause and no receive route. Nobody can change an envelope's conditions after
 the send, and the sender still cannot take money back early: it can only
 release the rest to the recipient (also on an envelope with `at_end refund`).
 
+## Combining conditions
+
+Every condition on an envelope applies at once: a spend lands only when each
+of them allows it, and the earlier of the end and the idle point closes it.
+Any mix may be written on one envelope, each condition at most once. A spend is
+judged in a fixed order, and the first condition that refuses names itself:
+due point reached, locked, outside the windows, more than the envelope holds,
+over the cap.
+
+Alice sends Bob 5,000: at most 500 a week from 1 December, only on working
+days; unused for two weeks, or left on 29 December, it comes back to her.
+
+```bash
+tau-testnet envelope check --to <bob_pubkey> --amount 5000 \
+    --cap 500 --recurring --period 7d --not-before 2026-12-01 --days mon-fri \
+    --refund-idle 14d --ends-at 2026-12-29 --at-end refund
+```
+
+```
+The recipient may spend 5,000 from Tue 2026-12-01 00:00 UTC, only on Mon-Fri (UTC),
+to anyone. At most 500 per week, every period; the periods count from the unlock,
+and nothing carries over. If the recipient spends nothing for 2 weeks, what is left
+goes back to the sender. At Tue 2026-12-29 00:00 UTC what is left goes back to the
+sender. The sender cannot take it back earlier, only release the rest to the
+recipient at once.
+  info: The limit lets at most 2,000 of the 5,000 be spent before the end; at least
+  3,000 goes back to the sender at Tue 2026-12-29 00:00 UTC, unless it is released
+  or refunded earlier.
+```
+
+With `--utc-offset +01:00` the same check reads "only on Mon-Fri (UTC+01:00)",
+and with hours "only on Mon-Fri and only 09:00-17:00 UTC+01:00": the text always
+names where the weekdays and hours are read. The notes follow the offset too
+(a weekday or an hour that covers the whole life of the envelope is counted on
+the envelope's own days).
+
+`envelope check` reads the conditions offline: no key, no node, nothing sent
+(times count from now or `--at-time`; on the block clock give `--at-height`).
+`envelope send` prints the same reading before it submits, and refuses locally
+what the node would refuse. A node answers the same for a queued send:
+`sendtx` and `checktx` add `plan`, `notes` and `text` to `envelope`.
+
+**The grant with three conditions only.** At most 500 a week, only from
+1 December, and what is not spent by the deadline goes back to Alice:
+
+```bash
+tau-testnet envelope send --key alice --to <bob_pubkey> --amount 5000 \
+    --cap 500 --recurring --period 7d --not-before 2026-12-01 \
+    --ends-at 2026-12-29 --at-end refund
+```
+
+```
+The recipient may spend 5,000 from Tue 2026-12-01 00:00 UTC, to anyone. At most 500
+per week, every period; the periods count from the unlock, and nothing carries over.
+At Tue 2026-12-29 00:00 UTC what is left goes back to the sender. The sender cannot
+take it back earlier, only release the rest to the recipient at once.
+  info: The limit lets at most 2,000 of the 5,000 be spent before the end; at least
+  3,000 goes back to the sender at Tue 2026-12-29 00:00 UTC, unless it is released
+  or refunded earlier.
+```
+
+Week by week, as a block with that timestamp decides it:
+
+| Block time (UTC) | Bob spends | What happens |
+|---|---|---|
+| 30 Nov 23:59:59 | 1 | refused: locked until 1 December |
+| 1 Dec 00:00 | 500 | lands; week 1 is full |
+| 3 Dec, 7 Dec | 1 | refused: the cap 500 leaves 0 |
+| 8 Dec | 300 | lands; week 2 started on its own |
+| 10 Dec | 201, then 200 | 201 is refused (the cap leaves 200), 200 lands |
+| 15 to 21 Dec | nothing | week 3 passes unused |
+| 22 Dec | 501, then 500 | 501 is refused: nothing carried over; 500 lands |
+| 29 Dec 00:00 | 1 | refused; at the end of that block the remaining 3,500 is back with Alice |
+
+Bob spent 1,500 and Alice has 3,500 back, with no transaction of hers and no
+fee.
+
+### What each part says
+
+- **`text`**: the conditions as sentences.
+- **`plan`**: the points that matter for an envelope sent now: `unlocks_at` and
+  `unlocked_by` (`not_before`, `hold`, or both when they meet), `first_spend_at`
+  (the first moment inside the windows), `first_due_at`, `first_due_by` (`end`
+  or `refund_idle`) and `first_due_outcome`, and for a limit `limit_periods`
+  (how many periods begin before the end), `limit_caps` (the caps that can
+  apply), `most_spendable` (what the limit lets through before the end) and
+  `limit_lapses_at`.
+- **`notes`**, each with a `level`, the `condition` and a `code`:
+
+| Code | Level | Says |
+|---|---|---|
+| `NOT_BEFORE_PASSED` | never_decides | `not_before` is already past when it arrives. |
+| `NOT_BEFORE_COVERED` | never_decides | The hold reaches as far or further. |
+| `HOLD_COVERED` | never_decides | `not_before` reaches as far or further. |
+| `LIMIT_NEVER_BINDS` | never_decides | Every cap that can apply is at least the amount. |
+| `CAPS_UNREACHED` | never_decides | Caps after the first N can never apply: the envelope ends first. |
+| `RECURRING_UNUSED` | never_decides | The list covers every period, or the last cap is at least the amount. |
+| `DAYS_COVER_LIFE` | never_decides | Every day from the unlock to the end is an allowed weekday. |
+| `HOURS_COVER_LIFE` | never_decides | Every hour from the unlock to the end is an allowed hour. |
+| `IDLE_NEVER_FIRES` | never_decides | The end comes first (or together, and the end decides a tie). |
+| `IDLE_BETWEEN_WINDOWS` | warning | `refund_idle` is not longer than the longest time with no window open: the rest may go back while the recipient cannot spend. |
+| `LIMIT_LAPSES` | info | The limit stops after its list; from then on the rest may be spent freely. |
+| `LIMIT_LEAVES_REST` | info | The limit lets through less than the amount before the end; the rest goes where `at_end` says. |
+
+A `never_decides` note is **certain**: that one condition could be removed and
+every spend, refusal and close would stay exactly the same, for every sequence
+of spends. On the block clock and without `refund_idle` the notes are also
+**complete**: a `not_before`, `hold`, limit or `recurring` without a note does
+change something; a `refund_idle` without a note always does. With windows or
+an idle refund a condition may still change nothing without a note saying so.
+`tests/test_envelope_combined.py` proves both by exhaustive search (below).
+
+### A send that could never be spent
+
+The node refuses it (`ENVELOPE_NEVER_SPENDABLE`). The CLI names the clash:
+
+```
+refused: It would unlock at Thu 2026-11-19 10:00 UTC (the hold of 2 days), but it
+ends at Wed 2026-11-18 00:00 UTC: it could never be spent.
+refused: No spending window (Sat, Sun) opens between the moment it unlocks at Tue
+2026-11-17 10:00 UTC and Wed 2026-11-18 10:00 UTC (the refund after 1 day unused):
+it could never be spent.
+```
+
+The check is exact: with one clock per envelope and windows that repeat every
+week, the node finds the first moment a spend could land (the unlock, or the
+first window after it, at most 168 hours on) and compares it with the first
+due point.
+
+### How the readings are proved
+
+- **Never spendable is exact.** On every envelope of a block-clock universe
+  (48,000 term sets: every mix of `not_before`, `hold`, `refund_idle`, end,
+  cap schedules, periods, `recurring`, `at_end` and amount around one sending
+  height) and on 6,000 random time-clock envelopes, most with windows, a send
+  is refused exactly when no moment exists at which a spend of 1 lands, tried
+  through the book's own spend check (weekdays and hours read with Python's
+  `datetime`).
+- **The notes are certain.** For every `never_decides` note in that universe,
+  and on 250 random envelopes with windows, the envelope with and without the
+  condition is checked for **bisimilarity**: every sequence of spends at every
+  block clock (no spend, or 1 up to what is left) must give the same accepts,
+  refusals and closes. The search walks pairs of book states, so it covers all
+  sequences without listing them.
+- **The notes are complete where this guide says so**, by the same search.
+- **The proofs have teeth.** Nine planted bugs in the notes (a lock or idle
+  point one tick off, a cap one short, the last period forgotten, the last hour
+  unread, a tie missed) are each rejected by them.
+- **The walkthrough runs.** The 5,000 envelope above, built with the CLI's own
+  flags, goes through the real block apply: locked before 1 December, 500 a
+  week, refused on a Saturday, back to Alice 14 days after the last spend; and
+  left alone, 3,000 back on 29 December. The grant with three conditions runs
+  the table above line by line.
+
 ## Spending
 
 ```bash
@@ -296,8 +450,8 @@ and where it stands at the next block: `status` (`locked`, `open` or `ended`),
 goes then: `ended`, `refunded` or `refunded_idle`), `period_index`,
 `cap_this_period`, `spent_this_period`, `left_this_period` (the most one spend
 may take under the limit) and `next_reset` (when the next period starts, or
-`null` without a limit or once it has lapsed). A closed envelope answers
-`closed` (how it closed). `history` lists its events on canonical blocks, newest first, and
+`null` without a limit or once it has lapsed), and `text`, its conditions in
+plain words. A closed envelope answers `closed` (how it closed). `history` lists its events on canonical blocks, newest first, and
 `semantics` is the node's own report of the rules and limits, so a wallet can
 explain the feature before offering it.
 
@@ -312,8 +466,10 @@ queued spend in the payee's `pending_incoming`.
 
 `gettxstatus` adds `envelopes` to a confirmed transaction: what it sent, spent,
 emptied or released, and for a send whether the envelope is still `open` or
-how it closed (`emptied`, `released`, `ended`, `refunded`, `refunded_idle`). `sendtx` and `checktx` answer `envelope`: what the envelope
-would hold, and what the period would have left, after the transaction.
+how it closed (`emptied`, `released`, `ended`, `refunded`, `refunded_idle`).
+`sendtx` and `checktx` answer `envelope`: what the envelope would hold, and what
+the period would have left, after the transaction; for a send also `plan`,
+`notes` and `text` (see [Combining conditions](#combining-conditions)).
 
 ## Limits
 
@@ -343,7 +499,7 @@ would hold, and what the period would have left, after the transaction.
 | `NOT_ENVELOPE_SENDER` | A release signed by anyone but the sender. |
 | `ENVELOPE_ENDED` | The envelope has reached its end, or its idle point (it goes back to the sender at the end of this block). |
 | `ENVELOPE_LOCKED` | The spend comes before the unlock; the message says until when (a block height, or Unix seconds with the moment in UTC). |
-| `ENVELOPE_OUTSIDE_WINDOW` | The block would fall outside the envelope's weekdays or hours; the message says when the next window opens (Unix seconds and UTC). |
+| `ENVELOPE_OUTSIDE_WINDOW` | The block would fall outside the envelope's weekdays or hours; the message says when the next window opens (Unix seconds, UTC, and the envelope's own offset when it has one). |
 | `ENVELOPE_LIMIT` | The spend is larger than the period's cap leaves. The message says what was spent this period and what is left. |
 | `ENVELOPE_INSUFFICIENT` | The spend is larger than what the envelope holds. |
 | `INSUFFICIENT_FUNDS` | The sender cannot pay amount plus fee, or the spender cannot pay the fee. |
@@ -406,6 +562,39 @@ keeps its bytes; adding or stripping one breaks the signature.
   metadata carries the same events for receipts.
 - Envelope transactions travel on their own gossip topic,
   `tau/envelopes/1.0.0`.
+
+## The conditions in Tau
+
+The node checks an envelope's conditions itself, in `EnvelopeBook.check_spend`,
+and the sender's and recipient's own `o5` rules on the Tau engine, as for any
+transfer. The conditions can also be written in Tau:
+`tests/test_envelope_tau_form.py` turns the terms of any envelope into the body
+of one `always` clause, in the form the policy worker runs, and has the real
+engine judge thousands of spends next to every point where a verdict changes
+(the unlock, the end, the idle refund, each period boundary, each window edge,
+and amounts around what the cap leaves). The engine and the node agree on every
+case. The clause is built from the signed terms alone; what changes after the
+send reaches it as input streams: the spend's amount, the block's clock and
+time, what the envelope holds, the period and amount of the last spends, and
+the unlock point.
+
+The node keeps the check for three reasons:
+
+- **The history comes from the book.** What a condition depends on (spent
+  this period, the last spend, what is left) reaches the clause as inputs that
+  the node computes and stores anyway, so the clause can confirm the node's
+  arithmetic on the node's numbers but cannot replace the book.
+- **Time comes from the block.** In the Tau form the clock is an input like any
+  other; the step counter `t` counts interpreter steps, not blocks or seconds,
+  so `[t > n]` cannot express "not before" (see #115).
+- **Cost.** One engine call per spend, about 2 ms with the clause cached and
+  about 20 ms to build it on a 2-core ARM server, against microseconds for the
+  node's check; and every envelope would be its own clause to build and keep
+  cached, up to 4,096 of them.
+
+A sender who wants a condition an envelope does not offer can still write it in
+their own `o5` rule, which judges the send; the recipient's rule judges each
+spend.
 
 ## Operator notes
 
@@ -490,6 +679,10 @@ These are the choices of this build that are easiest to change before release.
   wallet translates.
 - **A refund is never routed and never judged by a clause**: it is the sender's
   own money coming back.
+- **The readings are advice, not consensus.** `plan`, `notes` and `text` are
+  computed from the terms the node already judges and change nothing a node
+  accepts; a wallet may show them or not. Only `ENVELOPE_NEVER_SPENDABLE` is a
+  refusal, and it is the node's own check.
 
 ## Not in this release
 

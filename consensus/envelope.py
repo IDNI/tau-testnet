@@ -1011,9 +1011,13 @@ def close_event(terms: EnvelopeTerms, outcome: str, paid_out: int, **extra: Any)
 
 SEMANTICS: Dict[str, Any] = {
     "supported": True,
-    "version": 3,
+    "version": 4,
     "conditions": ["spending_limit", "not_before", "hold", "days", "hours",
                    "utc_offset", "refund_idle", "at_end"],
+    "combined": "every condition of an envelope applies at once: a spend lands only "
+                "when each allows it, and the earlier of the end and the idle point "
+                "closes it. Any mix of the conditions above may be written on one "
+                "envelope, each at most once",
     "spending_limit": "in period n = (clock - unlock) // period, at most cap(n) may be "
                       "spent: cap(n) = caps[n] while n < len(caps), then caps[-1] when "
                       "recurring, else no limit; nothing carries over. Optional",

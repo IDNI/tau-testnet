@@ -2180,11 +2180,14 @@ def _envelope_code(reason: str) -> str:
 def validate_envelope_send_payload(
     tx: Dict, tip_view: TipAdmissionView
 ) -> AdmissionResult:
-    """Tau-free screens for sending money in an envelope (spending limits).
+    """Tau-free screens for sending money in an envelope.
 
     The o5 verdict, fee and funds checks run on the sendtx path, as for a
     retractable transfer: a send is the one transfer sender -> recipient. The
-    checks here are apply's own (`can_admit_send`) against the next block.
+    checks here are apply's own (`can_admit_send`) against the next block. The
+    answer adds what a wallet shows before signing: the plan, the notes (a
+    condition that changes nothing, a combination that may surprise) and the
+    conditions in plain words (consensus/envelope_plan.py; none of it is consensus).
     """
     try:
         terms = parse_envelope_send(tx)
@@ -2201,13 +2204,16 @@ def validate_envelope_send_payload(
     if not ok:
         return format_error(f"envelope_send rejected: {reason}", code=_envelope_code(reason))
     from consensus.envelope import EnvelopeState
+    from consensus.envelope_plan import explain, notes, plan
 
+    sent = terms.clock(height, ts)
+    unlock = terms.unlock_at(sent)
     described = describe_envelope(
-        terms, EnvelopeState(anchor=terms.unlock_at(terms.clock(height, ts)),
-                             remaining=terms.amount),
-        height=height, ts=ts)
+        terms, EnvelopeState(anchor=unlock, remaining=terms.amount), height=height, ts=ts)
     return success({**described, "recipient_pubkey": terms.recipient_pubkey,
-                    "amount": terms.amount})
+                    "amount": terms.amount, "plan": plan(terms, sent),
+                    "notes": notes(terms, sent),
+                    "text": explain(terms, unlock=unlock, sent=sent)})
 
 
 def validate_envelope_spend_payload(

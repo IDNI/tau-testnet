@@ -97,6 +97,7 @@ jobs:
           tests/test_shrink_bare_ref_native.py
           tests/test_payout_native.py
           tests/test_envelope_policy_native.py
+          tests/test_envelope_tau_form.py
           tests/test_tau_output_determinism.py
           --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_temporary_spending_limit
           --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_time_decaying_multisig

@@ -7,7 +7,7 @@ block: whether it is locked (and until when), whether the next block is inside
 its spending window (and when the next one opens), the period it is in, that
 period's cap, what was spent in it, what one spend may still take, when the next
 period starts, and its due point (`due_at`, `due_outcome`: where the rest goes
-then). A closed one answers `open: false`; its history (newest first, canonical
+then), and `text`, its conditions in plain words. A closed one answers `open: false`; its history (newest first, canonical
 blocks only) says how it closed: `emptied`, `released`, `ended` (rest to the
 recipient), `refunded` or `refunded_idle` (rest back to the sender), with what
 was paid out and to whom.
@@ -36,7 +36,13 @@ def semantics() -> dict:
             "end_and_refunds": "fee-free, started by the network at the end of a block",
         },
         "preview": "sendtx and checktx answer `envelope` with what the envelope would "
-                   "hold or have left after the transaction",
+                   "hold or have left after the transaction; for a send also `plan` "
+                   "(unlock, first spend, first due point and outcome, the limit's "
+                   "reach), `notes` (conditions that change nothing for this envelope, "
+                   "and combinations that may surprise) and `text` (the conditions in "
+                   "plain words)",
+        "notes": "a never_decides note is certain: that condition alone could be "
+                 "removed and every spend, refusal and close would stay the same",
     })
     return out
 
@@ -55,7 +61,12 @@ def tip():
 
 
 def describe_open(book: EnvelopeBook, eid: bytes, height: int, ts: int) -> dict:
-    return describe(book.get(eid), book.state_of(eid), height=height, ts=ts)
+    from consensus.envelope_plan import explain
+
+    terms, state = book.get(eid), book.state_of(eid)
+    out = describe(terms, state, height=height, ts=ts)
+    out["text"] = explain(terms, unlock=state.anchor, remaining=state.remaining)
+    return out
 
 
 def execute(raw_command: str, container):

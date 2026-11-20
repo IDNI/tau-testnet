@@ -751,6 +751,11 @@ tau-testnet envelope send --key alice --to <bob_pk> --amount 5000 \
     --refund-idle 30d --ends-at 2027-03-01 --at-end refund
 tau-testnet envelope send --key dao --to <team_pk> --amount 900 \
     --hold-blocks 100 --refund-idle-blocks 5000 --ends-in-blocks 50000
+tau-testnet envelope check --to <bob_pk> --amount 5000 --cap 500 --recurring \
+    --period 7d --not-before 2026-12-01 --days mon-fri --refund-idle 14d \
+    --ends-at 2026-12-29 --at-end refund
+tau-testnet envelope check --amount 900 --hold-blocks 100 --ends-in-blocks 2000 \
+    --at-height 5000
 tau-testnet envelope spend --key child <envelope_id> --to <shop_pk> --amount 40
 tau-testnet envelope spend --key child <envelope_id> --to self --amount 60
 tau-testnet envelope release --key parent <envelope_id>
@@ -780,6 +785,15 @@ CLI stops with "one envelope, one clock". An envelope needs at least one
 condition. `send` prints the envelope id. `spend --to self` pays the signer's
 own balance.
 
+`check` takes the same flags as `send` (`--to` optional) and reads the envelope
+without a key or a node and sends nothing: the conditions in plain words, the
+notes (a condition that changes nothing, a combination that may surprise) and,
+when the node would refuse it, the clash in words (exit status 1).
+`--at-time` reads it as if sent then (default: now); on the block clock
+`--at-height` is the height the send would land at. `--json` prints `refused`,
+`why`, `plan`, `notes` and `text`. `send` prints the same reading on stderr
+before it submits, and stops if the node would refuse the envelope.
+
 Raw transactions (root fields only; a nested `payload` is ignored):
 
 | `tx_type` | Signed fields beyond the envelope |
@@ -794,11 +808,11 @@ RPC replies:
   `status` (`locked`, `open`), `spendable_now`, `remaining`, `spent_total`,
   `unlocks_at`, `in_window`, `next_window`, `idle_refund_at`, `due_at`,
   `due_outcome`, `period_index`, `cap_this_period`, `spent_this_period`,
-  `left_this_period`, `next_reset`); a closed one's `closed` (`emptied`,
-  `released`, `ended`, `refunded` or `refunded_idle`); `history` (sent, spend
-  and the closes, each close with `paid_out` and `paid_to`; canonical blocks
-  only, newest first), `block_hash`, and `semantics`. An id the chain never saw
-  answers `NOT_FOUND`.
+  `left_this_period`, `next_reset`, `text`: its conditions in plain words); a
+  closed one's `closed` (`emptied`, `released`, `ended`, `refunded` or
+  `refunded_idle`); `history` (sent, spend and the closes, each close with
+  `paid_out` and `paid_to`; canonical blocks only, newest first), `block_hash`,
+  and `semantics`. An id the chain never saw answers `NOT_FOUND`.
 - `getenvelopes` returns the open `envelopes` of the address in that role,
   `held_in_envelopes` and `history`.
 - `getaccountstate` adds `envelopes_out` and `envelopes_in` (what open
@@ -806,8 +820,10 @@ RPC replies:
 - `gettxstatus` adds `envelopes` to a confirmed transaction: what it did, and
   for a send whether the envelope is still `open` or how it closed.
 - `sendtx` and `checktx` add `envelope`: the envelope id and what it would
-  hold, and what the period would have left, after the transaction. A refused
-  spend names the reason: `ENVELOPE_LOCKED` (until when),
+  hold, and what the period would have left, after the transaction; for a
+  send also `plan`, `notes` and `text`
+  ([envelopes.md](envelopes.md#combining-conditions)). A refused spend names
+  the reason: `ENVELOPE_LOCKED` (until when),
   `ENVELOPE_OUTSIDE_WINDOW` (when the next window opens), `ENVELOPE_ENDED`,
   `ENVELOPE_LIMIT`; a refused send `ENVELOPE_NEVER_SPENDABLE`.
 

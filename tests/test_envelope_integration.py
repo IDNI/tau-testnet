@@ -517,7 +517,7 @@ def call(module, line, container):
 
 def test_the_capability_report():
     sem = getenvelope.semantics()
-    assert sem["supported"] is True and sem["version"] == 3
+    assert sem["supported"] is True and sem["version"] == 4
     assert sem["conditions"][0] == "spending_limit"
     assert "nothing carries over" in sem["spending_limit"]
     assert sem["clocks"] == ["blocks", "seconds"]

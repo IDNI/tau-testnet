@@ -3175,8 +3175,63 @@ def _envelope_terms(args, tip: int, now: int) -> dict:
     return out
 
 
-def cmd_envelope_send(args: argparse.Namespace) -> int:
+def _envelope_reading(terms, sent: int) -> dict:
+    """What an envelope sent at clock `sent` adds up to: the node's own verdict on
+    its shape, then the plan, the notes and the plain words."""
+    from consensus.envelope import KIND_BLOCKS as _BLOCKS, validate_send_shape
+    from consensus.envelope_plan import explain, notes, plan, refusal
+
+    height, ts = (sent, 0) if terms.kind == _BLOCKS else (0, sent)
+    refused = validate_send_shape(terms, height, ts)
+    if refused:
+        return {"refused": refused, "why": refusal(terms, sent), "plan": None,
+                "notes": [], "text": None}
+    return {"refused": None, "why": None, "plan": plan(terms, sent), "notes": notes(terms, sent),
+            "text": explain(terms, unlock=terms.unlock_at(sent), sent=sent)}
+
+
+def _print_envelope_reading(reading: dict, out=None) -> None:
+    out = out or sys.stdout
+    if reading["refused"]:
+        print(f"refused: {reading.get('why') or reading['refused']}", file=out)
+        return
+    print(reading["text"], file=out)
+    for note in reading["notes"]:
+        print(f"  {note['level']}: {note['text']}", file=out)
+
+
+def cmd_envelope_check(args: argparse.Namespace) -> int:
+    """Read an envelope's conditions before sending it: no key, no node, nothing sent."""
     from consensus.envelope import EnvelopeShapeError, parse_envelope_send
+
+    now = int(args.at_time) if args.at_time is not None else int(_now())
+    blocks = args.ends_in_blocks is not None or args.ends_at_height is not None
+    if blocks and args.at_height is None:
+        print_error("on the block clock, give --at-height: the height the send would land at")
+        return EXIT_LOCAL
+    sent = int(args.at_height) if blocks else now
+    sender = "0" * 96
+    recipient = (args.to or "1" * 96).strip().lower()
+    try:
+        payload = tx_mod.build_envelope_send_tx(
+            sender_pubkey=sender, sequence_number=0, expiration_time=now + 3600,
+            expire_at_height=sent + 1000, recipient_pubkey=recipient,
+            amount=int(args.amount),
+            **_envelope_terms(args, sent - 1 if blocks else 0, now))
+        terms = parse_envelope_send(payload)
+    except (_PayloadError, EnvelopeShapeError, ValueError) as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    reading = _envelope_reading(terms, sent)
+    if args.json:
+        print_result(reading, json_mode=True)
+    else:
+        _print_envelope_reading(reading)
+    return EXIT_APP_ERROR if reading["refused"] else EXIT_OK
+
+
+def cmd_envelope_send(args: argparse.Namespace) -> int:
+    from consensus.envelope import KIND_BLOCKS, EnvelopeShapeError, parse_envelope_send
 
     created = {}
 
@@ -3192,9 +3247,16 @@ def cmd_envelope_send(args: argparse.Namespace) -> int:
                 amount=int(args.amount),
                 **_envelope_terms(args, tip, now),
             )
-            created["id"] = parse_envelope_send(payload).envelope_id.hex()
+            terms = parse_envelope_send(payload)
+            created["id"] = terms.envelope_id.hex()
         except (EnvelopeShapeError, ValueError) as exc:
             raise _PayloadError(str(exc))
+        sent = tip + 1 if terms.kind == KIND_BLOCKS else now
+        reading = _envelope_reading(terms, sent)
+        if reading["refused"]:
+            raise _PayloadError("the node would refuse this envelope: "
+                                f"{reading.get('why') or reading['refused']}")
+        _print_envelope_reading(reading, out=sys.stderr)
         return payload
 
     status = _submit_rule_tx(args, _build, pass_tip=True)
@@ -3253,7 +3315,7 @@ def _add_envelope_subparsers(sub) -> None:
         "envelope",
         parents=[_GLOBAL_PARENT],
         help="Envelopes: money with conditions: limits, locks, windows, refunds "
-             "(send, spend, release, show, list)",
+             "(send, check, spend, release, show, list)",
     )
     esub = p_env.add_subparsers(dest="envelope_command", required=True)
     common = [_GLOBAL_PARENT]
@@ -3278,6 +3340,58 @@ def _add_envelope_subparsers(sub) -> None:
         parser.add_argument("--dry-run", action="store_true",
                             help="Sign and print the transaction, and send nothing")
 
+    def _conditions(parser, to_required=True):
+        parser.add_argument("--to", required=to_required, metavar="PUBKEY",
+                            help="The recipient (96 hex)")
+        parser.add_argument("--amount", required=True, type=int, help="What the envelope holds")
+        parser.add_argument(
+            "--cap", action="append", metavar="N[,N...]",
+            help="Spending limit: most the recipient may spend in one period; repeat or "
+                 "comma-separate for a schedule, first period first (--cap 1000,500)")
+        parser.add_argument("--recurring", action="store_true",
+                            help="After the list, the last cap repeats every period "
+                                 "(without it, the limit stops after the list)")
+        period = parser.add_mutually_exclusive_group()
+        period.add_argument("--period", type=_duration_seconds, metavar="DURATION",
+                            help="Period on the time clock: 3600, 12h, 7d, 2w")
+        period.add_argument("--period-blocks", type=_block_count, metavar="N",
+                            help="Period on the block clock")
+        ends = parser.add_mutually_exclusive_group(required=True)
+        ends.add_argument("--ends-in", type=_duration_seconds, metavar="DURATION",
+                          help="End this long from now (time clock)")
+        ends.add_argument("--ends-at", type=_utc_time, metavar="TIME",
+                          help="End at this time: unix seconds or 2027-01-01[T08:30] UTC")
+        ends.add_argument("--ends-in-blocks", type=_block_count, metavar="N",
+                          help="End this many blocks after the next one (block clock)")
+        ends.add_argument("--ends-at-height", type=int, metavar="HEIGHT")
+        parser.add_argument("--at-end", choices=["release", "refund"], default=None,
+                            help="What happens to the rest at the end: release (default) gives "
+                                 "it to the recipient, refund sends it back to you")
+        lock = parser.add_argument_group("time conditions")
+        lock.add_argument("--not-before", type=_utc_time, metavar="TIME",
+                          help="No spend before this time (unix seconds or 2026-12-01, UTC)")
+        lock.add_argument("--not-before-height", type=int, metavar="HEIGHT",
+                          help="No spend before this height (block clock)")
+        lock.add_argument("--hold", type=_duration_seconds, metavar="DURATION",
+                          help="No spend for this long after it arrives (6h, 2d)")
+        lock.add_argument("--hold-blocks", type=_block_count, metavar="N",
+                          help="No spend for this many blocks after it arrives")
+        lock.add_argument("--days", type=_day_list, metavar="DAYS",
+                          help="Spends only on these weekdays: mon-fri, sat,sun "
+                               "(UTC, or at --utc-offset)")
+        lock.add_argument("--hours", type=_hour_list, metavar="HOURS",
+                          help="Spends only in these hours: 9-17 (09:00 to 17:00), 22-6 "
+                               "(UTC, or at --utc-offset)")
+        lock.add_argument("--utc-offset", type=_utc_offset, metavar="OFFSET",
+                          help="Read --days and --hours at this fixed offset from UTC: "
+                               "+02:00, -03:30 (steps of 15 minutes; no daylight saving)")
+        refund = parser.add_argument_group("refunds")
+        refund.add_argument("--refund-idle", type=_duration_seconds, metavar="DURATION",
+                            help="Unused this long (from the unlock, then from each spend), "
+                                 "the rest comes back to you")
+        refund.add_argument("--refund-idle-blocks", type=_block_count, metavar="N",
+                            help="The same, in blocks")
+
     p_send = esub.add_parser(
         "send", parents=common,
         help="Send money in an envelope: the recipient spends it under your conditions",
@@ -3287,57 +3401,24 @@ def _add_envelope_subparsers(sub) -> None:
                     "UTC; --ends-in-blocks/--ends-at-height: blocks).",
     )
     _key_group(p_send)
-    p_send.add_argument("--to", required=True, metavar="PUBKEY", help="The recipient (96 hex)")
-    p_send.add_argument("--amount", required=True, type=int, help="What the envelope holds")
-    p_send.add_argument(
-        "--cap", action="append", metavar="N[,N...]",
-        help="Spending limit: most the recipient may spend in one period; repeat or "
-             "comma-separate for a schedule, first period first (--cap 1000,500)")
-    p_send.add_argument("--recurring", action="store_true",
-                        help="After the list, the last cap repeats every period "
-                             "(without it, the limit stops after the list)")
-    period = p_send.add_mutually_exclusive_group()
-    period.add_argument("--period", type=_duration_seconds, metavar="DURATION",
-                        help="Period on the time clock: 3600, 12h, 7d, 2w")
-    period.add_argument("--period-blocks", type=_block_count, metavar="N",
-                        help="Period on the block clock")
-    ends = p_send.add_mutually_exclusive_group(required=True)
-    ends.add_argument("--ends-in", type=_duration_seconds, metavar="DURATION",
-                      help="End this long from now (time clock)")
-    ends.add_argument("--ends-at", type=_utc_time, metavar="TIME",
-                      help="End at this time: unix seconds or 2027-01-01[T08:30] UTC")
-    ends.add_argument("--ends-in-blocks", type=_block_count, metavar="N",
-                      help="End this many blocks after the next one (block clock)")
-    ends.add_argument("--ends-at-height", type=int, metavar="HEIGHT")
-    p_send.add_argument("--at-end", choices=["release", "refund"], default=None,
-                        help="What happens to the rest at the end: release (default) gives "
-                             "it to the recipient, refund sends it back to you")
-    lock = p_send.add_argument_group("time conditions")
-    lock.add_argument("--not-before", type=_utc_time, metavar="TIME",
-                      help="No spend before this time (unix seconds or 2026-12-01, UTC)")
-    lock.add_argument("--not-before-height", type=int, metavar="HEIGHT",
-                      help="No spend before this height (block clock)")
-    lock.add_argument("--hold", type=_duration_seconds, metavar="DURATION",
-                      help="No spend for this long after it arrives (6h, 2d)")
-    lock.add_argument("--hold-blocks", type=_block_count, metavar="N",
-                      help="No spend for this many blocks after it arrives")
-    lock.add_argument("--days", type=_day_list, metavar="DAYS",
-                      help="Spends only on these weekdays: mon-fri, sat,sun "
-                           "(UTC, or at --utc-offset)")
-    lock.add_argument("--hours", type=_hour_list, metavar="HOURS",
-                      help="Spends only in these hours: 9-17 (09:00 to 17:00), 22-6 "
-                           "(UTC, or at --utc-offset)")
-    lock.add_argument("--utc-offset", type=_utc_offset, metavar="OFFSET",
-                      help="Read --days and --hours at this fixed offset from UTC: "
-                           "+02:00, -03:30 (steps of 15 minutes; no daylight saving)")
-    refund = p_send.add_argument_group("refunds")
-    refund.add_argument("--refund-idle", type=_duration_seconds, metavar="DURATION",
-                        help="Unused this long (from the unlock, then from each spend), "
-                             "the rest comes back to you")
-    refund.add_argument("--refund-idle-blocks", type=_block_count, metavar="N",
-                        help="The same, in blocks")
+    _conditions(p_send)
     _tx_flags(p_send)
     p_send.set_defaults(func=cmd_envelope_send)
+
+    p_check = esub.add_parser(
+        "check", parents=common,
+        help="Read an envelope's conditions before sending: plain words, notes, and "
+             "whether the node would refuse it (no key, no node, nothing sent)",
+        description="Takes the same conditions as `send`. Times count from now (or "
+                    "--at-time); on the block clock give --at-height, the height the send "
+                    "would land at.",
+    )
+    _conditions(p_check, to_required=False)
+    p_check.add_argument("--at-time", type=_utc_time, metavar="TIME",
+                         help="Read it as if sent at this time (default: now)")
+    p_check.add_argument("--at-height", type=int, metavar="HEIGHT",
+                         help="The height the send would land at (block clock)")
+    p_check.set_defaults(func=cmd_envelope_check)
 
     p_spend = esub.add_parser(
         "spend", parents=common,

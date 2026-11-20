@@ -647,7 +647,7 @@ def test_refunds_are_an_unrouted_credit_class():
 
 def test_the_capability_report_names_every_condition():
     sem = getenvelope.semantics()
-    assert sem["version"] == 3
+    assert sem["version"] == 4 and "at once" in sem["combined"]
     assert sem["conditions"] == ["spending_limit", "not_before", "hold", "days", "hours",
                                  "utc_offset", "refund_idle", "at_end"]
     for word in ("120 s", "UTC", "never through a route", "a tie is the end",
