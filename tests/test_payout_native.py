@@ -177,3 +177,31 @@ def test_the_royalty_rounds_down(real, amount, paid):
     else:
         with pytest.raises(PayoutRefused, match="pays nothing"):
             settle(rule, state, exe, outputs, height=HEIGHT, ts=TS, balance=10_000)
+
+
+# --- a condition chooses between amounts; it cannot stand alone --------------------------
+
+BARE = ("always ( (i40[t]:bv[24] > { 100 }:bv[24]) && "
+        "(o30[t]:bv[24] = i40[t]:bv[24]) ).")
+CHOSEN = ("always ( (i40[t]:bv[24] > { 100 }:bv[24]) ? "
+          "(o30[t]:bv[24] = i40[t]:bv[24]) : (o30[t]:bv[24] = { 0 }:bv[24]) ).")
+
+
+def test_a_bare_condition_does_not_build_and_the_screen_says_why(real):
+    """`(condition) && amount` has no answer where the condition fails, and the
+    engine builds only clauses that answer every input. The screen refuses the
+    shape with its reason before the engine is asked."""
+    body = BARE[len("always "):-1]
+    built = real.validate(body)
+    assert not built.ok
+    assert "a bare condition on inputs" in screen_payout_body(body, 1)
+
+
+def test_a_choice_pays_or_pays_nothing(real):
+    from consensus.payout import PayoutRefused
+
+    terms = _terms(CHOSEN, [BOB])
+    assert screen_payout_body(terms.body, 1) is None
+    assert _run(terms, STRANGER, {0: 250}) == [(0, BOB, 250)]
+    with pytest.raises(PayoutRefused, match="pays nothing"):
+        _run(terms, STRANGER, {0: 100})
