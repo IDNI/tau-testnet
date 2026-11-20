@@ -735,7 +735,7 @@ tau-testnet route release --key treasury --owner <project_pubkey>   # destinatio
 Semantics:
 
 - **Split.** Per credit, rounding the routed part down; nothing below `min_amount`; share 1..9000 bps (the account keeps at least 10%). Optional `active_from` / `expires_at` in block time.
-- **No bypass.** Transfers, approved transfers, retractable releases, standing payments and payout legs all split. Retract refunds, faucet grants and fees do not. A routed share is never routed again (one hop), and a route straight back (A -> B while B -> A) is refused.
+- **No bypass.** Transfers, approved transfers, retractable releases, standing payments, payout legs, envelope spends and envelope releases all split. Retract refunds, faucet grants and fees do not. A routed share is never routed again (one hop), and a route straight back (A -> B while B -> A) is refused.
 - **Payer and account.** The payer pays its own fee, unchanged; routing has no fee. The routed part never touches the account's balance, so no `o5` clause, cooldown or spend count sees it.
 - **Admin.** Setting and removing are rule changes (kinds 8 and 9) that a rule-change guard judges; a guarded account uses `--request`. A `--locked` route binds the account until its end (at most 366 days): it cannot be removed or weakened, and only the destination can release it early.
 - **Fees.** Setting costs one fee; remove and release are fee-free.
@@ -744,6 +744,36 @@ Semantics:
 - **Reads.** `getreceiveroute <address>` (with `routes_in`, `history`, `history_in`, `semantics`), `gettxstatus` (`receive_routes`: the splits a transaction caused), and `sendtx` / `checktx` (`receive_routes`: how the routes in force would split its credits).
 
 **Upgrade.** The book root is folded into the consensus metadata as `receive_routes_root` only once the book has held a route, so **no regenesis** is needed. Nodes must upgrade before the first route is set.
+
+## Envelopes (spending limits)
+
+Long-form guide: [docs/envelopes.md](docs/envelopes.md).
+
+An `envelope_send` sends money with a spending limit written on it. The amount leaves the sender at once and waits in the envelope; the recipient spends it with `envelope_spend`, to anyone, at most a cap per period. Every node enforces the limit at block apply.
+
+```bash
+tau-testnet envelope send --key parent --to <child_pubkey> --amount 5200 \
+    --cap 100 --recurring --period 7d --ends-in 52w                 # 100 a week for a year
+tau-testnet envelope send --key client --to <contractor_pubkey> --amount 4000 \
+    --cap 1000,500 --recurring --period 30d --ends-in 210d          # an advance, then 500 a month
+tau-testnet envelope spend --key child <envelope_id> --to <shop_pubkey> --amount 40
+tau-testnet envelope show <envelope_id>                            # room this period, history
+tau-testnet envelope list --key child --role in
+tau-testnet envelope release --key parent <envelope_id>            # the rest to the recipient now
+```
+
+Semantics:
+
+- **Limit.** Period `n = (clock - anchor) // period` on a block or time clock, the anchor being the block that sent it. `cap(n) = caps[n]` (up to 12 caps), then `caps[-1]` when `recurring`, else no limit. A spend needs `spent in period n + amount <= cap(n)` and at most what the envelope holds. Nothing carries over.
+- **Who.** Only the recipient spends, to anyone (itself included). Only the sender releases the rest early, to the recipient; it cannot take money back. At `expires_at` the rest goes to the recipient; an envelope spent to zero closes.
+- **Policy.** The send is judged by the sender's `o5` clause as "sender pays recipient amount"; each spend by the recipient's own `o5` clause as a transfer it signs. Both stamp the signer's cooldown clock.
+- **Fees.** Send and spend each pay one transfer fee, from the signer's own balance (a spend's payee is credited first, so a spend to oneself can pay its fee); release is fee-free.
+- **Routes.** A spend's payee and the recipient at a release or the end receive through their receive routes (classes `envelope_spend`, `envelope_release`).
+- **One network.** All three types sign `genesis_hash`, like standing payments; one signed for another network is refused (`WRONG_NETWORK`).
+- **Caps.** 16 open per sender, 4096 in total; period up to 1,000,000 blocks or 366 days; end up to 10,000,000 blocks or four years ahead.
+- **Reads.** `getenvelope <id>` (terms, `cap_this_period`, `left_this_period`, `next_reset`, `history`, `semantics`), `getenvelopes <address> [in|out|all]` (with `held_in_envelopes`), `gettxstatus` (`envelopes`), `getaccountstate` (`envelopes_out`, `envelopes_in`), and `sendtx` / `checktx` (`envelope`: what it would hold or have left).
+
+**Upgrade.** The book root is folded into the consensus metadata as `envelopes_root` only once the book has held an envelope, so **no regenesis** is needed. Nodes must upgrade before the first envelope is sent.
 
 ## Mempool policy
 

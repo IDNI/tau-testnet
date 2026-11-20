@@ -72,6 +72,9 @@ def execute(raw_command: str, container):
             # The recipient routes part of what it is paid (#35): the split
             # the routes in force now would make.
             data["receive_routes"] = result["receive_routes"]
+        if result.get("envelope"):
+            # What the envelope would hold or have left (spending limits).
+            data["envelope"] = result["envelope"]
         return api_response.success_response("checktx", data)
 
     # Rejection: forward sendtx's own code and details unchanged, and say which

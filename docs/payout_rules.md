@@ -299,7 +299,7 @@ settlement path pays exactly the locked price, and nothing after it.
 
 ```bash
 tau-testnet payout show <address>
-tau-testnet getpayoutrule <address>       # raw RPC
+tau-testnet rpc "getpayoutrule <address>"   # raw RPC
 ```
 
 `getpayoutrule` answers `installed`, the rule with its terms and where it

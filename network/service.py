@@ -120,6 +120,9 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "receive_route_set",
     "receive_route_remove",
     "receive_route_release",
+    "envelope_send",
+    "envelope_spend",
+    "envelope_release",
 })
 
 
@@ -602,6 +605,7 @@ class NetworkService:
             TAU_MEMPOOL_SNAPSHOT_MAX_STANDING_TXS,
             TAU_MEMPOOL_SNAPSHOT_MAX_PAYOUT_TXS,
             TAU_MEMPOOL_SNAPSHOT_MAX_ROUTE_TXS,
+            TAU_MEMPOOL_SNAPSHOT_MAX_ENVELOPE_TXS,
             TAU_GOSSIP_MAX_RAW_TX_BYTES
         )
         try:
@@ -617,6 +621,7 @@ class NetworkService:
             standing_txs_count = 0
             payout_txs_count = 0
             route_txs_count = 0
+            envelope_txs_count = 0
 
             for tx in txs:
                 if total_count >= TAU_MEMPOOL_SNAPSHOT_MAX_TOTAL:
@@ -677,6 +682,10 @@ class NetworkService:
                     if route_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_ROUTE_TXS:
                         continue
                     route_txs_count += 1
+                elif tx_type in ("envelope_send", "envelope_spend", "envelope_release"):
+                    if envelope_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_ENVELOPE_TXS:
+                        continue
+                    envelope_txs_count += 1
                 topic = self.topic_for_tx_type(tx_type)
                     
                 # 4. Optional partial decode
@@ -707,6 +716,7 @@ class NetworkService:
             TAU_GOSSIP_TOPIC_STANDING,
             TAU_GOSSIP_TOPIC_PAYOUT,
             TAU_GOSSIP_TOPIC_ROUTES,
+            TAU_GOSSIP_TOPIC_ENVELOPES,
             TAU_GOSSIP_TOPIC_BLOCKS,
             TAU_GOSSIP_TOPIC_PEERS,
         )
@@ -719,6 +729,7 @@ class NetworkService:
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_STANDING, self._on_standing_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PAYOUT, self._on_payout_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_ROUTES, self._on_route_gossip)
+        await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_ENVELOPES, self._on_envelope_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_BLOCKS, self._handle_block_gossip)
         await self._gossip_manager.join_topic(TAU_GOSSIP_TOPIC_PEERS, self._on_peer_advertisement)
 
@@ -977,6 +988,22 @@ class NetworkService:
             },
         )
 
+    async def _on_envelope_gossip(self, envelope: Dict[str, Any]) -> None:
+        from .protocols import (
+            TAU_MAX_ENVELOPE_RELEASE_BYTES,
+            TAU_MAX_ENVELOPE_SEND_BYTES,
+            TAU_MAX_ENVELOPE_SPEND_BYTES,
+        )
+        await self._process_gossip_payload(
+            envelope,
+            allowed_types={"envelope_send", "envelope_spend", "envelope_release"},
+            type_limits={
+                "envelope_send": TAU_MAX_ENVELOPE_SEND_BYTES,
+                "envelope_spend": TAU_MAX_ENVELOPE_SPEND_BYTES,
+                "envelope_release": TAU_MAX_ENVELOPE_RELEASE_BYTES,
+            },
+        )
+
     async def _process_gossip_payload(self, envelope: Dict[str, Any], allowed_types: set, type_limits: dict) -> None:
         import json
         from .protocols import TAU_GOSSIP_MAX_RAW_TX_BYTES
@@ -1111,6 +1138,23 @@ class NetworkService:
         elif tx_type == "receive_route_release":
             if "owner_pubkey" not in p_dict or "route_id" not in p_dict:
                 logger.debug("Gossip rejected: receive_route_release missing owner or route_id")
+                return
+        elif tx_type == "envelope_send":
+            missing = [f for f in ("recipient_pubkey", "amount", "caps", "expires_at")
+                       if f not in p_dict]
+            periods = [f for f in ("period_blocks", "period_seconds")
+                       if p_dict.get(f) is not None]
+            if missing or len(periods) != 1:
+                logger.debug("Gossip rejected: envelope_send missing %s or "
+                             "not exactly one period", missing)
+                return
+        elif tx_type == "envelope_spend":
+            if any(f not in p_dict for f in ("envelope_id", "to_pubkey", "amount")):
+                logger.debug("Gossip rejected: envelope_spend missing envelope_id, to or amount")
+                return
+        elif tx_type == "envelope_release":
+            if "envelope_id" not in p_dict:
+                logger.debug("Gossip rejected: envelope_release missing envelope_id")
                 return
 
         try:
@@ -1731,6 +1775,7 @@ class NetworkService:
             TAU_GOSSIP_TOPIC_STANDING,
             TAU_GOSSIP_TOPIC_PAYOUT,
             TAU_GOSSIP_TOPIC_ROUTES,
+            TAU_GOSSIP_TOPIC_ENVELOPES,
             TAU_GOSSIP_TOPIC_TRANSACTIONS,
         )
         if tx_type in ("consensus_rule_update", "consensus_rule_vote"):
@@ -1747,6 +1792,8 @@ class NetworkService:
             return TAU_GOSSIP_TOPIC_PAYOUT
         if tx_type in ("receive_route_set", "receive_route_remove", "receive_route_release"):
             return TAU_GOSSIP_TOPIC_ROUTES
+        if tx_type in ("envelope_send", "envelope_spend", "envelope_release"):
+            return TAU_GOSSIP_TOPIC_ENVELOPES
         return TAU_GOSSIP_TOPIC_TRANSACTIONS
 
     def broadcast_transaction(self, payload: str, message_id: str) -> None:

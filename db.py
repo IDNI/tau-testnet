@@ -618,6 +618,49 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_route_events_destination "
                 "ON route_events(destination_pubkey, block_number);"
             )
+            # Envelopes (spending limits): open envelopes and where each stands. Bound
+            # into consensus_meta_hash once the book has held anything, so
+            # written in the same transaction as accounts.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS envelopes_v1 (
+                    envelope_id      TEXT PRIMARY KEY,
+                    sender_pubkey    TEXT NOT NULL,
+                    sequence_number  INTEGER NOT NULL,
+                    recipient_pubkey TEXT NOT NULL,
+                    amount           INTEGER NOT NULL,
+                    caps_json        TEXT NOT NULL,
+                    period_kind      INTEGER NOT NULL,
+                    period           INTEGER NOT NULL,
+                    recurring        INTEGER NOT NULL,
+                    expires_at       INTEGER NOT NULL,
+                    anchor           INTEGER NOT NULL,
+                    remaining        INTEGER NOT NULL,
+                    period_index     INTEGER NOT NULL,
+                    spent_in_period  INTEGER NOT NULL,
+                    spends           INTEGER NOT NULL,
+                    last_height      INTEGER NOT NULL
+                );
+            ''')
+            # Node-local history: sends, every spend and every close. Read by
+            # envelope, by sender and by recipient.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS envelope_events (
+                    envelope_id      TEXT NOT NULL,
+                    sender_pubkey    TEXT NOT NULL,
+                    recipient_pubkey TEXT NOT NULL,
+                    block_hash       TEXT NOT NULL,
+                    block_number     INTEGER NOT NULL,
+                    event_index      INTEGER NOT NULL,
+                    outcome          TEXT NOT NULL,
+                    detail_json      TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (block_hash, event_index)
+                );
+            ''')
+            for column in ("envelope_id", "sender_pubkey", "recipient_pubkey"):
+                conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_envelope_events_{column} "
+                    f"ON envelope_events({column}, block_number);"
+                )
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -1879,6 +1922,21 @@ def get_mempool_txs_for_address(address: str) -> List[Dict]:
                 park_amount = 0
             if sender == address and park_amount > 0:
                 amount_out += park_amount
+        elif data.get("tx_type") in ("envelope_send", "envelope_spend"):
+            # A queued send debits its sender when mined and credits nobody yet;
+            # a queued spend credits its payee out of the envelope, debiting no
+            # balance (the spender's fee is counted with the fees).
+            try:
+                env_amount = int(data.get("amount"))
+            except (ValueError, TypeError):
+                env_amount = 0
+            if env_amount > 0:
+                if data["tx_type"] == "envelope_send" and sender == address:
+                    amount_out += env_amount
+                elif data["tx_type"] == "envelope_spend" and \
+                        data.get("to_pubkey") == address:
+                    amount_in += env_amount
+                    touches = True
         if isinstance(transfers, list):
             for tr in transfers:
                 if not (isinstance(tr, (list, tuple)) and len(tr) == 3):
@@ -2407,7 +2465,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None, receive_routes: Dict | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None, receive_routes: Dict | None = None, envelopes: Dict | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2449,6 +2507,7 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 standing_payments=standing_payments,
                 payout_rules=payout_rules,
                 receive_routes=receive_routes,
+                envelopes=envelopes,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
 
@@ -2513,7 +2572,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None, receive_routes: Dict | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None, standing_payments: Dict | None = None, payout_rules: Dict | None = None, receive_routes: Dict | None = None, envelopes: Dict | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2728,6 +2787,8 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
         _write_payout_rows(payout_rules)
     if receive_routes is not None:
         _write_route_rows(receive_routes)
+    if envelopes is not None:
+        _write_envelope_rows(envelopes)
 
     if max_rule_txs_per_block is not None:
         # Governance-activated value; persisted verbatim so a reload
@@ -3191,6 +3252,150 @@ def get_canonical_route_events_for_tx(tx_hash: str, block_hash: str) -> List[Dic
             continue
         out.append({"owner_pubkey": owner, "destination_pubkey": destination,
                     "route_id": route_id, "outcome": outcome, **extra})
+    return out
+
+
+_ENVELOPE_COLUMNS = (
+    'envelope_id, sender_pubkey, sequence_number, recipient_pubkey, amount, caps_json, '
+    'period_kind, period, recurring, expires_at, anchor, remaining, period_index, '
+    'spent_in_period, spends, last_height'
+)
+
+
+def _write_envelope_rows(state: Dict) -> None:
+    """Full replace of the open envelopes plus the commitment of closed ones."""
+    _db_conn.execute('DELETE FROM envelopes_v1')
+    for row in state['rows']:
+        (eid, sender, sequence, recipient, amount, caps, kind, period, recurring,
+         expires_at, anchor, remaining, period_index, spent, spends, last_height) = row
+        _db_conn.execute(
+            f'INSERT INTO envelopes_v1 ({_ENVELOPE_COLUMNS}) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (bytes(eid).hex(), sender, int(sequence), recipient, int(amount),
+             json.dumps([int(c) for c in caps]), int(kind), int(period),
+             1 if recurring else 0, int(expires_at), int(anchor), int(remaining),
+             int(period_index), int(spent), int(spends), int(last_height)),
+        )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        (
+            'envelope_resolved',
+            json.dumps({'count': int(state['resolved_count']), 'acc': state['resolved_acc']}),
+        )
+    )
+
+
+def load_envelope_state() -> tuple[List[tuple], int, bytes]:
+    """(rows, resolved_count, resolved_acc) in EnvelopeBook.restore order."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            f'SELECT {_ENVELOPE_COLUMNS} FROM envelopes_v1 ORDER BY envelope_id'
+        ).fetchall()
+        raw = _db_conn.execute(
+            "SELECT value FROM chain_state WHERE key = 'envelope_resolved'"
+        ).fetchone()
+    count, acc = 0, bytes(32)
+    if raw and raw[0]:
+        parsed = json.loads(raw[0])
+        count, acc = int(parsed['count']), bytes.fromhex(parsed['acc'])
+    out = []
+    for r in rows:
+        caps = json.loads(r[5])
+        if not isinstance(caps, list):
+            caps = []
+        out.append((bytes.fromhex(r[0]), r[1], int(r[2]), r[3], int(r[4]), tuple(caps),
+                    int(r[6]), int(r[7]), bool(r[8]), int(r[9]), int(r[10]), int(r[11]),
+                    int(r[12]), int(r[13]), int(r[14]), int(r[15])))
+    return out, count, acc
+
+
+def record_envelope_events(block_hash: str, block_number: int, events) -> None:
+    """Node-local history of what a block did to envelopes. Best effort."""
+    if _db_conn is None:
+        init_db()
+    try:
+        with _db_lock:
+            with _db_conn:
+                for index, event in enumerate(events):
+                    detail = {k: v for k, v in event.items()
+                              if k not in ('envelope_id', 'sender_pubkey',
+                                           'recipient_pubkey', 'outcome')}
+                    _db_conn.execute(
+                        'INSERT OR REPLACE INTO envelope_events '
+                        '(envelope_id, sender_pubkey, recipient_pubkey, block_hash, '
+                        'block_number, event_index, outcome, detail_json) '
+                        'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                        (event['envelope_id'], event['sender_pubkey'],
+                         event['recipient_pubkey'], block_hash, int(block_number), index,
+                         event['outcome'], json.dumps(detail, sort_keys=True)),
+                    )
+    except Exception:
+        logger.exception("could not record envelope events")
+
+
+def get_canonical_envelope_events(*, envelope_id: str | None = None,
+                                  pubkey: str | None = None, role: str = "all",
+                                  limit: int = 50) -> List[Dict]:
+    """Envelope history on the canonical chain, newest first: one envelope's
+    (`envelope_id`), or what `pubkey` sent (`role="out"`), held (`"in"`) or both."""
+    if envelope_id is not None:
+        where, args = 'envelope_id = ?', (envelope_id,)
+    elif role == 'out':
+        where, args = 'sender_pubkey = ?', (pubkey,)
+    elif role == 'in':
+        where, args = 'recipient_pubkey = ?', (pubkey,)
+    else:
+        where, args = '(sender_pubkey = ? OR recipient_pubkey = ?)', (pubkey, pubkey)
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT envelope_id, sender_pubkey, recipient_pubkey, block_hash, block_number, '
+            f'event_index, outcome, detail_json FROM envelope_events WHERE {where} '
+            'ORDER BY block_number DESC, event_index DESC',
+            args,
+        ).fetchall()
+    out: List[Dict] = []
+    canonical: Dict[str, bool] = {}
+    for eid, sender, recipient, block_hash, number, index, outcome, detail in rows:
+        if block_hash not in canonical:
+            canonical[block_hash] = get_canonical_confirmation(block_hash, int(number))[0]
+        if not canonical[block_hash]:
+            continue
+        item = {"block_number": int(number), "block_hash": block_hash, "envelope_id": eid,
+                "sender_pubkey": sender, "recipient_pubkey": recipient, "outcome": outcome}
+        try:
+            item.update(json.loads(detail or '{}'))
+        except Exception:
+            pass
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def get_canonical_envelope_events_for_tx(tx_hash: str, block_hash: str) -> List[Dict]:
+    """What one transaction did to envelopes in one block."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        rows = _db_conn.execute(
+            'SELECT envelope_id, sender_pubkey, recipient_pubkey, outcome, detail_json '
+            'FROM envelope_events WHERE block_hash = ? ORDER BY event_index',
+            (block_hash,),
+        ).fetchall()
+    out: List[Dict] = []
+    for eid, sender, recipient, outcome, detail in rows:
+        try:
+            extra = json.loads(detail or '{}')
+        except Exception:
+            extra = {}
+        if extra.get('tx_id') != tx_hash:
+            continue
+        out.append({"envelope_id": eid, "sender_pubkey": sender,
+                    "recipient_pubkey": recipient, "outcome": outcome, **extra})
     return out
 
 

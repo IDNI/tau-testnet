@@ -31,6 +31,9 @@ BOUND_TX_TYPES = frozenset({
     "receive_route_set",
     "receive_route_remove",
     "receive_route_release",
+    "envelope_send",
+    "envelope_spend",
+    "envelope_release",
 })
 
 _HEX_DIGITS = frozenset("0123456789abcdef")

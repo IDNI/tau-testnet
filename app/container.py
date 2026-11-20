@@ -27,6 +27,8 @@ from commands import (
     getretractables,
     getpayoutrule,
     getreceiveroute,
+    getenvelope,
+    getenvelopes,
     getstandingpayment,
     getstandingpayments,
 )
@@ -94,6 +96,8 @@ class ServiceContainer:
         "getstandingpayment": getstandingpayment,
         "getpayoutrule": getpayoutrule,
         "getreceiveroute": getreceiveroute,
+        "getenvelope": getenvelope,
+        "getenvelopes": getenvelopes,
         # Advisory, node-local, and engine-driving -- rate-limited accordingly
         # in server.py.
         "getapprovalslots": getapprovalslots,

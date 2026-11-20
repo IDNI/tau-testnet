@@ -596,6 +596,32 @@ def _route_state(lm) -> dict:
     }
 
 
+def _envelope_state(lm) -> dict:
+    book = getattr(lm, "envelopes", None)
+    if book is None:
+        from consensus.envelope import EnvelopeBook
+        book = EnvelopeBook()
+    count, acc = book.resolved_state()
+    return {
+        "rows": book.store_rows(),
+        "resolved_count": count,
+        "resolved_acc": acc.hex(),
+    }
+
+
+def _record_envelope_events(block, next_snapshot) -> None:
+    """Best-effort history write of envelope sends, spends and closes."""
+    try:
+        events = (getattr(next_snapshot, "metadata", None) or {}).get("envelope_events")
+        if events:
+            db.record_envelope_events(
+                block.block_hash, block.header.block_number,
+                [_with_tx_hash(block, e) for e in events],
+            )
+    except Exception:
+        logger.exception("could not record envelope events")
+
+
 def _record_route_events(block, next_snapshot) -> None:
     """Best-effort history write of receive-route splits and route changes."""
     try:
@@ -695,6 +721,7 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         standing_payments=_standing_state(lm),
         payout_rules=_payout_state(lm),
         receive_routes=_route_state(lm),
+        envelopes=_envelope_state(lm),
         eligibility_mode=lm.eligibility_mode,
         fee_beneficiary=lm.fee_beneficiary,
         last_transfer_ts=merged_ts,
@@ -1178,6 +1205,7 @@ def _process_new_block_locked(block: Block) -> bool:
             _record_standing_events(block, next_snapshot)
             _record_payout_events(block, next_snapshot)
             _record_route_events(block, next_snapshot)
+            _record_envelope_events(block, next_snapshot)
 
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
@@ -1462,6 +1490,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
             _record_standing_events(block, next_snapshot)
             _record_payout_events(block, next_snapshot)
             _record_route_events(block, next_snapshot)
+            _record_envelope_events(block, next_snapshot)
 
             if _enabled:
                 # The block's evaluator history becomes durable exactly as a live
@@ -2357,6 +2386,18 @@ def _restore_receive_routes(lm) -> None:
         raise DatabaseError(f"corrupt receive route state: {exc}") from exc
 
 
+def _restore_envelopes(lm) -> None:
+    """Rehydrate the envelope book; a row that does not recompute its id, or whose
+    progress no block could reach, refuses to load rather than lose held funds."""
+    from consensus.envelope import EnvelopeBook
+
+    rows, resolved_count, resolved_acc = db.load_envelope_state()
+    try:
+        lm.envelopes = EnvelopeBook.restore(rows, resolved_count, resolved_acc)
+    except ValueError as exc:
+        raise DatabaseError(f"corrupt envelope state: {exc}") from exc
+
+
 def _restore_payout_rules(lm) -> None:
     """Rehydrate the payout-rule book; a row that does not recompute its id,
     or whose progress is impossible, refuses to load."""
@@ -2504,6 +2545,7 @@ def load_state_from_db() -> bool:
         _restore_standing_payments(_lifecycle_manager)
         _restore_payout_rules(_lifecycle_manager)
         _restore_receive_routes(_lifecycle_manager)
+        _restore_envelopes(_lifecycle_manager)
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
         persisted_slots = db.get_chain_state_value("approval_slots_active", _MISSING)
@@ -2575,6 +2617,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         standing_snapshot = _standing_state(_lifecycle_manager)
         payout_snapshot = _payout_state(_lifecycle_manager)
         route_snapshot = _route_state(_lifecycle_manager)
+        envelope_snapshot = _envelope_state(_lifecycle_manager)
 
     db.save_canonical_state_atomically(
         block_hash, block_number,
@@ -2596,6 +2639,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         standing_payments=standing_snapshot,
         payout_rules=payout_snapshot,
         receive_routes=route_snapshot,
+        envelopes=envelope_snapshot,
     )
 
 def tick_governance(height: int):
@@ -3096,6 +3140,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 standing_payments=_standing_state(_lifecycle_manager),
                 payout_rules=_payout_state(_lifecycle_manager),
                 receive_routes=_route_state(_lifecycle_manager),
+                envelopes=_envelope_state(_lifecycle_manager),
             )
     except Exception as exc:
         logger.error(

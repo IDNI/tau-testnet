@@ -24,6 +24,8 @@ Routed, because each is a payment someone made to the account:
     retractable_release  a retractable transfer reaching its release point
     standing_payment     a standing payment the end-of-block sweep makes
     payout               a leg of a payout rule's execution
+    envelope_spend       a spend from an envelope, to its payee
+    envelope_release     what an envelope holds when it is released or ends
 
 Not routed, because none is a payment to the account:
 
@@ -73,8 +75,11 @@ CREDIT_APPROVED_TRANSFER = "approved_transfer"
 CREDIT_RETRACTABLE_RELEASE = "retractable_release"
 CREDIT_STANDING_PAYMENT = "standing_payment"
 CREDIT_PAYOUT = "payout"
+CREDIT_ENVELOPE_SPEND = "envelope_spend"
+CREDIT_ENVELOPE_RELEASE = "envelope_release"
 ROUTED_CLASSES = (CREDIT_TRANSFER, CREDIT_APPROVED_TRANSFER, CREDIT_RETRACTABLE_RELEASE,
-                  CREDIT_STANDING_PAYMENT, CREDIT_PAYOUT)
+                  CREDIT_STANDING_PAYMENT, CREDIT_PAYOUT, CREDIT_ENVELOPE_SPEND,
+                  CREDIT_ENVELOPE_RELEASE)
 UNROUTED_CLASSES = ("retract_refund", "faucet_grant", "fee", "routed_share")
 
 # Removals folded into the book's commitment.
@@ -588,6 +593,7 @@ def preview_credits(tx: Dict[str, Any], book: "ReceiveRouteBook",
     that land later say so, because the route in force then decides them.
     """
     from consensus.approvals import TX_TYPE_APPROVAL_REQUEST
+    from consensus.envelope import TX_TYPE_ENVELOPE_SPEND
     from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
     from consensus.standing import TX_TYPE_STANDING_PAYMENT_CREATE
 
@@ -610,6 +616,8 @@ def preview_credits(tx: Dict[str, Any], book: "ReceiveRouteBook",
     elif tx_type == TX_TYPE_STANDING_PAYMENT_CREATE:
         credits.append((tx.get("recipient_pubkey"), tx.get("amount"),
                         CREDIT_STANDING_PAYMENT, True))
+    elif tx_type == TX_TYPE_ENVELOPE_SPEND:
+        credits.append((tx.get("to_pubkey"), tx.get("amount"), CREDIT_ENVELOPE_SPEND, False))
     out: List[Dict[str, Any]] = []
     for recipient, raw, credit_class, later in credits:
         amount = _amount(raw)

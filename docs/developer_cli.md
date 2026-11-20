@@ -147,7 +147,7 @@ arguments keep their case except where a handler lowercases a hex id. Payload
 commands take the rest of the line verbatim as one JSON argument, and tolerate
 it being wrapped in matching single or double quotes.
 
-The full registry (32 names, `app/container.py`):
+The full registry (34 names, `app/container.py`):
 
 | Command | Grammar |
 |---|---|
@@ -183,6 +183,8 @@ The full registry (32 names, `app/container.py`):
 | `getstandingpayment` | `getstandingpayment <standing_id>` — 64 hex chars |
 | `getpayoutrule` | `getpayoutrule <address>` |
 | `getreceiveroute` | `getreceiveroute <address>` |
+| `getenvelope` | `getenvelope <envelope_id>` — 64 hex chars |
+| `getenvelopes` | `getenvelopes <address> [in\|out\|all]` (default `all`) |
 
 `gettimestamp` and `getcurrenttimestamp` share one handler, and it hardcodes
 its own name: a `getcurrenttimestamp` request comes back with
@@ -726,6 +728,59 @@ RPC replies:
 - `sendtx` and `checktx` add `receive_routes`: how the routes in force would
   split the transaction's credits (advisory; `lands_later` marks credits that
   the route in force at landing decides).
+
+## Envelopes
+
+Send money with a spending limit: the recipient spends it, to anyone, at most
+a cap per period. Semantics are in the
+[README](../README.md#envelopes-spending-limits). Long-form guide:
+[envelopes.md](envelopes.md).
+
+```bash
+tau-testnet envelope send --key parent --to <child_pk> --amount 5200 \
+    --cap 100 --recurring --period 7d --ends-in 52w
+tau-testnet envelope send --key client --to <contractor_pk> --amount 4000 \
+    --cap 1000 --cap 500 --recurring --period 30d --ends-in 210d
+tau-testnet envelope send --key dao --to <team_pk> --amount 20000 \
+    --cap 2000 --recurring --period-blocks 10000 --ends-in-blocks 100000
+tau-testnet envelope spend --key child <envelope_id> --to <shop_pk> --amount 40
+tau-testnet envelope spend --key child <envelope_id> --to self --amount 60
+tau-testnet envelope release --key parent <envelope_id>
+tau-testnet envelope show <envelope_id>
+tau-testnet envelope list [<address>] [--key k] [--role in|out|all]
+```
+
+`--cap` is repeatable and takes comma-separated lists, first period first.
+Without `--recurring` the limit stops after the last cap. One of `--period`
+(a duration: `3600`, `90s`, `15m`, `12h`, `7d`, `2w`) and `--period-blocks`;
+the end on the same clock: `--ends-in` (duration) or `--ends-at` (unix) for a
+time period, `--ends-in-blocks` or `--ends-at-height` for a block period.
+`send` prints the envelope id. `spend --to self` pays the signer's own balance.
+
+Raw transactions (root fields only; a nested `payload` is ignored):
+
+| `tx_type` | Signed fields beyond the envelope |
+|---|---|
+| `envelope_send` | `genesis_hash`, `recipient_pubkey`, `amount`, `caps`, exactly one of `period_blocks` / `period_seconds`, optional `recurring`, `expires_at` |
+| `envelope_spend` | `genesis_hash`, `envelope_id`, `to_pubkey`, `amount` (signed by the recipient) |
+| `envelope_release` | `genesis_hash`, `envelope_id` (signed by the sender; feeless) |
+
+RPC replies:
+
+- `getenvelope` returns `open`; an open envelope's `envelope` (terms,
+  `remaining`, `spent_total`, `period_index`, `cap_this_period`,
+  `spent_this_period`, `left_this_period`, `next_reset`, `status`); a closed
+  one's `closed` (`emptied`, `released` or `ended`); `history` (sent, spend,
+  emptied, released, ended; canonical blocks only, newest first),
+  `block_hash`, and `semantics`. An id the chain never saw answers `NOT_FOUND`.
+- `getenvelopes` returns the open `envelopes` of the address in that role,
+  `held_in_envelopes` and `history`.
+- `getaccountstate` adds `envelopes_out` and `envelopes_in` (what open
+  envelopes the address sent still hold, and what they hold for it to spend).
+- `gettxstatus` adds `envelopes` to a confirmed transaction: what it did, and
+  for a send whether the envelope is still `open` or how it closed.
+- `sendtx` and `checktx` add `envelope`: the envelope id and what it would
+  hold, and what the period would have left, after the transaction.
 
 ## Governance
 

@@ -47,6 +47,8 @@ SLOW_TX_TYPES = frozenset({
 # `receive_route_set`, `receive_route_remove` and `receive_route_release` are
 # FAST: a set costs one fee-query step, the other two need no Tau evaluation, and
 # the split itself is arithmetic on credits the block makes anyway.
+# `envelope_send`, `envelope_spend` and `envelope_release` are FAST: a send and a
+# spend each cost one transfer step, and a release needs no Tau evaluation.
 # `payout_execute` and `payout_rule_revoke` are FAST: an execution steps one
 # cached payout rule in its own pool, and a revoke needs no Tau evaluation.
 # The standing payment types are all FAST: a create or an update costs one
@@ -86,6 +88,9 @@ TAU_EVALUATING_TX_TYPES = frozenset({
     "payout_execute",
     # The fee step.
     "receive_route_set",
+    # One transfer step each: o1/o5 of the signer and the fee.
+    "envelope_send",
+    "envelope_spend",
 })
 
 

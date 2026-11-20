@@ -99,6 +99,7 @@ def node(temp_database, mock_policy_evaluators, monkeypatch):
         patch.object(TipAdmissionView, "get_offer", return_value=_offer_row()),
         patch.object(TipAdmissionView, "payout_book", return_value=_payout_book()),
         patch.object(TipAdmissionView, "standing_book", return_value=_standing_book()),
+        patch.object(TipAdmissionView, "envelope_book", return_value=_envelope_book()),
     ]
     mocks = [p.start() for p in patches]
     mocks[3].is_set.return_value = True
@@ -149,6 +150,22 @@ def _standing_book():
     book.create(parse_standing_payment_create({"sender_pubkey": SENDER,
                                                "sequence_number": 0,
                                                **_standing_fields()}))
+    return book
+
+
+def _envelope_fields():
+    return {"recipient_pubkey": RECIPIENT, "amount": 1000, "caps": [100],
+            "period_blocks": 10, "recurring": True, "expires_at": NEXT_HEIGHT + 500}
+
+
+def _envelope_book():
+    """SENDER sent RECIPIENT an envelope (seq 0), so RECIPIENT may spend from it."""
+    from consensus.envelope import EnvelopeBook, parse_envelope_send
+
+    book = EnvelopeBook()
+    terms = parse_envelope_send({"sender_pubkey": SENDER, "sequence_number": 0,
+                                 **_envelope_fields()})
+    book.send(terms, NEXT_HEIGHT - 5, TIP_TS)
     return book
 
 
@@ -214,6 +231,13 @@ def _payload(kind, fee_limit="0"):
     if kind == "receive_route_set":
         return _envelope(kind, SENDER, fee_limit, destination_pubkey=RECIPIENT,
                          share_bps=2000, genesis_hash=chain_genesis_hash())
+    if kind == "envelope_send":
+        return _envelope(kind, SENDER, fee_limit, genesis_hash=chain_genesis_hash(),
+                         **_envelope_fields())
+    if kind == "envelope_spend":
+        eid = next(iter(_envelope_book().open)).hex()
+        return _envelope(kind, RECIPIENT, fee_limit, envelope_id=eid, to_pubkey=APPROVER,
+                         amount=60, genesis_hash=chain_genesis_hash())
     raise AssertionError(kind)
 
 
@@ -227,7 +251,7 @@ FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
                "rule_change_request", "standing_payment_create",
                "standing_payment_update", "standing_payment_execute", "payout_rule_set",
-               "payout_execute", "receive_route_set"]
+               "payout_execute", "receive_route_set", "envelope_send", "envelope_spend"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():
@@ -505,3 +529,37 @@ def test_a_sender_who_cannot_pay_the_fee_gets_no_estimate(node, monkeypatch):
     assert env["error"]["code"] == "INSUFFICIENT_FUNDS", env
     assert env["error"]["details"]["required"] == 100 + BASE_FEE + CUSTOM_FEE
     assert "estimated_fee" not in env["error"]["details"]
+
+
+# --- envelope spends (spending limits): the money comes out of the envelope ------------------
+
+def _spend_payload(to, amount=60):
+    eid = next(iter(_envelope_book().open)).hex()
+    return _envelope("envelope_spend", RECIPIENT, str(BASE_FEE + CUSTOM_FEE),
+                     envelope_id=eid, to_pubkey=to, amount=amount,
+                     genesis_hash=chain_genesis_hash())
+
+
+@pytest.mark.parametrize("balance, ok", [(BASE_FEE + CUSTOM_FEE, True),
+                                         (BASE_FEE + CUSTOM_FEE - 1, False)])
+def test_a_spenders_own_balance_covers_only_the_fee(node, monkeypatch, balance, ok):
+    monkeypatch.setitem(chain_state._balances, RECIPIENT, balance)
+    env = _check(_spend_payload(APPROVER))
+    if ok:
+        assert env["data"]["admissible"] is True, env
+        assert env["data"]["envelope"]["remaining_after"] == 940
+    else:
+        assert env["error"]["code"] == "INSUFFICIENT_FUNDS", env
+
+
+def test_a_spend_to_oneself_pays_its_fee_from_what_it_moves(node, monkeypatch):
+    monkeypatch.setitem(chain_state._balances, RECIPIENT, 0)
+    env = _check(_spend_payload(RECIPIENT))
+    assert "data" in env, env
+    assert env["data"]["admissible"] is True, env
+
+
+def test_a_send_needs_the_amount_and_the_fee(node, monkeypatch):
+    monkeypatch.setitem(chain_state._balances, SENDER, 1000 + BASE_FEE + CUSTOM_FEE - 1)
+    payload = _payload("envelope_send", fee_limit=str(BASE_FEE + CUSTOM_FEE))
+    assert _check(payload)["error"]["code"] == "INSUFFICIENT_FUNDS"

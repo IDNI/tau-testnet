@@ -12,6 +12,7 @@ import tau_defs
 
 from consensus import network_binding
 from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST
+from consensus.envelope import TX_TYPE_ENVELOPE_SEND, TX_TYPE_ENVELOPE_SPEND
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
 from consensus.payout import TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_PAYOUT_RULE_SET
@@ -62,8 +63,11 @@ def check_transfer(transfer: Any, sender_pubkey: Any) -> Optional[str]:
 def _recipient_keys(tx: dict) -> list:
     tx_type = tx.get("tx_type", "user_tx")
     if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RETRACTABLE_TRANSFER,
-                   TX_TYPE_STANDING_PAYMENT_CREATE, TX_TYPE_STANDING_PAYMENT_UPDATE):
+                   TX_TYPE_STANDING_PAYMENT_CREATE, TX_TYPE_STANDING_PAYMENT_UPDATE,
+                   TX_TYPE_ENVELOPE_SEND):
         return [("recipient_pubkey", tx.get("recipient_pubkey"))]
+    if tx_type == TX_TYPE_ENVELOPE_SPEND:
+        return [("to_pubkey", tx.get("to_pubkey"))]
     if tx_type == TX_TYPE_PAYOUT_RULE_SET:
         slots = tx.get("slots")
         return [(f"slots[{k}]", key) for k, key in enumerate(slots or [])

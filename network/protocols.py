@@ -29,6 +29,9 @@ TAU_GOSSIP_TOPIC_STANDING = "tau/standing/1.0.0"
 TAU_GOSSIP_TOPIC_PAYOUT = "tau/payout/1.0.0"
 # Receive routes: small, rare, and a release by a destination is time-sensitive.
 TAU_GOSSIP_TOPIC_ROUTES = "tau/routes/1.0.0"
+# Envelopes (spending limits): a spend is an everyday payment, and a release by
+# the sender should not wait behind a burst of sends.
+TAU_GOSSIP_TOPIC_ENVELOPES = "tau/envelopes/1.0.0"
 TAU_GOSSIP_TOPIC_PEERS = "tau/peers/2.0.0"
 
 # Mempool & Edge Ingestion Limits
@@ -81,3 +84,9 @@ TAU_MAX_RECEIVE_ROUTE_SET_BYTES = 4096
 TAU_MAX_RECEIVE_ROUTE_REMOVE_BYTES = 4096
 TAU_MAX_RECEIVE_ROUTE_RELEASE_BYTES = 4096
 TAU_MEMPOOL_SNAPSHOT_MAX_ROUTE_TXS = 32
+# A send carries a recipient, an amount and at most twelve caps; spend and
+# release less.
+TAU_MAX_ENVELOPE_SEND_BYTES = 4096
+TAU_MAX_ENVELOPE_SPEND_BYTES = 4096
+TAU_MAX_ENVELOPE_RELEASE_BYTES = 4096
+TAU_MEMPOOL_SNAPSHOT_MAX_ENVELOPE_TXS = 64

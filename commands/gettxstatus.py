@@ -186,6 +186,31 @@ def _route_fields(db, tx_hash: str, block_hash: str) -> dict:
     return {"receive_routes": out}
 
 
+def _envelope_fields(db, tx_hash: str, block_hash: str) -> dict:
+    """`envelopes`: what this transaction did to envelopes (spending limits): sent one,
+    spent from one, released one, or emptied one. A send also says whether the
+    envelope is still `open` or how it closed (emptied, released, ended)."""
+    try:
+        events = db.get_canonical_envelope_events_for_tx(tx_hash, block_hash)
+    except Exception:
+        return {}
+    if not events:
+        return {}
+    out = []
+    for event in events:
+        item = {k: v for k, v in event.items() if k != "tx_id"}
+        if event.get("outcome") == "sent":
+            try:
+                latest = db.get_canonical_envelope_events(
+                    envelope_id=event.get("envelope_id"), limit=1)
+            except Exception:
+                latest = []
+            last = latest[0].get("outcome") if latest else None
+            item["status"] = last if last in ("emptied", "released", "ended") else "open"
+        out.append(item)
+    return {"envelopes": out}
+
+
 def execute(raw_command: str, container):
     parts = raw_command.split()
     if len(parts) != 2:
@@ -242,6 +267,7 @@ def execute(raw_command: str, container):
                 }
                 data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
                 data.update(_route_fields(db, tx_hash, loc["block_hash"]))
+                data.update(_envelope_fields(db, tx_hash, loc["block_hash"]))
                 return api_response.success_response("gettxstatus", data)
 
         # 3. Dropped without being mined?

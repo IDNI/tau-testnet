@@ -64,6 +64,17 @@ from consensus.payout import (
     parse_payout_spec,
     settle as settle_payout,
 )
+from consensus.envelope import (
+    EnvelopeRefused,
+    EnvelopeShapeError,
+    TX_TYPE_ENVELOPE_RELEASE,
+    TX_TYPE_ENVELOPE_SEND,
+    TX_TYPE_ENVELOPE_SPEND,
+    describe as describe_envelope,
+    parse_envelope_release,
+    parse_envelope_send,
+    parse_envelope_spend,
+)
 from consensus.receive_route import (
     TX_TYPE_RECEIVE_ROUTE_RELEASE,
     TX_TYPE_RECEIVE_ROUTE_REMOVE,
@@ -2138,6 +2149,111 @@ def validate_receive_route_release_payload(
     return success({"route_id": route_id.hex(), "owner_pubkey": owner})
 
 
+def _envelope_code(reason: str) -> str:
+    if "full" in reason:
+        return "ENVELOPE_BOOK_FULL"
+    if "already open" in reason:
+        return "DUPLICATE_ENVELOPE"
+    if "open envelopes" in reason:
+        return "TOO_MANY_ENVELOPES"
+    if "no open envelope" in reason:
+        return "NO_ENVELOPE"
+    if "recipient may spend" in reason:
+        return "NOT_ENVELOPE_RECIPIENT"
+    if "sender may release" in reason:
+        return "NOT_ENVELOPE_SENDER"
+    if "reached its end" in reason:
+        return "ENVELOPE_ENDED"
+    if "the cap" in reason:
+        return "ENVELOPE_LIMIT"
+    if "the envelope holds" in reason:
+        return "ENVELOPE_INSUFFICIENT"
+    return "INVALID_ENVELOPE"
+
+
+def validate_envelope_send_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for sending money in an envelope (spending limits).
+
+    The o5 verdict, fee and funds checks run on the sendtx path, as for a
+    retractable transfer: a send is the one transfer sender -> recipient. The
+    checks here are apply's own (`can_admit_send`) against the next block.
+    """
+    try:
+        terms = parse_envelope_send(tx)
+    except EnvelopeShapeError as exc:
+        return format_error(f"Malformed envelope_send: {exc}.", code="INVALID_ENVELOPE")
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != terms.sender_pubkey:
+        return format_error("envelope_send sender_pubkey must match the signer.")
+    err = validate_bls_pubkey(terms.recipient_pubkey, "recipient_pubkey")
+    if err:
+        return format_error(f"envelope_send rejected: {err}", code="INVALID_ENVELOPE")
+    height, ts = tip_view.next_block_height, tip_view.next_block_timestamp
+    ok, reason = tip_view.envelope_book().can_admit_send(terms, height, ts)
+    if not ok:
+        return format_error(f"envelope_send rejected: {reason}", code=_envelope_code(reason))
+    from consensus.envelope import EnvelopeState
+
+    described = describe_envelope(
+        terms, EnvelopeState(anchor=terms.clock(height, ts), remaining=terms.amount),
+        height=height, ts=ts)
+    return success({**described, "recipient_pubkey": terms.recipient_pubkey,
+                    "amount": terms.amount})
+
+
+def validate_envelope_spend_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """A recipient spending from an envelope: the envelope's own checks against
+    the next block. The o5 verdict and the fee run on the sendtx path, as the
+    one transfer recipient -> payee the spend is."""
+    try:
+        spend = parse_envelope_spend(tx)
+    except EnvelopeShapeError as exc:
+        return format_error(f"Malformed envelope_spend: {exc}.", code="INVALID_ENVELOPE")
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != spend.spender_pubkey:
+        return format_error("envelope_spend sender_pubkey must match the signer.")
+    err = validate_bls_pubkey(spend.to_pubkey, "to_pubkey")
+    if err:
+        return format_error(f"envelope_spend rejected: {err}", code="INVALID_ENVELOPE")
+    height, ts = tip_view.next_block_height, tip_view.next_block_timestamp
+    try:
+        terms, state = tip_view.envelope_book().check_spend(spend, height, ts)
+    except EnvelopeRefused as exc:
+        return format_error(f"envelope_spend refused: {exc}", code=_envelope_code(str(exc)))
+    clock = terms.clock(height, ts)
+    return success({
+        "envelope_id": spend.envelope_id.hex(),
+        "to_pubkey": spend.to_pubkey,
+        "amount": spend.amount,
+        "remaining_after": state.remaining - spend.amount,
+        "left_this_period_after": state.left_at(terms, clock) - spend.amount,
+    })
+
+
+def validate_envelope_release_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """The sender releasing what an envelope holds to its recipient, at once."""
+    try:
+        release = parse_envelope_release(tx)
+    except EnvelopeShapeError as exc:
+        return format_error(f"Malformed envelope_release: {exc}.", code="INVALID_ENVELOPE")
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != release.signer_pubkey:
+        return format_error("envelope_release sender_pubkey must match the signer.")
+    book = tip_view.envelope_book()
+    ok, reason = book.can_admit_release(release)
+    if not ok:
+        return format_error(f"envelope_release rejected: {reason}", code=_envelope_code(reason))
+    return success({"envelope_id": release.envelope_id.hex(),
+                    "released": book.state_of(release.envelope_id).remaining,
+                    "recipient_pubkey": book.get(release.envelope_id).recipient_pubkey})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -2287,6 +2403,15 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RECEIVE_ROUTE_RELEASE:
          return validate_receive_route_release_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_ENVELOPE_SEND:
+         return validate_envelope_send_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_ENVELOPE_SPEND:
+         return validate_envelope_spend_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_ENVELOPE_RELEASE:
+         return validate_envelope_release_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

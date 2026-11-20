@@ -366,11 +366,13 @@ def test_cli_leaves_a_plain_transfer_as_it_was(alice_key):
 
 def test_every_bound_type_is_a_type_the_node_knows():
     from commands.sendtx import _get_signing_message_bytes  # noqa: F401  (import check)
+    from consensus.envelope import ENVELOPE_TX_TYPES
     from consensus.payout import PAYOUT_TX_TYPES
     from consensus.receive_route import ROUTE_TX_TYPES
     from consensus.standing import STANDING_TX_TYPES
 
-    assert set(STANDING_TX_TYPES) | set(PAYOUT_TX_TYPES) | set(ROUTE_TX_TYPES) <= BOUND_TX_TYPES
+    known = STANDING_TX_TYPES | PAYOUT_TX_TYPES | ROUTE_TX_TYPES | ENVELOPE_TX_TYPES
+    assert set(known) <= BOUND_TX_TYPES
 
 
 @pytest.mark.parametrize("tx_type", sorted(BOUND_TX_TYPES))

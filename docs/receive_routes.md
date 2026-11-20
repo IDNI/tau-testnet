@@ -85,6 +85,8 @@ of each credit is consensus-frozen and appears on every split:
 | `retractable_release` | yes | A retractable transfer reaching its release point. |
 | `standing_payment` | yes | A standing payment made by the end-of-block sweep. |
 | `payout` | yes | A leg of a payout rule's execution. |
+| `envelope_spend` | yes | A spend from an envelope, credited to its payee (see [envelopes.md](envelopes.md)). |
+| `envelope_release` | yes | What an envelope still holds, reaching its recipient at a release or at its end. |
 | `retract_refund` | no | A retracted transfer returning to its sender: the sender's own money. |
 | `faucet_grant` | no | The grant of a new account. |
 | `fee` | no | A fee credited to the proposer or the fee beneficiary. |
@@ -200,7 +202,7 @@ A destination's release is not a rule change of the account and is not guarded.
 
 ```bash
 tau-testnet route show <address>
-tau-testnet getreceiveroute <address>       # raw RPC
+tau-testnet rpc "getreceiveroute <address>"   # raw RPC
 ```
 
 `getreceiveroute` answers:

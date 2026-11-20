@@ -1154,3 +1154,120 @@ def compute_receive_route_book_root(
     out.extend(encode_uint64(int(resolved_count)))
     out.extend(encode_hash32(resolved_acc))
     return blake3(bytes(out)).digest()
+
+
+# --- Envelopes: funds with spending conditions (spending limits) ---------------------
+
+DOMAIN_ENVELOPE_V1 = b"tau.envelope.v1"
+DOMAIN_ENVELOPE_RESOLVED_V1 = b"tau.envelope.resolved.v1"
+DOMAIN_ENVELOPE_BOOK_V1 = b"tau.envelope.book.v1"
+
+
+def _encode_envelope_terms(
+    sender_pubkey: Any,
+    sequence_number: int,
+    recipient_pubkey: Any,
+    amount: int,
+    caps: Any,
+    kind: int,
+    period: int,
+    recurring: bool,
+    expires_at: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_pubkey48(sender_pubkey))
+    out.extend(encode_uint64(int(sequence_number)))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    caps = list(caps)
+    out.extend(encode_uint32(len(caps)))
+    for cap in caps:
+        out.extend(encode_uint64(int(cap)))
+    out.extend(bytes([int(kind) & 0xFF]))
+    out.extend(encode_uint64(int(period)))
+    out.extend(encode_bool(bool(recurring)))
+    out.extend(encode_uint64(int(expires_at)))
+    return bytes(out)
+
+
+def compute_envelope_id(
+    sender_pubkey: Any,
+    sequence_number: int,
+    recipient_pubkey: Any,
+    amount: int,
+    caps: Any,
+    kind: int,
+    period: int,
+    recurring: bool,
+    expires_at: int,
+) -> bytes:
+    """BLAKE3 of the signed terms of an envelope. Returns 32 bytes.
+
+    Every spend and release names this id, so a signature never reaches funds
+    held under other terms.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ENVELOPE_V1.decode()))
+    out.extend(_encode_envelope_terms(
+        sender_pubkey, sequence_number, recipient_pubkey, amount, caps, kind, period,
+        recurring, expires_at,
+    ))
+    return blake3(bytes(out)).digest()
+
+
+def compute_envelope_resolved_acc(acc: Any, envelope_id: Any, outcome: int,
+                                  paid_out: int) -> bytes:
+    """Fold one closed envelope (spent, released, ended) and what its close paid
+    the recipient into the commitment."""
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ENVELOPE_RESOLVED_V1.decode()))
+    out.extend(encode_hash32(acc))
+    out.extend(encode_hash32(envelope_id))
+    out.extend(bytes([int(outcome) & 0xFF]))
+    out.extend(encode_uint64(int(paid_out)))
+    return blake3(bytes(out)).digest()
+
+
+def encode_envelope_entry(
+    envelope_id: Any,
+    sender_pubkey: Any,
+    sequence_number: int,
+    recipient_pubkey: Any,
+    amount: int,
+    caps: Any,
+    kind: int,
+    period: int,
+    recurring: bool,
+    expires_at: int,
+    anchor: int,
+    remaining: int,
+    period_index: int,
+    spent_in_period: int,
+    spends: int,
+    last_height: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_hash32(envelope_id))
+    out.extend(_encode_envelope_terms(
+        sender_pubkey, sequence_number, recipient_pubkey, amount, caps, kind, period,
+        recurring, expires_at,
+    ))
+    for value in (anchor, remaining, period_index, spent_in_period, spends, last_height):
+        out.extend(encode_uint64(int(value)))
+    return bytes(out)
+
+
+def compute_envelope_book_root(
+    entries: list, resolved_count: int, resolved_acc: Any
+) -> bytes:
+    """BLAKE3 of the envelope book: sorted open envelopes with where each
+    stands, then the closed ones."""
+    encoded = sorted(encode_envelope_entry(*e) for e in (entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ENVELOPE_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    out.extend(encode_uint64(int(resolved_count)))
+    out.extend(encode_hash32(resolved_acc))
+    return blake3(bytes(out)).digest()

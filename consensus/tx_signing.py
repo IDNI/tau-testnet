@@ -42,6 +42,11 @@ from consensus.payout import (
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_RULE_SET,
 )
+from consensus.envelope import (
+    TX_TYPE_ENVELOPE_RELEASE,
+    TX_TYPE_ENVELOPE_SEND,
+    TX_TYPE_ENVELOPE_SPEND,
+)
 from consensus.receive_route import (
     TX_TYPE_RECEIVE_ROUTE_RELEASE,
     TX_TYPE_RECEIVE_ROUTE_SET,
@@ -203,6 +208,21 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["owner_pubkey"] = payload.get("owner_pubkey")
         signing_dict["route_id"] = payload.get("route_id")
     # receive_route_remove signs the envelope only: it names the sender's own route.
+    elif tx_type == TX_TYPE_ENVELOPE_SEND:
+        # Every term the spending limit is computed from.
+        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
+        signing_dict["amount"] = payload.get("amount")
+        signing_dict["caps"] = payload.get("caps")
+        signing_dict["period_blocks"] = payload.get("period_blocks")
+        signing_dict["period_seconds"] = payload.get("period_seconds")
+        signing_dict["recurring"] = payload.get("recurring")
+        signing_dict["expires_at"] = payload.get("expires_at")
+    elif tx_type == TX_TYPE_ENVELOPE_SPEND:
+        signing_dict["envelope_id"] = payload.get("envelope_id")
+        signing_dict["to_pubkey"] = payload.get("to_pubkey")
+        signing_dict["amount"] = payload.get("amount")
+    elif tx_type == TX_TYPE_ENVELOPE_RELEASE:
+        signing_dict["envelope_id"] = payload.get("envelope_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

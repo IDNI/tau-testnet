@@ -515,3 +515,13 @@ class TipAdmissionView:
         lm = getattr(chain_state, "_lifecycle_manager", None)
         book = getattr(lm, "receive_routes", None)
         return book if isinstance(book, ReceiveRouteBook) else ReceiveRouteBook()
+
+    # --- Envelopes ---------------------------------------------------------------
+
+    def envelope_book(self):
+        """The envelope book of the canonical tip, read like `payout_book`."""
+        from consensus.envelope import EnvelopeBook
+
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        book = getattr(lm, "envelopes", None)
+        return book if isinstance(book, EnvelopeBook) else EnvelopeBook()

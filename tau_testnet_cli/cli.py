@@ -1225,6 +1225,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_standing_subparsers(sub)
     _add_payout_subparsers(sub)
     _add_route_subparsers(sub)
+    _add_envelope_subparsers(sub)
     _add_node_subparsers(sub)
 
     return parser
@@ -3019,6 +3020,227 @@ def cmd_route_show(args: argparse.Namespace) -> int:
         print_error(str(exc))
         return EXIT_LOCAL
     return _simple_query(args, f"getreceiveroute {address}")
+
+
+# --- Envelopes (spending limits) -------------------------------------------------
+
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+
+
+def _duration_seconds(text: str) -> int:
+    """Seconds from `90`, `90s`, `15m`, `12h`, `7d` or `2w`."""
+    raw = str(text).strip().lower()
+    unit = _DURATION_UNITS.get(raw[-1:]) if raw else None
+    number = raw[:-1] if unit else raw
+    if not number.isdigit() or int(number) < 1:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a duration (examples: 3600, 90s, 15m, 12h, 7d, 2w)")
+    return int(number) * (unit or 1)
+
+
+def _envelope_caps(values) -> list:
+    caps = []
+    for value in values or []:
+        for part in str(value).split(","):
+            part = part.strip()
+            if not part.isdigit():
+                raise _PayloadError(f"--cap {value!r}: caps are whole amounts")
+            caps.append(int(part))
+    if not caps:
+        raise _PayloadError("give at least one --cap")
+    return caps
+
+
+def _envelope_clock(args, tip: int, now: int) -> dict:
+    """The period and end of an envelope, both on one clock."""
+    if args.period_blocks is not None:
+        if args.ends_at is not None or args.ends_in is not None:
+            raise _PayloadError("a block period ends on the block clock: "
+                                "give --ends-at-height or --ends-in-blocks")
+        if args.ends_at_height is not None:
+            end = int(args.ends_at_height)
+        elif args.ends_in_blocks is not None:
+            end = tip + 1 + int(args.ends_in_blocks)
+        else:
+            raise _PayloadError("give --ends-at-height or --ends-in-blocks")
+        return {"period_blocks": int(args.period_blocks), "expires_at": end}
+    if args.ends_at_height is not None or args.ends_in_blocks is not None:
+        raise _PayloadError("a time period ends on the time clock: "
+                            "give --ends-at or --ends-in")
+    if args.ends_at is not None:
+        end = int(args.ends_at)
+    elif args.ends_in is not None:
+        end = now + int(args.ends_in)
+    else:
+        raise _PayloadError("give --ends-at or --ends-in")
+    return {"period_seconds": int(args.period), "expires_at": end}
+
+
+def cmd_envelope_send(args: argparse.Namespace) -> int:
+    from consensus.envelope import EnvelopeShapeError, parse_envelope_send
+
+    created = {}
+
+    def _build(sender_pubkey, sequence_number, expire_at_height, tip):
+        now = int(_now())
+        payload = tx_mod.build_envelope_send_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=now + args.expiry,
+            expire_at_height=expire_at_height,
+            recipient_pubkey=args.to.strip().lower(),
+            amount=int(args.amount),
+            caps=_envelope_caps(args.cap),
+            recurring=bool(args.recurring),
+            **_envelope_clock(args, tip, now),
+        )
+        try:
+            created["id"] = parse_envelope_send(payload).envelope_id.hex()
+        except EnvelopeShapeError as exc:
+            raise _PayloadError(str(exc))
+        return payload
+
+    status = _submit_rule_tx(args, _build, pass_tip=True)
+    if status == EXIT_OK and created.get("id"):
+        quiet = args.json or getattr(args, "dry_run", False)
+        print(f"envelope id: {created['id']}", file=sys.stderr if quiet else sys.stdout)
+    return status
+
+
+def cmd_envelope_spend(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        to = sender_pubkey if args.to.strip().lower() == "self" else args.to.strip().lower()
+        return tx_mod.build_envelope_spend_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            envelope_id=args.envelope_id.strip().lower(),
+            to_pubkey=to,
+            amount=int(args.amount),
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_envelope_release(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_envelope_release_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            envelope_id=args.envelope_id.strip().lower(),
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_envelope_show(args: argparse.Namespace) -> int:
+    return _simple_query(args, f"getenvelope {args.envelope_id.strip().lower()}")
+
+
+def cmd_envelope_list(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getenvelopes {address} {args.role}")
+
+
+def _add_envelope_subparsers(sub) -> None:
+    """`tau-testnet envelope ...` -- send money someone may spend only so fast."""
+    p_env = sub.add_parser(
+        "envelope",
+        parents=[_GLOBAL_PARENT],
+        help="Envelopes: money with a spending limit (send, spend, release, show, list)",
+    )
+    esub = p_env.add_subparsers(dest="envelope_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser, fee=True):
+        if fee:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument(
+            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+        window = parser.add_mutually_exclusive_group()
+        window.add_argument("--expire-in", type=_block_count, default=1000,
+                            help="Blocks the transaction may land in, from the next one")
+        window.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+        parser.add_argument("--dry-run", action="store_true",
+                            help="Sign and print the transaction, and send nothing")
+
+    p_send = esub.add_parser(
+        "send", parents=common,
+        help="Send money in an envelope: the recipient may spend at most a cap per period",
+    )
+    _key_group(p_send)
+    p_send.add_argument("--to", required=True, metavar="PUBKEY", help="The recipient (96 hex)")
+    p_send.add_argument("--amount", required=True, type=int, help="What the envelope holds")
+    p_send.add_argument(
+        "--cap", action="append", required=True, metavar="N[,N...]",
+        help="Most the recipient may spend in one period; repeat or comma-separate "
+             "for a schedule, first period first (--cap 1000,500)")
+    p_send.add_argument("--recurring", action="store_true",
+                        help="After the list, the last cap repeats every period "
+                             "(without it, the limit stops after the list)")
+    period = p_send.add_mutually_exclusive_group(required=True)
+    period.add_argument("--period", type=_duration_seconds, metavar="DURATION",
+                        help="Period on the time clock: 3600, 12h, 7d, 2w")
+    period.add_argument("--period-blocks", type=_block_count, metavar="N",
+                        help="Period on the block clock")
+    ends = p_send.add_mutually_exclusive_group(required=True)
+    ends.add_argument("--ends-in", type=_duration_seconds, metavar="DURATION",
+                      help="End this long from now (time clock); the rest then goes "
+                           "to the recipient")
+    ends.add_argument("--ends-at", type=int, metavar="UNIX")
+    ends.add_argument("--ends-in-blocks", type=_block_count, metavar="N",
+                      help="End this many blocks after the next one (block clock)")
+    ends.add_argument("--ends-at-height", type=int, metavar="HEIGHT")
+    _tx_flags(p_send)
+    p_send.set_defaults(func=cmd_envelope_send)
+
+    p_spend = esub.add_parser(
+        "spend", parents=common,
+        help="As an envelope's recipient, pay someone (or yourself) out of it",
+    )
+    _key_group(p_spend)
+    p_spend.add_argument("envelope_id", help="Envelope id (64 hex)")
+    p_spend.add_argument("--to", required=True, metavar="PUBKEY|self",
+                         help="Who is paid; 'self' moves it to your own balance")
+    p_spend.add_argument("--amount", required=True, type=int)
+    _tx_flags(p_spend)
+    p_spend.set_defaults(func=cmd_envelope_spend)
+
+    p_rel = esub.add_parser(
+        "release", parents=common,
+        help="As an envelope's sender, give the recipient everything left now",
+    )
+    _key_group(p_rel)
+    p_rel.add_argument("envelope_id", help="Envelope id (64 hex)")
+    _tx_flags(p_rel, fee=False)
+    p_rel.set_defaults(func=cmd_envelope_release)
+
+    p_show = esub.add_parser("show", parents=common,
+                             help="One envelope: terms, this period's room, history")
+    p_show.add_argument("envelope_id", help="Envelope id (64 hex)")
+    p_show.set_defaults(func=cmd_envelope_show)
+
+    p_list = esub.add_parser("list", parents=common,
+                             help="Envelopes an address holds (in) or sent (out)")
+    p_list.add_argument("address", nargs="?", help="Address (default: your key's)")
+    _key_group(p_list, required=False)
+    p_list.add_argument("--role", choices=["in", "out", "all"], default="all")
+    p_list.set_defaults(func=cmd_envelope_list)
 
 
 def _add_route_subparsers(sub) -> None:

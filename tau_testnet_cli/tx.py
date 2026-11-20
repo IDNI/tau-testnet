@@ -1127,3 +1127,111 @@ def build_receive_route_release_tx(
         "owner_pubkey": owner_pubkey.lower(),
         "route_id": route_id.lower(),
     }
+
+
+def build_envelope_send_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    recipient_pubkey: str,
+    amount: int,
+    caps: list,
+    expires_at: int,
+    period_blocks: int | None = None,
+    period_seconds: int | None = None,
+    recurring: bool = False,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='envelope_send'`` payload (without signature).
+
+    ``amount`` leaves the sender at once and waits in the envelope for the
+    recipient to spend, at most ``caps[n]`` in period n (``recurring`` repeats
+    the last cap). Exactly one period clock; ``expires_at`` is on that clock.
+    """
+    if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
+        raise ValueError("recipient_pubkey must be a 96-character hex public key")
+    if (period_blocks is None) == (period_seconds is None):
+        raise ValueError("give exactly one of period_blocks and period_seconds")
+    if not isinstance(caps, (list, tuple)) or not caps:
+        raise ValueError("caps must be a non-empty list of amounts")
+    tx = {
+        "tx_type": "envelope_send",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "recipient_pubkey": recipient_pubkey.lower(),
+        "amount": int(amount),
+        "caps": [int(c) for c in caps],
+        "expires_at": int(expires_at),
+    }
+    if period_blocks is not None:
+        tx["period_blocks"] = int(period_blocks)
+    else:
+        tx["period_seconds"] = int(period_seconds)
+    if recurring:
+        tx["recurring"] = True
+    return tx
+
+
+def build_envelope_spend_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    envelope_id: str,
+    to_pubkey: str,
+    amount: int,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='envelope_spend'`` payload (without signature).
+
+    Signed by the envelope's RECIPIENT; pays ``to_pubkey`` (anyone, the
+    recipient included) out of the envelope. The fee is the recipient's.
+    """
+    if not isinstance(envelope_id, str) or len(envelope_id) != 64:
+        raise ValueError("envelope_id must be a 64-character hex string")
+    if not isinstance(to_pubkey, str) or len(to_pubkey) != 96:
+        raise ValueError("to_pubkey must be a 96-character hex public key")
+    return {
+        "tx_type": "envelope_spend",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "envelope_id": envelope_id.lower(),
+        "to_pubkey": to_pubkey.lower(),
+        "amount": int(amount),
+    }
+
+
+def build_envelope_release_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    envelope_id: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='envelope_release'`` payload (without signature).
+
+    Signed by the envelope's SENDER: everything left goes to the recipient now.
+    Feeless.
+    """
+    if not isinstance(envelope_id, str) or len(envelope_id) != 64:
+        raise ValueError("envelope_id must be a 64-character hex string")
+    return {
+        "tx_type": "envelope_release",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "envelope_id": envelope_id.lower(),
+    }

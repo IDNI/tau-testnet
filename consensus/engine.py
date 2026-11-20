@@ -56,8 +56,22 @@ from .payout import (
     parse_payout_rule_set,
     settle as settle_payout,
 )
+from .envelope import (
+    ENVELOPE_TX_TYPES,
+    EnvelopeBook,
+    EnvelopeRefused,
+    EnvelopeShapeError,
+    TX_TYPE_ENVELOPE_SEND,
+    TX_TYPE_ENVELOPE_SPEND,
+    close_event as envelope_close_event,
+    parse_envelope_release,
+    parse_envelope_send,
+    parse_envelope_spend,
+)
 from .receive_route import (
     CREDIT_APPROVED_TRANSFER,
+    CREDIT_ENVELOPE_RELEASE,
+    CREDIT_ENVELOPE_SPEND,
     CREDIT_PAYOUT,
     CREDIT_RETRACTABLE_RELEASE,
     CREDIT_STANDING_PAYMENT,
@@ -120,6 +134,8 @@ from .rule_offers import (
 # `payout_rule_set` pays because it builds a clause; `payout_execute` is paid by
 # its executor, whoever that is, because it steps the rule. `receive_route_set`
 # pays because it adds to a bounded book; removing a route is free.
+# `envelope_send` and `envelope_spend` pay the fee of the transfer each is;
+# releasing an envelope is free.
 #
 # MUST stay in step with commands.sendtx.FEE_BEARING_TX_TYPES -- the same
 # constant is deliberately duplicated there to keep the admission path free of
@@ -129,7 +145,8 @@ FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_STANDING_PAYMENT_CREATE,
      TX_TYPE_STANDING_PAYMENT_UPDATE, TX_TYPE_STANDING_PAYMENT_EXECUTE,
-     TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_RECEIVE_ROUTE_SET}
+     TX_TYPE_PAYOUT_RULE_SET, TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_RECEIVE_ROUTE_SET,
+     TX_TYPE_ENVELOPE_SEND, TX_TYPE_ENVELOPE_SPEND}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -293,9 +310,40 @@ def _retractable_book(lm) -> Optional[RetractableBook]:
     return book if isinstance(book, RetractableBook) else None
 
 
+def _envelope_book(lm) -> Optional[EnvelopeBook]:
+    book = getattr(lm, "envelopes", None)
+    return book if isinstance(book, EnvelopeBook) else None
+
+
 def _escrow_total(lm) -> int:
+    """Money the network holds outside balances: parked retractable transfers
+    and what open envelopes hold."""
     book = _retractable_book(lm)
-    return book.escrow_total() if book is not None else 0
+    envelopes = _envelope_book(lm)
+    return ((book.escrow_total() if book is not None else 0)
+            + (envelopes.escrow_total() if envelopes is not None else 0))
+
+
+def _end_envelopes(lm, balances, sequences, height, timestamp,
+                   route_events: Optional[List[Dict[str, Any]]] = None
+                   ) -> List[Dict[str, Any]]:
+    """Close every envelope whose end this block reached and pay what it held to
+    its recipient, through the recipient's receive route; their events."""
+    book = _envelope_book(lm)
+    if book is None or not book.has_ending(int(height), int(timestamp)):
+        return []
+    credit = _balance_credit(balances, sequences, faucet.amount(lm))
+    events: List[Dict[str, Any]] = []
+    for terms, left in book.end_due(int(height), int(timestamp)):
+        eid = terms.envelope_id.hex()
+        if left:
+            event = _routed_credit(lm, terms.recipient_pubkey, left, timestamp, credit,
+                                   CREDIT_ENVELOPE_RELEASE, payer_pubkey=terms.sender_pubkey,
+                                   envelope_id=eid)
+            if event is not None and route_events is not None:
+                route_events.append(event)
+        events.append(envelope_close_event(terms, "ended", left))
+    return events
 
 
 def _route_book(lm) -> Optional[ReceiveRouteBook]:
@@ -1265,6 +1313,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp,
             route_events=route_block_events,
         )
+        # Envelopes that reached their end pay the rest to their recipients next,
+        # so, like a release, that money can fund a standing payment due now.
+        envelopes_ended = _end_envelopes(
+            lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp,
+            route_events=route_block_events,
+        )
         _block_session = session if session is not None else getattr(proposal, "session", None)
         standing_sweep = _run_standing_payments(
             lm, t_bals, t_seqs, t_lts, metadata,
@@ -1368,6 +1422,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if events and tx in exec_result.accepted_transactions:
                 route_events.extend(events)
         route_events.extend(route_block_events)
+
+        # Envelopes: sends, spends and releases of the kept transactions, then
+        # the envelopes whose end the block reached.
+        envelope_events: List[Dict[str, Any]] = []
+        for i, tx in enumerate(block.transactions):
+            events = (exec_result.receipts.get(tx.get('tx_id', str(i))) or {}).get(
+                "envelope_events")
+            if events and tx in exec_result.accepted_transactions:
+                envelope_events.extend(events)
+        envelope_events.extend(envelopes_ended)
 
         # 3. Post-State Materialization Layer
         
@@ -1527,6 +1591,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "standing_events": standing_events,
                 "payout_events": payout_events,
                 "route_events": route_events,
+                "envelope_events": envelope_events,
             }
         )
         
@@ -1543,6 +1608,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "standing_events": standing_events,
                 "payout_events": payout_events,
                 "route_events": route_events,
+                "envelope_events": envelope_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -2099,6 +2165,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_route_set = None
             pending_route_remove: Optional[str] = None
             pending_route_release: Optional[str] = None
+            pending_envelope_send = None
+            pending_envelope_spend = None
+            pending_envelope_release: Optional[bytes] = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2332,7 +2401,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
-                                          escrow=False, credit_class=CREDIT_TRANSFER):
+                                          escrow=False, credit_class=CREDIT_TRANSFER,
+                                          from_envelope=False):
                 """Execute ONE transfer under the fee model. True to continue.
 
                 Extracted verbatim from the user_tx transfer loop so the
@@ -2354,7 +2424,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
                 `escrow` stages only the debit: the credit belongs to the
                 retractable book until it releases. `credit_class` names the
-                credit for the recipient's receive route.
+                credit for the recipient's receive route. `from_envelope` stages
+                only the credit: the money leaves an envelope the caller has
+                already checked, not the sender's balance.
                 """
                 nonlocal accepted_in_block, hard_reject, execution_success
                 try:
@@ -2455,19 +2527,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                             return False
 
-                    current_from = _read_bal(from_addr)
-                    if current_from < amount:
-                        logger.error(
-                            "Insufficient funds for %s to send %s. Has: %s.",
-                            from_addr[:10], amount, current_from,
-                        )
-                        if not replay_mode:
-                            accepted_in_block = False
-                            hard_reject = True
-                        execution_success = False
-                        tx_receipt["logs"].append("Transfer balance state failed (insufficient)")
-                        return False
-                    staged_writes[from_addr] = current_from - amount
+                    if not from_envelope:
+                        current_from = _read_bal(from_addr)
+                        if current_from < amount:
+                            logger.error(
+                                "Insufficient funds for %s to send %s. Has: %s.",
+                                from_addr[:10], amount, current_from,
+                            )
+                            if not replay_mode:
+                                accepted_in_block = False
+                                hard_reject = True
+                            execution_success = False
+                            tx_receipt["logs"].append("Transfer balance state failed (insufficient)")
+                            return False
+                        staged_writes[from_addr] = current_from - amount
                     if not escrow:
                         _stage_credit(to_addr, amount, credit_class, from_addr)
                 except FeeRuleError:
@@ -3447,6 +3520,104 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         tx_receipt["logs"].append(f"Receive route change ignored: {reason}")
                         accepted_in_block = False
 
+            elif tx_type in ENVELOPE_TX_TYPES:
+                # Root fields only: only they are signed. A send and a spend are
+                # each ONE transfer through the same gates as any transfer the
+                # signer makes (o1, o5, the fee steps); a release moves what the
+                # envelope holds to its recipient and needs no Tau evaluation.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    book = lifecycle_mgr.envelopes
+                    h_now, ts_now = int(block_height or 0), int(block_timestamp or 0)
+                    reason = ""
+                    if tx_type == TX_TYPE_ENVELOPE_SEND:
+                        terms = None
+                        try:
+                            terms = parse_envelope_send(tx)
+                        except EnvelopeShapeError as exc:
+                            reason = f"invalid envelope ({exc})"
+                        if terms is not None:
+                            if not isinstance(sender, str) or sender != terms.sender_pubkey:
+                                reason = "sender is not the signer"
+                            elif target_balances is None:
+                                reason = "no balance overlay to escrow from"
+                            else:
+                                _, reason = book.can_admit_send(terms, h_now, ts_now)
+                        if reason:
+                            tx_receipt["logs"].append(f"Envelope not sent: {reason}")
+                            tx_receipt["reason"] = "envelope_not_sent"
+                            accepted_in_block = False
+                        else:
+                            sent = _execute_fee_era_transfer(
+                                terms.sender_pubkey, terms.recipient_pubkey, terms.amount,
+                                slot_values=_approval_slot_values(), overrides={},
+                                escrow=True,
+                            )
+                            fee_already_measured = True
+                            if sent and accepted_in_block and not hard_reject:
+                                pending_envelope_send = terms
+                                tx_receipt["logs"].append(
+                                    "Envelope sent: " + terms.envelope_id.hex())
+                    elif tx_type == TX_TYPE_ENVELOPE_SPEND:
+                        spend = None
+                        try:
+                            spend = parse_envelope_spend(tx)
+                        except EnvelopeShapeError as exc:
+                            reason = f"invalid envelope spend ({exc})"
+                        if spend is not None:
+                            if not isinstance(sender, str) or sender != spend.spender_pubkey:
+                                reason = "sender is not the signer"
+                            elif target_balances is None:
+                                reason = "no balance overlay to pay into"
+                            else:
+                                try:
+                                    book.check_spend(spend, h_now, ts_now)
+                                except EnvelopeRefused as exc:
+                                    reason = str(exc)
+                        if reason:
+                            tx_receipt["logs"].append(f"Envelope spend refused: {reason}")
+                            tx_receipt["reason"] = "envelope_not_spent"
+                            accepted_in_block = False
+                        else:
+                            paid = _execute_fee_era_transfer(
+                                spend.spender_pubkey, spend.to_pubkey, spend.amount,
+                                slot_values=_approval_slot_values(), overrides={},
+                                credit_class=CREDIT_ENVELOPE_SPEND, from_envelope=True,
+                            )
+                            fee_already_measured = True
+                            if paid and accepted_in_block and not hard_reject:
+                                pending_envelope_spend = spend
+                                tx_receipt["logs"].append(
+                                    f"Envelope spend: {spend.amount} from "
+                                    f"{spend.envelope_id.hex()}")
+                            else:
+                                tx_receipt.pop("route_events", None)
+                    else:  # TX_TYPE_ENVELOPE_RELEASE
+                        release = None
+                        try:
+                            release = parse_envelope_release(tx)
+                        except EnvelopeShapeError as exc:
+                            reason = f"invalid envelope release ({exc})"
+                        if release is not None:
+                            if not isinstance(sender, str) or sender != release.signer_pubkey:
+                                reason = "sender is not the signer"
+                            elif target_balances is None:
+                                reason = "no balance overlay to pay into"
+                            else:
+                                _, reason = book.can_admit_release(release)
+                        if reason:
+                            tx_receipt["logs"].append(f"Envelope not released: {reason}")
+                            tx_receipt["reason"] = "envelope_not_released"
+                            accepted_in_block = False
+                        else:
+                            terms = book.get(release.envelope_id)
+                            left = book.state_of(release.envelope_id).remaining
+                            _stage_credit(terms.recipient_pubkey, left,
+                                          CREDIT_ENVELOPE_RELEASE, sender)
+                            pending_envelope_release = release.envelope_id
+                            tx_receipt["logs"].append(
+                                "Envelope released: " + release.envelope_id.hex())
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -4077,6 +4248,38 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     gone = _lifecycle_for_write().receive_routes.release(pending_route_release)
                     tx_receipt.setdefault("route_events", []).append(
                         route_lifecycle_event(gone, "released", tx_id=tx_id))
+                h_now, ts_now = int(block_height or 0), int(block_timestamp or 0)
+                if pending_envelope_send is not None:
+                    terms = pending_envelope_send
+                    eid = _lifecycle_for_write().envelopes.send(terms, h_now, ts_now)
+                    tx_receipt.setdefault("envelope_events", []).append({
+                        "outcome": "sent", "envelope_id": eid.hex(),
+                        "sender_pubkey": terms.sender_pubkey,
+                        "recipient_pubkey": terms.recipient_pubkey,
+                        "amount": terms.amount, "tx_id": tx_id,
+                    })
+                elif pending_envelope_spend is not None:
+                    spend = pending_envelope_spend
+                    book = _lifecycle_for_write().envelopes
+                    terms = book.get(spend.envelope_id)
+                    state, emptied = book.record_spend(
+                        spend.envelope_id, spend.amount, h_now, ts_now)
+                    events = tx_receipt.setdefault("envelope_events", [])
+                    events.append({
+                        "outcome": "spend", "envelope_id": spend.envelope_id.hex(),
+                        "sender_pubkey": terms.sender_pubkey,
+                        "recipient_pubkey": terms.recipient_pubkey,
+                        "to_pubkey": spend.to_pubkey, "amount": spend.amount,
+                        "remaining": state.remaining, "period_index": state.period_index,
+                        "spent_in_period": state.spent_in_period, "tx_id": tx_id,
+                    })
+                    if emptied:
+                        events.append(envelope_close_event(terms, "emptied", 0, tx_id=tx_id))
+                elif pending_envelope_release is not None:
+                    terms, left = _lifecycle_for_write().envelopes.release(
+                        pending_envelope_release)
+                    tx_receipt.setdefault("envelope_events", []).append(
+                        envelope_close_event(terms, "released", left, tx_id=tx_id))
             else:
                 # Nothing the transaction staged lands, so no split happened either.
                 tx_receipt.pop("route_events", None)
@@ -4134,7 +4337,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # (issue #21). Only transfers count -- a rule-only user_tx is not
                 # a send -- and only for txs that stay accepted, mirroring the
                 # staged-balance commit rule.
-                if (sender and (transfers_op_data or stamp_retractable_park)
+                # An envelope send and a spend are transfers the signer makes
+                # (spending limits); a release only hands over what already left.
+                if (sender and (transfers_op_data or stamp_retractable_park
+                                or pending_envelope_send is not None
+                                or pending_envelope_spend is not None)
                         and target_last_transfer_ts is not None):
                     target_last_transfer_ts[sender] = int(block_timestamp or 0)
                 # A payout is a send from the ACCOUNT, not from its executor.
