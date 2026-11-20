@@ -108,6 +108,8 @@ _SNAPSHOT_TX_TYPES = frozenset({
     "rule_offer_reject",
     "approval_request",
     "transfer_vote",
+    "rule_change_request",
+    "rule_change_cancel",
     "retractable_transfer",
     "retract_transfer",
 })
@@ -628,7 +630,8 @@ class NetworkService:
                     if rule_txs_count >= TAU_MEMPOOL_SNAPSHOT_MAX_RULE_TXS:
                         continue
                     rule_txs_count += 1
-                elif tx_type in ("approval_request", "transfer_vote"):
+                elif tx_type in ("approval_request", "transfer_vote",
+                                 "rule_change_request", "rule_change_cancel"):
                     # Same reasoning, own quota: parked requests accumulate while
                     # they wait for signatures, so they are exactly the kind of
                     # backlog that could swallow a snapshot.
@@ -857,14 +860,23 @@ class NetworkService:
     async def _on_approval_gossip(self, envelope: Dict[str, Any]) -> None:
         from .protocols import (
             TAU_MAX_APPROVAL_REQUEST_BYTES,
+            TAU_MAX_RULE_CHANGE_CANCEL_BYTES,
+            TAU_MAX_RULE_CHANGE_REQUEST_BYTES,
             TAU_MAX_TRANSFER_VOTE_BYTES,
         )
+        # Rule-change requests and cancels travel with the other co-signature
+        # traffic. Before they were listed here they fell through to the
+        # transactions topic, whose handler accepts user_tx alone, so a request
+        # reached only the node it was submitted to.
         await self._process_gossip_payload(
             envelope,
-            allowed_types={"approval_request", "transfer_vote"},
+            allowed_types={"approval_request", "transfer_vote",
+                           "rule_change_request", "rule_change_cancel"},
             type_limits={
                 "approval_request": TAU_MAX_APPROVAL_REQUEST_BYTES,
                 "transfer_vote": TAU_MAX_TRANSFER_VOTE_BYTES,
+                "rule_change_request": TAU_MAX_RULE_CHANGE_REQUEST_BYTES,
+                "rule_change_cancel": TAU_MAX_RULE_CHANGE_CANCEL_BYTES,
             },
         )
 
@@ -969,6 +981,15 @@ class NetworkService:
         elif tx_type == "transfer_vote":
             if "request_id" not in p_dict:
                 logger.debug("Gossip rejected: transfer_vote missing request_id")
+                return
+        elif tx_type == "rule_change_request":
+            missing = [f for f in ("kind", "expire_at_height") if f not in p_dict]
+            if missing:
+                logger.debug("Gossip rejected: rule_change_request missing %s", missing)
+                return
+        elif tx_type == "rule_change_cancel":
+            if "request_id" not in p_dict:
+                logger.debug("Gossip rejected: rule_change_cancel missing request_id")
                 return
         elif tx_type == "retractable_transfer":
             if "recipient_pubkey" not in p_dict or "amount" not in p_dict:
@@ -1603,7 +1624,8 @@ class NetworkService:
             return TAU_GOSSIP_TOPIC_GOVERNANCE
         if tx_type in ("rule_offer", "rule_offer_accept", "rule_offer_reject"):
             return TAU_GOSSIP_TOPIC_RULES
-        if tx_type in ("approval_request", "transfer_vote"):
+        if tx_type in ("approval_request", "transfer_vote",
+                       "rule_change_request", "rule_change_cancel"):
             return TAU_GOSSIP_TOPIC_APPROVALS
         if tx_type in ("retractable_transfer", "retract_transfer"):
             return TAU_GOSSIP_TOPIC_RETRACTABLE
