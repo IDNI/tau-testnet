@@ -5,6 +5,7 @@ single slot apart from the sendtx slots, and never touches the standby. The plai
 form runs no Tau and says that the fee check was skipped.
 """
 import json
+import time
 from unittest.mock import PropertyMock, patch
 
 import pytest
@@ -27,6 +28,7 @@ FAR = 9_999_999_999
 BASE_FEE = 10
 CUSTOM_FEE = 3
 OFFER_RULE = "always ( o5[t]:bv[24] = { #x000000 }:bv[24] )."
+CHAIN = "ab" * 32
 
 
 class _Session:
@@ -95,6 +97,7 @@ def node(temp_database, mock_policy_evaluators, monkeypatch):
         patch.object(TipAdmissionView, "approval_slots_active",
                      new_callable=PropertyMock, return_value=True),
         patch.object(TipAdmissionView, "get_offer", return_value=_offer_row()),
+        patch("db.get_genesis_hash", return_value=CHAIN),
     ]
     mocks = [p.start() for p in patches]
     mocks[3].is_set.return_value = True
@@ -147,7 +150,103 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
+    if kind in _PAYMENT_KINDS:
+        return _payment_payload(kind, fee_limit)
     raise AssertionError(kind)
+
+
+_PAYMENT_KINDS = {
+    "standing_payment_create", "standing_payment_update", "standing_payment_execute",
+    "allowance_open", "allowance_draw", "receive_route_set", "payout_rule_set",
+    "payout_execute",
+}
+
+
+def _reset_payments():
+    from consensus.payments import PaymentBooks
+    chain_state._lifecycle_manager.programmable = PaymentBooks()
+
+
+def _payment_payload(kind, fee_limit):
+    """A draft each fee-bearing payment type can estimate. State is seeded for
+    the types that act on an instruction which already exists."""
+    from consensus.payments import PaymentBooks
+    now = int(time.time())
+    _reset_payments()
+    book: PaymentBooks = chain_state._lifecycle_manager.programmable
+    common = dict(chain_id=CHAIN)
+    if kind == "standing_payment_create":
+        return _envelope(
+            kind, SENDER, fee_limit, recipient_pubkey=RECIPIENT, amount=100,
+            schedule_kind="seconds", interval=7 * 86400, first_due=now + 3600,
+            window=86400, max_occurrences=2, max_fee_per_execution=0, **common,
+        )
+    if kind == "standing_payment_update":
+        row = book.add_standing(SENDER, 0, CHAIN, {
+            "recipient_pubkey": RECIPIENT, "amount": 100, "schedule_kind": "seconds",
+            "interval": 7 * 86400, "first_due": now + 3600, "window": 86400,
+            "max_occurrences": 2, "max_fee_per_execution": 0,
+        })
+        return _envelope(
+            kind, SENDER, fee_limit, standing_id=row["id"], recipient_pubkey=RECIPIENT,
+            amount=80, schedule_kind="seconds", interval=7 * 86400,
+            first_due=now + 7200, window=86400, max_occurrences=2,
+            max_fee_per_execution=0, **common,
+        )
+    if kind == "standing_payment_execute":
+        row = book.add_standing(SENDER, 0, CHAIN, {
+            "recipient_pubkey": RECIPIENT, "amount": 100, "schedule_kind": "seconds",
+            "interval": 7 * 86400, "first_due": now - 60, "window": 86400,
+            "max_occurrences": 2, "max_fee_per_execution": 0,
+        })
+        return _envelope(
+            kind, SENDER, fee_limit, standing_id=row["id"], occurrence=0, **common,
+        )
+    if kind == "allowance_open":
+        return _envelope(
+            kind, SENDER, fee_limit, grantee_pubkey=RECIPIENT, amount=100,
+            start_at=0, hold_seconds=0, spend_cap=100, cap_period="week",
+            cap_length=0, per_draw_cap=0, weekday_mask=0, hour_mask=0,
+            utc_offset_quarters=0, expires_at=now + 30 * 86400, refund_idle=0,
+            shared_key="", shared_cap=0, shared_period="", shared_length=0,
+            shared_anchor=0, **common,
+        )
+    if kind == "allowance_draw":
+        row = book.add_allowance(RECIPIENT, 0, CHAIN, {
+            "grantee_pubkey": SENDER, "amount": 500, "start_at": 0, "hold_seconds": 0,
+            "spend_cap": 500, "cap_period": "week", "cap_length": 0, "per_draw_cap": 0,
+            "weekday_mask": 0, "hour_mask": 0, "utc_offset_quarters": 0,
+            "expires_at": now + 30 * 86400, "refund_idle": 0, "shared_key": "",
+            "shared_cap": 0, "shared_period": "", "shared_length": 0, "shared_anchor": 0,
+        }, now - 100)
+        return _envelope(
+            kind, SENDER, fee_limit, allowance_id=row["id"],
+            recipient_pubkey=APPROVER, amount=10, **common,
+        )
+    if kind == "receive_route_set":
+        return _envelope(
+            kind, SENDER, fee_limit,
+            destinations=[{"pubkey": RECIPIENT, "bps": 2000}],
+            min_incoming=0, activate_at=0, expires_at=0, locked_until=0, **common,
+        )
+    if kind == "payout_rule_set":
+        return _envelope(
+            kind, SENDER, fee_limit,
+            legs=[{"pubkey": RECIPIENT, "expr": {"op": "bps", "bps": 500}}],
+            max_per_execution=1000, max_per_period=1000, period="week",
+            period_length=0, period_anchor=0, max_executions=4,
+            expires_at=now + 30 * 86400, bounded_by_gross=True, clause="", **common,
+        )
+    row = book.set_payout(RECIPIENT, CHAIN, {
+        "legs": [{"pubkey": SENDER, "expr": {"op": "bps", "bps": 500}}],
+        "max_per_execution": 1000, "max_per_period": 1000, "period": "week",
+        "period_length": 0, "period_anchor": 0, "max_executions": 4,
+        "expires_at": now + 30 * 86400, "bounded_by_gross": True, "clause": "",
+    })
+    return _envelope(
+        kind, SENDER, fee_limit, owner_pubkey=RECIPIENT, event_id="12" * 32,
+        gross=101, **common,
+    )
 
 
 def _check(payload, *, estimate=True):
@@ -158,7 +257,10 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request"]
+               "rule_change_request",
+               "standing_payment_create", "standing_payment_update",
+               "standing_payment_execute", "allowance_open", "allowance_draw",
+               "receive_route_set", "payout_rule_set", "payout_execute"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

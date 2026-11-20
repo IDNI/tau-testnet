@@ -503,8 +503,15 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
     empty_ok = allow_empty
     if wake_if_due and not empty_ok:
         book = getattr(lm, "retractable_transfers", None)
-        has_due = getattr(book, "has_due", None)
-        empty_ok = bool(has_due is not None and has_due(block_number, block_timestamp) is True)
+        has_due_fn = getattr(book, "has_due", None)
+        empty_ok = bool(has_due_fn is not None and has_due_fn(block_number, block_timestamp) is True)
+        if not empty_ok:
+            from consensus.payments import has_due as payments_due
+            payments_book = getattr(lm, "programmable", None)
+            empty_ok = bool(
+                payments_book is not None
+                and payments_due(payments_book, block_number, block_timestamp)
+            )
 
     # Get batch of reserved transactions from mempool. The chain-write lock is
     # already held for the whole round, so no second producer can sweep or

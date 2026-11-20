@@ -198,6 +198,7 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    programmable_payments_root: str = "",
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -243,6 +244,10 @@ def build_mechanism_metadata(
     if retractable_transfers_root is None:
         retractable_transfers_root = RetractableBook().root().hex()
     mech["retractable_transfers_root"] = retractable_transfers_root
+    # Same non-default gate as rule offers: a chain that never creates a
+    # standing payment, allowance, route or payout keeps its previous meta hash.
+    if programmable_payments_root:
+        mech["programmable_payments_root"] = programmable_payments_root
     return mech
 
 
@@ -451,6 +456,11 @@ class ConsensusLifecycleManager:
         # Co-signature approvals. A FIELD for the same reason rule_offers is.
         self.approval_requests = ApprovalRequestLifecycleManager()
         self.retractable_transfers = RetractableBook()
+        # Standing payments, allowances, receive routes and payout rules.
+        # Imported lazily: this module is on the import path of half the node,
+        # and the payments book imports the policy evaluator.
+        from consensus.payments import PaymentBooks
+        self.programmable = PaymentBooks()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
@@ -546,6 +556,11 @@ class ConsensusLifecycleManager:
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
+            programmable_payments_root=(
+                "" if getattr(self, "programmable", None) is None
+                or self.programmable.is_empty()
+                else self.programmable.root().hex()
+            ),
         )
         return compute_consensus_meta_hash(
             host_contract={},
