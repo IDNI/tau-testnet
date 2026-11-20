@@ -29,6 +29,17 @@ conjuncts whose guard binds i12 to exactly that account, and every other
 conjunct -- unguarded, or guarded on something else, or binding i12 to
 more than one account -- is listed under `unattributed` rather than
 dropped or guessed at.
+
+The response also carries the per-unit survival ledger (`units`),
+derived read-side from the snapshot sequence itself -- no extra state
+is recorded for it. A unit is the set of conjuncts one revision's step
+introduced; each conjunct is tracked across successive snapshots, so a
+unit reads `in_force`, `partially_displaced` or `displaced`, and a
+displaced conjunct names the revision that displaced it, the
+transaction that landed on that revision (from the recorded rule
+outcomes), and the conjunct that replaced it. The ledger is derived as
+of the snapshot being served: asked at a past height, it reports the
+survival known at that height, never from later state.
 """
 import re
 
@@ -150,6 +161,112 @@ def split_conjuncts_by_account(canonical_text: str, account: str):
     return mine, unattributed
 
 
+# A whole conjunct that is one plain output-stream definition -- the only
+# form a later revision can displace pointwise (the composer's rule in
+# consensus/engine.py, matched here so the ledger can name what replaced
+# a displaced conjunct).
+_PLAIN_ASSIGNMENT_STREAM_RE = re.compile(
+    r"^(o\d+)\[t\]:bv\[\d+\]\s*=\s*\{\s*(?:[0-9]+|#x[0-9a-fA-F]+)\s*\}:bv\[\d+\]$"
+)
+
+
+def _displacing_conjunct(displaced: str, present):
+    """The conjunct in `present` that took `displaced`'s place, or None.
+
+    Displacement is pointwise over plain assignments: the displacer is
+    the same stream's definition in the newer text. A displaced conjunct
+    of any other form has no single named replacement.
+    """
+    match = _PLAIN_ASSIGNMENT_STREAM_RE.match(displaced)
+    if match is None:
+        return None
+    stream = match.group(1)
+    for conjunct in present:
+        candidate = _PLAIN_ASSIGNMENT_STREAM_RE.match(conjunct)
+        if candidate is not None and candidate.group(1) == stream:
+            return conjunct
+    return None
+
+
+def derive_unit_ledger(snapshots, tx_by_revision):
+    """The per-unit survival ledger over a snapshot sequence.
+
+    `snapshots` is the recorded snapshot sequence (oldest revision
+    first, see db.get_all_spec_snapshots); `tx_by_revision` maps a
+    spec_revision to the transaction whose rule step landed on it (see
+    db.get_rule_tx_by_revision), or is empty when no outcomes were
+    recorded -- attribution then reads None, never a guess.
+
+    A conjunct instance is born at the first snapshot whose text
+    contains it and survives while every later snapshot still contains
+    it; the first snapshot without it is the revision that displaced
+    it. (A verbatim re-submission changes no snapshot, so it is not a
+    separate unit: the ledger counts units as they land in the composed
+    spec, which is the only existence a wallet can act on.) Instances
+    born at the same revision form one unit -- one rule step lands one
+    unit -- and the unit's status follows its conjuncts: all surviving
+    is `in_force`, none is `displaced`, a mix is `partially_displaced`.
+    """
+    instances = []
+    live = {}
+    for snapshot in snapshots:
+        revision = snapshot["spec_revision"]
+        present = top_level_conjuncts(snapshot["canonical_text"])
+        present_set = set(present)
+        for text, instance in list(live.items()):
+            if text not in present_set:
+                instance["displaced_at_revision"] = revision
+                instance["displaced_by_tx"] = tx_by_revision.get(revision)
+                instance["displaced_by"] = _displacing_conjunct(text, present)
+                del live[text]
+        for text in present:
+            if text not in live:
+                instance = {
+                    "conjunct": text,
+                    "introduced_at_revision": revision,
+                    "introduced_at_height": snapshot["height"],
+                    "displaced_at_revision": None,
+                    "displaced_by_tx": None,
+                    "displaced_by": None,
+                }
+                instances.append(instance)
+                live[text] = instance
+
+    units = []
+    by_revision = {}
+    for instance in instances:
+        revision = instance["introduced_at_revision"]
+        unit = by_revision.get(revision)
+        if unit is None:
+            unit = {
+                "introduced_at_revision": revision,
+                "introduced_at_height": instance["introduced_at_height"],
+                "introduced_by_tx": tx_by_revision.get(revision),
+                "status": "in_force",
+                "conjuncts": [],
+                "surviving_conjuncts": [],
+                "displaced_conjuncts": [],
+            }
+            by_revision[revision] = unit
+            units.append(unit)
+        unit["conjuncts"].append(instance["conjunct"])
+        if instance["displaced_at_revision"] is None:
+            unit["surviving_conjuncts"].append(instance["conjunct"])
+        else:
+            unit["displaced_conjuncts"].append({
+                "conjunct": instance["conjunct"],
+                "displaced_at_revision": instance["displaced_at_revision"],
+                "displaced_by_tx": instance["displaced_by_tx"],
+                "displaced_by": instance["displaced_by"],
+            })
+    for unit in units:
+        if unit["displaced_conjuncts"] and not unit["surviving_conjuncts"]:
+            unit["status"] = "displaced"
+        elif unit["displaced_conjuncts"]:
+            unit["status"] = "partially_displaced"
+    return units
+
+
 def execute(raw_command: str, container):
     parts = raw_command.split()
     if not 1 <= len(parts) <= 3:
@@ -212,6 +329,18 @@ def execute(raw_command: str, container):
         "canonical_text": snapshot["canonical_text"],
         "sha256": snapshot["sha256"],
     }
+    try:
+        sequence = db.get_all_spec_snapshots(
+            upto_revision=snapshot["spec_revision"]
+        )
+        data["units"] = derive_unit_ledger(
+            sequence, db.get_rule_tx_by_revision()
+        )
+    except Exception as exc:
+        return api_response.error_response(
+            "getactiverules", f"Failed to derive unit ledger: {exc}",
+            "INTERNAL_ERROR",
+        )
     if height is not None:
         data["requested_height"] = height
     if account is not None:
