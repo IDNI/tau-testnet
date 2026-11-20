@@ -113,6 +113,61 @@ def approval_slots_active(tip_view) -> bool:
     return getattr(tip_view, "approval_slots_active", False) is True
 
 
+def recipient_policy_active(tip_view) -> bool:
+    """Whether recipient controls (issues #47/#76) are active at the tip.
+
+    Same contract as `approval_slots_active` above, for the same reason: a
+    genuine `True` from consensus state or nothing. Absent or non-bool reads
+    as "not activated", which is the pre-activation behaviour of every
+    existing chain.
+    """
+    return getattr(tip_view, "recipient_policy_active", False) is True
+
+
+# --- Recipient-control stream width screening (i17, i16) --------------------
+#
+# Same reject-unless-annotated contract as the approval slots, for the two
+# streams the recipient gate feeds. The gate forces both at bv[64]; one clause
+# typing i17 at another width would pin that width process-wide and make the
+# gate's own feed overflow or fail to build — for everyone, until restart.
+
+_RECIPIENT_STREAMS = frozenset({
+    tau_defs.HOLD_STREAM_INDEX, tau_defs.CONTEXT_STREAM_INDEX,
+})
+
+
+def screen_recipient_stream_widths(body: str) -> Optional[str]:
+    """None when every i17/i16 mention is typed bv[64], else the reason.
+
+    Operates on comment-stripped text, like `screen_slot_widths`.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    scrubbed = strip_clause_comments(body or "")
+    width = tau_defs.RECIPIENT_STREAM_BV_WIDTH
+
+    for match in _SLOT_TYPED_RE.finditer(scrubbed):
+        idx, w = int(match.group(1)), int(match.group(2))
+        if idx in _RECIPIENT_STREAMS and w != width:
+            return (
+                f"i{idx} is a recipient-control stream and must be typed "
+                f"bv[{width}], found bv[{w}]"
+            )
+
+    for match in _SLOT_OCCURRENCE_RE.finditer(scrubbed):
+        idx = int(match.group(1))
+        if idx not in _RECIPIENT_STREAMS:
+            continue
+        tail = scrubbed[match.end():]
+        if not re.match(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*%d\s*\]" % width, tail):
+            return (
+                f"every mention of recipient-control stream i{idx} must be "
+                f"written i{idx}[t]:bv[{width}]; an untyped mention lets the "
+                f"engine infer a conflicting width process-wide"
+            )
+    return None
+
+
 # --- Slot width screening ---------------------------------------------------
 #
 # Per-stream bitvector typing is process-global and sticky: one rule typing i18
@@ -358,6 +413,55 @@ def audit_stream_collisions(spec_texts) -> List[str]:
                 f"registered clauses. Clear it or start from fresh state before "
                 f"activating."
             )
+    return findings
+
+
+def audit_recipient_stream_collisions(spec_texts) -> List[str]:
+    """Reasons recipient controls cannot safely be activated. Empty means clear.
+
+    Mirrors `audit_stream_collisions` for the approval slots. Before
+    activation, i17 and i16 are both ordinary custom input streams, so an
+    in-force rule may already read either with a meaning of its own — most
+    dangerously as a sender-supplied value. The moment the gate activates,
+    the host FORCES both streams on every transfer step: that rule's meaning
+    changes silently, and a rule typing either at a width other than bv[64]
+    additionally poisons process-global stream typing for the gate's own
+    clauses.
+
+    Refusing activation (flag stays off, chain keeps running) until the owner
+    replaces the rule is strictly better than either outcome. `spec_texts`
+    covers the COMPLETE effective spec, exactly as for the slot audit.
+
+    The i16 cooldown feed (issue #21) is a second, independent collision:
+    it is inactive today, but if it ever goes live it needs i16 too, so
+    activation is refused while it is active (see
+    `tau_defs.recipient_policy_conflicts_with_cooldown`).
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    findings: List[str] = []
+    streams = (tau_defs.HOLD_STREAM_INDEX, tau_defs.CONTEXT_STREAM_INDEX)
+
+    for label, text in spec_texts or ():
+        if not isinstance(text, str) or not text.strip():
+            continue
+        scrubbed = strip_clause_comments(text)
+
+        hit = [f"i{idx}" for idx in streams
+               if re.search(r"\bi%d\b" % idx, scrubbed)]
+        if hit:
+            findings.append(
+                f"{label} already references recipient-control stream(s) "
+                f"{', '.join(hit)}; activating would force host values onto "
+                f"them on every transfer step and change the rule's meaning"
+            )
+
+    if tau_defs.recipient_policy_conflicts_with_cooldown():
+        findings.append(
+            "the cooldown feed (issue #21) is active and needs i16; "
+            "recipient controls are mutually exclusive with it on that "
+            "stream, so the cooldown must take another stream first"
+        )
     return findings
 
 

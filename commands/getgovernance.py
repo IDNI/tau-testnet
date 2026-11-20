@@ -169,6 +169,33 @@ def execute(raw_command: str, container):
             "eligibility_mode": chain_state._lifecycle_manager.effective_eligibility_mode(),
             # "" means the levy goes to each block's proposer (the default).
             "fee_beneficiary": chain_state._lifecycle_manager.effective_fee_beneficiary(),
+            # Recipient controls (issues #47/#76): whether i17/i16 are
+            # reserved and the recipient gate runs, plus the capability
+            # block a wallet reads before offering an inbound whitelist or
+            # a hold cap. The i17/i16 widths live here, in capabilities,
+            # NOT in HOST_STREAM_WIDTHS: that dict feeds the fee model,
+            # and these streams carry no fee.
+            "recipient_policy_active": bool(
+                getattr(chain_state._lifecycle_manager, "recipient_policy_active", False)
+            ),
+            "capabilities": {
+                "recipient_controls": {
+                    "active": bool(
+                        getattr(chain_state._lifecycle_manager, "recipient_policy_active", False)
+                    ),
+                    "hold_stream": tau_defs.HOLD_STREAM_INDEX,
+                    "context_stream": tau_defs.CONTEXT_STREAM_INDEX,
+                    "hold_stream_width": tau_defs.RECIPIENT_STREAM_BV_WIDTH,
+                    "context_stream_width": tau_defs.RECIPIENT_STREAM_BV_WIDTH,
+                    "contexts": {
+                        "outgoing": tau_defs.CONTEXT_OUTGOING,
+                        "incoming_final": tau_defs.CONTEXT_INCOMING_FINAL,
+                        "incoming_time_park": tau_defs.CONTEXT_INCOMING_TIME_PARK,
+                        "incoming_height_park": tau_defs.CONTEXT_INCOMING_HEIGHT_PARK,
+                    },
+                    "preflight_command": "getrecipientpolicy",
+                },
+            },
             "active_validators": active_validators,
             "min_activation_height_for_next_update": min_activation_height,
             "active_consensus_id": active_consensus_id,
