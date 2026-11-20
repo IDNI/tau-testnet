@@ -24,12 +24,21 @@ recipient-only:
 
 Neutral default: a recipient with no o5 clause produces no o5 output
 and is allowed; a recipient whose rule states no cap produces no o10
-output and caps nothing.
+output and caps nothing. The default extends to the clause's shape:
+a clause written purely for the owner's OUTBOUND transfers -- it
+reads the destination stream i4, never the counterparty i3 or the
+release pair i17, and states no cap on o10 -- does not mention
+incoming transfers, so its verdict is not enforced against one
+(:func:`clause_applies_to_inbound`). On the recipient map i4 is the
+recipient himself, so such a clause judged inbound would veto
+payments for a reason it was never written to give.
 """
 
+import re
 from typing import Dict, Optional
 
 import tau_defs
+from consensus.rule_offers import strip_clause_comments
 
 REASON_POLICY_BLOCK = "recipient_policy_block"
 REASON_HOLD_CAP = "RECIPIENT_MAX_HOLD"
@@ -37,6 +46,48 @@ REASON_HOLD_CAP = "RECIPIENT_MAX_HOLD"
 _RELEASE_PAIR_STREAM = tau_defs.RECIPIENT_RELEASE_PAIR_STREAM_INDEX
 _HOLD_CAP_STREAM = tau_defs.RECIPIENT_HOLD_CAP_STREAM_INDEX
 _HEIGHT_STREAM = 6
+_COUNTERPARTY_STREAM = 3
+_DESTINATION_STREAM = 4
+
+_INPUT_REF = re.compile(r"\bi(\d+)\s*\[")
+_OUTPUT_REF = re.compile(r"\bo(\d+)\s*\[")
+
+
+def clause_applies_to_inbound(body) -> bool:
+    """Whether an accepted clause's verdict may refuse an INBOUND transfer.
+
+    The screen is textual, over the clause body the recipient
+    published: the verdict applies when the clause speaks about
+    incoming transfers -- it reads the counterparty (i3) or the
+    release pair (i17), or it states a hold cap (o10). It also
+    applies when the clause is direction-neutral: one that never
+    reads the destination stream i4 (a constant verdict, an
+    amount/balance rule) governs its owner as a party to a transfer
+    in either direction, exactly as it does when the owner sends.
+
+    Only the purely outbound shape is screened out: reads i4, never
+    reads i3/i17, writes no o10. Such a clause is the owner's send
+    whitelist; the neutral default leaves inbound transfers alone.
+
+    The scan runs on the COMMENT-STRIPPED body (the same helper the
+    codebase's own clause audits use): a stream reference that only
+    appears inside a '#' comment is not a reference the clause
+    makes, and must not flip the screen either way -- the same
+    flaw class as the raw-substring prescreen #133's PoCs caught
+    elsewhere (a key in a comment stepping the wrong recipient).
+    """
+    if not body:
+        return True
+    scrubbed = strip_clause_comments(str(body))
+    reads = {int(n) for n in _INPUT_REF.findall(scrubbed)}
+    writes = {int(n) for n in _OUTPUT_REF.findall(scrubbed)}
+    outbound_only = (
+        _DESTINATION_STREAM in reads
+        and _COUNTERPARTY_STREAM not in reads
+        and _RELEASE_PAIR_STREAM not in reads
+        and _HOLD_CAP_STREAM not in writes
+    )
+    return not outbound_only
 
 
 def pack_release_pair(release_ts: int = 0, release_height: int = 0) -> int:
