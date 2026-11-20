@@ -292,3 +292,135 @@ def test_executor_pays_the_fee_not_the_payer():
     assert ch.bal[ALICE] == 10_000 - 7 - 1_000
     assert ch.bal[BOB] == 1_000
     assert ch.bal[CAROL] == 100 - 7
+
+
+# -- admission/apply agreement + exactly-once clock ---------------------------
+
+
+class _ChainTipView:
+    """Admission view backed by a chain's live standing book.
+
+    Rows are the book's own snapshot rows -- the same dicts the
+    persisted-tip facade serves -- so admission screens exactly the
+    state block apply will see.
+    """
+
+    def __init__(self, chain, ts):
+        from consensus.standing import StandingTerms
+
+        self._rows = {}
+        for row in chain.book.snapshot_rows():
+            terms = StandingTerms(
+                payer=row["payer_pubkey"],
+                recipient=row["recipient_pubkey"],
+                amount=row["amount"],
+                kind=row["period_kind"],
+                anchor_ts=row["anchor_timestamp"],
+                window_start_offset=row["window_start_offset"],
+                window_end_offset=row["window_end_offset"],
+                end_kind=row["end_kind"],
+                end_value=row["end_value"],
+                sequence_number=row["sequence_number"],
+                supersedes=(
+                    bytes.fromhex(row["supersedes_id"])
+                    if row.get("supersedes_id")
+                    else None
+                ),
+            )
+            self._rows[terms.standing_id.hex()] = row
+        self.next_block_timestamp = ts
+        self.next_block_height = 50
+
+    def get_standing(self, standing_id):
+        return self._rows.get(bytes(standing_id).hex())
+
+
+def test_admission_and_apply_agree_on_the_same_book_and_order():
+    """Same execute payloads, two gates, one verdict.
+
+    Each payload is screened by mempool admission against the chain's
+    own tip book and then applied in a block at the same timestamp;
+    the verdicts must agree across the matrix: early, due, twice in
+    one period, late (the period's window has lapsed), a later period
+    due on its own window while the lapsed one stays unsettled (our
+    execute names no period, so there is no period argument to get
+    wrong -- the book derives the due period at both gates), and after
+    cancel. Admission and apply share the book's `due_period`, which
+    is what makes the agreement structural rather than coincidental.
+    Funds are sufficient throughout, so apply's balance screen -- the
+    one check admission cannot mirror -- never fires.
+    """
+    from consensus.admission import validate_standing_execute_payload
+
+    ch, sid = _created_chain()
+    carol_next_seq = [0]
+
+    def attempt(ts, height):
+        tx = execute_tx(sid.hex(), seq=carol_next_seq[0])
+        admitted = validate_standing_execute_payload(
+            tx, _ChainTipView(ch, ts)
+        ).is_valid
+        ch.block([tx], height=height, ts=ts)
+        applied = ch.accepted(tx)
+        if applied:
+            carol_next_seq[0] += 1
+        assert admitted == applied, (ts, admitted, applied)
+        return applied
+
+    assert not attempt(BEFORE, 21)  # early: before the first window
+    assert attempt(DUE_JAN, 22)  # due: inside the January window
+    assert not attempt(DUE_JAN + 3600, 23)  # twice in the same period
+    assert not attempt(_ts(2026, 2, 2, 12), 24)  # late: window lapsed
+    # February's window passes with no execution, so period 1 lapses
+    # unsettled. March is due on its own window and settles period 2;
+    # period 1 stays unsettled forever (no catch-up), and both gates
+    # agree on that too.
+    assert attempt(_ts(2026, 3, 31, 13), 25)
+    assert ch.book.paid_for_period(sid, 2)
+    assert not ch.book.paid_for_period(sid, 1)
+    # After the payer cancels, both gates refuse every later execute.
+    cx = cancel_tx(sid.hex())
+    ch.block([cx], height=26, ts=_ts(2026, 4, 2, 12))
+    assert ch.accepted(cx)
+    assert not attempt(_ts(2026, 4, 30, 13), 27)
+
+
+def test_execution_moves_only_the_payers_clock_never_the_executors():
+    """Exactly once, per authorization -- and only the payer's clock.
+
+    Carol executes Alice's standing payment: the settled-period clock
+    that moves belongs to Alice's authorization. Carol, the executor,
+    acquires no cooldown of her own: her own standing payment (Carol
+    as payer) is untouched by the execution and still executes in the
+    very same period, while nobody -- Carol included -- can execute
+    Alice's a second time in that period.
+    """
+    ch = Chain(_balances())
+    create_a = create_tx()  # Alice -> Bob, 1000
+    ch.block([create_a], height=20, ts=BEFORE)
+    sid_a = parse_standing_create(create_a).standing_id
+    create_c = create_tx(sk=SK_CAROL, sender=CAROL, amount=50, seq=0)
+    ch.block([create_c], height=21, ts=BEFORE)
+    sid_c = parse_standing_create(create_c).standing_id
+
+    ex = execute_tx(sid_a.hex(), seq=1)  # Carol executes Alice's
+    ch.block([ex], height=22, ts=DUE_JAN)
+    assert ch.accepted(ex)
+    assert ch.book.paid_for_period(sid_a, 0)
+    # The executor's own authorization did not move.
+    rec_c = ch.book.get(sid_c)
+    assert rec_c.executed_count == 0
+    assert rec_c.last_executed_period == -1
+    assert not ch.book.paid_for_period(sid_c, 0)
+    # Nobody can execute Alice's a second time in the period.
+    ex2 = execute_tx(sid_a.hex(), sk=SK_MALLORY, sender=MALLORY, seq=0)
+    ch.block([ex2], height=23, ts=DUE_JAN + 3600)
+    assert not ch.accepted(ex2)
+    # Carol's own payment still executes in the same period: executing
+    # for Alice gave her no cooldown.
+    ex3 = execute_tx(sid_c.hex(), sk=SK_ALICE, sender=ALICE, seq=1)
+    ch.block([ex3], height=24, ts=DUE_JAN + 7200)
+    assert ch.accepted(ex3)
+    assert ch.book.paid_for_period(sid_c, 0)
+    assert ch.bal[BOB] == 1_050
+    assert ch.bal[CAROL] == 100 - 50
