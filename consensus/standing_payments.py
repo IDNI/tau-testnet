@@ -528,6 +528,29 @@ class StandingPaymentBook:
             key=lambda f: f.period_index,
         )
 
+    def has_paid_period_containing(self, payer_pubkey: str, ts: int) -> bool:
+        """The rule-readable projection of the paid-for-period facts (#34).
+
+        True when at least one of `payer_pubkey`'s authorizations has the
+        period containing `ts` recorded paid. This is the value the node
+        feeds on tau_defs.STANDING_PAID_STREAM_INDEX (i17) for a transfer
+        from that account: per account, across ALL its authorizations —
+        a membership rule asks "is my current period paid?", not about
+        one named authorization. The recorded fact bounds are the
+        payment-calendar period bounds written at settlement
+        (period_bounds in execute()), so the period containing `ts` is
+        the fact whose [period_start_ts, period_end_ts) contains it.
+        Facts are history (they survive cancellation and supersession),
+        so a period paid under a since-replaced authorization version
+        still counts for that period.
+        """
+        payer = str(payer_pubkey).lower()
+        return any(
+            fact.payer_pubkey.lower() == payer
+            and fact.period_start_ts <= ts < fact.period_end_ts
+            for fact in self._facts.values()
+        )
+
     def total_executed(self, auth_id: bytes) -> Tuple[int, int]:
         """(settled occurrence count, cumulative total paid) for RPC/history."""
         _, progress = self._entry_and_progress(auth_id)
@@ -808,4 +831,14 @@ def standing_payment_capabilities() -> Dict[str, Any]:
             "the authorization's signed fee_limit"
         ),
         "paid_for_period_fact": True,
+        "paid_fact_rule_stream": {
+            "stream": tau_defs.TAU_INPUT_STREAM_STANDING_PAID,
+            "meaning": (
+                "fed on every transfer evaluation: 1 when the sender has "
+                "at least one standing authorization whose period "
+                "containing the block timestamp is recorded paid, else 0; "
+                "per account, across all of the sender's authorizations"
+            ),
+            "read_by": "any Tau rule, e.g. a membership o5 clause",
+        },
     }

@@ -205,7 +205,14 @@ TAU_INPUT_STREAM_TIMESTAMP = "i5"
 # (commands/sendtx.py, consensus/admission.py, consensus/engine.py). User custom
 # input streams therefore start at i13 (i12/i14/i15/i16 are screened explicitly
 # at every ingest/apply site; i13 only under tau_validator_set).
-RESERVED_STREAMS = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+# i17 (standing-paid fact, defined with the cooldown block below) IS in this
+# set, for the same reason i2 is: the node feeds it on every transfer
+# evaluation, so a sender-supplied operation on it would override the node's
+# value in the input merge and forge the fact. Membership here is what the
+# three ingest/apply screens check; it does not restrict READING the stream
+# from rule text (that is rule_text_forbidden_input_streams, a different set),
+# so a policy clause may read i17 exactly as it reads i2.
+RESERVED_STREAMS = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 17}
 
 # --- Tau Consensus ABI v1 ---
 # Blocks and consensus metadata injected for policy evaluation.
@@ -257,6 +264,32 @@ COOLDOWN_NEVER_SENT = (1 << 63) - 1
 # Storage, persistence and the accounts column ship unconditionally ahead of the
 # feed, so by the time this is switched on the history is already accumulated.
 COOLDOWN_STREAM_ACTIVE = False
+
+# --- Standing-payment paid fact (issue #34, Bounty 01) ------------------------
+# i17: 1 when the transfer's sender has at least one standing authorization
+# whose period containing the block timestamp is recorded paid in the
+# standing-payment book, else 0. Host-computed from the book's recorded
+# paid-for-period facts (gmikeyg on #34: the fact must be one "other rules
+# can read" — membership / keep-alive rules depend on it), so a membership
+# rule is a single comparison:
+#
+#   always ((i17[t]:bv[64] = { 1 }:bv[64]) -> (o5[t]:bv[24] = { #x000001 }:bv[24])).
+#
+# The projection is per ACCOUNT, across all of the sender's authorizations:
+# the stream answers "is my current period paid?", not a question about one
+# named authorization (the per-authorization fact itself stays readable via
+# the book API / facade). Facts are history — they survive cancellation and
+# supersession — so a period paid under an authorization version that has
+# since been replaced still counts for that period.
+#
+# Unlike i16 this feed is ALWAYS ON (the i2 precedent, not the cooldown
+# one): the value is fed on every transfer evaluation at admission and at
+# apply, byte-identically, and i17 sits in RESERVED_STREAMS so no sender
+# operation can override the node's value in the input merge. Before this
+# reservation i17 was an ordinary user custom stream in this tree; rules
+# that used it as one must move to another stream (i13+ remain available).
+TAU_INPUT_STREAM_STANDING_PAID = "i17"
+STANDING_PAID_STREAM_INDEX = 17
 
 # --- Tau Consensus ABI v1.2 additions (Tau-encoded validator membership) ---
 # Proposer BLS pubkey fed so a consensus rule can test set membership itself
