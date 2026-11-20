@@ -214,6 +214,8 @@ class Rig:
             return cur.rowcount
         finally:
             con.close()
+
+    def mine(self, node=None):
         node = node or self.a
         out = node.mine()
         self.chain.mined()
