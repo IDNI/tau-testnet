@@ -32,6 +32,19 @@ incoming transfers, so its verdict is not enforced against one
 (:func:`clause_applies_to_inbound`). On the recipient map i4 is the
 recipient himself, so such a clause judged inbound would veto
 payments for a reason it was never written to give.
+
+Activation: the gate is a governance-activated feature, like the
+co-signature approval slots. Until a host-contract patch sets
+`recipient_gate_active`, the gate does not run at all -- transfers
+are judged exactly as they were before this feature existed, which
+is also what keeps replay of pre-activation history byte-identical
+-- and a clause that would deploy the feature (it targets o10, or
+its body reads i17) is refused at deploy with
+:data:`REASON_GATE_INACTIVE` rather than silently admitted and
+never enforced. Activation is one-way: once recipient clauses are
+deployed under the gate, turning it off would un-govern transfers
+their authors published policies for, without any transaction of
+their own.
 """
 
 import re
@@ -42,6 +55,7 @@ from consensus.rule_offers import strip_clause_comments
 
 REASON_POLICY_BLOCK = "recipient_policy_block"
 REASON_HOLD_CAP = "RECIPIENT_MAX_HOLD"
+REASON_GATE_INACTIVE = "recipient_gate_inactive"
 
 _RELEASE_PAIR_STREAM = tau_defs.RECIPIENT_RELEASE_PAIR_STREAM_INDEX
 _HOLD_CAP_STREAM = tau_defs.RECIPIENT_HOLD_CAP_STREAM_INDEX
@@ -88,6 +102,53 @@ def clause_applies_to_inbound(body) -> bool:
         and _HOLD_CAP_STREAM not in writes
     )
     return not outbound_only
+
+
+def gate_active(tip_view) -> bool:
+    """Whether the recipient gate is activated at the given tip.
+
+    Mirrors consensus.approvals.approval_slots_active: requires a
+    genuine `True`, not merely a truthy value. A partial or mocked
+    view returns something truthy for any attribute it was never
+    given -- and silently running as if a consensus feature were
+    activated is the kind of thing that passes every test and then
+    diverges on a live chain. Absent or non-bool therefore reads as
+    "not activated", which is also the pre-activation behaviour of
+    every existing chain. The flag itself lives on the lifecycle
+    manager (consensus state, one-way governance activation), so
+    block apply reads it from the parent snapshot and an activation
+    recorded in block H governs H+1 onward.
+    """
+    return getattr(tip_view, "recipient_gate_active", False) is True
+
+
+def clause_uses_recipient_feature(body, target_stream=None) -> bool:
+    """Whether registering this clause would deploy the recipient feature.
+
+    True when the clause IS a hold-cap clause (its target stream is
+    o10, whose only meaning is the recipient cap) or when its body
+    reads the release pair i17 -- the stream the node feeds ONLY
+    into the recipient-side evaluation of a park. Neither signal has
+    any other meaning anywhere in the system, so a clause carrying
+    one is a recipient-policy clause whatever else it also does.
+    While the gate is inactive such a clause is refused at deploy
+    (see REASON_GATE_INACTIVE): admitting it would leave its author
+    believing inbound transfers are governed when no evaluation will
+    ever read it.
+
+    The scan runs on the COMMENT-STRIPPED body, as every other
+    textual screen in this module does: a stream mentioned only in a
+    '#' comment is not a reference the clause makes, and must not
+    make an ordinary sender clause undeployable.
+    """
+    if target_stream is not None and int(target_stream) == _HOLD_CAP_STREAM:
+        return True
+    if not body:
+        return False
+    scrubbed = strip_clause_comments(str(body))
+    reads = {int(n) for n in _INPUT_REF.findall(scrubbed)}
+    writes = {int(n) for n in _OUTPUT_REF.findall(scrubbed)}
+    return _RELEASE_PAIR_STREAM in reads or _HOLD_CAP_STREAM in writes
 
 
 def pack_release_pair(release_ts: int = 0, release_height: int = 0) -> int:

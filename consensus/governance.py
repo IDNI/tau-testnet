@@ -93,6 +93,7 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "fee_beneficiary",
     "max_rule_txs_per_block",
     "approval_slots_active",
+    "recipient_gate_active",
 })
 
 
@@ -106,6 +107,20 @@ def validate_approval_slots_active(value: Any) -> Optional[str]:
     """
     if value is not True:
         return "must be true; approval slots cannot be deactivated once active"
+    return None
+
+
+def validate_recipient_gate_active(value: Any) -> Optional[str]:
+    """Recipient-gate activation is a ONE-WAY switch to True.
+
+    Turning it back off would silently un-govern every transfer to a
+    recipient who deployed a policy or a hold cap under the gate: the
+    clauses stay registered, but no evaluation would ever read them.
+    So only `True` is a legal patch value, and
+    `apply_host_contract_patch` additionally refuses a downgrade.
+    """
+    if value is not True:
+        return "must be true; the recipient gate cannot be deactivated once active"
     return None
 
 
@@ -198,6 +213,7 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    recipient_gate_active: bool = False,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -234,6 +250,11 @@ def build_mechanism_metadata(
     # unaffected.
     if approval_slots_active:
         mech["approval_slots_active"] = True
+    # Recipient gate: same non-default gate, same reasoning -- emitted only
+    # once activated, so a chain that never turns the gate on hashes exactly
+    # as it did before the field existed.
+    if recipient_gate_active:
+        mech["recipient_gate_active"] = True
     if approval_requests_root:
         mech["approval_requests_root"] = approval_requests_root
     if faucet_amount:
@@ -457,6 +478,12 @@ class ConsensusLifecycleManager:
         # rollback, reorg and competing branches. Read from the PARENT snapshot,
         # so an activation recorded in block H governs H+1 onward.
         self.approval_slots_active: bool = False
+        # Recipient gate (#47/#76). ONE-WAY activation, held in consensus
+        # state for the same reason approval_slots_active is: read from the
+        # PARENT snapshot, so an activation recorded in block H governs
+        # H+1 onward, and pre-activation blocks keep the pre-feature
+        # execution semantics on replay.
+        self.recipient_gate_active: bool = False
         # Pinned by genesis for the life of the network: no patch sets it.
         # Bound into the meta hash only when non-zero.
         self.faucet_amount: int = 0
@@ -544,6 +571,7 @@ class ConsensusLifecycleManager:
                 else self.approval_requests.requests_root().hex()
             ),
             approval_slots_active=self.approval_slots_active,
+            recipient_gate_active=self.recipient_gate_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
         )
@@ -657,6 +685,17 @@ class ConsensusLifecycleManager:
                 )
             else:
                 self.activate_approval_slots()
+        if "recipient_gate_active" in patch:
+            # Same "only consensus-binding validation" reasoning as
+            # fee_beneficiary above. Unlike approval slots there is no
+            # collision audit and no second phase: i17 and o10 are this
+            # feature's own streams with no pre-existing corpus meaning,
+            # so there is nothing already in the effective spec for the
+            # activation to collide with.
+            err = validate_recipient_gate_active(patch["recipient_gate_active"])
+            if err:
+                raise ValueError(f"recipient_gate_active: {err}")
+            self.activate_recipient_gate()
         self.recompute_approval_threshold()
 
     def activate_approval_slots(self) -> None:
@@ -667,6 +706,16 @@ class ConsensusLifecycleManager:
         depend on them, letting a sender write their own approval slots.
         """
         self.approval_slots_active = True
+
+    def activate_recipient_gate(self) -> None:
+        """Turn the recipient gate on. Idempotent, and there is no way back.
+
+        Deactivation is unrepresentable on purpose: recipient clauses
+        and hold caps deployed under the gate would stay registered
+        but silently stop governing the transfers they were published
+        for.
+        """
+        self.recipient_gate_active = True
 
     def knows_update(self, update_id: bytes) -> bool:
         """Check if an update is currently known in any state."""

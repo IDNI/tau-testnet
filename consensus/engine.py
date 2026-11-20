@@ -271,6 +271,28 @@ def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tupl
     return error, "rule_not_applied"
 
 
+def _recipient_inactive_rejection(lm, body) -> Optional[Tuple[str, str]]:
+    """(error, receipt reason) when this clause body would deploy the
+    recipient feature on a chain whose gate is not activated.
+
+    The apply-side mirror of admission's deploy refusal
+    (consensus.admission._recipient_feature_refusal): the flag is read
+    from the block's lifecycle manager -- consensus state, read from
+    the parent snapshot -- so admission and apply reach the same
+    verdict on the same block.
+    """
+    if getattr(lm, "recipient_gate_active", False) is True:
+        return None
+    if recipient_gate.clause_uses_recipient_feature(body):
+        return (
+            "Recipient policy rules are not active on this chain. The "
+            "feature activates by governance patch (recipient_gate_active), "
+            "which turns on the recipient policy gate and the park hold cap.",
+            recipient_gate.REASON_GATE_INACTIVE,
+        )
+    return None
+
+
 def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str]]:
     """Write every READY rule-change request, lowest id first, up to the per-block cap.
 
@@ -1729,6 +1751,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     _did_not_land(f"o5 clause ignored ({domain_error})", reason=reason)
                     return True
 
+                # Same deploy refusal admission runs: a recipient-feature
+                # clause does not register while the gate is inactive.
+                inactive = _recipient_inactive_rejection(lifecycle_mgr, body)
+                if inactive:
+                    inactive_error, inactive_reason = inactive
+                    _did_not_land(
+                        f"o5 clause ignored ({inactive_error})",
+                        reason=inactive_reason)
+                    return True
+
                 key = (sender_n, stream)
                 revoking = is_neutral_clause_body(body, stream)
                 registered = key in offers.accepted_clauses
@@ -2034,9 +2066,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 to_addr, tau_defs.RECIPIENT_HOLD_CAP_STREAM_INDEX)
                             if park_release is not None else None
                         )
+                        # Activation (#47 case 5): before the governance
+                        # patch turns the gate on, none of this runs --
+                        # the transfer is judged exactly as it was before
+                        # the feature existed, which is also what keeps
+                        # replay of pre-activation blocks byte-identical.
                         gate_applies = (
-                            recipient_clause is not None
-                            or recipient_cap_clause is not None
+                            getattr(lifecycle_mgr, "recipient_gate_active", False) is True
+                            and (
+                                recipient_clause is not None
+                                or recipient_cap_clause is not None
+                            )
                         )
                         release_pair = 0
                         if park_release is not None:
@@ -2276,6 +2316,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             _clause_domain_rejection(clause_body_v1(offer.rule_text))
                             if ok else None
                         )
+                        if ok and rejection is None:
+                            rejection = _recipient_inactive_rejection(
+                                lifecycle_mgr, clause_body_v1(offer.rule_text))
                         if not ok:
                             tx_receipt["logs"].append(f"Offer ignored ({reason})")
                         elif rejection:
@@ -2312,6 +2355,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             _clause_domain_rejection(accepted_body)
                             if accepted_body is not None else None
                         )
+                        if accepted_body is not None and not rejection:
+                            rejection = _recipient_inactive_rejection(
+                                lifecycle_mgr, accepted_body)
                         if accepted_body is not None and not rejection:
                             builds, build_error = sender_policy.clause_builds(
                                 accepted_body, pool="apply",
