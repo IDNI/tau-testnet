@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from consensus import bls
 from consensus.approvals import (
@@ -43,6 +43,63 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_REJECT,
 )
 from consensus.routes import TX_TYPE_ROUTE_INSTALL, TX_TYPE_ROUTE_REMOVE
+
+# The Bounty 01 transaction types are bound to the network they were
+# signed for (see network_binding below). The pre-existing types predate
+# network binding and keep their CONSENSUS-FROZEN preimage bytes.
+NETWORK_BOUND_TX_TYPES = frozenset({TX_TYPE_ROUTE_INSTALL, TX_TYPE_ROUTE_REMOVE})
+
+_network_binding_override: Optional[str] = None
+_network_binding_cache: Optional[str] = None
+
+
+def set_network_binding(binding: Optional[str]) -> None:
+    """Pin the network identity bound into the Bounty 01 preimages.
+
+    Node startup pins the identity of the chain it loaded; tests pin a
+    foreign identity to prove a transaction signed for another network
+    is refused. Passing None releases the pin and drops the cached
+    resolution, so the next lookup re-resolves against the current chain.
+    """
+    global _network_binding_override, _network_binding_cache
+    _network_binding_override = binding
+    _network_binding_cache = None
+
+
+def network_binding() -> str:
+    """The network identity bound into the Bounty 01 signing preimage.
+
+    Resolves, in order: the explicit pin, the genesis hash of the local
+    chain (the identity two nodes compare when they peer), and the
+    configured network id. The resolved value is cached for the life of
+    the process: a signer and a verifier in one process must never watch
+    it move under them, and every node that has loaded its chain resolves
+    the same genesis hash.
+    """
+    global _network_binding_cache
+    if _network_binding_override is not None:
+        return _network_binding_override
+    if _network_binding_cache is None:
+        _network_binding_cache = _resolve_network_binding()
+    return _network_binding_cache
+
+
+def _resolve_network_binding() -> str:
+    try:
+        import db
+
+        # Only an already-open connection: resolving a signature must
+        # never create a database as a side effect.
+        if db._db_conn is not None:
+            genesis = db.get_genesis_hash()
+            if genesis:
+                return genesis
+    except Exception:
+        pass
+    import config
+
+    return str(config.NETWORK_ID)
+
 
 def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
     """CONSENSUS-FROZEN. Canonical bytes over the signed fields of a transaction.
@@ -67,6 +124,14 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
     # below with the same value, which is a no-op on a dict.
     if payload.get("expire_at_height") is not None:
         signing_dict["expire_at_height"] = payload["expire_at_height"]
+    if tx_type in NETWORK_BOUND_TX_TYPES:
+        # The network identity is signed for the Bounty 01 types, so a
+        # transaction signed for another network's genesis cannot verify
+        # on this one, however valid its signature is over there: the
+        # preimage it was made over names a different network. Sequence
+        # numbers alone cannot give this -- two networks that share a
+        # genesis-era account state would accept each other's replays.
+        signing_dict["network_id"] = network_binding()
     if tx_type == "user_tx":
         signing_dict["operations"] = payload.get("operations", {})
     elif tx_type == "consensus_rule_update":
