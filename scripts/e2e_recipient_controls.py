@@ -29,11 +29,12 @@ state hashes)
      final) — while the same transfer to carol passes and the 600s park
      to bob passes the guarded step.
   5. Apply-time receipt live (cap tightening): bob's cap is 600 when
-     alice's 300s park is admitted to A's mempool; bob tightens the cap
-     to 60, B mines the change, A follows, A mines the park's block —
-     the park is refused AT APPLY, and gettxstatus shows
-     reason=recipient_max_hold with the receipt log line carrying
-     max_hold_seconds=60; A's node log carries the same line.
+     alice's 300s park is admitted to A's mempool; the park's gossip to B
+     is contained by dropping it from B's mempool DB (the miner reads that
+     table); bob tightens the cap to 60, B mines the change, A follows, A
+     mines the park's block — the park is refused AT APPLY, and
+     gettxstatus shows reason=recipient_max_hold with the receipt log
+     line carrying max_hold_seconds=60; A's node log carries the same line.
   6. Follower parity: B ends with the same head hash, escrow and
      balances as A.
 
@@ -191,14 +192,28 @@ class Rig:
         # A must know B's peer id to bootstrap, and vice versa; the wrapper
         # nodes discover each other via the DHT bootstrap list, so B starts
         # with A as its bootstrap peer once A is up.
-        self.b.bootstrap = [f"/ip4/127.0.0.1/tcp/{self.a.p2p_port}/p2p/{self.a.peer_id}"] \
-            if self.a.peer_id else []
+        self.b.bootstrap = ([{"peer_id": self.a.peer_id,
+                               "addrs": [f"/ip4/127.0.0.1/tcp/{self.a.p2p_port}"]}]
+                            if self.a.peer_id else [])
         self.b.start()
         say(f"node B pid={self.b.proc.pid} rpc={self.b.rpc_port} p2p={self.b.p2p_port}")
         if not self.b.wait_ready(timeout=420):
             raise RuntimeError("node B never became ready: " + self.b.log()[-2000:])
 
-    def mine(self, node=None):
+    def drop_from_mempool(self, node, tx_hash):
+        """Delete one tx from a node's mempool DB. Harness-only: the miner
+        reads the mempool table, so this is how the e2e keeps a tx out of a
+        block without touching consensus code."""
+        import sqlite3
+        db_path = os.path.join(node.tree, "data", "node.db")
+        con = sqlite3.connect(db_path, timeout=10)
+        try:
+            cur = con.execute("DELETE FROM mempool WHERE tx_hash = ?",
+                              (tx_hash,))
+            con.commit()
+            return cur.rowcount
+        finally:
+            con.close()
         node = node or self.a
         out = node.mine()
         self.chain.mined()
@@ -413,7 +428,8 @@ def scenario_guarded(rig):
     check("alice -> carol (no guarded unit) admitted", base.ok(res), res)
     rig.mine()
     check("alice -> carol landed",
-          rig.a.balance("carol") > 1_000_000, rig.a.balance("carol"))
+          rig.a.balance("carol") == 1_000_000 - AMOUNT - base.BASE_FEE + AMOUNT,
+          rig.a.balance("carol"))
 
 
 def scenario_apply_receipt(rig):
@@ -439,6 +455,22 @@ def scenario_apply_receipt(rig):
     check("the park is queued on A",
           rig.tx_status(tx_hash, rig.a).get("status") == "queued",
           rig.tx_status(tx_hash, rig.a))
+    # The park gossips to B, and B's miner would take it first (fast lane)
+    # and admit it under the old cap. Contain the gossip: wait until B has
+    # it queued, then drop it from B's mempool DB (the miner reads that
+    # table), so B's next block carries ONLY the rule change.
+    end = time.time() + 60
+    while time.time() < end and \
+            rig.tx_status(tx_hash, rig.b).get("status") != "queued":
+        time.sleep(1.0)
+    check("the park gossiped to B",
+          rig.tx_status(tx_hash, rig.b).get("status") == "queued",
+          rig.tx_status(tx_hash, rig.b))
+    dropped = rig.drop_from_mempool(rig.b, tx_hash)
+    check("the park is dropped from B's mempool", dropped == 1, dropped)
+    check("B no longer knows the park",
+          rig.tx_status(tx_hash, rig.b).get("status") == "unknown",
+          rig.tx_status(tx_hash, rig.b))
     # Bob tightens the cap to 60 — submitted to B, mined BY B, so A's
     # mempool never sees a competing block; A follows B's block.
     tight = cap_clause(rig.pk["alice"], TIGHTENED_CAP, BLOCKS_CAP)
