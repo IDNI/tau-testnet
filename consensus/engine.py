@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -1957,13 +1958,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 registry = offers.accepted_clauses
                 registry_root_before = _clause_registry_root_hex(registry)
                 if revoking:
+                    stored_text = registry.get(key)
                     registry.pop(key, None)
                     clause_outcome = "CLAUSE_REVOKED"
                 elif registered:
                     registry[key] = body
+                    stored_text = body
                     clause_outcome = "CLAUSE_REPLACED"
                 else:
                     registry[key] = body
+                    stored_text = body
                     clause_outcome = "CLAUSE_REGISTERED"
                 # Bounty 02 (issue #42): a registry-routed rule transaction
                 # never reaches the revision machinery, so it has no engine
@@ -1974,11 +1978,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # marked, and never claiming a spec revision -- there are
                 # no spec_revision keys, by construction. _apply_block
                 # harvests and persists it exactly like a revision receipt.
+                # `stored_text_sha256` pins the exact clause text the
+                # outcome concerns -- the text this transaction stored, or
+                # on a revoke the text it removed -- so the record names
+                # its clause body, not only the registry-wide root.
                 tx_receipt["rule_outcome"] = {
                     "outcome": clause_outcome,
                     "evidence": "clause_registry",
                     "registry_root_before": registry_root_before,
                     "registry_root_after": _clause_registry_root_hex(registry),
+                    "stored_text_sha256": (
+                        hashlib.sha256(
+                            stored_text.encode("utf-8")
+                        ).hexdigest()
+                        if stored_text is not None else None
+                    ),
                     "account": sender_n,
                     "stream": stream,
                 }
