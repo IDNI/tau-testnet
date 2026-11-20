@@ -150,6 +150,20 @@ sender's `o5` policy (evaluated with the approval slots empty), the fee step, an
 the balance. Scheduling a payment therefore cannot be used to get around a
 co-signature policy. Retractable transfers are not co-signable.
 
+### The recipient's max-hold cap (issue #76)
+
+A park also passes the **recipient's** o5 policy, evaluated with the hold
+length available on i17 (`release_at_time` minus the block time in seconds,
+or `release_at_height` minus the height in blocks; 0 for a plain transfer).
+The recipient can cap how long a payment to it may be held: cap 0 admits
+plain transfers and refuses every park, cap 600 seconds admits a 10-minute
+park and refuses a 1-hour park. A cap refusal is a distinct reason --
+admission code `RECIPIENT_MAX_HOLD` (carrying `max_hold_seconds` /
+`max_hold_blocks`), apply receipt reason `recipient_max_hold` -- and, like
+any policy block, charges **no fee**. Retracts are never gated by the cap,
+and releases are not re-checked. Full detail in
+`docs/recipient-policy.md`.
+
 Nothing is re-checked at release. The release sweep is a plain credit from the
 escrow book, with no Tau evaluation, so a later policy change, a changed fee
 model, or the sender's balance dropping to zero does not block it. This is also
@@ -199,6 +213,8 @@ honest nodes disagree about admissibility and fork.
 | `UNKNOWN_RETRACTABLE` | A retract names an id that is not open (unknown, or already resolved). |
 | `NOT_RETRACTABLE_SENDER` | A retract is signed by someone other than the entry's sender. |
 | `RETRACT_TOO_LATE` | The next block is already at or past the release point. |
+| `RECIPIENT_POLICY_BLOCK` | The recipient's o5 policy refuses the park. |
+| `RECIPIENT_MAX_HOLD` | The recipient's hold cap refuses the park; the details carry `max_hold_seconds` / `max_hold_blocks`. |
 
 A malformed transaction, an out-of-range amount, or a release point that is not
 in the future or is outside the window is rejected with a descriptive message

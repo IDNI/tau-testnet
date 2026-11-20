@@ -66,7 +66,8 @@ Error codes emitted by the node, by origin:
 | `sendtx` / `checktx` structural | `TX_INVALID`, `TX_EXPIRED`, `INVALID_SIGNATURE`, `INVALID_SEQUENCE`, `TX_REJECTED` |
 | `sendtx` fees & capacity | `FEE_LIMIT_TOO_LOW`, `FEE_RULE_ERROR`, `INSUFFICIENT_FUNDS`, `MEMPOOL_FULL`, `ESTIMATE_BUSY` (`checktx estimate` only) |
 | `sendtx` approval request | `APPROVAL_NOT_NEEDED`: the policy of the sender allows the transfer with no votes, so send it as an ordinary transfer. Only admission gives it, because block apply drops such a request. |
-| Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED`, `RULE_CHANGE_NEEDS_APPROVAL`, `INVALID_RULE_CHANGE_REQUEST`, `INVALID_RULE_CHANGE_CANCEL`, `NOT_REQUEST_SENDER` |
+| Admission (`consensus/admission.py`) | `ADMISSION_TIMEOUT`, `ADMISSION_UNAVAILABLE`, `DUPLICATE_UPDATE`, `ALREADY_VOTED`, `UNSCOPED_USER_RULE`, `WIDTH_MISMATCH`, `RULE_WITH_TRANSFERS`, `MIXED_OUTPUT_RULE`, `CLAUSE_SHAPE`, `DUPLICATE_REQUEST`, `TOO_MANY_REQUESTS`, `NOT_AN_APPROVER`, `UNKNOWN_REQUEST`, `REQUEST_EXPIRED`, `REQUEST_RESOLVED`, `RULE_CHANGE_NEEDS_APPROVAL`, `INVALID_RULE_CHANGE_REQUEST`, `INVALID_RULE_CHANGE_CANCEL`, `NOT_REQUEST_SENDER`, `RECIPIENT_POLICY_INACTIVE` |
+| Recipient policy (`consensus/recipient_policy.py`) | `RECIPIENT_POLICY_BLOCK`: the recipient's o5 policy refuses the transfer. `RECIPIENT_MAX_HOLD`: the recipient's hold cap refuses the park; the details carry `max_hold_seconds` / `max_hold_blocks`. At apply the receipt reasons are `recipient_policy_block` / `recipient_max_hold`. See `docs/recipient-policy.md`. |
 | `createblock` | `MEMPOOL_EMPTY`, `MINING_NOT_ELIGIBLE`, `MINING_BUSY`, `MINING_CONFIG_ERROR`, `MINING_FAILED`, `BLOCK_NOT_CREATED` |
 | Governance / rule / approval reads | `GOVERNANCE_ERROR`, `OFFER_UNKNOWN`, `REQUEST_UNKNOWN`, `FEATURE_INACTIVE`, `TAU_UNAVAILABLE`, `TAU_ERROR` |
 
@@ -235,6 +236,14 @@ vote) runs no fee step. It gives `fee_checked: false`, `fee_limit` in
 `checks_skipped` (and `tau_eval` when no step ran), and a `note` that starts
 with `fee_exempt`. A refusal has `tau_evaluated`, `checks_skipped` and
 `fee_checked` in `details`, with the same meaning.
+
+**Capabilities.** Both the success data and the rejection details carry
+`capabilities`: `{"recipient_policy": true, "recipient_max_hold": true}`
+when recipient-side policy is active on this node. `gettaustate` reports
+the same object. An old node has no such field, which means inactive. A
+wallet should check it before deploying an inbound-only rule: on a node
+without the feature, a rule referencing i17 is refused at deploy with
+code `RECIPIENT_POLICY_INACTIVE`. See `docs/recipient-policy.md`.
 
 `checktx` never gives `MEMPOOL_FULL`. A full mempool is a fact about the node
 now, not a verdict about the transaction.

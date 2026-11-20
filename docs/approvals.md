@@ -423,10 +423,22 @@ only to stop accidental or lone revocations.
 |---|---|---|
 | `i1` | `bv[24]` | transfer amount |
 | `i3` / `i4` | `bv[384]` | sender / recipient pubkey |
-| `i12` | `bv[384]` | sender pubkey — set by the node; a clause body must not reference it |
+| `i12` | `bv[384]` | sender pubkey on the sender pass, recipient pubkey on the recipient pass — set by the node; a clause body must not reference it |
+| `i16` | `bv[64]` | seconds since the sender's previous transfer — set by the node, once the cooldown stream activates |
+| `i17` | `bv[64]` | hold length of the transfer being evaluated: `0` for a plain transfer, seconds until release for a `release_at_time` park, blocks for a `release_at_height` park — set by the node; readable in policy rules and clauses (see `docs/recipient-policy.md`) |
 | `i18`–`i25` | `bv[384]` | approval slots: node-written, clause-readable, `0` = no vote |
 | `i26`+ | — | sender custom inputs |
 | `o5` | `bv[24]` | user policy: `0` blocks, `1` or absent allows |
+
+### Recipient-side evaluation
+
+A transfer passes only if the **sender's** policy **and the recipient's**
+policy allow it (issues #47, #76). The recipient is evaluated with the
+same inputs -- i3 the sender (the counterparty), i4 the recipient, i1 the
+amount, i17 the hold -- in both modes: guarded mode re-runs the step with
+i12 = the recipient's key, clause mode evaluates the recipient's o5
+clause. Full detail, including the refusal codes and the max-hold cap, is
+in `docs/recipient-policy.md`.
 
 The slots are **write-reserved and read-permitted**, which is the whole point: a
 sender who could write them would forge their own approvals. Concretely,

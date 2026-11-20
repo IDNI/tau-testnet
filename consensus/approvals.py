@@ -167,6 +167,50 @@ def screen_slot_widths(body: str) -> Optional[str]:
     return None
 
 
+# --- Hold-length width screening (i17) --------------------------------------
+#
+# Same reject-unless-annotated contract as the approval slots: the node feeds
+# i17 at bv[64] on every transfer step, so a rule typing it at another width
+# (or leaving it untyped for the engine to infer) poisons process-global
+# stream typing for everyone.
+
+
+def screen_hold_widths(body: str) -> Optional[str]:
+    """None when every i17 mention is typed bv[64], else the reason.
+
+    Operates on comment-stripped text: i17 named inside a comment is not a
+    typing hazard. Called only while recipient-side policy is active -- when
+    it is off, i17 is forbidden in rule text outright (see
+    consensus/admission.py), so there is nothing to width-check.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    scrubbed = strip_clause_comments(body or "")
+    idx = tau_defs.HOLD_STREAM_INDEX
+    width = tau_defs.HOLD_STREAM_BV_WIDTH
+
+    for match in _SLOT_TYPED_RE.finditer(scrubbed):
+        found_idx, w = int(match.group(1)), int(match.group(2))
+        if found_idx == idx and w != width:
+            return (
+                f"i{idx} is the hold-length stream and must be typed "
+                f"bv[{width}], found bv[{w}]"
+            )
+
+    # Every *occurrence* must be one of the typed ones, so count them.
+    for match in _SLOT_OCCURRENCE_RE.finditer(scrubbed):
+        if int(match.group(1)) != idx:
+            continue
+        tail = scrubbed[match.end():]
+        if not re.match(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*%d\s*\]" % width, tail):
+            return (
+                f"every mention of the hold-length stream i{idx} must be "
+                f"written i{idx}[t]:bv[{width}]; an untyped mention lets the "
+                f"engine infer a conflicting width process-wide"
+            )
+    return None
+
+
 # --- User-policy / custom-fee width screening (o5, o8) ----------------------
 #
 # Same reject-unless-annotated contract as the approval slots, for the shared

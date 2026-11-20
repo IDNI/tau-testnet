@@ -42,6 +42,7 @@ from consensus.approvals import (
     parse_rule_change_cancel,
     parse_rule_change_request_checked,
     parse_transfer_vote,
+    screen_hold_widths,
     screen_policy_widths,
     screen_slot_widths,
     screen_stream_widths,
@@ -79,18 +80,61 @@ MAX_RULE_REVISIONS_BYTES = 196608   # 192 KiB total UTF-8, nests under the 26214
 MAX_TRANSFERS_PER_TX = 64
 MAX_CUSTOM_INPUT_STREAMS = 16
 
-# Input stream(s) the native fee/application path MOCKS to "0" during block apply
-# (consensus/engine.py) yet feeds REAL values at mempool admission
-# (commands/sendtx.py). Only i2 (balance) genuinely diverges: other txs in the
-# same block may debit the account between queue time and apply time, so a rule
-# reading i2 emits a different fee at admission than at inclusion (admitted, then
-# rejected at block build). We reject such rule text outright. i3/i4 (from/to
-# pubkeys) and i5 (block timestamp) are NOT mocked — they are immutable in the
-# transfer tuple / injected by consensus, hence identical at admission and apply,
-# so recipient-aware and time-aware policy rules are deterministic across both and
-# are permitted. Fee/policy rules may scope on i12 (sender), i3/i4 (from/to), i5
-# (time) and i1 (amount). See tau_defs.py "DETERMINISM CONSTRAINT".
-APPLY_MOCKED_INPUT_STREAMS = ("i2",)
+# Input streams whose admission value can differ from the apply value, so a
+# FEE rule reading one is quoted on one value and charged on another. i2
+# (balance): other txs in the same block may debit the account between queue
+# time and apply time, so a rule reading i2 emits a different fee at
+# admission than at inclusion (admitted, then rejected at block build). i17
+# (hold length): admission measures it against the advisory next-block clock
+# while apply measures it against the block's own clock, so a fee rule
+# reading it would be quoted on one hold and charged on another. We reject
+# such rule text outright -- for fee rules (o8/o9) only; POLICY rules (o5)
+# may read both. i3/i4 (from/to pubkeys) and i5 (block timestamp) do NOT
+# diverge -- they are immutable in the transfer tuple / injected by
+# consensus, hence identical at admission and apply, so recipient-aware and
+# time-aware policy rules are deterministic across both and are permitted.
+# Fee/policy rules may scope on i12 (sender), i3/i4 (from/to), i5 (time) and
+# i1 (amount). See tau_defs.py "DETERMINISM CONSTRAINT".
+# Policy (o5) rules may read it; only fee rules are screened.
+APPLY_MOCKED_INPUT_STREAMS = ("i2", "i17")
+
+
+def _mocked_stream_text(stream: str):
+    """(note, how-it-diverges, reason) for an apply-mocked stream, for errors."""
+    if stream == "i17":
+        return (
+            "hold length",
+            "admission measures it against the advisory next-block clock "
+            "while apply uses the block's own clock",
+            "fee_reads_hold_length",
+        )
+    return (
+        "balance",
+        "admission estimates it against the current head while apply uses "
+        "the parent block",
+        "fee_reads_balance",
+    )
+
+
+# Error code when a rule references the recipient hold-length stream (i17)
+# while recipient-side policy is inactive on this node.
+RECIPIENT_POLICY_INACTIVE_CODE = "RECIPIENT_POLICY_INACTIVE"
+
+# Phrase the domain-error mapper keys on, same idiom as the temporal one.
+_RECIPIENT_POLICY_INACTIVE_PHRASE = "recipient-side policy is not active"
+
+
+def _hold_stream_inactive_error() -> str:
+    """Why a rule that references i17 is refused while recipient-side policy
+    is inactive: the stream is never fed, so the rule would never run as its
+    author meant -- the silent-admit failure issues #47/#76 forbid."""
+    return (
+        "rule references the recipient hold-length stream i17, but "
+        f"{_RECIPIENT_POLICY_INACTIVE_PHRASE} on this node "
+        "(RECIPIENT_POLICY_ACTIVE is off): the node never feeds i17, so the "
+        "rule would never be enforced. Deploy it only on a node that reports "
+        "the recipient_policy capability (see gettaustate)."
+    )
 
 
 def _strip_tau_comments(rule_text: str) -> str:
@@ -213,6 +257,8 @@ def _admission_from_domain_error(domain_error: str, prefix: str = "") -> Admissi
     mismatch = _width_mismatch_details(domain_error)
     if mismatch:
         return format_error(msg, code="WIDTH_MISMATCH", **mismatch)
+    if _RECIPIENT_POLICY_INACTIVE_PHRASE in (domain_error or ""):
+        return format_error(msg, code=RECIPIENT_POLICY_INACTIVE_CODE)
     return format_error(msg)
 
 
@@ -263,17 +309,42 @@ def screen_user_rule_text(
     if temporal_error:
         return UserRuleRejection(temporal_error, "temporal_reference", TEMPORAL_REFERENCE_CODE)
 
-    # A balance-reading fee rule is quoted against the current head but charged
-    # against the parent block, so the sender pays a different fee than quoted.
+    # i17 (hold length) is fed only while recipient-side policy is active.
+    # While it is off, a rule reading it would never run as its author meant,
+    # so it is refused outright with the reason -- never silently admitted.
+    # While it is on, every mention must be typed bv[64], the width the node
+    # feeds (same reject-unless-annotated contract as the approval slots).
+    # This check runs BEFORE the generic reserved-inputs screen below, which
+    # would otherwise report i17 with the wrong (consensus-ABI) message.
+    if _streams_referenced(rule_text, ("i17",)):
+        if not tau_defs.RECIPIENT_POLICY_ACTIVE:
+            return UserRuleRejection(
+                _hold_stream_inactive_error(),
+                "recipient_policy_inactive",
+                RECIPIENT_POLICY_INACTIVE_CODE,
+            )
+        hold_error = screen_hold_widths(rule_text)
+        if hold_error:
+            return UserRuleRejection(
+                hold_error,
+                "width_mismatch",
+                "WIDTH_MISMATCH",
+                _width_mismatch_details(hold_error) or {},
+            )
+
+    # A fee rule reading a stream whose admission value differs from its
+    # apply value is quoted on one value and charged on another, so the
+    # sender pays a different fee than quoted.
     mocked_in = _streams_referenced(rule_text, APPLY_MOCKED_INPUT_STREAMS)
     if mocked_in and _streams_referenced(rule_text, ("o8",)):
+        stream = mocked_in[0]
+        note, how, reason = _mocked_stream_text(stream)
         return UserRuleRejection(
-            f"user_tx FEE rule (o8) references input stream '{mocked_in[0]}' "
-            f"(balance): admission estimates it against the current head while "
-            f"apply uses the parent block, so the fee charged could differ from "
-            f"the estimate quoted to the sender. Balance-reading POLICY rules "
-            f"(o5) are permitted; for fees, tier on i1 instead.",
-            "fee_reads_balance",
+            f"user_tx FEE rule (o8) references input stream '{stream}' "
+            f"({note}): {how}, so the fee charged could differ from "
+            f"the estimate quoted to the sender. {note.capitalize()}-reading "
+            f"POLICY rules (o5) are permitted; for fees, tier on i1 instead.",
+            reason,
             "TX_REJECTED",
         )
 
@@ -388,8 +459,10 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
                 f"Invalid operation target '{key}'. Stream {idx} is reserved "
                 f"(i12 sender pubkey; i14/i15 consensus stake/mode inputs; "
                 f"i13 consensus proposer pubkey under tau_validator_set; "
-                f"i18-i25 co-signature approval slots, which only the node may "
-                f"write)."
+                f"i16 seconds since the sender's previous transfer, once the "
+                f"cooldown stream activates; i17 hold length, which only the "
+                f"node may write; i18-i25 co-signature approval slots, which "
+                f"only the node may write)."
             )
 
     rule_text = operations.get("0")
@@ -450,10 +523,11 @@ def precheck_scheduled_update(update: Any, active_validators: Optional[Any] = No
             return {"status": "fail", "error": "rule_revisions must be strings"}
         mocked_in = _streams_referenced(rev, APPLY_MOCKED_INPUT_STREAMS)
         if mocked_in:
+            note = _mocked_stream_text(mocked_in[0])[0]
             return {
                 "status": "fail",
                 "error": (f"revision references apply-time-mocked input stream "
-                          f"'{mocked_in[0]}' (balance)"),
+                          f"'{mocked_in[0]}' ({note})"),
             }
 
     return {"status": "ok", "error": None}
@@ -753,16 +827,18 @@ def stage_and_validate_consensus_revisions(
                 logger.warning(f"Revision potentially shadowing {stream_idx}")
 
     # HARD-reject any revision that reads an apply-time-mocked input stream.
-    # Only i2 (balance) is mocked to "0" at block apply. A consensus fee rule (o9)
-    # reading it would compute a different fee at admission than at inclusion — the
-    # same divergence footgun the user o8 screen rejects. i3/i4/i5 are real at both
-    # points. Comment-stripped, word-boundary matched.
+    # A consensus fee rule (o9) reading one would compute a different fee at
+    # admission than at inclusion -- the same divergence footgun the user o8
+    # screen rejects. i3/i4/i5 are real at both points. Comment-stripped,
+    # word-boundary matched.
     for rev in revisions:
         mocked_in = _streams_referenced(rev, APPLY_MOCKED_INPUT_STREAMS)
         if mocked_in:
+            stream = mocked_in[0]
+            note = _mocked_stream_text(stream)[0]
             return format_error(
                 f"Consensus revision references apply-time-mocked input stream "
-                f"'{mocked_in[0]}' (balance): a fee rule reading i2 diverges between "
+                f"'{stream}' ({note}): a fee rule reading {stream} diverges between "
                 f"admission and block apply."
             )
 
@@ -939,6 +1015,14 @@ def _screen_clause_domains(body: str) -> Optional[str]:
     if temporal_error:
         return temporal_error
 
+    # i17 (hold length) is fed only while recipient-side policy is active.
+    # While it is off, a clause reading it would never run as its author
+    # meant, so it is refused outright with the reason -- never silently
+    # admitted. Checked before the generic reserved-inputs screen below,
+    # which would otherwise report i17 with the wrong (consensus-ABI) message.
+    if _streams_referenced(body, ("i17",)) and not tau_defs.RECIPIENT_POLICY_ACTIVE:
+        return _hold_stream_inactive_error()
+
     writes = _streams_referenced(body, CONSENSUS_OWNED_OUTPUT_STREAMS)
     if writes:
         return (
@@ -981,6 +1065,13 @@ def _screen_clause_widths_and_structure(body: str) -> Optional[str]:
     slot_error = screen_slot_widths(body)
     if slot_error:
         return "Shared rules: " + slot_error
+
+    # Same contract for the hold-length stream: the node feeds i17 at bv[64]
+    # on every transfer step. (Only reachable while recipient-side policy is
+    # active: _screen_clause_domains refuses i17 outright when it is off.)
+    hold_error = screen_hold_widths(body)
+    if hold_error:
+        return "Shared rules: " + hold_error
 
     # Same contract for o5 itself: an unguarded clause body still types the
     # shared policy stream, and a bv[16] unit here poisons the interpreter

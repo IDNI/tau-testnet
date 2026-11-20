@@ -258,6 +258,78 @@ COOLDOWN_NEVER_SENT = (1 << 63) - 1
 # feed, so by the time this is switched on the history is already accumulated.
 COOLDOWN_STREAM_ACTIVE = False
 
+# i12: the sender pubkey, node-injected on every transfer evaluation step
+# (bv[384]). The guarded recipient pass reuses the same stream with the
+# recipient's key (issue #47), so the index gets a name instead of a literal.
+SENDER_PUBKEY_STREAM_INDEX = 12
+
+# --- Recipient-side policy (issues #47, #76) -------------------------------
+# A transfer to R is admitted (and applied) only if BOTH the sender's o5
+# policy and R's o5 policy allow it. Guarded mode evaluates R's policy in a
+# second Tau step with i12 set to R (see consensus/recipient_policy.py);
+# clause mode evaluates clause_for(R, USER_POLICY_STREAM_INDEX) on the same
+# inputs as the sender's clause. In both modes the counterparty is readable
+# as i3 (sender key) and the amount as i1.
+#
+# RECIPIENT_POLICY_ACTIVE is ON: merging this change activates the gate, and
+# flipping it is a CONSENSUS CHANGE requiring coordinated activation across
+# the network -- same class as COOLDOWN_STREAM_ACTIVE. When it is off the
+# node evaluates no recipient policy, feeds no i17, reserves no i17, and
+# refuses any rule that references i17 at deploy with a clear reason instead
+# of silently admitting a rule that never runs (see
+# consensus/admission.py). `node_capabilities()` reports the flag so wallets
+# can detect the feature before offering an inbound rule.
+RECIPIENT_POLICY_ACTIVE = True
+
+
+def node_capabilities() -> dict:
+    """Node-level feature flags a wallet can read before offering a rule.
+
+    `recipient_policy`: the node gates transfers on the recipient's o5
+    policy (issue #47). `recipient_max_hold`: the node feeds the hold
+    length on i17 and refuses over-long parks with RECIPIENT_MAX_HOLD
+    (issue #76). Both track RECIPIENT_POLICY_ACTIVE: the cap is part of
+    the recipient gate, not a separate activation. Reported by gettaustate
+    and checktx; a node that predates this change reports no such field,
+    which reads as inactive.
+    """
+    active = bool(RECIPIENT_POLICY_ACTIVE)
+    return {"recipient_policy": active, "recipient_max_hold": active}
+
+
+# --- Per-transfer hold length (issue #76) ---
+# i17: how long this transfer will be held before the recipient is paid,
+# host-computed from the park's release point and the block clock:
+#
+#   * a `release_at_time` park: release_at_time minus the block time, seconds;
+#   * a `release_at_height` park: release_at_height minus the height, blocks;
+#   * a plain transfer: 0.
+#
+# The unit follows the park's release kind because there is no deterministic
+# blocks<->seconds conversion (future block times are unknown); a rule that
+# wants a wall-clock bound should cap blocks conservatively as well. A cap of
+# 0 therefore admits plain transfers and refuses every park; a cap of 600
+# admits a park releasing in ten minutes and refuses one releasing in an hour.
+#
+#   always ( (i17[t]:bv[64] > { #x0000000000000258 }:bv[64])
+#       ? (o5[t]:bv[24] = { #x000000 }:bv[24])
+#       : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
+#
+# Fed on every transfer evaluation (sender pass, recipient pass, both clause
+# evaluations) and as 0 on fee-query steps, so the input map shape is uniform.
+# bv[64] like i16: the widest release window (7,776,000 seconds /
+# 100,000 blocks) fits easily, with headroom for arithmetic.
+#
+# i17 was an ordinary user custom stream before this change and is used by NO
+# wallet template in circulation (whitelist i1/i4, escrow i13, approval slots
+# i18-i25, passphrase/custom i26+), so reserving it on activation breaks no
+# shipped template. It is reserved exactly while the node feeds it, mirroring
+# the i13/i16 precedents; a rule that reads it must type it bv[64] (see
+# consensus/approvals.py screen_hold_widths).
+TAU_INPUT_STREAM_HOLD_LENGTH = "i17"
+HOLD_STREAM_INDEX = 17
+HOLD_STREAM_BV_WIDTH = 64
+
 # --- Tau Consensus ABI v1.2 additions (Tau-encoded validator membership) ---
 # Proposer BLS pubkey fed so a consensus rule can test set membership itself
 # (o7 = 1 iff i13 equals one of the validator pubkey constants baked into the
@@ -341,6 +413,11 @@ def reserved_operation_keys(
         # Reserved only while the node actually feeds i16 (see above), so
         # pre-existing user rules using it keep working until activation.
         keys = keys + (COOLDOWN_STREAM_INDEX,)
+    if RECIPIENT_POLICY_ACTIVE:
+        # Reserved only while the node actually feeds i17 (see above): a
+        # sender who could write it would set their own hold to 0 and walk
+        # past every recipient's cap.
+        keys = keys + (HOLD_STREAM_INDEX,)
     if approval_slots_active:
         # Reserved exactly when the node starts feeding them, mirroring the i13
         # and i16 precedents.
@@ -362,10 +439,19 @@ def rule_text_forbidden_input_streams(
     operation is forbidden. Approval slots are the second: write-forbidden
     everywhere, readable only from a registered o5 clause.
     """
-    keys = reserved_operation_keys(
+    keys = list(reserved_operation_keys(
         eligibility_mode, approval_slots_active=approval_slots_active
-    )
+    ))
     readable = {12}
+    if RECIPIENT_POLICY_ACTIVE:
+        # i17 is write-reserved (in `keys`) but readable in BOTH contexts:
+        # a clause and a guarded rule alike cap the hold by reading it.
+        readable.add(HOLD_STREAM_INDEX)
+    else:
+        # Not fed, so a rule reading it could never run as its author meant;
+        # forbid it outright in rule text. The admission screens name the
+        # reason explicitly; this is the backstop.
+        keys.append(HOLD_STREAM_INDEX)
     if context == RULE_TEXT_CONTEXT_O5_CLAUSE:
         readable |= set(approval_slot_indices())
     return tuple(f"i{idx}" for idx in keys if idx not in readable)

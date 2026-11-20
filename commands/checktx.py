@@ -6,6 +6,7 @@ the same `code` and `details` as `sendtx`. A second admission implementation dri
 import logging
 
 import api_response
+import tau_defs
 from commands import sendtx
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,9 @@ def execute(raw_command: str, container):
             "tx_type": result.get("tx_type"),
             "tau_evaluated": tau_evaluated,
             "checks_skipped": checks_skipped,
+            # Capabilities let a wallet detect whether recipient-side
+            # policy is active on this node (issues #47/#76).
+            "capabilities": tau_defs.node_capabilities(),
         }
         if estimate and "estimated_fee" in result:
             data["estimated_fee"] = result["estimated_fee"]
@@ -76,6 +80,7 @@ def execute(raw_command: str, container):
     details["tau_evaluated"] = tau_evaluated
     details["checks_skipped"] = checks_skipped
     details["fee_checked"] = fee_checked
+    details["capabilities"] = tau_defs.node_capabilities()
     return api_response.error_response(
         "checktx",
         result.get("message", "Transaction would be rejected."),
