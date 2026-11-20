@@ -129,6 +129,9 @@ USER_POLICY_ALLOW_VALUE = 1
 # clause, at this stream index. It is not an output stream: the top of the
 # uint32 range is never a real stream, and offers can only target o5.
 RULE_CHANGE_GUARD_INDEX = 0xFFFFFFFF
+# Per-account inbound rule and hold limits, committed in the same registry.
+RECIPIENT_POLICY_INDEX = 0xFFFFFFFE
+RECIPIENT_POLICY_PREFIX = "recipient_v1 o5[t] "
 
 # i1 of a guard evaluation: which policy change is being judged.
 RULE_CHANGE_KIND_SET_POLICY = 1

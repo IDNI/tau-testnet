@@ -12,6 +12,7 @@ import types
 import pytest
 
 import db
+import tau_defs
 from commands import getofferid, getruleconflict, getruleoffer, getruleoffers
 from consensus.rule_offers import clause_body_v1
 from consensus.serialization import compute_offer_id
@@ -142,6 +143,20 @@ def test_getruleoffers_role_filter(container):
     assert "incoming" in data and "outgoing" not in data
     data = _call(getruleoffers, f"getruleoffers {A} out", container)["data"]
     assert "outgoing" in data and "incoming" not in data
+
+
+def test_getruleoffers_returns_recipient_policy_separately(container):
+    cap = (1 << 64) - 1
+    inbound = clause_body_v1(RULE)
+    _seed(clauses=[
+        {"acceptor_pubkey": B, "target_stream": tau_defs.RECIPIENT_POLICY_INDEX,
+         "clause_body": json.dumps({"inbound": inbound, "max_hold_seconds": cap})},
+        {"acceptor_pubkey": A, "target_stream": TARGET, "clause_body": inbound},
+    ])
+    recipient = _call(getruleoffers, f"getruleoffers {B}", container)["data"]
+    assert recipient["accepted_clauses"] == []
+    assert recipient["recipient_policy"] == {"inbound": inbound, "max_hold_seconds": str(cap)}
+    assert _call(getruleoffers, f"getruleoffers {A}", container)["data"]["recipient_policy"] is None
 
 
 def test_getruleoffers_lists_accepted_clauses(container):

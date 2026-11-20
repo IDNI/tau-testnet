@@ -27,7 +27,7 @@ PIN_BUILD_SECONDS = 0.100
 RECYCLE_BUILDS = 500
 RECYCLE_STEPS = 20_000
 RECYCLE_RSS_BYTES = 1 << 30
-POOL_NAMES = ("apply", "admission")
+POOL_NAMES = ("apply", "admission", "recipient-apply", "recipient-admission")
 
 # Without an injected probe, worker memory is read this often (in requests).
 RSS_PROBE_EVERY = 64

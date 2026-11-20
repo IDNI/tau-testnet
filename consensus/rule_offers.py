@@ -185,8 +185,8 @@ def clause_output_streams(body: str) -> List[int]:
     return sorted(seen)
 
 
-def clause_body_v1(rule_text: str) -> str:
-    """CONSENSUS-FROZEN. Extract the body of a single `always` unit.
+def single_unit_body(rule_text: str) -> str:
+    """Extract the body of a single `always` unit.
 
     Rejects anything that is not exactly one unit. The balanced-paren check
     is load-bearing, not cosmetic: `_ALWAYS_UNIT_RE` uses a greedy `.*`, so
@@ -210,6 +210,12 @@ def clause_body_v1(rule_text: str) -> str:
         raise RuleOfferShapeError(
             "nested temporal operator (always/sometimes) is not allowed"
         )
+    return body
+
+
+def clause_body_v1(rule_text: str) -> str:
+    """CONSENSUS-FROZEN. An ordinary sender clause has no i12 owner guard."""
+    body = single_unit_body(rule_text)
     if re.search(rf"\b{SENDER_STREAM}\b", strip_clause_comments(body)):
         raise RuleOfferShapeError(
             f"rule must not reference {SENDER_STREAM}; a clause is evaluated "

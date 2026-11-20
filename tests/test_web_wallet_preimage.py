@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node is no
 
 
 def _function_source(src: str, name: str) -> str:
-    m = re.search(rf"^function {name}\(.*?^\}}\n", src, re.S | re.M)
+    m = re.search(rf"^(?:async )?function {name}\(.*?^\}}\n", src, re.S | re.M)
     assert m, f"function {name} not found in app.js"
     return m.group(0)
 
@@ -152,3 +152,86 @@ def test_wallet_rule_change_cancel_builder_matches_the_node_preimage():
     payload = {**ENVELOPE, **{k: v for k, v in json.loads(wire).items() if k not in ENVELOPE}}
     assert wire == signing_message_bytes(payload)
     assert payload["request_id"] == "e" * 64
+
+
+def test_rule_editor_sends_recipient_envelopes_only_on_the_current_capable_node():
+    src = APP_JS.read_text(encoding="utf-8")
+    functions = ("attemptConnection", "handleServerResponse", "validateRuleSyntax",
+                 "stripTauComments", "onSendTransaction", "canonicalize", "asciiJson")
+    program = "\n".join(_function_source(src, name) for name in functions)
+    prefix = re.search(r"^const RECIPIENT_RULE_PREFIX = .*?;$", src, re.M).group()
+    harness = r"""
+const assert = require('node:assert/strict');
+const policy = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const commands = [];
+let signed;
+let customConfirm = async () => true;
+let socket = null, isConnected = false, recipientControlsActive = false;
+let connectionIndex = 0, connectionAttempts = ['test-node'];
+class WebSocket { send(cmd) { commands.push(cmd); } }
+const statusDiv = {classList: {replace() {}}}, btnConnect = {}, connectionInfo = {};
+const log = () => {}, enablePanels = () => {}, refreshInfo = () => {}, refreshKnownAccounts = () => {};
+const window = {dispatchEvent() {}};
+class CustomEvent {}
+const ruleEditor = null, customEditor = null, txRule = {value:''}, txCustom = {value:''};
+const ruleValidationStatus = {style:{}}, txRecipient = {value:''}, txAmount = {value:''};
+const currentKeyPair = {pub: 'sender', priv: 'test'}, txFeeLimit = {value:'10'};
+const bytesToHex = x => x, sha256 = x => x;
+const bls = {sign(data) { signed = JSON.parse(new TextDecoder().decode(data)); return 'sig'; }};
+const tipHeight = 12, DEFAULT_EXPIRY_BLOCKS = 50;
+let pendingSequence = 0;
+const sendRpc = cmd => socket.send(cmd);
+function connect() {
+    attemptConnection();
+    socket.onmessage({data:'ok version=1'});
+    assert.equal(commands.pop(), 'getgovernance');
+    return socket;
+}
+function capabilities(onSocket, active) {
+    onSocket.onmessage({data:JSON.stringify({status:'ok', command:'getgovernance',
+                                             data:{recipient_controls_active:active}})});
+}
+(async function() {
+    const first = connect();
+    txRule.value = policy;
+    await onSendTransaction();
+    assert.equal(commands.length, 0);
+    capabilities(first, true);
+    await onSendTransaction();
+    const sent = JSON.parse(commands.pop().slice('sendtx '.length));
+    assert.equal(signed.operations['0'], policy);
+    assert.equal(sent.operations['0'], policy);
+    first.onclose();
+    const second = connect();
+    capabilities(first, true);
+    await onSendTransaction();
+    assert.equal(commands.length, 0);
+    capabilities(second, false);
+    await onSendTransaction();
+    assert.equal(commands.length, 0);
+    capabilities(second, true);
+    customConfirm = async () => {
+        second.onclose();
+        capabilities(connect(), true);
+        return true;
+    };
+    await onSendTransaction();
+    assert.equal(commands.length, 0);
+    customConfirm = async () => true;
+    txRule.value = RECIPIENT_RULE_PREFIX + '[]';
+    await onSendTransaction();
+    assert.equal(commands.length, 0);
+    txRule.value = 'always (o5[t]:bv[24] = { 1 }:bv[24]). # a comment';
+    await onSendTransaction();
+    assert.equal(signed.operations['0'], 'always (o5[t]:bv[24] = { 1 }:bv[24]).');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    inbound = "always ( (i3[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]) ? " \
+              "(o5[t]:bv[24] = { 1 }:bv[24]) : (o5[t]:bv[24] = { 0 }:bv[24]) )."
+    for obj in ({"max_hold_seconds": 0}, {"inbound": inbound,
+                "outbound": "always (o5[t]:bv[24] = { 1 }:bv[24]).",
+                "max_hold_blocks": 2**64 - 1}):
+        policy = "recipient_v1 o5[t] " + json.dumps(obj, indent=2)
+        result = subprocess.run(["node", "-e", prefix + "\n" + program + "\n" + harness],
+                                input=json.dumps(policy), text=True, capture_output=True, timeout=15)
+        assert result.returncode == 0, result.stderr

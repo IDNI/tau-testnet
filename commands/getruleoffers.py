@@ -124,25 +124,34 @@ def execute(raw_command: str, container):
         clause for clause in clauses
         if (clause.get("acceptor_pubkey") or "").lower() == address
     ]
-    guard_index = tau_defs.RULE_CHANGE_GUARD_INDEX
-    accepted = [
-        {
-            "target_stream": clause["target_stream"],
-            "clause_body": clause["clause_body"],
-        }
-        for clause in own
-        if int(clause["target_stream"]) != guard_index
-    ]
-    guard = next(
-        (c["clause_body"] for c in own if int(c["target_stream"]) == guard_index),
-        None,
-    )
+    accepted = []
+    guard = None
+    recipient_policy = None
+    for clause in own:
+        index = int(clause["target_stream"])
+        body = clause["clause_body"]
+        if index == tau_defs.RULE_CHANGE_GUARD_INDEX:
+            guard = body
+        elif index == tau_defs.RECIPIENT_POLICY_INDEX:
+            try:
+                recipient_policy = json.loads(body)
+                # A uint64 can exceed a JavaScript client's exact integer range.
+                for key in ("max_hold_seconds", "max_hold_blocks"):
+                    if key in recipient_policy:
+                        recipient_policy[key] = str(recipient_policy[key])
+            except (TypeError, ValueError):
+                return api_response.error_response(
+                    _CMD, "Unreadable stored recipient policy", "INTERNAL_ERROR"
+                )
+        else:
+            accepted.append({"target_stream": clause["target_stream"], "clause_body": body})
 
     data = {
         "address": address,
         "pending_incoming": sum(1 for e in incoming if e["status"] == STATUS_OFFERED),
         "accepted_clauses": accepted,
         "rule_change_guard": guard,
+        "recipient_policy": recipient_policy,
         "supported_target_streams": sorted(ALLOWED_TARGET_STREAMS),
         "mempool": _mempool_offers(address),
     }

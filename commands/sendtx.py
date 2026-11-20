@@ -14,7 +14,7 @@ import tau_manager
 from tau_manager import parse_tau_output
 import utils
 from errors import TauCommunicationError
-from consensus import fees, sender_policy
+from consensus import fees, recipient_policy, sender_policy
 from consensus.fees import FeeRuleError
 from consensus.lanes import classify_lane
 from consensus.tx_checks import check_transfer, validate_bls_pubkey
@@ -29,6 +29,7 @@ from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
+    recipient_controls_active,
     RULE_CHANGE_TX_TYPES,
     TX_TYPE_APPROVAL_REQUEST,
     TX_TYPE_RULE_CHANGE_REQUEST,
@@ -214,26 +215,35 @@ def _approval_slot_feed(tip_view) -> tuple:
     return tau_defs.approval_slot_indices()
 
 
-def _parked_transfer_inputs(sender_pubkey: str, request: dict, tip_view,
-                            admission_ts: int) -> dict:
-    """Tau inputs of the step that prices an approval_request.
+def _transfer_policy_inputs(sender: str, recipient: str, amount: int, custom: dict,
+                            tip_view, timestamp: int) -> dict:
+    """Feed the per-transfer streams in apply order.
 
-    Apply prices a parked transfer with its real transfer inputs, so admission
-    feeds the same keys in the same order as the per-transfer step.
+    Each leg sees the sender's parent balance on i2, including later legs of a
+    batch. The head timestamp on i5 is advisory until the transaction is mined.
     """
     values = {
-        1: str(request["amount"]),
-        2: _admission_i2(sender_pubkey),
-        3: "{ #x" + sender_pubkey + " }:bv[384]",
-        4: "{ #x" + request["recipient_pubkey"] + " }:bv[384]",
-        12: "{ #x" + sender_pubkey + " }:bv[384]",
+        1: str(amount),
+        2: _admission_i2(sender),
+        3: "{ #x" + sender.lower() + " }:bv[384]",
+        4: "{ #x" + recipient + " }:bv[384]",
+        12: "{ #x" + sender + " }:bv[384]",
     }
-    for k, v in (request.get("custom_inputs") or {}).items():
-        values[int(k)] = str(v)
+    values.update(custom)
     for slot in _approval_slot_feed(tip_view):
         values[slot] = "0"
-    values[5] = str(admission_ts)
+    values[5] = str(timestamp)
     return values
+
+
+def _parked_transfer_inputs(sender_pubkey: str, request: dict, tip_view,
+                            admission_ts: int) -> dict:
+    """Price an approval request with the transfer inputs the sender signed."""
+    custom = {int(k): str(v) for k, v in (request.get("custom_inputs") or {}).items()}
+    return _transfer_policy_inputs(
+        sender_pubkey, request["recipient_pubkey"], request["amount"], custom,
+        tip_view, admission_ts,
+    )
 
 
 def _get_signing_message_bytes(payload: dict) -> bytes:
@@ -521,10 +531,10 @@ def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
     ))
 
 
-def _clause_build_refusal(body, budget):
+def _clause_build_refusal(body, budget, *, pool="admission"):
     """The rejection envelope when `body` does not build as a clause, or None."""
     ok, error = _policy_call(lambda: sender_policy.clause_builds(
-        body, pool="admission", timeout=budget
+        body, pool=pool, timeout=budget
     ))
     if ok:
         return None
@@ -1010,7 +1020,24 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
 
     # Advisory block timestamp for i5 at admission (see _admission_timestamp).
     # Read once: every step of one request is judged at the same moment.
-    admission_ts = _admission_timestamp()
+    # A park has already been screened for expiry against this exact clock/height.
+    # Reuse both so a wall-clock tick during validation cannot change its hold.
+    park_context = admission_eval.data if tx_type == TX_TYPE_RETRACTABLE_TRANSFER else {}
+    admission_ts = park_context.get("candidate_timestamp")
+    if admission_ts is None:
+        admission_ts = _admission_timestamp()
+
+    def recipient_error(recipient, inputs, index):
+        refusal = _policy_call(lambda: recipient_policy.check_recipient(
+            tip_view.clause_for, recipient, inputs, pool="admission",
+            timestamp=admission_ts, height=park_context.get("candidate_height", 0),
+            release_at_time=payload.get("release_at_time") if park_context else None,
+            release_at_height=payload.get("release_at_height") if park_context else None,
+            timeout=admission_tau.budget,
+        ))
+        if refusal is not None:
+            return _qt_err(refusal.code, refusal.message, transfer_index=index, **refusal.details)
+        return None
 
     try:
         if tx_type in (TX_TYPE_RULE_OFFER, TX_TYPE_RULE_OFFER_ACCEPT):
@@ -1044,7 +1071,13 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                 rule_text = rule_value.strip()
                 routed_action = (admission_eval.data or {}).get("o5_clause_action")
                 if rule_text and routed_action:
-                    if routed_action == "declare":
+                    if routed_action == "recipient":
+                        for direction, body in admission_eval.data["policy_builds"]:
+                            pool = "recipient-admission" if direction == "inbound" else "admission"
+                            refusal = _clause_build_refusal(body, admission_tau.budget, pool=pool)
+                            if refusal is not None:
+                                return refusal
+                    elif routed_action == "declare":
                         refusal = _clause_build_refusal(
                             (admission_eval.data or {}).get("o5_clause_body"),
                             admission_tau.budget,
@@ -1200,7 +1233,10 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
 
             # Step 3: Transfer Validation
             if has_transfers and all_validated_transfers and not skip_tau_eval:
-                if tau_force_test:
+                check_inbound = (
+                    "candidate_height" in park_context if park_context else recipient_controls_active(tip_view)
+                )
+                if tau_force_test and not check_inbound:
                     logger.info(
                         "TAU_FORCE_TEST=1: skipping Tau transfer validation for %s transfers.",
                         len(all_validated_transfers),
@@ -1212,51 +1248,17 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                     ):
                         logger.debug("Validating transfer #%s: %s", i + 1, transfer_details)
 
-                        # Tau program expects inputs on separate streams for the single-pass validation
-                        # i1: amount, i2: balance, i3: from_id, i4: to_id
-
-                        tau_input_stream_values = {}
-                        tau_input_stream_values[1] = str(tau_input_dict['amount'])
-                        # i2: the sender's balance at the current HEAD, identical
-                        # for every transfer in this tx — matching the engine,
-                        # which feeds the parent-block snapshot frozen for the
-                        # whole block (issue #20). Deliberately NOT the intra-tx
-                        # decremented `tau_input_dict['balance']`: that is more
-                        # accurate locally but diverges from what apply will feed,
-                        # and agreeing with apply is what makes a balance-reading
-                        # rule deterministic. Advisory in the same sense as i5 —
-                        # the tx may land a few blocks later; apply is
-                        # authoritative. `remaining_balances` still drives the
-                        # affordability pre-check below.
-                        tau_input_stream_values[2] = _admission_i2(sender_pubkey)
-                        # i3/i4: full 384-bit from/to pubkeys. The bv-shrink layer
-                        # interns these equality-only address streams to a small bv
-                        # for evaluation; the canonical full-width rule text is hashed.
-                        tau_input_stream_values[3] = "{ #x" + tau_input_dict['from_addr'] + " }:bv[384]"
-                        tau_input_stream_values[4] = "{ #x" + tau_input_dict['to_addr'] + " }:bv[384]"
-                        # i12: full 384-bit sender public key (bv[384]) for user-policy
-                        # rules that scope on the real key.
-                        tau_input_stream_values[12] = "{ #x" + sender_pubkey + " }:bv[384]"
-                        # Custom input streams (i13+). Merged AFTER i12 and BEFORE
-                        # i5, byte-identical to the apply-time overlay order in
-                        # consensus/engine.py, so rules combining i13+ with the
-                        # transfer fields (i1/i3/i4/i5/i12) are enforced the same
-                        # at admission and apply. Keys 2-12 are rejected upstream,
-                        # so custom keys can never clobber a reserved stream.
-                        for k, v in custom_tau_inputs.items():
-                            tau_input_stream_values[k] = v
-                        # Approval slots (i18..i25). An ORDINARY transfer always
-                        # feeds 0 on every slot, which equals no approver pubkey,
-                        # so a co-signature policy clause keeps blocking until the
-                        # parked-request path supplies real votes. Fed after the
-                        # custom merge and before i5, byte-identically at apply.
-                        # Reserved upstream, so a sender cannot pre-fill one.
-                        for slot in _approval_slot_feed(tip_view):
-                            tau_input_stream_values[slot] = "0"
-                        # i5: advisory block timestamp (see admission_ts above) so
-                        # time-lock o5 rules pre-check at admission; apply is
-                        # authoritative.
-                        tau_input_stream_values[5] = str(admission_ts)
+                        tau_input_stream_values = _transfer_policy_inputs(
+                            sender_pubkey, tau_input_dict["to_addr"],
+                            tau_input_dict["amount"], custom_tau_inputs, tip_view, admission_ts,
+                        )
+                        if tau_force_test:
+                            refusal = recipient_error(
+                                tau_input_dict["to_addr"], tau_input_stream_values, i + 1
+                            )
+                            if refusal is not None:
+                                return refusal
+                            continue
 
                         logger.info(
                             "Sending Tau inputs for transfer #%s validation: %s",
@@ -1310,6 +1312,13 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 transfer_index=i + 1,
                             )
 
+                        if check_inbound:
+                            refusal = recipient_error(
+                                tau_input_dict["to_addr"], tau_input_stream_values, i + 1
+                            )
+                            if refusal is not None:
+                                return refusal
+
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.
                         try:
@@ -1328,7 +1337,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 f"Consensus fee rule failure: {fee_exc}",
                             )
                     logger.info("All Tau transfer validations successful.")
-                    facts.fee_estimated = tx_type in FEE_BEARING_TX_TYPES
+                    facts.fee_estimated = not tau_force_test and tx_type in FEE_BEARING_TX_TYPES
 
         # Step 3b: Fee estimate for any fee-bearing tx with no transfers, for
         # every type, as apply charges it. An approval_request is priced on its

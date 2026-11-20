@@ -113,6 +113,11 @@ def approval_slots_active(tip_view) -> bool:
     return getattr(tip_view, "approval_slots_active", False) is True
 
 
+def recipient_controls_active(tip_view) -> bool:
+    """Require the consensus flag at the admission tip explicitly."""
+    return getattr(tip_view, "recipient_controls_active", False) is True
+
+
 # --- Slot width screening ---------------------------------------------------
 #
 # Per-stream bitvector typing is process-global and sticky: one rule typing i18
