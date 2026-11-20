@@ -286,6 +286,14 @@ party holding the money:
 From then on the money can leave only through the payout rule, the arbiter can
 release no more than the caps allow, and neither party alone can swap the rules.
 
+A work escrow with several recipients is `work_escrow` in
+`tests/test_payout_native.py`: the arbiter settles the review (the worker, two
+reviewers, the finder of each confirmed defect, the rest back to the poster)
+and a tenth is held for a warranty window, released later to the worker or,
+after a late defect, to its finder and the poster. The rule reads what it has
+already paid (`i26`) to tell the two executions apart. On the real engine every
+settlement path pays exactly the locked price, and nothing after it.
+
 ## Inspecting
 
 ```bash

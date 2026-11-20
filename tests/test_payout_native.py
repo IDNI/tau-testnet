@@ -205,3 +205,163 @@ def test_a_choice_pays_or_pays_nothing(real):
     assert _run(terms, STRANGER, {0: 250}) == [(0, BOB, 250)]
     with pytest.raises(PayoutRefused, match="pays nothing"):
         _run(terms, STRANGER, {0: 100})
+
+
+# --- a work escrow: one locked price, several recipients, exactly the price paid --------
+#
+# The evidence case of #63: a poster locks a task price in an escrow account. When
+# the review is done an arbiter settles it: the worker, two reviewers, whoever found
+# a defect, and the remainder back to the poster. A tenth is held back for a
+# warranty window and released in a second execution, to the worker, or to a late
+# defect's finder and the poster. Whatever path is taken, the account pays exactly
+# the locked price and then nothing more.
+#
+# Data: i40 the verdict (1 accepted, 2 rejected), i41 the defects confirmed in the
+# review (0..3), i42 a late defect confirmed in the warranty window (0 or 1).
+# i26 (paid by this rule so far) tells the two executions apart.
+
+WORKER, REVIEWER_A, REVIEWER_B, POSTER, ARBITER, FINDER = (
+    _key(n) for n in ("worker", "reviewer a", "reviewer b", "poster", "arbiter", "finder"))
+SLOT_WORKER, SLOT_A, SLOT_B, SLOT_FINDER, SLOT_POSTER = range(5)
+WARRANTY_END = HEIGHT + 500
+MAX_DEFECTS = 3
+
+
+def _split(price):
+    """The terms of an escrow of `price`: review fee, held back, the worker's cut
+    per defect and the finder's bounty out of it."""
+    fee, held, cut, bounty = price // 25, price // 10, price // 12, price // 20
+    assert price - held - 2 * fee >= MAX_DEFECTS * cut and cut >= bounty > 0
+    return fee, held, cut, bounty
+
+
+def work_escrow(price):
+    fee, held, cut, bounty = _split(price)
+    c = lambda n, w=24: "{ %d }:bv[%d]" % (n, w)                     # noqa: E731
+    verdict, defects, late, paid = (f"i{n}[t]:bv[24]" for n in (40, 41, 42, 26))
+    accepted, rejected = f"({c(2)} - {verdict})", f"({verdict} - {c(1)})"
+
+    def amounts(*per_slot):
+        return " && ".join(f"(o{30 + k}[t]:bv[24] = {v})" for k, v in enumerate(per_slot))
+
+    arbiter = f"(i13[t]:bv[384] = {{ #x{ARBITER} }}:bv[384])"
+    review = amounts(
+        f"{accepted} * ({c(price - held - 2 * fee)} - ({defects} * {c(cut)}))",
+        c(fee), c(fee),
+        f"{accepted} * ({defects} * {c(bounty)})",
+        f"({rejected} * {c(price - 2 * fee)}) + ({accepted} * ({defects} * {c(cut - bounty)}))")
+    warranty = amounts(
+        f"({c(1)} - {late}) * {c(held)}", c(0), c(0),
+        f"{late} * {c(bounty)}", f"{late} * {c(held - bounty)}")
+    nothing = amounts(*[c(0)] * 5)
+    at_review = (f"({arbiter} && ({paid} = {c(0)}) && ({verdict} >= {c(1)}) && "
+                 f"({verdict} <= {c(2)}) && ({defects} <= {c(MAX_DEFECTS)}))")
+    in_warranty = (f"({arbiter} && ({paid} = {c(price - held)}) && ({late} <= {c(1)}) && "
+                   f"(({late} = {c(1)}) || (i6[t]:bv[64] >= {c(WARRANTY_END, 64)})))")
+    return (f"always ( {at_review} ? ({review}) : "
+            f"( {in_warranty} ? ({warranty}) : ({nothing}) ) ).")
+
+
+def _escrow_model(price, verdict, defects, late):
+    """What each execution must pay, worked out without the engine:
+    [review legs, warranty legs] as {slot: amount} (zero amounts left out)."""
+    fee, held, cut, bounty = _split(price)
+    if verdict == 2:
+        return [{SLOT_A: fee, SLOT_B: fee, SLOT_POSTER: price - 2 * fee}]
+    review = {SLOT_WORKER: price - held - 2 * fee - defects * cut, SLOT_A: fee, SLOT_B: fee,
+              SLOT_FINDER: defects * bounty, SLOT_POSTER: defects * (cut - bounty)}
+    warranty = ({SLOT_FINDER: bounty, SLOT_POSTER: held - bounty} if late
+                else {SLOT_WORKER: held})
+    return [{k: v for k, v in legs.items() if v} for legs in (review, warranty)]
+
+
+class _Escrow:
+    """An escrow account holding exactly the price, with the rule installed."""
+
+    def __init__(self, price):
+        self.terms = parse_payout_rule_set({
+            "sender_pubkey": ACCOUNT, "sequence_number": 0, "rule_text": work_escrow(price),
+            "slots": [WORKER, REVIEWER_A, REVIEWER_B, "", POSTER],
+            "cap_per_execution": price, "cap_per_period": price,
+            # one period for the rule's whole life, so i26 never starts again
+            "period_blocks": 1_000_000, "expires_at": HEIGHT - 1 + 1_000_000,
+        })
+        self.book = PayoutBook()
+        self.book.install(self.terms, HEIGHT - 1)
+        self.balance = price
+
+    def execute(self, data, height, *, executor=ARBITER, finder=FINDER):
+        named = ((SLOT_FINDER, finder),) if finder else ()
+        exe = PayoutExecution(executor, ACCOUNT, self.terms.rule_id, named,
+                              tuple(sorted(data.items())))
+        rule, state = self.book.check_execution(exe, height, TS)
+        values = execution_inputs(rule, state, exe, parent_balance=self.balance,
+                                  height=height, ts=TS)
+        outputs = sender_policy.payout_outputs(rule.body, values, pool=POOL_APPLY)
+        legs = settle(rule, state, exe, outputs, height=height, ts=TS, balance=self.balance)
+        total = sum(amount for _, _, amount in legs)
+        self.book.record(ACCOUNT, total, height, TS)
+        self.balance -= total
+        return {slot: amount for slot, _who, amount in legs}
+
+
+ESCROW_PRICES = [600, 999, 1_000, 12_345, 1_000_000]
+
+
+def test_the_work_escrow_passes_the_screen_and_builds(real):
+    terms = _Escrow(1_000).terms
+    assert screen_payout_body(terms.body, 5) is None
+    built = real.validate(terms.body)
+    assert built.ok, built.error
+
+
+@pytest.mark.parametrize("price", ESCROW_PRICES)
+def test_a_work_escrow_pays_exactly_the_locked_price_on_every_path(real, price):
+    """Every settlement path: accepted with 0..3 defects, then the warranty part
+    released clean or after a late defect; and rejected. Each execution pays what
+    the model says, the account ends at zero, and nothing more can be paid."""
+    from consensus.payout import PayoutRefused
+
+    paths = [(1, d, late) for d in range(MAX_DEFECTS + 1) for late in (0, 1)]
+    paths += [(2, d, 0) for d in range(MAX_DEFECTS + 1)]
+    for verdict, defects, late in paths:
+        escrow = _Escrow(price)
+        expected = _escrow_model(price, verdict, defects, late)
+        paid = [escrow.execute({0: verdict, 1: defects}, HEIGHT)]
+        if verdict == 1:
+            # the warranty part: at once for a late defect, else only at its end
+            at = HEIGHT + 7 if late else WARRANTY_END
+            paid.append(escrow.execute({2: late}, at))
+        assert paid == expected, (verdict, defects, late)
+        assert sum(sum(legs.values()) for legs in paid) == price
+        assert escrow.balance == 0
+        with pytest.raises(PayoutRefused, match="pays nothing"):
+            escrow.execute({0: 1, 2: 1}, WARRANTY_END + 1)
+
+
+def test_the_work_escrow_refuses_everything_else(real):
+    from consensus.payout import PayoutRefused
+
+    def refused(data, height=HEIGHT, why="pays nothing", **kw):
+        escrow = _Escrow(1_000)
+        with pytest.raises(PayoutRefused, match=why):
+            escrow.execute(data, height, **kw)
+        assert escrow.balance == 1_000
+
+    refused({0: 1}, executor=STRANGER)             # only the arbiter settles
+    refused({})                                    # no verdict is no settlement
+    refused({0: 3})                                # a verdict the rule does not know
+    refused({0: 1, 1: MAX_DEFECTS + 1})            # more defects than the rule allows
+    refused({2: 1})                                # the warranty part before the review
+    refused({0: 1, 1: 2}, finder=None, why="no recipient was named")
+
+    escrow = _Escrow(1_000)
+    escrow.execute({0: 1}, HEIGHT)
+    for data, height in (({2: 0}, WARRANTY_END - 1),   # a clean release before the end
+                         ({2: 2}, WARRANTY_END)):      # neither a yes nor a no
+        with pytest.raises(PayoutRefused, match="pays nothing"):
+            escrow.execute(data, height)
+    # the review is never paid twice: at the end the same data releases only the
+    # held part to the worker
+    assert escrow.execute({0: 1}, WARRANTY_END) == {SLOT_WORKER: 100}
+    assert escrow.balance == 0
