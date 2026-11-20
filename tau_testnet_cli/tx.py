@@ -223,6 +223,21 @@ def get_sequence_and_tip(
     the height its ``expire_at_height`` is counted from. A node too old to
     report ``tip_height`` yields 0, and the caller falls back to getblocks.
     """
+    return get_sequence_tip_and_network(pubkey, host=host, port=port, timeout=timeout)[:2]
+
+
+def get_sequence_tip_and_network(
+    pubkey: str,
+    *,
+    host: str,
+    port: int,
+    timeout: float = rpc_mod.DEFAULT_TIMEOUT,
+) -> tuple[int, int, str]:
+    """Sequence number, tip height and the network's genesis hash, in one call.
+
+    The genesis hash is what the types bound to a network sign
+    (``consensus/network_binding.py``). A node too old to report it yields "".
+    """
     response = rpc_mod.send_command(
         f"getsequence {pubkey}", host, port, timeout=timeout
     )
@@ -244,7 +259,28 @@ def get_sequence_and_tip(
     tip = data.get("tip_height")
     if not isinstance(tip, int) or isinstance(tip, bool):
         tip = 0
-    return seq, tip
+    genesis_hash = data.get("genesis_hash")
+    if not isinstance(genesis_hash, str):
+        genesis_hash = ""
+    return seq, tip, genesis_hash
+
+
+def bind_to_network(payload: dict, genesis_hash: str) -> dict:
+    """Name the network in a payload whose type signs it; call before signing.
+
+    Other types are returned untouched. Raises ``ValueError`` when the type needs
+    the network and ``genesis_hash`` is empty.
+    """
+    from consensus.network_binding import BOUND_TX_TYPES, FIELD
+
+    if payload.get("tx_type") in BOUND_TX_TYPES:
+        if not genesis_hash:
+            raise ValueError(
+                "the node did not report its genesis hash, and this transaction "
+                "type is signed for one network"
+            )
+        payload[FIELD] = genesis_hash
+    return payload
 
 
 def submit_tx(
@@ -558,12 +594,15 @@ def build_rule_change_request_tx(
     """Construct a ``tx_type='rule_change_request'`` payload (without signature).
 
     Kinds 1 and 4 carry the clause in ``rule_text``; kind 3 carries the exact
-    offered text and the offer id; kinds 2 and 5 carry neither. Zero approvers is
+    offered text and the offer id; kind 6 carries a payout rule's canonical spec
+    text (``payout_spec_text`` without a sequence number) and kind 8 a receive
+    route's (``route_spec_text``); kinds 2, 5, 7 and 9 carry neither. Zero
+    approvers is
     valid: the time escape alone can release the request.
     """
-    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5):
-        raise ValueError("kind must be 1..5")
-    has_body = kind in (1, 3, 4)
+    if isinstance(kind, bool) or kind not in range(1, 10):
+        raise ValueError("kind must be 1..9")
+    has_body = kind in (1, 3, 4, 6, 8)
     if has_body and not (isinstance(rule_text, str) and rule_text.strip()):
         raise ValueError("this kind needs a non-empty rule text")
     if not has_body and rule_text:
@@ -742,4 +781,457 @@ def build_retract_transfer_tx(
         "expire_at_height": _check_expire_at_height(expire_at_height),
         "fee_limit": str(fee_limit),
         "retractable_id": retractable_id.lower(),
+    }
+
+
+_STANDING_INTERVAL_FIELDS = ("interval_blocks", "interval_seconds", "interval_months")
+
+
+def build_standing_payment_create_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    recipient_pubkey: str,
+    amount: int,
+    first_due: int,
+    periods: int,
+    interval_blocks: int | None = None,
+    interval_seconds: int | None = None,
+    interval_months: int | None = None,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='standing_payment_create'`` payload (without signature).
+
+    Exactly one interval. Admission refuses a create that could be mined at or
+    after its own first due point, so the deadline is clamped to it:
+    ``expire_at_height`` to ``first_due`` for a block schedule, ``expiration_time``
+    below ``first_due`` for a time schedule.
+    """
+    if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
+        raise ValueError("recipient_pubkey must be a 96-character hex public key")
+    for name, value in (("amount", amount), ("first_due", first_due), ("periods", periods)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    given = {
+        name: value for name, value in zip(
+            _STANDING_INTERVAL_FIELDS, (interval_blocks, interval_seconds, interval_months)
+        ) if value is not None
+    }
+    if len(given) != 1:
+        raise ValueError("give exactly one of interval_blocks, interval_seconds, interval_months")
+    (name, interval), = given.items()
+    if not isinstance(interval, int) or isinstance(interval, bool) or interval < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    expire_at_height = _check_expire_at_height(expire_at_height)
+    if name == "interval_blocks":
+        expire_at_height = min(expire_at_height, first_due)
+    else:
+        expiration_time = min(expiration_time, first_due - 1)
+    return {
+        "tx_type": "standing_payment_create",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": expire_at_height,
+        "fee_limit": str(fee_limit),
+        "recipient_pubkey": recipient_pubkey.lower(),
+        "amount": amount,
+        name: interval,
+        "first_due": first_due,
+        "periods": periods,
+    }
+
+
+def build_standing_payment_update_tx(*, standing_id: str, **create_fields) -> dict:
+    """Construct a ``tx_type='standing_payment_update'`` payload (without signature).
+
+    Takes exactly the fields of :func:`build_standing_payment_create_tx` for the
+    NEW terms, plus the id of the authorization they replace. The new version
+    gets its own id (its terms and this transaction's sequence number); the old
+    one ends when the update lands.
+    """
+    if not isinstance(standing_id, str) or len(standing_id) != 64:
+        raise ValueError("standing_id must be a 64-character hex string")
+    payload = build_standing_payment_create_tx(**create_fields)
+    payload["tx_type"] = "standing_payment_update"
+    payload["standing_id"] = standing_id.lower()
+    return payload
+
+
+def build_standing_payment_execute_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    standing_id: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='standing_payment_execute'`` payload (without signature).
+
+    Anyone may send it. It names the authorization only: the node pays the
+    period the block falls in, from the stored terms, or refuses. The sender
+    pays the fee.
+    """
+    if not isinstance(standing_id, str) or len(standing_id) != 64:
+        raise ValueError("standing_id must be a 64-character hex string")
+    return {
+        "tx_type": "standing_payment_execute",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "standing_id": standing_id.lower(),
+    }
+
+
+def build_standing_payment_cancel_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    standing_id: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='standing_payment_cancel'`` payload (without signature).
+
+    Feeless. It must be INCLUDED in a block before the next due point to stop
+    that payment, so send it with margin.
+    """
+    if not isinstance(standing_id, str) or len(standing_id) != 64:
+        raise ValueError("standing_id must be a 64-character hex string")
+    return {
+        "tx_type": "standing_payment_cancel",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "standing_id": standing_id.lower(),
+    }
+
+
+def build_payout_rule_set_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    rule_text: str,
+    slots: list,
+    cap_per_execution: int,
+    cap_per_period: int,
+    expires_at: int,
+    period_blocks: int | None = None,
+    period_seconds: int | None = None,
+    per_sale: bool = False,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='payout_rule_set'`` payload (without signature).
+
+    ``per_sale``: the rule pays only against sales the chain recorded (signed
+    transfers into the account), once per sale; executions name one.
+
+    ``slots`` lists one entry per slot: a recipient's 96-hex key, or "" for an
+    open slot the executor names. ``expires_at`` is on the period's clock: a
+    height with ``period_blocks``, a unix time with ``period_seconds``.
+    """
+    if (period_blocks is None) == (period_seconds is None):
+        raise ValueError("give exactly one of period_blocks and period_seconds")
+    clean = []
+    for k, slot in enumerate(slots or []):
+        if slot in ("", None, "open"):
+            clean.append("")
+        elif isinstance(slot, str) and len(slot) == 96:
+            clean.append(slot.lower())
+        else:
+            raise ValueError(f"slot {k} must be a 96-hex public key or open")
+    tx = {
+        "tx_type": "payout_rule_set",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "rule_text": rule_text,
+        "slots": clean,
+        "cap_per_execution": int(cap_per_execution),
+        "cap_per_period": int(cap_per_period),
+        "expires_at": int(expires_at),
+    }
+    if period_blocks is not None:
+        tx["period_blocks"] = int(period_blocks)
+    else:
+        tx["period_seconds"] = int(period_seconds)
+    if per_sale:
+        tx["per_sale"] = True
+    return tx
+
+
+def build_payout_rule_revoke_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='payout_rule_revoke'`` payload (without signature). Feeless."""
+    return {
+        "tx_type": "payout_rule_revoke",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+    }
+
+
+def build_payout_execute_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    account_pubkey: str,
+    rule_id: str,
+    recipients: dict | None = None,
+    data: dict | None = None,
+    sale_id: str | None = None,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='payout_execute'`` payload (without signature).
+
+    ``rule_id`` pins the exact rule: if the account replaced its rule since,
+    the execution is refused instead of running the new one. ``recipients``
+    names keys for open slots ({slot: pubkey}); ``data`` fills i40+k ({k: value}).
+    """
+    if not isinstance(account_pubkey, str) or len(account_pubkey) != 96:
+        raise ValueError("account_pubkey must be a 96-character hex public key")
+    if not isinstance(rule_id, str) or len(rule_id) != 64:
+        raise ValueError("rule_id must be a 64-character hex string")
+    tx = {
+        "tx_type": "payout_execute",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "account_pubkey": account_pubkey.lower(),
+        "rule_id": rule_id.lower(),
+        "recipients": {str(int(k)): v.lower() for k, v in (recipients or {}).items()},
+        "data": {str(int(k)): int(v) for k, v in (data or {}).items()},
+    }
+    if sale_id is not None:
+        if not isinstance(sale_id, str) or len(sale_id) != 64:
+            raise ValueError("sale_id must be a 64-character transaction hash")
+        tx["sale_id"] = sale_id.lower()
+    return tx
+
+
+def build_receive_route_set_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    destination_pubkey: str,
+    share_bps: int,
+    min_amount: int = 0,
+    active_from: int = 0,
+    expires_at: int = 0,
+    locked: bool = False,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='receive_route_set'`` payload (without signature).
+
+    ``share_bps`` is the routed share in basis points (2000 = 20%). The optional
+    terms are left out at their defaults, so the payload reads like the spec a
+    guarded account would file: a minimum credit, a start and an end (unix
+    seconds, block time), and ``locked``, which needs an end.
+    """
+    if not isinstance(destination_pubkey, str) or len(destination_pubkey) != 96:
+        raise ValueError("destination_pubkey must be a 96-character hex public key")
+    if isinstance(share_bps, bool) or not isinstance(share_bps, int):
+        raise ValueError("share_bps must be an integer")
+    if locked and not expires_at:
+        raise ValueError("a locked route needs an end (expires_at)")
+    tx = {
+        "tx_type": "receive_route_set",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "destination_pubkey": destination_pubkey.lower(),
+        "share_bps": share_bps,
+    }
+    for name, value in (("min_amount", min_amount), ("active_from", active_from),
+                        ("expires_at", expires_at)):
+        if value:
+            tx[name] = int(value)
+    if locked:
+        tx["locked"] = True
+    return tx
+
+
+def build_receive_route_remove_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='receive_route_remove'`` payload (without signature). Feeless."""
+    return {
+        "tx_type": "receive_route_remove",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+    }
+
+
+def build_receive_route_release_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    owner_pubkey: str,
+    route_id: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='receive_route_release'`` payload (without signature).
+
+    Signed by the route's DESTINATION. ``route_id`` pins the exact route: if
+    the owner replaced it since, the release is refused. Feeless.
+    """
+    if not isinstance(owner_pubkey, str) or len(owner_pubkey) != 96:
+        raise ValueError("owner_pubkey must be a 96-character hex public key")
+    if not isinstance(route_id, str) or len(route_id) != 64:
+        raise ValueError("route_id must be a 64-character hex string")
+    return {
+        "tx_type": "receive_route_release",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "owner_pubkey": owner_pubkey.lower(),
+        "route_id": route_id.lower(),
+    }
+
+
+def build_envelope_send_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    recipient_pubkey: str,
+    amount: int,
+    caps: list,
+    expires_at: int,
+    period_blocks: int | None = None,
+    period_seconds: int | None = None,
+    recurring: bool = False,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='envelope_send'`` payload (without signature).
+
+    ``amount`` leaves the sender at once and waits in the envelope for the
+    recipient to spend, at most ``caps[n]`` in period n (``recurring`` repeats
+    the last cap). Exactly one period clock; ``expires_at`` is on that clock.
+    """
+    if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
+        raise ValueError("recipient_pubkey must be a 96-character hex public key")
+    if (period_blocks is None) == (period_seconds is None):
+        raise ValueError("give exactly one of period_blocks and period_seconds")
+    if not isinstance(caps, (list, tuple)) or not caps:
+        raise ValueError("caps must be a non-empty list of amounts")
+    tx = {
+        "tx_type": "envelope_send",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "recipient_pubkey": recipient_pubkey.lower(),
+        "amount": int(amount),
+        "caps": [int(c) for c in caps],
+        "expires_at": int(expires_at),
+    }
+    if period_blocks is not None:
+        tx["period_blocks"] = int(period_blocks)
+    else:
+        tx["period_seconds"] = int(period_seconds)
+    if recurring:
+        tx["recurring"] = True
+    return tx
+
+
+def build_envelope_spend_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    envelope_id: str,
+    to_pubkey: str,
+    amount: int,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='envelope_spend'`` payload (without signature).
+
+    Signed by the envelope's RECIPIENT; pays ``to_pubkey`` (anyone, the
+    recipient included) out of the envelope. The fee is the recipient's.
+    """
+    if not isinstance(envelope_id, str) or len(envelope_id) != 64:
+        raise ValueError("envelope_id must be a 64-character hex string")
+    if not isinstance(to_pubkey, str) or len(to_pubkey) != 96:
+        raise ValueError("to_pubkey must be a 96-character hex public key")
+    return {
+        "tx_type": "envelope_spend",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "envelope_id": envelope_id.lower(),
+        "to_pubkey": to_pubkey.lower(),
+        "amount": int(amount),
+    }
+
+
+def build_envelope_release_tx(
+    *,
+    sender_pubkey: str,
+    sequence_number: int,
+    expiration_time: int,
+    expire_at_height: int,
+    envelope_id: str,
+    fee_limit: str | int = "0",
+) -> dict:
+    """Construct a ``tx_type='envelope_release'`` payload (without signature).
+
+    Signed by the envelope's SENDER: everything left goes to the recipient now.
+    Feeless.
+    """
+    if not isinstance(envelope_id, str) or len(envelope_id) != 64:
+        raise ValueError("envelope_id must be a 64-character hex string")
+    return {
+        "tx_type": "envelope_release",
+        "sender_pubkey": sender_pubkey,
+        "sequence_number": sequence_number,
+        "expiration_time": expiration_time,
+        "expire_at_height": _check_expire_at_height(expire_at_height),
+        "fee_limit": str(fee_limit),
+        "envelope_id": envelope_id.lower(),
     }

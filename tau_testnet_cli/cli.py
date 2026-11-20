@@ -708,7 +708,7 @@ def _submit_rule_tx(args: argparse.Namespace, build, *, pass_tip: bool = False) 
         return EXIT_LOCAL
 
     try:
-        sequence_number, tip = tx_mod.get_sequence_and_tip(
+        sequence_number, tip, genesis_hash = tx_mod.get_sequence_tip_and_network(
             sender_pubkey, host=args.host, port=args.port, timeout=args.timeout
         )
     except RuntimeError as exc:
@@ -719,6 +719,9 @@ def _submit_rule_tx(args: argparse.Namespace, build, *, pass_tip: bool = False) 
         height = _resolve_expire_at_height(args, tip=tip)
         payload = (build(sender_pubkey, sequence_number, height, tip) if pass_tip
                    else build(sender_pubkey, sequence_number, height))
+        # The types bound to a network sign its genesis hash; the node reported
+        # it with the sequence, so no extra call.
+        tx_mod.bind_to_network(payload, genesis_hash)
     except (_PayloadError, ValueError) as exc:
         print_error(str(exc))
         return EXIT_LOCAL
@@ -1219,6 +1222,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_approval_subparsers(sub)
     _add_policy_subparsers(sub)
     _add_retractable_subparsers(sub)
+    _add_standing_subparsers(sub)
+    _add_payout_subparsers(sub)
+    _add_route_subparsers(sub)
+    _add_envelope_subparsers(sub)
     _add_node_subparsers(sub)
 
     return parser
@@ -2417,6 +2424,919 @@ def cmd_retractable_id(args: argparse.Namespace) -> int:
     else:
         print(rid)
     return EXIT_OK
+
+
+# --- Standing payments ------------------------------------------------------
+
+
+def _standing_first_due(args, tip: int, now: int) -> int:
+    """first_due from whichever --first-due-* flag is set, checked against the tip."""
+    if args.every_blocks is not None:
+        if args.first_due_height is not None:
+            height = int(args.first_due_height)
+        elif args.first_due_in is not None:
+            height = (tip or _tip_height(args)) + 1 + int(args.first_due_in)
+        else:
+            raise _PayloadError("a block schedule needs --first-due-height or --first-due-in")
+        if height <= (tip or _tip_height(args)) + 1:
+            raise _PayloadError(
+                f"first due height {height} is not after the next block; "
+                "the authorization would be mined at or past its first payment."
+            )
+        return height
+    if args.first_due_time is not None:
+        when = int(args.first_due_time)
+    elif args.first_due_after is not None:
+        when = now + int(args.first_due_after)
+    else:
+        raise _PayloadError("a time schedule needs --first-due-time or --first-due-after")
+    if when <= now + 1:
+        raise _PayloadError(f"first due time {when} is already (almost) past.")
+    return when
+
+
+def _standing_interval(args) -> dict:
+    for flag, field in (("every_blocks", "interval_blocks"),
+                        ("every_seconds", "interval_seconds"),
+                        ("every_months", "interval_months")):
+        value = getattr(args, flag, None)
+        if value is not None:
+            return {field: int(value)}
+    raise _PayloadError("give one of --every-blocks, --every-seconds, --every-months")
+
+
+def cmd_standing_create(args: argparse.Namespace) -> int:
+    from consensus.standing import StandingShapeError, parse_standing_payment_create
+
+    created = {}
+    replaces = getattr(args, "standing_id", None)
+
+    def _build(sender_pubkey, sequence_number, expire_at_height, tip):
+        now = int(_now())
+        builder = tx_mod.build_standing_payment_create_tx
+        extra = {}
+        if replaces is not None:
+            builder, extra = tx_mod.build_standing_payment_update_tx, {"standing_id": replaces}
+        payload = builder(
+            **extra,
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=now + args.expiry,
+            expire_at_height=expire_at_height,
+            recipient_pubkey=args.to,
+            amount=int(args.amount),
+            first_due=_standing_first_due(args, tip, now),
+            periods=int(args.periods),
+            **_standing_interval(args),
+        )
+        try:
+            created["id"] = parse_standing_payment_create(payload).standing_id.hex()
+        except StandingShapeError as exc:
+            raise _PayloadError(str(exc))
+        return payload
+
+    status = _submit_rule_tx(args, _build, pass_tip=True)
+    if status == EXIT_OK and created.get("id"):
+        what = f"new version of {replaces}: " if replaces else ""
+        print(f"standing payment id: {what}{created['id']}",
+              file=sys.stderr if args.json else sys.stdout)
+    return status
+
+
+def cmd_standing_execute(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_standing_payment_execute_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            standing_id=args.standing_id,
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_standing_cancel(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_standing_payment_cancel_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            standing_id=args.standing_id,
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_standing_list(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getstandingpayments {address} {getattr(args, 'role', 'all')}")
+
+
+def cmd_standing_show(args: argparse.Namespace) -> int:
+    return _simple_query(args, f"getstandingpayment {args.standing_id}")
+
+
+def _add_standing_subparsers(sub) -> None:
+    """`tau-testnet standing ...` -- payments the network makes on a schedule."""
+    p_st = sub.add_parser(
+        "standing",
+        parents=[_GLOBAL_PARENT],
+        help="Standing payments (create, update, execute, cancel, inspect)",
+    )
+    ssub = p_st.add_subparsers(dest="standing_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser, fee=True):
+        if fee:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument(
+            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+        parser.add_argument("--expire-in", type=_block_count, default=1000,
+                            help="Blocks the transaction may land in, from the next one")
+        parser.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+
+    def _terms_flags(parser):
+        _key_group(parser)
+        parser.add_argument("--to", required=True, help="Recipient public key (96 hex)")
+        parser.add_argument("--amount", required=True, type=int, help="Amount per period")
+        parser.add_argument("--periods", required=True, type=int,
+                            help="How many periods the authorization covers (its end)")
+        every = parser.add_mutually_exclusive_group(required=True)
+        every.add_argument("--every-blocks", type=int, metavar="N")
+        every.add_argument("--every-seconds", type=int, metavar="N")
+        every.add_argument("--every-months", type=int, metavar="N",
+                           help="Calendar months in UTC; a missing day pays on the last day")
+        first = parser.add_mutually_exclusive_group(required=True)
+        first.add_argument("--first-due-height", type=int, metavar="HEIGHT")
+        first.add_argument("--first-due-in", type=_block_count, metavar="BLOCKS",
+                           help="First payment this many blocks after the next one")
+        first.add_argument("--first-due-time", type=int, metavar="UNIX")
+        first.add_argument("--first-due-after", type=_block_count, metavar="SECONDS",
+                           help="First payment this many seconds from now")
+        _tx_flags(parser)
+        parser.set_defaults(func=cmd_standing_create)
+
+    p_new = ssub.add_parser(
+        "create", parents=common,
+        help="Sign once: pay a fixed amount to a fixed recipient every period",
+    )
+    _terms_flags(p_new)
+
+    p_update = ssub.add_parser(
+        "update", parents=common,
+        help="Replace an authorization by new terms (a new version with its own id)",
+    )
+    p_update.add_argument("standing_id", help="Id of the authorization to replace (64 hex)")
+    _terms_flags(p_update)
+
+    p_exec = ssub.add_parser(
+        "execute", parents=common,
+        help="Pay the period that is due now (anyone may; you pay the fee)",
+    )
+    _key_group(p_exec)
+    p_exec.add_argument("standing_id", help="Standing payment id (64 hex)")
+    _tx_flags(p_exec)
+    p_exec.set_defaults(func=cmd_standing_execute)
+
+    p_cancel = ssub.add_parser("cancel", parents=common,
+                               help="Stop every later payment of an authorization")
+    _key_group(p_cancel)
+    p_cancel.add_argument("standing_id", help="Standing payment id (64 hex)")
+    # A cancel is fee-exempt, so a fee limit changes nothing.
+    _tx_flags(p_cancel, fee=False)
+    p_cancel.set_defaults(func=cmd_standing_cancel)
+
+    p_list = ssub.add_parser("list", parents=common,
+                             help="Standing payments an address pays or receives")
+    p_list.add_argument("--address", help="Address (default: your key's)")
+    _key_group(p_list, required=False)
+    p_list.add_argument("--role", choices=["in", "out", "all"], default="all")
+    p_list.set_defaults(func=cmd_standing_list)
+
+    p_show = ssub.add_parser("show", parents=common, help="One standing payment and its history")
+    p_show.add_argument("standing_id", help="Standing payment id (64 hex)")
+    p_show.set_defaults(func=cmd_standing_show)
+
+
+# --- Payout rules -----------------------------------------------------------
+
+_KIND_PAYOUT_SET = 6
+_KIND_PAYOUT_REVOKE = 7
+
+
+def _payout_fields(args, tip: int, now: int) -> dict:
+    """The signed fields of a payout rule from the command line."""
+    rule_text = _read_policy_body(args)
+    slots = []
+    for raw in args.slot or []:
+        slots.append("" if raw.strip().lower() == "open" else raw.strip().lower())
+    if not slots:
+        raise _PayloadError("give at least one --slot (a recipient key, or open)")
+    if args.period_blocks is not None:
+        period = {"period_blocks": int(args.period_blocks)}
+        clock = (tip or _tip_height(args)) + 1
+    else:
+        period = {"period_seconds": int(args.period_seconds)}
+        clock = now
+    if args.ends_at is not None:
+        expires_at = int(args.ends_at)
+    else:
+        expires_at = clock + int(args.ends_in)
+    if expires_at <= clock:
+        raise _PayloadError(f"the rule would end at {expires_at}, not after {clock}")
+    return {
+        "rule_text": rule_text, "slots": slots,
+        "cap_per_execution": int(args.cap_per_execution),
+        "cap_per_period": int(args.cap_per_period),
+        "expires_at": expires_at, **period,
+        **({"per_sale": True} if getattr(args, "per_sale", False) else {}),
+    }
+
+
+def cmd_payout_set(args: argparse.Namespace) -> int:
+    from consensus.payout import PayoutShapeError, parse_payout_rule_set, payout_spec_text
+
+    if args.request:
+        try:
+            fields = _payout_fields(args, 0, int(_now()))
+            payload = tx_mod.build_payout_rule_set_tx(
+                sender_pubkey="00" * 48, sequence_number=0, expiration_time=0,
+                expire_at_height=1, **fields)
+        except (_PayloadError, ValueError) as exc:
+            print_error(str(exc))
+            return EXIT_LOCAL
+        return _submit_rule_change(args, _KIND_PAYOUT_SET, payout_spec_text(payload), "")
+
+    created = {}
+
+    def _build(sender_pubkey, sequence_number, expire_at_height, tip):
+        payload = tx_mod.build_payout_rule_set_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            **_payout_fields(args, tip, int(_now())),
+        )
+        try:
+            created["id"] = parse_payout_rule_set(payload).rule_id.hex()
+        except PayoutShapeError as exc:
+            raise _PayloadError(str(exc))
+        return payload
+
+    if args.expire_in is None:
+        args.expire_in = 1000
+    status = _submit_rule_tx(args, _build, pass_tip=True)
+    if status == EXIT_OK and created.get("id"):
+        quiet = args.json or getattr(args, "dry_run", False)
+        print(f"payout rule id: {created['id']}", file=sys.stderr if quiet else sys.stdout)
+    return status
+
+
+def cmd_payout_revoke(args: argparse.Namespace) -> int:
+    if args.request:
+        return _submit_rule_change(args, _KIND_PAYOUT_REVOKE, "", "")
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_payout_rule_revoke_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+        )
+
+    if args.expire_in is None:
+        args.expire_in = 1000
+    if args.fee is None:
+        args.fee = "0"  # fee-exempt: the node gives no estimate to ask for
+    return _submit_rule_tx(args, _build)
+
+
+def _installed_rule_id(args, account: str) -> str:
+    raw = _send(args, f"getpayoutrule {account}")
+    if rpc_mod.is_error_response(raw):
+        raise _PayloadError(f"cannot read the payout rule of {account}: {raw}")
+    data = (parse_json_response(raw) or {}).get("data") or {}
+    if not data.get("installed"):
+        raise _PayloadError(f"{account} has no payout rule installed")
+    return data["rule"]["rule_id"]
+
+
+def cmd_payout_execute(args: argparse.Namespace) -> int:
+    try:
+        recipients = {k: v.strip().lower()
+                      for k, v in _parse_kv_pairs(args.recipient, "recipient").items()}
+        data = {}
+        for k, v in _parse_kv_pairs(args.data, "data").items():
+            try:
+                data[k] = int(v)
+            except ValueError:
+                raise _PayloadError(f"--data {k}: {v!r} is not an integer")
+        account = args.account.strip().lower()
+        rule_id = (args.rule_id or _installed_rule_id(args, account)).strip().lower()
+        sale_id = args.sale.strip().lower() if args.sale else None
+        if sale_id is not None and (len(sale_id) != 64
+                                    or any(c not in "0123456789abcdef" for c in sale_id)):
+            raise _PayloadError("--sale must be the 64-hex hash of the transaction that paid")
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_payout_execute_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            account_pubkey=account,
+            rule_id=rule_id,
+            recipients=recipients,
+            data=data,
+            sale_id=sale_id,
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_payout_show(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getpayoutrule {address}")
+
+
+def _add_payout_subparsers(sub) -> None:
+    """`tau-testnet payout ...` -- money an account lets a rule pay out."""
+    import tau_defs
+
+    p_pay = sub.add_parser(
+        "payout",
+        parents=[_GLOBAL_PARENT],
+        help="Payout rules (set, revoke, execute, show)",
+    )
+    psub = p_pay.add_subparsers(dest="payout_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser, fee=True, request=False):
+        if fee or request:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument(
+            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+        window = parser.add_mutually_exclusive_group()
+        window.add_argument(
+            "--expire-in", type=_block_count, default=None,
+            help="Blocks the transaction may land in, from the next one (default: "
+                 f"1000, or {2 * tau_defs.RULE_CHANGE_DELAY_BLOCKS} with --request)",
+        )
+        window.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+        parser.add_argument("--dry-run", action="store_true",
+                            help="Sign and print the transaction, and send nothing")
+        if request:
+            parser.add_argument(
+                "--request", action="store_true",
+                help="Send as a rule-change request, for an account with a guard",
+            )
+            parser.add_argument(
+                "--approver", action="append", metavar="SLOT=PUBKEY",
+                help="With --request: approver for one slot. Repeatable.",
+            )
+            parser.add_argument(
+                "--preview", action="store_true",
+                help="With --request: ask what the request would need, send nothing",
+            )
+
+    p_set = psub.add_parser(
+        "set", parents=common,
+        help="Install (or replace) your account's payout rule",
+    )
+    _key_group(p_set)
+    body = p_set.add_mutually_exclusive_group(required=True)
+    body.add_argument("--file", help="File containing the rule (one always clause)")
+    body.add_argument("--body", help="Rule text")
+    p_set.add_argument("--slot", action="append", metavar="PUBKEY|open",
+                       help="One slot, in order: a fixed recipient, or open. Repeatable.")
+    p_set.add_argument("--cap-per-execution", required=True, type=int)
+    p_set.add_argument("--cap-per-period", required=True, type=int)
+    period = p_set.add_mutually_exclusive_group(required=True)
+    period.add_argument("--period-blocks", type=int, metavar="N")
+    period.add_argument("--period-seconds", type=int, metavar="N")
+    ends = p_set.add_mutually_exclusive_group(required=True)
+    ends.add_argument("--ends-at", type=int, metavar="HEIGHT|UNIX",
+                      help="Last moment, on the period's clock")
+    ends.add_argument("--ends-in", type=int, metavar="N",
+                      help="Blocks or seconds from now, on the period's clock")
+    p_set.add_argument("--per-sale", action="store_true",
+                       help="Pay only against sales the chain recorded (transfers into "
+                            "the account), once per sale; the rule reads i27 and i28")
+    _tx_flags(p_set, request=True)
+    p_set.set_defaults(func=cmd_payout_set)
+
+    p_rev = psub.add_parser("revoke", parents=common, help="Remove your payout rule")
+    _key_group(p_rev)
+    _tx_flags(p_rev, fee=False, request=True)
+    p_rev.set_defaults(func=cmd_payout_revoke)
+
+    p_exe = psub.add_parser("execute", parents=common,
+                            help="Run an account's payout rule once (anyone may)")
+    _key_group(p_exe)
+    p_exe.add_argument("--account", required=True, help="The paying account (96 hex)")
+    p_exe.add_argument("--rule-id", help="Pin the rule (default: the installed one)")
+    p_exe.add_argument("--recipient", action="append", metavar="SLOT=PUBKEY",
+                       help="Name the recipient of an open slot. Repeatable.")
+    p_exe.add_argument("--data", action="append", metavar="K=VALUE",
+                       help="Executor data for input i40+K. Repeatable.")
+    p_exe.add_argument("--sale", metavar="TX_HASH",
+                       help="For a per-sale rule: the open sale to pay (the hash of "
+                            "the transfer that paid the account)")
+    _tx_flags(p_exe)
+    p_exe.set_defaults(func=cmd_payout_execute)
+
+    p_show = psub.add_parser("show", parents=common, help="An account's payout rule")
+    p_show.add_argument("address", nargs="?", help="Address (default: your key's)")
+    _key_group(p_show, required=False)
+    p_show.set_defaults(func=cmd_payout_show)
+
+
+# --- Receive routes ---------------------------------------------------------
+
+_KIND_ROUTE_SET = 8
+_KIND_ROUTE_REMOVE = 9
+
+
+def _share_bps(args) -> int:
+    """Basis points from --share-bps, or from --share as a percent (2 decimals)."""
+    from decimal import Decimal, InvalidOperation
+
+    if args.share_bps is not None:
+        return int(args.share_bps)
+    try:
+        bps = Decimal(str(args.share).strip().rstrip("%")) * 100
+    except InvalidOperation:
+        raise _PayloadError(f"--share {args.share!r} is not a percent")
+    if bps != bps.to_integral_value():
+        raise _PayloadError("--share has at most two decimals (it is basis points / 100)")
+    return int(bps)
+
+
+def _route_fields(args, now: int) -> dict:
+    """The signed fields of a receive route from the command line."""
+    destination = args.to.strip().lower()
+    start = 0
+    if args.starts_at is not None:
+        start = int(args.starts_at)
+    elif args.starts_in is not None:
+        start = now + int(args.starts_in)
+    end = 0
+    if args.ends_at is not None:
+        end = int(args.ends_at)
+    elif args.ends_in is not None:
+        end = now + int(args.ends_in)
+    if end and end <= max(now, start):
+        raise _PayloadError(f"the route would end at {end}, before it starts")
+    if args.locked and not end:
+        raise _PayloadError("a locked route needs an end: give --ends-at or --ends-in")
+    return {"destination_pubkey": destination, "share_bps": _share_bps(args),
+            "min_amount": int(args.min_amount or 0), "active_from": start,
+            "expires_at": end, "locked": bool(args.locked)}
+
+
+def cmd_route_set(args: argparse.Namespace) -> int:
+    from consensus.receive_route import (
+        RouteShapeError, parse_receive_route_set, route_spec_text,
+    )
+
+    try:
+        fields = _route_fields(args, int(_now()))
+    except (_PayloadError, ValueError) as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    if args.request:
+        return _submit_rule_change(args, _KIND_ROUTE_SET, route_spec_text(fields), "")
+
+    created = {}
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        payload = tx_mod.build_receive_route_set_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            **fields,
+        )
+        try:
+            created["id"] = parse_receive_route_set(payload).route_id.hex()
+        except RouteShapeError as exc:
+            raise _PayloadError(str(exc))
+        return payload
+
+    if args.expire_in is None:
+        args.expire_in = 1000
+    status = _submit_rule_tx(args, _build)
+    if status == EXIT_OK and created.get("id"):
+        quiet = args.json or getattr(args, "dry_run", False)
+        print(f"receive route id: {created['id']}", file=sys.stderr if quiet else sys.stdout)
+    return status
+
+
+def cmd_route_remove(args: argparse.Namespace) -> int:
+    if args.request:
+        return _submit_rule_change(args, _KIND_ROUTE_REMOVE, "", "")
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_receive_route_remove_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+        )
+
+    if args.expire_in is None:
+        args.expire_in = 1000
+    if args.fee is None:
+        args.fee = "0"  # fee-exempt: the node gives no estimate to ask for
+    return _submit_rule_tx(args, _build)
+
+
+def _installed_route_id(args, owner: str) -> str:
+    raw = _send(args, f"getreceiveroute {owner}")
+    if rpc_mod.is_error_response(raw):
+        raise _PayloadError(f"cannot read the receive route of {owner}: {raw}")
+    data = (parse_json_response(raw) or {}).get("data") or {}
+    if not data.get("installed"):
+        raise _PayloadError(f"{owner} has no receive route")
+    return data["route"]["route_id"]
+
+
+def cmd_route_release(args: argparse.Namespace) -> int:
+    try:
+        owner = args.owner.strip().lower()
+        route_id = (args.route_id or _installed_route_id(args, owner)).strip().lower()
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_receive_route_release_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            owner_pubkey=owner,
+            route_id=route_id,
+        )
+
+    if args.expire_in is None:
+        args.expire_in = 1000
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_route_show(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getreceiveroute {address}")
+
+
+# --- Envelopes (spending limits) -------------------------------------------------
+
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+
+
+def _duration_seconds(text: str) -> int:
+    """Seconds from `90`, `90s`, `15m`, `12h`, `7d` or `2w`."""
+    raw = str(text).strip().lower()
+    unit = _DURATION_UNITS.get(raw[-1:]) if raw else None
+    number = raw[:-1] if unit else raw
+    if not number.isdigit() or int(number) < 1:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a duration (examples: 3600, 90s, 15m, 12h, 7d, 2w)")
+    return int(number) * (unit or 1)
+
+
+def _envelope_caps(values) -> list:
+    caps = []
+    for value in values or []:
+        for part in str(value).split(","):
+            part = part.strip()
+            if not part.isdigit():
+                raise _PayloadError(f"--cap {value!r}: caps are whole amounts")
+            caps.append(int(part))
+    if not caps:
+        raise _PayloadError("give at least one --cap")
+    return caps
+
+
+def _envelope_clock(args, tip: int, now: int) -> dict:
+    """The period and end of an envelope, both on one clock."""
+    if args.period_blocks is not None:
+        if args.ends_at is not None or args.ends_in is not None:
+            raise _PayloadError("a block period ends on the block clock: "
+                                "give --ends-at-height or --ends-in-blocks")
+        if args.ends_at_height is not None:
+            end = int(args.ends_at_height)
+        elif args.ends_in_blocks is not None:
+            end = tip + 1 + int(args.ends_in_blocks)
+        else:
+            raise _PayloadError("give --ends-at-height or --ends-in-blocks")
+        return {"period_blocks": int(args.period_blocks), "expires_at": end}
+    if args.ends_at_height is not None or args.ends_in_blocks is not None:
+        raise _PayloadError("a time period ends on the time clock: "
+                            "give --ends-at or --ends-in")
+    if args.ends_at is not None:
+        end = int(args.ends_at)
+    elif args.ends_in is not None:
+        end = now + int(args.ends_in)
+    else:
+        raise _PayloadError("give --ends-at or --ends-in")
+    return {"period_seconds": int(args.period), "expires_at": end}
+
+
+def cmd_envelope_send(args: argparse.Namespace) -> int:
+    from consensus.envelope import EnvelopeShapeError, parse_envelope_send
+
+    created = {}
+
+    def _build(sender_pubkey, sequence_number, expire_at_height, tip):
+        now = int(_now())
+        payload = tx_mod.build_envelope_send_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=now + args.expiry,
+            expire_at_height=expire_at_height,
+            recipient_pubkey=args.to.strip().lower(),
+            amount=int(args.amount),
+            caps=_envelope_caps(args.cap),
+            recurring=bool(args.recurring),
+            **_envelope_clock(args, tip, now),
+        )
+        try:
+            created["id"] = parse_envelope_send(payload).envelope_id.hex()
+        except EnvelopeShapeError as exc:
+            raise _PayloadError(str(exc))
+        return payload
+
+    status = _submit_rule_tx(args, _build, pass_tip=True)
+    if status == EXIT_OK and created.get("id"):
+        quiet = args.json or getattr(args, "dry_run", False)
+        print(f"envelope id: {created['id']}", file=sys.stderr if quiet else sys.stdout)
+    return status
+
+
+def cmd_envelope_spend(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        to = sender_pubkey if args.to.strip().lower() == "self" else args.to.strip().lower()
+        return tx_mod.build_envelope_spend_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            envelope_id=args.envelope_id.strip().lower(),
+            to_pubkey=to,
+            amount=int(args.amount),
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_envelope_release(args: argparse.Namespace) -> int:
+    def _build(sender_pubkey, sequence_number, expire_at_height):
+        return tx_mod.build_envelope_release_tx(
+            sender_pubkey=sender_pubkey,
+            sequence_number=sequence_number,
+            expiration_time=int(_now()) + args.expiry,
+            expire_at_height=expire_at_height,
+            envelope_id=args.envelope_id.strip().lower(),
+        )
+
+    return _submit_rule_tx(args, _build)
+
+
+def cmd_envelope_show(args: argparse.Namespace) -> int:
+    return _simple_query(args, f"getenvelope {args.envelope_id.strip().lower()}")
+
+
+def cmd_envelope_list(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _simple_query(args, f"getenvelopes {address} {args.role}")
+
+
+def _add_envelope_subparsers(sub) -> None:
+    """`tau-testnet envelope ...` -- send money someone may spend only so fast."""
+    p_env = sub.add_parser(
+        "envelope",
+        parents=[_GLOBAL_PARENT],
+        help="Envelopes: money with a spending limit (send, spend, release, show, list)",
+    )
+    esub = p_env.add_subparsers(dest="envelope_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser, fee=True):
+        if fee:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument(
+            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+        window = parser.add_mutually_exclusive_group()
+        window.add_argument("--expire-in", type=_block_count, default=1000,
+                            help="Blocks the transaction may land in, from the next one")
+        window.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+        parser.add_argument("--dry-run", action="store_true",
+                            help="Sign and print the transaction, and send nothing")
+
+    p_send = esub.add_parser(
+        "send", parents=common,
+        help="Send money in an envelope: the recipient may spend at most a cap per period",
+    )
+    _key_group(p_send)
+    p_send.add_argument("--to", required=True, metavar="PUBKEY", help="The recipient (96 hex)")
+    p_send.add_argument("--amount", required=True, type=int, help="What the envelope holds")
+    p_send.add_argument(
+        "--cap", action="append", required=True, metavar="N[,N...]",
+        help="Most the recipient may spend in one period; repeat or comma-separate "
+             "for a schedule, first period first (--cap 1000,500)")
+    p_send.add_argument("--recurring", action="store_true",
+                        help="After the list, the last cap repeats every period "
+                             "(without it, the limit stops after the list)")
+    period = p_send.add_mutually_exclusive_group(required=True)
+    period.add_argument("--period", type=_duration_seconds, metavar="DURATION",
+                        help="Period on the time clock: 3600, 12h, 7d, 2w")
+    period.add_argument("--period-blocks", type=_block_count, metavar="N",
+                        help="Period on the block clock")
+    ends = p_send.add_mutually_exclusive_group(required=True)
+    ends.add_argument("--ends-in", type=_duration_seconds, metavar="DURATION",
+                      help="End this long from now (time clock); the rest then goes "
+                           "to the recipient")
+    ends.add_argument("--ends-at", type=int, metavar="UNIX")
+    ends.add_argument("--ends-in-blocks", type=_block_count, metavar="N",
+                      help="End this many blocks after the next one (block clock)")
+    ends.add_argument("--ends-at-height", type=int, metavar="HEIGHT")
+    _tx_flags(p_send)
+    p_send.set_defaults(func=cmd_envelope_send)
+
+    p_spend = esub.add_parser(
+        "spend", parents=common,
+        help="As an envelope's recipient, pay someone (or yourself) out of it",
+    )
+    _key_group(p_spend)
+    p_spend.add_argument("envelope_id", help="Envelope id (64 hex)")
+    p_spend.add_argument("--to", required=True, metavar="PUBKEY|self",
+                         help="Who is paid; 'self' moves it to your own balance")
+    p_spend.add_argument("--amount", required=True, type=int)
+    _tx_flags(p_spend)
+    p_spend.set_defaults(func=cmd_envelope_spend)
+
+    p_rel = esub.add_parser(
+        "release", parents=common,
+        help="As an envelope's sender, give the recipient everything left now",
+    )
+    _key_group(p_rel)
+    p_rel.add_argument("envelope_id", help="Envelope id (64 hex)")
+    _tx_flags(p_rel, fee=False)
+    p_rel.set_defaults(func=cmd_envelope_release)
+
+    p_show = esub.add_parser("show", parents=common,
+                             help="One envelope: terms, this period's room, history")
+    p_show.add_argument("envelope_id", help="Envelope id (64 hex)")
+    p_show.set_defaults(func=cmd_envelope_show)
+
+    p_list = esub.add_parser("list", parents=common,
+                             help="Envelopes an address holds (in) or sent (out)")
+    p_list.add_argument("address", nargs="?", help="Address (default: your key's)")
+    _key_group(p_list, required=False)
+    p_list.add_argument("--role", choices=["in", "out", "all"], default="all")
+    p_list.set_defaults(func=cmd_envelope_list)
+
+
+def _add_route_subparsers(sub) -> None:
+    """`tau-testnet route ...` -- send a share of what an account receives on."""
+    import tau_defs
+
+    p_route = sub.add_parser(
+        "route",
+        parents=[_GLOBAL_PARENT],
+        help="Receive routes (set, remove, release, show)",
+    )
+    rsub = p_route.add_subparsers(dest="route_command", required=True)
+    common = [_GLOBAL_PARENT]
+
+    def _key_group(parser, required=True):
+        src = parser.add_mutually_exclusive_group(required=required)
+        src.add_argument("--key", help="Logical name of a saved key")
+        src.add_argument("--privkey", help="Private key (hex or decimal)")
+
+    def _tx_flags(parser, fee=True, request=False):
+        if fee or request:
+            parser.add_argument("--fee", default=None, help=FEE_HELP)
+        parser.add_argument(
+            "--expiry", type=int, default=tx_mod.DEFAULT_EXPIRY_SECONDS,
+            help="Seconds until expiration_time (default: %(default)s)",
+        )
+        window = parser.add_mutually_exclusive_group()
+        window.add_argument(
+            "--expire-in", type=_block_count, default=None,
+            help="Blocks the transaction may land in, from the next one (default: "
+                 f"1000, or {2 * tau_defs.RULE_CHANGE_DELAY_BLOCKS} with --request)",
+        )
+        window.add_argument("--expire-at-height", type=int,
+                            help="Absolute expiry height (overrides --expire-in)")
+        parser.add_argument("--dry-run", action="store_true",
+                            help="Sign and print the transaction, and send nothing")
+        if request:
+            parser.add_argument(
+                "--request", action="store_true",
+                help="Send as a rule-change request, for an account with a guard",
+            )
+            parser.add_argument(
+                "--approver", action="append", metavar="SLOT=PUBKEY",
+                help="With --request: approver for one slot. Repeatable.",
+            )
+            parser.add_argument(
+                "--preview", action="store_true",
+                help="With --request: ask what the request would need, send nothing",
+            )
+
+    p_set = rsub.add_parser(
+        "set", parents=common,
+        help="Send a share of everything your account receives to another account",
+    )
+    _key_group(p_set)
+    p_set.add_argument("--to", required=True, metavar="PUBKEY",
+                       help="The destination account (96 hex)")
+    share = p_set.add_mutually_exclusive_group(required=True)
+    share.add_argument("--share", metavar="PERCENT",
+                       help="Share in percent, up to two decimals (20 = 20%%)")
+    share.add_argument("--share-bps", type=int, metavar="BPS",
+                       help="Share in basis points (2000 = 20%%)")
+    p_set.add_argument("--min-amount", type=int, default=0, metavar="N",
+                       help="Credits smaller than this are not split")
+    starts = p_set.add_mutually_exclusive_group()
+    starts.add_argument("--starts-at", type=int, metavar="UNIX")
+    starts.add_argument("--starts-in", type=int, metavar="SECONDS")
+    ends = p_set.add_mutually_exclusive_group()
+    ends.add_argument("--ends-at", type=int, metavar="UNIX")
+    ends.add_argument("--ends-in", type=int, metavar="SECONDS")
+    p_set.add_argument("--locked", action="store_true",
+                       help="Bind yourself until the end: only the destination can "
+                            "release the route earlier")
+    _tx_flags(p_set, request=True)
+    p_set.set_defaults(func=cmd_route_set)
+
+    p_rem = rsub.add_parser("remove", parents=common, help="Remove your receive route")
+    _key_group(p_rem)
+    _tx_flags(p_rem, fee=False, request=True)
+    p_rem.set_defaults(func=cmd_route_remove)
+
+    p_rel = rsub.add_parser(
+        "release", parents=common,
+        help="As a route's destination, let go of a route that pays you",
+    )
+    _key_group(p_rel)
+    p_rel.add_argument("--owner", required=True, help="The account that routes to you")
+    p_rel.add_argument("--route-id", help="Pin the route (default: the installed one)")
+    _tx_flags(p_rel, fee=False)
+    p_rel.set_defaults(func=cmd_route_release)
+
+    p_show = rsub.add_parser("show", parents=common,
+                             help="An account's receive route and the routes that pay it")
+    p_show.add_argument("address", nargs="?", help="Address (default: your key's)")
+    _key_group(p_show, required=False)
+    p_show.set_defaults(func=cmd_route_show)
 
 
 def _add_retractable_subparsers(sub) -> None:

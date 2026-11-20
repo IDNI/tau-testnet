@@ -22,6 +22,16 @@ TAU_GOSSIP_TOPIC_APPROVALS = "tau/approvals/1.0.0"
 # Retractable transfers get their own topic: parks are floods, while a retract
 # is deadline-sensitive and must not queue behind them.
 TAU_GOSSIP_TOPIC_RETRACTABLE = "tau/retractable/1.0.0"
+# Standing payments get their own topic too: creates can arrive in bursts, and a
+# cancel is time-sensitive -- it must land before the next due point.
+TAU_GOSSIP_TOPIC_STANDING = "tau/standing/1.0.0"
+# Payout rules: installs carry rule text, executions are what moves the money.
+TAU_GOSSIP_TOPIC_PAYOUT = "tau/payout/1.0.0"
+# Receive routes: small, rare, and a release by a destination is time-sensitive.
+TAU_GOSSIP_TOPIC_ROUTES = "tau/routes/1.0.0"
+# Envelopes (spending limits): a spend is an everyday payment, and a release by
+# the sender should not wait behind a burst of sends.
+TAU_GOSSIP_TOPIC_ENVELOPES = "tau/envelopes/1.0.0"
 TAU_GOSSIP_TOPIC_PEERS = "tau/peers/2.0.0"
 
 # Mempool & Edge Ingestion Limits
@@ -56,3 +66,27 @@ TAU_MEMPOOL_SNAPSHOT_MAX_APPROVAL_TXS = 32
 TAU_MAX_RETRACTABLE_TRANSFER_BYTES = 4096
 TAU_MAX_RETRACT_TRANSFER_BYTES = 4096
 TAU_MEMPOOL_SNAPSHOT_MAX_RETRACTABLE_TXS = 32
+# A create carries two pubkeys and a few integers, an update the same plus the
+# id it replaces; a cancel and an execute carry one id.
+TAU_MAX_STANDING_PAYMENT_CREATE_BYTES = 4096
+TAU_MAX_STANDING_PAYMENT_UPDATE_BYTES = 4096
+TAU_MAX_STANDING_PAYMENT_CANCEL_BYTES = 4096
+TAU_MAX_STANDING_PAYMENT_EXECUTE_BYTES = 4096
+TAU_MEMPOOL_SNAPSHOT_MAX_STANDING_TXS = 32
+# A rule set carries up to 4 KiB of Tau text and eight slots; an execution an id,
+# up to eight recipients and eight data values; a revoke the envelope.
+TAU_MAX_PAYOUT_RULE_SET_BYTES = 16384
+TAU_MAX_PAYOUT_EXECUTE_BYTES = 8192
+TAU_MAX_PAYOUT_RULE_REVOKE_BYTES = 4096
+TAU_MEMPOOL_SNAPSHOT_MAX_PAYOUT_TXS = 32
+# A route set carries a destination and five numbers; remove and release less.
+TAU_MAX_RECEIVE_ROUTE_SET_BYTES = 4096
+TAU_MAX_RECEIVE_ROUTE_REMOVE_BYTES = 4096
+TAU_MAX_RECEIVE_ROUTE_RELEASE_BYTES = 4096
+TAU_MEMPOOL_SNAPSHOT_MAX_ROUTE_TXS = 32
+# A send carries a recipient, an amount and at most twelve caps; spend and
+# release less.
+TAU_MAX_ENVELOPE_SEND_BYTES = 4096
+TAU_MAX_ENVELOPE_SPEND_BYTES = 4096
+TAU_MAX_ENVELOPE_RELEASE_BYTES = 4096
+TAU_MEMPOOL_SNAPSHOT_MAX_ENVELOPE_TXS = 64

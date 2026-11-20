@@ -285,6 +285,20 @@ tau-testnet retractable list --key alice --role out
 tau-testnet retractable show <retractable_id>
 tau-testnet retractable retract --key alice <retractable_id>
 
+# standing payments (sign once; paid every period from the payer's balance until the end or a cancel)
+tau-testnet standing create --key alice --to <recipient_pubkey> --amount 25 --periods 12 --every-months 1 --first-due-after 3600
+tau-testnet standing list --key alice --role out
+tau-testnet standing show <standing_id>
+tau-testnet standing execute --key bob <standing_id>     # anyone: pay the period due now
+tau-testnet standing update --key alice <standing_id> --to <recipient_pubkey> --amount 30 --periods 12 --every-months 1 --first-due-after 3600
+tau-testnet standing cancel --key alice <standing_id>
+
+# payout rules (a Tau rule pays out the account's money when anyone executes it, inside signed caps)
+tau-testnet payout set --key treasury --file payout.tau --slot <bob_pubkey> --cap-per-execution 500 --cap-per-period 2000 --period-blocks 1000 --ends-in 100000
+tau-testnet payout execute --key carol --account <treasury_pubkey> --data 0=300
+tau-testnet payout show <treasury_pubkey>
+tau-testnet payout revoke --key treasury
+
 # target a remote node
 tau-testnet --host testnet.tau.net --port 65432 status
 ```
@@ -494,7 +508,7 @@ state_hash = BLAKE3(
   - Transaction → `SHA-256` of canonical JSON of `{sender_pubkey, sequence_number, expiration_time, expire_at_height, fee_limit, tx_type, …type-specific}`. `tx_type` **is** signed, so a `user_tx` signature cannot be replayed as a governance vote. `expire_at_height` is signed whenever present, and required on anything new: the wall-clock `expiration_time` is rechecked at apply against the block **timestamp**, which the proposer picks, so the height is the deadline a proposer cannot move.
   - Block header → `SHA-256` of `BlockHeader.canonical_bytes()`, verified by `Block.verify_consensus_proof()`.
 
-> ⚠️ **No cross-network / version domain separation (replay risk).** Signed payloads do **not** include `network_id`, `genesis_hash`, or a protocol version, and there is no explicit `tx`-vs-`block` domain tag (they are separated only implicitly by incompatible encodings). A transaction signed for one Tau network is cryptographically valid on any other network where the same keypair is funded. **Do not reuse account/validator keys across networks.** Adding explicit domain tags (e.g. `TAU_TESTNET_TX_V1 | network_id | genesis_hash | tx_type | body`) is planned and will be a breaking signature-format change.
+> ⚠️ **No cross-network / version domain separation (replay risk).** Signed payloads do **not** include `network_id`, `genesis_hash`, or a protocol version, and there is no explicit `tx`-vs-`block` domain tag (they are separated only implicitly by incompatible encodings). A transaction signed for one Tau network is cryptographically valid on any other network where the same keypair is funded. **Do not reuse account/validator keys across networks.** Adding explicit domain tags (e.g. `TAU_TESTNET_TX_V1 | network_id | genesis_hash | tx_type | body`) is planned and will be a breaking signature-format change. Exception: the transaction types listed in `consensus/network_binding.py` (standing payments) already sign `genesis_hash` and are refused on every other network.
 
 ---
 
@@ -639,6 +653,127 @@ Timing caveats:
 - A retract must be **included in a block** before the release point, not merely sent. A feeless retract sorts last in the mempool under backlog, so retract with margin.
 
 **Upgrade.** This adds a field to the consensus metadata hash with no activation flag, so it needs a regenesis and every node on the same build. An older binary forks at the first park block.
+
+## Standing payments
+
+Long-form guide: [docs/standing_payments.md](docs/standing_payments.md).
+
+A `standing_payment_create` is an authorization signed once: pay a fixed `amount` to a fixed recipient every period, for `periods` periods. Each payment is made by an end-of-block sweep, with no further transaction, or earlier in its period by a `standing_payment_execute` that anyone may send. Nothing is reserved: the money stays in the payer's balance until a payment is made.
+
+```bash
+tau-testnet standing create --key alice --to <recipient_pubkey> --amount 25 --periods 12 \
+    --every-months 1 --first-due-time 1798761600                        # calendar months, UTC
+tau-testnet standing create --key alice --to <recipient_pubkey> --amount 10 --periods 52 \
+    --every-seconds 604800 --first-due-after 3600                       # weekly, first in an hour
+tau-testnet standing create --key alice --to <recipient_pubkey> --amount 5 --periods 10 \
+    --every-blocks 1000 --first-due-in 50                               # by height
+tau-testnet standing list --key alice --role out
+tau-testnet standing show <standing_id>                                  # open, ended, cancelled or replaced, with history
+tau-testnet standing execute --key bob <standing_id>                     # anyone: pay the period due now
+tau-testnet standing update --key alice <standing_id> --to <recipient_pubkey> --amount 30 \
+    --periods 12 --every-months 1 --first-due-time 1801440000            # a new version, its own id
+tau-testnet standing cancel --key alice <standing_id>
+```
+
+Semantics:
+
+- **Schedule.** Every `interval_blocks` blocks, `interval_seconds` seconds of block time, or `interval_months` calendar months (UTC; a day the month lacks becomes its last day, and every due point is derived from `first_due`, so there is no drift). Period `p` is payable from its due point until the next one.
+- **One payment per period, no catch-up.** A period whose window closes unpaid is missed.
+- **No funds.** Nothing is paid (never a part, never a debt); the period is retried in each later block of its window, then missed.
+- **Policy.** Every payment re-checks the payer's current `o5` clause as a transfer in that block, with the approval slots empty. A block misses the period, with no retry.
+- **Execute.** Anyone may send `standing_payment_execute {standing_id}` to pay the period the block falls in, from the stored terms: refused, with nothing changed and no fee, before the first due point, after the end, when the period is already settled, without funds or when the payer's policy blocks it. The sweep then finds the period settled.
+- **Update.** `standing_payment_update` (payer only) ends an authorization as `replaced` and starts complete new terms as the next `version`, with their own id and `replaces` naming the old one, in one transaction. Signed terms are never edited.
+- **Fees.** One fee when an authorization is created or updated; payments the sweep makes and the cancel are fee-free; an execute is paid by its sender.
+- **Cancel.** Payer only, takes effect in its own block: a payment due in that block is not made.
+- **One network.** All four transaction types sign `genesis_hash` (the hash of block 0; `getsequence` returns it and the CLI fills it in). One signed for another network is refused at admission (`WRONG_NETWORK`) and at block apply.
+- **Caps.** 16 open per payer, 4096 in total, 32 handled per block by the sweep and 32 executes per block. The shortest height interval (128 blocks) lets every entry be reached once per period even when the book is full.
+- **Reads.** `getstandingpayments <address> [out|in|all]` (with `semantics`, the node's rules and limits), `getstandingpayment <id>` (with `history`), and `gettxstatus`.
+
+**Upgrade.** The book root is folded into the consensus metadata as `standing_payments_root` only once the book has held an entry, so **no regenesis** is needed. Nodes must upgrade before the first create; an older binary diverges loudly at that block.
+
+## Payout rules
+
+Long-form guide: [docs/payout_rules.md](docs/payout_rules.md).
+
+A `payout_rule_set` installs the account's one payout rule: a Tau clause, up to eight recipient slots (a fixed key, or open for the executor to name), a cap per execution, a cap per period and an end. Anyone may then send `payout_execute`: the node steps the rule once in its own policy pool and pays every slot it writes, or nothing.
+
+```bash
+tau-testnet payout set --key treasury --file payout.tau --slot <bob_pubkey> --slot open \
+    --cap-per-execution 500 --cap-per-period 2000 --period-blocks 1000 --ends-in 100000
+tau-testnet payout execute --key carol --account <treasury_pubkey> --recipient 1=<dave_pubkey> --data 0=300
+tau-testnet payout show <treasury_pubkey>                    # terms, period spend, history
+tau-testnet payout revoke --key treasury
+```
+
+Semantics:
+
+- **ABI.** The rule reads `i2` (account balance at the parent block), `i5`/`i6` (block time and height), `i13` (executor key), `i26` (paid this period), `i30+k` (slot k's recipient), `i40+k` (executor data) and writes `o30+k` (slot k's amount), each at a fixed width.
+- **All or nothing.** `1 <= total <= cap_per_execution`, period total `<= cap_per_period`, `total <=` the account's balance; an open slot pays only a recipient the executor named, never the account itself.
+- **Periods.** Every `period_blocks` blocks or `period_seconds` of block time, counted from the install; nothing carries over.
+- **Per sale.** A rule installed with `per_sale` (`--per-sale`) pays only against sales the chain recorded: every signed transfer into the account is an open sale (id = its transaction hash). An execution names one (`--sale <tx_hash>`), the rule reads its amount and payer (`i27`, `i28`), and a paid sale is closed, so a royalty is paid once per sale and never on the claimant's word. At most 64 open per rule.
+- **Policy.** The account's `o5` clause is not consulted: the payout rule is its own authorization. Installing, replacing and revoking are rule changes (kinds 6 and 7) that a rule-change guard judges; a guarded account uses `--request`. Payout rule + blocking `o5` + guard = escrow.
+- **Fees.** The account pays one fee to install; each execution's executor pays its fee after the legs; revoke is fee-free. A refused execution is not included.
+- **Caps.** One rule per account, 4096 in total, 8 slots, 16 executions per block.
+- **Reads.** `getpayoutrule <address>` (with `history` and `semantics`) and `gettxstatus`.
+
+**Upgrade.** The book root is folded into the consensus metadata as `payout_rules_root` only once the book has held a rule, so **no regenesis** is needed. Nodes must upgrade before the first install.
+
+## Receive routes
+
+Long-form guide: [docs/receive_routes.md](docs/receive_routes.md).
+
+A `receive_route_set` installs the account's one receive route: a destination and a share. From then on every payment the account receives is split as it lands, in the same state transition: `routed = floor(gross * share_bps / 10000)` goes to the destination, the rest to the account. Nobody has to be online.
+
+```bash
+tau-testnet route set --key shop --to <tax_pubkey> --share 5
+tau-testnet route set --key project --to <treasury_pubkey> --share 20 --ends-in 31536000 --locked
+tau-testnet route show <address>                             # route, routes paying it, history
+tau-testnet route remove --key shop
+tau-testnet route release --key treasury --owner <project_pubkey>   # destination lets go
+```
+
+Semantics:
+
+- **Split.** Per credit, rounding the routed part down; nothing below `min_amount`; share 1..9000 bps (the account keeps at least 10%). Optional `active_from` / `expires_at` in block time.
+- **No bypass.** Transfers, approved transfers, retractable releases, standing payments, payout legs, envelope spends and envelope releases all split. Retract refunds, faucet grants and fees do not. A routed share is never routed again (one hop), and a route straight back (A -> B while B -> A) is refused.
+- **Payer and account.** The payer pays its own fee, unchanged; routing has no fee. The routed part never touches the account's balance, so no `o5` clause, cooldown or spend count sees it.
+- **Admin.** Setting and removing are rule changes (kinds 8 and 9) that a rule-change guard judges; a guarded account uses `--request`. A `--locked` route binds the account until its end (at most 366 days): it cannot be removed or weakened, and only the destination can release it early.
+- **Fees.** Setting costs one fee; remove and release are fee-free.
+- **One network.** All three types sign `genesis_hash`, like standing payments; one signed for another network is refused (`WRONG_NETWORK`).
+- **Caps.** One route per account, one destination, 4096 routes in total.
+- **Reads.** `getreceiveroute <address>` (with `routes_in`, `history`, `history_in`, `semantics`), `gettxstatus` (`receive_routes`: the splits a transaction caused), and `sendtx` / `checktx` (`receive_routes`: how the routes in force would split its credits).
+
+**Upgrade.** The book root is folded into the consensus metadata as `receive_routes_root` only once the book has held a route, so **no regenesis** is needed. Nodes must upgrade before the first route is set.
+
+## Envelopes (spending limits)
+
+Long-form guide: [docs/envelopes.md](docs/envelopes.md).
+
+An `envelope_send` sends money with a spending limit written on it. The amount leaves the sender at once and waits in the envelope; the recipient spends it with `envelope_spend`, to anyone, at most a cap per period. Every node enforces the limit at block apply.
+
+```bash
+tau-testnet envelope send --key parent --to <child_pubkey> --amount 5200 \
+    --cap 100 --recurring --period 7d --ends-in 52w                 # 100 a week for a year
+tau-testnet envelope send --key client --to <contractor_pubkey> --amount 4000 \
+    --cap 1000,500 --recurring --period 30d --ends-in 210d          # an advance, then 500 a month
+tau-testnet envelope spend --key child <envelope_id> --to <shop_pubkey> --amount 40
+tau-testnet envelope show <envelope_id>                            # room this period, history
+tau-testnet envelope list --key child --role in
+tau-testnet envelope release --key parent <envelope_id>            # the rest to the recipient now
+```
+
+Semantics:
+
+- **Limit.** Period `n = (clock - anchor) // period` on a block or time clock, the anchor being the block that sent it. `cap(n) = caps[n]` (up to 12 caps), then `caps[-1]` when `recurring`, else no limit. A spend needs `spent in period n + amount <= cap(n)` and at most what the envelope holds. Nothing carries over.
+- **Who.** Only the recipient spends, to anyone (itself included). Only the sender releases the rest early, to the recipient; it cannot take money back. At `expires_at` the rest goes to the recipient; an envelope spent to zero closes.
+- **Policy.** The send is judged by the sender's `o5` clause as "sender pays recipient amount"; each spend by the recipient's own `o5` clause as a transfer it signs. Both stamp the signer's cooldown clock.
+- **Fees.** Send and spend each pay one transfer fee, from the signer's own balance (a spend's payee is credited first, so a spend to oneself can pay its fee); release is fee-free.
+- **Routes.** A spend's payee and the recipient at a release or the end receive through their receive routes (classes `envelope_spend`, `envelope_release`).
+- **One network.** All three types sign `genesis_hash`, like standing payments; one signed for another network is refused (`WRONG_NETWORK`).
+- **Caps.** 16 open per sender, 4096 in total; period up to 1,000,000 blocks or 366 days; end up to 10,000,000 blocks or four years ahead.
+- **Reads.** `getenvelope <id>` (terms, `cap_this_period`, `left_this_period`, `next_reset`, `history`, `semantics`), `getenvelopes <address> [in|out|all]` (with `held_in_envelopes`), `gettxstatus` (`envelopes`), `getaccountstate` (`envelopes_out`, `envelopes_in`), and `sendtx` / `checktx` (`envelope`: what it would hold or have left).
+
+**Upgrade.** The book root is folded into the consensus metadata as `envelopes_root` only once the book has held an envelope, so **no regenesis** is needed. Nodes must upgrade before the first envelope is sent.
 
 ## Mempool policy
 

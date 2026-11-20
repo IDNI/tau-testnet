@@ -33,9 +33,29 @@ from consensus.approvals import (
     TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
+from consensus.network_binding import BOUND_TX_TYPES, FIELD as NETWORK_FIELD
 from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
+)
+from consensus.payout import (
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_RULE_SET,
+)
+from consensus.envelope import (
+    TX_TYPE_ENVELOPE_RELEASE,
+    TX_TYPE_ENVELOPE_SEND,
+    TX_TYPE_ENVELOPE_SPEND,
+)
+from consensus.receive_route import (
+    TX_TYPE_RECEIVE_ROUTE_RELEASE,
+    TX_TYPE_RECEIVE_ROUTE_SET,
+)
+from consensus.standing import (
+    TX_TYPE_STANDING_PAYMENT_CANCEL,
+    TX_TYPE_STANDING_PAYMENT_EXECUTE,
+    TX_TYPE_STANDING_PAYMENT_UPDATE,
+    TX_TYPE_STANDING_PAYMENT_CREATE,
 )
 from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER,
@@ -66,6 +86,10 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
     # below with the same value, which is a no-op on a dict.
     if payload.get("expire_at_height") is not None:
         signing_dict["expire_at_height"] = payload["expire_at_height"]
+    # The network a transaction is for is signed by the types that carry it, so
+    # nobody can move one to another network by editing the field.
+    if tx_type in BOUND_TX_TYPES:
+        signing_dict[NETWORK_FIELD] = payload.get(NETWORK_FIELD)
     if tx_type == "user_tx":
         signing_dict["operations"] = payload.get("operations", {})
     elif tx_type == "consensus_rule_update":
@@ -123,6 +147,82 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
+    elif tx_type in (TX_TYPE_STANDING_PAYMENT_CREATE, TX_TYPE_STANDING_PAYMENT_UPDATE):
+        # An update signs the id it replaces as well, so its signature binds
+        # the new version to exactly one predecessor.
+        if tx_type == TX_TYPE_STANDING_PAYMENT_UPDATE:
+            signing_dict["standing_id"] = payload.get("standing_id")
+        # Every term the sweep will act on is signed: it pays later, from
+        # hash-bound state, with no signature of the payer in sight, so an
+        # unsigned field would let a proposer change who is paid, how much or
+        # when. The three interval fields are all listed so that naming a
+        # different one changes the bytes.
+        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
+        signing_dict["amount"] = payload.get("amount")
+        signing_dict["interval_blocks"] = payload.get("interval_blocks")
+        signing_dict["interval_seconds"] = payload.get("interval_seconds")
+        signing_dict["interval_months"] = payload.get("interval_months")
+        signing_dict["first_due"] = payload.get("first_due")
+        signing_dict["periods"] = payload.get("periods")
+    elif tx_type in (TX_TYPE_STANDING_PAYMENT_CANCEL, TX_TYPE_STANDING_PAYMENT_EXECUTE):
+        # An execute names the authorization and nothing else: amount,
+        # recipient and period come from the stored terms and the block.
+        signing_dict["standing_id"] = payload.get("standing_id")
+    elif tx_type == TX_TYPE_PAYOUT_RULE_SET:
+        # Every term an executor will run against: the rule text, who may be
+        # paid, both caps, the period and the end. Both period fields are
+        # listed so naming the other one changes the bytes.
+        signing_dict["rule_text"] = payload.get("rule_text")
+        signing_dict["slots"] = payload.get("slots")
+        signing_dict["cap_per_execution"] = payload.get("cap_per_execution")
+        signing_dict["cap_per_period"] = payload.get("cap_per_period")
+        signing_dict["period_blocks"] = payload.get("period_blocks")
+        signing_dict["period_seconds"] = payload.get("period_seconds")
+        signing_dict["expires_at"] = payload.get("expires_at")
+        # Signed when present (only `true` is valid): a rule installed to pay per
+        # sale must not be turned into one that pays on any input, or back.
+        if "per_sale" in payload:
+            signing_dict["per_sale"] = payload.get("per_sale")
+    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+        # The executor answers for which rule it ran and with what inputs.
+        signing_dict["account_pubkey"] = payload.get("account_pubkey")
+        signing_dict["rule_id"] = payload.get("rule_id")
+        signing_dict["recipients"] = payload.get("recipients")
+        signing_dict["data"] = payload.get("data")
+        # The sale it pays: signed when present, so a proposer can neither move an
+        # execution to another sale nor add or drop the field.
+        if "sale_id" in payload:
+            signing_dict["sale_id"] = payload.get("sale_id")
+    # payout_rule_revoke signs the envelope only: it names the sender's own rule.
+    elif tx_type == TX_TYPE_RECEIVE_ROUTE_SET:
+        # Every term the split is computed from. The optional ones are listed
+        # even when absent, so adding one later changes the bytes.
+        signing_dict["destination_pubkey"] = payload.get("destination_pubkey")
+        signing_dict["share_bps"] = payload.get("share_bps")
+        signing_dict["min_amount"] = payload.get("min_amount")
+        signing_dict["active_from"] = payload.get("active_from")
+        signing_dict["expires_at"] = payload.get("expires_at")
+        signing_dict["locked"] = payload.get("locked")
+    elif tx_type == TX_TYPE_RECEIVE_ROUTE_RELEASE:
+        # The destination answers for which account's route, and which version.
+        signing_dict["owner_pubkey"] = payload.get("owner_pubkey")
+        signing_dict["route_id"] = payload.get("route_id")
+    # receive_route_remove signs the envelope only: it names the sender's own route.
+    elif tx_type == TX_TYPE_ENVELOPE_SEND:
+        # Every term the spending limit is computed from.
+        signing_dict["recipient_pubkey"] = payload.get("recipient_pubkey")
+        signing_dict["amount"] = payload.get("amount")
+        signing_dict["caps"] = payload.get("caps")
+        signing_dict["period_blocks"] = payload.get("period_blocks")
+        signing_dict["period_seconds"] = payload.get("period_seconds")
+        signing_dict["recurring"] = payload.get("recurring")
+        signing_dict["expires_at"] = payload.get("expires_at")
+    elif tx_type == TX_TYPE_ENVELOPE_SPEND:
+        signing_dict["envelope_id"] = payload.get("envelope_id")
+        signing_dict["to_pubkey"] = payload.get("to_pubkey")
+        signing_dict["amount"] = payload.get("amount")
+    elif tx_type == TX_TYPE_ENVELOPE_RELEASE:
+        signing_dict["envelope_id"] = payload.get("envelope_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

@@ -50,6 +50,11 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
             return {}
         tx = txs[ids.index(tx_hash)]
         tx_type = tx.get("tx_type") if isinstance(tx, dict) else None
+        if tx_type in ("standing_payment_create", "standing_payment_cancel",
+                       "standing_payment_update", "standing_payment_execute"):
+            return _standing_fields(tx, block_hash)
+        if tx_type in ("payout_rule_set", "payout_rule_revoke", "payout_execute"):
+            return _payout_fields(tx, tx_hash, block_hash)
         if tx_type == "retract_transfer":
             return {"retracts": tx.get("retractable_id")}
         if tx_type != "retractable_transfer":
@@ -68,6 +73,142 @@ def _retractable_fields(db, tx_hash: str, block_hash: str) -> dict:
     except Exception:
         logger.exception("Failed to resolve retractable detail for %s", tx_hash)
         return {}
+
+
+def _standing_fields(tx: dict, block_hash: str = "") -> dict:
+    """`standing` for a confirmed create or update, `cancels` for a cancel,
+    `executes` for an execute.
+
+    `status` is the authorization's state now: waiting, due or retrying while it
+    is open, ended, cancelled or replaced once resolved, not_recorded when this
+    node has no record of how it ended. An update also says which id it replaced.
+    """
+    tx_type = tx.get("tx_type")
+    if tx_type == "standing_payment_cancel":
+        return {"cancels": tx.get("standing_id")}
+    from commands.getstandingpayments import _tip
+    from consensus.standing import parse_standing_payment_create
+    import db
+
+    if tx_type == "standing_payment_execute":
+        # What it paid: the "paid" event of this block that names this executor.
+        sid_hex = tx.get("standing_id")
+        paid = next((e for e in db.get_canonical_standing_events(sid_hex)
+                     if e.get("block_hash") == block_hash and e.get("outcome") == "paid"
+                     and e.get("executor_pubkey") == tx.get("sender_pubkey")), None)
+        out = {"executes": sid_hex}
+        if paid is not None:
+            out["standing_payment"] = {"period": paid["period"], "amount": paid["amount"]}
+        return out
+
+    sid = parse_standing_payment_create(tx).standing_id
+    _head, book = _tip()
+    if book.knows(sid):
+        status = book.describe(sid)["status"]
+    else:
+        status = "not_recorded"
+        for event in db.get_canonical_standing_events(sid.hex()):
+            if event.get("outcome") in ("ended", "cancelled", "replaced"):
+                status = event["outcome"]
+                break
+    out = {"standing": {"id": sid.hex(), "status": status}}
+    if tx_type == "standing_payment_update":
+        out["standing"]["replaces"] = tx.get("standing_id")
+    return out
+
+
+def _payout_fields(tx: dict, tx_hash: str, block_hash: str) -> dict:
+    """`payout` for a confirmed payout transaction: what it did in its block.
+
+    For an install, `status` says whether the rule is still the account's rule
+    (installed), or how it ended (replaced, revoked, expired, not_recorded).
+    """
+    import db
+
+    account = tx.get("account_pubkey") if tx.get("tx_type") == "payout_execute" \
+        else tx.get("sender_pubkey")
+    if not isinstance(account, str):
+        return {}
+    history = db.get_canonical_payout_events(account.lower(), limit=500)
+    mine = next((e for e in history
+                 if e.get("tx_id") == tx_hash and e.get("block_hash") == block_hash), None)
+    if mine is None:
+        return {"payout": {"status": "not_recorded"}}
+    out = {k: v for k, v in mine.items() if k not in ("block_hash", "block_number", "tx_id")}
+    if mine.get("outcome") == "installed":
+        rule_id = mine.get("rule_id")
+        status = "installed"
+        for event in history:   # newest first: the latest thing that happened to it
+            if event.get("block_number", 0) < mine.get("block_number", 0):
+                break
+            if event.get("rule_id") == rule_id and event.get("outcome") in ("revoked", "expired"):
+                status = event["outcome"]
+                break
+            if event.get("replaced") == rule_id:
+                status = "replaced"
+                break
+        out["status"] = status
+    return {"payout": out}
+
+
+def _route_status(db, installed: dict) -> str:
+    """Whether a route this transaction installed is still in force, or how it ended."""
+    route_id = installed.get("route_id")
+    try:
+        history = db.get_canonical_route_events(
+            installed.get("owner_pubkey", ""), role="owner", limit=500)
+    except Exception:
+        return "unknown"
+    for event in history:   # newest first: the latest thing that happened to it
+        if event.get("route_id") == route_id and event.get("outcome") in (
+                "removed", "released", "expired"):
+            return event["outcome"]
+        if event.get("replaced") == route_id:
+            return "replaced"
+    return "installed"
+
+
+def _route_fields(db, tx_hash: str, block_hash: str) -> dict:
+    """`receive_routes`: how this transaction's payments were split by receive
+    routes (gross, routed, net, credit class), and the route change it made (#35)."""
+    try:
+        events = db.get_canonical_route_events_for_tx(tx_hash, block_hash)
+    except Exception:
+        return {}
+    if not events:
+        return {}
+    out = []
+    for event in events:
+        item = {k: v for k, v in event.items() if k != "tx_id"}
+        if event.get("outcome") == "installed":
+            item["status"] = _route_status(db, event)
+        out.append(item)
+    return {"receive_routes": out}
+
+
+def _envelope_fields(db, tx_hash: str, block_hash: str) -> dict:
+    """`envelopes`: what this transaction did to envelopes (spending limits): sent one,
+    spent from one, released one, or emptied one. A send also says whether the
+    envelope is still `open` or how it closed (emptied, released, ended)."""
+    try:
+        events = db.get_canonical_envelope_events_for_tx(tx_hash, block_hash)
+    except Exception:
+        return {}
+    if not events:
+        return {}
+    out = []
+    for event in events:
+        item = {k: v for k, v in event.items() if k != "tx_id"}
+        if event.get("outcome") == "sent":
+            try:
+                latest = db.get_canonical_envelope_events(
+                    envelope_id=event.get("envelope_id"), limit=1)
+            except Exception:
+                latest = []
+            last = latest[0].get("outcome") if latest else None
+            item["status"] = last if last in ("emptied", "released", "ended") else "open"
+        out.append(item)
+    return {"envelopes": out}
 
 
 def execute(raw_command: str, container):
@@ -125,6 +266,8 @@ def execute(raw_command: str, container):
                     "confirmations": max(1, confirmations),
                 }
                 data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
+                data.update(_route_fields(db, tx_hash, loc["block_hash"]))
+                data.update(_envelope_fields(db, tx_hash, loc["block_hash"]))
                 return api_response.success_response("gettxstatus", data)
 
         # 3. Dropped without being mined?
