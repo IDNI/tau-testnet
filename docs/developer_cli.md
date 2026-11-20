@@ -645,13 +645,16 @@ and `--period-seconds`, and one of `--ends-at` (on the period's clock) and
 `--ends-in`. `--data K=V` fills input `i40+K`. `execute` reads the installed
 `rule_id` from the node unless `--rule-id` pins it, so a rule replaced in the
 meantime is refused instead of run. `set` prints the payout rule id.
+`set --per-sale` installs a rule that pays once per recorded sale (a signed
+transfer into the account); `execute --sale <tx_hash>` names the sale to pay
+(`payout show` lists the open ones).
 
 Raw transactions (root fields only; a nested `payload` is ignored):
 
 | `tx_type` | Signed fields beyond the envelope |
 |---|---|
-| `payout_rule_set` | `genesis_hash`, `rule_text`, `slots`, `cap_per_execution`, `cap_per_period`, exactly one of `period_blocks` / `period_seconds`, `expires_at` |
-| `payout_execute` | `genesis_hash`, `account_pubkey`, `rule_id`, `recipients` (slot -> key), `data` (k -> value) |
+| `payout_rule_set` | `genesis_hash`, `rule_text`, `slots`, `cap_per_execution`, `cap_per_period`, exactly one of `period_blocks` / `period_seconds`, `expires_at`, `per_sale` when present |
+| `payout_execute` | `genesis_hash`, `account_pubkey`, `rule_id`, `recipients` (slot -> key), `data` (k -> value), `sale_id` when present |
 | `payout_rule_revoke` | `genesis_hash` (feeless) |
 
 RPC replies:

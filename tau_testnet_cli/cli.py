@@ -2622,6 +2622,7 @@ def _payout_fields(args, tip: int, now: int) -> dict:
         "cap_per_execution": int(args.cap_per_execution),
         "cap_per_period": int(args.cap_per_period),
         "expires_at": expires_at, **period,
+        **({"per_sale": True} if getattr(args, "per_sale", False) else {}),
     }
 
 
@@ -2705,6 +2706,10 @@ def cmd_payout_execute(args: argparse.Namespace) -> int:
                 raise _PayloadError(f"--data {k}: {v!r} is not an integer")
         account = args.account.strip().lower()
         rule_id = (args.rule_id or _installed_rule_id(args, account)).strip().lower()
+        sale_id = args.sale.strip().lower() if args.sale else None
+        if sale_id is not None and (len(sale_id) != 64
+                                    or any(c not in "0123456789abcdef" for c in sale_id)):
+            raise _PayloadError("--sale must be the 64-hex hash of the transaction that paid")
     except _PayloadError as exc:
         print_error(str(exc))
         return EXIT_LOCAL
@@ -2719,6 +2724,7 @@ def cmd_payout_execute(args: argparse.Namespace) -> int:
             rule_id=rule_id,
             recipients=recipients,
             data=data,
+            sale_id=sale_id,
         )
 
     return _submit_rule_tx(args, _build)
@@ -2801,6 +2807,9 @@ def _add_payout_subparsers(sub) -> None:
                       help="Last moment, on the period's clock")
     ends.add_argument("--ends-in", type=int, metavar="N",
                       help="Blocks or seconds from now, on the period's clock")
+    p_set.add_argument("--per-sale", action="store_true",
+                       help="Pay only against sales the chain recorded (transfers into "
+                            "the account), once per sale; the rule reads i27 and i28")
     _tx_flags(p_set, request=True)
     p_set.set_defaults(func=cmd_payout_set)
 
@@ -2818,6 +2827,9 @@ def _add_payout_subparsers(sub) -> None:
                        help="Name the recipient of an open slot. Repeatable.")
     p_exe.add_argument("--data", action="append", metavar="K=VALUE",
                        help="Executor data for input i40+K. Repeatable.")
+    p_exe.add_argument("--sale", metavar="TX_HASH",
+                       help="For a per-sale rule: the open sale to pay (the hash of "
+                            "the transfer that paid the account)")
     _tx_flags(p_exe)
     p_exe.set_defaults(func=cmd_payout_execute)
 

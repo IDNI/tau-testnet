@@ -39,8 +39,26 @@ let any number of payout rules share one worker.
     i40+k bv[24]  executor data k, k in 0..7 (0 when not given)
     o30+k bv[24]  amount for slot k (0 when the rule does not write it)
 
+  only in a rule installed with `per_sale` (see PER SALE below):
+    i27  bv[24]   the amount of the sale the execution names
+    i28  bv[384]  who paid it
+
 A rule reads [t] only, reads at least one input and writes at least one slot
 amount, and mentions no slot it does not have.
+
+PER SALE
+--------
+A royalty is owed once per sale, and the sale's amount must not be the
+claimant's word. A rule installed with `per_sale: true` therefore pays only
+against sales the chain recorded itself: every signed transfer into the account
+while the rule is installed is recorded as an open sale, its id the transfer's
+transaction hash, its amount what that transaction paid the account (capped at
+bv[24]). An execution must name one open sale; the rule reads the sale's amount
+and payer (i27, i28), and a paid execution closes the sale, so a second
+execution naming it is refused. A refused execution leaves it open. At most
+MAX_OPEN_SALES are open at once; a sale that arrives while that many are open is
+not recorded and is counted as missed. Replacing, revoking or expiring the rule
+drops its open sales.
 """
 from __future__ import annotations
 
@@ -93,6 +111,9 @@ STREAM_EXECUTOR = 13
 STREAM_SPENT = 26
 SLOT_BASE = 30
 DATA_BASE = 40
+STREAM_SALE_AMOUNT = 27
+STREAM_SALE_PAYER = 28
+MAX_OPEN_SALES = 64
 
 AMOUNT_WIDTH = tau_defs.TRANSFER_VALUE_BV_WIDTH
 KEY_WIDTH = 384
@@ -123,7 +144,7 @@ class PayoutRefused(ValueError):
     """An execution the rule, its caps or the balance do not allow. Nothing moves."""
 
 
-def abi_width(name: str, slot_count: int = MAX_SLOTS) -> Optional[int]:
+def abi_width(name: str, slot_count: int = MAX_SLOTS, per_sale: bool = False) -> Optional[int]:
     """The width stream `name` must carry in a payout rule, or None if it may not
     be mentioned at all."""
     io, index = name[0], int(name[1:])
@@ -131,6 +152,10 @@ def abi_width(name: str, slot_count: int = MAX_SLOTS) -> Optional[int]:
         return AMOUNT_WIDTH if SLOT_BASE <= index < SLOT_BASE + slot_count else None
     if index in (STREAM_BALANCE, STREAM_SPENT):
         return AMOUNT_WIDTH
+    if per_sale and index == STREAM_SALE_AMOUNT:
+        return AMOUNT_WIDTH
+    if per_sale and index == STREAM_SALE_PAYER:
+        return KEY_WIDTH
     if index in (STREAM_TIME, STREAM_HEIGHT):
         return CLOCK_WIDTH
     if index == STREAM_EXECUTOR:
@@ -158,6 +183,7 @@ class PayoutTerms:
     kind: int
     period: int
     expires_at: int
+    per_sale: bool = False          # pays only against sales the chain recorded
 
     @property
     def body_hash(self) -> bytes:
@@ -168,7 +194,7 @@ class PayoutTerms:
         return compute_payout_rule_id(
             self.account_pubkey, self.sequence_number, self.body_hash, self.slots,
             self.cap_per_execution, self.cap_per_period, self.kind, self.period,
-            self.expires_at,
+            self.expires_at, self.per_sale,
         )
 
     def clock(self, height: int, ts: int) -> int:
@@ -185,6 +211,15 @@ class PayoutState:
     executions: int = 0
     paid_total: int = 0
     last_height: int = 0         # height of the last execution, 0 = never
+    # per-sale rules only: (sale_id, payer, amount, height) in arrival order
+    open_sales: Tuple[Tuple[bytes, str, int, int], ...] = ()
+    sales_missed: int = 0
+
+    def sale(self, sale_id: bytes) -> Optional[Tuple[bytes, str, int, int]]:
+        for entry in self.open_sales:
+            if entry[0] == sale_id:
+                return entry
+        return None
 
     def period_at(self, terms: PayoutTerms, clock: int) -> int:
         return max(0, int(clock) - self.anchor) // terms.period
@@ -200,6 +235,7 @@ class PayoutExecution:
     rule_id: bytes
     recipients: Tuple[Tuple[int, str], ...]   # (slot, pubkey) for open slots, sorted
     data: Tuple[Tuple[int, int], ...]         # (k, value) for i40+k, sorted
+    sale_id: Optional[bytes] = None           # the recorded sale it pays (per-sale rules)
 
 
 # --- Parsing ---------------------------------------------------------------------
@@ -251,6 +287,11 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
     if len(present) != 1:
         raise PayoutShapeError("exactly one of period_blocks and period_seconds is required")
     name, kind = present[0]
+    per_sale = fields.get("per_sale")
+    if per_sale is not None and per_sale is not True:
+        # one spelling per meaning: leave the field out for a rule that does not
+        # pay per sale, so equal terms always sign and hash the same
+        raise PayoutShapeError("per_sale must be true or left out")
     return PayoutTerms(
         account_pubkey=account,
         sequence_number=sequence,
@@ -261,11 +302,12 @@ def _terms_from_fields(fields: Dict[str, Any], account: str, sequence: int) -> P
         kind=kind,
         period=_u64(fields, name),
         expires_at=_u64(fields, "expires_at"),
+        per_sale=per_sale is True,
     )
 
 
 SPEC_FIELDS = ("rule_text", "slots", "cap_per_execution", "cap_per_period",
-               "period_blocks", "period_seconds", "expires_at")
+               "period_blocks", "period_seconds", "expires_at", "per_sale")
 
 
 def parse_payout_rule_set(tx: Dict[str, Any]) -> PayoutTerms:
@@ -351,14 +393,18 @@ def parse_payout_execute(tx: Dict[str, Any]) -> PayoutExecution:
         if not _is_int(value) or not 0 <= value <= tau_defs.MAX_TRANSFER_VALUE:
             raise PayoutShapeError(f"data values must be integers 0..{tau_defs.MAX_TRANSFER_VALUE}")
         values.append((int(key), value))
+    sale = tx.get("sale_id")
+    if sale is not None and (not isinstance(sale, str) or not _ID_RE.match(sale)):
+        raise PayoutShapeError("sale_id must be 64 lowercase hex characters (a transaction hash)")
     return PayoutExecution(executor, account, bytes.fromhex(raw_id),
-                           tuple(sorted(named)), tuple(sorted(values)))
+                           tuple(sorted(named)), tuple(sorted(values)),
+                           bytes.fromhex(sale) if sale is not None else None)
 
 
 # --- Screens ---------------------------------------------------------------------
 
 
-def screen_payout_body(body: str, slot_count: int) -> Optional[str]:
+def screen_payout_body(body: str, slot_count: int, per_sale: bool = False) -> Optional[str]:
     """None when the body fits the payout ABI, else why not. Shared by admission,
     apply and the rule-change release."""
     from consensus.admission import screen_temporal_rule
@@ -374,8 +420,10 @@ def screen_payout_body(body: str, slot_count: int) -> Optional[str]:
         typed = _TYPED_RE.match(scrubbed, match.end())
         if typed is None:
             return f"every mention of {name} must be written {name}[t]:bv[<width>]"
-        want = abi_width(name, slot_count)
+        want = abi_width(name, slot_count, per_sale)
         if want is None:
+            if name in (f"i{STREAM_SALE_AMOUNT}", f"i{STREAM_SALE_PAYER}"):
+                return f"{name} is read only by a rule installed with per_sale"
             return f"{name} is not part of the payout ABI for {slot_count} slot(s)"
         width = int(typed.group(1))
         if width != want:
@@ -560,7 +608,7 @@ def screen_payout_shape(scrubbed_body: str) -> Optional[str]:
 
 def validate_terms_shape(terms: PayoutTerms, height: int, ts: int) -> Optional[str]:
     """Stateless admissibility of terms against the block that installs them."""
-    screened = screen_payout_body(terms.body, len(terms.slots))
+    screened = screen_payout_body(terms.body, len(terms.slots), terms.per_sale)
     if screened:
         return screened
     fixed = [s for s in terms.slots if s]
@@ -609,6 +657,12 @@ def execution_inputs(terms: PayoutTerms, state: PayoutState, exe: PayoutExecutio
         values[SLOT_BASE + k] = _key_literal(who) if who else "0"
     for k in range(MAX_DATA):
         values[DATA_BASE + k] = str(data.get(k, 0))
+    if terms.per_sale:
+        sale = state.sale(exe.sale_id) if exe.sale_id is not None else None
+        if sale is None:
+            raise PayoutRefused("the sale named is not an open sale of this rule")
+        values[STREAM_SALE_AMOUNT] = str(sale[2])
+        values[STREAM_SALE_PAYER] = _key_literal(sale[1])
     return values
 
 
@@ -657,8 +711,30 @@ def settle(terms: PayoutTerms, state: PayoutState, exe: PayoutExecution,
 
 # --- The book --------------------------------------------------------------------
 
-_Row = Tuple[bytes, str, int, str, Tuple[str, ...], int, int, int, int, int,
-             int, int, int, int, int, int]
+_Row = Tuple  # the 16 fields of encode_payout_entry, plus `sales` for a per-sale rule
+
+
+def _restore_sales(sales: Any, rid: bytes) -> Tuple[Tuple[Tuple[bytes, str, int, int], ...], int]:
+    """A stored (missed, open sales) pair, checked; ((), 0) for a rule without it."""
+    if sales is None:
+        return (), 0
+    try:
+        missed, entries = sales
+        out = []
+        for sale_id, payer, amount, height in entries:
+            sale_id = bytes.fromhex(sale_id) if isinstance(sale_id, str) else bytes(sale_id)
+            if len(sale_id) != 32 or not _PUBKEY_RE.match(str(payer)):
+                raise ValueError
+            if not (_is_int(amount) and 1 <= amount <= tau_defs.MAX_TRANSFER_VALUE
+                    and _is_int(height) and height >= 0):
+                raise ValueError
+            out.append((sale_id, str(payer), int(amount), int(height)))
+    except (TypeError, ValueError):
+        raise ValueError(f"stored payout rule has malformed sales: {rid.hex()}") from None
+    if not _is_int(missed) or missed < 0 or len(out) > MAX_OPEN_SALES \
+            or len({e[0] for e in out}) != len(out):
+        raise ValueError(f"stored payout rule has impossible sales: {rid.hex()}")
+    return tuple(out), int(missed)
 
 
 class PayoutBook:
@@ -696,21 +772,25 @@ class PayoutBook:
             raise ValueError("resolved_count must be a non-negative integer")
         book = cls()
         for row in rows:
+            row = tuple(row)
+            sales = row[16] if len(row) > 16 else None
             (stored_id, account, sequence, body, slots, cap_exec, cap_period, kind,
              period, expires_at, anchor, period_index, spent, executions, paid_total,
-             last_height) = row
+             last_height) = row[:16]
             if kind not in KIND_NAMES:
                 raise ValueError("stored payout rule has an unknown period clock")
             if not (_is_int(period) and period >= 1):
                 raise ValueError("stored payout rule has a bad period")
             terms = PayoutTerms(account, sequence, body, tuple(slots), cap_exec,
-                                cap_period, kind, period, expires_at)
+                                cap_period, kind, period, expires_at, sales is not None)
             rid = terms.rule_id
             if rid != bytes(stored_id):
                 raise ValueError(f"stored payout rule id does not match its terms: {rid.hex()}")
             if account in book.terms:
                 raise ValueError(f"two stored payout rules for one account: {account[:16]}")
-            state = PayoutState(anchor, period_index, spent, executions, paid_total, last_height)
+            open_sales, missed = _restore_sales(sales, rid)
+            state = PayoutState(anchor, period_index, spent, executions, paid_total,
+                                last_height, open_sales, missed)
             if not all(_is_int(v) and v >= 0 for v in (anchor, period_index, spent,
                                                         executions, paid_total, last_height)):
                 raise ValueError(f"stored payout rule has bad progress: {rid.hex()}")
@@ -743,10 +823,11 @@ class PayoutBook:
 
     def _row(self, account: str) -> _Row:
         t, s = self.terms[account], self.state[account]
-        return (t.rule_id, t.account_pubkey, t.sequence_number, t.body_hash, t.slots,
-                t.cap_per_execution, t.cap_per_period, t.kind, t.period, t.expires_at,
-                s.anchor, s.period_index, s.spent_in_period, s.executions,
-                s.paid_total, s.last_height)
+        row = (t.rule_id, t.account_pubkey, t.sequence_number, t.body_hash, t.slots,
+               t.cap_per_execution, t.cap_per_period, t.kind, t.period, t.expires_at,
+               s.anchor, s.period_index, s.spent_in_period, s.executions,
+               s.paid_total, s.last_height)
+        return row + ((s.sales_missed, s.open_sales),) if t.per_sale else row
 
     def root(self) -> bytes:
         if self._root is None:
@@ -776,10 +857,11 @@ class PayoutBook:
         out = []
         for account in sorted(self.terms):
             t, s = self.terms[account], self.state[account]
-            out.append((t.rule_id, account, t.sequence_number, t.body, t.slots,
-                        t.cap_per_execution, t.cap_per_period, t.kind, t.period,
-                        t.expires_at, s.anchor, s.period_index, s.spent_in_period,
-                        s.executions, s.paid_total, s.last_height))
+            row = (t.rule_id, account, t.sequence_number, t.body, t.slots,
+                   t.cap_per_execution, t.cap_per_period, t.kind, t.period,
+                   t.expires_at, s.anchor, s.period_index, s.spent_in_period,
+                   s.executions, s.paid_total, s.last_height)
+            out.append(row + ((s.sales_missed, s.open_sales),) if t.per_sale else row)
         return out
 
     def resolved_state(self) -> Tuple[int, bytes]:
@@ -820,7 +902,16 @@ class PayoutBook:
                 raise PayoutRefused(f"slot {k} has a fixed recipient")
             if who == terms.account_pubkey:
                 raise PayoutRefused("a slot may not pay the account itself")
-        return terms, self.state[exe.account_pubkey]
+        state = self.state[exe.account_pubkey]
+        if terms.per_sale:
+            if exe.sale_id is None:
+                raise PayoutRefused("this payout rule pays per sale: name an open sale (sale_id)")
+            if state.sale(exe.sale_id) is None:
+                raise PayoutRefused("the sale named is not an open sale of this rule "
+                                    "(never recorded, or already paid)")
+        elif exe.sale_id is not None:
+            raise PayoutRefused("this payout rule does not pay per sale")
+        return terms, state
 
     # -- mutation ----------------------------------------------------------------
 
@@ -837,17 +928,52 @@ class PayoutBook:
             raise KeyError(account)
         return self._remove(account, OUTCOME_REVOKED)
 
-    def record(self, account: str, total: int, height: int, ts: int) -> PayoutState:
+    def record(self, account: str, total: int, height: int, ts: int,
+               sale_id: Optional[bytes] = None) -> PayoutState:
+        """A paid execution; for a per-sale rule it closes the sale it paid."""
         terms, state = self.terms[account], self.state[account]
         clock = terms.clock(height, ts)
         index = state.period_at(terms, clock)
         spent = state.spent_at(terms, clock)
+        open_sales = state.open_sales
+        if terms.per_sale:
+            open_sales = tuple(e for e in open_sales if e[0] != sale_id)
+            if len(open_sales) != len(state.open_sales) - 1:
+                raise KeyError("the sale paid is not an open sale of this rule")
         state = replace(state, period_index=index, spent_in_period=spent + total,
                         executions=state.executions + 1,
-                        paid_total=state.paid_total + total, last_height=int(height))
+                        paid_total=state.paid_total + total, last_height=int(height),
+                        open_sales=open_sales)
         self.state[account] = state
         self._root = None
         return state
+
+    def pays_per_sale(self, account: str) -> bool:
+        terms = self.terms.get(account)
+        return terms is not None and terms.per_sale
+
+    def note_sale(self, account: str, sale_id: bytes, payer: str, amount: int,
+                  height: int) -> Optional[str]:
+        """A signed transaction paid `account` `amount` in total: record it as an
+        open sale of the account's per-sale rule, its id the transaction hash.
+        Returns "recorded", "missed" (MAX_OPEN_SALES already open), or None when
+        the account has no per-sale rule, the payer is the account itself, or the
+        sale is already recorded."""
+        terms = self.terms.get(account)
+        if terms is None or not terms.per_sale or payer == account or amount <= 0:
+            return None
+        state = self.state[account]
+        sale_id = bytes(sale_id)
+        if state.sale(sale_id) is not None:
+            return None
+        if len(state.open_sales) >= MAX_OPEN_SALES:
+            self.state[account] = replace(state, sales_missed=state.sales_missed + 1)
+            self._root = None
+            return "missed"
+        entry = (sale_id, payer, min(int(amount), tau_defs.MAX_TRANSFER_VALUE), int(height))
+        self.state[account] = replace(state, open_sales=state.open_sales + (entry,))
+        self._root = None
+        return "recorded"
 
     def expire(self, height: int, ts: int) -> List[PayoutTerms]:
         """Remove every rule whose end this block reached, earliest first."""
@@ -883,4 +1009,8 @@ def describe(terms: PayoutTerms, state: PayoutState, *, height: int = 0,
         "executions": state.executions,
         "paid_total": state.paid_total,
         "last_height": state.last_height or None,
+        **({"per_sale": True,
+            "open_sales": [{"sale_id": sid.hex(), "payer_pubkey": payer, "amount": amount,
+                            "height": h} for sid, payer, amount, h in state.open_sales],
+            "sales_missed": state.sales_missed} if terms.per_sale else {}),
     }

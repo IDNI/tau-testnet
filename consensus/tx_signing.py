@@ -162,12 +162,20 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["period_blocks"] = payload.get("period_blocks")
         signing_dict["period_seconds"] = payload.get("period_seconds")
         signing_dict["expires_at"] = payload.get("expires_at")
+        # Signed when present (only `true` is valid): a rule installed to pay per
+        # sale must not be turned into one that pays on any input, or back.
+        if "per_sale" in payload:
+            signing_dict["per_sale"] = payload.get("per_sale")
     elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
         # The executor answers for which rule it ran and with what inputs.
         signing_dict["account_pubkey"] = payload.get("account_pubkey")
         signing_dict["rule_id"] = payload.get("rule_id")
         signing_dict["recipients"] = payload.get("recipients")
         signing_dict["data"] = payload.get("data")
+        # The sale it pays: signed when present, so a proposer can neither move an
+        # execution to another sale nor add or drop the field.
+        if "sale_id" in payload:
+            signing_dict["sale_id"] = payload.get("sale_id")
     # payout_rule_revoke signs the envelope only: it names the sender's own rule.
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()

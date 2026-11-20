@@ -883,9 +883,13 @@ def build_payout_rule_set_tx(
     expires_at: int,
     period_blocks: int | None = None,
     period_seconds: int | None = None,
+    per_sale: bool = False,
     fee_limit: str | int = "0",
 ) -> dict:
     """Construct a ``tx_type='payout_rule_set'`` payload (without signature).
+
+    ``per_sale``: the rule pays only against sales the chain recorded (signed
+    transfers into the account), once per sale; executions name one.
 
     ``slots`` lists one entry per slot: a recipient's 96-hex key, or "" for an
     open slot the executor names. ``expires_at`` is on the period's clock: a
@@ -918,6 +922,8 @@ def build_payout_rule_set_tx(
         tx["period_blocks"] = int(period_blocks)
     else:
         tx["period_seconds"] = int(period_seconds)
+    if per_sale:
+        tx["per_sale"] = True
     return tx
 
 
@@ -950,6 +956,7 @@ def build_payout_execute_tx(
     rule_id: str,
     recipients: dict | None = None,
     data: dict | None = None,
+    sale_id: str | None = None,
     fee_limit: str | int = "0",
 ) -> dict:
     """Construct a ``tx_type='payout_execute'`` payload (without signature).
@@ -962,7 +969,7 @@ def build_payout_execute_tx(
         raise ValueError("account_pubkey must be a 96-character hex public key")
     if not isinstance(rule_id, str) or len(rule_id) != 64:
         raise ValueError("rule_id must be a 64-character hex string")
-    return {
+    tx = {
         "tx_type": "payout_execute",
         "sender_pubkey": sender_pubkey,
         "sequence_number": sequence_number,
@@ -974,3 +981,8 @@ def build_payout_execute_tx(
         "recipients": {str(int(k)): v.lower() for k, v in (recipients or {}).items()},
         "data": {str(int(k)): int(v) for k, v in (data or {}).items()},
     }
+    if sale_id is not None:
+        if not isinstance(sale_id, str) or len(sale_id) != 64:
+            raise ValueError("sale_id must be a 64-character transaction hash")
+        tx["sale_id"] = sale_id.lower()
+    return tx

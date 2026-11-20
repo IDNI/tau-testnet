@@ -9,7 +9,8 @@ them or none, inside caps the account signed.
 Typical uses: a reviewer's key releases bounty or milestone money to a
 contributor; a treasury pays out a fixed share whenever someone triggers it,
 at most so much per period; an allowance anyone can trigger for a named
-recipient, at most once a week.
+recipient, at most once a week; a royalty of 5% on every sale, paid once per
+sale ([Per sale](#per-sale-royalties)).
 
 The rule is a second, separate authorization for the account's money, chosen by
 the account. The `o5` policy governs transfers the account signs; the payout
@@ -52,6 +53,7 @@ tau-testnet payout set --key treasury --file payout.tau \
 | `cap_per_period` | The most all executions in one period may pay, `cap_per_execution` .. 16,777,215. |
 | `period_blocks` or `period_seconds` | Exactly one. The period clock: block height (1 .. 1,000,000) or block time (1 .. 366 days). |
 | `expires_at` | The end, on the period's clock (a height, or a unix time), at most 10,000,000 blocks or four years ahead. |
+| `per_sale` | Optional, `true` or left out. The rule pays only against sales the chain recorded, once per sale ([Per sale](#per-sale-royalties)). |
 
 Admission and apply refuse a rule that pays the account itself in a fixed slot,
 names one fixed recipient in two slots, or does not fit the ABI. The rule is
@@ -88,6 +90,8 @@ what let any number of payout rules share one worker.
 | `i30+k` | `bv[384]` | Recipient of slot k: the fixed key, the key the executor named, or 0. |
 | `i40+k` | `bv[24]` | Executor data k, k in 0..7 (0 when not given). |
 | `o30+k` | `bv[24]` | Amount for slot k (0 when the rule does not write it). |
+| `i27` | `bv[24]` | Only with `per_sale`: the amount of the sale the execution names. |
+| `i28` | `bv[384]` | Only with `per_sale`: who paid it. |
 
 A rule reads `[t]` only, reads at least one input, writes at least one slot
 amount, and mentions no slot it does not have. Anything else is refused at
@@ -144,7 +148,16 @@ Pay a fixed and an open slot the same amount together:
 always ( (o30[t]:bv[24] = i40[t]:bv[24]) && (o31[t]:bv[24] = i40[t]:bv[24]) ).
 ```
 
-`tests/test_payout_native.py` builds and steps these three on the real engine
+A 5% royalty on each sale (a rule installed with `per_sale`, below):
+
+```
+always ( o30[t]:bv[24] = i27[t]:bv[24] / { 20 }:bv[24] ).
+```
+
+Amounts are `bv[24]` and arithmetic wraps there, so divide rather than multiply
+first: `i27 * 5 / 100` would wrap for a sale above 3,355,443.
+
+`tests/test_payout_native.py` builds and steps these four on the real engine
 (skipped where the native module is not built).
 
 ## Executing
@@ -180,6 +193,38 @@ Period `n` covers clock values `anchor + n * period .. anchor + (n+1) * period -
 where `anchor` is the height (or block time) the rule was installed at. What was
 paid in an earlier period does not count against the current one, and nothing
 carries over.
+
+### Per sale (royalties)
+
+A royalty is owed once per sale, and the amount it is computed from must not be
+the word of whoever claims it. A rule installed with `"per_sale": true`
+(`payout set --per-sale`) therefore pays only against sales the chain recorded
+itself:
+
+- **The chain records the sale.** Every signed transfer (`user_tx`) into the
+  account while the rule is installed is an open sale: its id is the
+  transaction's hash, its amount what that transaction paid the account (all
+  its legs to the account together, capped at 16,777,215), its payer the
+  sender. A transfer from the account itself is not a sale. Transfers before
+  the rule was installed are not sales of it.
+- **An execution names one open sale** (`sale_id`, `payout execute --sale
+  <tx_hash>`). The rule reads its amount as `i27` and its payer as `i28`, so the
+  executor cannot choose the amount. An execution without a sale, with a sale
+  that is not open, or with a `sale_id` for a rule without `per_sale` is refused.
+- **Paid once.** A paid execution closes the sale; a second execution naming it
+  is refused (`the sale named is not an open sale of this rule`). A refused
+  execution, for example over a cap, leaves the sale open for a later attempt.
+- **Bounded.** At most 64 sales are open per rule. A sale that arrives while 64
+  are open is not recorded, and `sales_missed` counts it. Replacing, revoking or
+  expiring the rule drops its open sales.
+
+`getpayoutrule` lists the open sales (`open_sales`: id, payer, amount, height)
+and `sales_missed`; the `executed` event names the `sale_id` it paid. The open
+sales are part of the rule's entry in `payout_rules_root`, so every node agrees
+on which sales are still payable.
+
+The caps still apply: a royalty rule can pay no more per execution and per
+period than the account signed, whatever the sale.
 
 ### Policy at execution time
 
@@ -261,6 +306,7 @@ account's).
 | Executor data inputs | 8 |
 | Executions per block | 16 |
 | Rule text | 4,096 bytes |
+| Open sales per rule (`per_sale`) | 64 |
 
 ## Error codes
 
@@ -295,13 +341,16 @@ Apply reasons in receipts: `payout_rule_not_set`, `payout_rule_not_revoked`,
  "account_pubkey": "<account>", "rule_id": "<64 hex>", "recipients": {"1": "<dave>"},
  "data": {"0": 300}, "signature": "..."}
 
+{"tx_type": "payout_execute", "...": "as above, for a rule installed with per_sale",
+ "sale_id": "<64 hex: the hash of the transfer that paid the account>"}
+
 {"tx_type": "payout_rule_revoke", "genesis_hash": "<block 0>", "sender_pubkey": "<account>",
  "sequence_number": 8,
  "expiration_time": 1799999999, "expire_at_height": 5000, "fee_limit": "0",
  "signature": "..."}
 ```
 
-Every field above is in the signed bytes. `recipients` keys are slot numbers,
+Every field above is in the signed bytes (`per_sale` and `sale_id` when present). `recipients` keys are slot numbers,
 `data` keys are k for input `i40+k`. `genesis_hash` is the hash of block 0 of the
 network (`getsequence` returns it, the CLI fills it in): all three types are bound to
 one network like standing payments (`consensus/network_binding.py`), so a rule or an

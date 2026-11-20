@@ -107,6 +107,14 @@ FEE_BEARING_TX_TYPES = frozenset(
 )
 
 
+def _sale_id_of(tx: Dict[str, Any]) -> str:
+    """The hash a block lists for `tx` (block.compute_tx_hash), without the
+    `tx_id` a block builder adds for its own bookkeeping."""
+    from block import compute_tx_hash
+
+    return compute_tx_hash({k: v for k, v in tx.items() if k != "tx_id"})
+
+
 def _receipt_lookup_key(tx: Dict[str, Any], index: int) -> str:
     """Receipt dict key; only used for receipts and ApplyBlockResult id lists."""
     return tx.get("tx_id") or str(index)
@@ -1917,7 +1925,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_standing_cancel: Optional[bytes] = None
             pending_payout_set = None
             pending_payout_revoke: Optional[str] = None
-            pending_payout_exec = None   # (account, total, legs)
+            pending_payout_exec = None   # (account, total, legs, sale_id)
+            # Signed transfers this tx credited, as sales: (recipient, payer) ->
+            # amount. Recorded for a recipient whose payout rule pays per sale
+            # only once the tx stays accepted.
+            pending_sales: Dict[Tuple[str, str], int] = {}
+
+            def _note_sale(to_addr, from_addr, amount) -> None:
+                if tx.get("tx_type", "user_tx") != "user_tx":
+                    return
+                key = (str(to_addr), str(from_addr))
+                pending_sales[key] = pending_sales.get(key, 0) + int(amount)
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -3035,7 +3053,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             staged_writes[account] = _read_bal(account) - total
                             for _, who, amount in legs:
                                 staged_writes[who] = _read_bal(who) + amount
-                            pending_payout_exec = (account, total, legs)
+                            pending_payout_exec = (account, total, legs, exe.sale_id)
                             payout_executions_in_block += 1
                             tx_receipt["logs"].append(
                                 f"Payout executed: {total} from {account[:10]}... in "
@@ -3366,6 +3384,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 slot_values=_approval_slot_values(),
                             ):
                                 break
+                            _note_sale(to_addr, from_addr, amount_val)
                     elif isinstance(transfers_op_data, list):
                         for transfer in transfers_op_data:
                             if isinstance(transfer, (list, tuple)) and len(transfer) == 3:
@@ -3430,6 +3449,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         current_to = _balance_of(to_addr)
                                         target_balances[from_addr] = current_from - amount
                                         target_balances[to_addr] = current_to + amount
+                                        _note_sale(to_addr, from_addr, amount)
                                     else:
                                         if not chain_state.update_balances_after_transfer(from_addr, to_addr, amount):
                                             if not replay_mode:
@@ -3640,16 +3660,31 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         "outcome": "revoked", "tx_id": tx_id,
                     }
                 elif pending_payout_exec is not None:
-                    account, total, legs = pending_payout_exec
+                    account, total, legs, sale_id = pending_payout_exec
                     book = _lifecycle_for_write().payout_rules
-                    book.record(account, total, int(block_height or 0), int(block_timestamp or 0))
+                    book.record(account, total, int(block_height or 0), int(block_timestamp or 0),
+                                sale_id)
                     tx_receipt["payout_event"] = {
                         "account_pubkey": account, "rule_id": book.get(account).rule_id.hex(),
                         "outcome": "executed", "tx_id": tx_id,
                         "executor_pubkey": sender, "total": total,
                         "legs": [{"slot": k, "recipient_pubkey": who, "amount": amount}
                                  for k, who, amount in legs],
+                        **({"sale_id": sale_id.hex()} if sale_id is not None else {}),
                     }
+                if pending_sales and any(lifecycle_mgr.payout_rules.pays_per_sale(to)
+                                         for to, _ in pending_sales):
+                    # The sale's id is the transaction's hash, computed from the
+                    # transaction itself so every node names it the same.
+                    sale_id = bytes.fromhex(_sale_id_of(tx))
+                    book = _lifecycle_for_write().payout_rules
+                    for (to, payer), amount in sorted(pending_sales.items()):
+                        noted = book.note_sale(to, sale_id, payer, amount,
+                                               int(block_height or 0))
+                        if noted:
+                            tx_receipt["logs"].append(
+                                f"Sale {noted} for the payout rule of {to[:10]}...: "
+                                f"{sale_id.hex()[:16]} ({amount})")
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same

@@ -117,3 +117,63 @@ def test_two_slots_are_paid_together(real):
     terms = _terms(SPLIT, [BOB, ""])
     assert _run(terms, STRANGER, {0: 40}, recipients=[(1, REVIEWER)]) == \
         [(0, BOB, 40), (1, REVIEWER, 40)]
+
+
+# --- per sale: a 5% royalty, once per sale ---------------------------------------------
+
+# 5% is a twentieth; dividing only, the amount can never wrap at bv[24]
+ROYALTY = "always ( o30[t]:bv[24] = i27[t]:bv[24] / { 20 }:bv[24] )."
+BUYER = _key("buyer")
+
+
+def _royalty_terms():
+    return parse_payout_rule_set({
+        "sender_pubkey": ACCOUNT, "sequence_number": 0, "rule_text": ROYALTY, "slots": [BOB],
+        "cap_per_execution": 1_000, "cap_per_period": 5_000, "period_blocks": 100,
+        "expires_at": HEIGHT + 10_000, "per_sale": True,
+    })
+
+
+def test_a_5_percent_royalty_on_101_pays_5_once(real):
+    """On the real engine: the rule reads the recorded sale (i27 = 101) and pays 5;
+    the paid sale is closed, so naming it again is refused."""
+    from consensus.payout import PayoutRefused
+
+    terms = _royalty_terms()
+    assert screen_payout_body(terms.body, 1, per_sale=True) is None
+    built = real.validate(terms.body)
+    assert built.ok, built.error
+    book = PayoutBook()
+    book.install(terms, HEIGHT - 1)
+    sale = hashlib.sha256(b"a sale of 101").digest()
+    assert book.note_sale(ACCOUNT, sale, BUYER, 101, HEIGHT - 1) == "recorded"
+    exe = PayoutExecution(STRANGER, ACCOUNT, terms.rule_id, (), (), sale)
+    rule, state = book.check_execution(exe, HEIGHT, TS)
+    values = execution_inputs(rule, state, exe, parent_balance=10_000, height=HEIGHT, ts=TS)
+    outputs = sender_policy.payout_outputs(rule.body, values, pool=POOL_APPLY)
+    legs = settle(rule, state, exe, outputs, height=HEIGHT, ts=TS, balance=10_000)
+    assert legs == [(0, BOB, 5)]
+    book.record(ACCOUNT, 5, HEIGHT, TS, sale)
+    with pytest.raises(PayoutRefused, match="not an open sale"):
+        book.check_execution(exe, HEIGHT + 1, TS + 1)
+
+
+@pytest.mark.parametrize("amount, paid", [(1_000, 50), (20, 1), (19, 0)])
+def test_the_royalty_rounds_down(real, amount, paid):
+    from consensus.payout import PayoutRefused
+
+    terms = _royalty_terms()
+    book = PayoutBook()
+    book.install(terms, HEIGHT - 1)
+    sale = hashlib.sha256(str(amount).encode()).digest()
+    book.note_sale(ACCOUNT, sale, BUYER, amount, HEIGHT - 1)
+    exe = PayoutExecution(STRANGER, ACCOUNT, terms.rule_id, (), (), sale)
+    rule, state = book.check_execution(exe, HEIGHT, TS)
+    values = execution_inputs(rule, state, exe, parent_balance=10_000, height=HEIGHT, ts=TS)
+    outputs = sender_policy.payout_outputs(rule.body, values, pool=POOL_APPLY)
+    if paid:
+        assert settle(rule, state, exe, outputs, height=HEIGHT, ts=TS, balance=10_000) == \
+            [(0, BOB, paid)]
+    else:
+        with pytest.raises(PayoutRefused, match="pays nothing"):
+            settle(rule, state, exe, outputs, height=HEIGHT, ts=TS, balance=10_000)

@@ -24,7 +24,12 @@ included, and on the rule's history every node records)
        names Dave for the open slot and both slots are paid together.
     7. The replaced rule reaches its end: `expired`, and executions are refused.
     8. A third rule is installed and revoked with `payout revoke` (fee-free).
-    9. Node B replays A's blocks, restarts, and ends with the same state hash,
+    9. A royalty paid once per sale: the treasury installs `payout set
+       --per-sale` (5% to Bob). Carol pays the treasury 101; the node records
+       that transfer as an open sale named by its transaction hash. Bob runs
+       `payout execute --sale <hash>`: the engine reads 101 and Bob gets 5. The
+       same sale again is refused; a sale nobody paid is refused.
+   10. Node B replays A's blocks, restarts, and ends with the same state hash,
        the same balances and the same `getpayoutrule` answer.
 
 USAGE
@@ -48,6 +53,9 @@ PASSTHROUGH = "always ( o30[t]:bv[24] = i40[t]:bv[24] )."
 TWO_SLOTS = "always ( (o30[t]:bv[24] = i40[t]:bv[24]) && (o31[t]:bv[24] = i40[t]:bv[24]) )."
 BLOCK_ALL = ("always ( i1[t]:bv[24] > { #x000000 }:bv[24] -> "
              "( o5[t]:bv[24] = { #x000000 }:bv[24] ) ).")
+
+
+ROYALTY = "always ( o30[t]:bv[24] = i27[t]:bv[24] / { 20 }:bv[24] )."
 
 
 def reviewer_only(pk):
@@ -79,11 +87,11 @@ def execute(rig, who, *flags):
                    "--account", rig.pk["treasury"], "--fee", FEE_LIMIT, *flags)
 
 
-def raw_execute(rig, who, rid, data, recipients=None):
+def raw_execute(rig, who, rid, data, recipients=None, sale_id=None):
     from tau_testnet_cli import tx as cli_tx
     payload = cli_tx.build_payout_execute_tx(
         **rig.common(who), account_pubkey=rig.pk["treasury"], rule_id=rid,
-        recipients=recipients or {}, data=data, fee_limit=FEE_LIMIT)
+        recipients=recipients or {}, data=data, sale_id=sale_id, fee_limit=FEE_LIMIT)
     return rig.submit(who, payload)
 
 
@@ -231,8 +239,53 @@ def scenario_expire_and_revoke(rig, st):
     orc.verify("the end and the revoke (fee-free)")
 
 
+def scenario_per_sale(rig, st):
+    say("9. A royalty paid once per sale: 5% of a sale of 101 is 5, once")
+    orc = Oracle(rig, "9", ("treasury", "carol", "bob"))
+    install(rig, ROYALTY, "--slot", rig.pk["bob"], "--cap-per-execution", "100",
+            "--cap-per-period", "1000", "--period-blocks", "20", "--ends-in", "400",
+            "--per-sale")
+    rig.settle(lambda: payout(rig).get("installed"), "the royalty rule to install")
+    orc.fee("treasury")
+    rule = payout(rig).get("rule") or {}
+    check("the rule is installed to pay per sale, with no open sale yet",
+          rule.get("per_sale") is True and rule.get("open_sales") == [], rule)
+    st["rule4"] = rule.get("rule_id")
+
+    res = rig.transfer("carol", "treasury", 101)
+    sale = (res.get("data") or {}).get("tx_hash")
+    check("Carol's payment of 101 to the treasury is admitted", bool(sale), res)
+    rig.mine(empty=False)
+    orc.fee("carol")
+    orc.move("carol", "treasury", 101)
+    opened = (payout(rig).get("rule") or {}).get("open_sales") or []
+    check("the node records it as an open sale named by its transaction hash",
+          [(s.get("sale_id"), s.get("payer_pubkey"), s.get("amount")) for s in opened]
+          == [(sale, rig.pk["carol"], 101)], opened)
+
+    res = raw_execute(rig, "bob", st["rule4"], {}, sale_id="ab" * 32)
+    check("a sale nobody paid is refused at admission", refused(res), res)
+    proc = execute(rig, "bob", "--sale", sale)
+    check("Bob's `payout execute --sale` is admitted", proc.returncode == 0,
+          proc.stdout[-300:] + proc.stderr[-300:])
+    rig.mine(empty=False)
+    orc.fee("bob")
+    orc.move("treasury", "bob", 5)
+    orc.verify("the royalty (Bob gets the engine's 5 of 101)")
+    rule = payout(rig).get("rule") or {}
+    check("the sale is closed", rule.get("open_sales") == [] and rule.get("paid_total") == 5,
+          rule)
+    executed = (payout(rig).get("history") or [{}])[0]
+    check("the history names the sale it paid",
+          executed.get("outcome") == "executed" and executed.get("sale_id") == sale, executed)
+
+    res = raw_execute(rig, "bob", st["rule4"], {}, sale_id=sale)
+    check("the same sale again is refused at admission", refused(res), res)
+    orc.verify("nothing more is paid for that sale")
+
+
 def scenario_follower(rig, st):
-    say("9. Node B replays A's blocks, restarts, and agrees")
+    say("10. Node B replays A's blocks, restarts, and agrees")
     rig.mine()
     reads = [f"getpayoutrule {rig.pk['treasury']}"]
     reads += [f"getbalance {rig.pk[n]}" for n in ACTORS]
@@ -251,6 +304,7 @@ def run(root: str) -> int:
             scenario_o5_does_not_apply(rig, st)
             scenario_replace(rig, st)
             scenario_expire_and_revoke(rig, st)
+            scenario_per_sale(rig, st)
             scenario_follower(rig, st)
     except Exception:
         import traceback

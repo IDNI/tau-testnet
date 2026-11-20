@@ -908,6 +908,10 @@ def compute_standing_book_root(
 DOMAIN_PAYOUT_RULE_V1 = b"tau.payout.rule.v1"
 DOMAIN_PAYOUT_RESOLVED_V1 = b"tau.payout.resolved.v1"
 DOMAIN_PAYOUT_BOOK_V1 = b"tau.payout.book.v1"
+# A rule that pays per sale has its own id domain, so its id can never equal the
+# id of the same terms without per-sale payment (and ids of every other rule stay
+# what they were).
+DOMAIN_PAYOUT_RULE_PER_SALE_V1 = b"tau.payout.rule.per_sale.v1"
 
 
 def compute_payout_body_hash(body: str) -> bytes:
@@ -956,6 +960,7 @@ def compute_payout_rule_id(
     kind: int,
     period: int,
     expires_at: int,
+    per_sale: bool = False,
 ) -> bytes:
     """BLAKE3 of the signed terms of a payout rule. Returns 32 bytes.
 
@@ -963,7 +968,8 @@ def compute_payout_rule_id(
     signing and inclusion cannot be executed with inputs meant for another one.
     """
     out = bytearray()
-    out.extend(encode_string(DOMAIN_PAYOUT_RULE_V1.decode()))
+    domain = DOMAIN_PAYOUT_RULE_PER_SALE_V1 if per_sale else DOMAIN_PAYOUT_RULE_V1
+    out.extend(encode_string(domain.decode()))
     out.extend(_encode_payout_terms(
         account_pubkey, sequence_number, body_hash, slots, cap_per_execution,
         cap_per_period, kind, period, expires_at,
@@ -998,8 +1004,14 @@ def encode_payout_entry(
     executions: int,
     paid_total: int,
     last_height: int,
+    sales: Any = None,
 ) -> bytes:
-    """The signed terms, then where the rule stands: the period caps depend on it."""
+    """The signed terms, then where the rule stands: the period caps depend on it.
+
+    `sales`, only for a rule that pays per sale: (missed, open sales), each open
+    sale (sale_id, payer, amount, height). Which sales are still payable is state
+    every node must agree on, so it is part of the entry.
+    """
     out = bytearray()
     out.extend(encode_hash32(rule_id))
     out.extend(_encode_payout_terms(
@@ -1012,6 +1024,16 @@ def encode_payout_entry(
     out.extend(encode_uint64(int(executions)))
     out.extend(encode_uint64(int(paid_total)))
     out.extend(encode_uint64(int(last_height)))
+    if sales is not None:
+        missed, open_sales = sales
+        out.extend(b"\x01")
+        out.extend(encode_uint64(int(missed)))
+        out.extend(encode_uint32(len(open_sales)))
+        for sale_id, payer, amount, height in open_sales:
+            out.extend(encode_hash32(sale_id))
+            out.extend(encode_pubkey48(payer))
+            out.extend(encode_uint64(int(amount)))
+            out.extend(encode_uint64(int(height)))
     return bytes(out)
 
 

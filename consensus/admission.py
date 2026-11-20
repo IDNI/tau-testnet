@@ -1889,6 +1889,7 @@ def validate_payout_execute_payload(
         "total": sum(a for _, _, a in legs),
         "legs": [{"slot": k, "recipient_pubkey": who, "amount": amount}
                  for k, who, amount in legs],
+        **({"sale_id": exe.sale_id.hex()} if exe.sale_id is not None else {}),
     })
 
 

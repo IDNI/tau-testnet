@@ -2926,14 +2926,26 @@ _PAYOUT_COLUMNS = (
 def _write_payout_rows(state: Dict) -> None:
     """Full replace of the installed payout rules plus the removal commitment."""
     _db_conn.execute('DELETE FROM payout_rules_v1')
+    # Rules that pay per sale (a 17th element: missed count and open sales) keep
+    # that part in one chain_state value, so the table keeps its columns.
+    sales = {}
     for row in state['rows']:
-        (rule_id, account, sequence, body, slots), rest = row[:5], row[5:]
+        (rule_id, account, sequence, body, slots), rest = row[:5], row[5:16]
+        if len(row) > 16:
+            missed, open_sales = row[16]
+            sales[account] = {'missed': int(missed), 'open': [
+                [bytes(sid).hex(), payer, int(amount), int(height)]
+                for sid, payer, amount, height in open_sales]}
         _db_conn.execute(
             f'INSERT INTO payout_rules_v1 ({_PAYOUT_COLUMNS}) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (bytes(rule_id).hex(), account, int(sequence), body, json.dumps(list(slots)))
             + tuple(int(v) for v in rest),
         )
+    _db_conn.execute(
+        'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
+        ('payout_sales', json.dumps(sales, sort_keys=True)),
+    )
     _db_conn.execute(
         'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',
         (
@@ -2954,14 +2966,22 @@ def load_payout_state() -> tuple[List[tuple], int, bytes]:
         raw = _db_conn.execute(
             "SELECT value FROM chain_state WHERE key = 'payout_resolved'"
         ).fetchone()
+        raw_sales = _db_conn.execute(
+            "SELECT value FROM chain_state WHERE key = 'payout_sales'"
+        ).fetchone()
+    sales = json.loads(raw_sales[0]) if raw_sales and raw_sales[0] else {}
     count, acc = 0, bytes(32)
     if raw and raw[0]:
         parsed = json.loads(raw[0])
         count, acc = int(parsed['count']), bytes.fromhex(parsed['acc'])
     out = []
     for r in rows:
-        out.append((bytes.fromhex(r[0]), r[1], int(r[2]), r[3], tuple(json.loads(r[4])))
-                   + tuple(int(v) for v in r[5:]))
+        row = ((bytes.fromhex(r[0]), r[1], int(r[2]), r[3], tuple(json.loads(r[4])))
+               + tuple(int(v) for v in r[5:]))
+        if r[1] in sales:
+            entry = sales[r[1]]
+            row += ((entry['missed'], tuple(tuple(e) for e in entry['open'])),)
+        out.append(row)
     return out, count, acc
 
 
