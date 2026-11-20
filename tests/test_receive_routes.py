@@ -66,6 +66,9 @@ def test_twenty_percent_route_with_floor_rounding():
     assert ch.bal[BOB] == 10 + 81 and ch.bal[CAROL] == 20
     receipt = ch.last.outcomes[0].receipt_logs
     assert any("Receive route: 20 of 101" in log for log in receipt)
+    # #35: gross, net and routed amount are all in the receipt.
+    assert any(f"to {CAROL} (gross 101, net 81, routed 20, 2000 bps)" in log
+               for log in receipt)
 
 
 def test_sender_cannot_bypass_and_wallet_need_not_be_online():

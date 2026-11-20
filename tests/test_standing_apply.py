@@ -84,8 +84,10 @@ def test_executes_at_most_once_per_period_by_anyone():
     # Next period, a different executor.
     ch.block([exec_tx(sid, month(2027, 1), 0, sender=MALLORY)], ts=at(2027, 1, 31))
     assert ch.bal[BOB] == 2_000
-    # Last transfer time is the payer's, not the executor's.
+    # Last transfer time is the payer's, not the executor's: the payer's
+    # cooldown clock moves exactly once per execution.
     assert ch.lts[ALICE] == at(2027, 1, 31)
+    assert CAROL not in ch.lts and MALLORY not in ch.lts
 
 
 def test_before_and_after_the_window_is_rejected():
@@ -189,3 +191,38 @@ def test_state_hash_is_deterministic():
         ch.block([exec_tx(sid, month(2026, 12), 0)], ts=at(2026, 12, 31))
         return [h[-1] for h in ch.history]
     assert run() == run()
+
+
+def test_admission_and_apply_agree_on_the_same_book_and_order():
+    """#34: admission and block apply give the same verdict for the same
+    authorization state and transaction order (funds and o5 are apply-only)."""
+    import copy
+    import types
+
+    from consensus.admission import validate_standing_payload
+
+    def verdicts(ch, tx, ts):
+        view = types.SimpleNamespace(next_block_timestamp=ts,
+                                     standing_book=lambda: ch.lm.standing_payments)
+        admitted = validate_standing_payload(tx, view).is_valid
+        trial = copy.deepcopy(ch)
+        trial.block([tx], ts=ts)
+        applied = tx["tx_id"] not in trial.last.invalid_tx_ids
+        return admitted, applied
+
+    ch, sid = setup()
+    cases = [
+        (exec_tx(sid, month(2026, 12), 0), at(2026, 12, 30)),     # before the window
+        (exec_tx(sid, month(2026, 12), 0), at(2027, 1, 5)),       # after the window
+        (exec_tx(sid, month(2027, 1), 0), at(2026, 12, 31)),      # wrong period
+        (exec_tx(sid, month(2026, 12), 0), at(2026, 12, 31, 8)),  # due
+    ]
+    for tx, ts in cases:
+        admitted, applied = verdicts(ch, tx, ts)
+        assert admitted == applied, (tx["period"], ts, admitted, applied)
+    ch.block([exec_tx(sid, month(2026, 12), 0)], ts=at(2026, 12, 31, 8))
+    again = exec_tx(sid, month(2026, 12), 1, sender=MALLORY)       # second time
+    assert verdicts(ch, again, at(2027, 1, 2)) == (False, False)
+    ch.block([cancel_tx(sid, 1)], ts=at(2027, 1, 3))
+    after_cancel = exec_tx(sid, month(2027, 1), 1)
+    assert verdicts(ch, after_cancel, at(2027, 1, 31)) == (False, False)

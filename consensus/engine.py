@@ -2010,7 +2010,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         "routed": routed, "destination": dest, "bps": route.bps,
                     })
                     tx_receipt["logs"].append(
-                        f"Receive route: {routed} of {amount} to {dest[:10]}..."
+                        f"Receive route: {routed} of {amount} to {dest} "
+                        f"(gross {amount}, net {net}, routed {routed}, {route.bps} bps)"
                     )
 
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,

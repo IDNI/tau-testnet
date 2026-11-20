@@ -107,7 +107,11 @@ value (`standing_v1`) and every id is recomputed on load.
 `getstandingpayments <address> [in|out|all]` returns, per payment, its terms,
 `executions`, `total_executed`, `due_period` (what anyone may execute now, or
 `null`), `paid_this_period` (the "paid for this period" fact requested on
-#34) and `next_due_at`.
+#34) and `next_due_at`. Every answer also carries `semantics`: the time
+source, period kinds, the month-end rule, one execution per period, skipped
+missed periods, the mandatory end condition, who executes and pays the fee,
+chain binding and the bounds, so a wallet can check support before it offers
+the feature.
 
 ## Transactions
 

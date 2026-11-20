@@ -109,6 +109,12 @@ def test_rpc_reports_due_and_paid(temp_database):
     out = json.loads(getstandingpayments.execute(f"getstandingpayments {ALICE} out", None))
     (row,) = out["data"]["standing_payments"]
     assert row["paid_this_period"] is True and row["due_period"] is None
+    # #34: the capability endpoint states the canonical schedule semantics.
+    sem = out["data"]["semantics"]
+    assert sem["month_missing_due_day"] == "last calendar day of the month"
+    assert sem["missed_period"] == "skipped; no catch-up"
+    assert sem["executions_per_period"] == 1 and sem["end_condition_required"] is True
+    assert sem["executor"] == "anyone" and sem["chain_bound"] is True
 
 
 def test_every_schedule_term_is_signed():
