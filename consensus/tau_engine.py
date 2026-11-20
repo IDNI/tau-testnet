@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, NamedTuple, Protocol, Sequence
+from typing import Any, Dict, List, NamedTuple, Protocol, Sequence, Tuple
 
+from .credits import CreditRecord
 from .state import StateStore, TauStateSnapshot, compute_state_hash
 
 
@@ -11,6 +12,9 @@ class TauExecutionResult(NamedTuple):
     accepted_transactions: List[Dict[str, Any]]
     rejected_transactions: List[Dict[str, Any]]
     receipts: Dict[str, Any]
+    # Bounty 01, Stage 1: the credits this apply landed, in order, each with
+    # its credit class. Defaulted so existing construction sites keep working.
+    credits: Tuple[CreditRecord, ...] = ()
 
 
 class TauEngine(Protocol):

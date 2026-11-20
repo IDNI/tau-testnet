@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -41,6 +42,15 @@ from .retractable import (
     parse_retract_transfer,
     parse_retractable_transfer,
 )
+from .credits import (
+    CREDIT_FAUCET,
+    CREDIT_FEE_REWARD,
+    CREDIT_RETRACTABLE_RELEASE,
+    CREDIT_TRANSFER,
+    CreditLedger,
+    CreditRecord,
+)
+from .sweep import run_programmable_sweep
 from .rule_offers import (
     RULE_OFFER_TX_TYPES,
     RuleOfferDecision,
@@ -173,6 +183,10 @@ class ApplyBlockResult:
     invalid_tx_ids: List[str]
     governance_changes: Dict[str, Any]
     mempool_hints: Dict[str, Any]
+    # Bounty 01, Stage 1: the credits this block landed, in order (the
+    # transaction loop's credits first, then the sweep's). Defaulted so
+    # existing construction sites keep working.
+    credits: Tuple[CreditRecord, ...] = ()
 
 
 class ConsensusEngine(ABC):
@@ -231,8 +245,14 @@ def _escrow_total(lm) -> int:
     return book.escrow_total() if book is not None else 0
 
 
-def _release_due_retractables(lm, balances, sequences, height, timestamp) -> List[str]:
-    """Pay every matured entry to its recipient; returns the released ids."""
+def _release_due_retractables(lm, balances, sequences, height, timestamp, credit_records=None) -> List[str]:
+    """Pay every matured entry to its recipient; returns the released ids.
+
+    When ``credit_records`` is given (a ``CreditLedger``), each release is
+    recorded there as a ``CREDIT_RETRACTABLE_RELEASE`` credit (Bounty 01,
+    Stage 1). Releases land through the sweep, not through an ordinary
+    credit, so they are never routable.
+    """
     book = _retractable_book(lm)
     if book is None:
         return []
@@ -242,6 +262,13 @@ def _release_due_retractables(lm, balances, sequences, height, timestamp) -> Lis
         balances[entry.recipient_pubkey] = faucet.spendable(
             balances, sequences, entry.recipient_pubkey, grant
         ) + entry.amount
+        if credit_records is not None:
+            credit_records.record(
+                entry.recipient_pubkey,
+                entry.amount,
+                CREDIT_RETRACTABLE_RELEASE,
+                entry.retractable_id.hex(),
+            )
     return [entry.retractable_id.hex() for entry in released]
 
 
@@ -900,8 +927,28 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # burn). A mismatch is a consensus bug, not a recoverable error.
         # The sweep runs after the transaction loop, so a retract (strictly
         # before release) and a release can never both fire in one block.
+        # Credit ledger for the sweep: retractable releases land here with
+        # their class (Bounty 01, Stage 1).
+        release_credit_records = CreditLedger()
+        # The release hook is monkeypatchable (tests replace it with a
+        # 5-arg callable); pass the ledger only when the installed
+        # callable accepts the keyword, so the call never forces a new
+        # argument on a callee that does not take it.
+        _release_kwargs = {}
+        try:
+            _release_params = inspect.signature(
+                _release_due_retractables
+            ).parameters
+        except (TypeError, ValueError):
+            _release_params = {}
+        if "credit_records" in _release_params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in _release_params.values()
+        ):
+            _release_kwargs["credit_records"] = release_credit_records
         released_retractables = _release_due_retractables(
-            lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
+            lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp,
+            **_release_kwargs,
         )
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
@@ -909,6 +956,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 session if session is not None else getattr(proposal, "session", None),
                 "request_budget", None,
             ),
+        )
+
+        # Programmable-payments sweep (Bounty 01, Stage 1): runs after the
+        # transaction loop, at the same position as the retractable release
+        # (design 1.3: time is trigger #1). No handlers are registered yet,
+        # so this is a no-op until Stage 2 registers the grant book.
+        programmable_sweep_report = run_programmable_sweep(
+            lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
         )
 
         minted = faucet.granted(
@@ -1131,8 +1186,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "activated_updates": [u.update_id_hex for u in newly_active],
                 "released_retractables": released_retractables,
                 "retractable_events": retractable_events,
+                "programmable_sweep": programmable_sweep_report.summary(),
             },
-            mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
+            mempool_hints={"safe_to_drop": accepted_ids + skipped_ids},
+            credits=tuple(exec_result.credits) + release_credit_records.all(),
         )
 
     @staticmethod
@@ -1527,6 +1584,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     else _block_lifecycle.fork()
                 )
             return lifecycle_mgr
+
+        # Per-block credit ledger (Bounty 01, Stage 1): every credit this
+        # block lands is recorded here with its class, and returned on the
+        # execution result. The nested transfer applier below closes over it.
+        credit_records = CreditLedger()
 
         for i, tx in enumerate(transactions):
             # One branch per transaction. Its journal child, allocator child and
@@ -2019,6 +2081,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     staged_writes[from_addr] = current_from - amount
                     if not escrow:
                         staged_writes[to_addr] = _read_bal(to_addr) + amount
+                        credit_records.record(
+                            to_addr, amount, CREDIT_TRANSFER, tx_id
+                        )
                 except FeeRuleError:
                     raise
                 except Exception as e:
@@ -3138,6 +3203,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         # beneficiary, and beneficiary == proposer.
                         staged_writes[sender] = sender_bal - total_fee
                         staged_writes[beneficiary] = _read_bal(beneficiary) + total_fee
+                        if total_fee > 0:
+                            credit_records.record(
+                                beneficiary, total_fee, CREDIT_FEE_REWARD, tx_id
+                            )
                         tx_receipt["fee_charged"] = total_fee
                         tx_receipt["logs"].append(
                             f"Fee charged: {total_fee} -> "
@@ -3240,6 +3309,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     and not faucet.has_account(
                                         target_balances, target_sequences, sender)):
                                 target_balances[sender] = faucet_grant
+                                credit_records.record(
+                                    sender, faucet_grant, CREDIT_FAUCET, tx_id
+                                )
                             target_sequences[sender] = target_sequences.get(sender, 0) + 1
                         else:
                             if proposal is not None:
@@ -3295,4 +3367,5 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             accepted_transactions=accepted_txs,
             rejected_transactions=rejected_txs,
             receipts=receipts,
+            credits=credit_records.all(),
         )
