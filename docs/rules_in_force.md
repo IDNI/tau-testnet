@@ -62,6 +62,23 @@ operations logged "ignored".
 offer). The hash is over the exact stored text, which is also what
 `getaccountrules` hashes, so the two can be compared byte for byte.
 
+An `accumulated` effect also says what the engine did with the unit, read off
+the engine's own revision receipt when the block was applied:
+
+```json
+{"account": "8e7b…", "kind": "application_rule", "action": "accumulated", "sha256": "…",
+ "revision": {"taken": true, "engine_outcome": "ACCEPTED_CHANGED", "spec_revision": 12}}
+```
+
+| `revision` field | Meaning |
+|---|---|
+| `taken` | `true` when the engine's specification changed (`ACCEPTED_CHANGED`). `false` when the engine accepted the unit without a change (`ACCEPTED_NOOP`, a unit the specification already implies): the rule is stored, nothing new is in force. A unit the engine refuses is never included, so it has no effect at all. |
+| `engine_outcome` | The engine's outcome as it reported it. |
+| `spec_revision` | The engine's revision counter after the unit. It grows with every revision taken, so a wallet can order its rules. Nodes that applied the same blocks give the same number, and a restarted node, whose engine is rebuilt from the journal, continues it (both checked on two live nodes, scenario 7). |
+
+`revision` is absent when the evaluator gave no receipt (the mock engine of
+`TAU_FORCE_TEST`).
+
 ### What is recorded where
 
 Every node records the outcome of every block it applies, live or in a replay,
@@ -146,6 +163,12 @@ stores it and compare:
 Only then should a wallet say "protection on". A `skipped` outcome, a different
 hash, or a `null` clause means it is not.
 
+For an application rule, step 2 already answers whether it took effect, without
+running the engine: the `accumulated` effect carries the hash of the stored unit
+and `revision.taken`. `taken: false` means the engine already ran something that
+implies it. Whether a later rule has since revised part of it is what
+`running_spec` below answers.
+
 ### What the engine runs (`running_spec`)
 
 A rule unit can revise part of an earlier one. The probe of Sep 27 on #42:
@@ -186,8 +209,10 @@ why, on a node that runs without the authoritative engine (the mock engine of
 accepted again is reported, never a partial text).
 
 `tests/test_running_spec_native.py` runs the probe through real blocks on the
-real engine; `scripts/e2e_rules_in_force.py` (scenarios 6 and 7) on two live
-nodes, across a restart and a follower's replay.
+real engine, and checks that each of the two transactions says its revision was
+taken, in order; `scripts/e2e_rules_in_force.py` (scenarios 6 and 7) on two live
+nodes, across a restart (a third rule, `o27 = {4}`, applied by the engine as
+rebuilt after it) and a follower's replay.
 
 ### The rule-change release
 

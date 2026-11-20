@@ -253,7 +253,7 @@ TX_OUTCOME_NOT_PROCESSED = "not_processed"
 
 
 def _note_rule_effect(receipt, account, action, *, stream=None, body=None,
-                      kind="clause") -> None:
+                      kind="clause", revision=None) -> None:
     """Record on the receipt what a transaction did to one account's rules.
 
     kind "clause": a per-account registry clause; `action` is "registered",
@@ -271,13 +271,35 @@ def _note_rule_effect(receipt, account, action, *, stream=None, body=None,
         effect["stream"] = int(stream)
     if body is not None:
         effect["sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if revision is not None:
+        effect["revision"] = revision
     receipt.setdefault("rule_effects", []).append(effect)
 
 
-def _note_accumulated_rule(receipt, sender, rule_text) -> None:
+def _engine_revision(engine_receipt):
+    """What the engine did with an application rule, read off its revision receipt.
+
+    `taken`: the engine's specification changed (`ACCEPTED_CHANGED`); false for
+    a unit it accepted without a change (`ACCEPTED_NOOP`, for example one that
+    is already implied). `spec_revision`: the engine's revision counter after
+    the unit, as the evaluator that applied the block reports it. None when the
+    evaluator gave no receipt (the mock engine).
+    """
+    if not engine_receipt or not engine_receipt.get("outcome"):
+        return None
+    after = engine_receipt.get("spec_revision_after", engine_receipt.get("spec_revision"))
+    return {
+        "taken": engine_receipt["outcome"] == "ACCEPTED_CHANGED",
+        "engine_outcome": engine_receipt["outcome"],
+        "spec_revision": int(after) if after is not None else None,
+    }
+
+
+def _note_accumulated_rule(receipt, sender, rule_text, engine_receipt=None) -> None:
     """`_note_rule_effect` for a unit that joined the application-rules accumulation.
 
-    Hashes the unit in the form `chain_state.save_effective_tau_spec` stores it.
+    Hashes the unit in the form `chain_state.save_effective_tau_spec` stores it,
+    and carries what the engine did with it (`_engine_revision`).
     """
     if not isinstance(sender, str):
         return
@@ -288,7 +310,8 @@ def _note_accumulated_rule(receipt, sender, rule_text) -> None:
         unit = (chain_state._preprocess_tau_spec_text(raw) or raw).strip()
     except Exception:
         unit = raw
-    _note_rule_effect(receipt, sender, "accumulated", body=unit, kind="application_rule")
+    _note_rule_effect(receipt, sender, "accumulated", body=unit, kind="application_rule",
+                      revision=_engine_revision(engine_receipt))
 
 
 # Receipt logs kept per outcome. They are what issue #42 asks a wallet to see,
@@ -3010,7 +3033,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     current_tau_bytes = "\n".join(units).encode("utf-8")
                                     _rule_touched_canonical = True
                                     tx_receipt["logs"].append("Rule applied (staged)")
-                                    _note_accumulated_rule(tx_receipt, sender, rule_text)
+                                    _note_accumulated_rule(tx_receipt, sender, rule_text, receipt)
                                 elif not _application_rule_landed(rule_text):
                                     # Live apply: the handler did not persist, so
                                     # this is a no-op that must not sit in the
@@ -3029,7 +3052,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         )
                                     else:
                                         tx_receipt["logs"].append("Rule applied")
-                                        _note_accumulated_rule(tx_receipt, sender, rule_text)
+                                        _note_accumulated_rule(tx_receipt, sender, rule_text, receipt)
                                 else:
                                     rules_text = None
                                     try:
@@ -3045,7 +3068,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         current_tau_bytes += rule_op_data.encode("utf-8")
                                     _rule_touched_canonical = True
                                     tx_receipt["logs"].append("Rule applied")
-                                    _note_accumulated_rule(tx_receipt, sender, rule_text)
+                                    _note_accumulated_rule(tx_receipt, sender, rule_text, receipt)
 
                           except tau_shrink.ShrinkTypeConflict as e:
                             # W3: node-local. This process cannot represent the

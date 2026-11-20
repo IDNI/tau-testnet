@@ -99,21 +99,39 @@ def _sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _revision(queued):
+    """What the confirmed transaction says the engine did with its rule."""
+    import db
+    out = db.get_tx_outcome(queued["tx_hash"], chain_state._canonical_head_hash)
+    assert out and out["status"] == "applied", out
+    (effect,) = [e for e in out["rule_effects"] if e["action"] == "accumulated"]
+    return effect["revision"]
+
+
 def test_the_probe_of_sep_27_reads_what_the_engine_runs(authority, monkeypatch):
     # the baseline, without the probe: no o26 anywhere yet
     before = rs.at_head()
     assert before["text"] and "o26" not in before["text"], before
 
     sk, pk = _sender("probe")
-    assert _submit(sk, pk, {"0": A}, seq=0).get("ok")
+    queued_a = _submit(sk, pk, {"0": A}, seq=0)
+    assert queued_a.get("ok")
     _mine()
+    took_a = _revision(queued_a)
     first = rs.at_head()
     assert "o26[t]:bv[24] = { 7 }:bv[24]" in first["text"], first["text"]
 
-    assert _submit(sk, pk, {"0": B}, seq=1).get("ok")
+    queued_b = _submit(sk, pk, {"0": B}, seq=1)
+    assert queued_b.get("ok")
     _mine()
+    took_b = _revision(queued_b)
     out = rs.at_head()
     text = out["text"]
+
+    # each confirmed transaction says the engine took its revision, in order
+    assert took_a["taken"] and took_a["engine_outcome"] == "ACCEPTED_CHANGED", took_a
+    assert took_b["taken"] and took_b["engine_outcome"] == "ACCEPTED_CHANGED", took_b
+    assert took_b["spec_revision"] > took_a["spec_revision"], (took_a, took_b)
 
     # what the engine runs: o26 = 3 && o27 = 9, the 7 is gone
     assert "o26[t]:bv[24] = { 3 }:bv[24]" in text, text

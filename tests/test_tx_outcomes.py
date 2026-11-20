@@ -425,6 +425,43 @@ def test_an_accumulated_rule_records_the_stored_unit_hash():
     }]
 
 
+def _apply_with_engine_receipt(tx, receipt):
+    from unittest.mock import patch
+    with patch("tau_manager.get_last_revision_receipt", return_value=receipt):
+        result, _, _ = ap._apply([tx])
+    (row,) = result.next_snapshot.metadata["tx_outcomes"]
+    assert row["status"] == "applied", row
+    return row["rule_effects"]
+
+
+def test_an_accumulated_rule_says_whether_the_engine_took_the_revision():
+    """#42: a wallet reads from the confirmed transaction whether the rule took
+    effect, without running the engine itself."""
+    (effect,) = _apply_with_engine_receipt(ap.rule_tx(SCOPED_APP_RULE), {
+        "outcome": "ACCEPTED_CHANGED", "accepted": True, "changed": True,
+        "spec_revision_before": 4, "spec_revision_after": 5})
+    assert effect["action"] == "accumulated"
+    assert effect["revision"] == {"taken": True, "engine_outcome": "ACCEPTED_CHANGED",
+                                  "spec_revision": 5}
+
+
+def test_a_rule_the_engine_already_implied_is_accepted_but_not_taken():
+    (effect,) = _apply_with_engine_receipt(ap.rule_tx(SCOPED_APP_RULE), {
+        "outcome": "ACCEPTED_NOOP", "accepted": True, "changed": False,
+        "spec_revision_before": 5, "spec_revision_after": 5})
+    assert effect["revision"] == {"taken": False, "engine_outcome": "ACCEPTED_NOOP",
+                                  "spec_revision": 5}
+
+
+def test_the_worker_receipt_gives_the_revision_after_the_unit():
+    # the authoritative worker reports its counter once, after the revision
+    assert engine_module._engine_revision({"outcome": "ACCEPTED_CHANGED", "accepted": True,
+                                           "spec_revision": 9, "time_point": 31}) == {
+        "taken": True, "engine_outcome": "ACCEPTED_CHANGED", "spec_revision": 9}
+    assert engine_module._engine_revision(None) is None
+    assert engine_module._engine_revision({}) is None
+
+
 def test_a_built_block_records_only_its_own_transactions_at_their_positions(temp_database):
     """The builder's simulation ran a rejected tx the committed block dropped."""
     kept_a = {"sender_pubkey": "a" * 96, "sequence_number": 0, "operations": {"1": []}}
