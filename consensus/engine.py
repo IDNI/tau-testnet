@@ -163,6 +163,10 @@ class TransactionOutcome:
     status: str # "applied", "skipped", "invalid"
     reason: Optional[str] = None
     receipt_logs: List[str] = None
+    # Bounty 02 (issue #42): for a rule transaction, the revision receipt of
+    # its own rule step, captured in _apply at the moment the step returned
+    # (see tx_receipt["rule_outcome"]). None for every other transaction.
+    rule_outcome: Optional[Dict[str, Any]] = None
 
 @dataclass
 class ApplyBlockResult:
@@ -947,7 +951,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 else:
                     accepted_ids.append(tx_id)
                     
-                outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, receipt_logs=logs))
+                outcomes.append(TransactionOutcome(
+                    tx_id=tx_id, status=status, receipt_logs=logs,
+                    rule_outcome=receipt.get("rule_outcome"),
+                ))
             elif id(tx) in rejected_obj:
                 status = "invalid"
                 receipt = exec_result.receipts.get(tx_id, {})
@@ -962,6 +969,35 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if event and id(tx) in accepted_obj:
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
+
+        # Bounty 02 (issue #42): harvest the active-rules history this block
+        # produced, in apply order. `rule_outcomes` is the per-block map
+        # tx_hash -> rule outcome for accepted rule transactions, keyed by the
+        # block's own transaction hash (the hash a wallet knows), not the
+        # receipt lookup key. `spec_snapshots` carries one (spec_revision,
+        # canonical_text) candidate per revision a rule step advanced, so a
+        # block that moves the spec twice keeps both states. Both ride the
+        # snapshot metadata; chain_state records them from there at commit,
+        # the same seam as retractable_events.
+        rule_outcomes = []
+        spec_snapshots = []
+        block_tx_ids = getattr(block, "tx_ids", None) or []
+        for i, tx in enumerate(block.transactions):
+            if id(tx) not in accepted_obj:
+                continue
+            receipt = exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}
+            outcome = receipt.get("rule_outcome")
+            if outcome:
+                tx_hash = (
+                    block_tx_ids[i] if i < len(block_tx_ids)
+                    else _receipt_lookup_key(tx, i)
+                )
+                rule_outcomes.append((tx_hash, outcome))
+            snapshot = receipt.get("spec_snapshot")
+            if snapshot:
+                spec_snapshots.append(
+                    (snapshot["spec_revision"], snapshot["canonical_text"])
+                )
 
         # 3. Post-State Materialization Layer
         
@@ -1055,6 +1091,31 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             f"Governance rule activation rejected by live Tau interpreter "
                             f"at height {block.header.block_number}: {e}"
                         )
+            # Bounty 02 (issue #42): an activation advances the spec revision
+            # without any user rule transaction, so no per-step candidate
+            # exists for it. Take the block-end candidate from the last
+            # activation step's receipt, when it moved the revision past
+            # every candidate harvested so far.
+            try:
+                if proposal is not None:
+                    _act_receipt = proposal.session.last_receipt()
+                else:
+                    _act_receipt = tau_manager.get_last_revision_receipt()
+                if _act_receipt:
+                    _act_before = _act_receipt.get("spec_revision_before")
+                    _act_after = _act_receipt.get("spec_revision_after")
+                    _last_candidate = spec_snapshots[-1][0] if spec_snapshots else None
+                    if (
+                        isinstance(_act_before, int)
+                        and isinstance(_act_after, int)
+                        and _act_after > _act_before
+                        and (_last_candidate is None or _act_after > _last_candidate)
+                    ):
+                        _act_canonical = tau_manager.get_canonical_spec()
+                        if isinstance(_act_canonical, str) and _act_canonical:
+                            spec_snapshots.append((_act_after, _act_canonical))
+            except Exception:
+                pass
             last_update = newly_active[-1]
             # Provenance tag used by `compute_consensus_state_hash`. Every node
             # derives this string deterministically from `last_update.rule_revisions`,
@@ -1118,6 +1179,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "rule_outcomes": rule_outcomes,
+                "spec_snapshots": spec_snapshots,
             }
         )
         
@@ -2785,6 +2848,41 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     tx_receipt["logs"].append(
                                         f"Tau(rule) outcome: {receipt.get('outcome')}"
                                     )
+                                    # Bounty 02 (issue #42): copy the receipt
+                                    # into the transaction's own receipt NOW.
+                                    # The manager's last-receipt slot is a
+                                    # single process global that every later
+                                    # Tau step of this transaction (the fee
+                                    # steps included) and of the rest of the
+                                    # block overwrites, so this is the only
+                                    # moment the receipt still describes THIS
+                                    # rule step. _apply_block harvests it for
+                                    # accepted transactions and chain_state
+                                    # persists it at commit.
+                                    tx_receipt["rule_outcome"] = dict(receipt)
+                                    # If the step advanced the spec revision,
+                                    # the canonical spec text at this instant
+                                    # is that revision's snapshot: capture it
+                                    # alongside, for the same reason -- by
+                                    # commit time only the block's final text
+                                    # would still be readable, and the
+                                    # intra-block states would be lost.
+                                    try:
+                                        _rev_before = receipt.get("spec_revision_before")
+                                        _rev_after = receipt.get("spec_revision_after")
+                                        if (
+                                            isinstance(_rev_before, int)
+                                            and isinstance(_rev_after, int)
+                                            and _rev_after > _rev_before
+                                        ):
+                                            _canonical = tau_manager.get_canonical_spec()
+                                            if isinstance(_canonical, str) and _canonical:
+                                                tx_receipt["spec_snapshot"] = {
+                                                    "spec_revision": _rev_after,
+                                                    "canonical_text": _canonical,
+                                                }
+                                    except Exception:
+                                        pass
                                 else:
                                     tau_failed = (
                                         isinstance(output, str)
