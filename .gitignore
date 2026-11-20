@@ -2,6 +2,7 @@
 /data*
 /tmp/
 /venv/
+/.venv/
 /_old.git/
 /build/
 
