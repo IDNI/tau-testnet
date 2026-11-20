@@ -991,21 +991,21 @@ def _screen_clause_domains(body: str) -> Optional[str]:
             + ", ".join(typed)
         )
 
-    # A hold rule that reads i17 (the hold length) but never i26 (which unit
+    # A hold rule that reads i17 (the hold length) but never i16 (which unit
     # the hold is denominated in) would judge seconds and blocks with one
     # number: a 90-day height park would reach a seconds cap as a large
     # number of "seconds", or a 10-minute time park would reach a blocks cap
     # as 600 "blocks". Unit-blind hold rules are therefore undeployable —
-    # the author must branch on i26, which is also what makes the clause
+    # the author must branch on i16, which is also what makes the clause
     # statically recognisable as inbound-capable.
     from consensus import sender_policy
 
     if sender_policy.clause_reads_hold_without_context(body):
         return (
             "Shared rules: a unit-blind recipient hold rule reads i17 (hold "
-            "length) without ever reading i26 (hold unit/context). i17 is "
+            "length) without ever reading i16 (hold unit/context). i17 is "
             "denominated in seconds for a time park and in blocks for a "
-            "height park, so the clause must branch on i26 to say which "
+            "height park, so the clause must branch on i16 to say which "
             "unit its cap means."
         )
 
@@ -1024,7 +1024,7 @@ def _screen_clause_widths_and_structure(body: str) -> Optional[str]:
         return "Shared rules: " + slot_error
 
     # Same contract for the recipient-control streams the gate feeds: every
-    # i17/i26 mention typed bv[64], or the gate's own feed can be poisoned.
+    # i17/i16 mention typed bv[64], or the gate's own feed can be poisoned.
     recipient_error = screen_recipient_stream_widths(body)
     if recipient_error:
         return "Shared rules: " + recipient_error
@@ -1294,7 +1294,7 @@ def _recipient_policy_inactive_refusal(
     Acceptance #47.5 / #76.6: a node without the gate must refuse an
     inbound rule at deploy with a clear reason rather than silently admit
     a rule that never runs. Because every inbound-capable clause must read
-    i17 or i26 (the opt-in), the screen is complete — for allow-lists and
+    i17 or i16 (the opt-in), the screen is complete — for allow-lists and
     hold caps alike.
     """
     from consensus import sender_policy
@@ -1305,9 +1305,9 @@ def _recipient_policy_inactive_refusal(
         return None
     return format_error(
         "Recipient-side policy is not active on this chain. This rule reads "
-        "i17/i26 (the recipient hold/context streams), so it could only run "
+        "i17/i16 (the recipient hold/context streams), so it could only run "
         "as an inbound recipient rule; the feature activates by governance "
-        "patch (recipient_policy_active), which reserves i17 and i26.",
+        "patch (recipient_policy_active), which reserves i17 and i16.",
         code="RECIPIENT_POLICY_INACTIVE",
     )
 

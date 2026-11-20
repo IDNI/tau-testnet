@@ -1313,11 +1313,11 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         # Reserved upstream, so a sender cannot pre-fill one.
                         for slot in _approval_slot_feed(tip_view):
                             tau_input_stream_values[slot] = "0"
-                        # Recipient controls (i17/i26). The sender pass always
+                        # Recipient controls (i17/i16). The sender pass always
                         # carries the outgoing overlay (hold 0, context 0),
                         # forced after the custom merge and the slot feed,
                         # byte-identically at apply, so a sender-supplied
-                        # i17/i26 never survives and an owner's inbound rules
+                        # i17/i16 never survives and an owner's inbound rules
                         # never fire on their own outgoing payments.
                         if recipient_policy_active(tip_view):
                             tau_input_stream_values[tau_defs.HOLD_STREAM_INDEX] = "0"

@@ -2555,7 +2555,7 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
 
     if recipient_policy_active is not None:
         # One-way activation flag, same reasoning: persisted so a restart
-        # does not silently un-reserve i17/i26 and let a sender supply the
+        # does not silently un-reserve i17/i16 and let a sender supply the
         # recipient gate's own hold/context inputs.
         _db_conn.execute(
             'INSERT OR REPLACE INTO chain_state (key, value) VALUES (?, ?)',

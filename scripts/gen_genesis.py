@@ -47,7 +47,7 @@ def get_args():
     parser.add_argument(
         "--recipient-policy-active", action="store_true",
         help=(
-            "Activate recipient controls (i17/i26) from block 0. For a FRESH "
+            "Activate recipient controls (i17/i16) from block 0. For a FRESH "
             "chain only: on an existing chain this is a governance patch, "
             "which audits the live spec first. Off by default so a genesis "
             "generated without it stays byte-identical."

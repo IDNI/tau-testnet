@@ -10,7 +10,7 @@ the design's parity, determinism, guarded-mode and sabotage checks.
 
 Mock evaluator throughout (the native engine bindings are unavailable in
 this environment, so — exactly like the neighbouring suites — clause
-verdicts are scripted by input, keyed on i17/i26/i3).
+verdicts are scripted by input, keyed on i17/i16/i3).
 """
 import json
 import time
@@ -58,11 +58,11 @@ def _reset_overrides():
 def allowlist_body(sender):
     """Admits only payments from `sender` — the design's standard shape:
     the outgoing branch (context 0) is untouched, every inbound context
-    requires the sender to be listed. Reading i26 is what makes the clause
+    requires the sender to be listed. Reading i16 is what makes the clause
     inbound-capable; a clause reading only i3 keeps its outbound meaning
     and is never asked inbound."""
     return (
-        "(i26[t]:bv[64] = { #x0000 }:bv[64] || "
+        "(i16[t]:bv[64] = { #x0000 }:bv[64] || "
         "i3[t]:bv[384] = { #x" + sender + " }:bv[384]) "
         "? (o5[t]:bv[24] = { #x000001 }:bv[24]) "
         ": (o5[t]:bv[24] = { #x000000 }:bv[24])"
@@ -71,21 +71,21 @@ def allowlist_body(sender):
 
 def allowlist_verdict(sender):
     return lambda inputs: "1" if (
-        str(inputs.get("i26")) == "0" or inputs.get("i3") == "#x" + sender
+        str(inputs.get("i16")) == "0" or inputs.get("i3") == "#x" + sender
     ) else "0"
 
 
 # Caps: 600 seconds for time parks, 100 blocks for height parks (refusal
 # form: a hold strictly above the cap blocks).
 CAP_BODY = (
-    "((i26[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] > { #x0258 }:bv[64]) || "
-    "(i26[t]:bv[64] = { #x0003 }:bv[64] && i17[t]:bv[64] > { #x0064 }:bv[64])) "
+    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] > { #x0258 }:bv[64]) || "
+    "(i16[t]:bv[64] = { #x0003 }:bv[64] && i17[t]:bv[64] > { #x0064 }:bv[64])) "
     "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
 )
 
 
 def cap_verdict(inputs):
-    ctx = int(inputs.get("i26") or 0)
+    ctx = int(inputs.get("i16") or 0)
     hold = int(inputs.get("i17") or 0)
     if ctx == 2:
         return "0" if hold > 600 else "1"
@@ -95,13 +95,13 @@ def cap_verdict(inputs):
 
 
 ZERO_CAP_BODY = (
-    "(i26[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] > { #x0000 }:bv[64]) "
+    "(i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] > { #x0000 }:bv[64]) "
     "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
 )
 
 
 def zero_cap_verdict(inputs):
-    ctx = int(inputs.get("i26") or 0)
+    ctx = int(inputs.get("i16") or 0)
     hold = int(inputs.get("i17") or 0)
     if ctx == 2:
         return "0" if hold > 0 else "1"
@@ -144,7 +144,7 @@ def test_neutral_default_when_no_clause():
 
 def test_neutral_default_when_clause_never_reads_hold_or_context():
     sender_policy.set_evaluator("apply", _ev(BLOCKALL_BODY, "0"))
-    # BLOCKALL_BODY reads neither i17 nor i26, so it is not inbound-capable:
+    # BLOCKALL_BODY reads neither i17 nor i16, so it is not inbound-capable:
     # the gate must not consult it at all (the evaluator would block).
     blocked, info = sender_policy.recipient_clause_blocks(
         _clause_for({(ap.BOB, 5): BLOCKALL_BODY}), ap.BOB, {1: "5"},
@@ -213,15 +213,15 @@ def test_park_hold_measures_in_the_parks_own_unit():
 
 
 def test_sender_supplied_hold_streams_are_forced_not_merged():
-    """recipient_hold_inputs overwrites i17/i26 on the copy it returns and
+    """recipient_hold_inputs overwrites i17/i16 on the copy it returns and
     leaves the caller's map untouched: a value the sender supplied can never
     survive into the recipient pass."""
-    values = {1: "5", 17: "999999", 26: "2"}
+    values = {1: "5", 17: "999999", 16: "2"}
     out = sender_policy.recipient_hold_inputs(values, hold=3, context=3)
-    assert out[17] == "3" and out[26] == "3"
-    assert values[17] == "999999" and values[26] == "2"
+    assert out[17] == "3" and out[16] == "3"
+    assert values[17] == "999999" and values[16] == "2"
     sender_out = sender_policy.sender_pass_inputs(values)
-    assert sender_out[17] == "0" and sender_out[26] == "0"
+    assert sender_out[17] == "0" and sender_out[16] == "0"
 
 
 # --- deploy screens ----------------------------------------------------------
@@ -253,7 +253,7 @@ def _route(rule, view, sender=None):
 
 
 def test_unit_blind_hold_rule_is_refused_at_deploy(routing_view):
-    """#47.5/#76.6: a clause reading i17 without i26 cannot be registered —
+    """#47.5/#76.6: a clause reading i17 without i16 cannot be registered —
     it would silently misjudge one unit as the other."""
     result = _route(BLIND_RULE, routing_view)
     assert result.is_valid is False
@@ -282,6 +282,35 @@ def test_recipient_stream_widths_must_be_declared_64():
     wrong = "(i17[t]:bv[32] > { #x0258 }:bv[32])"
     assert screen_recipient_stream_widths(wrong) is not None
     assert screen_recipient_stream_widths(BLOCKALL_BODY) is None
+
+
+def test_shipped_wallet_templates_screen_clean_with_recipient_streams():
+    """Regression (found by independent cross-check of the first build):
+    the context tag originally sat on i26 — the documented start of the
+    clause custom-input space (REQUEST_CUSTOM_INPUT_MIN) — and the
+    recipient width screen then rejected the shipped wallet templates
+    that type i26 at bv[24] as a sender custom input: '2FA for High
+    Value Transfers', 'Escrow Contract' and 'Require a specific custom
+    input'. The tag now sits on i16. Every shipped o5 template must pass
+    _screen_clause_domains, and a recipient-control clause must still
+    screen clean in the same process — per-stream typing is
+    process-global, so the two have to coexist."""
+    from consensus.admission import _screen_clause_domains
+    from consensus.rule_offers import clause_body_v1
+    from wallet_templates import shipped_templates, writes
+
+    templates = shipped_templates()
+    for name in ("2FA for High Value Transfers", "Escrow Contract",
+                 "Require a specific custom input"):
+        assert name in templates, name
+        assert _screen_clause_domains(
+            clause_body_v1(templates[name])) is None, name
+    for name, template in sorted(templates.items()):
+        if writes(template, "o5"):
+            assert _screen_clause_domains(
+                clause_body_v1(template)) is None, name
+    # The recipient-control clause itself, in the same process.
+    assert _screen_clause_domains(CAP_RULE) is None
 
 
 # --- activation --------------------------------------------------------------
@@ -680,10 +709,10 @@ def test_capability_reporting_and_deploy_refusal(admission):
     payload = resp["data"] if "data" in resp else resp
     assert payload["recipient_policy_active"] is True
     controls = payload["capabilities"]["recipient_controls"]
-    assert controls["hold_stream"] == 17 and controls["context_stream"] == 26
+    assert controls["hold_stream"] == 17 and controls["context_stream"] == 16
     assert controls["hold_stream_width"] == 64
     assert "i17" not in payload["stream_widths"]
-    assert "i26" not in payload["stream_widths"]
+    assert "i16" not in payload["stream_widths"]
     # The frozen table itself, pinned exactly as it was before this feature.
     assert tau_defs.HOST_STREAM_WIDTHS == {
         "i1": 24, "i2": 24, "o5": 24, "o8": 24, "o9": 24,

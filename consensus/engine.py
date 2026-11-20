@@ -544,7 +544,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "approval_slots_active": bool(
                     getattr(lm, "approval_slots_active", False)
                 ),
-                # Whether i17/i26 are forced and the recipient gate runs.
+                # Whether i17/i16 are forced and the recipient gate runs.
                 # Same parent-snapshot read, same reasoning.
                 "recipient_policy_active": bool(
                     getattr(lm, "recipient_policy_active", False)
@@ -1477,7 +1477,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
         # Recipient controls (issues #47/#76). Same parent-snapshot read as
         # the approval slots: an activation recorded in block H governs H+1
-        # onward. While off, nothing below feeds i17/i26 or asks a recipient
+        # onward. While off, nothing below feeds i17/i16 or asks a recipient
         # clause anything, so a pre-activation node evaluates byte-identical
         # inputs.
         recipient_policy_on = getattr(lifecycle_mgr, "recipient_policy_active", False) is True
@@ -1834,7 +1834,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # Recipient controls: the sender pass always carries the
                 # outgoing overlay (hold 0, context 0), forced here — after
                 # the custom merge, where the slots are overlaid — so a
-                # sender-supplied i17/i26 never survives into any step, and
+                # sender-supplied i17/i16 never survives into any step, and
                 # an owner's inbound rules can never fire on their own
                 # outgoing payments. The recipient pass overwrites both keys
                 # on its own copy (sender_policy.recipient_hold_inputs).

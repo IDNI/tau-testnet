@@ -114,7 +114,7 @@ def validate_approval_slots_active(value: Any) -> Optional[str]:
 def validate_recipient_policy_active(value: Any) -> Optional[str]:
     """Recipient-control activation is a ONE-WAY switch to True.
 
-    Turning it back off would un-reserve i17/i26 while registered clauses
+    Turning it back off would un-reserve i17/i16 while registered clauses
     read them as the host-forced hold/context streams: a sender could then
     supply both values and forge the recipient gate's own inputs. So only
     `True` is a legal patch value, exactly as for the approval slots.
@@ -687,7 +687,7 @@ class ConsensusLifecycleManager:
 
         if "recipient_policy_active" in patch:
             # Same two-phase activation as the approval slots, for the same
-            # reason: an in-force rule already reading i17/i26 with a meaning
+            # reason: an in-force rule already reading i17/i16 with a meaning
             # of its own would silently change meaning the moment the gate
             # starts forcing those streams. Raising would freeze the chain,
             # so a collision leaves the flag False and the chain running.
@@ -720,7 +720,7 @@ class ConsensusLifecycleManager:
         """Turn recipient controls on. Idempotent, and there is no way back.
 
         Deactivation is unrepresentable on purpose: it would un-reserve
-        i17/i26 while registered clauses read them as the host-forced
+        i17/i16 while registered clauses read them as the host-forced
         hold/context streams, letting a sender supply both values and forge
         the recipient gate's own inputs.
         """

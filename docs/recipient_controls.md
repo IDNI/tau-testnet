@@ -11,7 +11,7 @@ apply through the same helper, so the two never disagree.
 | Stream | Meaning |
 | ------ | ------- |
 | `i17` | The hold length, in the park's **native unit** |
-| `i26` | The context/unit tag: `0` outgoing, `1` incoming final payment, `2` incoming time park (seconds), `3` incoming height park (blocks) |
+| `i16` | The context/unit tag: `0` outgoing, `1` incoming final payment, `2` incoming time park (seconds), `3` incoming height park (blocks) |
 
 A plain transfer is a final payment: hold `0`, context `1`. A park's hold is
 `release_at_time` minus the block timestamp (seconds) or `release_at_height`
@@ -19,29 +19,37 @@ minus the block height (blocks), measured against the block being built at
 apply and against `next_block_height` / `next_block_timestamp` at admission.
 A hold that is not in the future saturates at `0`.
 
+The indices are the two unassigned slots below the approval-slot block:
+`i26` and above are the documented custom-input space for clauses and
+parked requests, so the tag cannot live there — the shipped wallet
+templates type `i26` at `bv[24]` as a sender custom input. `i16` was
+designated for the (inactive, never-fed) cooldown stream at the same
+`bv[64]` width; the two activations are mutually exclusive on it, and
+each audits the live spec before it may proceed.
+
 Both streams are `bv[64]` and are reserved exactly while the feature is
-active. The sender pass always feeds `i17 = 0, i26 = 0`, forced after the
-custom-input merge, so a sender-supplied `i17`/`i26` never reaches any step
+active. The sender pass always feeds `i17 = 0, i16 = 0`, forced after the
+custom-input merge, so a sender-supplied `i17`/`i16` never reaches any step
 and an owner's inbound rules can never fire on their own outgoing payments.
 Before activation nothing is fed at all, and a pre-activation node evaluates
 byte-identical inputs.
 
 ## Writing a clause
 
-A clause is inbound-capable **iff it reads `i26` or `i17`**. A clause reading
+A clause is inbound-capable **iff it reads `i16` or `i17`**. A clause reading
 neither keeps exactly its outbound meaning and is never asked inbound — that
 is the neutral default for recipients without a policy.
 
 ```tau
 # inbound allow-list + 600-second / 10-block hold cap, outbound untouched
 always (
-  (i26[t] = {0}:bv[64]) ? <existing outbound body, or o5 = allow>
-: (i26[t] = {1}:bv[64]) ? (sender ∈ {A, B} on i3 ? o5 = allow : o5 = block)
-: (i26[t] = {2}:bv[64]) ? ((sender ∈ {A, B}) && i17[t] ≤ 600 ? allow : block)
+  (i16[t] = {0}:bv[64]) ? <existing outbound body, or o5 = allow>
+: (i16[t] = {1}:bv[64]) ? (sender ∈ {A, B} on i3 ? o5 = allow : o5 = block)
+: (i16[t] = {2}:bv[64]) ? ((sender ∈ {A, B}) && i17[t] ≤ 600 ? allow : block)
 :                          ((sender ∈ {A, B}) && i17[t] ≤ 10  ? allow : block) ).
 ```
 
-A clause that reads `i17` but never reads `i26` is **refused at deploy**:
+A clause that reads `i17` but never reads `i16` is **refused at deploy**:
 it would judge seconds and blocks with one number. The same refusal applies
 on a node where the feature is not active yet (`RECIPIENT_POLICY_INACTIVE`),
 so a rule is never silently admitted that will never run.
@@ -52,7 +60,7 @@ so a rule is never silently admitted that will never run.
 `approval_slots_active` precedent: a host-contract patch sets it to `True`
 only, and `build_mechanism_metadata` emits the key only when on, so the
 legacy consensus meta-hash is pinned while the flag is off. Activation first
-audits the effective spec; if any in-force text already reads `i17`/`i26`
+audits the effective spec; if any in-force text already reads `i17`/`i16`
 with a meaning of its own, activation is refused and the flag stays off —
 the chain keeps running. A fresh chain can activate from block 0 with
 `scripts/gen_genesis.py --recipient-policy-active`.

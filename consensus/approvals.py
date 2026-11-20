@@ -178,7 +178,7 @@ def screen_slot_widths(body: str) -> Optional[str]:
     return None
 
 
-# --- Recipient-control stream width screening (i17, i26) --------------------
+# --- Recipient-control stream width screening (i17, i16) --------------------
 #
 # Same reject-unless-annotated contract as the approval slots, for the two
 # streams the recipient gate feeds. The gate forces both at bv[64]; one clause
@@ -191,7 +191,7 @@ _RECIPIENT_STREAMS = frozenset({
 
 
 def screen_recipient_stream_widths(body: str) -> Optional[str]:
-    """None when every i17/i26 mention is typed bv[64], else the reason.
+    """None when every i17/i16 mention is typed bv[64], else the reason.
 
     Operates on comment-stripped text, like `screen_slot_widths`.
     """
@@ -420,8 +420,8 @@ def audit_recipient_stream_collisions(spec_texts) -> List[str]:
     """Reasons recipient controls cannot safely be activated. Empty means clear.
 
     Mirrors `audit_stream_collisions` for the approval slots. Before
-    activation, i17 is an ordinary custom input stream and i26 an ordinary
-    parked-request custom input, so an in-force rule may already read either
+    activation, i17 and i16 are both ordinary custom input streams, so an
+    in-force rule may already read either
     with a meaning of its own — most dangerously as a sender-supplied value.
     The moment the gate activates, the host FORCES both streams on every
     transfer step: that rule's meaning changes silently, and a rule typing

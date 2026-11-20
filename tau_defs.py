@@ -316,28 +316,45 @@ REQUEST_CUSTOM_INPUT_MIN = APPROVAL_SLOT_BASE + APPROVAL_SLOT_COUNT
 #
 #   i17  the hold length of the transfer being judged, in the park's OWN unit
 #        (seconds for a time park, blocks for a height park); 0 for a plain
-#        transfer. i17 is the only free index below the approval-slot block.
-#   i26  the judgment context: which direction and which unit i17 carries.
+#        transfer.
+#   i16  the judgment context: which direction and which unit i17 carries.
 #        0 = judging an outgoing payment (the sender pass, always),
 #        1 = incoming final payment, 2 = incoming time park,
 #        3 = incoming height park.
 #
 # One hold value in its native unit plus an explicit unit tag, instead of two
 # parallel hold streams: a rule that caps only seconds can never mistake a
-# height park for hold 0, because i26 always says which unit i17 is in. A
-# clause that reads i17 without i26 is refused at deploy for exactly that
+# height park for hold 0, because i16 always says which unit i17 is in. A
+# clause that reads i17 without i16 is refused at deploy for exactly that
 # reason (consensus/admission.py).
+#
+# Stream choice, surveyed against every assignment in the repo: i1–i5 are
+# the transfer fields, i6–i11 the consensus ABI, i12 the sender pubkey,
+# i13–i15 reserved, i18–i25 the approval slots, and i26+ the documented
+# custom-input space for clauses and parked requests
+# (REQUEST_CUSTOM_INPUT_MIN; the stream map in docs/approvals.md). The
+# first implementation put the context tag on i26, and the shipped wallet
+# templates — which type i26 at bv[24] as a sender custom input — stopped
+# passing the clause screens; per-stream typing is process-global and
+# sticky, so the tag moved. i17 has no assignment in any stream map, doc
+# or production code path. i16 is designated above for the cooldown feed
+# (issue #21), but that feed is INACTIVE (COOLDOWN_STREAM_ACTIVE is False
+# and the engine never feeds it) and its width is frozen at the same
+# bv[64] these streams pin, so the width screen cannot collide with a
+# cooldown clause; claiming it follows the same reserve-when-fed
+# precedent as i13 and the slots. The two activations are mutually
+# exclusive on i16: if the cooldown is ever switched on it must take
+# another stream, and each activation audits the live spec first.
 #
 # Both streams are bv[64], host-forced into the transfer input map AFTER the
 # custom-input merge (where the approval slots are overlaid), so a value the
 # sender supplies never reaches the recipient's clause. They are fed only
 # while RECIPIENT_POLICY_ACTIVE (below) and become reserved operations keys
-# at the same moment — the i16-cooldown precedent: reserve a stream exactly
-# when the node feeds it. Before activation i17 stays an ordinary custom
-# stream and i26 an ordinary parked-request custom input, so rules already
-# deployed against them keep working.
+# at the same moment — reserve a stream exactly when the node feeds it, the
+# i13 / approval-slot precedent. Before activation both stay ordinary
+# custom streams, so rules already deployed against them keep working.
 HOLD_STREAM_INDEX = 17
-CONTEXT_STREAM_INDEX = 26
+CONTEXT_STREAM_INDEX = 16
 RECIPIENT_STREAM_BV_WIDTH = 64
 
 CONTEXT_OUTGOING = 0
@@ -371,7 +388,7 @@ def reserved_operation_keys(
     global would leak across simulation, rollback and reorg.
 
     `recipient_policy_active` is the same class of flag for the recipient
-    controls (issues #47/#76): i17 (hold) and i26 (context) become reserved
+    controls (issues #47/#76): i17 (hold) and i16 (context) become reserved
     exactly when the node starts forcing them into the transfer input map.
     """
     keys = EXTRA_RESERVED_OPERATION_KEYS
@@ -404,7 +421,7 @@ def rule_text_forbidden_input_streams(
     the sender pubkey is how a policy rule scopes itself, only writing it as an
     operation is forbidden. Approval slots are the second: write-forbidden
     everywhere, readable only from a registered o5 clause. The recipient-control
-    streams i17/i26 are the third, on the same terms: an o5 clause MUST be able
+    streams i17/i16 are the third, on the same terms: an o5 clause MUST be able
     to read them or the recipient gate has no inputs; any other rule text may
     not, because typing them from an accumulated rule would pin their width
     outside the gate's control.

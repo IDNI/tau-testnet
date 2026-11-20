@@ -126,7 +126,7 @@ def clause_builds(body, *, pool: str, timeout=_SESSION_DEFAULT) -> tuple[bool, s
 # input-map builder upstream, same evaluator pools, same failure mapping — so
 # the two directions cannot drift apart. The only differences are the ones the
 # feature is made of: the clause is the RECIPIENT's, and the input map carries
-# the hold/context overlay (i17/i26) the gate forces in.
+# the hold/context overlay (i17/i16) the gate forces in.
 
 
 def _streams_read(body) -> set:
@@ -140,7 +140,7 @@ def _streams_read(body) -> set:
 
 
 def clause_is_inbound_capable(body) -> bool:
-    """True when a clause opts into inbound judging by reading i17 or i26.
+    """True when a clause opts into inbound judging by reading i17 or i16.
 
     The opt-in is what makes the set of inbound-capable clauses statically
     decidable at deploy: a clause reading neither stream is never invoked
@@ -155,7 +155,7 @@ def clause_is_inbound_capable(body) -> bool:
 
 
 def clause_reads_hold_without_context(body) -> bool:
-    """True for a unit-blind hold rule: reads i17 but never i26.
+    """True for a unit-blind hold rule: reads i17 but never i16.
 
     Such a rule would have to judge seconds and blocks with one number — a
     height park would reach it denominated in blocks while its cap was
@@ -173,7 +173,7 @@ def clause_reads_hold_without_context(body) -> bool:
 def recipient_hold_inputs(values: dict, *, hold: int, context: int) -> dict:
     """A copy of a transfer input map with the gate's overlay forced in.
 
-    i17 = the hold in its native unit, i26 = the judgment context. Forced —
+    i17 = the hold in its native unit, i16 = the judgment context. Forced —
     never merged — so a sender-supplied value on either stream (possible in
     a parked request's custom inputs before activation) never reaches the
     recipient's clause.
@@ -186,7 +186,7 @@ def recipient_hold_inputs(values: dict, *, hold: int, context: int) -> dict:
 
 def sender_pass_inputs(values: dict) -> dict:
     """The overlay the SENDER pass always carries while the gate is active:
-    i17 = 0, i26 = 0 ("judging an outgoing payment"), so an owner's inbound
+    i17 = 0, i16 = 0 ("judging an outgoing payment"), so an owner's inbound
     rules can never fire on their own outgoing payments."""
     return recipient_hold_inputs(
         values, hold=0, context=tau_defs.CONTEXT_OUTGOING
@@ -221,7 +221,8 @@ _HOLD_CMP_FLIPPED_RE = re.compile(
     r"\s*(<=|>=|<|>)\s*\bi17\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
 )
 _CONTEXT_GUARD_RE = re.compile(
-    r"\bi26\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*=\s*"
+    r"\bi" + str(tau_defs.CONTEXT_STREAM_INDEX) +
+    r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*=\s*"
     r"\{\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}\s*:\s*bv\s*\[\s*64\s*\]"
 )
 
@@ -242,7 +243,7 @@ def extract_candidate_cap(body, context: int):
     A HINT, never a verdict: the caller verifies the candidate against the
     clause's actual evaluation before printing it (see
     `recipient_clause_blocks`). Extraction is branch-aware — a comparison is
-    attributed to the i26 branch whose guard most recently precedes it in
+    attributed to the i16 branch whose guard most recently precedes it in
     the ternary chain — and per-branch restrictive (the minimum bound in the
     branch), never a global "most restrictive wins" over the whole clause,
     which would print one counterparty's cap to another.

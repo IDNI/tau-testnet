@@ -195,7 +195,7 @@ class TipAdmissionView:
 
     @property
     def recipient_policy_active(self) -> bool:
-        """Whether recipient controls (i17/i26) are active at the canonical tip.
+        """Whether recipient controls (i17/i16) are active at the canonical tip.
 
         Same source and same reasoning as `approval_slots_active` above.
         """

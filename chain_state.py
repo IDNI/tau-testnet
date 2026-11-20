@@ -2408,7 +2408,7 @@ def load_state_from_db() -> bool:
                         exc_info=True)
 
         # Recipient controls: the same one-way rehydration, for the same
-        # reason — a restarted node must not briefly un-reserve i17/i26.
+        # reason — a restarted node must not briefly un-reserve i17/i16.
         persisted_recipient = db.get_chain_state_value("recipient_policy_active", _MISSING)
         if _genesis_recipient_policy_active or (
             persisted_recipient is not _MISSING and str(persisted_recipient) == "1"
