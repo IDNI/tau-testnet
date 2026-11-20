@@ -13,7 +13,8 @@ BLOCK = "(o5[t]:bv[24] = { #x000000 }:bv[24])"
 # "This is a payment I send": the receive stream reads 0.
 MINE = "(i17[t]:bv[64] = { 0 }:bv[64])"
 
-UNBOUNDED = tau_defs.RECEIVE_HOLD_UNBOUNDED
+# Where the hold lengths in blocks start on the receive stream.
+BLOCKS = tau_defs.RECEIVE_HOLD_BLOCKS
 
 
 def _is(stream: str, pubkey: str) -> str:
@@ -51,6 +52,24 @@ def max_hold(seconds: int) -> str:
 def max_hold_model(seconds: int):
     def decide(inputs):
         return "0" if _receive(inputs) > seconds + 1 else "1"
+    return decide
+
+
+def max_hold_either(seconds: int, blocks: int) -> str:
+    """A payment to me may be held for at most `seconds`, or released at a
+    height at most `blocks` ahead."""
+    too_long = "( (i17[t]:bv[64] > { %d }:bv[64]) && (i17[t]:bv[64] < { %d }:bv[64]) )" % (
+        seconds + 1, BLOCKS)
+    too_far = "(i17[t]:bv[64] > { %d }:bv[64])" % (BLOCKS + blocks)
+    return "( ( %s || %s ) ? %s : %s )" % (too_long, too_far, BLOCK, ALLOW)
+
+
+def max_hold_either_model(seconds: int, blocks: int):
+    def decide(inputs):
+        receive = _receive(inputs)
+        if receive >= BLOCKS:
+            return "0" if receive > BLOCKS + blocks else "1"
+        return "0" if receive > seconds + 1 else "1"
     return decide
 
 

@@ -2657,14 +2657,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         else:
                             # What the recipient's clause reads as the hold:
                             # seconds from THIS block's timestamp to the release
-                            # for a time-based park. A height-based one has no
-                            # length in seconds, so it reads as unbounded.
+                            # for a time-based park, blocks from THIS block's
+                            # height for a height-based one.
                             if park.kind == KIND_TIME:
                                 park_receive_value = tau_defs.receive_stream_value(
                                     park.release_at - int(block_timestamp or 0)
                                 )
                             else:
-                                park_receive_value = tau_defs.RECEIVE_HOLD_UNBOUNDED
+                                park_receive_value = tau_defs.receive_stream_value(
+                                    hold_blocks=park.release_at - int(block_height or 0)
+                                )
                             escrowed = _execute_fee_era_transfer(
                                 park.sender_pubkey, park.recipient_pubkey, park.amount,
                                 slot_values=_approval_slot_values(),

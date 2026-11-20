@@ -24,7 +24,7 @@ from consensus.admission import (
 )
 from consensus.governance import ConsensusLifecycleManager
 from consensus.policy_mock import MockPolicyEvaluator
-from consensus.retractable import MAX_RELEASE_WINDOW_SECONDS
+from consensus.retractable import MAX_RELEASE_WINDOW_BLOCKS, MAX_RELEASE_WINDOW_SECONDS
 from tau_speculation import WorkerLost, WorkerTimeout
 
 import recipient_rules as rules
@@ -270,14 +270,76 @@ def test_a_cap_admits_ten_minutes_and_refuses_an_hour(node, tip):
     assert "held for 3600 seconds" in hour["message"]
 
 
-def test_a_height_release_is_refused_under_any_cap_and_says_why(node, tip):
+def test_a_cap_in_seconds_alone_refuses_a_height_release_and_says_why(node, tip):
+    """A length in blocks is not a length in seconds. The payer is told both
+    halves: no height release, and the cap a timed one must respect."""
     sendtx, _script = node
-    tip.rule(RECIPIENT, rules.max_hold(600), rules.max_hold_model(600))
+    body = tip.rule(RECIPIENT, rules.max_hold(600), rules.max_hold_model(600))
     result = _queue(sendtx, _park(release_at_height=NEXT_HEIGHT + 30))
     assert result["ok"] is False and result["code"] == "RECIPIENT_MAX_HOLD"
-    assert result["details"]["max_hold_seconds"] == 600
-    assert "hold_seconds" not in result["details"]
+    assert result["details"] == {
+        "transfer_index": 1, "recipient": RECIPIENT,
+        "max_hold_blocks": 0, "max_hold_seconds": 600, "hold_blocks": 30,
+    }
+    assert "max_hold_seconds=600" in result["message"]
+    assert "max_hold_blocks=0" in result["message"]
     assert "release_at_time" in result["message"]
+    assert tip.asked(body)[0]["i17"] == str(rules.BLOCKS + 30)
+
+
+def test_a_cap_in_blocks_admits_a_height_release_inside_it_and_refuses_one_beyond(node, tip):
+    """The hold of a height release is `release_at_height` minus the height of
+    the next block, in blocks (#76)."""
+    sendtx, _script = node
+    body = tip.rule(RECIPIENT, rules.max_hold_either(600, 100),
+                    rules.max_hold_either_model(600, 100))
+    inside = _queue(sendtx, _park(release_at_height=NEXT_HEIGHT + 100))
+    assert inside["ok"], inside
+    assert tip.asked(body)[-1]["i17"] == str(rules.BLOCKS + 100)
+
+    beyond = _queue(sendtx, _park(release_at_height=NEXT_HEIGHT + 101, sequence_number=2))
+    assert beyond["ok"] is False and beyond["code"] == "RECIPIENT_MAX_HOLD"
+    assert beyond["details"] == {
+        "transfer_index": 1, "recipient": RECIPIENT,
+        "max_hold_blocks": 100, "hold_blocks": 101,
+    }
+    assert "at most 100 blocks ahead" in beyond["message"]
+    assert "max_hold_blocks=100" in beyond["message"]
+    assert "held for 101 blocks" in beyond["message"]
+
+    far = _queue(sendtx, _park(release_at_height=NEXT_HEIGHT + MAX_RELEASE_WINDOW_BLOCKS,
+                               sequence_number=2))
+    assert far["code"] == "RECIPIENT_MAX_HOLD" and far["details"]["max_hold_blocks"] == 100
+
+
+def test_one_rule_caps_both_kinds_of_release_each_in_its_own_unit(node, tip):
+    sendtx, _script = node
+    tip.rule(RECIPIENT, rules.max_hold_either(600, 100),
+             rules.max_hold_either_model(600, 100))
+    hour = _queue(sendtx, _timed(3_600))
+    assert hour["code"] == "RECIPIENT_MAX_HOLD"
+    assert hour["details"] == {
+        "transfer_index": 1, "recipient": RECIPIENT,
+        "max_hold_seconds": 600, "hold_seconds": 3_600,
+    }
+    assert _queue(sendtx, _timed(600))["ok"]
+
+
+def test_working_out_the_cap_has_one_budget_and_no_more(node, tip, monkeypatch):
+    """A refusal costs the payer nothing, so the node bounds what it spends on
+    one: when the time for the cap is used up the park is still refused, and
+    the message says where the cap can be read."""
+    import tau_admission
+
+    sendtx, _script = node
+    body = tip.rule(RECIPIENT, rules.max_hold(600), rules.max_hold_model(600))
+    monkeypatch.setattr(tau_admission, "default_budget", lambda: 0.0)
+    result = _queue(sendtx, _timed(3_600))
+    assert result["ok"] is False and result["code"] == "RECIPIENT_POLICY"
+    assert "max_hold_seconds" not in result.get("details", {})
+    assert "getrecipientpolicy" in result["message"]
+    assert len(tip.asked(body)) == 1, "the verdict, and nothing after the time ran out"
+    assert ra._mempool_hashes() == []
 
 
 def test_a_park_refused_for_another_reason_is_not_a_hold_refusal(node, tip):
@@ -435,17 +497,37 @@ def test_the_probe_reports_the_cap_a_wallet_must_respect(node, tip):
     assert probe == {
         "sender": SENDER, "amount": 25, "advisory": True,
         "accepts_payment": True, "max_hold_seconds": 600,
-        "accepts_height_release": False,
+        "max_hold_blocks": 0, "accepts_height_release": False,
     }
     tip.rule(RECIPIENT, rules.max_hold(0), rules.max_hold_model(0))
     assert _rpc(RECIPIENT, SENDER, 25)["probe"]["max_hold_seconds"] == 0
+
+
+def test_the_probe_reports_a_cap_in_blocks(node, tip):
+    tip.rule(RECIPIENT, rules.max_hold_either(600, 100),
+             rules.max_hold_either_model(600, 100))
+    probe = _rpc(RECIPIENT, SENDER, 25)["probe"]
+    assert probe["max_hold_seconds"] == 600 and probe["max_hold_blocks"] == 100
+    assert probe["accepts_height_release"] is True
+
+
+def test_the_probe_has_one_budget_for_all_it_asks(node, tip, monkeypatch):
+    import tau_admission
+
+    tip.rule(RECIPIENT, rules.max_hold(600), rules.max_hold_model(600))
+    monkeypatch.setattr(tau_admission, "default_budget", lambda: 0.0)
+    parsed = json.loads(getrecipientpolicy.execute(
+        f"getrecipientpolicy {RECIPIENT} {SENDER} 25", None))
+    assert parsed.get("status") != "ok" and "TAU_UNAVAILABLE" in json.dumps(parsed)
+    assert tip.ev.verdict_calls == []
 
 
 def test_the_probe_reports_an_allow_list(node, tip):
     tip.rule(RECIPIENT, rules.allow_list(SENDER), rules.allow_list_model(SENDER))
     listed = _rpc(RECIPIENT, SENDER, 25)["probe"]
     assert listed["accepts_payment"] is True
-    assert listed["max_hold_seconds"] is None and listed["accepts_height_release"] is True
+    assert listed["max_hold_seconds"] is None and listed["max_hold_blocks"] is None
+    assert listed["accepts_height_release"] is True
     stranger = _rpc(RECIPIENT, STRANGER, 25)["probe"]
     assert stranger["accepts_payment"] is False
 
@@ -453,6 +535,7 @@ def test_the_probe_reports_an_allow_list(node, tip):
 def test_the_probe_of_an_account_without_a_receive_rule_accepts(node, tip):
     probe = _rpc(RECIPIENT, SENDER, 25)["probe"]
     assert probe["accepts_payment"] is True and probe["max_hold_seconds"] is None
+    assert probe["max_hold_blocks"] is None and probe["accepts_height_release"] is True
     assert tip.ev.verdict_calls == []
 
 

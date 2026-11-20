@@ -25,7 +25,7 @@ payment it is judging:
 | `0` | a payment its owner **sends**. Also what any path that does not feed the stream reads. |
 | `1` | an incoming payment that is **final in this block**: a transfer, or a co-signed transfer that executes. |
 | `1 + N` | an incoming retractable transfer that releases **N seconds** after the block's timestamp. The sender can take it back for those N seconds. |
-| `9223372036854775807` | an incoming retractable transfer that releases at a **block height**. It has no length in seconds, so every cap in seconds refuses it. |
+| `1000000000000000000 + N` | an incoming retractable transfer that releases at a **block height**, **N blocks** after the block that parks it. A length in blocks is not a length in seconds, so it has a range of its own (10^18 and up), above every length in seconds. |
 
 A clause that reads `i17` is evaluated a second time for every payment whose
 recipient is its owner. A clause that does not read `i17` is never asked about
@@ -60,7 +60,22 @@ always ( (i17[t]:bv[64] > { 1 }:bv[64])
 ```
 
 **Held for 600 seconds at most:** the same rule with `{ 601 }`. A cap of N
-seconds is `i17 > { N + 1 }`.
+seconds is `i17 > { N + 1 }`. A rule like this, written in seconds alone, takes
+no height release at all, because every length in blocks reads above it.
+
+**Held for 600 seconds, or released at most 100 blocks ahead.** A rule that
+takes height releases names its cap in blocks as well. The number of blocks is
+the end of the second literal:
+
+```
+always ( ( ( (i17[t]:bv[64] > { 601 }:bv[64]) && (i17[t]:bv[64] < { 1000000000000000000 }:bv[64]) )
+        || (i17[t]:bv[64] > { 1000000000000000100 }:bv[64]) )
+         ? (o5[t]:bv[24] = { #x000000 }:bv[24])
+         : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
+```
+
+Height releases only, 5 blocks at most: the same rule with `{ 1 }` in place of
+`{ 601 }` and `{ 1000000000000000005 }` at the end.
 
 **One unit for everything.** Bob pays only the shop, is paid only by Alice, and
 takes no payment held longer than 10 minutes:
@@ -121,12 +136,21 @@ charged:
 | Code | Meaning | `details` |
 |---|---|---|
 | `RECIPIENT_POLICY` | The recipient's rule does not accept this payment. Message: `Transaction rejected by recipient policy (o5) ...`. | `transfer_index`, `recipient` |
-| `RECIPIENT_MAX_HOLD` | The recipient would accept the payment with a shorter hold. The message carries the cap (`max_hold_seconds=N`). | `transfer_index`, `recipient`, `max_hold_seconds`, and `hold_seconds` for a time-based release |
+| `RECIPIENT_MAX_HOLD` | The recipient would accept the payment with a shorter hold. The message carries the cap in the park's own unit (`max_hold_seconds=N` or `max_hold_blocks=N`). | `transfer_index`, `recipient`, and for a time-based release `max_hold_seconds` and `hold_seconds`, for a height-based one `max_hold_blocks` and `hold_blocks` |
 | `RECIPIENT_POLICY_INACTIVE` | A rule that reads `i17` was submitted on a chain where the feature is not active. It would register and never be asked, so the node refuses it at deploy. | |
 
-`max_hold_seconds` is found by asking the recipient's clause about shorter holds
-(at most 25 evaluations, admission only). `0` means the recipient accepts only
-payments that are final at once.
+The cap is found by asking the recipient's clause about shorter holds, at
+admission only, by bisection: the reported cap was accepted and the next longer
+hold was refused, by the clause itself. `0` means the recipient accepts only
+payments that are final at once. A height release sent to a recipient whose rule
+takes none is told both: `max_hold_blocks=0` and the cap in seconds a timed
+release must respect.
+
+A refusal costs the payer nothing, so the node bounds what one costs it: the
+verdict is one evaluation, and working out the cap (about 27 evaluations at
+most) gets one more admission budget in total. If that runs out, the park is
+still refused, as `RECIPIENT_POLICY`, and the message points to
+`getrecipientpolicy` for the cap.
 
 At block apply a refused transaction is **not included** in the block: no
 amount moves, **no fee is charged** and no sequence number is used, exactly like
@@ -138,20 +162,25 @@ is refused, as on the sender's side, so every node reaches the same result.
 
 ## The hold length
 
-The hold is counted in **seconds**.
+The hold is counted in the park's own unit: **seconds** for `release_at_time`,
+**blocks** for `release_at_height`.
 
 - At block apply it is `release_at_time` minus the timestamp of the block that
-  carries the park.
+  carries the park, or `release_at_height` minus that block's height.
 - At admission it is `release_at_time` minus the node's estimate of the next
-  block's timestamp. That is the clock admission already uses for `i5` and to
+  block's timestamp, or `release_at_height` minus the height of the next block.
+  Those are the clock and the height admission already uses for `i5` and to
   refuse a park that could be mined at or after its release.
-- A park with `release_at_height` has no length in seconds: a chain can stand
-  still between blocks. A recipient with any cap refuses it, and the refusal
-  says to use `release_at_time`.
+- The two units are never converted into each other: a chain can stand still
+  between blocks, so a number of blocks is not a number of seconds. A rule with
+  a cap in seconds alone refuses every height release, and the refusal says to
+  use `release_at_time`. A rule that takes height releases says how many blocks.
 
-Admission is a pre-check. A park sent at the edge of a cap can pass admission
-and be refused at apply, or the reverse, by the seconds between the two clocks.
-The block decides, and a refused park costs nothing.
+Admission is a pre-check. A hold in blocks only gets shorter by the time the
+park is mined, so a height release admitted under a cap stays under it. A timed
+park sent at the edge of a cap can pass admission and be refused at apply, or
+the reverse, by the seconds between the two clocks. The block decides, and a
+refused park costs nothing.
 
 ## Asking a node
 
@@ -170,10 +199,11 @@ tau-testnet policy receive <address> --from <sender_pubkey> --amount 25
 | `has_clause` | The address has a registered `o5` clause. |
 | `judges_incoming` | The feature is active and the address's clause reads `i17`: payments to it are also judged by its own rule. |
 | `clause` | The clause text when it reads `i17`. |
-| `probe` | Only with `<sender> <amount>`: `accepts_payment`, `max_hold_seconds` (`null` = no cap inside the 90-day park window), `accepts_height_release`. |
+| `probe` | Only with `<sender> <amount>`: `accepts_payment`, `max_hold_seconds` (`null` = no cap inside the 90-day park window), `max_hold_blocks` (`null` = no cap inside the 100,000-block window, `0` = no height release), `accepts_height_release`. |
 
 The probe is advisory: a clause may read the clock and the payer's balance, so
-admission and apply decide. It counts as an expensive command for rate limiting.
+admission and apply decide. It counts as an expensive command for rate limiting,
+and everything one probe asks the clause shares one admission budget.
 
 ## Activation
 

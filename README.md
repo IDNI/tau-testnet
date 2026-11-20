@@ -648,7 +648,7 @@ Timing caveats:
 
 Long-form guide: [docs/recipient_controls.md](docs/recipient_controls.md).
 
-An account's own `o5` policy clause can also judge the payments made **to** it. One node-fed input, the receive stream `i17` (`bv[64]`), tells the clause which side it is judging: `0` for a payment its owner sends, `1` for an incoming payment that is final in this block, `1 + N` for an incoming retractable transfer that releases N seconds after the block's timestamp. A clause that reads `i17` is asked about every payment to its owner; a clause that does not is never asked, and an account with no clause is paid by everyone.
+An account's own `o5` policy clause can also judge the payments made **to** it. One node-fed input, the receive stream `i17` (`bv[64]`), tells the clause which side it is judging: `0` for a payment its owner sends, `1` for an incoming payment that is final in this block, `1 + N` for an incoming retractable transfer that releases N seconds after the block's timestamp, `10^18 + N` for one that releases at a height N blocks ahead. A clause that reads `i17` is asked about every payment to its owner; a clause that does not is never asked, and an account with no clause is paid by everyone.
 
 ```
 # Inbound allow-list: only Alice may pay me. What I send is not restricted.
@@ -669,8 +669,8 @@ tau-testnet policy receive <address> --from <sender_pubkey> --amount 25 # would 
 Semantics:
 
 - **When.** The recipient's clause is asked at admission and at block apply, after every check on the sender's side, for each transfer of a `user_tx` (by its own recipient), for a retractable transfer when it parks, and for a co-signed transfer when it executes. A retract is never gated and a release is not asked again. Rule offers and the creation of approval requests are not judged.
-- **Refusal.** One refusing recipient fails the whole transaction. At admission the code is `RECIPIENT_POLICY`, or `RECIPIENT_MAX_HOLD` with the cap as `max_hold_seconds` when a shorter hold would be accepted. At block apply the transaction is not included, so **no fee is charged**; the receipt reason is `recipient_policy_block`.
-- **Hold length.** Seconds from the block's timestamp to `release_at_time` (admission uses its estimate of the next block's timestamp). A height-based release has no length in seconds, so a recipient with any cap refuses it.
+- **Refusal.** One refusing recipient fails the whole transaction. At admission the code is `RECIPIENT_POLICY`, or `RECIPIENT_MAX_HOLD` with the cap as `max_hold_seconds` (or `max_hold_blocks` for a height release) when a shorter hold would be accepted. At block apply the transaction is not included, so **no fee is charged**; the receipt reason is `recipient_policy_block`.
+- **Hold length.** Seconds from the block's timestamp to `release_at_time` (admission uses its estimate of the next block's timestamp), or blocks from the block's height to `release_at_height`. The two are never converted: a cap written in seconds alone refuses every height release, and a rule that takes height releases names its cap in blocks.
 - **One unit.** Outbound rules, the inbound allow-list and the hold cap are one clause, registered, replaced, guarded and revoked like any `o5` policy.
 - **Reads.** `getrecipientpolicy <address> [<sender> <amount>]`; `getgovernance` reports `recipient_policy_active`.
 

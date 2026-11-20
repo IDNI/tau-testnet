@@ -208,7 +208,7 @@ or the balance surfaces as for an ordinary transfer.
 
 A recipient can cap how long a payment to it may be held, down to "final at
 once". A park over the cap is refused with `RECIPIENT_MAX_HOLD`, which carries
-the cap as `max_hold_seconds`; a retract is never refused. See
+the cap as `max_hold_seconds` (or `max_hold_blocks` for a height release); a retract is never refused. See
 [recipient_controls.md](recipient_controls.md).
 
 ## Timing caveats

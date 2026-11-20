@@ -14,12 +14,14 @@ The probe is ADVISORY and node-local, like `getapprovalpreview`: a clause may
 read the clock and the payer's balance, so the answer is for now, and the
 verdict that binds is the one at admission and apply.
 """
+import time
+
 import api_response
 import tau_admission
 import tau_defs
 from consensus import recipient_policy, sender_policy
 from consensus.approvals import ApprovalShapeError, _normalize_pubkey
-from consensus.retractable import MAX_RELEASE_WINDOW_SECONDS
+from consensus.retractable import MAX_RELEASE_WINDOW_BLOCKS, MAX_RELEASE_WINDOW_SECONDS
 
 _CMD = "getrecipientpolicy"
 _USAGE = f"Usage: {_CMD} <address> [<sender> <amount>]"
@@ -42,11 +44,17 @@ def _probe(clause: str, sender: str, recipient: str, amount: int, tip) -> dict:
             base[slot] = "0"
     base[5] = str(tip.next_block_timestamp)
 
+    # One admission budget for the whole probe, however many holds it asks about.
+    probe_ends = time.monotonic() + float(tau_admission.default_budget())
+
     def allows(value: int) -> bool:
+        left = probe_ends - time.monotonic()
+        if left <= 0:
+            raise tau_admission.AdmissionTimeout("the probe's budget ran out")
         try:
             blocked, _detail = sender_policy.clause_blocks(
                 clause, recipient_policy.receive_inputs(base, value),
-                pool="admission", timeout=tau_admission.default_budget(),
+                pool="admission", timeout=left,
             )
         except WorkerTimeout as exc:
             raise tau_admission.AdmissionTimeout(str(exc)) from exc
@@ -58,16 +66,19 @@ def _probe(clause: str, sender: str, recipient: str, amount: int, tip) -> dict:
         return {
             "accepts_payment": False,
             "max_hold_seconds": None,
+            "max_hold_blocks": None,
             "accepts_height_release": False,
         }
-    cap = recipient_policy.max_accepted_hold(
-        allows, tau_defs.RECEIVE_HOLD_UNBOUNDED, MAX_RELEASE_WINDOW_SECONDS
-    )
+    seconds = recipient_policy.longest_hold(
+        allows, recipient_policy.SECONDS, None, MAX_RELEASE_WINDOW_SECONDS)
+    blocks = recipient_policy.longest_hold(
+        allows, recipient_policy.BLOCKS, None, MAX_RELEASE_WINDOW_BLOCKS)
     return {
         "accepts_payment": True,
         # None: no cap within the longest window the chain admits for a park.
-        "max_hold_seconds": None if cap is None or cap >= MAX_RELEASE_WINDOW_SECONDS else cap,
-        "accepts_height_release": allows(tau_defs.RECEIVE_HOLD_UNBOUNDED),
+        "max_hold_seconds": None if seconds >= MAX_RELEASE_WINDOW_SECONDS else seconds,
+        "max_hold_blocks": None if blocks >= MAX_RELEASE_WINDOW_BLOCKS else blocks,
+        "accepts_height_release": blocks > 0,
     }
 
 
@@ -110,7 +121,7 @@ def execute(raw_command: str, container):
             data["probe"] = {
                 "sender": sender, "amount": amount, "advisory": True,
                 "accepts_payment": True, "max_hold_seconds": None,
-                "accepts_height_release": True,
+                "max_hold_blocks": None, "accepts_height_release": True,
             }
         else:
             try:

@@ -267,13 +267,35 @@ def test_a_cap_admits_a_park_inside_it_and_refuses_one_beyond(ev):
 
 
 def test_a_park_released_at_a_height_has_no_length_in_seconds(ev):
-    """So every cap in seconds refuses it: it reads as RECEIVE_HOLD_UNBOUNDED."""
+    """Its length is in blocks, above every length in seconds, so a cap written
+    in seconds alone refuses it, however long that cap is."""
     body = rules.max_hold(MAX_RELEASE_WINDOW_SECONDS)
     ch = _chain(ev, {BOB: (body, rules.max_hold_model(MAX_RELEASE_WINDOW_SECONDS))})
     park = park_tx(amount=50, seq=0, at_height=HEIGHT + 1)
     before = ch.snapshot()
     _refused(ch, ch.block([park]), park, before)
-    assert _asked_about(ev, body)[-1]["i17"] == str(tau_defs.RECEIVE_HOLD_UNBOUNDED)
+    assert _asked_about(ev, body)[-1]["i17"] == str(tau_defs.RECEIVE_HOLD_BLOCKS + 1)
+
+
+def test_a_cap_in_blocks_admits_a_height_release_inside_it_and_refuses_one_beyond(ev):
+    """The hold is counted from the height of the block that parks it."""
+    body = rules.max_hold_either(600, 100)
+    ch = _chain(ev, {BOB: (body, rules.max_hold_either_model(600, 100))})
+    inside = park_tx(amount=50, seq=0, at_height=HEIGHT + 100)
+    result = ch.block([inside], height=HEIGHT)
+    assert not result.invalid_tx_ids
+    assert ch.book.escrow_total() == 50
+    assert _asked_about(ev, body)[-1]["i17"] == str(tau_defs.RECEIVE_HOLD_BLOCKS + 100)
+
+    # The same release point, one block later, is one block shorter.
+    again = park_tx(amount=50, seq=1, at_height=HEIGHT + 100)
+    assert not ch.block([again], height=HEIGHT + 1).invalid_tx_ids
+    assert _asked_about(ev, body)[-1]["i17"] == str(tau_defs.RECEIVE_HOLD_BLOCKS + 99)
+
+    before = ch.snapshot()
+    beyond = park_tx(amount=50, seq=2, at_height=HEIGHT + 2 + 101)
+    _refused(ch, ch.block([beyond], height=HEIGHT + 2), beyond, before)
+    assert _asked_about(ev, body)[-1]["i17"] == str(tau_defs.RECEIVE_HOLD_BLOCKS + 101)
 
 
 def test_the_hold_is_counted_from_the_blocks_own_timestamp(ev):

@@ -139,40 +139,101 @@ def recipient_blocks(clause_for, recipient: str, values: dict, receive_value: in
     )
 
 
+SECONDS = "seconds"
+BLOCKS = "blocks"
+
+
 def hold_seconds_of(receive_value: int) -> Optional[int]:
     """The hold in seconds an i17 value stands for; None when it has none
     (the owner's own payment, or a height-based park)."""
     value = int(receive_value)
-    if value < tau_defs.RECEIVE_FINAL_NOW or value >= tau_defs.RECEIVE_HOLD_UNBOUNDED:
+    if value < tau_defs.RECEIVE_FINAL_NOW or value >= tau_defs.RECEIVE_HOLD_BLOCKS:
         return None
     return value - tau_defs.RECEIVE_FINAL_NOW
 
 
-def max_accepted_hold(allows: Callable[[int], bool], receive_value: int,
-                      longest_window: int) -> Optional[int]:
-    """The longest hold in seconds a clause accepts for a payment it refused.
-
-    `allows(v)` answers whether the clause lets the same payment through with
-    i17 = v. Returns None when it refuses the payment even with no hold: the
-    refusal is then not about the hold. Otherwise the largest N in
-    0..`longest_window` with `allows(1 + N)`, found by bisection (at most 24
-    evaluations), where 0 means only a payment that is final at once.
-
-    For the message a wallet prints, never for a verdict: a clause need not be
-    monotone in the hold, and then this is one boundary of several.
-    """
-    if not allows(tau_defs.RECEIVE_FINAL_NOW):
+def hold_blocks_of(receive_value: int) -> Optional[int]:
+    """The hold in blocks an i17 value stands for; None unless it is a
+    height-based park."""
+    value = int(receive_value)
+    if value < tau_defs.RECEIVE_HOLD_BLOCKS:
         return None
-    refused = hold_seconds_of(receive_value)
-    if refused is None or refused > longest_window:
-        if allows(tau_defs.RECEIVE_FINAL_NOW + longest_window):
-            return longest_window
-        refused = longest_window
-    low, high = 0, refused  # allows(1 + low), not allows(1 + high)
+    return value - tau_defs.RECEIVE_HOLD_BLOCKS
+
+
+def hold_value(unit: str, length: int) -> int:
+    """The i17 value of a hold of `length` in `unit`. A hold of no length is a
+    payment that is final at once, in either unit."""
+    if int(length) <= 0:
+        return tau_defs.RECEIVE_FINAL_NOW
+    if unit == BLOCKS:
+        return tau_defs.receive_stream_value(hold_blocks=length)
+    return tau_defs.receive_stream_value(length)
+
+
+def _bisect(allows: Callable[[int], bool], unit: str, low: int, high: int) -> int:
+    """The largest N in low..high-1 whose hold the clause accepts, given that it
+    accepts `low` and refuses `high`."""
     while high - low > 1:
         mid = (low + high) // 2
-        if allows(tau_defs.RECEIVE_FINAL_NOW + mid):
+        if allows(hold_value(unit, mid)):
             low = mid
         else:
             high = mid
     return low
+
+
+def longest_hold(allows: Callable[[int], bool], unit: str,
+                 refused: Optional[int], longest_window: int) -> int:
+    """The longest hold in `unit` a clause accepts for one payment that it
+    accepts when final at once.
+
+    `allows(v)` answers whether the clause lets the payment through with
+    i17 = v. `refused` is a length the clause is known to refuse, or None.
+    The largest N in 0..`longest_window` whose hold it accepts, found by
+    bisection (at most 24 evaluations for the 90 days in seconds, 18 for the
+    window in blocks), where 0 means only a payment that is final at once.
+
+    Both ends are answers of the clause itself: N was accepted and N + 1 was
+    refused. For the message a wallet prints, never for a verdict: a clause need
+    not be monotone in the hold, and then this is one boundary of several.
+    """
+    if refused is None or refused > longest_window:
+        if allows(hold_value(unit, longest_window)):
+            return longest_window
+        refused = longest_window
+    return _bisect(allows, unit, 0, int(refused))
+
+
+def max_accepted_hold(allows: Callable[[int], bool], unit: str,
+                      refused: Optional[int], longest_window: int) -> Optional[int]:
+    """`longest_hold`, or None when the clause refuses the payment even with no
+    hold: a refusal is then not about the hold."""
+    if not allows(tau_defs.RECEIVE_FINAL_NOW):
+        return None
+    return longest_hold(allows, unit, refused, longest_window)
+
+
+def accepted_holds(allows: Callable[[int], bool], receive_value: int, *,
+                   seconds_window: int, blocks_window: int) -> Optional[dict]:
+    """What a clause that refused an incoming park would take instead.
+
+    None when it refuses the payment even final at once. For a time-based park
+    `{"max_hold_seconds": N}`. For a height-based one `{"max_hold_blocks": N}`
+    when the clause takes a height release at all; when it takes none, also its
+    cap in seconds, so the payer learns which kind of release to use. At most
+    about 27 evaluations either way.
+    """
+    if not allows(tau_defs.RECEIVE_FINAL_NOW):
+        return None
+    blocks = hold_blocks_of(receive_value)
+    if blocks is None:
+        return {"max_hold_seconds": longest_hold(
+            allows, SECONDS, hold_seconds_of(receive_value), seconds_window)}
+    if blocks > 1 and allows(hold_value(BLOCKS, 1)):
+        return {"max_hold_blocks": _bisect(
+            allows, BLOCKS, 1, min(blocks, blocks_window + 1))}
+    return {
+        "max_hold_blocks": 0,
+        "max_hold_seconds": longest_hold(allows, SECONDS, None, seconds_window),
+    }

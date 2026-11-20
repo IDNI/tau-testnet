@@ -46,9 +46,18 @@ RULES = [
     ("instant only", rules.max_hold(0), rules.max_hold_model(0)),
     ("held 600 s at most", rules.max_hold(600), rules.max_hold_model(600)),
     ("one unit", rules.one_unit(C, A, 600), rules.one_unit_model(C, A, 600)),
+    ("held 600 s or 100 blocks at most", rules.max_hold_either(600, 100),
+     rules.max_hold_either_model(600, 100)),
+    ("no timed park, 5 blocks at most", rules.max_hold_either(0, 5),
+     rules.max_hold_either_model(0, 5)),
 ]
 
-RECEIVE_VALUES = [None, 0, 1, 2, 601, 602, 7_776_001, tau_defs.RECEIVE_HOLD_UNBOUNDED]
+BLOCKS = tau_defs.RECEIVE_HOLD_BLOCKS
+RECEIVE_VALUES = [
+    None, 0, 1, 2, 601, 602, 7_776_001, BLOCKS - 1,
+    BLOCKS, BLOCKS + 1, BLOCKS + 5, BLOCKS + 6, BLOCKS + 100, BLOCKS + 101,
+    BLOCKS + 100_000, (1 << 64) - 1,
+]
 
 
 @pytest.fixture(scope="module")
@@ -124,6 +133,25 @@ def test_the_longest_accepted_hold_is_found_on_the_engine(evaluator):
             recipient_policy.receive_inputs(_transfer(A, B), value))
         return not evaluator.verdict(body, inputs).blocked
 
-    assert recipient_policy.max_accepted_hold(allows, 3_601, 7_776_000) == 600
     assert recipient_policy.max_accepted_hold(
-        allows, tau_defs.RECEIVE_HOLD_UNBOUNDED, 7_776_000) == 600
+        allows, recipient_policy.SECONDS, 3_600, 7_776_000) == 600
+    assert recipient_policy.accepted_holds(
+        allows, BLOCKS + 30, seconds_window=7_776_000, blocks_window=100_000,
+    ) == {"max_hold_blocks": 0, "max_hold_seconds": 600}
+
+
+def test_the_farthest_accepted_height_release_is_found_on_the_engine(evaluator):
+    body = rules.max_hold_either(600, 100)
+
+    def allows(value):
+        inputs = sender_policy.clause_inputs(
+            recipient_policy.receive_inputs(_transfer(A, B), value))
+        return not evaluator.verdict(body, inputs).blocked
+
+    holds = lambda value: recipient_policy.accepted_holds(
+        allows, value, seconds_window=7_776_000, blocks_window=100_000)
+    assert holds(BLOCKS + 101) == {"max_hold_blocks": 100}
+    assert holds(BLOCKS + 100_000) == {"max_hold_blocks": 100}
+    assert holds(3_601) == {"max_hold_seconds": 600}
+    assert recipient_policy.longest_hold(
+        allows, recipient_policy.BLOCKS, None, 100_000) == 100

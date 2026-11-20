@@ -323,15 +323,21 @@ REQUEST_CUSTOM_INPUT_MIN = APPROVAL_SLOT_BASE + APPROVAL_SLOT_COUNT
 #   i17 = 1 + N    incoming retractable transfer released N seconds after this
 #                  block's timestamp: the sender can still take it back for N
 #                  seconds.
-#   i17 = RECEIVE_HOLD_UNBOUNDED
-#                  incoming retractable transfer released at a block HEIGHT. It
-#                  has no length in seconds, so every cap in seconds refuses it.
+#   i17 = 10^18 + N
+#                  incoming retractable transfer released at a block HEIGHT, N
+#                  blocks after this block. A length in blocks is not a length
+#                  in seconds, so it has a range of its own, above every length
+#                  in seconds: a cap written in seconds alone refuses it, and a
+#                  rule that takes height releases names its cap in blocks.
 #
 # Host-computed, like i16, so a rule is a single comparison:
 #
 #   only A may pay me:   always ( (i17[t]:bv[64] = { 0 }:bv[64]) || (i3[t]:bv[384] = A) ? allow : block ).
 #   instant only:        block when i17[t]:bv[64] > { 1 }:bv[64]
 #   held 600 s at most:  block when i17[t]:bv[64] > { 601 }:bv[64]
+#   held 600 s or 100 blocks at most:
+#                        block when (i17 > { 601 } && i17 < { 1000000000000000000 })
+#                                   || i17 > { 1000000000000000100 }
 #
 # A clause that does not read i17 is never asked about incoming payments, so
 # every clause registered before the feature keeps its meaning.
@@ -346,22 +352,28 @@ RECEIVE_STREAM_INDEX = 17
 RECEIVE_STREAM_BV_WIDTH = 64
 RECEIVE_SIDE_SENDER = 0
 RECEIVE_FINAL_NOW = 1
-RECEIVE_HOLD_UNBOUNDED = (1 << 63) - 1
+# Where the lengths in blocks start. A decimal power so the number of blocks can
+# be read off the end of a rule's literal; far above any length in seconds (the
+# longest park is 90 days) and far below the width of the stream.
+RECEIVE_HOLD_BLOCKS = 10 ** 18
+_RECEIVE_VALUE_MAX = (1 << RECEIVE_STREAM_BV_WIDTH) - 1
 
 
-def receive_stream_value(hold_seconds=None) -> int:
+def receive_stream_value(hold_seconds=None, *, hold_blocks=None) -> int:
     """The i17 value of an incoming payment.
 
-    `hold_seconds` is None for a payment that is final at once, the seconds from
-    the block's timestamp to the release for a time-based park (never negative),
-    and RECEIVE_HOLD_UNBOUNDED for a height-based one.
+    Neither argument for a payment that is final at once. `hold_seconds` is the
+    seconds from the block's timestamp to the release of a time-based park,
+    `hold_blocks` the blocks from the block's height to the release of a
+    height-based one (neither is ever negative). A length that does not fit its
+    range reads as the longest of that range, so the two never run into each
+    other.
     """
+    if hold_blocks is not None:
+        return min(RECEIVE_HOLD_BLOCKS + max(0, int(hold_blocks)), _RECEIVE_VALUE_MAX)
     if hold_seconds is None:
         return RECEIVE_FINAL_NOW
-    hold = max(0, int(hold_seconds))
-    if hold >= RECEIVE_HOLD_UNBOUNDED - RECEIVE_FINAL_NOW:
-        return RECEIVE_HOLD_UNBOUNDED
-    return RECEIVE_FINAL_NOW + hold
+    return min(RECEIVE_FINAL_NOW + max(0, int(hold_seconds)), RECEIVE_HOLD_BLOCKS - 1)
 
 
 # Rule-text screening contexts. Slots are readable in exactly one of them.

@@ -188,15 +188,47 @@ def test_the_receive_stream_values():
     assert tau_defs.receive_stream_value(0) == 1
     assert tau_defs.receive_stream_value(600) == 601
     assert tau_defs.receive_stream_value(-5) == 1, "a hold is never negative"
-    assert tau_defs.receive_stream_value(1 << 70) == tau_defs.RECEIVE_HOLD_UNBOUNDED
-    assert tau_defs.RECEIVE_HOLD_UNBOUNDED < 1 << tau_defs.RECEIVE_STREAM_BV_WIDTH
+    blocks = tau_defs.RECEIVE_HOLD_BLOCKS
+    assert blocks == 10 ** 18
+    assert tau_defs.receive_stream_value(hold_blocks=1) == blocks + 1
+    assert tau_defs.receive_stream_value(hold_blocks=100_000) == blocks + 100_000
+    assert tau_defs.receive_stream_value(hold_blocks=-3) == blocks, "never negative"
+
+
+def test_the_two_ranges_never_run_into_each_other():
+    """A length that does not fit its range reads as the longest of that range."""
+    blocks = tau_defs.RECEIVE_HOLD_BLOCKS
+    top = (1 << tau_defs.RECEIVE_STREAM_BV_WIDTH) - 1
+    assert tau_defs.receive_stream_value(1 << 70) == blocks - 1
+    assert tau_defs.receive_stream_value(blocks) == blocks - 1
+    assert tau_defs.receive_stream_value(hold_blocks=1 << 70) == top
+    # The longest park the chain admits is far inside each range.
+    assert 1 + 7_776_000 < blocks and blocks + 100_000 < top
 
 
 def test_hold_seconds_of_inverts_the_value():
     assert recipient_policy.hold_seconds_of(0) is None
     assert recipient_policy.hold_seconds_of(1) == 0
     assert recipient_policy.hold_seconds_of(601) == 600
-    assert recipient_policy.hold_seconds_of(tau_defs.RECEIVE_HOLD_UNBOUNDED) is None
+    assert recipient_policy.hold_seconds_of(tau_defs.RECEIVE_HOLD_BLOCKS - 1) \
+        == tau_defs.RECEIVE_HOLD_BLOCKS - 2
+    assert recipient_policy.hold_seconds_of(tau_defs.RECEIVE_HOLD_BLOCKS) is None
+    assert recipient_policy.hold_seconds_of(tau_defs.RECEIVE_HOLD_BLOCKS + 30) is None
+
+
+def test_hold_blocks_of_inverts_the_value():
+    assert recipient_policy.hold_blocks_of(0) is None
+    assert recipient_policy.hold_blocks_of(1) is None
+    assert recipient_policy.hold_blocks_of(7_776_001) is None
+    assert recipient_policy.hold_blocks_of(tau_defs.RECEIVE_HOLD_BLOCKS + 30) == 30
+
+
+def test_a_hold_of_no_length_is_a_payment_that_is_final_at_once():
+    for unit in (recipient_policy.SECONDS, recipient_policy.BLOCKS):
+        assert recipient_policy.hold_value(unit, 0) == tau_defs.RECEIVE_FINAL_NOW
+    assert recipient_policy.hold_value(recipient_policy.SECONDS, 600) == 601
+    assert recipient_policy.hold_value(recipient_policy.BLOCKS, 30) \
+        == tau_defs.RECEIVE_HOLD_BLOCKS + 30
 
 
 def test_the_recipient_view_empties_the_slots_and_sets_the_stream():
@@ -237,28 +269,87 @@ def test_the_documented_rules_pass_the_width_screen():
 LONGEST = 7_776_000
 
 
+FARTHEST = 100_000
+SECONDS, BLOCKS = recipient_policy.SECONDS, recipient_policy.BLOCKS
+BASE = tau_defs.RECEIVE_HOLD_BLOCKS
+
+
+def _holds(allows, receive_value):
+    return recipient_policy.accepted_holds(
+        allows, receive_value, seconds_window=LONGEST, blocks_window=FARTHEST)
+
+
 @pytest.mark.parametrize("cap", [0, 1, 599, 600, 601, 86_400, LONGEST - 1])
-def test_the_cap_is_found_for_a_time_based_and_a_height_based_park(cap):
+def test_the_cap_in_seconds_is_found_by_bisection(cap):
     calls = []
 
     def allows(value):
         calls.append(value)
         return value <= cap + 1
 
-    assert recipient_policy.max_accepted_hold(allows, cap + 5_000, LONGEST) == cap
-    assert recipient_policy.max_accepted_hold(
-        allows, tau_defs.RECEIVE_HOLD_UNBOUNDED, LONGEST) == cap
+    assert recipient_policy.max_accepted_hold(allows, SECONDS, cap + 5_000, LONGEST) == cap
+    assert recipient_policy.max_accepted_hold(allows, SECONDS, None, LONGEST) == cap
     assert len(calls) <= 2 * 26, "bisection, not a scan"
+    assert _holds(allows, cap + 5_000) == {"max_hold_seconds": cap}
+
+
+@pytest.mark.parametrize("cap", [1, 2, 99, 100, 101, 5_000, FARTHEST - 1])
+def test_the_cap_in_blocks_is_found_by_bisection(cap):
+    calls = []
+
+    def allows(value):
+        calls.append(value)
+        return value <= 601 or BASE <= value <= BASE + cap
+
+    assert recipient_policy.max_accepted_hold(allows, BLOCKS, None, FARTHEST) == cap
+    calls.clear()
+    assert _holds(allows, BASE + cap + 1) == {"max_hold_blocks": cap}
+    assert _holds(allows, BASE + FARTHEST) == {"max_hold_blocks": cap}
+    assert len(calls) <= 2 * 20, "bisection, not a scan"
+
+
+def test_both_ends_of_a_reported_cap_are_answers_of_the_clause():
+    """The cap was accepted and the next longer hold was refused, by the clause."""
+    for unit, cap, base in ((SECONDS, 600, 1), (BLOCKS, 100, BASE)):
+        asked = {}
+
+        def allows(value):
+            asked[value] = value <= 601 or BASE <= value <= BASE + 100
+            return asked[value]
+
+        assert recipient_policy.max_accepted_hold(allows, unit, None, FARTHEST) == cap
+        assert asked[base + cap] is True and asked[base + cap + 1] is False
+
+
+def test_a_clause_with_a_cap_in_seconds_alone_takes_no_height_release():
+    """So a refused height release is told both: no blocks, and the seconds."""
+    calls = []
+
+    def allows(value):
+        calls.append(value)
+        return value <= 601
+
+    assert _holds(allows, BASE + 30) == {"max_hold_blocks": 0, "max_hold_seconds": 600}
+    assert len(calls) <= 28
+    assert _holds(lambda value: value <= 1, BASE + 30) == {
+        "max_hold_blocks": 0, "max_hold_seconds": 0}
+
+
+def test_a_height_release_of_one_block_that_is_refused_reports_no_blocks():
+    allows = lambda value: value <= 601
+    assert _holds(allows, BASE + 1) == {"max_hold_blocks": 0, "max_hold_seconds": 600}
 
 
 def test_no_cap_is_reported_when_the_refusal_is_not_about_the_hold():
-    assert recipient_policy.max_accepted_hold(lambda value: False, 601, LONGEST) is None
+    assert recipient_policy.max_accepted_hold(lambda value: False, SECONDS, 600, LONGEST) is None
+    assert _holds(lambda value: False, 601) is None
+    assert _holds(lambda value: False, BASE + 30) is None
 
 
 def test_a_clause_that_only_refuses_height_releases_reports_the_longest_window():
     allows = lambda value: value <= LONGEST + 1
-    assert recipient_policy.max_accepted_hold(
-        allows, tau_defs.RECEIVE_HOLD_UNBOUNDED, LONGEST) == LONGEST
+    assert recipient_policy.max_accepted_hold(allows, SECONDS, None, LONGEST) == LONGEST
+    assert recipient_policy.max_accepted_hold(allows, BLOCKS, None, FARTHEST) == 0
 
 
 # --- persistence --------------------------------------------------------------

@@ -68,6 +68,15 @@ def max_hold(seconds):
     return "always ( (i17[t]:bv[64] > { %d }:bv[64]) ? %s : %s )." % (seconds + 1, BLOCK, ALLOW)
 
 
+BLOCKS = 10 ** 18      # where the hold lengths in blocks start on i17
+
+
+def max_hold_either(seconds, blocks):
+    return ("always ( ( ( (i17[t]:bv[64] > { %d }:bv[64]) && (i17[t]:bv[64] < { %d }:bv[64]) )"
+            " || (i17[t]:bv[64] > { %d }:bv[64]) ) ? %s : %s )." % (
+                seconds + 1, BLOCKS, BLOCKS + blocks, BLOCK, ALLOW))
+
+
 def one_unit(pay_only, accept_only_from, seconds):
     return "always ( ( ( %s && !%s ) || ( !%s && !%s ) || (i17[t]:bv[64] > { %d }:bv[64]) ) ? %s : %s )." % (
         MINE, _is("i4", pay_only), MINE, _is("i3", accept_only_from), seconds + 1, BLOCK, ALLOW)
@@ -299,8 +308,8 @@ def scenario_4(node, sg):
           3_500 <= ((res.get("error") or {}).get("details") or {}).get("hold_seconds", 0) <= 3_600,
           json.dumps(res)[:240])
     res, _rid = sg.park(node, "alice", "frank", 30, at_height=node.height() + 3)
-    refused(res, "RECIPIENT_MAX_HOLD", "4b: a height release has no length in seconds",
-            max_hold_seconds=600)
+    refused(res, "RECIPIENT_MAX_HOLD", "4b: a cap in seconds alone takes no height release",
+            max_hold_seconds=600, max_hold_blocks=0)
     probe = policy(node, sg.pk("frank"), sg.pk("alice"), 30).get("probe") or {}
     check("4b: the probe reports 600", probe.get("max_hold_seconds") == 600
           and probe.get("accepts_height_release") is False, probe)
@@ -323,6 +332,37 @@ def scenario_4(node, sg):
           and (node.retractable(long_rid) or {}).get("status") == "retracted")
     orc.add("alice", 30 + 10)
     orc.add("frank", -2 * BASE_FEE); orc.add("miner", 2 * BASE_FEE)     # his two rules
+
+    say("   erin now takes a hold of 600 seconds, or a height release at most 20 blocks ahead")
+    deploy(node, sg, "erin", max_hold_either(600, 20), "4e")
+    orc.add("erin", -BASE_FEE); orc.add("miner", BASE_FEE)
+    res, near = sg.park(node, "alice", "erin", 15, at_height=node.height() + 10)
+    tx_ok(res, "4e: a height release 10 blocks ahead is admitted under the 20-block cap")
+    mined(node, "4e: park mined")
+    check("4e: the park is open", (node.retractable(near) or {}).get("status") == "open",
+          node.retractable(near))
+    orc.add("alice", -(15 + BASE_FEE)); orc.add("miner", BASE_FEE)
+    res, _rid = sg.park(node, "alice", "erin", 15, at_height=node.height() + 60)
+    refused(res, "RECIPIENT_MAX_HOLD", "4e: one 60 blocks ahead is refused, carrying the cap in blocks",
+            max_hold_blocks=20)
+    details = (res.get("error") or {}).get("details") or {}
+    check("4e: the refusal reports the hold in blocks, and no seconds",
+          55 <= details.get("hold_blocks", 0) <= 60 and "max_hold_seconds" not in details,
+          json.dumps(res)[:240])
+    check("4e: the message carries the cap in blocks",
+          "max_hold_blocks=20" in json.dumps(res), json.dumps(res)[:240])
+    res, _rid = sg.park(node, "alice", "erin", 15, at_time=int(time.time()) + 3_600)
+    refused(res, "RECIPIENT_MAX_HOLD", "4e: the same rule caps a timed park in seconds",
+            max_hold_seconds=600)
+    probe = policy(node, sg.pk("erin"), sg.pk("alice"), 15).get("probe") or {}
+    check("4e: the probe reports both caps",
+          probe.get("max_hold_seconds") == 600 and probe.get("max_hold_blocks") == 20
+          and probe.get("accepts_height_release") is True, probe)
+    tx_ok(sg.retract(node, "alice", near), "4e: alice takes the park back")
+    mined(node, "4e: retract mined")
+    check("4e: the park is retracted",
+          (node.retractable(near) or {}).get("status") == "retracted", node.retractable(near))
+    orc.add("alice", 15)
     orc.verify("end")
     return by_height
 
