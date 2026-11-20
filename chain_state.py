@@ -1089,6 +1089,23 @@ def _process_new_block_locked(block: Block) -> bool:
 
             _record_retractable_events(block, next_snapshot)
 
+            # Issue #42: snapshot the canonical spec whenever this block
+            # advanced spec_revision, so getactiverules can serve the spec
+            # the engine runs rather than the append-only accumulation.
+            # Best effort -- a committed block must never fail over a
+            # missing view snapshot.
+            try:
+                from consensus import active_rules
+
+                active_rules.record_snapshot_after_commit(
+                    block.header.block_number
+                )
+            except Exception:
+                logger.warning(
+                    "active_rules snapshot hook failed for block #%s",
+                    block.header.block_number, exc_info=True,
+                )
+
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
             # instead of leaving the i0-accumulated conjunction in place. Done
