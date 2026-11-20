@@ -48,6 +48,37 @@ from consensus.approvals import (
     validate_request_shape,
     validate_rule_change_shape,
 )
+from consensus import network_binding
+from consensus.payout import (
+    KIND_BLOCKS as PAYOUT_KIND_BLOCKS,
+    KIND_NAMES as PAYOUT_KIND_NAMES,
+    POOL_ADMISSION as PAYOUT_POOL_ADMISSION,
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_RULE_REVOKE,
+    TX_TYPE_PAYOUT_RULE_SET,
+    PayoutExecution,
+    PayoutRefused,
+    PayoutShapeError,
+    PayoutState,
+    execution_inputs as payout_execution_inputs,
+    parse_payout_execute,
+    parse_payout_rule_revoke,
+    parse_payout_rule_set,
+    parse_payout_spec,
+    settle as settle_payout,
+)
+from consensus.standing import (
+    KIND_BLOCKS as STANDING_KIND_BLOCKS,
+    MAX_OPEN_STANDING_PER_PAYER,
+    MAX_OPEN_STANDING_TOTAL,
+    KIND_NAMES as STANDING_KIND_NAMES,
+    TX_TYPE_STANDING_PAYMENT_CANCEL,
+    TX_TYPE_STANDING_PAYMENT_CREATE,
+    StandingShapeError,
+    parse_standing_payment_cancel,
+    parse_standing_payment_create,
+    validate_create_shape as validate_standing_create_shape,
+)
 from consensus.retractable import (
     KIND_HEIGHT,
     MAX_OPEN_RETRACTABLE_PER_SENDER,
@@ -1382,6 +1413,18 @@ def _rule_change_precondition_error(request, tip_view: TipAdmissionView) -> Opti
     elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD:
         if not tip_view.clause_for(sender, tau_defs.RULE_CHANGE_GUARD_INDEX):
             return "there is no registered rule-change guard to revoke"
+    elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_PAYOUT:
+        try:
+            terms = parse_payout_spec(request.body, sender)
+        except PayoutShapeError as exc:
+            return str(exc)
+        _, reason = tip_view.payout_book().can_admit_set(
+            terms, tip_view.next_block_height, tip_view.next_block_timestamp)
+        if reason:
+            return reason
+    elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
+        if tip_view.payout_book().get(sender) is None:
+            return "there is no payout rule to revoke"
     elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
         row = tip_view.get_offer(request.offer_id)
         if not isinstance(row, dict) or row.get("status") != STATUS_OFFERED:
@@ -1618,6 +1661,269 @@ def validate_retract_transfer_payload(
     return success({"retractable_id": request.retractable_id.hex()})
 
 
+# --- Standing payments -------------------------------------------------------
+
+def validate_standing_payment_create_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for a standing payment authorization.
+
+    The fee and the funds for it are checked on the sendtx path like any
+    fee-bearing type. Shape, schedule and book limits are shared with block apply
+    (`validate_create_shape`, then the same order of book checks as
+    `StandingBook.can_admit_create`), so admission refuses what apply refuses.
+    """
+    try:
+        terms = parse_standing_payment_create(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment_create: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != terms.payer_pubkey:
+        return format_error("standing_payment_create sender_pubkey must match the signer.")
+
+    err = validate_bls_pubkey(terms.recipient_pubkey, "recipient_pubkey")
+    if err:
+        return format_error(f"standing_payment_create rejected: {err}")
+
+    shape_error = validate_standing_create_shape(
+        terms, tip_view.next_block_height, tip_view.next_block_timestamp
+    )
+    if shape_error:
+        return format_error(
+            f"standing_payment_create rejected: {shape_error}", code="INVALID_SCHEDULE"
+        )
+
+    book = tip_view.standing_book()
+    standing_id = terms.standing_id
+    if book.knows(standing_id):
+        return format_error(
+            "Duplicate standing_payment_create (same payer, terms and sequence).",
+            code="DUPLICATE_STANDING_PAYMENT",
+        )
+    if book.open_count_for_payer(terms.payer_pubkey) >= MAX_OPEN_STANDING_PER_PAYER:
+        return format_error(
+            f"Payer already has {MAX_OPEN_STANDING_PER_PAYER} open standing payments.",
+            code="TOO_MANY_STANDING_PAYMENTS",
+        )
+    if book.open_count() >= MAX_OPEN_STANDING_TOTAL:
+        return format_error(
+            "The standing payment book is full.", code="STANDING_BOOK_FULL"
+        )
+
+    # Advisory deadline coupling, as for a retractable park: a create mined at or
+    # after its own first due point is refused by apply, so do not queue one that
+    # could be.
+    if terms.kind == STANDING_KIND_BLOCKS:
+        expire_at_height = tx.get("expire_at_height")
+        if isinstance(expire_at_height, int) and expire_at_height > terms.first_due:
+            return format_error(
+                "expire_at_height must not be after first_due.",
+                code="DEADLINE_AFTER_FIRST_DUE",
+            )
+    else:
+        expiration_time = tx.get("expiration_time")
+        if isinstance(expiration_time, int) and expiration_time >= terms.first_due:
+            return format_error(
+                "expiration_time must be before first_due.",
+                code="DEADLINE_AFTER_FIRST_DUE",
+            )
+
+    return success({
+        "standing_id": standing_id.hex(),
+        "amount": terms.amount,
+        "recipient_pubkey": terms.recipient_pubkey,
+        "schedule": STANDING_KIND_NAMES[terms.kind],
+        "interval": terms.interval,
+        "first_due": terms.first_due,
+        "periods": terms.periods,
+        "end": terms.end,
+    })
+
+
+def validate_standing_payment_cancel_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for ending a standing payment; apply runs the same book check."""
+    try:
+        signer, standing_id = parse_standing_payment_cancel(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment_cancel: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != signer:
+        return format_error("standing_payment_cancel sender_pubkey must match the signer.")
+
+    terms = tip_view.standing_book().get(standing_id)
+    if terms is None:
+        return format_error(
+            "Unknown or already ended standing payment.", code="UNKNOWN_STANDING_PAYMENT"
+        )
+    if terms.payer_pubkey != signer:
+        return format_error(
+            "Only the payer may cancel a standing payment.", code="NOT_STANDING_PAYER"
+        )
+    return success({"standing_id": standing_id.hex()})
+
+
+def _payout_evaluator_call(fn):
+    """Run one admission-pool payout evaluation, mapping evaluator trouble the
+    way every other admission-time Tau call maps it."""
+    import tau_admission
+    from tau_speculation import SpeculationError, WorkerLost, WorkerTimeout
+
+    try:
+        return fn(tau_admission.default_budget())
+    except WorkerTimeout as exc:
+        raise tau_admission.AdmissionTimeout(str(exc)) from exc
+    except (WorkerLost, SpeculationError) as exc:
+        raise tau_admission.AdmissionUnavailable(str(exc)) from exc
+
+
+def validate_payout_rule_set_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Screens for installing or replacing the sender's payout rule (#63).
+
+    Shape, ABI screen and book checks are apply's own (`can_admit_set`); the
+    rule is built in the payout admission pool, and the sender's rule-change
+    guard is consulted (kind 6), as apply does. A rule with a due point is also
+    stepped once, on the inputs of the run the node will make.
+    """
+    from consensus import sender_policy
+
+    try:
+        terms = parse_payout_rule_set(tx)
+    except PayoutShapeError as exc:
+        return format_error(f"Malformed payout_rule_set: {exc}.", code="INVALID_PAYOUT_RULE")
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != terms.account_pubkey:
+        return format_error("payout_rule_set sender_pubkey must match the signer.")
+    for k, slot in enumerate(terms.slots):
+        if slot:
+            err = validate_bls_pubkey(slot, f"slots[{k}]")
+            if err:
+                return format_error(f"payout_rule_set rejected: {err}", code="INVALID_PAYOUT_RULE")
+    ok, reason = tip_view.payout_book().can_admit_set(
+        terms, tip_view.next_block_height, tip_view.next_block_timestamp)
+    if not ok:
+        code = ("PAYOUT_BOOK_FULL" if "full" in reason
+                else "DUPLICATE_PAYOUT_RULE" if "already installed" in reason
+                else "INVALID_PAYOUT_RULE")
+        return format_error(f"payout_rule_set rejected: {reason}", code=code)
+    built = _payout_evaluator_call(
+        lambda budget: sender_policy.evaluator(PAYOUT_POOL_ADMISSION).validate(
+            terms.body, timeout=budget))
+    if not built.ok:
+        return format_error(
+            f"payout_rule_set rejected: the rule does not build: {built.error[:300]}",
+            code="PAYOUT_RULE_DOES_NOT_BUILD",
+        )
+    if terms.due_at is not None:
+        # The node steps this rule by itself at the due point, and no transaction
+        # passes admission first then. So step it once here, on the inputs such a
+        # run hands it: a rule the evaluator cannot answer within its budget stops
+        # here, as an execution that times out does. The answer itself is not
+        # judged; the block that reaches the due point decides that.
+        import chain_state
+
+        height, ts = tip_view.next_block_height, tip_view.next_block_timestamp
+        state = PayoutState(anchor=terms.clock(height, ts))
+        if terms.kind == PAYOUT_KIND_BLOCKS:
+            height = terms.due_at
+        else:
+            ts = terms.due_at
+        trial = PayoutExecution("", terms.account_pubkey, terms.rule_id, (), ())
+        values = payout_execution_inputs(
+            terms, state, trial,
+            parent_balance=int(chain_state.get_balance(terms.account_pubkey) or 0),
+            height=height, ts=ts)
+        try:
+            _payout_evaluator_call(
+                lambda budget: sender_policy.payout_outputs(
+                    terms.body, values, pool=PAYOUT_POOL_ADMISSION, timeout=budget))
+        except PayoutRefused:
+            pass
+    refusal = _rule_change_refusal(tip_view, sender, tau_defs.RULE_CHANGE_KIND_SET_PAYOUT)
+    if refusal is not None:
+        return refusal
+    return success({
+        "rule_id": terms.rule_id.hex(),
+        "slots": list(terms.slots),
+        "cap_per_execution": terms.cap_per_execution,
+        "cap_per_period": terms.cap_per_period,
+        "period_clock": PAYOUT_KIND_NAMES[terms.kind],
+        "period": terms.period,
+        "expires_at": terms.expires_at,
+        **({"periods_from": terms.periods_from} if terms.periods_from is not None else {}),
+        **({"due_at": terms.due_at} if terms.due_at is not None else {}),
+    })
+
+
+def validate_payout_rule_revoke_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    try:
+        account = parse_payout_rule_revoke(tx)
+    except PayoutShapeError as exc:
+        return format_error(f"Malformed payout_rule_revoke: {exc}.")
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != account:
+        return format_error("payout_rule_revoke sender_pubkey must match the signer.")
+    terms = tip_view.payout_book().get(account)
+    if terms is None:
+        return format_error("The account has no payout rule.", code="NO_PAYOUT_RULE")
+    refusal = _rule_change_refusal(tip_view, sender, tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT)
+    if refusal is not None:
+        return refusal
+    return success({"rule_id": terms.rule_id.hex()})
+
+
+def validate_payout_execute_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Runs the account's payout rule against the tip and reports the legs.
+
+    Advisory as every admission evaluation is: apply re-runs the rule against
+    the block it lands in, whose balance and period may differ.
+    """
+    import chain_state
+    from consensus import sender_policy
+
+    try:
+        exe = parse_payout_execute(tx)
+    except PayoutShapeError as exc:
+        return format_error(f"Malformed payout_execute: {exc}.", code="INVALID_PAYOUT_EXECUTION")
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != exe.executor_pubkey:
+        return format_error("payout_execute sender_pubkey must match the signer.")
+    for k, who in exe.recipients:
+        err = validate_bls_pubkey(who, f"recipients[{k}]")
+        if err:
+            return format_error(f"payout_execute rejected: {err}", code="INVALID_PAYOUT_EXECUTION")
+    height, ts = tip_view.next_block_height, tip_view.next_block_timestamp
+    book = tip_view.payout_book()
+    try:
+        rule, state = book.check_execution(exe, height, ts)
+        balance = int(chain_state.get_balance(exe.account_pubkey) or 0)
+        values = payout_execution_inputs(rule, state, exe, parent_balance=balance,
+                                         height=height, ts=ts)
+        outputs = _payout_evaluator_call(
+            lambda budget: sender_policy.payout_outputs(
+                rule.body, values, pool=PAYOUT_POOL_ADMISSION, timeout=budget))
+        legs = settle_payout(rule, state, exe, outputs, height=height, ts=ts, balance=balance)
+    except PayoutRefused as exc:
+        return format_error(f"payout_execute refused: {exc}", code="PAYOUT_REFUSED")
+    return success({
+        "rule_id": rule.rule_id.hex(),
+        "account_pubkey": exe.account_pubkey,
+        "total": sum(a for _, _, a in legs),
+        "legs": [{"slot": k, "recipient_pubkey": who, "amount": amount}
+                 for k, who, amount in legs],
+        **({"sale_id": exe.sale_id.hex()} if exe.sale_id is not None else {}),
+    })
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -1682,6 +1988,15 @@ def validate_mempool_admission(
     if expiry_error is not None:
         return expiry_error
 
+    # Block apply runs the same check (tx_checks.apply_tx_error).
+    network_error = network_binding.problem(payload)
+    if network_error is not None:
+        return format_error(
+            f"{tx_type} rejected: {network_error}.",
+            code="WRONG_NETWORK",
+            genesis_hash=network_binding.chain_genesis_hash(),
+        )
+
     if tx_type == "user_tx":
          return validate_user_tx_reserved_domains(payload, tip_view)
          
@@ -1728,6 +2043,21 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
          return validate_retract_transfer_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_CREATE:
+         return validate_standing_payment_create_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
+         return validate_standing_payment_cancel_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_PAYOUT_RULE_SET:
+         return validate_payout_rule_set_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_PAYOUT_RULE_REVOKE:
+         return validate_payout_rule_revoke_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+         return validate_payout_execute_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

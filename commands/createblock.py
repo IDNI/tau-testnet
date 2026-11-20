@@ -186,6 +186,47 @@ def _drop_sequence_gap_orphans(transactions, execution_transactions, reserved_id
     return dropped_ids
 
 
+def _defer_payout_overflow(transactions, execution_transactions, reserved_ids):
+    """Keep at most MAX_PAYOUT_EXECUTIONS_PER_BLOCK payout executions in the batch.
+
+    Apply refuses the executions over the per-block cap, and a refused
+    transaction is disposed with the block, i.e. a valid execution would be
+    destroyed only because the block was full. Leave the overflow, and every
+    later transaction of its senders (their sequence would gap), in the mempool
+    for the next block instead. All three lists are mutated in lockstep.
+    """
+    from consensus.payout import MAX_PAYOUT_EXECUTIONS_PER_BLOCK, TX_TYPE_PAYOUT_EXECUTE
+
+    kept, held_senders, dropped_ids = 0, set(), []
+    for i in range(len(transactions)):
+        tx = transactions[i]
+        if not isinstance(tx, dict):
+            continue
+        sender = tx.get("sender_pubkey")
+        if sender in held_senders:
+            dropped_ids.append(i)
+            continue
+        if tx.get("tx_type") == TX_TYPE_PAYOUT_EXECUTE:
+            if kept >= MAX_PAYOUT_EXECUTIONS_PER_BLOCK:
+                held_senders.add(sender)
+                dropped_ids.append(i)
+            else:
+                kept += 1
+    held = [reserved_ids[i] for i in dropped_ids]
+    for i in reversed(dropped_ids):
+        del transactions[i]
+        del execution_transactions[i]
+        del reserved_ids[i]
+    if held:
+        print(f"[INFO][createblock] Deferred {len(held)} tx(s) over the per-block "
+              "payout execution cap")
+        try:
+            db.unreserve_mempool_txs(held)
+        except Exception:
+            pass
+    return held
+
+
 def _restore_per_sender_sequence_order(transactions, execution_transactions, reserved_ids):
     """
     reserve_mempool_txs orders by fee priority, which can place a sender's
@@ -433,8 +474,9 @@ def create_block_from_mempool(allow_empty: bool = False, wake_if_due: bool = Fal
     default: a caller polling `createblock` would otherwise mint an unbounded
     run of empty blocks.
 
-    `wake_if_due` permits an empty block only when a retractable transfer is due
-    at this candidate's own height and header timestamp, judged under the lock;
+    `wake_if_due` permits an empty block only when a retractable transfer or a
+    standing payment is due at this candidate's own height and header timestamp,
+    judged under the lock;
     the miner's pre-check is a hint and may be stale.
     """
     print(f"[INFO][createblock] Starting block creation process...")
@@ -502,9 +544,12 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
     block_timestamp = int(time.time())
     empty_ok = allow_empty
     if wake_if_due and not empty_ok:
-        book = getattr(lm, "retractable_transfers", None)
-        has_due = getattr(book, "has_due", None)
-        empty_ok = bool(has_due is not None and has_due(block_number, block_timestamp) is True)
+        for name in ("retractable_transfers", "standing_payments", "payout_rules"):
+            book = getattr(lm, name, None)
+            has_due = getattr(book, "has_due", None)
+            if has_due is not None and has_due(block_number, block_timestamp) is True:
+                empty_ok = True
+                break
 
     # Get batch of reserved transactions from mempool. The chain-write lock is
     # already held for the whole round, so no second producer can sweep or
@@ -613,6 +658,7 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
     # the block, so drop such orphans here and let them wait for their
     # predecessor instead.
     _drop_sequence_gap_orphans(transactions, execution_transactions, filtered_reserved_ids)
+    _defer_payout_overflow(transactions, execution_transactions, filtered_reserved_ids)
 
     if not transactions and not empty_ok:
         msg = "Mempool has no contiguous-sequence txs; no block produced."
