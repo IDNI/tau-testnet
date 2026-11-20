@@ -308,12 +308,16 @@ def test_route_amounts_visible_in_receipt_and_history():
     assert split["gross"] == 101
     assert split["routed"] == 20
     assert split["net"] == 81
+    assert split["bps"] == 2000
     assert split["destination"] == CAROL
     assert split["route_id"] == terms.route_id.hex()
     # And the split is in the transaction's own receipt logs, the
-    # history surface every block carries.
+    # history surface every block carries: gross, net, routed amount,
+    # bps and the full destination.
     logs = " ".join(ch.receipt(spend)["logs"])
-    assert "Receive route: 20 of 101" in logs
+    assert "Receive route: gross 101, net 81, routed 20" in logs
+    assert "at 2000 bps" in logs
+    assert CAROL in logs
 
 
 def test_route_replay_and_snapshot_restore_preserve_balances():
@@ -351,3 +355,97 @@ def test_capability_reports_route_semantics():
     assert SEMANTICS["rounding"] == "floor_on_gross"
     assert SEMANTICS["credit_classes"] == "ordinary_transfers_only"
     assert SEMANTICS["fee"] == "single_fee_on_gross_charged_to_sender"
+
+
+# -- admission/apply agreement ------------------------------------------------
+
+
+class _RouteChainTipView:
+    """Admission view backed by a chain's live route book.
+
+    Rows are the book's own snapshot rows -- the same dicts the
+    persisted-tip facade serves -- so admission screens exactly the
+    state block apply will see.
+    """
+
+    def __init__(self, chain, ts):
+        self._rows = {
+            row["owner_pubkey"]: row for row in chain.book.snapshot_rows()
+        }
+        self.next_block_timestamp = ts
+        self.next_block_height = 100
+
+    def get_route(self, owner):
+        return self._rows.get(owner)
+
+    def route_count(self):
+        return len(self._rows)
+
+
+def test_admission_and_apply_agree_on_install_and_remove():
+    """Same install/remove payloads, two gates, one verdict.
+
+    Each payload is screened by mempool admission against the chain's
+    own tip book and then applied in a block at the same timestamp;
+    the verdicts must agree: a clean install, replacing an unlocked
+    route, a self-route, a locked route with no expiry, removing a
+    route that does not exist, removing a locked route without the
+    destination's signature, and removing that route once its lock
+    has expired. Shape is shared (`validate_route_shape`) and the
+    lock is checked against the same book at both gates, which is
+    what makes the agreement structural.
+    """
+    from consensus.admission import (
+        validate_route_install_payload,
+        validate_route_remove_payload,
+    )
+
+    def install_agrees(chain, tx, ts, height):
+        admitted = validate_route_install_payload(
+            tx, _RouteChainTipView(chain, ts)
+        ).is_valid
+        chain.block([tx], height=height, ts=ts)
+        applied = chain.accepted(tx)
+        assert admitted == applied, (admitted, applied)
+        return applied
+
+    def remove_agrees(chain, tx, ts, height):
+        admitted = validate_route_remove_payload(
+            tx, _RouteChainTipView(chain, ts)
+        ).is_valid
+        chain.block([tx], height=height, ts=ts)
+        applied = chain.accepted(tx)
+        assert admitted == applied, (admitted, applied)
+        return applied
+
+    ch = Chain(_balances())
+    # A clean install: both admit.
+    assert install_agrees(ch, install_tx(), NOW, 20)
+    # Replacing an unlocked route: both admit.
+    assert install_agrees(ch, install_tx(bps=3000, seq=1), NOW, 21)
+    # A self-route: both refuse.
+    assert not install_agrees(ch, install_tx(destination=BOB, seq=2), NOW, 22)
+    # A locked route with no expiry: both refuse.
+    assert not install_agrees(
+        ch, install_tx(seq=2, extra={"locked": True}), NOW, 23
+    )
+    # Removing a route that does not exist: both refuse.
+    ghost = parse_route_install(
+        install_tx(owner=MALLORY, sk=SK_MALLORY, destination=CAROL)
+    )
+    assert not remove_agrees(
+        ch,
+        remove_tx(ghost.route_id.hex(), owner=MALLORY, sk=SK_MALLORY, seq=0),
+        NOW,
+        24,
+    )
+
+    # A locked route: removal without the destination's signature is
+    # refused by both gates; once the lock expires, both admit it.
+    ch2 = Chain(_balances())
+    expiry = NOW + 100_000
+    inst = install_tx(extra={"locked": True, "expiry_timestamp": expiry})
+    assert install_agrees(ch2, inst, NOW, 20)
+    terms = parse_route_install(inst)
+    assert not remove_agrees(ch2, remove_tx(terms.route_id.hex()), NOW, 21)
+    assert remove_agrees(ch2, remove_tx(terms.route_id.hex()), expiry + 1, 22)
