@@ -280,6 +280,23 @@ EXTRA_RESERVED_OPERATION_KEYS = (12, 14, 15)
 # ordinary custom stream, so pre-existing user rules keep working.
 TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS = (13,)
 
+# --- Recipient controls (issues #47/#76) -------------------------------------
+# i17 is the one input below the custom-input bound (i26) that no ABI
+# allocates: i13/i14/i15 are consensus operations keys, i16 is the cooldown
+# stream, i18..i25 are the approval slots. The node feeds i17 ONLY into the
+# recipient-side evaluation of a park creation (consensus/recipient_gate.py):
+# the park's absolute release point packed as one bv[64] -- high 32 bits the
+# release timestamp, low 32 bits the release height, the unused unit packed
+# as 0. It is 0 for every non-park evaluation, so a rule reading it outside a
+# park sees "no hold". No screening change is needed: sender custom inputs
+# start at i26, so a transaction can never supply i17 itself.
+RECIPIENT_RELEASE_PAIR_STREAM_INDEX = 17
+# o10 is the first user output no ABI owns (o0..o4/o6/o7/o9 are
+# consensus-owned, o5 is the policy verdict, o8 the custom fee). A
+# recipient's rule states its park hold cap there, read in the park's own
+# unit (blocks for a height park, seconds for a time park).
+RECIPIENT_HOLD_CAP_STREAM_INDEX = 10
+
 
 # --- Co-signature approval slots (i18..i25) ----------------------------------
 # Streams the node fills with the public key of an approver who has actually
