@@ -183,29 +183,6 @@ def _mine():
     return db.get_canonical_head()
 
 
-def _dump_db(tag):
-    """TEMP-DIAG: print the raw rule-view tables so a CI failure log
-    shows exactly what was (or was not) recorded."""
-    try:
-        cur = db._db_conn.cursor()
-        rows = cur.execute(
-            "SELECT tx_hash, block_hash, block_number, outcome FROM rule_outcomes"
-        ).fetchall()
-        print(f"TEMP-DIAG {tag}: rule_outcomes rows={len(rows)}")
-        for txh, bh, bn, outcome in rows:
-            print(f"TEMP-DIAG {tag}: outcome tx={txh} block={bh} n={bn} body={outcome[:400]}")
-        srows = cur.execute(
-            "SELECT spec_revision, height FROM spec_snapshots ORDER BY spec_revision"
-        ).fetchall()
-        print(f"TEMP-DIAG {tag}: spec_snapshots rows={srows}")
-        head = db.get_canonical_head()
-        if head:
-            print(f"TEMP-DIAG {tag}: head keys={sorted(head.keys())} "
-                  f"header={head.get('header')} tx_ids={head.get('tx_ids')}")
-    except Exception as exc:
-        print(f"TEMP-DIAG {tag}: dump failed: {exc!r}")
-
-
 def _run_probe(authority):
     """Install, then displace, as two confirmed rule transactions in
     two blocks, under the worker-backed authority. Returns the two
@@ -218,9 +195,6 @@ def _run_probe(authority):
     assert displace.get("ok"), displace
     head2 = _mine()
     assert head2["header"]["block_number"] == head1["header"]["block_number"] + 1
-    _dump_db("after-probe")
-    print(f"TEMP-DIAG: install tx_hash={install.get('tx_hash')} "
-          f"displace tx_hash={displace.get('tx_hash')}")
     # The evaluator serving the node after both commits is the
     # authority, and it describes the committed journal.
     assert authority.state == auth.ACTIVE
