@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
+from consensus.grants import GrantBook
 from consensus.payout_rules import PayoutRuleBook
 from consensus.receive_routes import ReceiveRouteBook
 from consensus.retractable import RetractableBook
@@ -203,6 +204,7 @@ def build_mechanism_metadata(
     receive_routes_root: str = "",
     standing_payments_root: str = "",
     payout_rules_root: str = "",
+    grants_root: str = "",
     faucet_amount: int = 0,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
@@ -267,6 +269,8 @@ def build_mechanism_metadata(
     # gen_genesis (which calls this without it) is unaffected.
     if payout_rules_root:
         mech["payout_rules_root"] = payout_rules_root
+    if grants_root:
+        mech["grants_root"] = grants_root
     return mech
 
 
@@ -489,6 +493,11 @@ class ConsensusLifecycleManager:
         # shares, and consensus_meta_hash binds its root once a rule or a
         # settlement exists.
         self.payout_rules = PayoutRuleBook()
+        # A FIELD for the same reason (Bounty 01, stages 2-5): the grants
+        # live in the manager object the snapshot deep-copies, so their
+        # state (custodied totals, releases, settled refunds, shared caps)
+        # is part of every block snapshot without a call site to forget.
+        self.grants = GrantBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
@@ -594,6 +603,9 @@ class ConsensusLifecycleManager:
             payout_rules_root=(
                 "" if self.payout_rules.is_empty()
                 else self.payout_rules.root().hex()
+            ),
+            grants_root=(
+                "" if self.grants.is_empty() else self.grants.root().hex()
             ),
             faucet_amount=self.faucet_amount,
         )

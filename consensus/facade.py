@@ -6,6 +6,7 @@ from typing import Optional, Set
 import config
 import db
 import chain_state
+from consensus.grants import GrantBook
 from consensus.payout_rules import PayoutRuleBook
 from consensus.standing_payments import StandingPaymentBook
 
@@ -665,6 +666,105 @@ class TipAdmissionView:
         if entry is None:
             return None
         return self._payout_rule_view(book, entry)
+
+    def _tip_grant_book(self) -> Optional[GrantBook]:
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        book = getattr(lm, "grants", None)
+        return book if isinstance(book, GrantBook) else None
+
+    def _shared_cap_view(self, book: GrantBook, funder_pubkey: str) -> Optional[dict]:
+        """One funder's shared cap as a restore-shaped dict, or None."""
+        for row in book.shared_cap_rows():
+            if row[1] == funder_pubkey:
+                (cap_id, funder, amount, period_seconds, anchor,
+                 version, totals) = row
+                return {
+                    "cap_id": cap_id.hex(),
+                    "funder_pubkey": funder,
+                    "cap_amount": amount,
+                    "period_seconds": period_seconds,
+                    "period_anchor_ts": anchor,
+                    "version": version,
+                    "period_totals": [
+                        {"period_index": i, "total": t} for i, t in totals
+                    ],
+                }
+        return None
+
+    def _grant_view(self, book: GrantBook, entry) -> dict:
+        """The full view of one grant (stages 2-5).
+
+        Terms and progress come from the book's own rows — the exact
+        tuples `GrantBook.restore` consumes, so admission can rebuild the
+        book from this dict and call its verbs verbatim — and the computed
+        fields (status, effective deadline, released/spendable/held) are
+        the book's own answers at the next block's timestamp. The funder's
+        shared cap rides along because a draw's verdict depends on it:
+        without it the rebuilt book could not answer evaluate_draw the way
+        the full book does. One source for the getgrant command, admission
+        and tests.
+        """
+        from consensus.grants import released_by
+
+        row = next(r for r in book.rows() if r[0] == entry.grant_id)
+        (grant_id, funder, beneficiary, total, release, kind, day, start,
+         deadline, locked, win_start, win_end, inactivity, version,
+         spent, last_draw, refunded, refunded_amount, refunded_ts) = row
+        ts = self.next_block_timestamp
+        return {
+            "grant_id": entry.grant_id.hex(),
+            "funder_pubkey": funder,
+            "beneficiary_pubkey": beneficiary,
+            "total_amount": total,
+            "release_per_period": release,
+            "schedule_kind": kind,
+            "signed_day": day,
+            "start_ts": start,
+            "deadline_ts": deadline,
+            "locked_until_ts": locked,
+            "window_start_ts": win_start,
+            "window_end_ts": win_end,
+            "inactivity_seconds": inactivity,
+            "version": version,
+            "total_spent": spent,
+            "last_draw_ts": last_draw,
+            "refunded": bool(refunded),
+            "refunded_amount": refunded_amount,
+            "refunded_ts": refunded_ts,
+            "status": book.status(entry.grant_id, ts),
+            "effective_deadline_ts": book.deadline_of(entry.grant_id),
+            "released": released_by(entry, ts),
+            "spendable": book.spendable(entry.grant_id, ts),
+            "held": book.held(entry.grant_id),
+            "shared_cap": self._shared_cap_view(book, funder),
+        }
+
+    def get_grant(self, grant_id: bytes) -> Optional[dict]:
+        """One grant (stages 2-5) by id, or None.
+
+        Read from the canonical tip's lifecycle manager — the same
+        in-memory source get_payout_rule uses (the grant book's db
+        persistence is the same follow-up as the other books').
+        """
+        book = self._tip_grant_book()
+        if book is None:
+            return None
+        entry = book.get(bytes(grant_id))
+        if entry is None:
+            return None
+        return self._grant_view(book, entry)
+
+    def get_shared_cap(self, funder_pubkey: str) -> Optional[dict]:
+        """One funder's shared cap (stages 2-5), or None.
+
+        Shared-cap admission needs the funder's current cap so it can call
+        the book's can_set_shared_cap verbatim — the next-version rule
+        lives in the book, not here.
+        """
+        book = self._tip_grant_book()
+        if book is None:
+            return None
+        return self._shared_cap_view(book, funder_pubkey)
 
     def get_balance(self, pubkey: str) -> int:
         """The spendable balance at the canonical tip (chain_state's read)."""

@@ -21,6 +21,7 @@ from commands import (
     getapprovalrequest,
     getapprovalrequests,
     getapprovalslots,
+    getgrant,
     getpayoutrule,
     getreceiveroute,
     getstandingpayment,
@@ -92,6 +93,7 @@ class ServiceContainer:
         "getreceiveroute": getreceiveroute,
         "getstandingpayment": getstandingpayment,
         "getpayoutrule": getpayoutrule,
+        "getgrant": getgrant,
         # Advisory, node-local, and engine-driving -- rate-limited accordingly
         # in server.py.
         "getapprovalslots": getapprovalslots,

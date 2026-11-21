@@ -33,6 +33,11 @@ from consensus.approvals import (
     TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
+from consensus.grants import (
+    TX_TYPE_CREATE_GRANT,
+    TX_TYPE_DRAW_GRANT,
+    TX_TYPE_SET_GRANT_SHARED_CAP,
+)
 from consensus.payout_rules import (
     TX_TYPE_EXECUTE_PAYOUT_RULE,
     TX_TYPE_INSTALL_PAYOUT_RULE,
@@ -209,6 +214,41 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["payout_rule_id"] = payload.get("payout_rule_id")
         signing_dict["payout_settlement_id"] = payload.get("payout_settlement_id")
         signing_dict["payout_base_amount"] = payload.get("payout_base_amount")
+    elif tx_type == TX_TYPE_CREATE_GRANT:
+        # Every field that fixes the grant is signed: the beneficiary, the
+        # total, the release schedule, the deadline and every time
+        # condition. The apply path creates exactly these root fields, so
+        # anything omitted here could be rewritten by a proposer into a
+        # different grant than the funder chose — above all the beneficiary
+        # and the total.
+        signing_dict["grant_beneficiary_pubkey"] = payload.get("grant_beneficiary_pubkey")
+        signing_dict["grant_total_amount"] = payload.get("grant_total_amount")
+        signing_dict["grant_release_per_period"] = payload.get("grant_release_per_period")
+        signing_dict["grant_schedule"] = payload.get("grant_schedule")
+        signing_dict["grant_signed_day"] = payload.get("grant_signed_day")
+        signing_dict["grant_start_ts"] = payload.get("grant_start_ts")
+        signing_dict["grant_deadline_ts"] = payload.get("grant_deadline_ts")
+        signing_dict["grant_locked_until_ts"] = payload.get("grant_locked_until_ts")
+        signing_dict["grant_window_start_ts"] = payload.get("grant_window_start_ts")
+        signing_dict["grant_window_end_ts"] = payload.get("grant_window_end_ts")
+        signing_dict["grant_inactivity_seconds"] = payload.get("grant_inactivity_seconds")
+        signing_dict["grant_version"] = payload.get("grant_version")
+    elif tx_type == TX_TYPE_DRAW_GRANT:
+        # The id names the exact grant (a hash of its signed terms) and the
+        # amount is the draw's whole content, so signing both binds the
+        # draw to that grant and that amount alone; the value can only ever
+        # land on the grant's beneficiary, who is the book's, never the
+        # submitter's.
+        signing_dict["grant_id"] = payload.get("grant_id")
+        signing_dict["grant_draw_amount"] = payload.get("grant_draw_amount")
+    elif tx_type == TX_TYPE_SET_GRANT_SHARED_CAP:
+        # Every field that fixes the cap is signed: the amount, the period
+        # shape and the version — a proposer must not be able to widen a
+        # funder's ceiling or move the periods their draws are counted on.
+        signing_dict["grant_shared_cap_amount"] = payload.get("grant_shared_cap_amount")
+        signing_dict["grant_shared_cap_period_seconds"] = payload.get("grant_shared_cap_period_seconds")
+        signing_dict["grant_shared_cap_anchor_ts"] = payload.get("grant_shared_cap_anchor_ts")
+        signing_dict["grant_shared_cap_version"] = payload.get("grant_shared_cap_version")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 
