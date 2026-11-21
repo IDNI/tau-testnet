@@ -649,11 +649,21 @@ class TipAdmissionView:
             "SELECT COALESCE(SUM(amount), 0) FROM retractable_transfers_v1 "
             "WHERE sender_pubkey = ?",
             (pubkey,),
+        ) + self._retractable_scalar(
+            # Open grants escrow the not-yet-drawn remainder per grant.
+            "SELECT COALESCE(SUM(amount - drawn_total), 0) FROM grants_v1 "
+            "WHERE granter_pubkey = ?",
+            (pubkey,),
         )
 
     def escrowed_in(self, pubkey: str) -> int:
         return self._retractable_scalar(
             "SELECT COALESCE(SUM(amount), 0) FROM retractable_transfers_v1 "
             "WHERE recipient_pubkey = ?",
+            (pubkey,),
+        ) + self._retractable_scalar(
+            # Open grants escrow the not-yet-drawn remainder per grant.
+            "SELECT COALESCE(SUM(amount - drawn_total), 0) FROM grants_v1 "
+            "WHERE grantee_pubkey = ?",
             (pubkey,),
         )
