@@ -256,6 +256,14 @@ class _Session:
             "deferred_diagnostics": drain.text,
             "capture_complete": bool(cap.complete and drain.complete),
             "binding_id": self.binding_id,
+            # The in-process revision receipt carries the revision span
+            # (tau_native._build_revision_receipt); the engine's Bounty 02
+            # harvest reads exactly these two fields to capture the spec
+            # snapshot a step advanced to. Report the same span here --
+            # `before` was taken before the first offer -- so a worker's
+            # receipt is shape-compatible with the in-process one.
+            "spec_revision_before": before,
+            "spec_revision_after": self.itp.spec_revision,
             **self.observe(),
         }
 
