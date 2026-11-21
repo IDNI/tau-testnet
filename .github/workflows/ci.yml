@@ -106,3 +106,23 @@ jobs:
           --deselect tests/test_consensus_time.py::TestConsensusTime::test_complex_rule_time_decaying_multisig
           -p no:asyncio -v
           "
+
+      # The Bounty 01 native suites run in their OWN docker run — a clean
+      # interpreter process. In the shared process above, an earlier file's
+      # TauInterface can leave the interpreter unusable for the next file
+      # (the native suites' pollution guard), which would skip the Bounty
+      # 01 proofs in exactly the job that exists to produce them. Same
+      # key/genesis preamble as the consensus suite step.
+      - name: Run Bounty 01 native suite
+        run: >
+          docker run --rm -e TAU_FORCE_TEST=0 -w /app/tau-testnet tau-node:ci
+          sh -c "
+          python scripts/generate_miner_keys.py &&
+          python scripts/gen_genesis.py --validator-privkey \"\$(cat test_miner.key)\" --out data/genesis.json &&
+          mv test_miner.key test_miner.pub data/ &&
+          mkdir -p data_local && cp data/test_miner.key data/test_miner.pub data_local/ &&
+          python -m pytest
+          tests/test_standing_payments_native.py
+          tests/test_payout_rules_native.py
+          -p no:asyncio -v
+          "

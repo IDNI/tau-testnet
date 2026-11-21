@@ -48,6 +48,26 @@ from consensus.approvals import (
     validate_request_shape,
     validate_rule_change_shape,
 )
+from consensus.payout_rules import (
+    TX_TYPE_EXECUTE_PAYOUT_RULE,
+    TX_TYPE_INSTALL_PAYOUT_RULE,
+    TX_TYPE_REMOVE_PAYOUT_RULE,
+    PayoutRuleBook,
+    PayoutRuleShapeError,
+    parse_execute_payout_rule,
+    parse_install_payout_rule,
+    parse_remove_payout_rule,
+)
+from consensus.standing_payments import (
+    TX_TYPE_CANCEL_STANDING_PAYMENT,
+    TX_TYPE_CREATE_STANDING_PAYMENT,
+    TX_TYPE_EXECUTE_STANDING_PAYMENT,
+    StandingPaymentBook,
+    StandingPaymentShapeError,
+    parse_cancel_standing_payment,
+    parse_create_standing_payment,
+    parse_execute_standing_payment,
+)
 from consensus.retractable import (
     KIND_HEIGHT,
     MAX_OPEN_RETRACTABLE_PER_SENDER,
@@ -1661,6 +1681,324 @@ def validate_retract_transfer_payload(
     return success({"retractable_id": request.retractable_id.hex()})
 
 
+# --- Standing payments ---------------------------------------------------------
+
+def _tip_standing_book(row: Optional[Dict]) -> StandingPaymentBook:
+    """A book holding exactly one tip authorization (the facade's row).
+
+    Admission and apply must reach the same verdict, and the verdicts live
+    in the book's can_create/can_cancel/execution_due; rebuilding the
+    one-entry book from the tip view lets admission call them verbatim
+    instead of re-implementing the version, end-condition and due rules a
+    second time. A same-id entry necessarily shares the series key (the id
+    hashes every signed field), so the one-entry book also gives can_create
+    identical verdicts for a create.
+    """
+    if row is None:
+        return StandingPaymentBook()
+    entry_row = (
+        bytes.fromhex(row["auth_id"]),
+        row["payer_pubkey"],
+        row["recipient_pubkey"],
+        int(row["amount"]),
+        int(row["schedule_kind"]),
+        int(row["signed_day"]),
+        int(row["anchor_ts"]),
+        int(row["window_seconds"]),
+        int(row["final_ts"]),
+        int(row["max_occurrences"]),
+        int(row["max_total"]),
+        int(row["fee_limit"]),
+        int(row["policy_version_ref"]),
+        int(row["allow_catch_up"]),
+        int(row["version"]),
+        tuple(int(p) for p in row["settled_periods"]),
+        int(row["total_paid"]),
+        int(row["last_execution_ts"]),
+        int(row["cancelled"]),
+        int(row["cancelled_ts"]),
+    )
+    fact_rows = [
+        (
+            bytes.fromhex(row["auth_id"]),
+            row["payer_pubkey"],
+            int(fact["period_index"]),
+            int(fact["period_start_ts"]),
+            int(fact["period_end_ts"]),
+            int(fact["amount"]),
+            int(fact["execution_ts"]),
+        )
+        for fact in row.get("paid_facts", [])
+    ]
+    return StandingPaymentBook.restore([entry_row], fact_rows)
+
+
+def validate_create_standing_payment_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for creating (or updating) a standing payment (#34).
+
+    Shape and state checks are the book's own (`can_create` against the
+    tip's one-entry series book), shared with block apply verbatim. An
+    update is a create carrying the next version; the book decides.
+    """
+    try:
+        entry = parse_create_standing_payment(tx)
+    except StandingPaymentShapeError as exc:
+        return format_error(f"Malformed create_standing_payment: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != entry.payer_pubkey:
+        return format_error(
+            "create_standing_payment sender_pubkey must match the signer.")
+
+    err = validate_bls_pubkey(entry.recipient_pubkey, "standing_recipient_pubkey")
+    if err:
+        return format_error(f"create_standing_payment rejected: {err}")
+
+    row = tip_view.get_standing_payment_for_series(
+        entry.payer_pubkey, entry.recipient_pubkey,
+        entry.schedule_kind, entry.anchor_ts,
+    )
+    ok, reason = _tip_standing_book(row).can_create(
+        entry, tip_view.next_block_timestamp)
+    if not ok:
+        return format_error(f"create_standing_payment rejected: {reason}")
+
+    return success({"auth_id": entry.auth_id.hex()})
+
+
+def validate_cancel_standing_payment_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for cancelling a standing payment (#34).
+
+    Only the payer cancels their own authorization; the state check is the
+    book's can_cancel against the tip's one-entry book, shared with apply.
+    """
+    try:
+        auth_id = parse_cancel_standing_payment(tx)
+    except StandingPaymentShapeError as exc:
+        return format_error(f"Malformed cancel_standing_payment: {exc}.")
+
+    row = tip_view.get_standing_payment(auth_id)
+    if row is None:
+        return format_error(
+            "Unknown standing payment authorization.",
+            code="UNKNOWN_STANDING_PAYMENT",
+        )
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != row["payer_pubkey"]:
+        return format_error(
+            "Only the payer may cancel a standing payment.",
+            code="NOT_STANDING_PAYMENT_PAYER",
+        )
+    ok, reason = _tip_standing_book(row).can_cancel(
+        auth_id, tip_view.next_block_timestamp)
+    if not ok:
+        return format_error(f"cancel_standing_payment rejected: {reason}")
+
+    return success({"auth_id": auth_id.hex()})
+
+
+def validate_execute_standing_payment_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for executing a standing payment (#34).
+
+    Anyone may trigger an execution. Whether anything is due is the book's
+    execution_due against the tip state and the payer's tip balance — the
+    same call block apply makes, so the two agree on identical state. The
+    payer's o5 re-check and the fee are apply-side (they need the engine's
+    evaluation), exactly as for an ordinary transfer.
+    """
+    try:
+        auth_id = parse_execute_standing_payment(tx)
+    except StandingPaymentShapeError as exc:
+        return format_error(f"Malformed execute_standing_payment: {exc}.")
+
+    row = tip_view.get_standing_payment(auth_id)
+    if row is None:
+        return format_error(
+            "Unknown standing payment authorization.",
+            code="UNKNOWN_STANDING_PAYMENT",
+        )
+    sender = tx.get("sender_pubkey")
+    try:
+        decision = _tip_standing_book(row).execution_due(
+            auth_id, tip_view.next_block_timestamp,
+            tip_view.get_balance(row["payer_pubkey"]),
+            executor_pubkey=sender if isinstance(sender, str) else None,
+        )
+    except StandingPaymentShapeError as exc:
+        return format_error(f"Malformed execute_standing_payment: {exc}.")
+    if not decision.executed:
+        return format_error(
+            f"execute_standing_payment rejected: {decision.reason}")
+
+    return success({
+        "auth_id": auth_id.hex(),
+        "amount": decision.amount,
+        "period_index": decision.period_index,
+        "periods_collected": decision.periods_collected,
+    })
+
+
+# --- Payout rules --------------------------------------------------------------
+
+def _tip_payout_book(row: Optional[Dict]) -> PayoutRuleBook:
+    """A book holding exactly one tip payout rule (the facade's row).
+
+    Admission and apply must reach the same verdict, and the verdicts live
+    in the book's can_install/can_remove/evaluate_execution; rebuilding the
+    one-entry book from the tip view lets admission call them verbatim
+    instead of re-implementing the version, cap and settlement rules a
+    second time. The row carries the rule's settlements and period totals,
+    so the rebuilt book also answers the settlement-idempotency and
+    per-period-cap questions identically.
+    """
+    if row is None:
+        return PayoutRuleBook()
+    entry_row = (
+        bytes.fromhex(row["rule_id"]),
+        row["owner_pubkey"],
+        tuple(row["recipients"]),
+        tuple(
+            (leg["recipient_pubkey"], int(leg["mode"]), int(leg["value"]))
+            for leg in row["legs"]
+        ),
+        int(row["max_per_execution"]),
+        int(row["max_per_period"]),
+        int(row["period_seconds"]),
+        int(row["period_anchor_ts"]),
+        int(row["version"]),
+        tuple(
+            (int(t["period_index"]), int(t["total"]))
+            for t in row.get("period_totals", [])
+        ),
+    )
+    settlement_rows = [
+        (
+            bytes.fromhex(row["rule_id"]),
+            bytes.fromhex(s["settlement_id"]),
+            int(s["base_amount"]),
+            int(s["total"]),
+            int(s["execution_ts"]),
+        )
+        for s in row.get("settlements", [])
+    ]
+    return PayoutRuleBook.restore([entry_row], settlement_rows)
+
+
+def validate_install_payout_rule_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for installing (or replacing) a payout rule (#63).
+
+    Shape and state checks are the book's own (`can_install` against the
+    tip's one-entry book), shared with block apply verbatim. A replacement
+    is an install carrying the next version; the book decides.
+    """
+    try:
+        entry = parse_install_payout_rule(tx)
+    except PayoutRuleShapeError as exc:
+        return format_error(f"Malformed install_payout_rule: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != entry.owner_pubkey:
+        return format_error(
+            "install_payout_rule sender_pubkey must match the signer.")
+
+    for recipient in entry.recipients:
+        err = validate_bls_pubkey(recipient, "payout_recipients")
+        if err:
+            return format_error(f"install_payout_rule rejected: {err}")
+
+    row = tip_view.get_payout_rule_for_owner(entry.owner_pubkey)
+    ok, reason = _tip_payout_book(row).can_install(
+        entry, tip_view.next_block_timestamp)
+    if not ok:
+        return format_error(f"install_payout_rule rejected: {reason}")
+
+    return success({"rule_id": entry.rule_id.hex()})
+
+
+def validate_remove_payout_rule_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for removing a payout rule (#63).
+
+    Only the owner removes their own rule — removal follows the account's
+    normal rules. The state check is the book's can_remove against the
+    tip's one-entry book, shared with apply.
+    """
+    try:
+        owner = parse_remove_payout_rule(tx)
+    except PayoutRuleShapeError as exc:
+        return format_error(f"Malformed remove_payout_rule: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != owner:
+        return format_error(
+            "remove_payout_rule sender_pubkey must match the signer.")
+
+    row = tip_view.get_payout_rule_for_owner(owner)
+    if row is None:
+        return format_error(
+            "No payout rule installed for this account.",
+            code="UNKNOWN_PAYOUT_RULE",
+        )
+    ok, reason = _tip_payout_book(row).can_remove(
+        owner, tip_view.next_block_timestamp)
+    if not ok:
+        return format_error(f"remove_payout_rule rejected: {reason}")
+
+    return success({"rule_id": row["rule_id"]})
+
+
+def validate_execute_payout_rule_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for executing a payout rule (#63).
+
+    Anyone may submit an execution with the rule's inputs. What the rule
+    computes and whether it may settle is the book's evaluate_execution
+    against the tip state and the owner's tip balance — the same call
+    block apply makes, so the two agree on identical state. The owner's
+    o5 re-check per leg and the fee are apply-side (they need the engine's
+    evaluation), exactly as for an ordinary transfer.
+    """
+    try:
+        rule_id, settlement_id, base_amount = parse_execute_payout_rule(tx)
+    except PayoutRuleShapeError as exc:
+        return format_error(f"Malformed execute_payout_rule: {exc}.")
+
+    row = tip_view.get_payout_rule(rule_id)
+    if row is None:
+        return format_error(
+            "Unknown payout rule.",
+            code="UNKNOWN_PAYOUT_RULE",
+        )
+    decision = _tip_payout_book(row).evaluate_execution(
+        rule_id, settlement_id, base_amount,
+        tip_view.next_block_timestamp,
+        tip_view.get_balance(row["owner_pubkey"]),
+    )
+    if not decision.executed:
+        return format_error(
+            f"execute_payout_rule rejected: {decision.reason}")
+
+    return success({
+        "rule_id": rule_id.hex(),
+        "settlement_id": settlement_id.hex(),
+        "total": decision.total,
+        "period_index": decision.period_index,
+        "legs": [
+            {"recipient_pubkey": r, "amount": a} for r, a in decision.legs
+        ],
+    })
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -1771,6 +2109,24 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
          return validate_retract_transfer_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_CREATE_STANDING_PAYMENT:
+         return validate_create_standing_payment_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_CANCEL_STANDING_PAYMENT:
+         return validate_cancel_standing_payment_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_EXECUTE_STANDING_PAYMENT:
+         return validate_execute_standing_payment_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_INSTALL_PAYOUT_RULE:
+         return validate_install_payout_rule_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_REMOVE_PAYOUT_RULE:
+         return validate_remove_payout_rule_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_EXECUTE_PAYOUT_RULE:
+         return validate_execute_payout_rule_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

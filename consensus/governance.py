@@ -6,7 +6,9 @@ from dataclasses import dataclass
 
 from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
+from consensus.payout_rules import PayoutRuleBook
 from consensus.retractable import RetractableBook
+from consensus.standing_payments import StandingPaymentBook
 
 logger = logging.getLogger(__name__)
 from consensus.approvals import (
@@ -197,6 +199,8 @@ def build_mechanism_metadata(
     approval_requests_root: str = "",
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
+    standing_payments_root: str = "",
+    payout_rules_root: str = "",
     faucet_amount: int = 0,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
@@ -243,6 +247,18 @@ def build_mechanism_metadata(
     if retractable_transfers_root is None:
         retractable_transfers_root = RetractableBook().root().hex()
     mech["retractable_transfers_root"] = retractable_transfers_root
+    # Standing payments (#34): same non-default gate. The key is emitted
+    # only once an authorization or a paid-period fact exists, so a chain
+    # that never creates one hashes exactly as it did before the field
+    # existed, and gen_genesis (which calls this without it) is unaffected.
+    if standing_payments_root:
+        mech["standing_payments_root"] = standing_payments_root
+    # Payout rules (#63): same non-default gate. The key is emitted only
+    # once a rule or a settlement exists, so a chain that never installs
+    # one hashes exactly as it did before the field existed, and
+    # gen_genesis (which calls this without it) is unaffected.
+    if payout_rules_root:
+        mech["payout_rules_root"] = payout_rules_root
     return mech
 
 
@@ -451,6 +467,16 @@ class ConsensusLifecycleManager:
         # Co-signature approvals. A FIELD for the same reason rule_offers is.
         self.approval_requests = ApprovalRequestLifecycleManager()
         self.retractable_transfers = RetractableBook()
+        # Standing payments (#34). A FIELD for the same reason rule_offers is: the engine
+        # wires create/cancel/execute against the manager every node already
+        # shares, and consensus_meta_hash binds its root once an
+        # authorization or a paid-period fact exists.
+        self.standing_payments = StandingPaymentBook()
+        # Payout rules (#63). A FIELD for the same reason: the engine wires
+        # install/remove/execute against the manager every node already
+        # shares, and consensus_meta_hash binds its root once a rule or a
+        # settlement exists.
+        self.payout_rules = PayoutRuleBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
@@ -545,6 +571,14 @@ class ConsensusLifecycleManager:
             ),
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
+            standing_payments_root=(
+                "" if self.standing_payments.is_empty()
+                else self.standing_payments.root().hex()
+            ),
+            payout_rules_root=(
+                "" if self.payout_rules.is_empty()
+                else self.payout_rules.root().hex()
+            ),
             faucet_amount=self.faucet_amount,
         )
         return compute_consensus_meta_hash(
