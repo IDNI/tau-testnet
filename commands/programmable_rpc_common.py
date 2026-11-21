@@ -125,9 +125,20 @@ def standing_due_fields(book, standing_id: bytes, now: int) -> dict:
             entry.period_kind, due, anchor=entry.period_anchor,
             length=entry.period_length)
     else:
-        nxt = _period_start_safe(
-            entry.period_kind, current + 1, anchor=entry.period_anchor,
-            length=entry.period_length)
+        # Dormant (occurrences cap reached or past the horizon): no next
+        # due date at all. Otherwise the next period starts after this one.
+        from consensus.standing import (
+            MAX_OCCURRENCES,
+            MAX_STANDING_HORIZON_SECONDS,
+        )
+
+        if (book.executions(standing_id) >= MAX_OCCURRENCES
+                or now >= entry.start_at + MAX_STANDING_HORIZON_SECONDS):
+            nxt = None
+        else:
+            nxt = _period_start_safe(
+                entry.period_kind, current + 1, anchor=entry.period_anchor,
+                length=entry.period_length)
     return {"due_period": due, "paid_this_period": paid_this_period,
             "next_due_at": nxt, "total_executed": total_executed}
 

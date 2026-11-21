@@ -22,6 +22,9 @@ from consensus.periods import (
     period_start,
 )
 from consensus.standing import (
+    MAX_OCCURRENCES,
+    MAX_STANDING_HORIZON_SECONDS,
+    MIN_WINDOW_SECONDS,
     OUTCOME_CANCELLED,
     OUTCOME_SUPERSEDED,
     StandingPaymentBook,
@@ -158,6 +161,103 @@ def test_validate_standing_shape():
     assert validate_standing_shape(
         make_entry(start_at=DEC_1_2026 + 91 * DAY), 0, DEC_1_2026
     ) is not None
+
+
+# ---------------------------------------------------------------- bounds
+
+
+def test_fixed_window_below_one_hour_is_rejected():
+    # The 1-hour minimum is enforced chain-wide by validate_period_spec
+    # (which validate_standing_shape calls): a fixed length below 3600
+    # seconds is refused at create and at update alike.
+    entry = make_entry(
+        period_kind=PERIOD_FIXED, period_length=1800,
+        period_anchor=DEC_1_2026,
+    )
+    assert validate_standing_shape(entry, 0, DEC_1_2026) == (
+        "fixed period length must be in 3600..31536000 seconds")
+    book = StandingPaymentBook()
+    assert book.can_admit_create(entry, 0, DEC_1_2026) == (
+        False, "fixed period length must be in 3600..31536000 seconds")
+    # An update to a sub-hour window is refused the same way.
+    book.submit(make_entry())
+    assert book.can_admit_update(
+        make_entry().standing_id, ALICE,
+        make_entry(
+            version=2, period_kind=PERIOD_FIXED, period_length=1800,
+            period_anchor=DEC_1_2026,
+        ),
+        0, DEC_1_2026,
+    ) == (False, "fixed period length must be in 3600..31536000 seconds")
+
+
+def test_fixed_window_of_one_hour_is_admitted():
+    assert MIN_WINDOW_SECONDS == 3600
+    entry = make_entry(
+        period_kind=PERIOD_FIXED, period_length=3600,
+        period_anchor=DEC_1_2026,
+    )
+    assert validate_standing_shape(entry, 0, DEC_1_2026) is None
+    book = StandingPaymentBook()
+    assert book.can_admit_create(entry, 0, DEC_1_2026) == (True, "")
+
+
+def test_schedule_goes_dormant_after_max_occurrences():
+    book = StandingPaymentBook()
+    # Hourly fixed window: 10,000 executions span ~417 days, inside the
+    # 5-year horizon, so only the occurrences cap binds here.
+    entry = make_entry(
+        period_kind=PERIOD_FIXED, period_length=3600,
+        period_anchor=DEC_1_2026,
+    )
+    book.submit(entry)
+    sid = entry.standing_id
+    # One execution per hour, up to the cap.
+    ts = entry.start_at
+    for _ in range(MAX_OCCURRENCES):
+        period = book.due_period(sid, ts)
+        assert period is not None
+        book.mark_executed(sid, period)
+        ts += 3600
+    assert book.executions(sid) == MAX_OCCURRENCES
+    # The 10,001st period is never due, manual execute is refused at
+    # admission, and the apply function fails closed without moving funds.
+    assert book.due_period(sid, ts) is None
+    assert book.can_admit_execute(sid, ALICE, 0, ts) == (
+        False, "no period due for execution")
+    balances = {ALICE: 1000, BOB: 0, CAROL: 0}
+    outcome, period = apply_standing_execution(
+        book, sid, ts,
+        read=lambda pk: balances.get(pk, 0),
+        write=lambda pk, v: balances.__setitem__(pk, v),
+        fee=0, fee_beneficiary="", credit_records=CreditLedger(),
+    )
+    assert outcome == "skipped_max_occurrences" and period is None
+    assert balances == {ALICE: 1000, BOB: 0, CAROL: 0}
+
+
+def test_schedule_goes_dormant_past_the_five_year_horizon():
+    assert MAX_STANDING_HORIZON_SECONDS == 5 * 365 * 86400
+    book = StandingPaymentBook()
+    entry = make_entry(
+        period_kind=PERIOD_DAY, period_length=None, period_anchor=0)
+    book.submit(entry)
+    sid = entry.standing_id
+    just_inside = entry.start_at + MAX_STANDING_HORIZON_SECONDS - 1
+    assert book.due_period(sid, just_inside) is not None
+    past = entry.start_at + MAX_STANDING_HORIZON_SECONDS
+    assert book.due_period(sid, past) is None
+    assert book.can_admit_execute(sid, ALICE, 0, past) == (
+        False, "no period due for execution")
+    balances = {ALICE: 1000, BOB: 0, CAROL: 0}
+    outcome, period = apply_standing_execution(
+        book, sid, past,
+        read=lambda pk: balances.get(pk, 0),
+        write=lambda pk, v: balances.__setitem__(pk, v),
+        fee=0, fee_beneficiary="", credit_records=CreditLedger(),
+    )
+    assert outcome == "skipped_horizon" and period is None
+    assert balances == {ALICE: 1000, BOB: 0, CAROL: 0}
 
 
 # ---------------------------------------------------------------- book

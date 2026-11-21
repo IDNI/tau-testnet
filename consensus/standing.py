@@ -30,6 +30,16 @@ Execution has two paths through the SAME apply function,
   ``fee_limit <= max_fee_per_execution`` so the payer never pays more per
   execution than they declared.
 
+Safety bounds keep a schedule finite even though it has no end date: a
+schedule executes at most ``MAX_OCCURRENCES`` times and only within
+``MAX_STANDING_HORIZON_SECONDS`` of its ``start_at``. Past either bound
+the schedule is dormant -- it stays open until cancelled, but no period
+is due (``due_period`` returns None, so the sweep never attempts it and
+manual execute is refused at admission) and ``apply_standing_execution``
+fails closed with ``skipped_max_occurrences`` / ``skipped_horizon``.
+A fixed window must be at least ``MIN_WINDOW_SECONDS`` (1 hour); the
+calendar kinds are a day or longer by construction.
+
 Chain binding: all four standing tx types are signed with ``chain_id`` (the
 genesis hash) so a standing payment signed on one Tau network cannot be
 replayed on another. See ``consensus.chain_binding``.
@@ -46,6 +56,7 @@ from blake3 import blake3
 from consensus.credits import CREDIT_FEE_REWARD, CREDIT_STANDING_PAYMENT
 from consensus.faucet import spendable
 from consensus.periods import (
+    MIN_FIXED_PERIOD_SECONDS,
     PeriodError,
     period_index,
     period_start,
@@ -100,6 +111,19 @@ MAX_OPEN_STANDING_TOTAL = 4096
 #: ``start_at`` may be at most 90 days ahead of the creation block, the same
 #: window as a grant's start delay.
 MAX_STANDING_START_DELAY_SECONDS = 7_776_000
+#: A schedule may execute at most this many times. Standing payments have no
+#: end date, so without this an hourly schedule would pay forever; the cap
+#: bounds the total work (and total payout) one schedule can ever cause.
+MAX_OCCURRENCES = 10_000
+#: A schedule may only execute within 5 years of its ``start_at`` (5 x 365
+#: days, in seconds). Past the horizon the schedule is dormant.
+MAX_STANDING_HORIZON_SECONDS = 5 * 365 * 86400
+#: The shortest period a schedule may use: one hour. Calendar kinds (day /
+#: ISO week / month) are a day or longer by construction, so this binds
+#: only PERIOD_FIXED lengths. It is enforced chain-wide by
+#: ``validate_period_spec`` (which ``validate_standing_shape`` calls); this
+#: name exists so the bound is visible here and in the RPC semantics block.
+MIN_WINDOW_SECONDS = MIN_FIXED_PERIOD_SECONDS
 
 ZERO_ACC = bytes(32)
 
@@ -526,7 +550,9 @@ class StandingPaymentBook:
         A period is due when it has started (``ts`` is in it or a later one)
         and it has not been executed yet. When several periods have passed
         since the last execution, only the CURRENT one is due: missed periods
-        are skipped, never caught up.
+        are skipped, never caught up. A dormant schedule (``MAX_OCCURRENCES``
+        executions reached, or ``ts`` past the 5-year horizon) never has a
+        due period again.
         """
         entry = self.open.get(standing_id)
         if entry is None:
@@ -538,6 +564,12 @@ class StandingPaymentBook:
         if current < first_period(entry):
             return None
         rt = self._runtime[standing_id]
+        if rt.executions >= MAX_OCCURRENCES:
+            # The schedule has paid out: dormant, nothing is ever due again.
+            return None
+        if ts >= entry.start_at + MAX_STANDING_HORIZON_SECONDS:
+            # Past the 5-year horizon: dormant, nothing is ever due again.
+            return None
         if rt.last_executed_period is not None and rt.last_executed_period >= current:
             return None
         return current
@@ -769,6 +801,12 @@ def apply_standing_execution(
     rt = book._runtime[standing_id]
     if rt.last_executed_period is not None and rt.last_executed_period >= current:
         return "already_executed", None
+    if rt.executions >= MAX_OCCURRENCES:
+        # Dormant: the schedule has paid out. Fail closed, never advance.
+        return "skipped_max_occurrences", None
+    if ts >= entry.start_at + MAX_STANDING_HORIZON_SECONDS:
+        # Dormant: past the 5-year horizon. Fail closed, never advance.
+        return "skipped_horizon", None
     if fee > entry.max_fee_per_execution:
         return "skipped_fee_cap", current
     payer_bal = read(entry.payer_pubkey)

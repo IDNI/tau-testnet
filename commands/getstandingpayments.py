@@ -27,8 +27,11 @@ from commands.programmable_rpc_common import (
     standing_due_fields,
 )
 from consensus.standing import (
+    MAX_OCCURRENCES,
     MAX_OPEN_STANDING_PER_PAYER,
     MAX_OPEN_STANDING_TOTAL,
+    MAX_STANDING_HORIZON_SECONDS,
+    MIN_WINDOW_SECONDS,
 )
 
 _CMD = "getstandingpayments"
@@ -38,9 +41,15 @@ _SEMANTICS = semantics_block(
     {
         "max_open_per_payer": MAX_OPEN_STANDING_PER_PAYER,
         "max_open_total": MAX_OPEN_STANDING_TOTAL,
+        "max_occurrences": MAX_OCCURRENCES,
+        "max_horizon_seconds": MAX_STANDING_HORIZON_SECONDS,
+        "min_window_seconds": MIN_WINDOW_SECONDS,
     },
     "Sweep primary, standing_payment_execute fallback; one execution per "
-    "period, no catch-up; max_fee_per_execution is charged to the payer.",
+    "period, no catch-up; max_fee_per_execution is charged to the payer. "
+    "A schedule goes dormant after max_occurrences executions or past "
+    "the max_horizon_seconds horizon; a fixed window is at least "
+    "min_window_seconds.",
 )
 
 
