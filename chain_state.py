@@ -580,6 +580,16 @@ def _route_state(lm) -> dict:
     }
 
 
+def _payout_state(lm) -> dict:
+    book = lm.payouts
+    count, acc = book.resolved_state()
+    return {
+        "rows": book.snapshot_rows(),
+        "resolved_count": count,
+        "resolved_acc": acc.hex(),
+    }
+
+
 def _record_retractable_events(block, next_snapshot) -> None:
     """Best-effort history write; the apply verdict is already final.
 
@@ -641,6 +651,7 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         grants=_grant_state(lm),
         standing=_standing_state(lm),
         routes=_route_state(lm),
+        payouts=_payout_state(lm),
         eligibility_mode=lm.eligibility_mode,
         fee_beneficiary=lm.fee_beneficiary,
         last_transfer_ts=merged_ts,
@@ -2320,6 +2331,19 @@ def _restore_routes(lm) -> None:
         raise DatabaseError(f"corrupt route state: {exc}") from exc
 
 
+def _restore_payouts(lm) -> None:
+    """Rehydrate the payout book; a stored row that does not recompute
+    its id is corruption and refuses to load rather than silently
+    dropping a payer's payout rule."""
+    from consensus.payouts import PayoutBook
+
+    rows, resolved_count, resolved_acc = db.load_payout_state()
+    try:
+        lm.payouts = PayoutBook.restore(rows, resolved_count, resolved_acc)
+    except ValueError as exc:
+        raise DatabaseError(f"corrupt payout state: {exc}") from exc
+
+
 def save_effective_tau_spec(canonical_rule_text: str):
     """
     Append ONE canonical (full-width, pre-shrink) application rule to the raw
@@ -2456,6 +2480,7 @@ def load_state_from_db() -> bool:
         _restore_grants(_lifecycle_manager)
         _restore_standing(_lifecycle_manager)
         _restore_routes(_lifecycle_manager)
+        _restore_payouts(_lifecycle_manager)
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
         persisted_slots = db.get_chain_state_value("approval_slots_active", _MISSING)
@@ -2527,6 +2552,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         grant_snapshot = _grant_state(_lifecycle_manager)
         standing_snapshot = _standing_state(_lifecycle_manager)
         route_snapshot = _route_state(_lifecycle_manager)
+        payout_snapshot = _payout_state(_lifecycle_manager)
 
     db.save_canonical_state_atomically(
         block_hash, block_number,
@@ -2548,6 +2574,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         grants=grant_snapshot,
         standing=standing_snapshot,
         routes=route_snapshot,
+        payouts=payout_snapshot,
     )
 
 def tick_governance(height: int):
@@ -3048,6 +3075,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 grants=_grant_state(_lifecycle_manager),
                 standing=_standing_state(_lifecycle_manager),
                 routes=_route_state(_lifecycle_manager),
+                payouts=_payout_state(_lifecycle_manager),
             )
     except Exception as exc:
         logger.error(

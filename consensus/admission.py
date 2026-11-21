@@ -42,6 +42,19 @@ from consensus.grants import (
     parse_grant_draw,
     validate_grant_shape,
 )
+from consensus.payouts import (
+    MAX_OPEN_PAYOUTS_PER_PAYER,
+    MAX_OPEN_PAYOUTS_TOTAL,
+    TX_TYPE_PAYOUT_CREATE,
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_REMOVE,
+    PayoutBook,
+    PayoutShapeError,
+    parse_payout_create,
+    parse_payout_execute,
+    parse_payout_remove,
+    validate_payout_shape,
+)
 from consensus.routes import (
     MAX_ROUTES_TOTAL,
     TX_TYPE_ROUTE_REMOVE,
@@ -1666,6 +1679,12 @@ def _route_book_from_row(row: Dict) -> RouteBook:
     return RouteBook.restore([row], 0, bytes(32))
 
 
+def _payout_book_from_row(row: Dict) -> PayoutBook:
+    """A one-payout book rebuilt from a stored row, so admission judges an
+    execute/remove with the same code the engine applies."""
+    return PayoutBook.restore([row], 0, bytes(32))
+
+
 def _standing_book_from_row(row: Dict) -> StandingPaymentBook:
     """A one-standing-payment book rebuilt from a stored row, so admission
     judges a standing payment from the persisted state alone (the tip view
@@ -2017,6 +2036,118 @@ def validate_route_remove_payload(
     return success({"account_pubkey": request.account_pubkey})
 
 
+def validate_payout_create_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for creating a payout rule."""
+    try:
+        entry = parse_payout_create(tx)
+    except PayoutShapeError as exc:
+        return format_error(f"Malformed payout_create: {exc}.")
+
+    if not isinstance(tx.get("sender_pubkey"), str) or tx.get("sender_pubkey") != entry.payer_pubkey:
+        return format_error("payout_create sender_pubkey must match the payer.")
+
+    chain_error = check_chain_binding(tx, tip_view.genesis_hash)
+    if chain_error is not None:
+        return format_error(
+            f"payout_create rejected: {chain_error}.", code=WRONG_CHAIN_ID
+        )
+
+    shape_error = validate_payout_shape(
+        entry, tip_view.next_block_height, tip_view.next_block_timestamp
+    )
+    if shape_error is not None:
+        return format_error(f"payout_create rejected: {shape_error}")
+
+    if tip_view.get_payout(entry.payout_id) is not None:
+        return format_error(
+            "Duplicate payout_create (same payer, recipients, sequence "
+            "number).",
+            code="DUPLICATE_PAYOUT",
+        )
+    if tip_view.open_payout_count_for_payer(entry.payer_pubkey) >= MAX_OPEN_PAYOUTS_PER_PAYER:
+        return format_error(
+            f"Payer already has {MAX_OPEN_PAYOUTS_PER_PAYER} open payout rules.",
+            code="PAYOUT_PAYER_FULL",
+        )
+    if tip_view.open_payout_count() >= MAX_OPEN_PAYOUTS_TOTAL:
+        return format_error("The payout book is full.", code="PAYOUT_BOOK_FULL")
+    return success(
+        {
+            "payout_id": entry.payout_id.hex(),
+            "payer_pubkey": entry.payer_pubkey,
+        }
+    )
+
+
+def validate_payout_execute_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for executing one period of a payout rule."""
+    try:
+        request = parse_payout_execute(tx)
+    except PayoutShapeError as exc:
+        return format_error(f"Malformed payout_execute: {exc}.")
+
+    chain_error = check_chain_binding(tx, tip_view.genesis_hash)
+    if chain_error is not None:
+        return format_error(
+            f"payout_execute rejected: {chain_error}.", code=WRONG_CHAIN_ID
+        )
+
+    row = tip_view.get_payout(request.payout_id)
+    if row is None:
+        return format_error(
+            "Unknown or already resolved payout rule.", code="UNKNOWN_PAYOUT"
+        )
+    book = _payout_book_from_row(row)
+    ok, reason = book.can_admit_execute(
+        request.payout_id, tx.get("sender_pubkey"),
+        tip_view.next_block_height, tip_view.next_block_timestamp,
+        fee_limit=parse_fee_limit(tx.get("fee_limit")),
+    )
+    if not ok:
+        return format_error(
+            f"payout_execute rejected: {reason}",
+            code="PAYOUT_EXECUTE_REJECTED",
+        )
+    return success({"payout_id": request.payout_id.hex()})
+
+
+def validate_payout_remove_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for removing a payout rule."""
+    try:
+        request = parse_payout_remove(tx)
+    except PayoutShapeError as exc:
+        return format_error(f"Malformed payout_remove: {exc}.")
+
+    chain_error = check_chain_binding(tx, tip_view.genesis_hash)
+    if chain_error is not None:
+        return format_error(
+            f"payout_remove rejected: {chain_error}.", code=WRONG_CHAIN_ID
+        )
+
+    row = tip_view.get_payout(request.payout_id)
+    if row is None:
+        return format_error(
+            "Unknown or already resolved payout rule.", code="UNKNOWN_PAYOUT"
+        )
+    book = _payout_book_from_row(row)
+    ok, reason = book.can_admit_remove(
+        request.payout_id, tx.get("sender_pubkey"),
+        tip_view.next_block_height, tip_view.next_block_timestamp,
+    )
+    if not ok:
+        return format_error(
+            f"payout_remove rejected: {reason}",
+            code="PAYOUT_REMOVE_REJECTED",
+        )
+    return success({"payout_id": request.payout_id.hex()})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -2154,6 +2285,15 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_ROUTE_REMOVE:
          return validate_route_remove_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_PAYOUT_CREATE:
+         return validate_payout_create_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+         return validate_payout_execute_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_PAYOUT_REMOVE:
+         return validate_payout_remove_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

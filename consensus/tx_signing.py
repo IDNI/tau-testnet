@@ -48,6 +48,11 @@ from consensus.routes import (
     TX_TYPE_ROUTE_REMOVE,
     TX_TYPE_ROUTE_SET,
 )
+from consensus.payouts import (
+    TX_TYPE_PAYOUT_CREATE,
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_REMOVE,
+)
 from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
@@ -199,6 +204,27 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["locked_until"] = payload.get("locked_until")
         signing_dict["chain_id"] = payload.get("chain_id")
     elif tx_type == TX_TYPE_ROUTE_REMOVE:
+        signing_dict["chain_id"] = payload.get("chain_id")
+    elif tx_type == TX_TYPE_PAYOUT_CREATE:
+        # Every field that fixes the rule is signed; the payer is the
+        # sender, so a proposer cannot install a payout rule on someone
+        # else's funds.
+        signing_dict["recipients"] = payload.get("recipients")
+        signing_dict["clause"] = payload.get("clause")
+        signing_dict["max_per_execution"] = payload.get("max_per_execution")
+        signing_dict["max_per_period"] = payload.get("max_per_period")
+        signing_dict["period_kind"] = payload.get("period_kind")
+        signing_dict["period_length"] = payload.get("period_length")
+        signing_dict["period_anchor"] = payload.get("period_anchor")
+        signing_dict["start_at"] = payload.get("start_at")
+        signing_dict["expires_at"] = payload.get("expires_at")
+        signing_dict["locked_until"] = payload.get("locked_until")
+        signing_dict["chain_id"] = payload.get("chain_id")
+    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+        signing_dict["payout_id"] = payload.get("payout_id")
+        signing_dict["chain_id"] = payload.get("chain_id")
+    elif tx_type == TX_TYPE_PAYOUT_REMOVE:
+        signing_dict["payout_id"] = payload.get("payout_id")
         signing_dict["chain_id"] = payload.get("chain_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()

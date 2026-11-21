@@ -202,6 +202,23 @@ def _payload(kind, fee_limit="0"):
                          activate_at=now, expires_at=now + 30 * 86400,
                          locked_until=None,
                          chain_id=db.get_genesis_hash())
+    if kind == "payout_create":
+        if not db.get_genesis_hash():
+            db.add_block(Block.create(
+                block_number=0, previous_hash="00" * 32, transactions=[],
+                proposer_pubkey=SENDER, timestamp=TIP_TS,
+            ))
+        now = int(time.time())
+        return _envelope(kind, SENDER, fee_limit, recipients=[RECIPIENT],
+                         clause="true", max_per_execution=1000,
+                         max_per_period=1000, period_kind=2, period_anchor=0,
+                         start_at=now, expires_at=now + 30 * 86400,
+                         locked_until=None,
+                         chain_id=db.get_genesis_hash())
+    if kind == "payout_execute":
+        payout_id = _ensure_payout()
+        return _envelope(kind, SENDER, fee_limit, payout_id=payout_id.hex(),
+                         chain_id=db.get_genesis_hash())
     raise AssertionError(kind)
 
 
@@ -235,6 +252,45 @@ def _ensure_standing():
     return standing_id
 
 
+def _ensure_payout():
+    """Insert one open payout rule (SENDER -> [RECIPIENT], due now) into
+    payouts_v1, for the execute estimate case. Returns its id."""
+    import json
+
+    from consensus.periods import PERIOD_WEEK
+    from consensus.payouts import compute_payout_id
+
+    # Admission judges on next_block_timestamp, which is real wall-clock
+    # time (max(tip_timestamp, time.time())), NOT the fixture TIP_TS
+    # (2023): the rule must be live at real now, like the payout_create
+    # branch, or can_admit_execute rejects it as expired.
+    now = int(time.time())
+    payout_id = compute_payout_id(SENDER, [RECIPIENT], 0)
+    if not db.get_genesis_hash():
+        db.add_block(Block.create(
+            block_number=0, previous_hash="00" * 32, transactions=[],
+            proposer_pubkey=SENDER, timestamp=TIP_TS,
+        ))
+    with db._db_lock:
+        with db._db_conn:
+            db._db_conn.execute(
+                "DELETE FROM payouts_v1 WHERE payout_id = ?",
+                (payout_id.hex(),),
+            )
+            db._db_conn.execute(
+                "INSERT INTO payouts_v1 (payout_id, payer_pubkey, "
+                "recipients, clause, max_per_execution, max_per_period, "
+                "period_kind, period_length, period_anchor, start_at, "
+                "expires_at, locked_until, sequence_number, "
+                "period_index, paid_in_period, executions) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (payout_id.hex(), SENDER, json.dumps([RECIPIENT]), "true",
+                 1000, 1000, PERIOD_WEEK, None, 0, now - 1000000,
+                 now + 30 * 86400, None, 0, None, 0, 0),
+            )
+    return payout_id
+
+
 def _check(payload, *, estimate=True):
     sign_payload(payload, SECRET_KEYS[payload["sender_pubkey"]])
     word = "checktx estimate" if estimate else "checktx"
@@ -245,7 +301,8 @@ FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
                "rule_change_request", "grant_create",
                "standing_payment", "standing_payment_execute",
-               "standing_payment_update", "route_set"]
+               "standing_payment_update", "route_set",
+               "payout_create", "payout_execute"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

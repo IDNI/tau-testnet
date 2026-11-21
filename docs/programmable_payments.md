@@ -223,3 +223,35 @@ completion, a standing execution (manual or sweep) — splits the same way.
 
 Demo: Bob routes 25% of every incoming transfer to Carol
 (`tests/test_routes.py::test_demo_bob_routes_25_percent_to_carol`).
+
+## Stage 5 — payout rules
+
+`consensus/payouts.py` — `PayoutBook`: one payout rule pays up to 8
+declared recipients under ONE Tau clause. The clause is evaluated in an
+isolated `payout` policy pool (registered in `tau_policy.POOL_NAMES`
+alongside `apply` and `admission`, with its own worker — a payout clause
+can never see or touch another pool's state). Its outputs o1..o8 are the
+per-recipient amounts: o1 pays `recipients[0]`, o2 pays `recipients[1]`,
+and so on. A missing or zero output pays nothing to that recipient; a
+non-integer or negative output blocks the whole execution (fail-closed).
+
+Caps: `max_per_execution` bounds one execution's total, `max_per_period`
+bounds the total paid inside one period (calendar month / ISO week / day /
+fixed — `consensus/periods.py`). A skipped execution pays nothing and does
+not consume the period cap — only an `executed` call marks the period.
+
+All legs are atomic or none: every check runs before any write is staged;
+the payer is debited once for the total (+ fee), each recipient is credited
+its leg in the same staged-write step, and zero legs are skipped (a zero
+credit is not a record). Legs are recorded as `CREDIT_PAYOUT_LEG`, which is
+not routable — a payout leg never triggers a receive route. `payout_create`
+and `payout_execute` are fee-bearing and carry `chain_id`; `payout_remove`
+is fee-exempt, like a retract.
+
+Removal is #33-aware: only the payer may remove a rule, and `locked_until`
+is the binding lock — while it is in the future the rule cannot be removed
+at all. A rule-change guard (#33) only has to set the lock; the removal
+path already consults it.
+
+Demo: Alice splits 1,000 to Bob and Carol by clause
+(`tests/test_payouts.py::test_demo_alice_pays_bob_and_carol_by_clause`).

@@ -44,6 +44,19 @@ from .grants import (
     parse_grant_create,
     parse_grant_draw,
 )
+from .payouts import (
+    PAYOUT_FEE_BEARING_TX_TYPES,
+    PAYOUT_TX_TYPES,
+    TX_TYPE_PAYOUT_CREATE,
+    TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_REMOVE,
+    PayoutShapeError,
+    apply_payout,
+    clause_outputs_for,
+    parse_payout_create,
+    parse_payout_execute,
+    parse_payout_remove,
+)
 from .routes import (
     ROUTE_FEE_BEARING_TX_TYPES,
     ROUTE_TX_TYPES,
@@ -82,6 +95,7 @@ from .credits import (
     CREDIT_GRANT_DRAW,
     CREDIT_GRANT_REFUND,
     CREDIT_RETRACTABLE_RELEASE,
+    CREDIT_PAYOUT_LEG,
     CREDIT_ROUTE_OUTPUT,
     CREDIT_TRANSFER,
     CreditLedger,
@@ -122,6 +136,7 @@ FEE_BEARING_TX_TYPES = frozenset(
     | set(RULE_OFFER_TX_TYPES)
     | set(STANDING_FEE_BEARING_TX_TYPES)
     | set(ROUTE_FEE_BEARING_TX_TYPES)
+    | set(PAYOUT_FEE_BEARING_TX_TYPES)
 )
 
 
@@ -337,6 +352,9 @@ def _escrow_total(lm) -> int:
     standing = getattr(lm, "standing", None)
     if standing is not None:
         total += standing.escrowed_total()
+    payouts = getattr(lm, "payouts", None)
+    if payouts is not None:
+        total += payouts.escrowed_total()
     return total
 
 
@@ -1889,6 +1907,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_standing_cancel: Optional[bytes] = None
             pending_route_set = None
             pending_route_remove: Optional[bytes] = None
+            pending_payout_create = None
+            pending_payout_execute = None
+            pending_payout_remove: Optional[bytes] = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -3197,6 +3218,141 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 "Route removed: " + request.account_pubkey[:16] + "..."
                             )
 
+            elif tx_type in PAYOUT_TX_TYPES:
+                # Nothing here reads nested `payload` or `operations`: only root
+                # fields are signed, so anything else is unsigned data.
+                if accepted_in_block and not hard_reject:
+                    payout_book = lifecycle_mgr.payouts
+
+                    def _stage_write(addr, value):
+                        staged_writes[addr] = value
+
+                    if tx_type == TX_TYPE_PAYOUT_CREATE:
+                        try:
+                            entry = parse_payout_create(tx)
+                        except PayoutShapeError as exc:
+                            entry = None
+                            reason = f"invalid payout create ({exc})"
+                        else:
+                            chain_error = check_chain_binding(tx, lifecycle_mgr.genesis_hash)
+                            if not isinstance(sender, str) or sender != entry.payer_pubkey:
+                                reason = "sender is not the payer"
+                            elif chain_error is not None:
+                                reason = f"chain binding failed: {chain_error}"
+                            else:
+                                _, reason = payout_book.can_admit_create(
+                                    entry, int(block_height or 0), int(block_timestamp or 0)
+                                )
+                        if entry is None or reason:
+                            tx_receipt["logs"].append(f"Payout ignored: {reason}")
+                            tx_receipt["reason"] = "payout_not_created"
+                            accepted_in_block = False
+                        else:
+                            pending_payout_create = entry
+                            tx_receipt["logs"].append(
+                                "Payout created: " + entry.payout_id.hex()
+                            )
+                    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+                        try:
+                            request = parse_payout_execute(tx)
+                        except PayoutShapeError as exc:
+                            request = None
+                            reason = f"invalid payout execute ({exc})"
+                        else:
+                            chain_error = check_chain_binding(tx, lifecycle_mgr.genesis_hash)
+                            if chain_error is not None:
+                                reason = f"chain binding failed: {chain_error}"
+                            elif target_balances is None:
+                                reason = "no balance overlay to pay into"
+                            else:
+                                _, reason = payout_book.can_admit_execute(
+                                    request.payout_id, sender,
+                                    int(block_height or 0), int(block_timestamp or 0),
+                                    fee_limit=fees.parse_fee_limit(tx.get("fee_limit")),
+                                )
+                        if request is None or reason:
+                            tx_receipt["logs"].append(
+                                f"Payout execute ignored: {reason}"
+                            )
+                            tx_receipt["reason"] = "payout_execute_not_applied"
+                            accepted_in_block = False
+                        else:
+                            # The clause decides the amounts, evaluated in
+                            # the isolated payout policy pool. A clause that
+                            # cannot be read pays nothing (fail-closed); the
+                            # tx is skipped, not the rule.
+                            entry = payout_book.get(request.payout_id)
+                            outputs = clause_outputs_for(
+                                entry.clause,
+                                payer_balance=_read_bal(entry.payer_pubkey),
+                                ts=int(block_timestamp or 0),
+                                payer_pubkey=entry.payer_pubkey,
+                            )
+                            if outputs is None:
+                                tx_receipt["logs"].append(
+                                    "Payout execute skipped (clause_unavailable)"
+                                )
+                                tx_receipt["reason"] = "payout_execute_skipped"
+                                accepted_in_block = False
+                            else:
+                                amounts = [
+                                    outputs.get(f"o{i + 1}", 0)
+                                    for i in range(len(entry.recipients))
+                                ]
+                                # The shared apply function. fee=0 here: this
+                                # tx is fee-bearing, so the standard fee
+                                # settlement charges the payer separately after
+                                # the body.
+                                outcome, period = apply_payout(
+                                    payout_book, request.payout_id,
+                                    int(block_timestamp or 0), amounts,
+                                    read=_read_bal, write=_stage_write,
+                                    fee=0, fee_beneficiary="",
+                                    credit_records=credit_records,
+                                )
+                                if outcome == "executed":
+                                    # Only an executed payout consumes the
+                                    # period cap; a skipped one pays nothing
+                                    # and leaves the period open.
+                                    payout_book.mark_executed(
+                                        request.payout_id, period, sum(amounts)
+                                    )
+                                    pending_payout_execute = request
+                                    tx_receipt["logs"].append(
+                                        "Payout executed: "
+                                        + request.payout_id.hex()
+                                    )
+                                else:
+                                    tx_receipt["logs"].append(
+                                        f"Payout execute skipped ({outcome})"
+                                    )
+                                    tx_receipt["reason"] = "payout_execute_skipped"
+                                    accepted_in_block = False
+                    else:  # TX_TYPE_PAYOUT_REMOVE
+                        try:
+                            request = parse_payout_remove(tx)
+                        except PayoutShapeError as exc:
+                            request = None
+                            reason = f"invalid payout remove ({exc})"
+                        else:
+                            chain_error = check_chain_binding(tx, lifecycle_mgr.genesis_hash)
+                            if chain_error is not None:
+                                reason = f"chain binding failed: {chain_error}"
+                            else:
+                                _, reason = payout_book.can_admit_remove(
+                                    request.payout_id, sender,
+                                    int(block_height or 0), int(block_timestamp or 0),
+                                )
+                        if request is None or reason:
+                            tx_receipt["logs"].append(f"Payout remove ignored: {reason}")
+                            tx_receipt["reason"] = "payout_remove_not_applied"
+                            accepted_in_block = False
+                        else:
+                            pending_payout_remove = request.payout_id
+                            tx_receipt["logs"].append(
+                                "Payout removed: " + request.payout_id.hex()
+                            )
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3813,6 +3969,28 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         pending_route_remove[:16], "removed"
                     )
                     route_book.remove(pending_route_remove)
+
+            if accepted_in_block and not hard_reject:
+                if (pending_payout_create is not None
+                        or pending_payout_execute is not None
+                        or pending_payout_remove is not None):
+                    payout_book = _lifecycle_for_write().payouts
+                if pending_payout_create is not None:
+                    tx_receipt["payout_event"] = (
+                        pending_payout_create.payout_id.hex(), "created"
+                    )
+                    payout_book.submit(pending_payout_create)
+                elif pending_payout_execute is not None:
+                    tx_receipt["payout_event"] = (
+                        pending_payout_execute.payout_id.hex(), "executed"
+                    )
+                    # The book's mark_executed already advanced the schedule
+                    # in the branch above; nothing left to commit here.
+                elif pending_payout_remove is not None:
+                    tx_receipt["payout_event"] = (
+                        pending_payout_remove.hex(), "removed"
+                    )
+                    payout_book.remove(pending_payout_remove)
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same

@@ -27,7 +27,7 @@ PIN_BUILD_SECONDS = 0.100
 RECYCLE_BUILDS = 500
 RECYCLE_STEPS = 20_000
 RECYCLE_RSS_BYTES = 1 << 30
-POOL_NAMES = ("apply", "admission")
+POOL_NAMES = ("apply", "admission", "payout")
 
 # Without an injected probe, worker memory is read this often (in requests).
 RSS_PROBE_EVERY = 64
@@ -78,6 +78,24 @@ def clause_key(body: str) -> str:
 
 def clause_spec(body: str) -> str:
     return f"always ( {body} )."
+
+
+def _parse_output_int(value) -> int | None:
+    """A plain non-negative integer from an output string, else None.
+
+    Accepts "123" and "{ 123 }:bv[16]". Hex, binary and other bit-vector
+    forms are not amounts and return None, so a payout clause that emits
+    them pays nothing instead of paying a misread amount.
+    """
+    if value is None:
+        return None
+    match = _O5_VALUE.match(str(value).strip())
+    if not match:
+        return None
+    hex_digits, bin_digits, dec_digits = match.groups()
+    if dec_digits is not None:
+        return int(dec_digits)
+    return None
 
 
 def parse_o5(value: str | None) -> int | None:
@@ -180,6 +198,35 @@ class PolicyEvaluator:
         o5 = resp.get("o5")
         value = parse_o5(o5)
         return PolicyVerdict(blocked=value == 0, o5=o5, built=bool(resp.get("built")))
+
+    def step_outputs(self, body: str, inputs: dict, *,
+                     timeout=_SESSION_DEFAULT) -> dict:
+        """{output name: int} for the clause's numeric outputs.
+
+        The worker step returns every output stream by name; this parses
+        the ones that are plain integers and omits the rest. Raises
+        PolicyBuildError / PolicyStepError exactly like verdict() when the
+        clause does not build or cannot be stepped, so a payout execution
+        that cannot read its clause fails closed (no payment).
+        """
+        resp = self._run(
+            {"op": "step", "key": clause_key(body), "text": body,
+             "inputs": dict(inputs or {})},
+            timeout,
+        )
+        if not resp.get("ok"):
+            if resp.get("phase") == "build":
+                raise PolicyBuildError(str(resp.get("error") or ""))
+            if resp.get("phase") == "step":
+                raise PolicyStepError(str(resp.get("error") or ""))
+            raise SpeculationError(f"policy step failed: {_failure_text(resp)}")
+        outputs = resp.get("outputs") or {}
+        result = {}
+        for name, raw in outputs.items():
+            value = _parse_output_int(raw)
+            if value is not None:
+                result[name] = value
+        return result
 
     def stats(self) -> dict:
         with self._lock:

@@ -559,6 +559,58 @@ class TipAdmissionView:
     def open_route_count(self) -> int:
         return self._retractable_scalar("SELECT COUNT(*) FROM routes_v1")
 
+    def get_payout(self, payout_id: bytes) -> Optional[dict]:
+        """The open payout rule with this id, or None (unknown or
+        already resolved)."""
+        try:
+            with db._db_lock:
+                row = db._db_conn.execute(
+                    "SELECT payer_pubkey, recipients, clause, "
+                    "max_per_execution, max_per_period, period_kind, "
+                    "period_length, period_anchor, start_at, expires_at, "
+                    "locked_until, sequence_number, period_index, "
+                    "paid_in_period, executions "
+                    "FROM payouts_v1 WHERE payout_id = ?",
+                    (bytes(payout_id).hex(),),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        try:
+            recipients = json.loads(row[1])
+        except (TypeError, ValueError):
+            recipients = row[1]
+        return {
+            "payout_id": bytes(payout_id).hex(),
+            "payer_pubkey": row[0],
+            "recipients": recipients,
+            "clause": row[2],
+            "max_per_execution": int(row[3]),
+            "max_per_period": int(row[4]),
+            "period_kind": int(row[5]),
+            "period_length": None if row[6] is None else int(row[6]),
+            "period_anchor": int(row[7]),
+            "start_at": int(row[8]),
+            "expires_at": None if row[9] is None else int(row[9]),
+            "locked_until": None if row[10] is None else int(row[10]),
+            "sequence_number": int(row[11]),
+            "period_index": (
+                None if row[12] is None else int(row[12])
+            ),
+            "paid_in_period": int(row[13]),
+            "executions": int(row[14]),
+        }
+
+    def open_payout_count_for_payer(self, payer_pubkey: str) -> int:
+        return self._retractable_scalar(
+            "SELECT COUNT(*) FROM payouts_v1 WHERE payer_pubkey = ?",
+            (payer_pubkey,),
+        )
+
+    def open_payout_count(self) -> int:
+        return self._retractable_scalar("SELECT COUNT(*) FROM payouts_v1")
+
     def get_retractable(self, retractable_id: bytes) -> Optional[dict]:
         """The open entry with this id, or None (unknown or already resolved)."""
         try:

@@ -11,6 +11,7 @@ from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_RE
 from consensus.grants import TX_TYPE_GRANT_CREATE
 from consensus.standing import TX_TYPE_STANDING_PAYMENT
 from consensus.routes import TX_TYPE_ROUTE_SET
+from consensus.payouts import TX_TYPE_PAYOUT_CREATE
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
 from consensus import bls
@@ -66,6 +67,13 @@ def _recipient_keys(tx: dict) -> list:
         return [("payee_pubkey", tx.get("payee_pubkey"))]
     if tx_type == TX_TYPE_ROUTE_SET:
         return [("destination_pubkey", tx.get("destination_pubkey"))]
+    if tx_type == TX_TYPE_PAYOUT_CREATE:
+        # One pair per recipient: the engine validates each value as a
+        # single 96-hex pubkey, so the list itself must never be a value.
+        recipients = tx.get("recipients") or []
+        if not isinstance(recipients, list):
+            return [("recipients", recipients)]
+        return [("recipients", r) for r in recipients]
     if tx_type in (TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST):
         keys = (
             [("recipient_pubkey", tx.get("recipient_pubkey"))]
