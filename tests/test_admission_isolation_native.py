@@ -327,12 +327,15 @@ def test_a_rule_is_judged_against_the_committed_type_history(authority):
 
 # --- custom inputs reach the evaluator as values --------------------------------
 
-CUSTOM = "17"
+# i27: an ordinary custom stream. (i17 is the node-fed hold-length stream
+# since recipient-side policy, issues #47/#76, so it cannot be a sender
+# custom input any more.)
+CUSTOM = "27"
 
 
 def _custom_policy():
-    """The sender is blocked when its own custom input i17 is 7."""
-    return ("always ( (i17[t]:bv[24] = { #x000007 }:bv[24]) "
+    """The sender is blocked when its own custom input i27 is 7."""
+    return ("always ( (i27[t]:bv[24] = { #x000007 }:bv[24]) "
             "? (o5[t]:bv[24] = { #x000000 }:bv[24]) "
             ": (o5[t]:bv[24] = { #x000001 }:bv[24]) ).")
 

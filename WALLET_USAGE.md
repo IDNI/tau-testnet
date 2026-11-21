@@ -144,6 +144,7 @@ An operation key `N` maps to Tau input stream `iN`. The wallet supports:
 | `i13` | proposer pubkey, reserved under the `tau_validator_set` eligibility mode |
 | `i14` / `i15` | consensus stake / eligibility-mode inputs |
 | `i16` | seconds since the sender's previous transfer (`bv[64]`). Reserved **only while the network feeds it**; until then it is an ordinary custom stream. While reserved, a policy clause may not read it. |
+| `i17` | hold length of the transfer being evaluated (`bv[64]`, set by the node): `0` for a plain transfer, seconds until release for a `release_at_time` park, blocks for a `release_at_height` park. Readable by policy (`o5`) rules and clauses — e.g. a max-hold cap (see below). Rejected in **fee** (`o8`) rules, since admission measures it against the advisory next-block clock and apply against the block's own clock. |
 | `i18`–`i25` | co-signature approval slots, reserved once the chain has activated approvals; only the node fills them |
 
 So user-controllable custom input streams start at **`i13`**, and the streams
@@ -188,7 +189,8 @@ rejects the whole transaction (no partial execution); a malformed `o5` fails
 closed (treated as block), and so does a registered clause the engine refuses to
 evaluate for the transfer's inputs.
 
-A clause is evaluated on its own, and only for transfers you send, so it carries
+A clause is evaluated on its own, for transfers you send *and* for transfers
+sent to you (see "Recipient-side policy" below), so it carries
 **no sender guard** and must not reference `i12`. You hold one clause; submitting
 another replaces it. A transfer is blocked when the consensus rules or your
 clause yield `o5 = 0`. A policy rule cannot share a transaction with transfers
@@ -215,6 +217,27 @@ Examples expressible today:
 - **Recipient whitelist:** `always ( (i4[t]:bv[384] = { #x<96-hex recipient pubkey> }:bv[384]) ? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24]) ).`
 - **Time-lock:** block transfers while `i5[t]:bv[64]` is below the unlock timestamp.
 - **Spending limit:** block when `i1[t]` exceeds a per-tier cap.
+
+### Recipient-side policy (`o5` as the recipient)
+
+Your clause is also evaluated when **you are the recipient**: a transfer to
+you passes only if the sender's policy *and* your policy allow it, at
+admission and at apply. In that evaluation the counterparty is `i3` (the
+sender), the amount is `i1`, and the hold length is `i17`. Examples:
+
+- **Inbound allow-list:** allow incoming only from one sender —
+  `always ( (i3[t]:bv[384] = { #x<96-hex sender pubkey> }:bv[384]) ? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24]) ).`
+- **Instant only (cap 0):** accept plain transfers, refuse every park —
+  `always ( (i17[t]:bv[64] <= { #x0000000000000000 }:bv[64]) ? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24]) ).`
+- **Cap 600 seconds:** accept parks held up to 10 minutes, refuse longer
+  ones — `always ( (i17[t]:bv[64] <= { #x0000000000000258 }:bv[64]) ? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24]) ).`
+
+A recipient block is refused with a distinct code (`RECIPIENT_POLICY_BLOCK`,
+or `RECIPIENT_MAX_HOLD` with `max_hold_seconds` / `max_hold_blocks` when
+the cap is the cause). Check `gettaustate` / `checktx` `capabilities`
+(`recipient_policy`, `recipient_max_hold`) before deploying an
+inbound-only rule: a node without the feature refuses an `i17` rule at
+deploy. Full detail: `docs/recipient-policy.md`.
 
 To remove your clause, submit the neutral clause
 `always ( (o5[t]:bv[24] = { #x000001 }:bv[24]) ).`. Changing or removing it fails

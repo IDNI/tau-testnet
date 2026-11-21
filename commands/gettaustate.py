@@ -1,4 +1,5 @@
 import api_response
+import tau_defs
 
 
 def execute(raw_command: str, container):
@@ -9,4 +10,13 @@ def execute(raw_command: str, container):
         )
 
     state = container.chain_state.get_rules_state()
-    return api_response.success_response("gettaustate", {"rules_state": state or ""})
+    # Capabilities let a wallet detect whether recipient-side policy is
+    # active on this node before deploying an inbound-only rule (issues
+    # #47/#76): an old node has no such field, which means inactive.
+    return api_response.success_response(
+        "gettaustate",
+        {
+            "rules_state": state or "",
+            "capabilities": tau_defs.node_capabilities(),
+        },
+    )
