@@ -530,6 +530,28 @@ in place of `--file`, `--fee`, `--expire-in N` (default 2000 blocks, so the
 send nothing) and `--dry-run`, and print the request id. `cancel` is feeless.
 They exit like the other transaction commands.
 
+## Recipient controls
+
+Control who may pay **you**: your `o5` clause is also judged in the recipient
+role, so you can refuse senders you never approved and parks held longer than
+you accept. Semantics are in [recipient-controls.md](recipient-controls.md).
+
+```bash
+tau-testnet policy receive set --key alice --sender <pubkey> [--sender <pubkey>]
+tau-testnet policy receive set --key alice --instant
+tau-testnet policy receive set --key alice --max-hold-seconds 600
+tau-testnet policy receive set --key alice --sender <pubkey> --print-only
+tau-testnet policy receive show <address>
+tau-testnet policy receive clear --key alice
+```
+
+`set` builds the clause from the plain-language options and submits it as a
+policy `set` rule-change request (so `--preview`/`--dry-run`/guard semantics
+are the ones above); `--print-only` prints the clause text and sends nothing.
+`clear` submits a `revoke`. A refusal at `sendtx`/`checktx` comes back as
+`RECIPIENT_POLICY_BLOCK`, or as `RECIPIENT_MAX_HOLD` with the measured cap
+(`max_hold_seconds` / `max_hold_blocks`) in the details.
+
 ## Retractable transfers
 
 Escrow a transfer until a block height or Unix time; the sender can take it back

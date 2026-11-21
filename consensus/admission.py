@@ -928,6 +928,56 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
     })
 
 
+_HOLD_STREAM_NAMES = (
+    f"i{tau_defs.RECIPIENT_HOLD_SECONDS_STREAM_INDEX}",
+    f"i{tau_defs.RECIPIENT_HOLD_BLOCKS_STREAM_INDEX}",
+)
+_HOLD_MENTION_RE = re.compile(
+    r"\bi(?:%d|%d)\b" % (
+        tau_defs.RECIPIENT_HOLD_SECONDS_STREAM_INDEX,
+        tau_defs.RECIPIENT_HOLD_BLOCKS_STREAM_INDEX,
+    )
+)
+
+
+def _screen_recipient_hold_streams(body: str) -> Optional[str]:
+    """Screens for the recipient-control hold streams (issues #47/#76).
+
+    A clause that reads i17/i27 is a recipient rule: it only means anything
+    on a node that feeds those streams into clause evaluations. A node
+    without the feature must refuse it at deploy with a clear reason, never
+    accept it silently and never run it (issue #47's capability rule). Where
+    the feature is active, every mention must be typed at the frozen width:
+    per-stream typing is process-global and sticky, so one clause typing
+    i17 at another width would poison the policy evaluator for everyone.
+    """
+    scrubbed = _strip_tau_comments(body or "")
+    if not _HOLD_MENTION_RE.search(scrubbed):
+        return None
+    if not tau_defs.RECIPIENT_POLICY_ACTIVE:
+        return (
+            "Recipient-control rules (reading "
+            + " or ".join(_HOLD_STREAM_NAMES)
+            + ") are not supported by this node: it never feeds the hold "
+            "streams, so the rule would be accepted but never enforced. "
+            "Deploy it on a node with recipient controls active."
+        )
+    width = tau_defs.RECIPIENT_HOLD_BV_WIDTH
+    typed_tail = re.compile(
+        r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*%d\s*\]" % width
+    )
+    for match in _HOLD_MENTION_RE.finditer(scrubbed):
+        if not typed_tail.match(scrubbed, match.end()):
+            return (
+                "every mention of the hold streams "
+                + " and ".join(_HOLD_STREAM_NAMES)
+                + f" must be written iN[t]:bv[{width}]; an untyped or "
+                "differently-typed mention lets the engine infer a "
+                "conflicting width process-wide"
+            )
+    return None
+
+
 def _screen_clause_domains(body: str) -> Optional[str]:
     """Reserved-domain screens for a clause body, shared by offer and accept.
 
@@ -967,6 +1017,10 @@ def _screen_clause_domains(body: str) -> Optional[str]:
             "Shared rules may not reference reserved input streams: "
             + ", ".join(typed)
         )
+
+    hold_error = _screen_recipient_hold_streams(body)
+    if hold_error:
+        return hold_error
 
     return _screen_clause_widths_and_structure(body)
 

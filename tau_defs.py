@@ -281,6 +281,47 @@ EXTRA_RESERVED_OPERATION_KEYS = (12, 14, 15)
 TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS = (13,)
 
 
+# --- Recipient controls (issues #47/#76) -------------------------------------
+# A transfer is admitted only when the RECIPIENT's o5 policy also allows it,
+# not just the sender's. The recipient's registered o5 clause is evaluated a
+# second time per transfer, in the recipient role (the owner is i4, the
+# counterparty sender is i3 -- clause bodies may not reference i12), through
+# the same shared transfer closure every payment path uses, so ordinary
+# transfers, batches, escrow parks and approval-request settlements are all
+# gated by the one implementation.
+#
+# The hold a payment carries is visible to policy clauses on two host-fed
+# streams, fed ONLY into clause evaluations (sender-role and recipient-role),
+# never into the shared session map, so the shared evaluation stays
+# byte-identical to before:
+#   i17: the hold in SECONDS (release_at_time - block timestamp), bv[64]
+#   i27: the hold in BLOCKS  (release_at_height - block height), bv[64]
+# An ordinary transfer and an approval-request settlement carry 0 on both.
+# A park carries its hold on exactly one of them (a park is time-based or
+# height-based, never both). A cap written against one unit therefore sees
+# the other unit's parks as a positive hold on the other stream: a
+# seconds-only cap that also refuses i27 > 0 fails closed against height
+# parks instead of silently reading them as 0. Clause screens pin both
+# streams at bv[64] (consensus/admission.py), because per-stream typing is
+# process-global and sticky.
+RECIPIENT_HOLD_SECONDS_STREAM_INDEX = 17
+RECIPIENT_HOLD_BLOCKS_STREAM_INDEX = 27
+RECIPIENT_HOLD_BV_WIDTH = 64
+
+# ON in this build. Flipping it off is a CONSENSUS CHANGE of the same class
+# as COOLDOWN_STREAM_ACTIVE: while off, the engine runs no recipient
+# evaluation and admission REFUSES clause bodies that reference the hold
+# streams, with a clear reason -- a node without the feature must never
+# silently accept a recipient rule it will never execute (issue #47).
+RECIPIENT_POLICY_ACTIVE = True
+
+# Receipt / admission reasons for a recipient-side refusal. The MAX_HOLD
+# reason always carries the cap the recipient's policy was measured to
+# accept for that transfer, so a wallet can print a sentence a human
+# understands ("Third only accepts payments held up to 10 minutes").
+REASON_RECIPIENT_POLICY_BLOCK = "recipient_policy_block"
+REASON_RECIPIENT_MAX_HOLD = "recipient_max_hold"
+
 # --- Co-signature approval slots (i18..i25) ----------------------------------
 # Streams the node fills with the public key of an approver who has actually
 # submitted a verified vote on a parked transfer. A user policy rule tests them

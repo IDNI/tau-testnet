@@ -14,7 +14,7 @@ import tau_manager
 from tau_manager import parse_tau_output
 import utils
 from errors import TauCommunicationError
-from consensus import fees, sender_policy
+from consensus import fees, recipient_policy, sender_policy
 from consensus.fees import FeeRuleError
 from consensus.lanes import classify_lane
 from consensus.tx_checks import check_transfer, validate_bls_pubkey
@@ -25,7 +25,7 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_REJECT,
     RULE_OFFER_TX_TYPES,
 )
-from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
+from consensus.retractable import KIND_TIME, TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -518,6 +518,21 @@ def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
     body = tip_view.clause_for(sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX)
     return _policy_call(lambda: sender_policy.clause_blocks(
         body, values, pool="admission", timeout=budget
+    ))
+
+
+def _recipient_clause_verdict(tip_view, sender_pubkey, recipient_pubkey,
+                              values, budget, hold_seconds=0, hold_blocks=0):
+    """The recipient-role verdict for one transfer (issues #47/#76).
+
+    Mirrors the apply-side gate in consensus/engine.py: admission is the
+    early filter, apply is authoritative.
+    """
+    return _policy_call(lambda: recipient_policy.recipient_verdict(
+        tip_view.clause_for, recipient_pubkey, values,
+        pool="admission", timeout=budget,
+        hold_seconds=hold_seconds, hold_blocks=hold_blocks,
+        sender=sender_pubkey,
     ))
 
 
@@ -1198,6 +1213,23 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         )
                     logger.info("Tau custom input validation successful.")
 
+            # The hold this payment carries (issue #76): only a park has
+            # one, measured against the tip the block will extend -- the
+            # same reference apply uses (the including block's height and
+            # timestamp are its own, so admission stays advisory here in
+            # exactly the way i5 already is).
+            admission_hold_seconds = 0
+            admission_hold_blocks = 0
+            if tx_type == TX_TYPE_RETRACTABLE_TRANSFER:
+                _park_data = admission_eval.data or {}
+                _release_at = int(_park_data.get("release_at") or 0)
+                if _park_data.get("release_kind") == KIND_TIME:
+                    admission_hold_seconds = max(
+                        0, _release_at - int(tip_view.next_block_timestamp))
+                else:
+                    admission_hold_blocks = max(
+                        0, _release_at - int(tip_view.next_block_height))
+
             # Step 3: Transfer Validation
             if has_transfers and all_validated_transfers and not skip_tau_eval:
                 if tau_force_test:
@@ -1295,9 +1327,15 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                     transfer_index=i + 1,
                                 )
 
+                        # Clause evaluations carry the hold streams, as at
+                        # apply; the shared step above never sees them.
+                        clause_values = recipient_policy.with_hold(
+                            tau_input_stream_values,
+                            admission_hold_seconds, admission_hold_blocks,
+                        )
                         own_blocks, own_o5 = _sender_clause_blocks(
                             tip_view, sender_pubkey,
-                            tau_input_stream_values, admission_tau.budget,
+                            clause_values, admission_tau.budget,
                         )
                         if own_blocks:
                             return _qt_err(
@@ -1308,6 +1346,40 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                     f"Policy output: {own_o5}"
                                 ),
                                 transfer_index=i + 1,
+                            )
+
+                        # --- Recipient Policy Check (o5, issues #47/#76) ---
+                        verdict = _recipient_clause_verdict(
+                            tip_view, sender_pubkey,
+                            tau_input_dict['to_addr'], clause_values,
+                            admission_tau.budget,
+                            hold_seconds=admission_hold_seconds,
+                            hold_blocks=admission_hold_blocks,
+                        )
+                        if verdict.blocked:
+                            if verdict.reason == tau_defs.REASON_RECIPIENT_MAX_HOLD:
+                                unit = verdict.cap_unit
+                                return _qt_err(
+                                    "RECIPIENT_MAX_HOLD",
+                                    (
+                                        f"Transaction rejected: the recipient only "
+                                        f"accepts payments held up to {verdict.cap} "
+                                        f"{unit}; send a shorter park or an instant "
+                                        f"transfer instead (transfer #{i+1})."
+                                    ),
+                                    transfer_index=i + 1,
+                                    recipient=tau_input_dict['to_addr'],
+                                    **verdict.max_hold,
+                                )
+                            return _qt_err(
+                                "RECIPIENT_POLICY_BLOCK",
+                                (
+                                    f"Transaction rejected: the recipient's policy "
+                                    f"refuses this payment for transfer #{i+1} "
+                                    f"({transfer_details}). Policy output: {verdict.detail}"
+                                ),
+                                transfer_index=i + 1,
+                                recipient=tau_input_dict['to_addr'],
                             )
 
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
@@ -1373,7 +1445,11 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                     # allows: the o5 rules and the sender's own clause, which
                     # the registry holds apart from the step.
                     if _o5_allows(fee_outputs) and not _sender_clause_blocks(
-                        tip_view, sender_pubkey, fee_query_inputs,
+                        tip_view, sender_pubkey,
+                        # A parked approval transfer carries no retractable
+                        # hold; the hold streams are fed (zeroed) so every
+                        # clause evaluation sees them, as at apply.
+                        recipient_policy.with_hold(fee_query_inputs),
                         admission_tau.budget,
                     )[0]:
                         return _qt_err(

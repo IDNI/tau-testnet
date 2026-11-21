@@ -2201,6 +2201,88 @@ def cmd_policy_change_cancel(args: argparse.Namespace) -> int:
     return _submit_rule_tx(args, _build)
 
 
+# --- Recipient controls (issues #47/#76) --------------------------------------
+# Plain-language installs over the same rule-change path as a policy set:
+# the templates live in consensus.recipient_policy so the CLI, the docs and
+# the tests all speak about the same clause bodies.
+
+def _receive_body(args: argparse.Namespace, owner: str) -> str:
+    from consensus import recipient_policy
+
+    senders = []
+    for raw in (getattr(args, "sender", None) or []):
+        key = raw.strip().lower()
+        if len(key) != 96 or any(c not in "0123456789abcdef" for c in key):
+            raise _PayloadError(
+                f"--sender is not a BLS pubkey (96 hex chars): {raw}")
+        senders.append(key)
+    seconds = getattr(args, "max_hold_seconds", None)
+    blocks = getattr(args, "max_hold_blocks", None)
+    if getattr(args, "instant", False):
+        if seconds is not None or blocks is not None:
+            raise _PayloadError(
+                "--instant already caps the hold at 0; drop --max-hold-*")
+        seconds = blocks = 0
+    if not senders and seconds is None and blocks is None:
+        raise _PayloadError(
+            "nothing to install: give at least one --sender, a "
+            "--max-hold-seconds/--max-hold-blocks cap, or --instant")
+    return recipient_policy.recipient_clause_body(
+        owner, allowed_senders=senders,
+        max_hold_seconds=seconds, max_hold_blocks=blocks,
+    )
+
+
+def cmd_policy_receive_set(args: argparse.Namespace) -> int:
+    try:
+        _sk, owner = _resolve_signing_key(args)
+        body = _receive_body(args, owner)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    if getattr(args, "print_only", False):
+        print(body)
+        return EXIT_OK
+    return _submit_rule_change(args, _KIND_BY_NAME["set"], body, "")
+
+
+def cmd_policy_receive_clear(args: argparse.Namespace) -> int:
+    return _submit_rule_change(args, _KIND_BY_NAME["revoke"], "", "")
+
+
+def cmd_policy_receive_show(args: argparse.Namespace) -> int:
+    try:
+        address = _address_or_key(args)
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    raw = _send(args, f"getruleoffers {address} all")
+    if rpc_mod.is_error_response(raw):
+        if args.json:
+            print_result({"error": raw}, json_mode=True)
+        else:
+            print(raw)
+        return EXIT_APP_ERROR
+    import tau_defs
+
+    data = (parse_json_response(raw) or {}).get("data") or {}
+    clause = None
+    for entry in data.get("accepted_clauses") or []:
+        if entry.get("target_stream") == tau_defs.USER_POLICY_STREAM_INDEX:
+            clause = entry.get("clause_body")
+    if args.json:
+        print_result({"address": address, "policy_clause": clause},
+                     json_mode=True)
+    elif clause:
+        print(f"policy clause on {address}:\n{clause}")
+        if "i17" in clause or "i27" in clause:
+            print("recipient controls: this clause reads the hold streams "
+                  "(it caps how long a payment to you may be held)")
+    else:
+        print(f"no policy clause on {address}: every payment may land")
+    return EXIT_OK
+
+
 def _add_policy_subparsers(sub) -> None:
     """`tau-testnet policy ...` -- the rule-change guard and its requests."""
     import tau_defs
@@ -2306,6 +2388,58 @@ def _add_policy_subparsers(sub) -> None:
     p_ccan.add_argument("--expire-at-height", type=int,
                         help="Absolute expiry height (overrides --expire-in)")
     p_ccan.set_defaults(func=cmd_policy_change_cancel)
+
+    p_recv = psub.add_parser(
+        "receive", parents=common,
+        help="Control who may pay you (recipient controls, issues #47/#76)",
+    )
+    rsub = p_recv.add_subparsers(dest="receive_command", required=True)
+
+    p_rset = rsub.add_parser(
+        "set", parents=common,
+        help="Install recipient controls from plain-language options",
+    )
+    _key_group(p_rset)
+    p_rset.add_argument(
+        "--sender", action="append", metavar="PUBKEY",
+        help="A sender allowed to pay you (96 hex). Repeatable; anyone not "
+             "listed is refused.",
+    )
+    p_rset.add_argument(
+        "--max-hold-seconds", type=int, default=None, metavar="N",
+        help="Longest time-based park that may land, in seconds. Height-"
+             "based parks are refused unless --max-hold-blocks is also set.",
+    )
+    p_rset.add_argument(
+        "--max-hold-blocks", type=int, default=None, metavar="N",
+        help="Longest height-based park that may land, in blocks. Time-"
+             "based parks are refused unless --max-hold-seconds is also set.",
+    )
+    p_rset.add_argument(
+        "--instant", action="store_true",
+        help="Accept only instant, final payments: refuse every park.",
+    )
+    p_rset.add_argument(
+        "--print-only", action="store_true",
+        help="Print the clause text and send nothing",
+    )
+    _request_flags(p_rset)
+    p_rset.set_defaults(func=cmd_policy_receive_set)
+
+    p_rclear = rsub.add_parser(
+        "clear", parents=common,
+        help="Remove your policy clause (accept every payment again)",
+    )
+    _key_group(p_rclear)
+    _request_flags(p_rclear)
+    p_rclear.set_defaults(func=cmd_policy_receive_clear)
+
+    p_rshow = rsub.add_parser("show", parents=common,
+                              help="The policy clause on an account")
+    p_rshow.add_argument("address", nargs="?",
+                         help="Address (default: your key's)")
+    _key_group(p_rshow, required=False)
+    p_rshow.set_defaults(func=cmd_policy_receive_show)
 
 
 # --- Retractable transfers --------------------------------------------------

@@ -16,6 +16,7 @@ from .governance import (
     is_tau_authoritative_eligibility_mode,
 )
 from . import faucet, fees
+from . import recipient_policy
 from . import sender_policy
 from .fees import FeeRuleError
 from .approvals import (
@@ -1867,7 +1868,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     own_blocks, _own_o5 = sender_policy.clause_blocks(
                         lifecycle_mgr.rule_offers.clause_for(
                             from_addr, tau_defs.USER_POLICY_STREAM_INDEX),
-                        inputs, pool="apply",
+                        # An approval park carries no retractable hold; the
+                        # hold streams are fed (zeroed) so every clause
+                        # evaluation sees them, as the transfer path does.
+                        recipient_policy.with_hold(inputs),
+                        pool="apply",
                         timeout=getattr(_session, "request_budget", None),
                     )
                     allows = not own_blocks
@@ -1882,7 +1887,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
-                                          escrow=False):
+                                          escrow=False,
+                                          hold_seconds=0, hold_blocks=0):
                 """Execute ONE transfer under the fee model. True to continue.
 
                 Extracted verbatim from the user_tx transfer loop so the
@@ -1904,6 +1910,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
                 `escrow` stages only the debit: the credit belongs to the
                 retractable book until it releases.
+
+                `hold_seconds` / `hold_blocks` are the hold this payment
+                carries (escrow parks only; 0 on both for ordinary transfers
+                and approval settlements). They are fed into the clause
+                evaluations -- the sender's and the recipient's -- on the
+                host-fed hold streams, so a recipient hold cap (issue #76)
+                judges the park at the moment it is taken, never at release.
                 """
                 nonlocal accepted_in_block, hard_reject, execution_success
                 try:
@@ -1983,10 +1996,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             )
                             return False
 
+                        # Clause evaluations carry the hold streams (fed
+                        # here, after every merge, so no sender-supplied
+                        # custom input can shadow them); the shared session
+                        # map above stays byte-identical to before.
+                        clause_values = recipient_policy.with_hold(
+                            tau_input_stream_values, hold_seconds, hold_blocks,
+                        )
                         own_blocks, own_o5 = sender_policy.clause_blocks(
                             lifecycle_mgr.rule_offers.clause_for(
                                 from_addr, tau_defs.USER_POLICY_STREAM_INDEX),
-                            tau_input_stream_values, pool="apply",
+                            clause_values, pool="apply",
                             timeout=getattr(_session, "request_budget", None),
                         )
                         if own_blocks:
@@ -2001,6 +2021,45 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["reason"] = "user_policy_block"
                             tx_receipt["logs"].append(
                                 f"Transfer rejected by the sender's own policy clause (o5={own_o5})"
+                            )
+                            return False
+
+                        # --- Recipient policy (o5) — consensus-enforced ---
+                        # The recipient's clause, judged in the recipient
+                        # role on the same inputs (issues #47/#76). Living
+                        # here, inside the one closure, is what covers every
+                        # payment path: ordinary transfers and batches above,
+                        # approval-request settlements (whose recipient never
+                        # appears as a transfer output of the vote tx) and
+                        # escrow parks. Failure mapping mirrors the sender
+                        # clause exactly, replay included.
+                        verdict = recipient_policy.recipient_verdict(
+                            lifecycle_mgr.rule_offers.clause_for,
+                            to_addr, clause_values, pool="apply",
+                            timeout=getattr(
+                                _session, "request_budget", None),
+                            hold_seconds=hold_seconds,
+                            hold_blocks=hold_blocks,
+                            sender=from_addr,
+                        )
+                        if verdict.blocked:
+                            logger.info(
+                                "Transfer rejected by the recipient's policy for %s->%s (%s)",
+                                str(from_addr)[:10], str(to_addr)[:10],
+                                verdict.reason,
+                            )
+                            if not replay_mode:
+                                accepted_in_block = False
+                                hard_reject = True
+                            execution_success = False
+                            tx_receipt["reason"] = verdict.reason
+                            if verdict.max_hold:
+                                tx_receipt["recipient_max_hold"] = (
+                                    verdict.max_hold
+                                )
+                            tx_receipt["logs"].append(
+                                "Transfer rejected by the recipient's "
+                                f"policy ({verdict.reason})"
                             )
                             return False
 
@@ -2588,11 +2647,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             tx_receipt["reason"] = "retractable_not_parked"
                             accepted_in_block = False
                         else:
+                            _hold_seconds, _hold_blocks = (
+                                recipient_policy.park_hold(
+                                    park, int(block_height or 0),
+                                    int(block_timestamp or 0),
+                                )
+                            )
                             escrowed = _execute_fee_era_transfer(
                                 park.sender_pubkey, park.recipient_pubkey, park.amount,
                                 slot_values=_approval_slot_values(),
                                 overrides={},
                                 escrow=True,
+                                hold_seconds=_hold_seconds,
+                                hold_blocks=_hold_blocks,
                             )
                             fee_already_measured = True
                             if escrowed and accepted_in_block and not hard_reject:

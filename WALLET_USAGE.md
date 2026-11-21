@@ -188,11 +188,19 @@ rejects the whole transaction (no partial execution); a malformed `o5` fails
 closed (treated as block), and so does a registered clause the engine refuses to
 evaluate for the transfer's inputs.
 
-A clause is evaluated on its own, and only for transfers you send, so it carries
-**no sender guard** and must not reference `i12`. You hold one clause; submitting
-another replaces it. A transfer is blocked when the consensus rules or your
-clause yield `o5 = 0`. A policy rule cannot share a transaction with transfers
-(`RULE_WITH_TRANSFERS`): send the rule first, then the transfers.
+A clause is evaluated on its own, so it carries **no sender guard** and must not
+reference `i12`. You hold one clause; submitting another replaces it. A transfer
+is blocked when the consensus rules or your clause yield `o5 = 0`. A policy rule
+cannot share a transaction with transfers (`RULE_WITH_TRANSFERS`): send the rule
+first, then the transfers.
+
+Your clause is also evaluated in a second role: when someone pays **you**, your
+clause is judged again with you as the recipient (`i4`) and the payer as `i3`,
+and the payment lands only if it allows that too. That is how an account refuses
+payments from senders it never approved, or parks held longer than it accepts
+(the hold is on `i17` seconds / `i27` blocks, `bv[64]`, fed into clause
+evaluations only). See `docs/recipient-controls.md`, or install the ready-made
+forms with `tau-testnet policy receive set`.
 
 A clause may read the amount (`i1`), your balance (`i2`), sender and recipient
 (`i3`/`i4`), block time (`i5`), approval slots and custom inputs from `i26` up —

@@ -24,7 +24,7 @@ from consensus.approvals import (
     _normalize_index_map,
     _normalize_pubkey,
 )
-from consensus import sender_policy
+from consensus import recipient_policy, sender_policy
 
 _CMD = "getapprovalpreview"
 
@@ -43,7 +43,12 @@ def _own_clause_allows(clause, inputs):
 
     try:
         blocked, _detail = sender_policy.clause_blocks(
-            clause, inputs, pool="admission",
+            clause,
+            # A previewed approval transfer carries no retractable hold;
+            # the hold streams are fed (zeroed) so every clause evaluation
+            # sees them, as on the transfer path.
+            recipient_policy.with_hold(inputs),
+            pool="admission",
             timeout=tau_admission.default_budget(),
         )
     except WorkerTimeout as exc:

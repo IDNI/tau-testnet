@@ -181,6 +181,22 @@ def execute(raw_command: str, container):
             "votes": sorted(votes, key=lambda entry: (entry["update_id"], entry["voter_pubkey"])),
             "lifecycle": lifecycle,
             "stream_widths": dict(tau_defs.HOST_STREAM_WIDTHS),
+            # Capability detection for recipient controls (issues #47/#76):
+            # a wallet asks here whether this node's chain enforces a
+            # recipient's o5 policy and hold cap, instead of guessing from
+            # rule text. The hold streams are clause-evaluation inputs, not
+            # shared-session streams, so they are advertised here rather
+            # than in stream_widths.
+            "features": {
+                "recipient_policy": {
+                    "active": bool(tau_defs.RECIPIENT_POLICY_ACTIVE),
+                    "hold_seconds_stream":
+                        f"i{tau_defs.RECIPIENT_HOLD_SECONDS_STREAM_INDEX}",
+                    "hold_blocks_stream":
+                        f"i{tau_defs.RECIPIENT_HOLD_BLOCKS_STREAM_INDEX}",
+                    "hold_bv_width": tau_defs.RECIPIENT_HOLD_BV_WIDTH,
+                },
+            },
         }
 
     return api_response.success_response("getgovernance", payload)

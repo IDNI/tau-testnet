@@ -247,7 +247,13 @@ def test_the_evaluator_gets_the_values_the_main_step_got():
                    if str(c["input_stream_values"].get(1)) == "500"][-1]
     body, inputs = ev.verdict_calls[-1]
     assert body == CLAUSE
-    assert inputs == sender_policy.clause_inputs(main_values)
+    # The main step's values, plus the host-fed hold streams (zeroed for an
+    # ordinary transfer): every clause evaluation carries them so a clause
+    # reading i17/i27 is never judged on an unfed stream (recipient
+    # controls, issues #47/#76).
+    from consensus import recipient_policy
+    assert inputs == sender_policy.clause_inputs(
+        recipient_policy.with_hold(main_values))
     assert inputs["i12"] == "#x" + ap.ALICE
 
 
