@@ -13,6 +13,7 @@ from consensus.approvals import (
     ApprovalRequestLifecycleManager,
     audit_stream_collisions,
 )
+from consensus.recipient_policy import audit_hold_stream
 
 VALIDATOR_DELTA_FIELDS = ("validator_additions", "validator_removals")
 
@@ -93,7 +94,19 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "fee_beneficiary",
     "max_rule_txs_per_block",
     "approval_slots_active",
+    "recipient_controls_active",
 })
+
+
+def validate_recipient_controls_active(value: Any) -> Optional[str]:
+    """Recipient-control activation is a ONE-WAY switch to True.
+
+    Turning it off would un-reserve i17 while clauses still read the hold the
+    node feeds there, and a sender could then supply their own value.
+    """
+    if value is not True:
+        return "must be true; recipient controls cannot be deactivated once active"
+    return None
 
 
 def validate_approval_slots_active(value: Any) -> Optional[str]:
@@ -196,6 +209,7 @@ def build_mechanism_metadata(
     max_rule_txs_per_block: int = DEFAULT_MAX_RULE_TXS_PER_BLOCK,
     approval_requests_root: str = "",
     approval_slots_active: bool = False,
+    recipient_controls_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
 ) -> dict:
@@ -234,6 +248,10 @@ def build_mechanism_metadata(
     # unaffected.
     if approval_slots_active:
         mech["approval_slots_active"] = True
+    # Recipient controls: same non-default gate. i17 stays a custom stream, and
+    # the meta hash stays byte-identical, until the first activation.
+    if recipient_controls_active:
+        mech["recipient_controls_active"] = True
     if approval_requests_root:
         mech["approval_requests_root"] = approval_requests_root
     if faucet_amount:
@@ -457,6 +475,9 @@ class ConsensusLifecycleManager:
         # rollback, reorg and competing branches. Read from the PARENT snapshot,
         # so an activation recorded in block H governs H+1 onward.
         self.approval_slots_active: bool = False
+        # One-way, same timing as approval slots: an activation recorded in
+        # block H governs H+1, because apply reads the parent manager.
+        self.recipient_controls_active: bool = False
         # Pinned by genesis for the life of the network: no patch sets it.
         # Bound into the meta hash only when non-zero.
         self.faucet_amount: int = 0
@@ -544,6 +565,7 @@ class ConsensusLifecycleManager:
                 else self.approval_requests.requests_root().hex()
             ),
             approval_slots_active=self.approval_slots_active,
+            recipient_controls_active=self.recipient_controls_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
         )
@@ -657,6 +679,23 @@ class ConsensusLifecycleManager:
                 )
             else:
                 self.activate_approval_slots()
+        if "recipient_controls_active" in patch:
+            # Same two-phase rule as the approval slots above: a raise at the
+            # activation height would freeze the chain, so a collision only
+            # declines to flip the flag.
+            err = validate_recipient_controls_active(patch["recipient_controls_active"])
+            if err:
+                raise ValueError(f"recipient_controls_active: {err}")
+            corpus = effective_spec_texts() if callable(effective_spec_texts) else effective_spec_texts
+            findings = audit_hold_stream(corpus or ())
+            if findings:
+                logger.error(
+                    "recipient_controls_active activation REFUSED at this height; the "
+                    "effective spec already references i17: %s",
+                    "; ".join(findings),
+                )
+            else:
+                self.activate_recipient_controls()
         self.recompute_approval_threshold()
 
     def activate_approval_slots(self) -> None:
@@ -667,6 +706,10 @@ class ConsensusLifecycleManager:
         depend on them, letting a sender write their own approval slots.
         """
         self.approval_slots_active = True
+
+    def activate_recipient_controls(self) -> None:
+        """Turn recipient controls on. Idempotent, and there is no way back."""
+        self.recipient_controls_active = True
 
     def knows_update(self, update_id: bytes) -> bool:
         """Check if an update is currently known in any state."""

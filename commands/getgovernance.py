@@ -169,6 +169,11 @@ def execute(raw_command: str, container):
             "eligibility_mode": chain_state._lifecycle_manager.effective_eligibility_mode(),
             # "" means the levy goes to each block's proposer (the default).
             "fee_beneficiary": chain_state._lifecycle_manager.effective_fee_beneficiary(),
+            # False until a governance patch turns recipient controls on. A wallet
+            # reads this before offering an inbound allow-list or a hold cap.
+            "recipient_controls_active": (
+                chain_state._lifecycle_manager.recipient_controls_active is True
+            ),
             "active_validators": active_validators,
             "min_activation_height_for_next_update": min_activation_height,
             "active_consensus_id": active_consensus_id,
