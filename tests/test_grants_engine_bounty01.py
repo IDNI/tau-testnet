@@ -390,6 +390,47 @@ def test_shared_cap_binds_across_two_grants():
     assert _book(chain).shared_period_total(FUNDER, 0) == 500
 
 
+# --- time conditions at engine level ---------------------------------------------------------
+
+
+def test_draw_on_a_locked_grant_is_refused_until_the_lock_lifts():
+    chain, grant_id = _created_chain(locked_until_ts=DEC1 + WEEK)
+    chain.ts = DEC1 + 10
+    early = _draw_tx(EXECUTOR, SK_EXECUTOR, grant_id, 500, seq=0)
+    result = chain.apply([early])
+    assert early["tx_id"] in result.invalid_tx_ids
+    assert chain.balances[BOB] == 0
+    assert _book(chain).accounting(grant_id)["drawn"] == 0
+    # At the unlock time the same draw settles (1000 released by then).
+    chain.ts = DEC1 + WEEK + 10
+    draw = _draw_tx(EXECUTOR, SK_EXECUTOR, grant_id, 500, seq=0)
+    result = chain.apply([draw])
+    assert draw["tx_id"] in result.accepted_tx_ids
+    assert chain.balances[BOB] == 500
+
+
+def test_draw_outside_the_scheduled_window_is_refused():
+    chain, grant_id = _created_chain(
+        window_start_ts=DEC1 + 2 * WEEK, window_end_ts=DEC1 + 3 * WEEK)
+    chain.ts = DEC1 + WEEK + 10
+    early = _draw_tx(EXECUTOR, SK_EXECUTOR, grant_id, 500, seq=0)
+    result = chain.apply([early])
+    assert early["tx_id"] in result.invalid_tx_ids
+    assert chain.balances[BOB] == 0
+    # Inside the window the draw settles.
+    chain.ts = DEC1 + 2 * WEEK + 10
+    draw = _draw_tx(EXECUTOR, SK_EXECUTOR, grant_id, 500, seq=0)
+    result = chain.apply([draw])
+    assert draw["tx_id"] in result.accepted_tx_ids
+    assert chain.balances[BOB] == 500
+    # At the window's end the next draw is refused again.
+    chain.ts = DEC1 + 3 * WEEK + 10
+    late = _draw_tx(EXECUTOR, SK_EXECUTOR, grant_id, 500, seq=1)
+    result = chain.apply([late])
+    assert late["tx_id"] in result.invalid_tx_ids
+    assert chain.balances[BOB] == 500
+
+
 # --- capability record + facade ----------------------------------------------------------------
 
 
