@@ -209,3 +209,13 @@ def test_a_balance_floor_clause_judges_both_sides_of_the_floor(evaluator):
     assert not evaluator.verdict(BALANCE_FLOOR, {"i1": "4000", "i2": "5000"}).blocked
     assert evaluator.verdict(BALANCE_FLOOR, {"i1": "4001", "i2": "5000"}).blocked
     assert evaluator.verdict(BALANCE_FLOOR, {"i1": "5000", "i2": "5000"}).blocked
+
+
+def test_dissimilar_clauses_interleaved_in_one_worker_keep_their_verdicts(evaluator):
+    t_inputs = {"i1": "3000", **_approvers(OTHER, OTHER, OTHER)}
+    b_inputs = {"i1": "3000", "i2": "5000"}
+    for _ in range(4):
+        assert evaluator.verdict(THREE_SLOT, t_inputs).blocked
+        assert not evaluator.verdict(BALANCE_FLOOR, b_inputs).blocked
+    stats = evaluator.stats()
+    assert stats["retries"] == 0 and stats["fresh_fallbacks"] == 0

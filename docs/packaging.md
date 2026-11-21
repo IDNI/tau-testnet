@@ -40,7 +40,7 @@ Build args:
 | Arg | Default | Purpose |
 |---|---|---|
 | `TAU_LANG_REPO` | `https://github.com/IDNI/tau-lang.git` | tau-lang git remote |
-| `TAU_LANG_REF`  | `c3ea334cd1e6612930ea9f404933211858f0009f` | tau-lang git ref to check out |
+| `TAU_LANG_REF`  | `6ea436e8d3113a7d90635b9d06113e5bc506176c` | tau-lang git ref to check out |
 | `TAU_BUILD_JOBS`| `4` | parallel make/cmake jobs for cvc5/boost/tau-lang |
 
 The image carries OCI labels (`org.opencontainers.image.title`,
