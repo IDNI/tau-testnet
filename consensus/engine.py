@@ -33,6 +33,17 @@ from .approvals import (
     parse_rule_change_request_checked,
     parse_transfer_vote,
 )
+from .grants import (
+    GRANT_TX_TYPES,
+    TX_TYPE_CREATE_GRANT,
+    TX_TYPE_DRAW_GRANT,
+    TX_TYPE_SET_GRANT_SHARED_CAP,
+    GrantBook,
+    GrantShapeError,
+    parse_create_grant,
+    parse_draw_grant,
+    parse_set_grant_shared_cap,
+)
 from .payout_rules import (
     PAYOUT_RULE_TX_TYPES,
     TX_TYPE_EXECUTE_PAYOUT_RULE,
@@ -109,6 +120,7 @@ FEE_BEARING_TX_TYPES = frozenset(
     | set(RECEIVE_ROUTE_TX_TYPES)
     | set(STANDING_PAYMENT_TX_TYPES)
     | set(PAYOUT_RULE_TX_TYPES)
+    | set(GRANT_TX_TYPES)
 )
 
 
@@ -296,9 +308,26 @@ def _payout_rule_book(lm) -> Optional[PayoutRuleBook]:
     return book if isinstance(book, PayoutRuleBook) else None
 
 
+def _grant_book(lm) -> Optional[GrantBook]:
+    """The grant book, or None when the manager does not carry one.
+
+    The same isinstance guard as `_receive_route_book`, for the same
+    reason: a stand-in manager must mean "no grants" (the legacy
+    behavior), never phantom custody.
+    """
+    book = getattr(lm, "grants", None)
+    return book if isinstance(book, GrantBook) else None
+
+
 def _escrow_total(lm) -> int:
+    total = 0
     book = _retractable_book(lm)
-    return book.escrow_total() if book is not None else 0
+    if book is not None:
+        total += book.escrow_total()
+    grants = _grant_book(lm)
+    if grants is not None:
+        total += grants.held_total()
+    return total
 
 
 def _release_due_retractables(lm, balances, sequences, height, timestamp) -> List[str]:
@@ -313,6 +342,35 @@ def _release_due_retractables(lm, balances, sequences, height, timestamp) -> Lis
             balances, sequences, entry.recipient_pubkey, grant
         ) + entry.amount
     return [entry.retractable_id.hex() for entry in released]
+
+
+def _refund_expired_grants(lm, balances, sequences, timestamp) -> List[Dict[str, Any]]:
+    """Refund every grant whose deadline this block reaches; returns events.
+
+    The refund is the sweep's, not a transaction's: it moves with no fee
+    and returns the full unspent remainder (total - spent) to the funder,
+    out of the custody the creation funded — never out of the
+    beneficiary's balance. It settles exactly once per grant: the book
+    stops listing a grant as expired the moment its refund settles.
+    """
+    book = _grant_book(lm)
+    if book is None:
+        return []
+    events: List[Dict[str, Any]] = []
+    grant = faucet.amount(lm)
+    for entry in book.expired_grants(int(timestamp)):
+        amount = book.settle_expiry_refund(entry.grant_id, int(timestamp))
+        balances[entry.funder_pubkey] = faucet.spendable(
+            balances, sequences, entry.funder_pubkey, grant
+        ) + amount
+        events.append({
+            "grant_id": entry.grant_id.hex(),
+            "action": "refunded",
+            "funder_pubkey": entry.funder_pubkey,
+            "beneficiary_pubkey": entry.beneficiary_pubkey,
+            "amount": amount,
+        })
+    return events
 
 
 TEMPORAL_REFERENCE_REASON = "temporal_reference"
@@ -973,6 +1031,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         released_retractables = _release_due_retractables(
             lm, t_bals, t_seqs, block.header.block_number, block.header.timestamp
         )
+        # Grant expiry refunds settle in the same sweep, after the
+        # transaction loop: a draw in this block still counts (it settled
+        # before the deadline evaluation), and the refund then returns
+        # exactly what is left. Fee-free, like every sweep movement.
+        refunded_grants = _refund_expired_grants(
+            lm, t_bals, t_seqs, block.header.timestamp
+        )
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
             getattr(
@@ -1066,6 +1131,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             )
             if event and id(tx) in accepted_obj:
                 payout_events.append(event)
+
+        # Grant events (stages 2-5): creations, draws and shared-cap
+        # settings that stayed accepted, in transaction order, then this
+        # block's sweep refunds — carried on the snapshot exactly as the
+        # payout events are, for history to record.
+        grant_events = []
+        for i, tx in enumerate(block.transactions):
+            event = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "grant_event"
+            )
+            if event and id(tx) in accepted_obj:
+                grant_events.append(event)
+        grant_events.extend(refunded_grants)
 
         # 3. Post-State Materialization Layer
         
@@ -1225,6 +1303,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "routing_events": routing_events,
                 "standing_payment_events": standing_payment_events,
                 "payout_events": payout_events,
+                "grant_events": grant_events,
             }
         )
         
@@ -1241,6 +1320,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "routing_events": routing_events,
                 "standing_payment_events": standing_payment_events,
                 "payout_events": payout_events,
+                "grant_events": grant_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -1796,6 +1876,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_payout_install = None
             pending_payout_removal = None
             pending_payout_execution = None
+            # Grant mutations defer to the same post-settlement site, for
+            # the same reason: a creation whose fee is never paid custodies
+            # nothing and records nothing, and a draw settles in the book
+            # only once the credit it staged is known to stay in the block.
+            pending_grant_create = None
+            pending_grant_draw = None
+            pending_grant_shared_cap = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -3142,6 +3229,119 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     + pr_rule_id.hex()
                                 )
 
+            elif tx_type in GRANT_TX_TYPES:
+                # Nothing here reads nested `payload`: only root fields are
+                # signed, so anything else is unsigned data. Validation runs
+                # against this transaction's lifecycle fork through the
+                # book's own can_create/can_set_shared_cap/evaluate_draw
+                # (the same functions admission calls), and every mutation
+                # is deferred to the post-settlement site below, so a tx
+                # whose fee is never paid creates, draws and caps nothing.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    gr_book = _lifecycle_for_write().grants
+                    gr_ts = int(block_timestamp or 0)
+                    if tx_type == TX_TYPE_CREATE_GRANT:
+                        try:
+                            gr_entry = parse_create_grant(tx)
+                        except GrantShapeError as exc:
+                            gr_entry = None
+                            reason = f"invalid grant ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != gr_entry.funder_pubkey:
+                                reason = "sender is not the grant funder"
+                            elif target_balances is None:
+                                reason = "no balance overlay to escrow from"
+                            else:
+                                _, reason = gr_book.can_create(gr_entry, gr_ts)
+                        if gr_entry is None or reason:
+                            tx_receipt["logs"].append(f"Grant creation ignored: {reason}")
+                            tx_receipt["reason"] = "grant_not_created"
+                            accepted_in_block = False
+                        else:
+                            # The total moves funder -> book custody through
+                            # the seam with escrow=True (the retractable-park
+                            # discipline): the funder's o5 is re-checked on
+                            # the real beneficiary and amount, the fee is
+                            # measured on the real inputs, and only the debit
+                            # is staged — the credit is the book's custody,
+                            # recorded at the post-settlement site, so a
+                            # fee-rejected creation holds nothing.
+                            escrowed = _execute_fee_era_transfer(
+                                gr_entry.funder_pubkey,
+                                gr_entry.beneficiary_pubkey,
+                                gr_entry.total_amount,
+                                slot_values=_approval_slot_values(),
+                                overrides={},
+                                escrow=True,
+                            )
+                            fee_already_measured = True
+                            if escrowed and accepted_in_block and not hard_reject:
+                                pending_grant_create = gr_entry
+                                tx_receipt["logs"].append(
+                                    "Grant creation staged: "
+                                    + gr_entry.grant_id.hex()
+                                )
+                    elif tx_type == TX_TYPE_DRAW_GRANT:
+                        try:
+                            gr_id, gr_amount = parse_draw_grant(tx)
+                        except GrantShapeError as exc:
+                            gr_id = None
+                            gr_entry = None
+                            gr_decision = None
+                            reason = f"invalid grant draw ({exc})"
+                        else:
+                            gr_entry = gr_book.get(gr_id)
+                            if gr_entry is None:
+                                gr_decision = None
+                                reason = "no grant with this id"
+                            else:
+                                gr_decision = gr_book.evaluate_draw(
+                                    gr_id, gr_amount, gr_ts
+                                )
+                                reason = "" if gr_decision.drawn else gr_decision.reason
+                        if gr_id is None or reason:
+                            tx_receipt["logs"].append(f"Grant draw ignored: {reason}")
+                            tx_receipt["reason"] = "grant_not_drawn"
+                            accepted_in_block = False
+                        else:
+                            # Transfer-less (the retract precedent): the
+                            # credit is staged directly, and the book
+                            # records the draw at the post-settlement site.
+                            # The value can only ever land on the
+                            # beneficiary, and the credit is a grant_draw
+                            # credit — it never enters the seam, so no
+                            # receive route can split it (the design's
+                            # credit-class table).
+                            staged_writes[gr_entry.beneficiary_pubkey] = (
+                                _read_bal(gr_entry.beneficiary_pubkey)
+                                + gr_amount
+                            )
+                            pending_grant_draw = (gr_entry, gr_decision)
+                            tx_receipt["logs"].append(
+                                "Grant draw staged: " + gr_id.hex()
+                            )
+                    else:  # TX_TYPE_SET_GRANT_SHARED_CAP
+                        try:
+                            gr_cap = parse_set_grant_shared_cap(tx)
+                        except GrantShapeError as exc:
+                            gr_cap = None
+                            reason = f"invalid grant shared cap ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != gr_cap.funder_pubkey:
+                                reason = "sender is not the cap funder"
+                            else:
+                                _, reason = gr_book.can_set_shared_cap(gr_cap, gr_ts)
+                        if gr_cap is None or reason:
+                            tx_receipt["logs"].append(f"Grant shared cap ignored: {reason}")
+                            tx_receipt["reason"] = "grant_shared_cap_not_set"
+                            accepted_in_block = False
+                        else:
+                            pending_grant_shared_cap = gr_cap
+                            tx_receipt["logs"].append(
+                                "Grant shared cap staged: " + gr_cap.cap_id.hex()
+                            )
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3883,6 +4083,80 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         "Payout rule executed: " + pr_entry.rule_id.hex()
                         + f" ({settled.total} over "
                         f"{len(settled.legs)} leg(s))"
+                    )
+                if (pending_grant_create is not None
+                        or pending_grant_draw is not None
+                        or pending_grant_shared_cap is not None):
+                    gr_book = _lifecycle_for_write().grants
+                if pending_grant_create is not None:
+                    # Re-checked by create() itself: the fork state the
+                    # branch validated is the state committed here, because
+                    # nothing else in this tx can touch the grant book.
+                    # The funder's debit was staged by the seam in the
+                    # branch; this records the custody it funded.
+                    gr_book.create(
+                        pending_grant_create, int(block_timestamp or 0)
+                    )
+                    tx_receipt["grant_event"] = {
+                        "grant_id": pending_grant_create.grant_id.hex(),
+                        "action": "created",
+                        "funder_pubkey": pending_grant_create.funder_pubkey,
+                        "beneficiary_pubkey": (
+                            pending_grant_create.beneficiary_pubkey
+                        ),
+                        "total_amount": pending_grant_create.total_amount,
+                        "release_per_period": (
+                            pending_grant_create.release_per_period
+                        ),
+                        "deadline_ts": pending_grant_create.deadline_ts,
+                        "version": pending_grant_create.version,
+                    }
+                    tx_receipt["logs"].append(
+                        "Grant created: "
+                        + pending_grant_create.grant_id.hex()
+                    )
+                elif pending_grant_draw is not None:
+                    gr_entry, _gr_decision = pending_grant_draw
+                    # Same fork, same inputs as the branch's
+                    # evaluate_draw: the settled decision is the staged
+                    # one by construction.
+                    settled = gr_book.draw(
+                        gr_entry.grant_id, _gr_decision.amount,
+                        int(block_timestamp or 0),
+                    )
+                    tx_receipt["grant_event"] = {
+                        "grant_id": gr_entry.grant_id.hex(),
+                        "action": "drawn",
+                        "funder_pubkey": gr_entry.funder_pubkey,
+                        "beneficiary_pubkey": gr_entry.beneficiary_pubkey,
+                        "amount": settled.amount,
+                        "period_index": settled.period_index,
+                        "spendable_after": settled.spendable_after,
+                        "shared_period_index": settled.shared_period_index,
+                        "shared_total_after": settled.shared_total_after,
+                        "submitter_pubkey": sender,
+                    }
+                    tx_receipt["logs"].append(
+                        "Grant drawn: " + gr_entry.grant_id.hex()
+                        + f" ({settled.amount} to the beneficiary)"
+                    )
+                elif pending_grant_shared_cap is not None:
+                    gr_book.set_shared_cap(
+                        pending_grant_shared_cap, int(block_timestamp or 0)
+                    )
+                    tx_receipt["grant_event"] = {
+                        "cap_id": pending_grant_shared_cap.cap_id.hex(),
+                        "action": "shared_cap_set",
+                        "funder_pubkey": pending_grant_shared_cap.funder_pubkey,
+                        "cap_amount": pending_grant_shared_cap.cap_amount,
+                        "period_seconds": (
+                            pending_grant_shared_cap.period_seconds
+                        ),
+                        "version": pending_grant_shared_cap.version,
+                    }
+                    tx_receipt["logs"].append(
+                        "Grant shared cap set: "
+                        + pending_grant_shared_cap.cap_id.hex()
                     )
 
             # Commit staged balance writes only for txs that stay accepted.

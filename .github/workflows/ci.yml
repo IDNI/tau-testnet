@@ -104,7 +104,7 @@ jobs:
       # The Bounty 01 native suites run in their OWN docker run — a clean
       # interpreter process. In the shared process above, an earlier file's
       # TauInterface can leave the interpreter unusable for the next file
-      # (the native suites' pollution guard), which would skip the Bounty
+      # (the routes suite's pollution guard), which would skip the Bounty
       # 01 proofs in exactly the job that exists to produce them. Same
       # key/genesis preamble as the consensus suite step.
       - name: Run Bounty 01 native suite
@@ -119,5 +119,6 @@ jobs:
           tests/test_receive_routes_native.py
           tests/test_standing_payments_native.py
           tests/test_payout_rules_native.py
+          tests/test_grants_native.py
           -p no:asyncio -v
           "

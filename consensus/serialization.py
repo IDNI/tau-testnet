@@ -1138,3 +1138,177 @@ def compute_payout_rule_book_root(records: list, settlements: list) -> bytes:
     for blob in encoded_settlements:
         out.extend(blob)
     return blake3(bytes(out)).digest()
+
+
+# --- Grants (Bounty 01, stages 2-5) --------------------------------------------
+
+DOMAIN_GRANT_V1 = b"tau.grant.v1"
+DOMAIN_GRANT_SHARED_CAP_V1 = b"tau.grant.shared_cap.v1"
+DOMAIN_GRANT_BOOK_V1 = b"tau.grant.book.v1"
+
+
+def compute_grant_id(
+    funder_pubkey: Any,
+    beneficiary_pubkey: Any,
+    total_amount: int,
+    release_per_period: int,
+    schedule_kind: int,
+    signed_day: int,
+    start_ts: int,
+    deadline_ts: int,
+    locked_until_ts: int,
+    window_start_ts: int,
+    window_end_ts: int,
+    inactivity_seconds: int,
+    version: int,
+) -> bytes:
+    """BLAKE3 of the canonical grant. Returns 32 bytes.
+
+    Content-derived from the signed fields alone, like the standing-payment
+    and payout-rule ids: the parties, the total, the release schedule, the
+    deadline and every time condition are inside the hash, so a tampered
+    copy of a grant is a different, unknown grant — never the same one with
+    different terms. `version` distinguishes two grants of one funder to
+    one beneficiary whose other terms are identical.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_GRANT_V1.decode()))
+    out.extend(encode_pubkey48(funder_pubkey))
+    out.extend(encode_pubkey48(beneficiary_pubkey))
+    out.extend(encode_uint64(int(total_amount)))
+    out.extend(encode_uint64(int(release_per_period)))
+    out.extend(encode_uint64(int(schedule_kind)))
+    out.extend(encode_uint64(int(signed_day)))
+    out.extend(encode_uint64(int(start_ts)))
+    out.extend(encode_uint64(int(deadline_ts)))
+    out.extend(encode_uint64(int(locked_until_ts)))
+    out.extend(encode_uint64(int(window_start_ts)))
+    out.extend(encode_uint64(int(window_end_ts)))
+    out.extend(encode_uint64(int(inactivity_seconds)))
+    out.extend(encode_uint64(int(version)))
+    return blake3(bytes(out)).digest()
+
+
+def encode_grant_record(
+    grant_id: Any,
+    funder_pubkey: Any,
+    beneficiary_pubkey: Any,
+    total_amount: int,
+    release_per_period: int,
+    schedule_kind: int,
+    signed_day: int,
+    start_ts: int,
+    deadline_ts: int,
+    locked_until_ts: int,
+    window_start_ts: int,
+    window_end_ts: int,
+    inactivity_seconds: int,
+    version: int,
+    total_spent: int,
+    last_draw_ts: int,
+    refunded: int,
+    refunded_amount: int,
+    refunded_ts: int,
+) -> bytes:
+    """One grant for the book root: signed fields + live progress.
+
+    The progress is consensus state exactly like the terms: two nodes that
+    disagree about how much a grant already paid out, or whether its
+    refund settled, disagree about what the next draw or sweep may do.
+    """
+    out = bytearray()
+    out.extend(encode_hash32(grant_id))
+    out.extend(encode_pubkey48(funder_pubkey))
+    out.extend(encode_pubkey48(beneficiary_pubkey))
+    out.extend(encode_uint64(int(total_amount)))
+    out.extend(encode_uint64(int(release_per_period)))
+    out.extend(encode_uint64(int(schedule_kind)))
+    out.extend(encode_uint64(int(signed_day)))
+    out.extend(encode_uint64(int(start_ts)))
+    out.extend(encode_uint64(int(deadline_ts)))
+    out.extend(encode_uint64(int(locked_until_ts)))
+    out.extend(encode_uint64(int(window_start_ts)))
+    out.extend(encode_uint64(int(window_end_ts)))
+    out.extend(encode_uint64(int(inactivity_seconds)))
+    out.extend(encode_uint64(int(version)))
+    out.extend(encode_uint64(int(total_spent)))
+    out.extend(encode_uint64(int(last_draw_ts)))
+    out.extend(encode_uint64(int(refunded)))
+    out.extend(encode_uint64(int(refunded_amount)))
+    out.extend(encode_uint64(int(refunded_ts)))
+    return bytes(out)
+
+
+def compute_grant_shared_cap_id(
+    funder_pubkey: Any,
+    cap_amount: int,
+    period_seconds: int,
+    period_anchor_ts: int,
+    version: int,
+) -> bytes:
+    """BLAKE3 of the canonical shared cap. Returns 32 bytes.
+
+    Content-derived from the signed fields alone: a funder's shared cap is
+    identified by exactly the terms they signed — the amount, the period
+    shape and the version.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_GRANT_SHARED_CAP_V1.decode()))
+    out.extend(encode_pubkey48(funder_pubkey))
+    out.extend(encode_uint64(int(cap_amount)))
+    out.extend(encode_uint64(int(period_seconds)))
+    out.extend(encode_uint64(int(period_anchor_ts)))
+    out.extend(encode_uint64(int(version)))
+    return blake3(bytes(out)).digest()
+
+
+def encode_grant_shared_cap_record(
+    cap_id: Any,
+    funder_pubkey: Any,
+    cap_amount: int,
+    period_seconds: int,
+    period_anchor_ts: int,
+    version: int,
+    period_totals: Any,
+) -> bytes:
+    """One shared cap for the book root: signed fields + live period totals.
+
+    The per-period drawn totals are consensus state exactly like the cap:
+    two nodes that disagree about how much a funder's grants already drew
+    this period disagree about whether the next draw fits the shared cap —
+    the totals are what "counted exactly once" is made of.
+    """
+    out = bytearray()
+    out.extend(encode_hash32(cap_id))
+    out.extend(encode_pubkey48(funder_pubkey))
+    out.extend(encode_uint64(int(cap_amount)))
+    out.extend(encode_uint64(int(period_seconds)))
+    out.extend(encode_uint64(int(period_anchor_ts)))
+    out.extend(encode_uint64(int(version)))
+    totals = sorted((int(i), int(t)) for i, t in (period_totals or ()))
+    out.extend(encode_uint32(len(totals)))
+    for index, total in totals:
+        out.extend(encode_uint64(index))
+        out.extend(encode_uint64(total))
+    return bytes(out)
+
+
+def compute_grant_book_root(records: list, shared_caps: list) -> bytes:
+    """BLAKE3 of the grant book: grant records + shared-cap records.
+
+    `records` are tuples in encode_grant_record argument order and
+    `shared_caps` in encode_grant_shared_cap_record argument order.
+    """
+    encoded_records = sorted(encode_grant_record(*r) for r in (records or []))
+    encoded_caps = sorted(
+        encode_grant_shared_cap_record(*c) for c in (shared_caps or [])
+    )
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_GRANT_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded_records)))
+    for blob in encoded_records:
+        out.extend(blob)
+    out.extend(encode_uint32(len(encoded_caps)))
+    for blob in encoded_caps:
+        out.extend(blob)
+    return blake3(bytes(out)).digest()

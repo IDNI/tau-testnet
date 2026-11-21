@@ -48,6 +48,16 @@ from consensus.approvals import (
     validate_request_shape,
     validate_rule_change_shape,
 )
+from consensus.grants import (
+    TX_TYPE_CREATE_GRANT,
+    TX_TYPE_DRAW_GRANT,
+    TX_TYPE_SET_GRANT_SHARED_CAP,
+    GrantBook,
+    GrantShapeError,
+    parse_create_grant,
+    parse_draw_grant,
+    parse_set_grant_shared_cap,
+)
 from consensus.payout_rules import (
     TX_TYPE_EXECUTE_PAYOUT_RULE,
     TX_TYPE_INSTALL_PAYOUT_RULE,
@@ -2061,6 +2071,180 @@ def validate_execute_payout_rule_payload(
     })
 
 
+# --- Grants --------------------------------------------------------------------
+
+def _tip_grant_book(row: Optional[Dict]) -> GrantBook:
+    """A book holding exactly one tip grant (the facade's row).
+
+    Admission and apply must reach the same verdict, and the verdicts live
+    in the book's can_create/can_set_shared_cap/evaluate_draw; rebuilding
+    the one-entry book from the tip view lets admission call them verbatim
+    instead of re-implementing the release, condition and shared-cap rules
+    a second time. The row carries the grant's progress AND the funder's
+    shared cap with its period totals, so the rebuilt book also answers
+    the shared-cap question identically — a draw that the full book would
+    refuse for the shared cap is refused here too.
+    """
+    if row is None:
+        return GrantBook()
+    entry_row = (
+        bytes.fromhex(row["grant_id"]),
+        row["funder_pubkey"],
+        row["beneficiary_pubkey"],
+        int(row["total_amount"]),
+        int(row["release_per_period"]),
+        int(row["schedule_kind"]),
+        int(row["signed_day"]),
+        int(row["start_ts"]),
+        int(row["deadline_ts"]),
+        int(row["locked_until_ts"]),
+        int(row["window_start_ts"]),
+        int(row["window_end_ts"]),
+        int(row["inactivity_seconds"]),
+        int(row["version"]),
+        int(row["total_spent"]),
+        int(row["last_draw_ts"]),
+        int(row["refunded"]),
+        int(row["refunded_amount"]),
+        int(row["refunded_ts"]),
+    )
+    cap_rows = []
+    cap = row.get("shared_cap")
+    if cap is not None:
+        cap_rows.append((
+            bytes.fromhex(cap["cap_id"]),
+            cap["funder_pubkey"],
+            int(cap["cap_amount"]),
+            int(cap["period_seconds"]),
+            int(cap["period_anchor_ts"]),
+            int(cap["version"]),
+            tuple(
+                (int(t["period_index"]), int(t["total"]))
+                for t in cap.get("period_totals", [])
+            ),
+        ))
+    return GrantBook.restore([entry_row], cap_rows)
+
+
+def _tip_shared_cap_book(row: Optional[Dict]) -> GrantBook:
+    """A book holding exactly one funder's tip shared cap (the facade's row)."""
+    if row is None:
+        return GrantBook()
+    cap_row = (
+        bytes.fromhex(row["cap_id"]),
+        row["funder_pubkey"],
+        int(row["cap_amount"]),
+        int(row["period_seconds"]),
+        int(row["period_anchor_ts"]),
+        int(row["version"]),
+        tuple(
+            (int(t["period_index"]), int(t["total"]))
+            for t in row.get("period_totals", [])
+        ),
+    )
+    return GrantBook.restore([], [cap_row])
+
+
+def validate_create_grant_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for creating a grant (stages 2-5).
+
+    Shape and state checks are the book's own (`can_create` against a
+    one-entry book rebuilt from the tip view of the same grant id, which
+    is what makes the duplicate check exact), shared with block apply
+    verbatim. The o5 verdict, fee and funds checks run on the sendtx
+    path, exactly as for a retractable park.
+    """
+    try:
+        entry = parse_create_grant(tx)
+    except GrantShapeError as exc:
+        return format_error(f"Malformed create_grant: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != entry.funder_pubkey:
+        return format_error(
+            "create_grant sender_pubkey must match the signer.")
+
+    err = validate_bls_pubkey(entry.beneficiary_pubkey, "grant_beneficiary_pubkey")
+    if err:
+        return format_error(f"create_grant rejected: {err}")
+
+    row = tip_view.get_grant(entry.grant_id)
+    ok, reason = _tip_grant_book(row).can_create(
+        entry, tip_view.next_block_timestamp)
+    if not ok:
+        return format_error(f"create_grant rejected: {reason}")
+
+    return success({"grant_id": entry.grant_id.hex()})
+
+
+def validate_draw_grant_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for drawing on a grant (stages 2-5).
+
+    Anyone may submit a draw; the value can only ever land on the grant's
+    beneficiary. Whether it may settle is the book's evaluate_draw
+    against the tip state — the same call block apply makes, so the two
+    agree on identical state. The fee is apply-side (it needs the
+    engine's evaluation), exactly as for the other lifecycle types.
+    """
+    try:
+        grant_id, amount = parse_draw_grant(tx)
+    except GrantShapeError as exc:
+        return format_error(f"Malformed draw_grant: {exc}.")
+
+    row = tip_view.get_grant(grant_id)
+    if row is None:
+        return format_error(
+            "Unknown grant.",
+            code="UNKNOWN_GRANT",
+        )
+    decision = _tip_grant_book(row).evaluate_draw(
+        grant_id, amount, tip_view.next_block_timestamp)
+    if not decision.drawn:
+        return format_error(f"draw_grant rejected: {decision.reason}")
+
+    return success({
+        "grant_id": grant_id.hex(),
+        "beneficiary_pubkey": row["beneficiary_pubkey"],
+        "amount": decision.amount,
+        "period_index": decision.period_index,
+        "spendable_after": decision.spendable_after,
+    })
+
+
+def validate_set_grant_shared_cap_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for setting a funder's shared cap (stages 2-5).
+
+    Shape and state checks are the book's own (`can_set_shared_cap`
+    against the tip's one-cap book), shared with block apply verbatim: a
+    replacement must be the next version with the same period shape, so
+    the per-period totals — every settled draw counted exactly once —
+    survive it.
+    """
+    try:
+        entry = parse_set_grant_shared_cap(tx)
+    except GrantShapeError as exc:
+        return format_error(f"Malformed set_grant_shared_cap: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != entry.funder_pubkey:
+        return format_error(
+            "set_grant_shared_cap sender_pubkey must match the signer.")
+
+    row = tip_view.get_shared_cap(entry.funder_pubkey)
+    ok, reason = _tip_shared_cap_book(row).can_set_shared_cap(
+        entry, tip_view.next_block_timestamp)
+    if not ok:
+        return format_error(f"set_grant_shared_cap rejected: {reason}")
+
+    return success({"cap_id": entry.cap_id.hex()})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -2195,6 +2379,15 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_EXECUTE_PAYOUT_RULE:
          return validate_execute_payout_rule_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_CREATE_GRANT:
+         return validate_create_grant_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_DRAW_GRANT:
+         return validate_draw_grant_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_SET_GRANT_SHARED_CAP:
+         return validate_set_grant_shared_cap_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

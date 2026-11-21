@@ -26,6 +26,7 @@ from consensus.rule_offers import (
     RULE_OFFER_TX_TYPES,
 )
 from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
+from consensus.grants import GRANT_TX_TYPES
 from consensus.payout_rules import PAYOUT_RULE_TX_TYPES
 from consensus.receive_routes import RECEIVE_ROUTE_TX_TYPES
 from consensus.standing_payments import STANDING_PAYMENT_TX_TYPES
@@ -50,6 +51,7 @@ KNOWN_TX_TYPES = frozenset(
     | set(RECEIVE_ROUTE_TX_TYPES)
     | set(STANDING_PAYMENT_TX_TYPES)
     | set(PAYOUT_RULE_TX_TYPES)
+    | set(GRANT_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
 # execution later is free and there is no second fee to drift. `transfer_vote` is
@@ -63,6 +65,7 @@ FEE_BEARING_TX_TYPES = frozenset(
     | set(RECEIVE_ROUTE_TX_TYPES)
     | set(STANDING_PAYMENT_TX_TYPES)
     | set(PAYOUT_RULE_TX_TYPES)
+    | set(GRANT_TX_TYPES)
 )
 from db import add_mempool_tx
 from network import bus as network_bus

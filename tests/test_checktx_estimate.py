@@ -175,6 +175,29 @@ def _payload(kind, fee_limit="0"):
                          payout_rule_id=_seed_installed_payout_rule(),
                          payout_settlement_id="11" * 32,
                          payout_base_amount=101)
+    if kind == "create_grant":
+        # Beneficiary APPROVER, so the id cannot collide with the seeded
+        # draw grant (SENDER -> RECIPIENT) whichever case ran first. The
+        # term runs 520 weeks: the tip view's next-block clock is the
+        # later of the tip and the wall clock, so a grant window ending
+        # near TIP_TS would already read as expired at estimate time.
+        return _envelope(kind, SENDER, fee_limit,
+                         grant_beneficiary_pubkey=APPROVER,
+                         grant_total_amount=5000,
+                         grant_release_per_period=500,
+                         grant_schedule="weekly", grant_signed_day=0,
+                         grant_start_ts=TIP_TS,
+                         grant_deadline_ts=TIP_TS + 520 * 604800,
+                         grant_version=1)
+    if kind == "draw_grant":
+        return _envelope(kind, SENDER, fee_limit,
+                         grant_id=_seed_grant(), grant_draw_amount=100)
+    if kind == "set_grant_shared_cap":
+        return _envelope(kind, SENDER, fee_limit,
+                         grant_shared_cap_amount=500,
+                         grant_shared_cap_period_seconds=604800,
+                         grant_shared_cap_anchor_ts=TIP_TS,
+                         grant_shared_cap_version=1)
     raise AssertionError(kind)
 
 
@@ -190,7 +213,8 @@ FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "remove_receive_route", "create_standing_payment",
                "cancel_standing_payment", "execute_standing_payment",
                "install_payout_rule", "remove_payout_rule",
-               "execute_payout_rule"]
+               "execute_payout_rule", "create_grant", "draw_grant",
+               "set_grant_shared_cap"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():
@@ -369,6 +393,32 @@ def _seed_installed_payout_rule():
     if book.get(SENDER) is None:
         book.install(entry, TIP_TS)
     return entry.rule_id.hex()
+
+
+def _seed_grant():
+    """Create the sender's grant in the tip's book, as a mined creation
+    would leave it, and return its grant id hex.
+
+    5000 releasing 500/week from TIP_TS over a 520-week term: the tip
+    view's next-block clock is the later of the tip and the wall clock,
+    so by estimate time every release has landed (spendable is the full
+    unspent total) and the deadline is still ahead — a 100 draw is
+    admissible. The estimate mutates nothing, so the one grant serves
+    the draw case however often it runs.
+    """
+    from consensus.grants import GrantEntry
+    from consensus.standing_payments import SCHEDULE_WEEKLY
+    book = chain_state._lifecycle_manager.grants
+    entry = GrantEntry(
+        funder_pubkey=SENDER, beneficiary_pubkey=RECIPIENT,
+        total_amount=5000, release_per_period=500,
+        schedule_kind=SCHEDULE_WEEKLY, signed_day=0, start_ts=TIP_TS,
+        deadline_ts=TIP_TS + 520 * 604800, locked_until_ts=0,
+        window_start_ts=0, window_end_ts=0, inactivity_seconds=0,
+        version=1)
+    if book.get(entry.grant_id) is None:
+        book.create(entry, TIP_TS)
+    return entry.grant_id.hex()
 
 
 def _seed_open_park():
