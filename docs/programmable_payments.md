@@ -255,3 +255,29 @@ path already consults it.
 
 Demo: Alice splits 1,000 to Bob and Carol by clause
 (`tests/test_payouts.py::test_demo_alice_pays_bob_and_carol_by_clause`).
+
+Valid clause shape: the clause is stored as one `always ( ... ).` unit,
+and `clause_outputs_for` strips that wrapper before stepping (the policy
+worker wraps every body in `always ( ... ).` itself, so stepping the
+stored text verbatim would double-wrap and never build). The body must
+be a valid Tau expression that READS an input stream — amounts are
+bit-vector literals joined with `&&`, never bare decimals or
+comma-separated assignments, and a constant-only clause cannot be
+stepped at all (the engine refuses a clause that reads no input). The
+shape that works, verified against the real payout-pool evaluator:
+
+```
+always ((i1[t]:bv[24] > { #x000000 }:bv[24])
+  ? (o1[t]:bv[24] = { 300 }:bv[24] && o2[t]:bv[24] = { 700 }:bv[24])
+  : (o1[t]:bv[24] = { 0 }:bv[24] && o2[t]:bv[24] = { 0 }:bv[24])).
+```
+
+`i1` is the payer balance, so the guard is true whenever the payer is
+funded (the real funds check is `apply_payout`'s payer-balance guard).
+Caveat: the `i1[t]:bv[24]` guard caps at 16,777,215 — fine for ordinary
+balances, but a payer holding more than ~16.7M needs a wider guard (or
+an `i5`-timestamp guard, `i5[t]:bv[32] > { #x000000 }:bv[32]`, which has
+no balance ceiling). A clause that cannot be built or stepped fails
+closed at execute time: the execute is rejected, pays nothing, and the
+rule stays open — `payout_create` does not validate buildability
+(admission has no evaluator access).
