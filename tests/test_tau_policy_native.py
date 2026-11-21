@@ -187,14 +187,14 @@ def test_a_value_wider_than_the_clauses_input_type_is_a_blocked_verdict(evaluato
         sender_policy.set_evaluator("apply", None)
 
 
-def test_a_refused_step_in_a_warm_worker_keeps_the_worker(evaluator):
+def test_a_refused_step_in_a_warm_worker_is_judged_again_in_a_fresh_one(evaluator):
     assert evaluator.validate(NARROW).ok
     assert not evaluator.verdict(NARROW, {"i1": "50"}).blocked
     warm = evaluator.worker_pid()
     before = evaluator.stats()["fresh_fallbacks"]
     _refusal(evaluator, {"i1": "2000"})
-    assert evaluator.stats()["fresh_fallbacks"] == before
-    assert evaluator.worker_pid() == warm
+    assert evaluator.stats()["fresh_fallbacks"] == before + 1
+    assert evaluator.worker_pid() != warm
 
 
 BALANCE_FLOOR = (
