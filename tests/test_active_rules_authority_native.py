@@ -194,7 +194,7 @@ def _run_probe(authority):
     displace = _submit(sk, pk, {"0": RULE_DISPLACE}, seq=1)
     assert displace.get("ok"), displace
     head2 = _mine()
-    assert head2["block_number"] == head1["block_number"] + 1
+    assert head2["header"]["block_number"] == head1["header"]["block_number"] + 1
     # The evaluator serving the node after both commits is the
     # authority, and it describes the committed journal.
     assert authority.state == auth.ACTIVE
