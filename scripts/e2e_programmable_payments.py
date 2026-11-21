@@ -23,11 +23,8 @@ USAGE
 with its miner enabled, drives scenario c, then starts node2 (follower)
 for scenario f, and stops exactly the processes it started.
 
-BLOCKER (2026-11-21): `run` requires the native tau binding
-(`require_native` below). The tau-lang build is blocked on this machine
-by an execution-risk check, so `run` cannot execute here until a built
-tau module is available. `provision` is still validated; do NOT claim
-e2e coverage that has not run.
+`run` requires the native tau binding (`require_native` below), provided
+by the official tau-lang v0.8.5 wheel installed in the venv.
 
 ASSERTION DISCIPLINE
     Each scenario asserts an accounting oracle -- expected balance deltas
