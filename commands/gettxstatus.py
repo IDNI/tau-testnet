@@ -6,7 +6,22 @@ Resolution order:
   2. tx_index -> "confirmed" for the first location on the canonical chain
                  (with block_hash/number and confirmation depth). Fork-only
                  locations fall through (a reorged-out tx is re-queued into the
-                 mempool, so step 1 usually catches it).
+                 mempool, so step 1 usually catches it). A confirmed rule
+                 transaction also carries `rule_outcome` when this node
+                 recorded one at apply (issue #42): for a shared-spec rule,
+                 the revision receipt of its rule step -- outcome
+                 classification, the engine's o0 verdict in `outputs`, and
+                 spec_revision before/after; for a rule routed to the
+                 per-account clause registry, a registry record instead
+                 (the registry root before/after, marked
+                 `evidence: "clause_registry"`, never claiming a spec
+                 revision; the registry form also carries
+                 `stored_text_sha256`, the hash of the clause text the
+                 transaction stored or, on a revoke, removed). Either form
+                 carries the transaction receipt's log lines under `logs`,
+                 bounded to 16 lines of 400 chars.
+                 So a wallet can confirm a rule took effect without
+                 re-running the engine.
   3. mempool_dropped -> "expired" / "evicted" / "rejected". A "rejected" row
                  may carry the apply receipt's `reason` code and a `detail`
                  log trail. Only the node that built the block records these;
@@ -124,6 +139,21 @@ def execute(raw_command: str, container):
                     "block_number": loc["block_number"],
                     "confirmations": max(1, confirmations),
                 }
+                # Issue #42: the apply outcome of a confirmed rule
+                # transaction, recorded by this node when it applied the
+                # block at this location. Absent when nothing was recorded
+                # (a non-rule transaction, a block applied before the record
+                # existed, a node that never applied the block) -- absence
+                # says "not recorded", never "the rule did nothing".
+                try:
+                    rule_outcome = db.get_rule_outcome(tx_hash, loc["block_hash"])
+                except Exception:
+                    logger.exception(
+                        "Failed to resolve rule outcome for %s", tx_hash
+                    )
+                    rule_outcome = None
+                if rule_outcome is not None:
+                    data["rule_outcome"] = rule_outcome
                 data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
                 return api_response.success_response("gettxstatus", data)
 

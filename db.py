@@ -524,6 +524,39 @@ def init_db():
                 if col not in dropped_cols:
                     conn.execute(f"ALTER TABLE mempool_dropped ADD COLUMN {col} TEXT;")
 
+            # Bounty 02 (issue #42): node-local history for the active-rules
+            # view. `rule_outcomes` is the per-block map tx_hash -> rule_outcome
+            # for CONFIRMED rule transactions (the revision receipt captured at
+            # apply), the confirmed-side counterpart of mempool_dropped's
+            # rejection details. Keyed by (tx_hash, block_hash) like tx_index:
+            # the same transaction can sit in several fork blocks, and only
+            # the outcome of the block that actually confirmed it may be
+            # served; canonicality is resolved by the caller, as with tx_index.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_outcomes (
+                    tx_hash      TEXT NOT NULL,
+                    block_hash   TEXT NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    outcome      TEXT NOT NULL,
+                    PRIMARY KEY (tx_hash, block_hash)
+                );
+            ''')
+            # `spec_snapshots` holds the node's canonical spec text at every
+            # spec_revision it has advanced to: {spec_revision, height,
+            # canonical_text, sha256(canonical_text)}. Sparse by construction
+            # -- a row exists only for revisions some committed block reached.
+            # The height index is the height -> revision resolution the
+            # getactiverules view is served from.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS spec_snapshots (
+                    spec_revision INTEGER PRIMARY KEY,
+                    height        INTEGER NOT NULL,
+                    canonical_text TEXT NOT NULL,
+                    sha256        TEXT NOT NULL
+                );
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_spec_snapshots_height ON spec_snapshots(height);')
+
             # Backfill tx_index for databases created before it existed: if the
             # index is empty but blocks exist, populate it once from stored block
             # bodies. Idempotent (INSERT OR IGNORE); runs only on the first init
@@ -1608,6 +1641,234 @@ def get_tx_block_locations(tx_hash: str) -> List[Dict]:
             (tx_hash,),
         )
         return [{"block_hash": r[0], "block_number": r[1]} for r in cur.fetchall()]
+
+
+# --- Bounty 02 (issue #42): rule outcomes and spec snapshots -----------------
+#
+# Both stores are node-local history, written best-effort at block commit and
+# never read back by consensus: a write failure is logged and swallowed, and a
+# missing row means "this node did not record it" (a block applied before the
+# record existed, or one this node never applied), never "nothing happened".
+
+
+def record_rule_outcomes(block_hash: str, block_number: int, outcomes) -> None:
+    """Persist one block's confirmed rule outcomes.
+
+    `outcomes` is an iterable of (tx_hash, outcome) pairs, where `outcome` is
+    the outcome dict captured at apply -- the revision receipt of the rule
+    step (see `tau_native._build_revision_receipt`) or, for a rule routed to
+    the clause registry, the registry record -- with the transaction
+    receipt's bounded log lines attached under `logs`. Stored verbatim as
+    JSON. Replaced on re-record: replaying a block re-observes the same
+    apply, and the newest observation is the one the node stands behind.
+    """
+    rows = [
+        (tx_hash, block_hash, int(block_number), json.dumps(outcome))
+        for tx_hash, outcome in (outcomes or [])
+    ]
+    if not rows:
+        return
+    try:
+        if _db_conn is None:
+            init_db()
+        with _db_lock:
+            with _db_conn:
+                _db_conn.executemany(
+                    "INSERT OR REPLACE INTO rule_outcomes "
+                    "(tx_hash, block_hash, block_number, outcome) VALUES (?, ?, ?, ?)",
+                    rows,
+                )
+    except Exception:
+        logger.exception("could not record rule outcomes")
+
+
+def get_rule_outcome(tx_hash: str, block_hash: str) -> Optional[Dict]:
+    """The rule outcome recorded for `tx_hash` in block `block_hash`, or None.
+
+    Block-scoped on purpose: gettxstatus asks for the outcome of the location
+    it has already confirmed as canonical, so a fork block's observation of
+    the same transaction is never served in its place.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT outcome FROM rule_outcomes WHERE tx_hash = ? AND block_hash = ? LIMIT 1",
+            (tx_hash, block_hash),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return None
+
+
+def get_rule_tx_by_revision() -> Dict[int, str]:
+    """Map spec_revision -> the transaction whose rule step landed on it.
+
+    Built from the recorded rule outcomes: a shared-spec outcome carries
+    `spec_revision_after`, the revision its own step produced, so the map
+    names the transaction responsible for each revision -- the attribution
+    the active-rules ledger uses to say which transaction introduced a
+    unit and which one displaced it. Registry outcomes carry no revision
+    and never appear here. A step that advanced onto the revision
+    (before < after) always wins the attribution over a no-op outcome
+    that merely landed on it; remaining ties break by earliest block,
+    deterministically.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT tx_hash, outcome FROM rule_outcomes "
+            "ORDER BY block_number ASC, tx_hash ASC"
+        )
+        rows = cur.fetchall()
+    parsed = []
+    for tx_hash, payload in rows:
+        try:
+            outcome = json.loads(payload)
+        except Exception:
+            continue
+        after = outcome.get("spec_revision_after")
+        if isinstance(after, int):
+            parsed.append((tx_hash, outcome.get("spec_revision_before"), after))
+    by_revision: Dict[int, str] = {}
+    for advancing_pass in (True, False):
+        for tx_hash, before, after in parsed:
+            if advancing_pass and not (
+                isinstance(before, int) and before < after
+            ):
+                continue
+            if after not in by_revision:
+                by_revision[after] = tx_hash
+    return by_revision
+
+
+def record_spec_snapshots(height: int, snapshots) -> None:
+    """Persist canonical spec snapshots for the revisions a block advanced.
+
+    `snapshots` is an iterable of (spec_revision, canonical_text) pairs in
+    apply order; several pairs may share `height` when one block advanced the
+    revision more than once, and each stays addressable by its revision. The
+    sha256 is computed here, over the exact text stored, so a stored row can
+    always be verified against its own hash. Replaced on re-record.
+    """
+    rows = [
+        (
+            int(revision),
+            int(height),
+            text,
+            hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        )
+        for revision, text in (snapshots or [])
+    ]
+    if not rows:
+        return
+    try:
+        if _db_conn is None:
+            init_db()
+        with _db_lock:
+            with _db_conn:
+                _db_conn.executemany(
+                    "INSERT OR REPLACE INTO spec_snapshots "
+                    "(spec_revision, height, canonical_text, sha256) VALUES (?, ?, ?, ?)",
+                    rows,
+                )
+    except Exception:
+        logger.exception("could not record spec snapshots")
+
+
+def _spec_snapshot_row(row) -> Optional[Dict]:
+    if row is None:
+        return None
+    return {
+        "spec_revision": row[0],
+        "height": row[1],
+        "canonical_text": row[2],
+        "sha256": row[3],
+    }
+
+
+def get_spec_snapshot(spec_revision: int) -> Optional[Dict]:
+    """The snapshot stored for exactly `spec_revision`, or None."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT spec_revision, height, canonical_text, sha256 "
+            "FROM spec_snapshots WHERE spec_revision = ? LIMIT 1",
+            (int(spec_revision),),
+        )
+        return _spec_snapshot_row(cur.fetchone())
+
+
+def get_spec_snapshot_at_height(height: int) -> Optional[Dict]:
+    """The latest snapshot taken at or before `height`, or None.
+
+    This is the height -> revision resolution behind getactiverules: the
+    rules in force at a height are the newest snapshot that height has
+    reached. None means no snapshot exists at or before the height -- the
+    view answers "not available" rather than guessing from later state.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT spec_revision, height, canonical_text, sha256 "
+            "FROM spec_snapshots WHERE height <= ? "
+            "ORDER BY height DESC, spec_revision DESC LIMIT 1",
+            (int(height),),
+        )
+        return _spec_snapshot_row(cur.fetchone())
+
+
+def get_latest_spec_snapshot() -> Optional[Dict]:
+    """The snapshot for the highest spec_revision recorded, or None."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            "SELECT spec_revision, height, canonical_text, sha256 "
+            "FROM spec_snapshots ORDER BY spec_revision DESC LIMIT 1"
+        )
+        return _spec_snapshot_row(cur.fetchone())
+
+
+def get_all_spec_snapshots(upto_revision: Optional[int] = None) -> list:
+    """Every recorded spec snapshot, oldest revision first.
+
+    The sequence the active-rules ledger is derived from: successive
+    snapshots are the successive composed specs, so the difference
+    between neighbours is exactly what one revision's step introduced
+    and displaced. `upto_revision` bounds the sequence to the history
+    of the snapshot being served, so a view at a past height derives
+    its ledger as of that height, never from later state.
+    """
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        if upto_revision is None:
+            cur.execute(
+                "SELECT spec_revision, height, canonical_text, sha256 "
+                "FROM spec_snapshots ORDER BY spec_revision ASC"
+            )
+        else:
+            cur.execute(
+                "SELECT spec_revision, height, canonical_text, sha256 "
+                "FROM spec_snapshots WHERE spec_revision <= ? "
+                "ORDER BY spec_revision ASC",
+                (int(upto_revision),),
+            )
+        return [_spec_snapshot_row(row) for row in cur.fetchall()]
 
 
 def get_canonical_confirmation(block_hash: str, block_number: int) -> tuple[bool, int]:

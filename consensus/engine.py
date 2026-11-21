@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import config
 import db
 import tau_defs
 from .tau_engine import TauEngine, TauExecutionResult, TauStateSnapshot
-from .serialization import canonical_json, canonicalize_parent_hash_yid, canonicalize_proposer_yid
+from .serialization import canonical_json, canonicalize_parent_hash_yid, canonicalize_proposer_yid, compute_clause_registry_root
 from .state import StateStore, compute_state_hash
 from .governance import (
     DEFAULT_MAX_RULE_TXS_PER_BLOCK,
@@ -142,6 +144,78 @@ def _application_rule_landed(rule_text: str) -> bool:
     return unit in app or raw in app
 
 
+# A plain output-stream definition, the only conjunct form a revision can
+# displace pointwise: `oN[t]:bv[W] = { lit }:bv[W]` and nothing else.
+_PLAIN_ASSIGNMENT_RE = re.compile(
+    r"^(o\d+)\[t\]:(bv\[\d+\])\s*=\s*\{\s*([0-9]+|#x[0-9a-fA-F]+)\s*\}:bv\[\d+\]$"
+)
+
+
+def _compose_canonical_spec_text(accumulation_text: str) -> str:
+    """The canonical spec text of an application-rules accumulation.
+
+    Composed pointwise from the accumulation itself -- the canonical
+    full-width units `chain_state.save_effective_tau_spec` appends and
+    persists as the `full_tau_spec` chain-state value -- never from the
+    tau_manager process global. That global is a debug/error-state aid
+    holding the interpreter's composed, possibly shrunk spec: two
+    processes that shrank differently would snapshot different text for
+    the same revision, and under worker-backed authority it need not
+    describe the executing session at all. The accumulation is hashed
+    consensus state, identical on every node, so its composition is too.
+
+    This is also the very text the engine is rebuilt from: the node's
+    startup restore feeds the persisted accumulation to the interpreter
+    (server.py's restore callback restores the spec from
+    `get_persisted_full_tau_spec()`; the restore plan replays exactly
+    these units). The composition of the accumulation is therefore the
+    spec the engine runs by construction -- not submitted text awaiting
+    interpretation, and not a parallel reconstruction of it.
+
+    Pointwise, as the engine's revisions are: a plain `oN[t] = { lit }`
+    conjunct replaces the previous definition of oN; every other
+    conjunct is carried verbatim, in arrival order. Returns "" for an
+    empty accumulation.
+    """
+    from commands.getactiverules import top_level_conjuncts
+
+    assignments: Dict[str, str] = {}
+    extras: List[str] = []
+    for conjunct in top_level_conjuncts(accumulation_text or ""):
+        match = _PLAIN_ASSIGNMENT_RE.match(conjunct)
+        if match:
+            stream, width, literal = (
+                match.group(1), match.group(2), match.group(3),
+            )
+            assignments[stream] = f"{stream}[t]:{width} = {{ {literal} }}:{width}"
+        elif conjunct not in extras:
+            extras.append(conjunct)
+    parts = [
+        assignments[s] for s in sorted(assignments, key=lambda s: int(s[1:]))
+    ] + extras
+    if not parts:
+        return ""
+    return "always ( " + " && ".join(parts) + " )."
+
+
+def _bounded_receipt_logs(logs, limit: int = 16, width: int = 400) -> List[str]:
+    """The stored form of a transaction receipt's log lines (issue #42):
+    at most `limit` lines, each truncated to `width` characters, so the
+    persisted rule-outcome record stays small and bounded."""
+    return [str(line)[:width] for line in (logs or [])[:limit]]
+
+
+def _clause_registry_root_hex(registry) -> str:
+    """The clause-registry root as hex, for a registry in either of its
+    forms: the ClauseRegistry (whose incremental root is the one the
+    state hash uses) or a plain mapping, whose root is the same
+    construction computed whole."""
+    root_fn = getattr(registry, "root", None)
+    if callable(root_fn):
+        return root_fn().hex()
+    return compute_clause_registry_root(dict(registry)).hex()
+
+
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 
@@ -163,6 +237,12 @@ class TransactionOutcome:
     status: str # "applied", "skipped", "invalid"
     reason: Optional[str] = None
     receipt_logs: List[str] = None
+    # Bounty 02 (issue #42): for a rule transaction, the apply outcome of its
+    # own rule step, captured in _apply at the moment the step returned (see
+    # tx_receipt["rule_outcome"]): the revision receipt for a shared-spec
+    # rule, or the clause-registry record for a registry-routed one. None
+    # for every other transaction.
+    rule_outcome: Optional[Dict[str, Any]] = None
 
 @dataclass
 class ApplyBlockResult:
@@ -947,7 +1027,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 else:
                     accepted_ids.append(tx_id)
                     
-                outcomes.append(TransactionOutcome(tx_id=tx_id, status=status, receipt_logs=logs))
+                outcomes.append(TransactionOutcome(
+                    tx_id=tx_id, status=status, receipt_logs=logs,
+                    rule_outcome=receipt.get("rule_outcome"),
+                ))
             elif id(tx) in rejected_obj:
                 status = "invalid"
                 receipt = exec_result.receipts.get(tx_id, {})
@@ -962,6 +1045,44 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if event and id(tx) in accepted_obj:
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
+
+        # Bounty 02 (issue #42): harvest the active-rules history this block
+        # produced, in apply order. `rule_outcomes` is the per-block map
+        # tx_hash -> rule outcome for accepted rule transactions, keyed by the
+        # block's own transaction hash (the hash a wallet knows), not the
+        # receipt lookup key. `spec_snapshots` carries one (spec_revision,
+        # canonical_text) candidate per revision a rule step advanced, so a
+        # block that moves the spec twice keeps both states. Both ride the
+        # snapshot metadata; chain_state records them from there at commit,
+        # the same seam as retractable_events.
+        rule_outcomes = []
+        spec_snapshots = []
+        block_tx_ids = getattr(block, "tx_ids", None) or []
+        for i, tx in enumerate(block.transactions):
+            if id(tx) not in accepted_obj:
+                continue
+            receipt = exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}
+            outcome = receipt.get("rule_outcome")
+            if outcome:
+                tx_hash = (
+                    block_tx_ids[i] if i < len(block_tx_ids)
+                    else _receipt_lookup_key(tx, i)
+                )
+                # Issue #42, ask 1: the stored outcome also carries the
+                # transaction receipt's log lines -- the rule step's own
+                # "Tau(rule) ..." trail among them -- bounded to 16 lines
+                # of 400 chars so the record stays small. Copied here, at
+                # harvest: the apply receipt is the only place the lines
+                # and the outcome coexist, and the stored copy is the one
+                # gettxstatus serves.
+                stored = dict(outcome)
+                stored["logs"] = _bounded_receipt_logs(receipt.get("logs"))
+                rule_outcomes.append((tx_hash, stored))
+            snapshot = receipt.get("spec_snapshot")
+            if snapshot:
+                spec_snapshots.append(
+                    (snapshot["spec_revision"], snapshot["canonical_text"])
+                )
 
         # 3. Post-State Materialization Layer
         
@@ -1055,6 +1176,39 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             f"Governance rule activation rejected by live Tau interpreter "
                             f"at height {block.header.block_number}: {e}"
                         )
+            # Bounty 02 (issue #42): an activation advances the spec revision
+            # without any user rule transaction, so no per-step candidate
+            # exists for it. Take the block-end candidate from the last
+            # activation step's receipt, when it moved the revision past
+            # every candidate harvested so far.
+            try:
+                if proposal is not None:
+                    _act_receipt = proposal.session.last_receipt()
+                else:
+                    _act_receipt = tau_manager.get_last_revision_receipt()
+                if _act_receipt:
+                    _act_before = _act_receipt.get("spec_revision_before")
+                    _act_after = _act_receipt.get("spec_revision_after")
+                    _last_candidate = spec_snapshots[-1][0] if spec_snapshots else None
+                    if (
+                        isinstance(_act_before, int)
+                        and isinstance(_act_after, int)
+                        and _act_after > _act_before
+                        and (_last_candidate is None or _act_after > _last_candidate)
+                    ):
+                        # Same source as the per-step snapshots, never the
+                        # tau_manager process global. An activation feeds
+                        # its revisions with accumulate=False, so it does
+                        # not change the application-rules accumulation;
+                        # the candidate for the revision it advanced is
+                        # the composition of the block-end accumulation.
+                        _act_canonical = _compose_canonical_spec_text(
+                            next_app_rules
+                        )
+                        if _act_canonical:
+                            spec_snapshots.append((_act_after, _act_canonical))
+            except Exception:
+                pass
             last_update = newly_active[-1]
             # Provenance tag used by `compute_consensus_state_hash`. Every node
             # derives this string deterministically from `last_update.rule_revisions`,
@@ -1118,6 +1272,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "rule_outcomes": rule_outcomes,
+                "spec_snapshots": spec_snapshots,
             }
         )
         
@@ -1355,6 +1511,32 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 proposal.state["application_rules"] = text
                 return
             chain_state.save_application_rules_state(text)
+
+        def _step_accumulation_text(applied_rule_text: str) -> str:
+            """The canonical accumulation as the current rule step leaves it.
+
+            The step's own session state: the proposal's copy under
+            proposal execution, the committed accumulation otherwise --
+            never a process-global spec read (see
+            _compose_canonical_spec_text). On the live path the rules
+            handler has already appended the step's unit by the time its
+            receipt is read; on a speculative session it has not (the unit
+            is staged further down instead), so append it here under the
+            same dedup rule `save_effective_tau_spec` and that staging
+            both use.
+            """
+            base = _rules_state()
+            units = [u for u in (base or "").split("\n") if u.strip()]
+            try:
+                unit = (
+                    chain_state._preprocess_tau_spec_text(applied_rule_text)
+                    or applied_rule_text
+                ).strip()
+            except Exception:
+                unit = (applied_rule_text or "").strip()
+            if unit and unit not in units:
+                units.append(unit)
+            return "\n".join(units)
 
         def _sequence_of(address) -> int:
             if proposal is not None:
@@ -1773,10 +1955,47 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     tx_receipt["logs"].append(
                         "Policy change failed %d open approval request(s)" % len(doomed))
 
+                registry = offers.accepted_clauses
+                registry_root_before = _clause_registry_root_hex(registry)
                 if revoking:
-                    offers.accepted_clauses.pop(key, None)
+                    stored_text = registry.get(key)
+                    registry.pop(key, None)
+                    clause_outcome = "CLAUSE_REVOKED"
+                elif registered:
+                    registry[key] = body
+                    stored_text = body
+                    clause_outcome = "CLAUSE_REPLACED"
                 else:
-                    offers.accepted_clauses[key] = body
+                    registry[key] = body
+                    stored_text = body
+                    clause_outcome = "CLAUSE_REGISTERED"
+                # Bounty 02 (issue #42): a registry-routed rule transaction
+                # never reaches the revision machinery, so it has no engine
+                # receipt to copy -- but a confirmed rule transaction is
+                # still owed its apply outcome. Record it in the same slot,
+                # as registry evidence: the clause-registry root before and
+                # after (the root is part of the state hash), explicitly
+                # marked, and never claiming a spec revision -- there are
+                # no spec_revision keys, by construction. _apply_block
+                # harvests and persists it exactly like a revision receipt.
+                # `stored_text_sha256` pins the exact clause text the
+                # outcome concerns -- the text this transaction stored, or
+                # on a revoke the text it removed -- so the record names
+                # its clause body, not only the registry-wide root.
+                tx_receipt["rule_outcome"] = {
+                    "outcome": clause_outcome,
+                    "evidence": "clause_registry",
+                    "registry_root_before": registry_root_before,
+                    "registry_root_after": _clause_registry_root_hex(registry),
+                    "stored_text_sha256": (
+                        hashlib.sha256(
+                            stored_text.encode("utf-8")
+                        ).hexdigest()
+                        if stored_text is not None else None
+                    ),
+                    "account": sender_n,
+                    "stream": stream,
+                }
 
                 tx_receipt["logs"].append(
                     "o5 clause %s for %s"
@@ -2785,6 +3004,52 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     tx_receipt["logs"].append(
                                         f"Tau(rule) outcome: {receipt.get('outcome')}"
                                     )
+                                    # Bounty 02 (issue #42): copy the receipt
+                                    # into the transaction's own receipt NOW.
+                                    # The manager's last-receipt slot is a
+                                    # single process global that every later
+                                    # Tau step of this transaction (the fee
+                                    # steps included) and of the rest of the
+                                    # block overwrites, so this is the only
+                                    # moment the receipt still describes THIS
+                                    # rule step. _apply_block harvests it for
+                                    # accepted transactions and chain_state
+                                    # persists it at commit.
+                                    tx_receipt["rule_outcome"] = dict(receipt)
+                                    # If the step advanced the spec revision,
+                                    # the canonical spec text at this instant
+                                    # is that revision's snapshot: capture it
+                                    # alongside, for the same reason -- by
+                                    # commit time only the block's final text
+                                    # would still be readable, and the
+                                    # intra-block states would be lost. The
+                                    # text is composed from the canonical
+                                    # accumulation as this step's own session
+                                    # leaves it (see
+                                    # _compose_canonical_spec_text), NOT read
+                                    # from tau_manager's process global: that
+                                    # global is a debug aid holding the
+                                    # interpreter's possibly shrunk spec, and
+                                    # under worker-backed authority it need
+                                    # not describe the executing session.
+                                    try:
+                                        _rev_before = receipt.get("spec_revision_before")
+                                        _rev_after = receipt.get("spec_revision_after")
+                                        if (
+                                            isinstance(_rev_before, int)
+                                            and isinstance(_rev_after, int)
+                                            and _rev_after > _rev_before
+                                        ):
+                                            _canonical = _compose_canonical_spec_text(
+                                                _step_accumulation_text(rule_text)
+                                            )
+                                            if _canonical:
+                                                tx_receipt["spec_snapshot"] = {
+                                                    "spec_revision": _rev_after,
+                                                    "canonical_text": _canonical,
+                                                }
+                                    except Exception:
+                                        pass
                                 else:
                                     tau_failed = (
                                         isinstance(output, str)
