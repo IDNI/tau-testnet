@@ -681,6 +681,27 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
             timestamp=block_timestamp,
             state_hash=''
         )
+        # Block.create hashed the EXECUTION form of each transaction --
+        # the copy carrying the synthetic "tx_id" field added above --
+        # so the candidate's tx_ids are not the canonical hashes the
+        # persisted block body carries (the invariant the note at the
+        # reservation loop states: tx_ids is the canonical ID surface).
+        # Anything that keys records by block.tx_ids -- the Bounty 02
+        # rule-outcome harvest in consensus/engine.py does -- would
+        # record under a hash no wallet or status lookup can find.
+        # Recompute the candidate's IDs, merkle root and block hash
+        # from the pristine transaction list (index-aligned with the
+        # execution list by construction); the candidate's transactions
+        # themselves stay in execution form for the engine.
+        candidate_block.tx_ids = [
+            block.compute_tx_hash(tx) for tx in transactions
+        ]
+        candidate_block.header.merkle_root = block.compute_merkle_root(
+            candidate_block.tx_ids
+        )
+        candidate_block.block_hash = block.sha256_hex(
+            candidate_block.header.canonical_bytes()
+        )
 
         # Snapshot global Tau interpreter + application-rules state BEFORE the
         # miner-side simulation. `engine.apply_block` ultimately calls
