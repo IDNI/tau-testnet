@@ -42,6 +42,16 @@ from consensus.grants import (
     parse_grant_draw,
     validate_grant_shape,
 )
+from consensus.routes import (
+    MAX_ROUTES_TOTAL,
+    TX_TYPE_ROUTE_REMOVE,
+    TX_TYPE_ROUTE_SET,
+    RouteBook,
+    RouteShapeError,
+    parse_route_remove,
+    parse_route_set,
+    validate_route_shape,
+)
 from consensus.standing import (
     MAX_OPEN_STANDING_PER_PAYER,
     MAX_OPEN_STANDING_TOTAL,
@@ -1649,6 +1659,13 @@ def validate_retract_transfer_payload(
     return success({"retractable_id": request.retractable_id.hex()})
 
 
+def _route_book_from_row(row: Dict) -> RouteBook:
+    """A one-route book rebuilt from a stored row, so admission judges a
+    route from the persisted state alone (the tip view reads stored rows,
+    not the in-memory manager)."""
+    return RouteBook.restore([row], 0, bytes(32))
+
+
 def _standing_book_from_row(row: Dict) -> StandingPaymentBook:
     """A one-standing-payment book rebuilt from a stored row, so admission
     judges a standing payment from the persisted state alone (the tip view
@@ -1926,6 +1943,80 @@ def validate_standing_cancel_payload(
     return success({"standing_id": request.standing_id.hex()})
 
 
+def validate_route_set_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for setting (or replacing) a receive route."""
+    try:
+        entry = parse_route_set(tx)
+    except RouteShapeError as exc:
+        return format_error(f"Malformed route_set: {exc}.")
+
+    if not isinstance(tx.get("sender_pubkey"), str) or tx.get("sender_pubkey") != entry.account_pubkey:
+        return format_error("route_set sender_pubkey must match the account.")
+
+    chain_error = check_chain_binding(tx, tip_view.genesis_hash)
+    if chain_error is not None:
+        return format_error(
+            f"route_set rejected: {chain_error}.", code=WRONG_CHAIN_ID
+        )
+
+    shape_error = validate_route_shape(
+        entry, tip_view.next_block_height, tip_view.next_block_timestamp
+    )
+    if shape_error is not None:
+        return format_error(f"route_set rejected: {shape_error}")
+
+    row = tip_view.get_route(entry.account_pubkey)
+    book = RouteBook()
+    if row is not None:
+        book = _route_book_from_row(row)
+    ok, reason = book.can_admit_set(
+        entry, tip_view.next_block_height, tip_view.next_block_timestamp
+    )
+    if not ok:
+        return format_error(f"route_set rejected: {reason}", code="ROUTE_SET_REJECTED")
+    if row is None and tip_view.open_route_count() >= MAX_ROUTES_TOTAL:
+        return format_error("The route book is full.", code="ROUTE_BOOK_FULL")
+    return success(
+        {
+            "account_pubkey": entry.account_pubkey,
+            "destination_pubkey": entry.destination_pubkey,
+            "bps": entry.bps,
+        }
+    )
+
+
+def validate_route_remove_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for removing a receive route."""
+    try:
+        request = parse_route_remove(tx)
+    except RouteShapeError as exc:
+        return format_error(f"Malformed route_remove: {exc}.")
+
+    chain_error = check_chain_binding(tx, tip_view.genesis_hash)
+    if chain_error is not None:
+        return format_error(
+            f"route_remove rejected: {chain_error}.", code=WRONG_CHAIN_ID
+        )
+
+    row = tip_view.get_route(request.account_pubkey)
+    if row is None:
+        return format_error("Unknown route.", code="UNKNOWN_ROUTE")
+    book = _route_book_from_row(row)
+    ok, reason = book.can_admit_remove(
+        request.account_pubkey, tx.get("sender_pubkey"),
+        tip_view.next_block_height, tip_view.next_block_timestamp,
+    )
+    if not ok:
+        return format_error(
+            f"route_remove rejected: {reason}", code="ROUTE_REMOVE_REJECTED"
+        )
+    return success({"account_pubkey": request.account_pubkey})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -2057,6 +2148,12 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
          return validate_standing_cancel_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_ROUTE_SET:
+         return validate_route_set_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_ROUTE_REMOVE:
+         return validate_route_remove_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

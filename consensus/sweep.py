@@ -103,6 +103,10 @@ class SweepContext:
     # measure_fee(payer_pubkey, payee_pubkey, amount, timestamp) -> int.
     # None means the fee model is inactive and the fee is 0.
     measure_fee: Optional[Any] = None
+    # Optional route splitter for handlers that land a routable credit:
+    # called as route_split(recipient, amount, credit_class, timestamp)
+    # -> (net, routed, destination) or None. None means no route applies.
+    route_split: Optional[Any] = None
 
 
 class SweepHandler(Protocol):
@@ -209,6 +213,7 @@ def run_programmable_sweep(
     credit_records: Optional[Any] = None,
     fee_beneficiary: str = "",
     measure_fee: Optional[Any] = None,
+    route_split: Optional[Any] = None,
 ) -> SweepReport:
     """Engine hook: run the post-transaction programmable sweep for a block.
 
@@ -227,5 +232,6 @@ def run_programmable_sweep(
         credit_records=credit_records,
         fee_beneficiary=fee_beneficiary,
         measure_fee=measure_fee,
+        route_split=route_split,
     )
     return (registry or DEFAULT_SWEEP_REGISTRY).run(ctx, cap=cap)

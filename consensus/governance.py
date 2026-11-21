@@ -8,6 +8,7 @@ from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.grants import GrantBook
 from consensus.standing import StandingPaymentBook
+from consensus.routes import RouteBook
 from consensus.retractable import RetractableBook
 
 logger = logging.getLogger(__name__)
@@ -202,6 +203,7 @@ def build_mechanism_metadata(
     faucet_amount: int = 0,
     grants_root: str = "",
     standing_root: str = "",
+    routes_root: str = "",
     genesis_hash: str = "",
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
@@ -255,6 +257,8 @@ def build_mechanism_metadata(
         mech["grants_root"] = grants_root
     if standing_root:
         mech["standing_root"] = standing_root
+    if routes_root:
+        mech["routes_root"] = routes_root
     if genesis_hash:
         mech["genesis_hash"] = genesis_hash
     return mech
@@ -467,6 +471,7 @@ class ConsensusLifecycleManager:
         self.retractable_transfers = RetractableBook()
         self.grants = GrantBook()
         self.standing = StandingPaymentBook()
+        self.routes = RouteBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
@@ -568,6 +573,7 @@ class ConsensusLifecycleManager:
             faucet_amount=self.faucet_amount,
             grants_root=("" if self.grants.is_empty() else self.grants.root().hex()),
             standing_root=("" if self.standing.is_empty() else self.standing.root().hex()),
+            routes_root=("" if self.routes.is_empty() else self.routes.root().hex()),
             genesis_hash=self.genesis_hash,
         )
         return compute_consensus_meta_hash(

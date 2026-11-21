@@ -531,6 +531,34 @@ class TipAdmissionView:
     def open_standing_count(self) -> int:
         return self._retractable_scalar("SELECT COUNT(*) FROM standing_v1")
 
+    def get_route(self, account_pubkey: str) -> Optional[dict]:
+        """The account's receive route, or None (no route set)."""
+        try:
+            with db._db_lock:
+                row = db._db_conn.execute(
+                    "SELECT destination_pubkey, bps, min_incoming, "
+                    "activate_at, expires_at, locked_until, sequence_number "
+                    "FROM routes_v1 WHERE account_pubkey = ?",
+                    (account_pubkey,),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        return {
+            "account_pubkey": account_pubkey,
+            "destination_pubkey": row[0],
+            "bps": int(row[1]),
+            "min_incoming": int(row[2]),
+            "activate_at": int(row[3]),
+            "expires_at": int(row[4]),
+            "locked_until": None if row[5] is None else int(row[5]),
+            "sequence_number": int(row[6]),
+        }
+
+    def open_route_count(self) -> int:
+        return self._retractable_scalar("SELECT COUNT(*) FROM routes_v1")
+
     def get_retractable(self, retractable_id: bytes) -> Optional[dict]:
         """The open entry with this id, or None (unknown or already resolved)."""
         try:

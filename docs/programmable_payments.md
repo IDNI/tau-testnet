@@ -192,3 +192,34 @@ update at all. `standing_payment_cancel` is fee-exempt, like a retract.
 binding, see above).
 
 Demo: Alice pays Bob 100/week (`tests/test_standing.py::test_demo_alice_bob_100_per_week`).
+
+## Stage 4 — receive routes
+
+`consensus/routes.py` — `RouteBook`: one receive route per account. When
+a routable credit lands on the account, a share of it is forwarded to a
+destination: `routed = floor(gross * bps / 10000)`, `net = gross - routed`,
+with `bps` in 1..9,000, so the recipient always keeps at least 10%.
+
+Only two credit classes are routable (design 1.4 / 2.2): ordinary
+`transfer` credits and `standing_payment` credits. The routed share is
+recorded as `CREDIT_ROUTE_OUTPUT`, which is itself NOT routable — so the
+split is a single hop by construction, even when the destination has its
+own route. Everything else passes through untouched (faucet, genesis,
+fee/reward, refunds, grant draws/refunds, payout legs, retractable
+releases). The receipt is atomic: recipient and destination balances move
+in the same staged-write step and both credits carry the same transaction
+id, so net + routed always equals the gross.
+
+A route is active only inside `[activate_at, expires_at)` and only for
+grosses at or above `min_incoming`. `locked_until` is an optional binding
+lock: while it is in the future the route cannot be changed or removed.
+`route_set` is fee-bearing and carries `chain_id`; `route_remove` is
+fee-exempt, like a retract.
+
+The split hooks into the engine's single transfer choke point
+(`_execute_fee_era_transfer`) and into the shared standing-payment apply
+function, so every routable credit — a user transfer, a parked-transfer
+completion, a standing execution (manual or sweep) — splits the same way.
+
+Demo: Bob routes 25% of every incoming transfer to Carol
+(`tests/test_routes.py::test_demo_bob_routes_25_percent_to_carol`).

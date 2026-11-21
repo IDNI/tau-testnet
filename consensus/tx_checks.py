@@ -10,6 +10,7 @@ from typing import Any, Optional, Tuple
 from consensus.approvals import TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST
 from consensus.grants import TX_TYPE_GRANT_CREATE
 from consensus.standing import TX_TYPE_STANDING_PAYMENT
+from consensus.routes import TX_TYPE_ROUTE_SET
 from consensus.retractable import TX_TYPE_RETRACTABLE_TRANSFER
 from consensus.rule_offers import TX_TYPE_RULE_OFFER
 from consensus import bls
@@ -63,6 +64,8 @@ def _recipient_keys(tx: dict) -> list:
                 ("refund_to", tx.get("refund_to"))]
     if tx_type == TX_TYPE_STANDING_PAYMENT:
         return [("payee_pubkey", tx.get("payee_pubkey"))]
+    if tx_type == TX_TYPE_ROUTE_SET:
+        return [("destination_pubkey", tx.get("destination_pubkey"))]
     if tx_type in (TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RULE_CHANGE_REQUEST):
         keys = (
             [("recipient_pubkey", tx.get("recipient_pubkey"))]

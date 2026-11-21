@@ -44,6 +44,15 @@ from .grants import (
     parse_grant_create,
     parse_grant_draw,
 )
+from .routes import (
+    ROUTE_FEE_BEARING_TX_TYPES,
+    ROUTE_TX_TYPES,
+    RouteShapeError,
+    TX_TYPE_ROUTE_REMOVE,
+    TX_TYPE_ROUTE_SET,
+    parse_route_remove,
+    parse_route_set,
+)
 from .standing import (
     STANDING_FEE_BEARING_TX_TYPES,
     STANDING_TX_TYPES,
@@ -73,6 +82,7 @@ from .credits import (
     CREDIT_GRANT_DRAW,
     CREDIT_GRANT_REFUND,
     CREDIT_RETRACTABLE_RELEASE,
+    CREDIT_ROUTE_OUTPUT,
     CREDIT_TRANSFER,
     CreditLedger,
     CreditRecord,
@@ -111,6 +121,7 @@ FEE_BEARING_TX_TYPES = frozenset(
      TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_GRANT_CREATE}
     | set(RULE_OFFER_TX_TYPES)
     | set(STANDING_FEE_BEARING_TX_TYPES)
+    | set(ROUTE_FEE_BEARING_TX_TYPES)
 )
 
 
@@ -267,6 +278,45 @@ class ConsensusEngine(ABC):
 def _retractable_book(lm) -> Optional[RetractableBook]:
     book = getattr(lm, "retractable_transfers", None)
     return book if isinstance(book, RetractableBook) else None
+
+
+def _make_route_splitter(lm):
+    """A route_split callable for `lm`, or None when `lm` has no usable
+    routes book.
+
+    A lifecycle manager without a real routes book (a test double such as
+    the MagicMock lifecycle in test_worker_lost.py) has no route to apply,
+    so the splitter is None and credits land whole. A splitter that raises
+    or returns a malformed split also yields None (no split) instead of
+    breaking the transfer: the route is an optional receipt feature, and a
+    missing or broken route book must never reject a transfer.
+    """
+    book = getattr(lm, "routes", None)
+    apply_route = getattr(book, "apply_route", None)
+    if not callable(apply_route):
+        return None
+
+    def _split(recipient, amount, credit_class, ts):
+        try:
+            result = apply_route(recipient, amount, credit_class, ts)
+        except Exception:
+            return None
+        if not isinstance(result, (tuple, list)) or len(result) != 3:
+            return None
+        net, routed, destination = result
+        if (
+            not isinstance(net, int)
+            or isinstance(net, bool)
+            or not isinstance(routed, int)
+            or isinstance(routed, bool)
+            or not isinstance(destination, str)
+        ):
+            return None
+        if net <= 0 or routed <= 0:
+            return None
+        return (net, routed, destination)
+
+    return _split
 
 
 def _escrow_total(lm) -> int:
@@ -1067,6 +1117,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 lm.effective_fee_beneficiary() or block.header.proposer_pubkey
             ),
             measure_fee=_measure_standing_fee,
+            route_split=_make_route_splitter(lm),
         )
 
         minted = faucet.granted(
@@ -1836,6 +1887,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_standing_execute = None
             pending_standing_update = None
             pending_standing_cancel: Optional[bytes] = None
+            pending_route_set = None
+            pending_route_remove: Optional[bytes] = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2190,10 +2243,38 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         return False
                     staged_writes[from_addr] = current_from - amount
                     if not escrow:
-                        staged_writes[to_addr] = _read_bal(to_addr) + amount
-                        credit_records.record(
-                            to_addr, amount, CREDIT_TRANSFER, tx_id
+                        # A receive route on the recipient splits the credit:
+                        # the recipient keeps the net, the destination gets
+                        # the routed share as a route output (not routable,
+                        # so the split is a single hop by construction).
+                        # The debit above is the full gross, so the split
+                        # conserves supply.
+                        _splitter = _make_route_splitter(lifecycle_mgr)
+                        split = (
+                            _splitter(
+                                to_addr, amount, CREDIT_TRANSFER,
+                                int(block_timestamp or 0),
+                            )
+                            if _splitter is not None
+                            else None
                         )
+                        if split is None:
+                            staged_writes[to_addr] = _read_bal(to_addr) + amount
+                            credit_records.record(
+                                to_addr, amount, CREDIT_TRANSFER, tx_id
+                            )
+                        else:
+                            net, routed, destination = split
+                            staged_writes[to_addr] = _read_bal(to_addr) + net
+                            staged_writes[destination] = (
+                                _read_bal(destination) + routed
+                            )
+                            credit_records.record(
+                                to_addr, net, CREDIT_TRANSFER, tx_id
+                            )
+                            credit_records.record(
+                                destination, routed, CREDIT_ROUTE_OUTPUT, tx_id
+                            )
                 except FeeRuleError:
                     raise
                 except Exception as e:
@@ -2979,6 +3060,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 read=_read_bal, write=_stage_write,
                                 fee=0, fee_beneficiary="",
                                 credit_records=credit_records,
+                                route_split=_make_route_splitter(lifecycle_mgr),
                             )
                             if outcome in (
                                 "executed",
@@ -3058,6 +3140,61 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             pending_standing_cancel = request.standing_id
                             tx_receipt["logs"].append(
                                 "Standing payment cancelled: " + request.standing_id.hex()
+                            )
+
+            elif tx_type in ROUTE_TX_TYPES:
+                # Nothing here reads nested `payload` or `operations`: only root
+                # fields are signed, so anything else is unsigned data.
+                if accepted_in_block and not hard_reject:
+                    route_book = lifecycle_mgr.routes
+                    if tx_type == TX_TYPE_ROUTE_SET:
+                        try:
+                            entry = parse_route_set(tx)
+                        except RouteShapeError as exc:
+                            entry = None
+                            reason = f"invalid route set ({exc})"
+                        else:
+                            chain_error = check_chain_binding(tx, lifecycle_mgr.genesis_hash)
+                            if not isinstance(sender, str) or sender != entry.account_pubkey:
+                                reason = "sender is not the account owner"
+                            elif chain_error is not None:
+                                reason = f"chain binding failed: {chain_error}"
+                            else:
+                                _, reason = route_book.can_admit_set(
+                                    entry, int(block_height or 0), int(block_timestamp or 0)
+                                )
+                        if entry is None or reason:
+                            tx_receipt["logs"].append(f"Route ignored: {reason}")
+                            tx_receipt["reason"] = "route_not_set"
+                            accepted_in_block = False
+                        else:
+                            pending_route_set = entry
+                            tx_receipt["logs"].append(
+                                "Route set: " + entry.account_pubkey[:16] + "..."
+                            )
+                    else:  # TX_TYPE_ROUTE_REMOVE
+                        try:
+                            request = parse_route_remove(tx)
+                        except RouteShapeError as exc:
+                            request = None
+                            reason = f"invalid route remove ({exc})"
+                        else:
+                            chain_error = check_chain_binding(tx, lifecycle_mgr.genesis_hash)
+                            if chain_error is not None:
+                                reason = f"chain binding failed: {chain_error}"
+                            else:
+                                _, reason = route_book.can_admit_remove(
+                                    request.account_pubkey, sender,
+                                    int(block_height or 0), int(block_timestamp or 0),
+                                )
+                        if request is None or reason:
+                            tx_receipt["logs"].append(f"Route remove ignored: {reason}")
+                            tx_receipt["reason"] = "route_remove_not_applied"
+                            accepted_in_block = False
+                        else:
+                            pending_route_remove = request.account_pubkey
+                            tx_receipt["logs"].append(
+                                "Route removed: " + request.account_pubkey[:16] + "..."
                             )
 
             elif tx_type == 'consensus_rule_vote':
@@ -3661,6 +3798,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         pending_standing_cancel.hex(), "cancelled"
                     )
                     standing_book.cancel(pending_standing_cancel)
+
+            if accepted_in_block and not hard_reject:
+                if (pending_route_set is not None
+                        or pending_route_remove is not None):
+                    route_book = _lifecycle_for_write().routes
+                if pending_route_set is not None:
+                    tx_receipt["route_event"] = (
+                        pending_route_set.account_pubkey[:16], "set"
+                    )
+                    route_book.submit(pending_route_set)
+                elif pending_route_remove is not None:
+                    tx_receipt["route_event"] = (
+                        pending_route_remove[:16], "removed"
+                    )
+                    route_book.remove(pending_route_remove)
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same

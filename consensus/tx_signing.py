@@ -44,6 +44,10 @@ from consensus.standing import (
     TX_TYPE_STANDING_PAYMENT_EXECUTE,
     TX_TYPE_STANDING_PAYMENT_UPDATE,
 )
+from consensus.routes import (
+    TX_TYPE_ROUTE_REMOVE,
+    TX_TYPE_ROUTE_SET,
+)
 from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
@@ -183,6 +187,18 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["chain_id"] = payload.get("chain_id")
     elif tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
         signing_dict["standing_id"] = payload.get("standing_id")
+        signing_dict["chain_id"] = payload.get("chain_id")
+    elif tx_type == TX_TYPE_ROUTE_SET:
+        # Every field that fixes the route is signed; the account is the
+        # sender, so a proposer cannot redirect someone else's receipts.
+        signing_dict["destination_pubkey"] = payload.get("destination_pubkey")
+        signing_dict["bps"] = payload.get("bps")
+        signing_dict["min_incoming"] = payload.get("min_incoming")
+        signing_dict["activate_at"] = payload.get("activate_at")
+        signing_dict["expires_at"] = payload.get("expires_at")
+        signing_dict["locked_until"] = payload.get("locked_until")
+        signing_dict["chain_id"] = payload.get("chain_id")
+    elif tx_type == TX_TYPE_ROUTE_REMOVE:
         signing_dict["chain_id"] = payload.get("chain_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()

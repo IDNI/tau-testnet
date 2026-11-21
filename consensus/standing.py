@@ -738,6 +738,7 @@ def apply_standing_execution(
     fee: int,
     fee_beneficiary: str,
     credit_records: Optional[Any],
+    route_split: Optional[Any] = None,
 ) -> Tuple[str, Optional[int]]:
     """Execute one due period of a standing payment. Returns (outcome, period).
 
@@ -782,14 +783,55 @@ def apply_standing_execution(
     # so payer == payee or payer == beneficiary nets to zero -- the same
     # aliasing-safe ordering the engine's fee settlement uses.
     write(entry.payer_pubkey, payer_bal - entry.amount - fee)
-    write(entry.payee_pubkey, read(entry.payee_pubkey) + entry.amount)
-    if credit_records is not None:
-        credit_records.record(
-            entry.payee_pubkey,
-            entry.amount,
-            CREDIT_STANDING_PAYMENT,
-            standing_id.hex(),
-        )
+    # A receive route on the payee splits the credit: the payee keeps the
+    # net, the destination gets the routed share as a route output (which is
+    # itself not routable, so the split is a single hop by construction).
+    # The debit above is the full gross, so the split conserves supply.
+    split = None
+    if route_split is not None:
+        try:
+            _raw = route_split(
+                entry.payee_pubkey, entry.amount, CREDIT_STANDING_PAYMENT, ts
+            )
+        except Exception:
+            _raw = None
+        # A malformed split degrades to no split; only a well-formed
+        # (net, routed, destination) triple with positive legs applies.
+        if isinstance(_raw, (tuple, list)) and len(_raw) == 3:
+            _net, _routed, _dest = _raw
+            if (
+                isinstance(_net, int)
+                and not isinstance(_net, bool)
+                and isinstance(_routed, int)
+                and not isinstance(_routed, bool)
+                and isinstance(_dest, str)
+                and _net > 0
+                and _routed > 0
+            ):
+                split = (_net, _routed, _dest)
+    if split is None:
+        write(entry.payee_pubkey, read(entry.payee_pubkey) + entry.amount)
+        if credit_records is not None:
+            credit_records.record(
+                entry.payee_pubkey,
+                entry.amount,
+                CREDIT_STANDING_PAYMENT,
+                standing_id.hex(),
+            )
+    else:
+        from consensus.credits import CREDIT_ROUTE_OUTPUT
+
+        net, routed, destination = split
+        write(entry.payee_pubkey, read(entry.payee_pubkey) + net)
+        write(destination, read(destination) + routed)
+        if credit_records is not None:
+            credit_records.record(
+                entry.payee_pubkey, net, CREDIT_STANDING_PAYMENT,
+                standing_id.hex(),
+            )
+            credit_records.record(
+                destination, routed, CREDIT_ROUTE_OUTPUT, standing_id.hex()
+            )
     if fee > 0:
         write(fee_beneficiary, read(fee_beneficiary) + fee)
         if credit_records is not None:
@@ -866,6 +908,7 @@ class _StandingSweepHandler:
             fee=fee,
             fee_beneficiary=fee_beneficiary,
             credit_records=ctx.credit_records,
+            route_split=ctx.route_split,
         )
         if outcome in _ADVANCING_OUTCOMES and period is not None:
             book.mark_executed(item.object_id, period)
