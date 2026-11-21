@@ -247,7 +247,7 @@ fields are unsigned 64-bit integers. `sender_pubkey` must be the signer.
 
 - Custom inputs (`--input`) on a retractable transfer.
 - Co-signed retractable transfers.
-- Recipient refusal: the recipient cannot decline an open entry.
+- Recipient refusal of a park that is already open: a retract and a release are not re-checked. The recipient's clause can refuse the park itself, once `recipient_controls_active` is on. See [WALLET_USAGE.md](../WALLET_USAGE.md).
 - Partial retraction or editing an open entry.
 - Multi-leg or split payments.
 - Heartbeat blocks: the chain does not mine empty blocks on a schedule.
