@@ -7,7 +7,8 @@ at runtime: the real fee rule, the miner sealing blocks, the books
 surviving a restart, and a second node reproducing the same state from
 the first node's blocks. One flow per stage: (a) credits, (b) grants,
 (c) standing payments, (d) receive routes, (e) payout rules, (f) restart
-+ follower agreement.
++ follower agreement, (g) grant-expiry refund (short-lived grant, runs
+right after b while the miner is still off).
 
 Every node runs from its own tree under --dir (exported from `git archive HEAD`,
 so it tests committed code) with its own keys, genesis, database and ports. The
@@ -18,7 +19,7 @@ USAGE
     python scripts/e2e_programmable_payments.py provision --dir .local/payments-e2e
     python scripts/e2e_programmable_payments.py run --dir .local/payments-e2e
 
-`run` starts node1 (miner off), drives scenarios a, b, d, e, restarts node1
+`run` starts node1 (miner off), drives scenarios a, b, g, d, e, restarts node1
 with its miner enabled, drives scenario c, then starts node2 (follower)
 for scenario f, and stops exactly the processes it started.
 
@@ -65,7 +66,7 @@ FUNDS = 1_000_000
 RPC_PORTS = {"node1": 64810, "node2": 64820}
 P2P_PORTS = {"node1": 64830, "node2": 64840}
 PORT_MIN, PORT_MAX = 64810, 64890
-SCENARIOS = ("a", "b", "c", "d", "e", "f")
+SCENARIOS = ("a", "b", "c", "d", "e", "f", "g")
 ROLES = ("sender", "recipient", "other")
 ACTORS = ("miner",) + tuple(f"{s}_{r}" for s in SCENARIOS for r in ROLES) + ("pad1", "pad2")
 DAY = 86400
@@ -426,7 +427,7 @@ class Signer:
         return self.submit(node, self.sign(name, payload))
 
     def grant_create(self, node, name, to, amount=5000, spend_cap=500,
-                     per_payment_cap=500):
+                     per_payment_cap=500, expires_in=28 * DAY):
         payload = self._base(node, name, "grant_create")
         now = int(time.time())
         payload.update({
@@ -438,7 +439,7 @@ class Signer:
             "spend_cap": spend_cap,
             "per_payment_cap": per_payment_cap,
             "start_at": now,
-            "expires_at": now + 28 * DAY,
+            "expires_at": now + expires_in,
         })
         return self.submit(node, self.sign(name, payload))
 
@@ -639,6 +640,51 @@ def scenario_b(node, sg):
     return gid
 
 
+def scenario_g(node, sg):
+    say("g. grant expiry: a short-lived grant refunds the remainder on expiry")
+    g, r, o = fresh("g")
+    orc = Oracle(node, sg, "g", (g, r, o))
+    amount = 2000
+    draw = 500
+    # Two minutes is long enough for the create + draw to mine with margin,
+    # and short enough that the scenario does not dominate the run.
+    res = sg.grant_create(node, g, r, amount=amount, expires_in=120)
+    tx_ok(res, "g: short-expiry grant_create admitted")
+    check("g: grant_create mined", produce(node, node.height() + 1))
+    check("g: getgrants lists the open grant",
+          wait_until(lambda: len(node.grants(sg.pk(g))) == 1, "grant visible", 180))
+    row = node.grants(sg.pk(g))[0]
+    gid = row["grant_id"]
+    expires_at = int(row["expires_at"])
+    orc.add(g, -(amount + BASE_FEE)); orc.add("miner", BASE_FEE)
+    orc.verify("after create")
+    out, _ = node.acct(sg.pk(g))
+    check("g: granter escrowed_out == amount", out == amount, out)
+
+    # Draw first, so the refund is the REMAINDER (1500), not the full amount.
+    res = sg.grant_draw(node, r, gid, draw)
+    tx_ok(res, "g: grant_draw admitted")
+    check("g: grant_draw mined", produce(node, node.height() + 1))
+    orc.add(r, draw)
+    orc.verify("after draw")
+
+    # Wait for real time to pass the expiry, then mine: the sweep refunds
+    # the remainder to refund_to (the granter) and the grant disappears.
+    # The refund itself bears no fee.
+    say(f"   waiting for the grant to expire (expires_at={expires_at})")
+    while time.time() < expires_at + 2 and not over_deadline():
+        time.sleep(2.0)
+    check("g: blocks mined past the expiry",
+          produce(node, node.height() + 2, allow_empty=True))
+    check("g: grant is gone after expiry",
+          wait_until(lambda: len(node.grants(sg.pk(g))) == 0, "grant gone", 180))
+    orc.add(g, amount - draw)
+    orc.verify("after expiry refund")
+    out, _ = node.acct(sg.pk(g))
+    check("g: granter escrow is zero after the refund", out == 0, out)
+    return gid
+
+
 def scenario_c(node, sg):
     say("c. standing payments: create sweeps the current period once")
     p, r, o = fresh("c")
@@ -829,6 +875,7 @@ def run(base, log_dir, deadline):
         # observable step by step.
         scenario_a(node1, sg)
         gid = scenario_b(node1, sg)
+        scenario_g(node1, sg)
         scenario_d(node1, sg)
         pid = scenario_e(node1, sg)
 
