@@ -25,7 +25,11 @@ from commands import (
     getretractable,
     getretractableid,
     getchainid,
+    getgrants,
+    getpayoutrule,
+    getreceiveroute,
     getretractables,
+    getstandingpayments,
 )
 from errors import DependencyError
 from network import BootstrapPeer, NetworkConfig
@@ -88,6 +92,10 @@ class ServiceContainer:
         "getretractables": getretractables,
         "getretractableid": getretractableid,
         "getchainid": getchainid,
+        "getgrants": getgrants,
+        "getstandingpayments": getstandingpayments,
+        "getreceiveroute": getreceiveroute,
+        "getpayoutrule": getpayoutrule,
         # Advisory, node-local, and engine-driving -- rate-limited accordingly
         # in server.py.
         "getapprovalslots": getapprovalslots,
