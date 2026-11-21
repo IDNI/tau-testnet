@@ -226,6 +226,52 @@ class TestGrantsNativeE2E(unittest.TestCase):
         res = sendtx.queue_transaction(self._draw_tx(live.grant_id), propagate=False)
         self.assertFalse(res["ok"], f"second draw admitted: {res}")
 
+    def _seed_time_condition_grants(self):
+        """Two grants whose time conditions refuse a draw right now.
+
+        The locked grant unlocks in seven days; the windowed grant's
+        window opens in seven days and closes in fourteen. Both have a
+        release available today (500), so a refusal can only come from
+        the time condition — the condition is isolated, not the cap.
+        """
+        now = int(time.time())
+        book = chain_state._lifecycle_manager.grants
+        locked = GrantEntry(
+            funder_pubkey=FUNDER, beneficiary_pubkey=BENEFICIARY,
+            total_amount=5000, release_per_period=500,
+            schedule_kind=SCHEDULE_WEEKLY, signed_day=0,
+            start_ts=now - 100, deadline_ts=now + 30 * DAY,
+            locked_until_ts=now + 7 * DAY, window_start_ts=0,
+            window_end_ts=0, inactivity_seconds=0, version=1,
+        )
+        book.create(locked, now - 100)
+        windowed = GrantEntry(
+            funder_pubkey=FUNDER, beneficiary_pubkey=BENEFICIARY,
+            total_amount=5000, release_per_period=500,
+            schedule_kind=SCHEDULE_WEEKLY, signed_day=0,
+            start_ts=now - 100, deadline_ts=now + 30 * DAY,
+            locked_until_ts=0, window_start_ts=now + 7 * DAY,
+            window_end_ts=now + 14 * DAY, inactivity_seconds=0, version=1,
+        )
+        book.create(windowed, now - 100)
+        return locked, windowed
+
+    def test_draw_on_a_locked_grant_is_refused_on_the_native_engine(self):
+        locked, _ = self._seed_time_condition_grants()
+        before = chain_state._balances.get(BENEFICIARY, 0)
+        res = sendtx.queue_transaction(
+            self._draw_tx(locked.grant_id), propagate=False)
+        self.assertFalse(res["ok"], f"locked draw admitted: {res}")
+        self.assertEqual(chain_state._balances.get(BENEFICIARY, 0), before)
+
+    def test_draw_outside_the_scheduled_window_is_refused_on_the_native_engine(self):
+        _, windowed = self._seed_time_condition_grants()
+        before = chain_state._balances.get(BENEFICIARY, 0)
+        res = sendtx.queue_transaction(
+            self._draw_tx(windowed.grant_id), propagate=False)
+        self.assertFalse(res["ok"], f"out-of-window draw admitted: {res}")
+        self.assertEqual(chain_state._balances.get(BENEFICIARY, 0), before)
+
 
 if __name__ == "__main__":
     unittest.main()
