@@ -272,6 +272,35 @@ _STREAM_MENTION_RE = re.compile(r"\b([io])(\d+)\b")
 _STREAM_TYPED_TAIL_RE = re.compile(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*(\d+)\s*\]")
 
 
+def screen_receive_widths(text: str) -> Optional[str]:
+    """None when every mention of i17 is typed bv[64], else the reason.
+
+    Same hazard as o5 and the approval slots: the node feeds i17 at bv[64] on
+    every transfer, and per-stream typing is process-global and sticky, so one
+    clause typing it bv[16] (or leaving the width to be inferred) would leave
+    the interpreter unable to build anyone's receive rule -- measured, and it
+    fails closed, which is worse than refusing the rule that caused it.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    scrubbed = strip_clause_comments(text or "")
+    width = tau_defs.RECEIVE_STREAM_BV_WIDTH
+    name = f"i{tau_defs.RECEIVE_STREAM_INDEX}"
+    mention = re.compile(rf"\b{name}\b")
+    typed_tail = re.compile(r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*(\d+)\s*\]")
+    for match in mention.finditer(scrubbed):
+        typed = typed_tail.match(scrubbed, match.end())
+        if typed is None:
+            return (
+                f"every mention of {name} must be written "
+                f"{name}[t]:bv[{width}]; an untyped mention lets the engine "
+                f"infer a conflicting width process-wide"
+            )
+        if int(typed.group(1)) != width:
+            return f"{name} must be typed bv[{width}], found bv[{typed.group(1)}]"
+    return None
+
+
 def screen_stream_widths(body: str) -> Optional[str]:
     """None when every input/output mention carries one explicit width, else the reason.
 

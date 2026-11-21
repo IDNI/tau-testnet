@@ -44,6 +44,7 @@ from consensus.approvals import (
     parse_transfer_vote,
     screen_policy_widths,
     screen_slot_widths,
+    screen_receive_widths,
     screen_stream_widths,
     validate_request_shape,
     validate_rule_change_shape,
@@ -1027,6 +1028,13 @@ def _screen_clause_widths_and_structure(body: str) -> Optional[str]:
     policy_error = screen_policy_widths(body)
     if policy_error:
         return "Shared rules: " + policy_error
+
+    # And for the receive stream (#47/#76): the node feeds i17 at bv[64] on
+    # every transfer, so a clause that types it otherwise poisons the same
+    # process-global typing.
+    receive_error = screen_receive_widths(body)
+    if receive_error:
+        return "Shared rules: " + receive_error
 
     width_error = screen_stream_widths(body)
     if width_error:

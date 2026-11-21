@@ -227,6 +227,9 @@ def _parked_transfer_inputs(sender_pubkey: str, request: dict, tip_view,
         3: "{ #x" + sender_pubkey + " }:bv[384]",
         4: "{ #x" + request["recipient_pubkey"] + " }:bv[384]",
         12: "{ #x" + sender_pubkey + " }:bv[384]",
+        # Outbound judgement: the receive stream is fed on every transfer, so
+        # every input map carries it (see tau_defs.RECEIVE_STREAM_INDEX).
+        17: str(tau_defs.RECEIVE_OUTBOUND),
     }
     for k, v in (request.get("custom_inputs") or {}).items():
         values[int(k)] = str(v)
@@ -518,6 +521,39 @@ def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
     body = tip_view.clause_for(sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX)
     return _policy_call(lambda: sender_policy.clause_blocks(
         body, values, pool="admission", timeout=budget
+    ))
+
+
+def _receive_value_for_admission(tx_type, admission_eval, tip_view, admission_ts):
+    """`i17` for the transfer being admitted.
+
+    A plain transfer is final in its block (hold 0). A park carries its hold in
+    its own unit, measured against the same clock admission already uses to
+    refuse a park that could be mined at or after its own release: the NEXT
+    block's height/timestamp, since that is the earliest block that can carry it.
+    """
+    from consensus import recipient_policy
+
+    data = getattr(admission_eval, "data", None) or {}
+    if tx_type == TX_TYPE_RETRACTABLE_TRANSFER and data.get("release_kind") is not None:
+        return recipient_policy.park_value(
+            data["release_kind"], data["release_at"],
+            tip_view.next_block_height, admission_ts,
+        )
+    return tau_defs.RECEIVE_FINAL
+
+
+def _recipient_clause_blocks(tip_view, recipient_pubkey, values, hold, budget):
+    """(blocked, reason, message) for the RECIPIENT's own o5 clause (#47, #76).
+
+    Goes through `consensus.recipient_policy` so the inputs, the `i17` encoding
+    and the failure mapping are the ones block apply uses.
+    """
+    from consensus import recipient_policy
+
+    return _policy_call(lambda: recipient_policy.judge(
+        tip_view.clause_for, recipient_pubkey, values, hold,
+        pool="admission", timeout=budget,
     ))
 
 
@@ -1237,6 +1273,9 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                         # i12: full 384-bit sender public key (bv[384]) for user-policy
                         # rules that scope on the real key.
                         tau_input_stream_values[12] = "{ #x" + sender_pubkey + " }:bv[384]"
+                        tau_input_stream_values[tau_defs.RECEIVE_STREAM_INDEX] = str(
+                            tau_defs.RECEIVE_OUTBOUND
+                        )
                         # Custom input streams (i13+). Merged AFTER i12 and BEFORE
                         # i5, byte-identical to the apply-time overlay order in
                         # consensus/engine.py, so rules combining i13+ with the
@@ -1310,6 +1349,30 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 transfer_index=i + 1,
                             )
 
+                        # --- Recipient-side policy (#47, #76) ---
+                        # The recipient's own clause, judged with i12 set to the
+                        # recipient and i17 carrying the hold this payment would
+                        # have. Nothing is charged: a refusal here rejects the
+                        # transaction before it is queued.
+                        r_blocked, r_reason, r_message = _recipient_clause_blocks(
+                            tip_view, tau_input_dict['to_addr'],
+                            tau_input_stream_values,
+                            _receive_value_for_admission(
+                                tx_type, admission_eval, tip_view, admission_ts,
+                            ),
+                            admission_tau.budget,
+                        )
+                        if r_blocked:
+                            return _qt_err(
+                                "TX_REJECTED",
+                                (
+                                    f"Transaction rejected: {r_message} "
+                                    f"(transfer #{i+1}: {transfer_details})."
+                                ),
+                                transfer_index=i + 1,
+                                reason=r_reason,
+                            )
+
                         # --- Fee Estimation (o9 consensus + o8 custom) ---
                         # Same tau_outputs dict: zero extra roundtrips.
                         try:
@@ -1352,6 +1415,9 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                         3: "0", 4: "0"}
                     fee_query_inputs[5] = str(admission_ts)
                     fee_query_inputs[12] = "{ #x" + sender_pubkey + " }:bv[384]"
+                    fee_query_inputs[tau_defs.RECEIVE_STREAM_INDEX] = str(
+                        tau_defs.RECEIVE_OUTBOUND
+                    )
                     # Custom streams (i13+) last, matching the apply-time
                     # fee-query overlay order in consensus/engine.py.
                     for k, v in custom_tau_inputs.items():

@@ -640,6 +640,38 @@ Timing caveats:
 
 **Upgrade.** This adds a field to the consensus metadata hash with no activation flag, so it needs a regenesis and every node on the same build. An older binary forks at the first park block.
 
+## Recipient controls
+
+Long-form guide: [docs/recipient_controls.md](docs/recipient_controls.md).
+
+An account's own `o5` clause judges the payments made **to** it, not just the payments it makes: it can refuse senders it has not approved ([#47](https://github.com/IDNI/tau-testnet/issues/47)) and cap how long a payment to it may be held ([#76](https://github.com/IDNI/tau-testnet/issues/76)). The network refuses the transaction at mempool admission and again at block apply; a refusal at apply is a hard reject, so the sender pays the fee for it, exactly as for the sender's own clause.
+
+The node evaluates the account's one `o5` unit twice per payment: once with `i12 = the sender` (outbound) and once with `i12 = the recipient` (inbound). A clause body may not read `i12`, so the node also feeds `i17` (`bv[64]`), which is what an inbound rule reads:
+
+| `i17` | Meaning |
+|---|---|
+| `0` | the owner is the sender (outbound judgement) |
+| `1` | the owner is the recipient; the payment is final in this block (plain transfer, hold 0) |
+| `1 + N` | recipient; a park released `N` seconds after the block's timestamp |
+| `2^63 + N` | recipient; a park released `N` blocks ahead |
+
+```text
+# only approved senders may pay me
+always ( (i3[t]:bv[384] = { #x<APPROVER> }:bv[384]) -> (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
+
+# take payments that arrive instantly, and nothing held for more than 600 seconds
+always ( (i17[t]:bv[64] > { #x0259 }:bv[64]) -> (o5[t]:bv[24] = { #x000000 }:bv[24]) ).
+```
+
+Semantics:
+
+- **Neutral default.** An account with no clause, or one that never mentions `i17`, accepts payments and parks of any length. The receiving pass costs nothing when there is no clause.
+- **Not gated.** A retract, a matured release, a rule offer and an approval request are all untouched: none of them delivers funds to the recipient. A request's transfer is judged when it executes.
+- **Capability.** `getgovernance` reports `features.recipient_policy` and `stream_widths["i17"] = 64`. Do not deploy these rules against a node that does not list them: there `i17` is an ordinary custom stream and the rule would never run.
+- **Cap in the message.** A park refused on its hold reports `RECIPIENT_MAX_HOLD` with the hold and, when the clause uses the shipped template, the recipient's cap, so the payer's wallet can say "only accepts payments held up to 10 minutes; send it now instead".
+
+**Upgrade.** The feed changes what an `o5` clause can see, and therefore can change a verdict, which is the same class of change as activating `i16` (cooldown): every node must run the same build. `i17` also stops being a user custom input stream — a transaction that writes key `17` in `operations` is now refused, because the node fills it.
+
 ## Mempool policy
 
 - **Lanes** — every tx is classified `fast` (coin transfers) or `slow` (anything carrying Tau rule text: `rule_offer`, `rule_offer_accept`, `consensus_rule_update`, or a `user_tx` with a non-empty `operations["0"]`). A `user_tx` carrying both a rule and transfers is `slow` — the signature covers the whole payload, so it cannot be split. Applying a rule builds or recompiles Tau state, which costs far more than a transfer's one cheap step; without separation a burst of rule work delays every queued transfer. Fee priority cannot express the split, because a rule emits its own `o8` user fee and can therefore price itself to the front of the queue.

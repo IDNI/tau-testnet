@@ -181,6 +181,15 @@ def execute(raw_command: str, container):
             "votes": sorted(votes, key=lambda entry: (entry["update_id"], entry["voter_pubkey"])),
             "lifecycle": lifecycle,
             "stream_widths": dict(tau_defs.HOST_STREAM_WIDTHS),
+            # What this node enforces beyond the base rule set. A wallet should
+            # refuse to deploy a recipient-side rule against a node that does not
+            # list it here (issues #47/#76): on such a node i17 is an ordinary
+            # custom stream, the rule is admitted and then never runs.
+            "features": {
+                "recipient_policy": True,
+                "receive_stream": f"i{tau_defs.RECEIVE_STREAM_INDEX}",
+                "receive_stream_width": tau_defs.RECEIVE_STREAM_BV_WIDTH,
+            },
         }
 
     return api_response.success_response("getgovernance", payload)

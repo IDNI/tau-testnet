@@ -63,6 +63,9 @@ HOST_STREAM_WIDTHS = {
     "o5": USER_POLICY_BV_WIDTH,
     "o8": CUSTOM_FEE_BV_WIDTH,
     "o9": CONSENSUS_FEE_BV_WIDTH,
+    # Recipient-side policy (#47/#76): node-fed on every transfer, so a wallet
+    # can build a cap rule without guessing the width.
+    "i17": 64,
 }
 
 # --- Transaction expiry ---
@@ -258,6 +261,43 @@ COOLDOWN_NEVER_SENT = (1 << 63) - 1
 # feed, so by the time this is switched on the history is already accumulated.
 COOLDOWN_STREAM_ACTIVE = False
 
+
+# --- Recipient-side policy: the receive stream (issues #47, #76) -------------
+# i17 is node-fed, bv[64], and carries the two facts the RECIPIENT's clause
+# needs: that this payment is being judged on the receiving side, and how long
+# the money would be held before it is final.
+#
+# A clause body may not reference i12 (clause_body_v1 refuses it), so an
+# account's single o5 unit cannot tell "I am paying" from "I am being paid" by
+# reading its own key. i17 is what it reads instead:
+#
+#   i17 == 0                  the owner is the SENDER of this payment
+#   i17 == 1                  the owner is the RECIPIENT; the payment is final
+#                             in this block (a plain transfer: hold 0)
+#   i17 == 1 + N (N >= 1)     recipient; a park released N SECONDS after the
+#                             block's timestamp
+#   i17 == 2^63 + N (N >= 1)  recipient; a park released N BLOCKS ahead
+#
+# The two families are ordered, deliberately: every seconds value is small, so
+# "refuse anything held longer than C seconds" is one comparison,
+# `i17 > 1 + C`, and it also refuses every block-based park, because a block
+# value is always above 2^63. "Instant only" is the same rule with C = 0.
+#
+# Like i16 this is an ordinary user custom stream until the node starts feeding
+# it; this change is that point, so it is reserved for writes as well (see
+# `reserved_operation_keys`) and user rules that used "17" as a custom input
+# are refused instead of being silently shadowed.
+RECEIVE_STREAM_INDEX = 17
+RECEIVE_STREAM_BV_WIDTH = 64
+RECEIVE_OUTBOUND = 0
+RECEIVE_FINAL = 1
+RECEIVE_BLOCKS_BASE = 1 << 63
+
+# i12 (the sender key the node injects) as an index, so call sites that swap it
+# for the recipient's key do not spell the number.
+SENDER_KEY_STREAM_INDEX = 12
+
+
 # --- Tau Consensus ABI v1.2 additions (Tau-encoded validator membership) ---
 # Proposer BLS pubkey fed so a consensus rule can test set membership itself
 # (o7 = 1 iff i13 equals one of the validator pubkey constants baked into the
@@ -335,6 +375,10 @@ def reserved_operation_keys(
     global would leak across simulation, rollback and reorg.
     """
     keys = EXTRA_RESERVED_OPERATION_KEYS
+    # i17 is fed by the node on every transfer (recipient-side policy, #47/#76),
+    # so a sender must not be able to write it. Unconditional: the feed is part
+    # of this rule set, not a per-node switch.
+    keys = keys + (RECEIVE_STREAM_INDEX,)
     if eligibility_mode == "tau_validator_set":
         keys = keys + TAU_VALIDATOR_SET_RESERVED_OPERATION_KEYS
     if COOLDOWN_STREAM_ACTIVE:
@@ -366,6 +410,12 @@ def rule_text_forbidden_input_streams(
         eligibility_mode, approval_slots_active=approval_slots_active
     )
     readable = {12}
+    if context in (RULE_TEXT_CONTEXT_USER, RULE_TEXT_CONTEXT_O5_CLAUSE):
+        # Recipient-side policy (#47/#76): an o5 rule reads the receive stream to
+        # tell an inbound payment from an outbound one and to cap its hold. Write
+        # -forbidden everywhere, readable only by policy rule text -- the same
+        # split the approval slots use.
+        readable.add(RECEIVE_STREAM_INDEX)
     if context == RULE_TEXT_CONTEXT_O5_CLAUSE:
         readable |= set(approval_slot_indices())
     return tuple(f"i{idx}" for idx in keys if idx not in readable)
