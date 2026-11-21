@@ -40,6 +40,7 @@ from consensus.periods import (
     ALL_HOURS_MASK, ALL_WEEKDAYS_MASK, PERIOD_DAY, PERIOD_WEEK,
 )
 from consensus.policy_mock import MockPolicyEvaluator
+from consensus.rule_offers import clause_body_v1
 from consensus.standing import compute_standing_id
 from test_reorg_deep_chain import (
     BASE_TS, FUNDED_ACCOUNT, DeepChainTestCase, quiet,
@@ -49,7 +50,11 @@ from test_grants_native import NativeChainCase, _fresh
 ALICE = FUNDED_ACCOUNT
 DAY = 86400
 FAR_FUTURE = 9999999999
-CLAUSE = "always (o1[t] = 300, o2[t] = 700)."
+CLAUSE = (
+    "always ((i1[t]:bv[24] > { #x000000 }:bv[24])"
+    " ? (o1[t]:bv[24] = { 300 }:bv[24] && o2[t]:bv[24] = { 700 }:bv[24])"
+    " : (o1[t]:bv[24] = { 0 }:bv[24] && o2[t]:bv[24] = { 0 }:bv[24]))."
+)
 
 
 class TestProgrammablePaymentsReorg(NativeChainCase):
@@ -58,7 +63,7 @@ class TestProgrammablePaymentsReorg(NativeChainCase):
         # Program the payout-pool clause evaluator: the clause pays 300 to
         # the first recipient and 700 to the second. Restored in tearDown.
         self._payout_mock = MockPolicyEvaluator(pool="payout")
-        self._payout_mock.set_outputs(CLAUSE, {"o1": 300, "o2": 700})
+        self._payout_mock.set_outputs(clause_body_v1(CLAUSE), {"o1": 300, "o2": 700})
         sender_policy.set_evaluator("payout", self._payout_mock)
 
     def tearDown(self):

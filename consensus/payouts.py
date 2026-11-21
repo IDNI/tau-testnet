@@ -658,6 +658,7 @@ def clause_outputs_for(clause, *, payer_balance, ts, payer_pubkey, evaluator=Non
     directly (the real worker is a subprocess the test harness cannot
     mock), so the payout execution path never depends on it succeeding.
     """
+    from consensus.rule_offers import RuleOfferShapeError, clause_body_v1
     from consensus.sender_policy import clause_inputs, evaluator as _pool_evaluator
     from tau_policy import PolicyBuildError, PolicyStepError
 
@@ -669,6 +670,13 @@ def clause_outputs_for(clause, *, payer_balance, ts, payer_pubkey, evaluator=Non
         12: "{ #x" + str(payer_pubkey) + " }:bv[384]",
     })
     try:
-        return evaluator.step_outputs(clause, inputs)
-    except (PolicyBuildError, PolicyStepError):
+        # The stored clause is a full `always ( ... ).` unit, but the
+        # policy worker wraps every body in `always ( ... ).` itself, so
+        # stepping the stored text verbatim builds
+        # `always ( always ( ... ). ).` and always fails. Strip one wrapper
+        # first; a clause that is not exactly one `always` unit fails
+        # closed (None) like any other unevaluatable clause.
+        body = clause_body_v1(clause)
+        return evaluator.step_outputs(body, inputs)
+    except (PolicyBuildError, PolicyStepError, RuleOfferShapeError):
         return None

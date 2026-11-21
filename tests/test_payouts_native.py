@@ -43,6 +43,7 @@ from bls_keys import SK_ALICE, SK_BOB, pubkey_hex, sign_payload, signed_block
 from consensus import sender_policy
 from consensus.periods import PERIOD_WEEK, period_index
 from consensus.policy_mock import MockPolicyEvaluator
+from consensus.rule_offers import clause_body_v1
 from test_reorg_deep_chain import (
     BASE_TS,
     FUNDED_ACCOUNT,
@@ -54,7 +55,11 @@ from test_grants_native import NativeChainCase, _fresh
 ALICE = FUNDED_ACCOUNT
 DAY = 86400
 FAR_FUTURE = 9999999999
-CLAUSE = "always (o1[t] = 300, o2[t] = 700)."
+CLAUSE = (
+    "always ((i1[t]:bv[24] > { #x000000 }:bv[24])"
+    " ? (o1[t]:bv[24] = { 300 }:bv[24] && o2[t]:bv[24] = { 700 }:bv[24])"
+    " : (o1[t]:bv[24] = { 0 }:bv[24] && o2[t]:bv[24] = { 0 }:bv[24]))."
+)
 
 
 class TestPayoutsNative(NativeChainCase):
@@ -63,7 +68,7 @@ class TestPayoutsNative(NativeChainCase):
         # Program the payout-pool clause evaluator: the clause pays 300 to
         # the first recipient and 700 to the second. Restored in tearDown.
         self._payout_mock = MockPolicyEvaluator(pool="payout")
-        self._payout_mock.set_outputs(CLAUSE, {"o1": 300, "o2": 700})
+        self._payout_mock.set_outputs(clause_body_v1(CLAUSE), {"o1": 300, "o2": 700})
         sender_policy.set_evaluator("payout", self._payout_mock)
 
     def tearDown(self):
@@ -182,7 +187,7 @@ class TestPayoutsNative(NativeChainCase):
         create = self._payout_create_tx(SK_ALICE, [r1, r2])
         self._mine({1: [create]})
         pid = self._open_payout_id()
-        self._payout_mock.fail_step(CLAUSE)
+        self._payout_mock.fail_step(clause_body_v1(CLAUSE))
         execute = self._payout_execute_tx(SK_ALICE, pid)
         self._mine({2: [execute]})
         self.assertEqual(
@@ -192,7 +197,7 @@ class TestPayoutsNative(NativeChainCase):
     def test_execute_with_zero_outputs_skipped(self):
         """A clause that outputs nothing pays nothing (skipped_zero)."""
         r1, r2 = _fresh(4242), _fresh(4343)
-        self._payout_mock.set_outputs(CLAUSE, {})
+        self._payout_mock.set_outputs(clause_body_v1(CLAUSE), {})
         create = self._payout_create_tx(SK_ALICE, [r1, r2])
         self._mine({1: [create]})
         pid = self._open_payout_id()

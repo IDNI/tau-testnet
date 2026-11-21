@@ -35,13 +35,22 @@ DAVE = "dd" * 48
 CHAIN_ID = "ab" * 32
 
 T0 = 1_700_000_000  # a fixed "now" for shape/admission tests
+# Valid payout-clause shape: ternary over the i1 (payer balance) guard;
+# see docs/programmable_payments.md Stage 5. Bare decimals and
+# comma-separated assignments do not parse, and a constant-only clause
+# cannot be stepped (it reads no input stream).
+CLAUSE = (
+    "always ((i1[t]:bv[24] > { #x000000 }:bv[24])"
+    " ? (o1[t]:bv[24] = { 300 }:bv[24] && o2[t]:bv[24] = { 700 }:bv[24])"
+    " : (o1[t]:bv[24] = { 0 }:bv[24] && o2[t]:bv[24] = { 0 }:bv[24]))."
+)
 
 
 def make_payout(**overrides):
     fields = {
         "payer_pubkey": ALICE,
         "recipients": [BOB, CAROL],
-        "clause": "always (o1[t] = 300, o2[t] = 700).",
+        "clause": CLAUSE,
         "max_per_execution": 1000,
         "max_per_period": 1000,
         "period_kind": 2,  # PERIOD_WEEK
@@ -67,7 +76,7 @@ def make_tx(**overrides):
         "tx_type": TX_TYPE_PAYOUT_CREATE,
         "sender_pubkey": ALICE,
         "recipients": [BOB, CAROL],
-        "clause": "always (o1[t] = 300, o2[t] = 700).",
+        "clause": CLAUSE,
         "max_per_execution": 1000,
         "max_per_period": 1000,
         "period_kind": 2,
@@ -763,7 +772,7 @@ def _e_payout_create_tx(seq=0, sender=E_ALICE, sk=E_SK_ALICE,
         "expire_at_height": 1000,
         "fee_limit": "10000",
         "recipients": [E_BOB, E_CAROL],
-        "clause": "always (o1[t] = 300, o2[t] = 700).",
+        "clause": CLAUSE,
         "max_per_execution": 1000,
         "max_per_period": 1000,
         "period_kind": 2,
