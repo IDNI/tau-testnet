@@ -466,6 +466,39 @@ class TipAdmissionView:
     def open_retractable_count(self) -> int:
         return self._retractable_scalar("SELECT COUNT(*) FROM retractable_transfers_v1")
 
+    # --- Receive routes (Bounty 01, issue #35) ------------------------------
+    # Same read-from-tables discipline as the retractable accessors.
+
+    def get_route(self, owner_pubkey: str) -> Optional[dict]:
+        """The route installed by this owner, or None."""
+        try:
+            with db._db_lock:
+                row = db._db_conn.execute(
+                    "SELECT route_id, destination_pubkey, bps, min_incoming, "
+                    "activation_timestamp, expiry_timestamp, locked, "
+                    "sequence_number FROM receive_routes_v1 "
+                    "WHERE owner_pubkey = ?",
+                    (owner_pubkey,),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        return {
+            "route_id": row[0],
+            "owner_pubkey": owner_pubkey,
+            "destination_pubkey": row[1],
+            "bps": int(row[2]),
+            "min_incoming": int(row[3]),
+            "activation_timestamp": int(row[4]),
+            "expiry_timestamp": int(row[5]),
+            "locked": bool(row[6]),
+            "sequence_number": int(row[7]),
+        }
+
+    def route_count(self) -> int:
+        return self._retractable_scalar("SELECT COUNT(*) FROM receive_routes_v1")
+
     def escrowed_out(self, pubkey: str) -> int:
         return self._retractable_scalar(
             "SELECT COALESCE(SUM(amount), 0) FROM retractable_transfers_v1 "

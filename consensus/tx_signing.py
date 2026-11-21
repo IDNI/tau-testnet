@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from consensus import bls
 from consensus.approvals import (
@@ -42,6 +42,64 @@ from consensus.rule_offers import (
     TX_TYPE_RULE_OFFER_ACCEPT,
     TX_TYPE_RULE_OFFER_REJECT,
 )
+from consensus.routes import TX_TYPE_ROUTE_INSTALL, TX_TYPE_ROUTE_REMOVE
+
+# The Bounty 01 transaction types are bound to the network they were
+# signed for (see network_binding below). The pre-existing types predate
+# network binding and keep their CONSENSUS-FROZEN preimage bytes.
+NETWORK_BOUND_TX_TYPES = frozenset({TX_TYPE_ROUTE_INSTALL, TX_TYPE_ROUTE_REMOVE})
+
+_network_binding_override: Optional[str] = None
+_network_binding_cache: Optional[str] = None
+
+
+def set_network_binding(binding: Optional[str]) -> None:
+    """Pin the network identity bound into the Bounty 01 preimages.
+
+    Node startup pins the identity of the chain it loaded; tests pin a
+    foreign identity to prove a transaction signed for another network
+    is refused. Passing None releases the pin and drops the cached
+    resolution, so the next lookup re-resolves against the current chain.
+    """
+    global _network_binding_override, _network_binding_cache
+    _network_binding_override = binding
+    _network_binding_cache = None
+
+
+def network_binding() -> str:
+    """The network identity bound into the Bounty 01 signing preimage.
+
+    Resolves, in order: the explicit pin, the genesis hash of the local
+    chain (the identity two nodes compare when they peer), and the
+    configured network id. The resolved value is cached for the life of
+    the process: a signer and a verifier in one process must never watch
+    it move under them, and every node that has loaded its chain resolves
+    the same genesis hash.
+    """
+    global _network_binding_cache
+    if _network_binding_override is not None:
+        return _network_binding_override
+    if _network_binding_cache is None:
+        _network_binding_cache = _resolve_network_binding()
+    return _network_binding_cache
+
+
+def _resolve_network_binding() -> str:
+    try:
+        import db
+
+        # Only an already-open connection: resolving a signature must
+        # never create a database as a side effect.
+        if db._db_conn is not None:
+            genesis = db.get_genesis_hash()
+            if genesis:
+                return genesis
+    except Exception:
+        pass
+    import config
+
+    return str(config.NETWORK_ID)
+
 
 def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
     """CONSENSUS-FROZEN. Canonical bytes over the signed fields of a transaction.
@@ -66,6 +124,14 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
     # below with the same value, which is a no-op on a dict.
     if payload.get("expire_at_height") is not None:
         signing_dict["expire_at_height"] = payload["expire_at_height"]
+    if tx_type in NETWORK_BOUND_TX_TYPES:
+        # The network identity is signed for the Bounty 01 types, so a
+        # transaction signed for another network's genesis cannot verify
+        # on this one, however valid its signature is over there: the
+        # preimage it was made over names a different network. Sequence
+        # numbers alone cannot give this -- two networks that share a
+        # genesis-era account state would accept each other's replays.
+        signing_dict["network_id"] = network_binding()
     if tx_type == "user_tx":
         signing_dict["operations"] = payload.get("operations", {})
     elif tx_type == "consensus_rule_update":
@@ -123,6 +189,27 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
+    elif tx_type == TX_TYPE_ROUTE_INSTALL:
+        # Every field that fixes the route's terms is signed: the route
+        # diverts future credits by node action, with no further
+        # signature from the owner, so a proposer who could rewrite the
+        # destination or the share would be redirecting money the owner
+        # never agreed to divert.
+        signing_dict["destination_pubkey"] = payload.get("destination_pubkey")
+        signing_dict["bps"] = payload.get("bps")
+        signing_dict["min_incoming"] = payload.get("min_incoming")
+        signing_dict["activation_timestamp"] = payload.get("activation_timestamp")
+        signing_dict["expiry_timestamp"] = payload.get("expiry_timestamp")
+        signing_dict["locked"] = payload.get("locked")
+        # Present when an install replaces a LOCKED route: the outgoing
+        # destination's unlock signature, bound for the same reason as
+        # in the remove branch below.
+        signing_dict["destination_signature"] = payload.get("destination_signature")
+    elif tx_type == TX_TYPE_ROUTE_REMOVE:
+        signing_dict["route_id"] = payload.get("route_id")
+        # The destination's unlock signature is bound too: stripping or
+        # swapping it must not be something a proposer can do silently.
+        signing_dict["destination_signature"] = payload.get("destination_signature")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

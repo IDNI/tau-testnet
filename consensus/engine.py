@@ -41,6 +41,16 @@ from .retractable import (
     parse_retract_transfer,
     parse_retractable_transfer,
 )
+from .routes import (
+    MAX_ROUTES_TOTAL,
+    ROUTE_TX_TYPES,
+    TX_TYPE_ROUTE_INSTALL,
+    RouteShapeError as RouteShapeError_,
+    parse_route_install,
+    parse_route_remove,
+    validate_route_shape,
+    verify_route_unlock,
+)
 from .rule_offers import (
     RULE_OFFER_TX_TYPES,
     RuleOfferDecision,
@@ -70,7 +80,7 @@ from .rule_offers import (
 # at inclusion.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST}
+     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_ROUTE_INSTALL}
     | set(RULE_OFFER_TX_TYPES)
 )
 
@@ -87,6 +97,7 @@ _LIFECYCLE_TX_TYPES = frozenset(
     | set(RULE_OFFER_TX_TYPES)
     | set(APPROVAL_TX_TYPES)
     | set(RULE_CHANGE_TX_TYPES)
+    | set(ROUTE_TX_TYPES)
 )
 from consensus.tx_checks import apply_tx_error
 from consensus import bls
@@ -963,6 +974,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
 
+        route_events = []
+        route_splits = []
+        for i, tx in enumerate(block.transactions):
+            receipt = exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}
+            event = receipt.get("route_event")
+            if event and id(tx) in accepted_obj:
+                route_events.append(event)
+            split = receipt.get("route")
+            if split and id(tx) in accepted_obj:
+                route_splits.append({"tx": _receipt_lookup_key(tx, i), **split})
+
         # 3. Post-State Materialization Layer
         
         # The rules are updated by self.apply (it returns a generic snapshot with tau_bytes).
@@ -1118,9 +1140,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "route_events": route_events,
+                "route_splits": route_splits,
             }
         )
-        
+
         return ApplyBlockResult(
             next_snapshot=next_snapshot,
             outcomes=outcomes,
@@ -1131,6 +1155,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "activated_updates": [u.update_id_hex for u in newly_active],
                 "released_retractables": released_retractables,
                 "retractable_events": retractable_events,
+                "route_events": route_events,
+                "route_splits": route_splits,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -1664,6 +1690,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             parked_rule_change_id: Optional[bytes] = None
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
+            pending_route_install = None
+            pending_route_remove_owner: Optional[str] = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2018,7 +2046,45 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         return False
                     staged_writes[from_addr] = current_from - amount
                     if not escrow:
-                        staged_writes[to_addr] = _read_bal(to_addr) + amount
+                        credit = amount
+                        # --- Receive route (Bounty 01, issue #35) ---
+                        # The recipient's installed route diverts a
+                        # share of the GROSS credit to its destination,
+                        # staged in this same write set: the split
+                        # commits with the credit or not at all, the fee
+                        # above was measured on the whole transfer (one
+                        # fee, as charged for the unrouted transfer),
+                        # and the diverted share is credited directly --
+                        # it never re-enters this seam, so a routed
+                        # share can never trigger another route. Credits
+                        # that never pass the seam (sweep releases,
+                        # retract refunds, fee credits) are other credit
+                        # classes and stay unrouted by construction.
+                        route = lifecycle_mgr.receive_routes.active_route(
+                            to_addr, int(block_timestamp or 0)
+                        )
+                        if route is not None:
+                            share = route.split(amount)
+                            if share:
+                                staged_writes[route.destination] = (
+                                    _read_bal(route.destination) + share
+                                )
+                                credit = amount - share
+                                tx_receipt["route"] = {
+                                    "route_id": route.route_id.hex(),
+                                    "destination": route.destination,
+                                    "gross": amount,
+                                    "routed": share,
+                                    "net": credit,
+                                    "bps": route.bps,
+                                }
+                                tx_receipt["logs"].append(
+                                    f"Receive route: gross {amount}, "
+                                    f"net {credit}, routed {share} "
+                                    f"at {route.bps} bps to "
+                                    f"{route.destination}"
+                                )
+                        staged_writes[to_addr] = _read_bal(to_addr) + credit
                 except FeeRuleError:
                     raise
                 except Exception as e:
@@ -2628,6 +2694,80 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 "Retractable transfer retracted: " + request.retractable_id.hex()
                             )
 
+            elif tx_type in ROUTE_TX_TYPES:
+                # Receive routes (Bounty 01, issue #35). Root fields only,
+                # like the retractable branch: anything nested is unsigned.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    route_book = lifecycle_mgr.receive_routes
+                    now_ts = int(block_timestamp or 0)
+                    if tx_type == TX_TYPE_ROUTE_INSTALL:
+                        try:
+                            route_terms = parse_route_install(tx)
+                        except RouteShapeError_ as exc:
+                            route_terms = None
+                            reason = f"invalid receive route ({exc})"
+                        else:
+                            reason = validate_route_shape(route_terms, now_ts)
+                            existing = route_book.get(route_terms.owner)
+                            if reason is None and existing is not None \
+                                    and existing.removal_locked(now_ts) \
+                                    and not verify_route_unlock(
+                                        existing, tx.get("destination_signature")
+                                    ):
+                                reason = (
+                                    "the installed route is locked; replacing "
+                                    "it needs the destination's signature"
+                                )
+                            if reason is None and existing is None \
+                                    and route_book.count() >= MAX_ROUTES_TOTAL:
+                                reason = "the route book is full"
+                        if route_terms is None or reason:
+                            tx_receipt["logs"].append(
+                                f"Receive route ignored: {reason}"
+                            )
+                            tx_receipt["reason"] = "route_not_installed"
+                            accepted_in_block = False
+                        else:
+                            pending_route_install = route_terms
+                            tx_receipt["logs"].append(
+                                "Receive route installed: "
+                                + route_terms.route_id.hex()
+                            )
+                    else:  # TX_TYPE_ROUTE_REMOVE
+                        try:
+                            removal = parse_route_remove(tx)
+                        except RouteShapeError_ as exc:
+                            removal = None
+                            reason = f"invalid route removal ({exc})"
+                        else:
+                            installed = route_book.get(removal.owner)
+                            if installed is None:
+                                reason = "no route is installed for the sender"
+                            elif installed.route_id != removal.route_id:
+                                reason = "route_id does not name the installed route"
+                            elif installed.removal_locked(now_ts) \
+                                    and not verify_route_unlock(
+                                        installed, removal.destination_signature
+                                    ):
+                                reason = (
+                                    "the route is locked; removal needs the "
+                                    "destination's signature"
+                                )
+                            else:
+                                reason = None
+                        if removal is None or reason:
+                            tx_receipt["logs"].append(
+                                f"Route removal ignored: {reason}"
+                            )
+                            tx_receipt["reason"] = "route_not_removed"
+                            accepted_in_block = False
+                        else:
+                            pending_route_remove_owner = removal.owner
+                            tx_receipt["logs"].append(
+                                "Receive route removed: " + removal.route_id.hex()
+                            )
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3174,6 +3314,21 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 elif pending_retract_id is not None:
                     tx_receipt["retractable_event"] = (pending_retract_id.hex(), "retracted")
                     book.retract(pending_retract_id)
+
+            if accepted_in_block and not hard_reject:
+                if pending_route_install is not None or pending_route_remove_owner is not None:
+                    routes_book = _lifecycle_for_write().receive_routes
+                    if pending_route_install is not None:
+                        routes_book.install(pending_route_install)
+                        tx_receipt["route_event"] = (
+                            pending_route_install.route_id.hex(), "installed",
+                        )
+                    elif pending_route_remove_owner is not None:
+                        removed_route = routes_book.remove(pending_route_remove_owner)
+                        if removed_route is not None:
+                            tx_receipt["route_event"] = (
+                                removed_route.route_id.hex(), "removed",
+                            )
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same

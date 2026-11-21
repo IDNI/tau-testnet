@@ -59,6 +59,17 @@ from consensus.retractable import (
     parse_retractable_transfer,
     validate_park_shape,
 )
+from consensus.routes import (
+    MAX_ROUTES_TOTAL,
+    TX_TYPE_ROUTE_INSTALL,
+    TX_TYPE_ROUTE_REMOVE,
+    RouteShapeError,
+    RouteTerms,
+    parse_route_install,
+    parse_route_remove,
+    validate_route_shape,
+    verify_route_unlock,
+)
 from consensus.tx_checks import check_transfer, validate_bls_pubkey
 from consensus.governance import (
     normalize_validator_delta,
@@ -1628,6 +1639,96 @@ _EXPIRY_WINDOW_BY_TYPE = {
 }
 
 
+def _installed_route_terms(row: dict) -> RouteTerms:
+    return RouteTerms(
+        owner=row["owner_pubkey"],
+        destination=row["destination_pubkey"],
+        bps=int(row["bps"]),
+        min_incoming=int(row["min_incoming"]),
+        activation_ts=int(row["activation_timestamp"]),
+        expiry_ts=int(row["expiry_timestamp"]),
+        locked=bool(row["locked"]),
+        sequence_number=int(row["sequence_number"]),
+    )
+
+
+def validate_route_install_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for installing (or replacing) a receive route.
+
+    Shape is shared with block apply through `validate_route_shape`;
+    the lock on the route being replaced is checked here against the
+    tip book and again at apply against the candidate book.
+    """
+    try:
+        terms = parse_route_install(tx)
+    except RouteShapeError as exc:
+        return format_error(f"Malformed receive_route_install: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != terms.owner:
+        return format_error("receive_route_install sender_pubkey must match the signer.")
+
+    err = validate_bls_pubkey(terms.destination, "destination_pubkey")
+    if err:
+        return format_error(f"receive_route_install rejected: {err}")
+
+    shape_error = validate_route_shape(terms, tip_view.next_block_timestamp)
+    if shape_error:
+        return format_error(f"receive_route_install rejected: {shape_error}")
+
+    existing_row = tip_view.get_route(terms.owner)
+    if existing_row is not None:
+        existing = _installed_route_terms(existing_row)
+        if existing.removal_locked(tip_view.next_block_timestamp) and not verify_route_unlock(
+            existing, tx.get("destination_signature")
+        ):
+            return format_error(
+                "The installed route is locked; replacing it needs the "
+                "destination's signature.",
+                code="ROUTE_LOCKED",
+            )
+    elif tip_view.route_count() >= MAX_ROUTES_TOTAL:
+        return format_error("The route book is full.", code="ROUTE_BOOK_FULL")
+
+    return success({
+        "route_id": terms.route_id.hex(),
+        "destination_pubkey": terms.destination,
+        "bps": terms.bps,
+    })
+
+
+def validate_route_remove_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for removing a receive route."""
+    try:
+        removal = parse_route_remove(tx)
+    except RouteShapeError as exc:
+        return format_error(f"Malformed receive_route_remove: {exc}.")
+
+    row = tip_view.get_route(removal.owner)
+    if row is None:
+        return format_error(
+            "No route is installed for the sender.", code="ROUTE_NOT_FOUND"
+        )
+    installed = _installed_route_terms(row)
+    if installed.route_id != removal.route_id:
+        return format_error(
+            "route_id does not name the installed route.", code="ROUTE_NOT_FOUND"
+        )
+    if installed.removal_locked(tip_view.next_block_timestamp) and not verify_route_unlock(
+        installed, removal.destination_signature
+    ):
+        return format_error(
+            "The route is locked; removal needs the destination's signature.",
+            code="ROUTE_LOCKED",
+        )
+
+    return success({"route_id": removal.route_id.hex()})
+
+
 def validate_expire_at_height(payload: Dict, tip_view: TipAdmissionView) -> Optional[AdmissionResult]:
     """The height deadline every transaction carries. None when it is fine.
 
@@ -1728,6 +1829,12 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
          return validate_retract_transfer_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_ROUTE_INSTALL:
+         return validate_route_install_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_ROUTE_REMOVE:
+         return validate_route_remove_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

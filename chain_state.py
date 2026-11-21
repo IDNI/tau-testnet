@@ -550,6 +550,10 @@ def _retractable_state(lm) -> dict:
     }
 
 
+def _routes_state(lm) -> dict:
+    return {"rows": lm.receive_routes.snapshot_rows()}
+
+
 def _record_retractable_events(block, next_snapshot) -> None:
     """Best-effort history write; the apply verdict is already final.
 
@@ -564,6 +568,18 @@ def _record_retractable_events(block, next_snapshot) -> None:
             )
     except Exception:
         logger.exception("could not record retractable events")
+
+
+def _record_route_events(block, next_snapshot) -> None:
+    """Best-effort history write; the apply verdict is already final."""
+    try:
+        events = (getattr(next_snapshot, "metadata", None) or {}).get("route_events")
+        if events:
+            db.record_route_events(
+                block.block_hash, block.header.block_number, list(events)
+            )
+    except Exception:
+        logger.exception("could not record route events")
 
 
 def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
@@ -608,6 +624,7 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         rule_change_requests=lm.approval_requests.snapshot_rule_change_requests(),
         approval_slots_active=lm.approval_slots_active,
         retractable_transfers=_retractable_state(lm),
+        receive_routes=_routes_state(lm),
         eligibility_mode=lm.eligibility_mode,
         fee_beneficiary=lm.fee_beneficiary,
         last_transfer_ts=merged_ts,
@@ -1088,6 +1105,7 @@ def _process_new_block_locked(block: Block) -> bool:
                 _swap_in_memory_state(next_snapshot, block)
 
             _record_retractable_events(block, next_snapshot)
+            _record_route_events(block, next_snapshot)
 
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
@@ -1369,6 +1387,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                                       reason="state_hash invariant mismatch")
 
             _record_retractable_events(block, next_snapshot)
+            _record_route_events(block, next_snapshot)
 
             if _enabled:
                 # The block's evaluator history becomes durable exactly as a live
@@ -2240,6 +2259,18 @@ def _restore_retractables(lm) -> None:
         raise DatabaseError(f"corrupt retractable transfer state: {exc}") from exc
 
 
+def _restore_routes(lm) -> None:
+    """Rehydrate the route book; a stored row that does not recompute
+    its id is corruption and refuses to load."""
+    from consensus.routes import RouteBook
+
+    rows = db.load_route_state()
+    try:
+        lm.receive_routes = RouteBook.restore(rows)
+    except ValueError as exc:
+        raise DatabaseError(f"corrupt receive route state: {exc}") from exc
+
+
 def save_effective_tau_spec(canonical_rule_text: str):
     """
     Append ONE canonical (full-width, pre-shrink) application rule to the raw
@@ -2372,6 +2403,7 @@ def load_state_from_db() -> bool:
         _restore_approvals(_lifecycle_manager)
         _restore_rule_change_requests(_lifecycle_manager)
         _restore_retractables(_lifecycle_manager)
+        _restore_routes(_lifecycle_manager)
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
         persisted_slots = db.get_chain_state_value("approval_slots_active", _MISSING)
@@ -2440,6 +2472,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         )
         approval_slots_active_snapshot = _lifecycle_manager.approval_slots_active
         retractable_snapshot = _retractable_state(_lifecycle_manager)
+        routes_snapshot = _routes_state(_lifecycle_manager)
 
     db.save_canonical_state_atomically(
         block_hash, block_number,
@@ -2458,6 +2491,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_change_requests=rule_change_requests_list,
         approval_slots_active=approval_slots_active_snapshot,
         retractable_transfers=retractable_snapshot,
+        receive_routes=routes_snapshot,
     )
 
 def tick_governance(height: int):
@@ -2955,6 +2989,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 ),
                 approval_slots_active=_lifecycle_manager.approval_slots_active,
                 retractable_transfers=_retractable_state(_lifecycle_manager),
+                receive_routes=_routes_state(_lifecycle_manager),
             )
     except Exception as exc:
         logger.error(

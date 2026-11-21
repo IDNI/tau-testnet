@@ -780,3 +780,94 @@ def compute_retractable_book_root(
     out.extend(encode_uint64(int(resolved_count)))
     out.extend(encode_hash32(resolved_acc))
     return blake3(bytes(out)).digest()
+
+
+# --- Receive routes (Bounty 01, issue #35) -----------------------------------
+
+DOMAIN_ROUTE_TERMS_V1 = b"tau.route.terms.v1"
+DOMAIN_ROUTE_BOOK_V1 = b"tau.route.book.v1"
+
+
+def _encode_route_terms(
+    out: bytearray,
+    owner_pubkey: Any,
+    destination_pubkey: Any,
+    bps: int,
+    min_incoming: int,
+    activation_ts: int,
+    expiry_ts: int,
+    locked: int,
+    sequence_number: int,
+) -> None:
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(encode_pubkey48(destination_pubkey))
+    out.extend(encode_uint64(int(bps)))
+    out.extend(encode_uint64(int(min_incoming)))
+    out.extend(encode_uint64(int(activation_ts)))
+    out.extend(encode_uint64(int(expiry_ts)))
+    out.extend(bytes([int(locked) & 0xFF]))
+    out.extend(encode_uint64(int(sequence_number)))
+
+
+def compute_route_id(
+    owner_pubkey: Any,
+    destination_pubkey: Any,
+    bps: int,
+    min_incoming: int,
+    activation_ts: int,
+    expiry_ts: int,
+    locked: int,
+    sequence_number: int,
+) -> bytes:
+    """BLAKE3 of the canonical signed route terms. Returns 32 bytes.
+
+    Content-derived for the same reason retractable and standing ids
+    are: the apply-time tx_id differs between proposer and validators.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ROUTE_TERMS_V1.decode()))
+    _encode_route_terms(
+        out, owner_pubkey, destination_pubkey, bps, min_incoming,
+        activation_ts, expiry_ts, locked, sequence_number,
+    )
+    return blake3(bytes(out)).digest()
+
+
+def encode_route_entry(
+    route_id: Any,
+    owner_pubkey: Any,
+    destination_pubkey: Any,
+    bps: int,
+    min_incoming: int,
+    activation_ts: int,
+    expiry_ts: int,
+    locked: int,
+    sequence_number: int,
+) -> bytes:
+    """One installed route for the book root: id AND terms."""
+    out = bytearray()
+    out.extend(encode_hash32(route_id))
+    _encode_route_terms(
+        out, owner_pubkey, destination_pubkey, bps, min_incoming,
+        activation_ts, expiry_ts, locked, sequence_number,
+    )
+    return bytes(out)
+
+
+def compute_route_book_root(entries: Any) -> bytes:
+    """Root over the installed routes, canonically sorted by encoding.
+
+    ``entries`` is an iterable of tuples in :func:`encode_route_entry`
+    argument order. A route book is configuration, not a settlement
+    ledger: the root binds exactly the routes installed now, so a
+    removal changes the root and a re-install restores it.
+    """
+    encoded = sorted(
+        encode_route_entry(*entry) for entry in entries
+    )
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_ROUTE_BOOK_V1.decode()))
+    out.extend(encode_uint64(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    return blake3(bytes(out)).digest()

@@ -26,6 +26,7 @@ from consensus.rule_offers import (
     RULE_OFFER_TX_TYPES,
 )
 from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
+from consensus.routes import ROUTE_TX_TYPES, TX_TYPE_ROUTE_INSTALL
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
     approval_slots_active,
@@ -44,6 +45,7 @@ KNOWN_TX_TYPES = frozenset(
     | set(APPROVAL_TX_TYPES)
     | set(RULE_CHANGE_TX_TYPES)
     | set(RETRACTABLE_TX_TYPES)
+    | set(ROUTE_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
 # execution later is free and there is no second fee to drift. `transfer_vote` is
@@ -52,7 +54,7 @@ KNOWN_TX_TYPES = frozenset(
 # set instead.
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
-     TX_TYPE_RULE_CHANGE_REQUEST}
+     TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_ROUTE_INSTALL}
     | set(RULE_OFFER_TX_TYPES)
 )
 from db import add_mempool_tx
@@ -1464,6 +1466,43 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
             update_id = admission_eval.data.get("update_id")
             if update_id:
                 verdict["update_id"] = update_id
+            if tx_type == "user_tx" and all_validated_transfers:
+                # Receive-route preview (Bounty 01, issue #35): the split
+                # a transfer will meet at apply, computed from the tip
+                # book with the same RouteTerms.split the seam uses --
+                # so the result online (here) is the result offline
+                # (at apply), for the same tip state.
+                from consensus.routes import RouteTerms as _RouteTerms
+
+                previews = []
+                for _from, _to, _amt in all_validated_transfers:
+                    row = tip_view.get_route(_to)
+                    if row is None:
+                        continue
+                    route = _RouteTerms(
+                        owner=row["owner_pubkey"],
+                        destination=row["destination_pubkey"],
+                        bps=int(row["bps"]),
+                        min_incoming=int(row["min_incoming"]),
+                        activation_ts=int(row["activation_timestamp"]),
+                        expiry_ts=int(row["expiry_timestamp"]),
+                        locked=bool(row["locked"]),
+                        sequence_number=int(row["sequence_number"]),
+                    )
+                    if not route.is_active(tip_view.next_block_timestamp):
+                        continue
+                    share = route.split(int(_amt))
+                    if share:
+                        previews.append({
+                            "recipient": _to,
+                            "destination": route.destination,
+                            "route_id": route.route_id.hex(),
+                            "gross": int(_amt),
+                            "routed": share,
+                            "net": int(_amt) - share,
+                        })
+                if previews:
+                    verdict["route_previews"] = previews
             return verdict
 
         if db.count_mempool_txs() >= config.MAX_MEMPOOL_TXS:

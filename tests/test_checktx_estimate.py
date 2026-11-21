@@ -147,6 +147,10 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
+    if kind == "receive_route_install":
+        return _envelope(kind, SENDER, fee_limit, destination_pubkey=RECIPIENT,
+                         bps=2000, min_incoming=0, activation_timestamp=0,
+                         expiry_timestamp=0, locked=False)
     raise AssertionError(kind)
 
 
@@ -158,7 +162,7 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request"]
+               "rule_change_request", "receive_route_install"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():
