@@ -116,6 +116,7 @@ jobs:
           mv test_miner.key test_miner.pub data/ &&
           mkdir -p data_local && cp data/test_miner.key data/test_miner.pub data_local/ &&
           python -m pytest
+          tests/test_receive_routes_native.py
           tests/test_standing_payments_native.py
           tests/test_payout_rules_native.py
           -p no:asyncio -v

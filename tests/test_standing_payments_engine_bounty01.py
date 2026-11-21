@@ -30,6 +30,7 @@ from consensus import standing_payments
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.facade import TipAdmissionView
 from consensus.governance import ConsensusLifecycleManager
+from consensus.receive_routes import ReceiveRouteEntry
 from consensus.standing_payments import (
     SCHEDULE_DAILY,
     StandingPaymentBook,
@@ -340,6 +341,23 @@ def test_third_party_execution_settles_once_with_one_fee():
     assert again["tx_id"] in result.invalid_tx_ids
     assert _book(chain).total_executed(auth_id) == (1, AMOUNT)
     assert chain.balances[RECIPIENT] == 1000 + AMOUNT
+
+
+def test_execution_credit_is_never_split_by_a_receive_route():
+    """The design's credit-class table: standing credits do not route."""
+    chain, auth_id = _created_chain(max_total=100000)
+    chain.lm.receive_routes.install(ReceiveRouteEntry(
+        owner_pubkey=RECIPIENT, destination_pubkey=DEST, bps=2000,
+        min_amount=0, activation_ts=0, expiry_ts=0, locked_until_ts=0,
+        version=1,
+    ), TS)
+
+    execute = _execute_tx(EXECUTOR, SK_EXECUTOR, auth_id, seq=0)
+    result = chain.apply([execute])
+    assert execute["tx_id"] in result.accepted_tx_ids
+    assert chain.balances[RECIPIENT] == 1000 + AMOUNT  # whole, not 200
+    assert chain.balances[DEST] == 0
+    assert result.next_snapshot.metadata["routing_events"] == []
 
 
 def test_o5_blocked_execution_settles_nothing_then_settles_once():

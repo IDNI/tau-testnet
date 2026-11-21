@@ -38,6 +38,10 @@ from consensus.payout_rules import (
     TX_TYPE_INSTALL_PAYOUT_RULE,
     TX_TYPE_REMOVE_PAYOUT_RULE,
 )
+from consensus.receive_routes import (
+    TX_TYPE_INSTALL_RECEIVE_ROUTE,
+    TX_TYPE_REMOVE_RECEIVE_ROUTE,
+)
 from consensus.standing_payments import (
     TX_TYPE_CANCEL_STANDING_PAYMENT,
     TX_TYPE_CREATE_STANDING_PAYMENT,
@@ -133,6 +137,24 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["release_at_time"] = payload.get("release_at_time")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
+    elif tx_type == TX_TYPE_INSTALL_RECEIVE_ROUTE:
+        # Every field that fixes the route is signed: the apply path installs
+        # exactly these root fields, so anything omitted here could be
+        # rewritten by a proposer into a different route than the owner chose.
+        signing_dict["route_destination_pubkey"] = payload.get("route_destination_pubkey")
+        signing_dict["route_bps"] = payload.get("route_bps")
+        signing_dict["route_min_amount"] = payload.get("route_min_amount")
+        signing_dict["route_activation_ts"] = payload.get("route_activation_ts")
+        signing_dict["route_expiry_ts"] = payload.get("route_expiry_ts")
+        signing_dict["route_locked_until_ts"] = payload.get("route_locked_until_ts")
+        signing_dict["route_version"] = payload.get("route_version")
+    elif tx_type == TX_TYPE_REMOVE_RECEIVE_ROUTE:
+        # The destination's authorization, when presented, is bound into the
+        # owner's signature so it cannot be transplanted onto another removal;
+        # the destination signed (owner, route id) separately, before this
+        # transaction existed, so there is no circularity.
+        signing_dict["route_destination_signature"] = payload.get(
+            "route_destination_signature")
     elif tx_type == TX_TYPE_CREATE_STANDING_PAYMENT:
         # Every field that fixes the authorization is signed: the apply path
         # installs exactly these root fields (the recipient comes from
