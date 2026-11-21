@@ -634,6 +634,7 @@ class TipAdmissionView:
             "rule_index": rule_index,
             "shared_cap_id": shared_cap_id,
             "shared_cap_amount": shared_cap_amount,
+            "periods_from_ts": periods_from,
             "owner_pubkey": owner,
             "recipients": list(recipients),
             "legs": [

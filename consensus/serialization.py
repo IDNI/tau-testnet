@@ -1487,6 +1487,66 @@ def compute_payout_rule_deciding_id(
     return blake3(bytes(out)).digest()
 
 
+def compute_payout_rule_periods_from_id(
+    owner_pubkey: Any,
+    recipients: Any,
+    legs: Any,
+    clause_text: str,
+    form: int,
+    max_per_execution: int,
+    max_per_period: int,
+    period_seconds: int,
+    period_anchor_ts: int,
+    periods_from_ts: int,
+    version: int,
+    rule_index: int = 0,
+    shared_cap_id: str = "",
+    shared_cap_amount: int = 0,
+) -> bytes:
+    """BLAKE3 of a payout rule that carries a `periods_from` anchor.
+
+    The periods-from counterpart of the three ids above, under its own
+    domain: a rule whose periods count from a signed fixed start
+    (periods_from_ts) instead of the recorded install anchor is a
+    different rule from the same terms without it — the period grid its
+    caps are counted on differs, so the anchor is inside the hash, and
+    the form is encoded so a declared-form, a Tau-form and a
+    deciding-form rule over the same terms and anchor never collide
+    either. Entries WITHOUT periods_from keep the original ids
+    byte-for-byte; this function is only ever called for entries that
+    carry the anchor.
+
+    Fold adaptation (FIX 10 line): the FIX 7 slot and FIX 8 shared-cap
+    terms are appended after `version`, exactly as in the declared, Tau
+    and deciding ids on this line — the G4 line this function came from
+    has neither, and without them two periods-from rules differing only
+    in slot or shared cap would collide in this domain.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_RULE_PERIODS_FROM_V1.decode()))
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(_encode_pubkey_list(sorted(recipients or ())))
+    out.extend(encode_uint64(int(form)))
+    # Clause forms hash the clause text: form 2 is the Tau form, form 3
+    # the deciding form (FIX 10). A deciding rule hashed over its (empty)
+    # leg list instead would collide with any other deciding rule over
+    # the same terms and a different clause.
+    if int(form) in (2, 3):
+        out.extend(encode_string(str(clause_text or "")))
+    else:
+        out.extend(_encode_leg_list(legs))
+    out.extend(encode_uint64(int(max_per_execution)))
+    out.extend(encode_uint64(int(max_per_period)))
+    out.extend(encode_uint64(int(period_seconds)))
+    out.extend(encode_uint64(int(period_anchor_ts)))
+    out.extend(encode_uint64(int(periods_from_ts)))
+    out.extend(encode_uint64(int(version)))
+    out.extend(encode_uint64(int(rule_index)))
+    out.extend(encode_string(str(shared_cap_id or "")))
+    out.extend(encode_uint64(int(shared_cap_amount)))
+    return blake3(bytes(out)).digest()
+
+
 def encode_payout_rule_record(
     rule_id: Any,
     owner_pubkey: Any,
