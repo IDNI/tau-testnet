@@ -44,7 +44,16 @@ account creation cannot pollute them.
 A further test pins the periods_from anchor on the real engine: a rule
 installed now whose periods count from two weeks in the past settles
 its execution against anchored period 2 — the book's period total
-lands under index 2, not under the install grid's period 0.
+lands under index 2, not under the install grid's period 0. Its
+clause deliberately READS an input stream (i1, the base amount): a
+clause that reads no input stream cannot be stepped by the policy
+worker at all (the worker's build probe names the case — "clause
+cannot be evaluated: it reads no input stream" — and a step attempt
+is refused the same way). The constant clauses of the cap and
+duplicate tests above never exposed this: every assertion of theirs
+is negative, so a step refusal and a book refusal look identical to
+them. A positive settlement test has no such cover, so its clause
+must be a reading clause, like the grant example's.
 """
 import json
 import os
@@ -349,6 +358,84 @@ class TestPayoutTauRuleNativeE2E(unittest.TestCase):
         self.assertEqual(after[OWNER] - before[OWNER], 0)
         book = chain_state._lifecycle_manager.payout_rules
         self.assertFalse(book.is_settled(entry.rule_id, bytes.fromhex("66" * 32)))
+
+    def test_clause_duplicate_candidate_index_settles_nothing(self):
+        # A candidate named twice is malformed output, not two legs: the
+        # whole execution settles nothing — refused at admission, and
+        # refused again at inclusion with admission bypassed. The total
+        # (150) is under the declared 500 per-execution cap, so only the
+        # duplicate rule can refuse this execution.
+        now = int(time.time())
+        clause = (
+            "((o30[t]:bv[64] = { 2 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 100 }:bv[64]) "
+            "&& (o33[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o34[t]:bv[64] = { 50 }:bv[64]))"
+        )
+        entry = PayoutRuleEntry(
+            owner_pubkey=OWNER, recipients=(BOB,), legs=(),
+            max_per_execution=500, max_per_period=0,
+            period_seconds=WEEK, period_anchor_ts=now - 100, version=1,
+            form=FORM_TAU_RULE, clause_text=clause,
+        )
+        chain_state._lifecycle_manager.payout_rules.install(entry, now)
+
+        blob = self._execute_tx(entry.rule_id, "77" * 32, 1)
+        before = self._balances()
+        res = sendtx.queue_transaction(blob, propagate=False)
+        self.assertFalse(res["ok"], f"duplicate-index execution admitted: {res}")
+        # Inclusion on its own refuses it too, with admission bypassed.
+        forced = self._force_queue(blob)
+        self._mine()
+        self.assertFalse(self._included(forced),
+                         "inclusion settled a duplicate candidate index")
+        after = self._balances()
+        self.assertEqual(after[BOB] - before[BOB], 0)
+        self.assertEqual(after[OWNER] - before[OWNER], 0)
+        book = chain_state._lifecycle_manager.payout_rules
+        self.assertFalse(book.is_settled(entry.rule_id, bytes.fromhex("77" * 32)))
+
+    def test_anchored_grid_counts_the_settlement_in_period_2(self):
+        # periods_from two weeks in the past: the wall-clock execution
+        # lands in anchored period 2, while the install-anchored grid
+        # would call it period 0. The clause pays a fixed 100 to Bob
+        # whenever the submitted base is positive (always true of a
+        # valid execution — and the read of i1 is what makes the
+        # clause steppable at all; see the module docstring); the
+        # settlement must be counted against anchored period 2 —
+        # period_total(rule_id, 2) is 100 and period 0 stays empty.
+        now = int(time.time())
+        clause = (
+            "((i1[t]:bv[64] < { 1 }:bv[64]) "
+            "? ((o30[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 0 }:bv[64])) "
+            ": ((o30[t]:bv[64] = { 1 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 100 }:bv[64])))"
+        )
+        entry = PayoutRuleEntry(
+            owner_pubkey=OWNER, recipients=(BOB,), legs=(),
+            max_per_execution=500, max_per_period=500,
+            period_seconds=WEEK, period_anchor_ts=now - 100, version=1,
+            form=FORM_TAU_RULE, clause_text=clause,
+            periods_from_ts=now - 2 * WEEK,
+        )
+        chain_state._lifecycle_manager.payout_rules.install(entry, now)
+
+        before = self._balances()
+        res = sendtx.queue_transaction(
+            self._execute_tx(entry.rule_id, "88" * 32, 1), propagate=False)
+        self.assertTrue(res["ok"], f"anchored execution rejected: {res}")
+        self._mine()
+        after = self._balances()
+        self.assertEqual(after[BOB] - before[BOB], 100)
+        self.assertEqual(after[OWNER] - before[OWNER], -100)
+        book = chain_state._lifecycle_manager.payout_rules
+        self.assertTrue(book.is_settled(entry.rule_id, bytes.fromhex("88" * 32)))
+        self.assertEqual(book.period_total(entry.rule_id, 2), 100)
+        self.assertEqual(book.period_total(entry.rule_id, 0), 0)
 
 
 if __name__ == "__main__":
