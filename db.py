@@ -2394,6 +2394,9 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 retractable_transfers=retractable_transfers,
                 rule_change_requests=rule_change_requests,
                 grants=grants,
+                standing=standing,
+                routes=routes,
+                payouts=payouts,
             )
         _confirm_rule_clauses({'rule_clauses': rule_clauses})
 
