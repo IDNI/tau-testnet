@@ -232,6 +232,9 @@ def test_a_blocks_threshold_reports_that_cap_and_still_allows_a_time_park(cap):
     refusal = recipient_refusal(HOLD, {}, HEIGHT_CODE_BASE + cap + 1, pool="apply")
     assert refusal.code == MAX_HOLD
     assert refusal.details == {"max_hold_blocks": cap}
+    if cap == 0:
+        assert "straight away" not in refusal.message
+        assert "max_hold_seconds" not in refusal.details
 
 
 def test_the_search_stops_at_the_boundary_instead_of_scanning_the_window():
@@ -659,6 +662,8 @@ def test_a_seconds_cap_refuses_a_long_time_park_and_a_height_park_at_apply():
     result = ch.block([height])
     assert _reason(result, height) == MAX_HOLD
     assert "max_hold_blocks=0" in _logs(result)
+    assert "max_hold_seconds=600" in _logs(result)
+    assert "straight away" not in _logs(result)
     assert ch.book.open == {}
     assert ch.bal[parks.PROPOSER] == 0
 

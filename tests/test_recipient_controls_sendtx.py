@@ -247,7 +247,13 @@ def test_a_queued_height_park_past_a_seconds_cap_names_zero_blocks(node):
     result = _queue(sendtx, _park())
     assert result["ok"] is False
     assert result["code"] == MAX_HOLD
-    assert result["details"] == {"transfer_index": 1, "max_hold_blocks": 0}
+    assert result["details"] == {
+        "transfer_index": 1,
+        "max_hold_blocks": 0,
+        "max_hold_seconds": 600,
+    }
+    assert "600 seconds" in result["message"]
+    assert "straight away" not in result["message"]
     assert mock.verdict_calls[0][1]["i17"] == str(HEIGHT_CODE_BASE + 30)
     assert _mempool() == []
     _no_hold_on_fee_step(script)

@@ -100,11 +100,17 @@ def test_an_outbound_clause_is_not_asked_about_an_incoming_payment():
 def test_cap_zero_admits_a_plain_payment_and_refuses_every_park():
     _use(_over(CODE_PLAIN))
     assert recipient_refusal(HOLD, {}, CODE_PLAIN, pool="apply") is None
-    for code in (2, 601, park_hold_code(KIND_HEIGHT, 20, 10, 0)):
+    for code in (2, 601):
         refusal = recipient_refusal(HOLD, {}, code, pool="apply")
         assert refusal.code == MAX_HOLD
-        assert refusal.details in ({"max_hold_seconds": 0}, {"max_hold_blocks": 0})
+        assert refusal.details == {"max_hold_seconds": 0}
         assert "straight away" in refusal.message
+    height = recipient_refusal(
+        HOLD, {}, park_hold_code(KIND_HEIGHT, 20, 10, 0), pool="apply",
+    )
+    assert height.code == MAX_HOLD
+    assert height.details == {"max_hold_blocks": 0, "max_hold_seconds": 0}
+    assert "straight away" in height.message
 
 
 def test_a_600_second_cap_allows_600_and_refuses_an_hour():
@@ -115,7 +121,27 @@ def test_a_600_second_cap_allows_600_and_refuses_an_hour():
     assert refusal.details == {"max_hold_seconds": 600}
     assert "600 seconds" in refusal.message
     height = recipient_refusal(HOLD, {}, HEIGHT_CODE_BASE + 10, pool="apply")
-    assert height.details == {"max_hold_blocks": 0}
+    assert height.code == MAX_HOLD
+    assert height.details == {"max_hold_blocks": 0, "max_hold_seconds": 600}
+    assert "600 seconds" in height.message
+    assert "straight away" not in height.message
+    assert "max_hold_blocks=0" in height.message
+
+
+def test_the_recipient_pass_sees_co_signers_as_zero_and_leaves_absent_slots_out():
+    cosigner = "{ #x" + PAYER + " }:bv[384]"
+    values = {3: OTHER, 18: cosigner, "i25": cosigner}
+    mock = _use(lambda inputs: 0 if inputs.get("i18") not in (None, "0") else 1)
+    assert recipient_refusal(HOLD, values, CODE_PLAIN, pool="apply") is None
+    assert values[18] == cosigner
+    seen = mock.verdict_calls[0][1]
+    assert seen["i18"] == "0"
+    assert seen["i25"] == "0"
+    bare = {3: OTHER}
+    mock = _use(lambda inputs: 1)
+    assert recipient_refusal(HOLD, bare, CODE_PLAIN, pool="apply") is None
+    assert "i18" not in mock.verdict_calls[0][1]
+    assert "i25" not in mock.verdict_calls[0][1]
 
 
 def test_an_allow_list_names_the_payer_and_does_not_invent_a_hold_cap():

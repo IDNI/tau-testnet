@@ -234,8 +234,11 @@ One that does is also asked about each payment to you. Branch on `0` so an
 inbound rule does not block your own sends:
 
 - **Inbound allow-list:** allow when `i17` is `0`, otherwise allow only when `i3` is an approved payer.
-- **Instant only:** block when `i17 > 1`. Plain payments pass. Every park is refused with `RECIPIENT_MAX_HOLD` and `max_hold_seconds=0` (a height park reports `max_hold_blocks=0`).
-- **Up to 10 minutes:** block when `i17 > 601`. A 600-second park passes. A longer time park is refused with `max_hold_seconds=600`. A height park fails that comparison.
+- **Instant only:** block when `i17 > 1`. Plain payments pass. A time park is refused with `max_hold_seconds=0`. A height park is refused with `max_hold_seconds=0` and `max_hold_blocks=0`.
+- **Up to 10 minutes:** block when `i17 > 601`. A 600-second park passes. A longer time park is refused with `max_hold_seconds=600`. A height park is refused with `max_hold_blocks=0` and `max_hold_seconds=600`, because that comparison still accepts a 10-minute time park.
+- **No height park, any time park:** block when `i17 > 7776001`. The refusal is `max_hold_blocks=0` and does not name a seconds cap.
+
+The approval slots `i18`–`i25` are the sender's co-signers. The recipient pass reads a slot the transfer already carries as `0`; the sender's own clause still sees the keys. A slot the transfer does not carry stays absent.
 
 Admission measures a time park against `next_block_timestamp` (the later of the tip timestamp and the wall clock) and a height park against `next_block_height`. Apply measures against the block being applied, so a park that lands later has a shorter hold. A refusal at admission or at apply charges no fee: apply hard-rejects, and the fee is taken only from a transaction that stays accepted. A retract is not judged again, and a release is not judged again. Rule offers and approval requests are not gated; the transfer that an approval later pays is.
 

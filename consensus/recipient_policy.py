@@ -10,6 +10,12 @@ runs only when that clause mentions i17, and feeds a code:
 
 A cap of 0 is the comparison ``i17 > 1``. A cap of 600 seconds is ``i17 > 601``,
 and every height park fails it, because those codes sit above the seconds range.
+That refusal reports ``max_hold_blocks=0`` and, when the seconds side is itself
+one cap, ``max_hold_seconds`` as well.
+
+The recipient pass sets approval slots the transfer map already carries to 0.
+Those slots are the sender's co-signers, and the sender's own clause still
+sees them. A slot the map does not have is left absent.
 
 i17 stays a sender-supplied custom stream until ``recipient_controls_active``.
 The flag is consensus state, the same one-way governance switch as the
@@ -187,6 +193,51 @@ def _message(unit: str, cap: int) -> str:
     )
 
 
+def _height_closed_message(seconds: Optional[int]) -> str:
+    """A height park every height code refuses.
+
+    ``seconds`` is the seconds cap when that side is one threshold. None means
+    the seconds window is open, or not a single cap, so it is not quoted.
+    """
+    if seconds == 0:
+        return (
+            "Recipient only accepts payments that arrive straight away "
+            "(max_hold_seconds=0, max_hold_blocks=0)."
+        )
+    if seconds is None:
+        return (
+            "Recipient does not accept a payment held in blocks "
+            "(max_hold_blocks=0)."
+        )
+    return (
+        f"Recipient accepts payments held for up to {seconds} seconds "
+        f"(max_hold_seconds={seconds}) and does not accept a height park "
+        f"(max_hold_blocks=0)."
+    )
+
+
+def _recipient_view(values: dict, hold_code: int) -> dict:
+    """The map the recipient clause is stepped on.
+
+    i17 is the hold. Approval slots already on the map become 0, whichever
+    key shape the caller used. The caller's dict is not written.
+    """
+    trial = dict(values or {})
+    code = str(int(hold_code))
+    for slot in tau_defs.approval_slot_indices():
+        for key in (slot, str(slot), f"i{slot}"):
+            if key in trial:
+                trial[key] = "0"
+    present = False
+    for key in (STREAM, str(STREAM), f"i{STREAM}"):
+        if key in trial:
+            trial[key] = code
+            present = True
+    if not present:
+        trial[STREAM] = code
+    return trial
+
+
 def recipient_refusal(body, values: dict, hold_code: int, *, pool: str,
                       timeout=_SESSION_DEFAULT) -> Optional[RecipientRefusal]:
     """The recipient pass. None when the clause allows the payment.
@@ -197,7 +248,9 @@ def recipient_refusal(body, values: dict, hold_code: int, *, pool: str,
     The cap is the longest hold of the same unit that the clause still allows,
     and only when the probed points are a single threshold. A clause that
     allows a long hold and refuses a shorter one gets ``recipient_policy_block``
-    rather than a number the wallet would misquote.
+    rather than a number the wallet would misquote. A height park that every
+    height code refuses also carries the seconds cap when that side is one
+    threshold, so a 10-minute rule is not reported as instant-only.
     """
     if not isinstance(body, str) or not body or not clause_reads_hold_stream(body):
         return None
@@ -208,10 +261,8 @@ def recipient_refusal(body, values: dict, hold_code: int, *, pool: str,
         cached = cache.get(code)
         if cached is not None:
             return cached
-        trial = dict(values or {})
-        trial[STREAM] = str(int(code))
         verdict, _detail = sender_policy.clause_blocks(
-            body, trial, pool=pool, timeout=timeout,
+            body, _recipient_view(values, code), pool=pool, timeout=timeout,
         )
         cache[code] = bool(verdict)
         return bool(verdict)
@@ -233,41 +284,46 @@ def recipient_refusal(body, values: dict, hold_code: int, *, pool: str,
             {},
         )
 
-    name, low, high, hold_of = unit
-    low_blocks = blocked(low)
-    high_blocks = blocked(high)
-    if low_blocks and high_blocks:
-        mid = (low + high) // 2
-        if not blocked(mid):
-            return RecipientRefusal(
-                POLICY_BLOCK, "rejected by recipient policy (o5)", {},
-            )
-        return RecipientRefusal(
-            MAX_HOLD, _message(name, 0), {f"max_hold_{name}": 0},
-        )
-    if low_blocks or not high_blocks:
-        # Shortest park blocked while a longer one is allowed, or the whole
-        # unit allowed while this hold is not. Either way there is no one cap.
-        return RecipientRefusal(
-            POLICY_BLOCK, "rejected by recipient policy (o5)", {},
-        )
+    def cap_of(low: int, high: int, hold_of) -> Optional[int]:
+        """The single threshold in ``low..high``, or None when there is not one.
 
-    left, right = low, high
-    while left + 1 < right:
-        mid = (left + right) // 2
-        if blocked(mid):
-            right = mid
-        else:
-            left = mid
-    if left > low and blocked((low + left) // 2):
+        None covers an open window, a hole the probes hit, and a short hold
+        refused while a longer one is allowed. Zero is a real cap: every code
+        in the unit blocks.
+        """
+        low_blocks = blocked(low)
+        high_blocks = blocked(high)
+        if low_blocks and high_blocks:
+            if not blocked((low + high) // 2):
+                return None
+            return 0
+        if low_blocks or not high_blocks:
+            return None
+        left, right = low, high
+        while left + 1 < right:
+            mid = (left + right) // 2
+            if blocked(mid):
+                right = mid
+            else:
+                left = mid
+        if left > low and blocked((low + left) // 2):
+            return None
+        if right < high and not blocked((right + high) // 2):
+            return None
+        return int(hold_of(left))
+
+    name, low, high, hold_of = unit
+    cap = cap_of(low, high, hold_of)
+    if cap is None:
         return RecipientRefusal(
             POLICY_BLOCK, "rejected by recipient policy (o5)", {},
         )
-    if right < high and not blocked((right + high) // 2):
-        return RecipientRefusal(
-            POLICY_BLOCK, "rejected by recipient policy (o5)", {},
-        )
-    cap = int(hold_of(left))
+    if name == "blocks" and cap == 0:
+        seconds = cap_of(SECONDS_LO, TIME_CODE_MAX, lambda code: code - 1)
+        details = {"max_hold_blocks": 0}
+        if seconds is not None:
+            details["max_hold_seconds"] = seconds
+        return RecipientRefusal(MAX_HOLD, _height_closed_message(seconds), details)
     return RecipientRefusal(
         MAX_HOLD, _message(name, cap), {f"max_hold_{name}": cap},
     )
