@@ -147,6 +147,12 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
+    if kind == "install_receive_route":
+        return _envelope(kind, SENDER, fee_limit,
+                         route_destination_pubkey=RECIPIENT, route_bps=2000)
+    if kind == "remove_receive_route":
+        _seed_installed_route()
+        return _envelope(kind, SENDER, fee_limit)
     if kind == "create_standing_payment":
         return _envelope(kind, SENDER, fee_limit,
                          standing_recipient_pubkey=APPROVER, standing_amount=100,
@@ -180,7 +186,8 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request", "create_standing_payment",
+               "rule_change_request", "install_receive_route",
+               "remove_receive_route", "create_standing_payment",
                "cancel_standing_payment", "execute_standing_payment",
                "install_payout_rule", "remove_payout_rule",
                "execute_payout_rule"]
@@ -288,6 +295,18 @@ def test_an_estimate_with_no_payload_shows_the_usage(node):
     env = json.loads(checktx.execute("checktx estimate", None))
     assert env["error"]["code"] == "INVALID_PARAMS"
     assert "checktx [estimate]" in env["error"]["message"]
+
+
+def _seed_installed_route():
+    """Install the sender's receive route in the tip's book, as a mined
+    install would leave it, so a removal has something to remove."""
+    from consensus.receive_routes import ReceiveRouteEntry
+    book = chain_state._lifecycle_manager.receive_routes
+    if book.get(SENDER) is None:
+        book.install(ReceiveRouteEntry(
+            owner_pubkey=SENDER, destination_pubkey=RECIPIENT, bps=2000,
+            min_amount=0, activation_ts=0, expiry_ts=0, locked_until_ts=0,
+            version=1), TIP_TS)
 
 
 def _seed_standing_payment():

@@ -782,6 +782,82 @@ def compute_retractable_book_root(
     return blake3(bytes(out)).digest()
 
 
+# --- Receive routes (Bounty 01, issue #35) ------------------------------------
+
+DOMAIN_RECEIVE_ROUTE_V1 = b"tau.receive_route.v1"
+DOMAIN_RECEIVE_ROUTE_BOOK_V1 = b"tau.receive_route.book.v1"
+
+
+def compute_receive_route_id(
+    owner_pubkey: Any,
+    destination_pubkey: Any,
+    bps: int,
+    min_amount: int,
+    activation_ts: int,
+    expiry_ts: int,
+    locked_until_ts: int,
+    version: int,
+) -> bytes:
+    """BLAKE3 of the canonical receive route. Returns 32 bytes.
+
+    Content-derived from the signed fields alone, like the retractable id:
+    the apply-time tx_id differs between proposer and validators, so it can
+    never be part of a route's identity. `version` keeps a replacement route
+    from colliding with the route it supersedes.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RECEIVE_ROUTE_V1.decode()))
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(encode_pubkey48(destination_pubkey))
+    out.extend(encode_uint64(int(bps)))
+    out.extend(encode_uint64(int(min_amount)))
+    out.extend(encode_uint64(int(activation_ts)))
+    out.extend(encode_uint64(int(expiry_ts)))
+    out.extend(encode_uint64(int(locked_until_ts)))
+    out.extend(encode_uint64(int(version)))
+    return blake3(bytes(out)).digest()
+
+
+def encode_receive_route_entry(
+    route_id: Any,
+    owner_pubkey: Any,
+    destination_pubkey: Any,
+    bps: int,
+    min_amount: int,
+    activation_ts: int,
+    expiry_ts: int,
+    locked_until_ts: int,
+    version: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_hash32(route_id))
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(encode_pubkey48(destination_pubkey))
+    out.extend(encode_uint64(int(bps)))
+    out.extend(encode_uint64(int(min_amount)))
+    out.extend(encode_uint64(int(activation_ts)))
+    out.extend(encode_uint64(int(expiry_ts)))
+    out.extend(encode_uint64(int(locked_until_ts)))
+    out.extend(encode_uint64(int(version)))
+    return bytes(out)
+
+
+def compute_receive_route_book_root(entries: list) -> bytes:
+    """BLAKE3 of the route book: the sorted encoded entries, count-prefixed.
+
+    `entries` are tuples in encode_receive_route_entry argument order. There
+    is no resolved section: a removed route leaves the book entirely, and the
+    history of removals lives in block history, not in state.
+    """
+    encoded = sorted(encode_receive_route_entry(*e) for e in (entries or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_RECEIVE_ROUTE_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded)))
+    for blob in encoded:
+        out.extend(blob)
+    return blake3(bytes(out)).digest()
+
+
 # --- Standing payments (Bounty 01, issue #34) ---------------------------------
 
 DOMAIN_STANDING_PAYMENT_V1 = b"tau.standing_payment.v1"

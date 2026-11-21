@@ -27,6 +27,7 @@ from consensus.rule_offers import (
 )
 from consensus.retractable import TX_TYPE_RETRACT_TRANSFER, TX_TYPE_RETRACTABLE_TRANSFER, RETRACTABLE_TX_TYPES
 from consensus.payout_rules import PAYOUT_RULE_TX_TYPES
+from consensus.receive_routes import RECEIVE_ROUTE_TX_TYPES
 from consensus.standing_payments import STANDING_PAYMENT_TX_TYPES
 from consensus.approvals import (
     APPROVAL_TX_TYPES,
@@ -46,6 +47,7 @@ KNOWN_TX_TYPES = frozenset(
     | set(APPROVAL_TX_TYPES)
     | set(RULE_CHANGE_TX_TYPES)
     | set(RETRACTABLE_TX_TYPES)
+    | set(RECEIVE_ROUTE_TX_TYPES)
     | set(STANDING_PAYMENT_TX_TYPES)
     | set(PAYOUT_RULE_TX_TYPES)
 )
@@ -58,6 +60,7 @@ FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST}
     | set(RULE_OFFER_TX_TYPES)
+    | set(RECEIVE_ROUTE_TX_TYPES)
     | set(STANDING_PAYMENT_TX_TYPES)
     | set(PAYOUT_RULE_TX_TYPES)
 )

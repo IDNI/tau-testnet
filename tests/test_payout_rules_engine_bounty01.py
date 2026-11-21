@@ -34,6 +34,7 @@ from consensus.payout_rules import (
     parse_install_payout_rule,
     payout_rule_capabilities,
 )
+from consensus.receive_routes import ReceiveRouteEntry
 from consensus.state import TauStateSnapshot
 from consensus.tx_signing import signing_message_bytes
 
@@ -441,6 +442,22 @@ def test_execution_of_unknown_rule_is_refused():
     result = chain.apply([execute])
     assert execute["tx_id"] in result.invalid_tx_ids
     assert chain.balances[ARTIST] == 1000
+
+
+def test_payout_leg_is_never_split_by_a_receive_route():
+    """The design's credit-class table: payout legs carry the payout class."""
+    chain, rule_id = _installed_chain()
+    chain.lm.receive_routes.install(ReceiveRouteEntry(
+        owner_pubkey=ARTIST, destination_pubkey=RDEST, bps=5000,
+        min_amount=0, activation_ts=0, expiry_ts=0, locked_until_ts=0,
+        version=1,
+    ), TS)
+    execute = _execute_tx(EXECUTOR, SK_EXECUTOR, rule_id, SID_1, 101, seq=0)
+    result = chain.apply([execute])
+    assert execute["tx_id"] in result.accepted_tx_ids
+    assert chain.balances[ARTIST] == 1000 + 5  # whole, not split
+    assert chain.balances[RDEST] == 0
+    assert result.next_snapshot.metadata["routing_events"] == []
 
 
 # --- capability record + facade -----------------------------------------------------

@@ -459,6 +459,34 @@ class TipAdmissionView:
             "release_at": int(row[5]),
         }
 
+    def get_receive_route(self, owner_pubkey: str) -> Optional[dict]:
+        """The owner's installed receive route (#35), or None.
+
+        Read from the canonical tip's lifecycle manager — the same in-memory
+        source the eligibility and validator views above use. (Retractable
+        entries are read from their db table because that book is persisted;
+        the route book's persistence is a follow-up, so the manager is the
+        only honest source today.)
+        """
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        book = getattr(lm, "receive_routes", None)
+        if book is None:
+            return None
+        entry = book.get(owner_pubkey)
+        if entry is None:
+            return None
+        return {
+            "route_id": entry.route_id.hex(),
+            "owner_pubkey": entry.owner_pubkey,
+            "destination_pubkey": entry.destination_pubkey,
+            "bps": entry.bps,
+            "min_amount": entry.min_amount,
+            "activation_ts": entry.activation_ts,
+            "expiry_ts": entry.expiry_ts,
+            "locked_until_ts": entry.locked_until_ts,
+            "version": entry.version,
+        }
+
     def _tip_standing_book(self) -> Optional[StandingPaymentBook]:
         lm = getattr(chain_state, "_lifecycle_manager", None)
         book = getattr(lm, "standing_payments", None)
@@ -522,9 +550,8 @@ class TipAdmissionView:
         """One standing-payment authorization (#34) by id, or None.
 
         Read from the canonical tip's lifecycle manager — the same
-        in-memory source the eligibility and validator views above use
-        (the standing book's db persistence is a follow-up, so the
-        manager is the only honest source today).
+        in-memory source get_receive_route uses (the standing book's db
+        persistence is the same follow-up as the route book's).
         """
         book = self._tip_standing_book()
         if book is None:
@@ -613,7 +640,7 @@ class TipAdmissionView:
         """One payout rule (#63) by id, or None.
 
         Read from the canonical tip's lifecycle manager — the same
-        in-memory source get_standing_payment uses (the payout book's db
+        in-memory source get_receive_route uses (the payout book's db
         persistence is the same follow-up as the other books').
         """
         book = self._tip_payout_book()
