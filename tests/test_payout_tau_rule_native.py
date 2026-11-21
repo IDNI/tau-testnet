@@ -40,6 +40,11 @@ A second test pins cap enforcement at engine level: a clause naming a
 at admission, and refused again at inclusion with admission bypassed.
 Assertions are deltas around the measured blocks, so faucet grants at
 account creation cannot pollute them.
+
+A further test pins the periods_from anchor on the real engine: a rule
+installed now whose periods count from two weeks in the past settles
+its execution against anchored period 2 — the book's period total
+lands under index 2, not under the install grid's period 0.
 """
 import json
 import os

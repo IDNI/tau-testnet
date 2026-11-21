@@ -2133,7 +2133,7 @@ def _tip_payout_book(row) -> PayoutRuleBook:
     entry_rows = []
     settlement_rows = []
     for r in rows:
-        entry_rows.append((
+        entry_row = (
             bytes.fromhex(r["rule_id"]),
             r["owner_pubkey"],
             tuple(r["recipients"]),
@@ -2155,7 +2155,10 @@ def _tip_payout_book(row) -> PayoutRuleBook:
             int(r.get("rule_index", 0)),
             str(r.get("shared_cap_id", "")),
             int(r.get("shared_cap_amount", 0)),
-        ))
+        )
+        if int(r.get("periods_from_ts", 0)):
+            entry_row = entry_row + (int(r["periods_from_ts"]),)
+        entry_rows.append(entry_row)
         settlement_rows.extend(
             (
                 bytes.fromhex(r["rule_id"]),

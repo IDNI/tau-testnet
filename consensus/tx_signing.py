@@ -224,6 +224,7 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["payout_max_per_period"] = payload.get("payout_max_per_period")
         signing_dict["payout_period_seconds"] = payload.get("payout_period_seconds")
         signing_dict["payout_period_anchor_ts"] = payload.get("payout_period_anchor_ts")
+        signing_dict["payout_periods_from_ts"] = payload.get("payout_periods_from_ts")
         signing_dict["payout_version"] = payload.get("payout_version")
         # FIX 7: the slot is a field that fixes the rule — with up to 8
         # rules per account, an unsigned slot could be rewritten by a

@@ -625,13 +625,14 @@ class TipAdmissionView:
         rule_index = int(row[12]) if len(row) > 12 else 0
         shared_cap_id = str(row[13]) if len(row) > 13 else ""
         shared_cap_amount = int(row[14]) if len(row) > 14 else 0
+        periods_from = int(row[15]) if len(row) > 15 else 0
         ts = self.next_block_timestamp
-        period = period_index_at(entry, ts)
         return {
             "rule_id": entry.rule_id.hex(),
             "rule_index": rule_index,
             "shared_cap_id": shared_cap_id,
             "shared_cap_amount": shared_cap_amount,
+            "periods_from_ts": periods_from,
             "owner_pubkey": owner,
             "recipients": list(recipients),
             "legs": [
@@ -644,6 +645,7 @@ class TipAdmissionView:
             "max_per_period": max_period,
             "period_seconds": period_seconds,
             "period_anchor_ts": anchor,
+            "periods_from_ts": periods_from,
             "version": version,
             "period_totals": [
                 {"period_index": i, "total": t} for i, t in period_totals
