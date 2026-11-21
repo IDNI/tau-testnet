@@ -95,8 +95,12 @@ def test_the_clause_screen_carries_the_same_check():
     assert _screen_clause_domains("o5[t]:bv[24] = i1[t]:bv[24]") is None
 
 
-def test_the_clause_screen_takes_the_body_and_nothing_else():
-    assert list(inspect.signature(_screen_clause_domains).parameters) == ["body"]
+def test_the_clause_screen_takes_the_body_and_the_hold_flag():
+    """The hold flag defaults off, so a caller that has not been threaded yet
+    keeps the pre-activation screen. Adding another parameter is still a drift."""
+    params = inspect.signature(_screen_clause_domains).parameters
+    assert list(params) == ["body", "recipient_controls_active"]
+    assert params["recipient_controls_active"].default is False
 
 
 # --- admission ----------------------------------------------------------------

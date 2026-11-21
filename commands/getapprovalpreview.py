@@ -111,11 +111,17 @@ def _rule_change_screen(request, tip):
     error = admission._rule_change_precondition_error(request, tip)
     if not error:
         if request.kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
-            error = admission._screen_clause_domains(request.body)
+            error = admission._screen_clause_domains(
+                request.body,
+                recipient_controls_active=tip.recipient_controls_active,
+            )
         elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
             error = admission._screen_guard_domains(request.body)
         elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
-            error = admission._screen_clause_domains(clause_body_v1(request.rule_text))
+            error = admission._screen_clause_domains(
+                clause_body_v1(request.rule_text),
+                recipient_controls_active=tip.recipient_controls_active,
+            )
     return {"ok": not error, "error": error or None}
 
 

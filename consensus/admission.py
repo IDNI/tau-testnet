@@ -69,6 +69,12 @@ from consensus.governance import (
     HOST_CONTRACT_PATCH_KEYS,
     validate_fee_beneficiary,
     validate_approval_slots_active,
+    validate_recipient_controls_active,
+)
+from consensus.recipient_policy import (
+    audit_hold_stream,
+    controls_active,
+    screen_hold_clause,
 )
 
 logger = logging.getLogger(__name__)
@@ -208,6 +214,8 @@ def _width_mismatch_details(reason: str) -> Optional[Dict]:
 
 def _admission_from_domain_error(domain_error: str, prefix: str = "") -> AdmissionResult:
     msg = f"{prefix}{domain_error}" if prefix else domain_error
+    if domain_error.startswith("recipient controls are not active"):
+        return format_error(msg, code="RECIPIENT_CONTROLS_INACTIVE")
     if is_temporal_reference_error(domain_error):
         return format_error(msg, code=TEMPORAL_REFERENCE_CODE)
     mismatch = _width_mismatch_details(domain_error)
@@ -246,7 +254,8 @@ class UserRuleRejection(NamedTuple):
 
 
 def screen_user_rule_text(
-    rule_text: str, eligibility_mode: str, slots_active: bool
+    rule_text: str, eligibility_mode: str, slots_active: bool,
+    recipient_controls_active: bool = False,
 ) -> Optional[UserRuleRejection]:
     """Screens for an accumulated op-0 rule, run by admission and by block apply.
 
@@ -283,6 +292,7 @@ def screen_user_rule_text(
         tau_defs.RULE_TEXT_CONTEXT_USER,
         eligibility_mode,
         approval_slots_active=slots_active,
+        recipient_controls_active=recipient_controls_active,
     )
     typed_reserved_in = _streams_referenced(rule_text, typed_reserved)
     if typed_reserved_in:
@@ -362,9 +372,11 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
     # The slot reservation is what makes a co-signature unforgeable: without it a
     # sender could put "18" in `operations` and write their own approval.
     slots_active = approval_slots_active(tip_view)
+    controls_on = controls_active(tip_view)
     reserved_ops = tau_defs.reserved_operation_keys(
         getattr(tip_view, "eligibility_mode", ""),
         approval_slots_active=slots_active,
+        recipient_controls_active=controls_on,
     )
 
     for key, val in operations.items():
@@ -389,7 +401,8 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
                 f"(i12 sender pubkey; i14/i15 consensus stake/mode inputs; "
                 f"i13 consensus proposer pubkey under tau_validator_set; "
                 f"i18-i25 co-signature approval slots, which only the node may "
-                f"write)."
+                f"write; i17 the recipient-hold input once recipient controls "
+                f"are active)."
             )
 
     rule_text = operations.get("0")
@@ -401,7 +414,9 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         if routing is not None:
             return routing
 
-        rejection = screen_user_rule_text(rule_text, tip_view.eligibility_mode, slots_active)
+        rejection = screen_user_rule_text(
+            rule_text, tip_view.eligibility_mode, slots_active, controls_on,
+        )
         if rejection:
             return format_error(
                 rejection.error, code=rejection.code, **(rejection.details or {})
@@ -546,6 +561,16 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         if findings:
             return (
                 "approval_slots_active cannot be activated on this chain: "
+                + "; ".join(findings)
+            )
+    if "recipient_controls_active" in patch:
+        err = validate_recipient_controls_active(patch["recipient_controls_active"])
+        if err:
+            return f"recipient_controls_active: {err}"
+        findings = audit_hold_stream(_tip_effective_spec_texts())
+        if findings:
+            return (
+                "recipient_controls_active cannot be activated on this chain: "
                 + "; ".join(findings)
             )
     if "vote_quorum" in patch:
@@ -917,7 +942,9 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
     except RuleOfferShapeError as exc:
         return format_error(f"Offered rule has an unsupported shape: {exc}")
 
-    domain_error = _screen_clause_domains(body)
+    domain_error = _screen_clause_domains(
+        body, recipient_controls_active=controls_active(tip_view),
+    )
     if domain_error:
         return _admission_from_domain_error(domain_error)
 
@@ -928,7 +955,9 @@ def validate_rule_offer_payload(tx: Dict, tip_view: TipAdmissionView) -> Admissi
     })
 
 
-def _screen_clause_domains(body: str) -> Optional[str]:
+def _screen_clause_domains(
+    body: str, *, recipient_controls_active: bool = False,
+) -> Optional[str]:
     """Reserved-domain screens for a clause body, shared by offer and accept.
 
     A clause must not write the consensus-owned verdict/fee streams, must not
@@ -967,6 +996,10 @@ def _screen_clause_domains(body: str) -> Optional[str]:
             "Shared rules may not reference reserved input streams: "
             + ", ".join(typed)
         )
+
+    hold_error = screen_hold_clause(body, active=recipient_controls_active)
+    if hold_error:
+        return hold_error
 
     return _screen_clause_widths_and_structure(body)
 
@@ -1111,7 +1144,9 @@ def validate_rule_offer_decision_payload(
     except RuleOfferShapeError as exc:
         return format_error(f"Accepted rule has an unsupported shape: {exc}")
 
-    domain_error = _screen_clause_domains(body)
+    domain_error = _screen_clause_domains(
+        body, recipient_controls_active=controls_active(tip_view),
+    )
     if domain_error:
         return _admission_from_domain_error(domain_error)
 
@@ -1186,7 +1221,9 @@ def validate_o5_clause_routing(
             code="CLAUSE_SHAPE",
         )
 
-    domain_error = _screen_clause_domains(body)
+    domain_error = _screen_clause_domains(
+        body, recipient_controls_active=controls_active(tip_view),
+    )
     if domain_error:
         return _admission_from_domain_error(
             domain_error, prefix="o5 policy rule rejected: "
@@ -1430,12 +1467,17 @@ def validate_rule_change_request_payload(
     if shape_error:
         return _invalid_rule_change(shape_error)
 
+    controls_on = controls_active(tip_view)
     if request.kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
-        domain_error = _screen_clause_domains(request.body)
+        domain_error = _screen_clause_domains(
+            request.body, recipient_controls_active=controls_on,
+        )
     elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
         domain_error = _screen_guard_domains(request.body)
     elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
-        domain_error = _screen_clause_domains(clause_body_v1(request.rule_text))
+        domain_error = _screen_clause_domains(
+            clause_body_v1(request.rule_text), recipient_controls_active=controls_on,
+        )
     else:
         domain_error = None
     if domain_error:
