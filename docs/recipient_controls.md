@@ -105,3 +105,36 @@ returns the verified cap when the rule is a threshold rule.
 `getgovernance` reports `recipient_policy_active` and a `capabilities`
 block with the stream numbers and widths, so a wallet can detect the
 feature before asking.
+
+## Command line
+
+`tau-testnet policy receive ...` is the operator surface for the gate:
+
+- `policy receive status` — whether recipient controls are active on the
+  connected chain, and which streams they reserve (the readable form of
+  the `getgovernance` capability report above).
+- `policy receive show <address> [--sender <pubkey> --amount <n> --hold
+  <n> --unit seconds|blocks]` — one address's recipient state, and with
+  the four extra flags a preflight verdict for a payment you are about to
+  make, including the verified cap when the rule is a threshold rule
+  (the readable form of `getrecipientpolicy`).
+- `policy receive allow-list <pubkey>...` — prints an inbound allow-list
+  clause in the canonical form above: the outgoing branch untouched,
+  every inbound context restricted to the listed payers.
+- `policy receive max-hold [--seconds <n>] [--blocks <n>]` — prints a
+  hold-cap clause, one disjunct per unit, so a seconds cap never refuses
+  a height park and vice versa. A cap of 0 refuses every park of that
+  kind while still admitting plain transfers.
+- `policy receive combined --allow <pubkey> [--allow <pubkey>...]
+  [--seconds <n>] [--blocks <n>]` — prints a clause that is both an
+  allow-list and a hold cap; either cap may be omitted to leave that
+  unit uncapped.
+
+The three composition commands are offline: they print clause text and
+send nothing. Every clause they print reads `i16` (never unit-blind),
+types every `i17`/`i16` mention `bv[64]`, and declares its caps in the
+canonical comparisons the node's extractor reads — so the text passes
+the same deploy screens a node applies, and the caps `show` reports for
+it are the caps it declares. Install the printed text as your `o5`
+policy clause to use it; it takes effect only on a chain where
+recipient controls are active.

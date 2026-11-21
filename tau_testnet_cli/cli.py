@@ -2201,6 +2201,248 @@ def cmd_policy_change_cancel(args: argparse.Namespace) -> int:
     return _submit_rule_tx(args, _build)
 
 
+# --- Recipient controls (issues #47/#76): `policy receive ...` ---------------
+#
+# The operator surface for the recipient gate, in three parts: inspect the
+# chain (status), inspect one address (show, a preflight against the node's
+# own getrecipientpolicy), and compose an inbound clause offline
+# (allow-list / max-hold / combined). Composition is pure text — the same
+# canonical annotated shapes the node's deploy screens and cap extractor
+# read — so what is printed here is exactly what a node will screen, and
+# the caps printed by `show` are the caps these texts declare.
+#
+# The composed clauses follow this chain's stream contract: i17 is the hold
+# in its native unit and i16 is the context tag (0 outgoing, 1 final,
+# 2 time park in seconds, 3 height park in blocks). Every composed clause
+# reads i16, so none of them is unit-blind, and every i17/i16 mention is
+# typed bv[64], so all of them pass the node's width screen. A clause only
+# takes effect once installed as the account's o5 policy, and only on a
+# chain where recipient controls are active (`policy receive status`).
+
+_O5_ALLOW = "(o5[t]:bv[24] = { #x000001 }:bv[24])"
+_O5_BLOCK = "(o5[t]:bv[24] = { #x000000 }:bv[24])"
+
+
+def _bv64_hex(value: int) -> str:
+    digits = format(int(value), "x")
+    if len(digits) % 2:
+        digits = "0" + digits
+    return digits.rjust(4, "0")
+
+
+def _ctx_is(context: int) -> str:
+    return "i16[t]:bv[64] = { #x%s }:bv[64]" % _bv64_hex(context)
+
+
+def _sender_is(pubkey: str) -> str:
+    return "i3[t]:bv[384] = { #x%s }:bv[384]" % pubkey
+
+
+def _listed(senders) -> str:
+    return " || ".join(_sender_is(s) for s in senders)
+
+
+def compose_allowlist_clause(senders) -> str:
+    """An o5 rule admitting inbound payments only from `senders`.
+
+    The outgoing branch (context 0) is left untouched, exactly as the
+    node's own test-suite bodies write it: an owner is never gated on
+    their own sends.
+    """
+    cond = "(%s || %s)" % (_ctx_is(0), _listed(senders))
+    return "always ( %s ? %s : %s )." % (cond, _O5_ALLOW, _O5_BLOCK)
+
+
+def compose_max_hold_clause(seconds=None, blocks=None) -> str:
+    """An o5 rule refusing parks held longer than the given cap(s).
+
+    Refusal form (`i17 > cap` blocks), one disjunct per unit, so a seconds
+    cap never refuses a height park and vice versa. At least one cap is
+    required; a cap of 0 refuses every park of that kind while still
+    admitting plain transfers.
+    """
+    terms = []
+    if seconds is not None:
+        terms.append("(%s && i17[t]:bv[64] > { #x%s }:bv[64])"
+                     % (_ctx_is(2), _bv64_hex(seconds)))
+    if blocks is not None:
+        terms.append("(%s && i17[t]:bv[64] > { #x%s }:bv[64])"
+                     % (_ctx_is(3), _bv64_hex(blocks)))
+    cond = " || ".join(terms)
+    if len(terms) > 1:
+        cond = "(%s)" % cond
+    return "always ( %s ? %s : %s )." % (cond, _O5_BLOCK, _O5_ALLOW)
+
+
+def compose_combined_clause(senders, seconds=None, blocks=None) -> str:
+    """An o5 rule that is both an allow-list and a hold cap.
+
+    Flat form: the payer must be listed (or the payment is the owner's own
+    outgoing one), AND the hold must fit the cap of its own context —
+    final payments (context 1) carry no hold, so only the list applies to
+    them. Each i17 comparison sits behind its own context guard, which is
+    what the node's branch-aware cap extractor attributes it to.
+    """
+    def _fits(context: int, cap) -> str:
+        if cap is None:
+            return "(%s)" % _ctx_is(context)
+        return "(%s && i17[t]:bv[64] <= { #x%s }:bv[64])" % (
+            _ctx_is(context), _bv64_hex(cap))
+
+    cond = "((%s || %s) && (%s || %s || %s || %s))" % (
+        _ctx_is(0), _listed(senders),
+        _ctx_is(0), _ctx_is(1), _fits(2, seconds), _fits(3, blocks),
+    )
+    return "always ( %s ? %s : %s )." % (cond, _O5_ALLOW, _O5_BLOCK)
+
+
+def _checked_pubkeys(values, what: str):
+    import re
+
+    out = []
+    for value in values or ():
+        text = str(value).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{96}", text):
+            raise _PayloadError(
+                f"{what} must be a 96-hex-character pubkey, got {value!r}")
+        out.append(text)
+    if not out:
+        raise _PayloadError(f"at least one {what} is required")
+    return out
+
+
+def _checked_cap(value, flag: str):
+    if value is None:
+        return None
+    if int(value) < 0:
+        raise _PayloadError(f"{flag} must be 0 or more, got {value}")
+    return int(value)
+
+
+def _print_composed(clause: str) -> int:
+    print(clause)
+    print("Install this as your o5 policy clause to use it. It takes "
+          "effect only on a chain where recipient controls are active — "
+          "check with: tau-testnet policy receive status")
+    return EXIT_OK
+
+
+def cmd_policy_receive_allow_list(args: argparse.Namespace) -> int:
+    try:
+        senders = _checked_pubkeys(args.senders, "sender pubkey")
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _print_composed(compose_allowlist_clause(senders))
+
+
+def cmd_policy_receive_max_hold(args: argparse.Namespace) -> int:
+    try:
+        seconds = _checked_cap(args.seconds, "--seconds")
+        blocks = _checked_cap(args.blocks, "--blocks")
+        if seconds is None and blocks is None:
+            raise _PayloadError(
+                "give at least one cap: --seconds N and/or --blocks N")
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _print_composed(compose_max_hold_clause(seconds, blocks))
+
+
+def cmd_policy_receive_combined(args: argparse.Namespace) -> int:
+    try:
+        senders = _checked_pubkeys(args.allow, "allowed sender pubkey")
+        seconds = _checked_cap(args.seconds, "--seconds")
+        blocks = _checked_cap(args.blocks, "--blocks")
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    return _print_composed(compose_combined_clause(senders, seconds, blocks))
+
+
+def cmd_policy_receive_status(args: argparse.Namespace) -> int:
+    response = _send(args, "getgovernance")
+    if rpc_mod.is_error_response(response) or args.json:
+        return _simple_query_response(args, response)
+    parsed = parse_json_response(response)
+    data = (parsed or {}).get("data") if isinstance(parsed, dict) else None
+    if not isinstance(data, dict) or "recipient_policy_active" not in data:
+        print("recipient controls: not reported by this node "
+              "(a build without the feature)")
+        return EXIT_OK
+    caps = (data.get("capabilities") or {}).get("recipient_controls") or {}
+    active = data.get("recipient_policy_active") is True
+    lines = [
+        "recipient controls (issues #47/#76): %s"
+        % ("ACTIVE" if active else "inactive"),
+        "  hold stream:    i%s (bv[%s]) — the hold, in its native unit"
+        % (caps.get("hold_stream", 17), caps.get("hold_stream_width", 64)),
+        "  context stream: i%s (bv[%s]) — 0 outgoing, 1 final payment, "
+        "2 time park (seconds), 3 height park (blocks)"
+        % (caps.get("context_stream", 16),
+           caps.get("context_stream_width", 64)),
+        "  guarded mode:   %s" % caps.get("guarded_mode", "unknown"),
+        "  preflight:      tau-testnet policy receive show <address>",
+    ]
+    if not active:
+        lines.append(
+            "  activation:     one-way governance patch "
+            "recipient_policy_active=true (see docs/recipient_controls.md)")
+    print("\n".join(lines))
+    return EXIT_OK
+
+
+def cmd_policy_receive_show(args: argparse.Namespace) -> int:
+    try:
+        address = _checked_pubkeys([args.address], "address")[0]
+        given = [args.sender is not None, args.amount is not None,
+                 args.hold is not None, args.unit is not None]
+        if any(given) and not all(given):
+            raise _PayloadError(
+                "the preflight needs all of --sender, --amount, --hold "
+                "and --unit together")
+        sender = None
+        if args.sender is not None:
+            sender = _checked_pubkeys([args.sender], "sender pubkey")[0]
+            if int(args.amount) < 0 or int(args.hold) < 0:
+                raise _PayloadError("--amount and --hold must be 0 or more")
+    except _PayloadError as exc:
+        print_error(str(exc))
+        return EXIT_LOCAL
+    command = f"getrecipientpolicy {address}"
+    if sender is not None:
+        command += f" {sender} {int(args.amount)} {int(args.hold)} {args.unit}"
+    response = _send(args, command)
+    if rpc_mod.is_error_response(response) or args.json:
+        return _simple_query_response(args, response)
+    parsed = parse_json_response(response)
+    data = (parsed or {}).get("data") if isinstance(parsed, dict) else None
+    if not isinstance(data, dict):
+        return _simple_query_response(args, response)
+    lines = [
+        f"address:          {data.get('address', address)}",
+        "has policy clause: %s" % bool(data.get("has_clause")),
+        "inbound-capable:   %s" % bool(data.get("inbound_capable")),
+        "neutral default:   %s (no inbound rule: judged exactly as "
+        "before recipient controls existed)" % bool(data.get("neutral_default")),
+    ]
+    ev = data.get("evaluation")
+    if isinstance(ev, dict):
+        lines.append(
+            "preflight: sender %s paying %s with a %s-%s hold -> %s"
+            % (ev.get("sender"), ev.get("amount"), ev.get("hold"),
+               ev.get("unit"),
+               "ADMITTED" if ev.get("admitted") else "REFUSED"))
+        for key, label in (("max_hold_seconds", "verified cap (seconds)"),
+                           ("max_hold_blocks", "verified cap (blocks)"),
+                           ("cap_kind", "cap kind"),
+                           ("reason", "reason")):
+            if key in ev:
+                lines.append(f"  {label}: {ev[key]}")
+    print("\n".join(lines))
+    return EXIT_OK
+
+
 def _add_policy_subparsers(sub) -> None:
     """`tau-testnet policy ...` -- the rule-change guard and its requests."""
     import tau_defs
@@ -2306,6 +2548,64 @@ def _add_policy_subparsers(sub) -> None:
     p_ccan.add_argument("--expire-at-height", type=int,
                         help="Absolute expiry height (overrides --expire-in)")
     p_ccan.set_defaults(func=cmd_policy_change_cancel)
+
+    p_recv = psub.add_parser(
+        "receive", parents=common,
+        help="Recipient controls (issues #47/#76): inspect state, "
+             "compose inbound rules")
+    rsub = p_recv.add_subparsers(dest="receive_command", required=True)
+
+    p_rstatus = rsub.add_parser(
+        "status", parents=common,
+        help="Whether recipient controls are active, and which streams "
+             "they reserve")
+    p_rstatus.set_defaults(func=cmd_policy_receive_status)
+
+    p_rshow = rsub.add_parser(
+        "show", parents=common,
+        help="One address's recipient policy, with an optional preflight "
+             "for a payment you are about to make")
+    p_rshow.add_argument("address", help="Recipient pubkey (96 hex)")
+    p_rshow.add_argument("--sender",
+                         help="Payer pubkey for the preflight (96 hex)")
+    p_rshow.add_argument("--amount", type=int,
+                         help="Payment amount for the preflight")
+    p_rshow.add_argument("--hold", type=int,
+                         help="Hold length for the preflight")
+    p_rshow.add_argument("--unit", choices=("seconds", "blocks"),
+                         help="Hold unit for the preflight")
+    p_rshow.set_defaults(func=cmd_policy_receive_show)
+
+    p_rlist = rsub.add_parser(
+        "allow-list", parents=common,
+        help="Compose an inbound allow-list clause (offline, prints text)")
+    p_rlist.add_argument("senders", nargs="+", metavar="PUBKEY",
+                         help="Allowed payer pubkey(s), 96 hex each")
+    p_rlist.set_defaults(func=cmd_policy_receive_allow_list)
+
+    p_rhold = rsub.add_parser(
+        "max-hold", parents=common,
+        help="Compose a hold-cap clause (offline, prints text)")
+    p_rhold.add_argument("--seconds", type=int, default=None,
+                         help="Longest allowed time park, in seconds "
+                              "(0 refuses every time park)")
+    p_rhold.add_argument("--blocks", type=int, default=None,
+                         help="Longest allowed height park, in blocks "
+                              "(0 refuses every height park)")
+    p_rhold.set_defaults(func=cmd_policy_receive_max_hold)
+
+    p_rcomb = rsub.add_parser(
+        "combined", parents=common,
+        help="Compose an allow-list + hold-cap clause (offline, "
+             "prints text)")
+    p_rcomb.add_argument("--allow", action="append", required=True,
+                         metavar="PUBKEY",
+                         help="Allowed payer pubkey (96 hex). Repeatable.")
+    p_rcomb.add_argument("--seconds", type=int, default=None,
+                         help="Longest allowed time park, in seconds")
+    p_rcomb.add_argument("--blocks", type=int, default=None,
+                         help="Longest allowed height park, in blocks")
+    p_rcomb.set_defaults(func=cmd_policy_receive_combined)
 
 
 # --- Retractable transfers --------------------------------------------------
