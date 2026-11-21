@@ -165,7 +165,62 @@ def _payload(kind, fee_limit="0"):
                          spend_cap=500, per_payment_cap=500,
                          start_at=now, expires_at=now + 28 * 86400,
                          chain_id=db.get_genesis_hash())
+    if kind == "standing_payment":
+        # Like grant_create: the fixture provisions no genesis block, so
+        # create a block 0 lazily (only this case needs one) and sign
+        # chain_id from it.
+        if not db.get_genesis_hash():
+            db.add_block(Block.create(
+                block_number=0, previous_hash="00" * 32, transactions=[],
+                proposer_pubkey=SENDER, timestamp=TIP_TS,
+            ))
+        now = int(time.time())
+        return _envelope(kind, SENDER, fee_limit, payee_pubkey=RECIPIENT,
+                         amount=100, period_kind=2, period_anchor=0,
+                         max_fee_per_execution=10, start_at=now,
+                         chain_id=db.get_genesis_hash())
+    if kind == "standing_payment_execute":
+        standing_id = _ensure_standing()
+        return _envelope(kind, SENDER, fee_limit, standing_id=standing_id.hex(),
+                         chain_id=db.get_genesis_hash())
+    if kind == "standing_payment_update":
+        standing_id = _ensure_standing()
+        now = int(time.time())
+        return _envelope(kind, SENDER, fee_limit, standing_id=standing_id.hex(),
+                         amount=200, period_kind=2, period_anchor=0,
+                         max_fee_per_execution=10, start_at=now,
+                         chain_id=db.get_genesis_hash())
     raise AssertionError(kind)
+
+
+def _ensure_standing():
+    """Insert one open standing payment (SENDER -> RECIPIENT, due now)
+    into standing_v1, for the execute/update estimate cases. Returns its id."""
+    from consensus.periods import PERIOD_WEEK
+    from consensus.standing import compute_standing_id
+
+    standing_id = compute_standing_id(SENDER, RECIPIENT, 0)
+    if not db.get_genesis_hash():
+        db.add_block(Block.create(
+            block_number=0, previous_hash="00" * 32, transactions=[],
+            proposer_pubkey=SENDER, timestamp=TIP_TS,
+        ))
+    with db._db_lock:
+        with db._db_conn:
+            db._db_conn.execute(
+                "DELETE FROM standing_v1 WHERE standing_id = ?",
+                (standing_id.hex(),),
+            )
+            db._db_conn.execute(
+                "INSERT INTO standing_v1 (standing_id, payer_pubkey, "
+                "payee_pubkey, amount, sequence_number, version, period_kind, "
+                "period_length, period_anchor, max_fee_per_execution, start_at, "
+                "last_executed_period, executions) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (standing_id.hex(), SENDER, RECIPIENT, 100, 0, 1,
+                 PERIOD_WEEK, None, 0, 10, TIP_TS - 1000000, None, 0),
+            )
+    return standing_id
 
 
 def _check(payload, *, estimate=True):
@@ -176,7 +231,9 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request", "grant_create"]
+               "rule_change_request", "grant_create",
+               "standing_payment", "standing_payment_execute",
+               "standing_payment_update"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

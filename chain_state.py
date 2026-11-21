@@ -560,6 +560,16 @@ def _grant_state(lm) -> dict:
     }
 
 
+def _standing_state(lm) -> dict:
+    book = lm.standing
+    count, acc = book.resolved_state()
+    return {
+        "rows": book.snapshot_rows(),
+        "resolved_count": count,
+        "resolved_acc": acc.hex(),
+    }
+
+
 def _record_retractable_events(block, next_snapshot) -> None:
     """Best-effort history write; the apply verdict is already final.
 
@@ -619,6 +629,7 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         approval_slots_active=lm.approval_slots_active,
         retractable_transfers=_retractable_state(lm),
         grants=_grant_state(lm),
+        standing=_standing_state(lm),
         eligibility_mode=lm.eligibility_mode,
         fee_beneficiary=lm.fee_beneficiary,
         last_transfer_ts=merged_ts,
@@ -2272,6 +2283,19 @@ def _restore_grants(lm) -> None:
         raise DatabaseError(f"corrupt grant state: {exc}") from exc
 
 
+def _restore_standing(lm) -> None:
+    """Rehydrate the standing-payment book; a stored row that does not
+    recompute its id is corruption and refuses to load rather than
+    silently dropping a payer's schedule."""
+    from consensus.standing import StandingPaymentBook
+
+    rows, resolved_count, resolved_acc = db.load_standing_state()
+    try:
+        lm.standing = StandingPaymentBook.restore(rows, resolved_count, resolved_acc)
+    except ValueError as exc:
+        raise DatabaseError(f"corrupt standing state: {exc}") from exc
+
+
 def save_effective_tau_spec(canonical_rule_text: str):
     """
     Append ONE canonical (full-width, pre-shrink) application rule to the raw
@@ -2406,6 +2430,7 @@ def load_state_from_db() -> bool:
         _restore_rule_change_requests(_lifecycle_manager)
         _restore_retractables(_lifecycle_manager)
         _restore_grants(_lifecycle_manager)
+        _restore_standing(_lifecycle_manager)
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
         persisted_slots = db.get_chain_state_value("approval_slots_active", _MISSING)
@@ -2475,6 +2500,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         approval_slots_active_snapshot = _lifecycle_manager.approval_slots_active
         retractable_snapshot = _retractable_state(_lifecycle_manager)
         grant_snapshot = _grant_state(_lifecycle_manager)
+        standing_snapshot = _standing_state(_lifecycle_manager)
 
     db.save_canonical_state_atomically(
         block_hash, block_number,
@@ -2494,6 +2520,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         approval_slots_active=approval_slots_active_snapshot,
         retractable_transfers=retractable_snapshot,
         grants=grant_snapshot,
+        standing=standing_snapshot,
     )
 
 def tick_governance(height: int):
@@ -2992,6 +3019,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 approval_slots_active=_lifecycle_manager.approval_slots_active,
                 retractable_transfers=_retractable_state(_lifecycle_manager),
                 grants=_grant_state(_lifecycle_manager),
+                standing=_standing_state(_lifecycle_manager),
             )
     except Exception as exc:
         logger.error(

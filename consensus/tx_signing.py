@@ -38,6 +38,12 @@ from consensus.grants import (
     TX_TYPE_GRANT_CREATE,
     TX_TYPE_GRANT_DRAW,
 )
+from consensus.standing import (
+    TX_TYPE_STANDING_PAYMENT,
+    TX_TYPE_STANDING_PAYMENT_CANCEL,
+    TX_TYPE_STANDING_PAYMENT_EXECUTE,
+    TX_TYPE_STANDING_PAYMENT_UPDATE,
+)
 from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
@@ -150,6 +156,33 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["chain_id"] = payload.get("chain_id")
     elif tx_type == TX_TYPE_GRANT_CANCEL:
         signing_dict["grant_id"] = payload.get("grant_id")
+        signing_dict["chain_id"] = payload.get("chain_id")
+    elif tx_type == TX_TYPE_STANDING_PAYMENT:
+        # Every field that fixes the standing payment's terms is signed;
+        # the standing id is derived from them, so a proposer cannot
+        # rewrite the terms.
+        signing_dict["payee_pubkey"] = payload.get("payee_pubkey")
+        signing_dict["amount"] = payload.get("amount")
+        signing_dict["period_kind"] = payload.get("period_kind")
+        signing_dict["period_length"] = payload.get("period_length")
+        signing_dict["period_anchor"] = payload.get("period_anchor")
+        signing_dict["max_fee_per_execution"] = payload.get("max_fee_per_execution")
+        signing_dict["start_at"] = payload.get("start_at")
+        signing_dict["chain_id"] = payload.get("chain_id")
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_EXECUTE:
+        signing_dict["standing_id"] = payload.get("standing_id")
+        signing_dict["chain_id"] = payload.get("chain_id")
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_UPDATE:
+        signing_dict["standing_id"] = payload.get("standing_id")
+        signing_dict["amount"] = payload.get("amount")
+        signing_dict["period_kind"] = payload.get("period_kind")
+        signing_dict["period_length"] = payload.get("period_length")
+        signing_dict["period_anchor"] = payload.get("period_anchor")
+        signing_dict["max_fee_per_execution"] = payload.get("max_fee_per_execution")
+        signing_dict["start_at"] = payload.get("start_at")
+        signing_dict["chain_id"] = payload.get("chain_id")
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
+        signing_dict["standing_id"] = payload.get("standing_id")
         signing_dict["chain_id"] = payload.get("chain_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()

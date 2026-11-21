@@ -157,3 +157,38 @@ on the lifecycle manager by `chain_state` at genesis load (the same way
 when set, so a chain that predates the field keeps a byte-identical hash.
 Clients read it with the `getchainid` command. `grant_create` is
 fee-bearing; `grant_draw` and `grant_cancel` are fee-exempt, like a retract.
+
+## Stage 3 — standing payments
+
+`consensus/standing.py` — `StandingPaymentBook`: recurring payments from
+a payer to a payee, one execution per period, no catch-up. The payer keeps
+the funds until an execution moves them, so the book holds no escrow
+(`escrowed_total()` is always 0). Schedules are calendar month (month-end
+clamp), ISO week, day, or fixed; `start_at` is at most 90 days ahead; at
+most 16 open standing payments per payer, 4096 total.
+
+Execution has two paths through ONE shared apply function
+(`apply_standing_execution`): the post-transaction sweep is primary, and
+`standing_payment_execute` is a manual fallback for a period the sweep
+missed. Both debit the payer first, then credit through the (possibly
+staged) view — aliasing-safe, like the engine's fee settlement. A period
+is executed once; a missed period is skipped, never caught up. The payer's
+`max_fee_per_execution` caps the fee: on the sweep path the engine
+measures one Tau fee-query step per execution (the same way a
+transfer-less `user_tx` is charged) and skips the period when the fee
+exceeds the cap; on the manual path admission rejects a `fee_limit` above
+the cap. If the payer's balance is below amount + fee, the period is
+skipped and stays due for retry; if the fee has nowhere to go (no fee
+beneficiary), the period also stays due. Only advancing outcomes
+(`executed`, `skipped_fee_cap`, `skipped_insufficient_funds`) move the
+schedule forward.
+
+`standing_payment_update` never mutates the old terms: it resolves the old
+version as SUPERSEDED and submits a new version (same `standing_id`,
+version + 1) — this beats both competing PRs, neither of which offers an
+update at all. `standing_payment_cancel` is fee-exempt, like a retract.
+`standing_payment`, `standing_payment_execute` and
+`standing_payment_update` are fee-bearing and carry `chain_id` (genesis
+binding, see above).
+
+Demo: Alice pays Bob 100/week (`tests/test_standing.py::test_demo_alice_bob_100_per_week`).

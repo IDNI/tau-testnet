@@ -28,6 +28,7 @@ from consensus.rule_offers import (
 )
 from consensus.chain_binding import WRONG_CHAIN_ID, check_chain_binding
 from consensus.facade import TipAdmissionView
+from consensus.fees import parse_fee_limit
 from consensus.grants import (
     MAX_OPEN_GRANTS_PER_GRANTER,
     MAX_OPEN_GRANTS_TOTAL,
@@ -40,6 +41,22 @@ from consensus.grants import (
     parse_grant_create,
     parse_grant_draw,
     validate_grant_shape,
+)
+from consensus.standing import (
+    MAX_OPEN_STANDING_PER_PAYER,
+    MAX_OPEN_STANDING_TOTAL,
+    TX_TYPE_STANDING_PAYMENT,
+    TX_TYPE_STANDING_PAYMENT_CANCEL,
+    TX_TYPE_STANDING_PAYMENT_EXECUTE,
+    TX_TYPE_STANDING_PAYMENT_UPDATE,
+    StandingPaymentBook,
+    StandingShapeError,
+    build_update_entry,
+    parse_standing_cancel,
+    parse_standing_create,
+    parse_standing_execute,
+    parse_standing_update,
+    validate_standing_shape,
 )
 from consensus.approvals import (
     MAX_APPROVAL_WINDOW_BLOCKS,
@@ -1632,6 +1649,13 @@ def validate_retract_transfer_payload(
     return success({"retractable_id": request.retractable_id.hex()})
 
 
+def _standing_book_from_row(row: Dict) -> StandingPaymentBook:
+    """A one-standing-payment book rebuilt from a stored row, so admission
+    judges a standing payment from the persisted state alone (the tip view
+    reads stored rows, not the in-memory manager)."""
+    return StandingPaymentBook.restore([row], 0, bytes(32))
+
+
 def _grant_book_from_row(row: Dict) -> GrantBook:
     """A one-grant book rebuilt from a stored row, so admission judges a
     draw/cancel with the same code the engine applies."""
@@ -1748,6 +1772,158 @@ def validate_grant_cancel_payload(
             f"grant_cancel rejected: {reason}", code="GRANT_CANCEL_REJECTED"
         )
     return success({"grant_id": request.grant_id.hex()})
+
+
+def validate_standing_create_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for creating a standing payment."""
+    try:
+        entry = parse_standing_create(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment: {exc}.")
+
+    if not isinstance(tx.get("sender_pubkey"), str) or tx.get("sender_pubkey") != entry.payer_pubkey:
+        return format_error("standing_payment sender_pubkey must match the payer.")
+
+    chain_error = check_chain_binding(tx, tip_view.genesis_hash)
+    if chain_error is not None:
+        return format_error(
+            f"standing_payment rejected: {chain_error}.", code=WRONG_CHAIN_ID
+        )
+
+    shape_error = validate_standing_shape(
+        entry, tip_view.next_block_height, tip_view.next_block_timestamp
+    )
+    if shape_error is not None:
+        return format_error(f"standing_payment rejected: {shape_error}")
+
+    if tip_view.get_standing(entry.standing_id) is not None:
+        return format_error(
+            "Duplicate standing_payment (same payer, payee, sequence "
+            "number).",
+            code="DUPLICATE_STANDING",
+        )
+    if tip_view.open_standing_count_for_payer(entry.payer_pubkey) >= MAX_OPEN_STANDING_PER_PAYER:
+        return format_error(
+            f"Payer already has {MAX_OPEN_STANDING_PER_PAYER} open standing payments.",
+            code="STANDING_PAYER_FULL",
+        )
+    if tip_view.open_standing_count() >= MAX_OPEN_STANDING_TOTAL:
+        return format_error("The standing payment book is full.", code="STANDING_BOOK_FULL")
+    return success(
+        {
+            "standing_id": entry.standing_id.hex(),
+            "payer_pubkey": entry.payer_pubkey,
+            "payee_pubkey": entry.payee_pubkey,
+        }
+    )
+
+
+def validate_standing_execute_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for executing one period of a standing payment."""
+    try:
+        request = parse_standing_execute(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment_execute: {exc}.")
+
+    chain_error = check_chain_binding(tx, tip_view.genesis_hash)
+    if chain_error is not None:
+        return format_error(
+            f"standing_payment_execute rejected: {chain_error}.", code=WRONG_CHAIN_ID
+        )
+
+    row = tip_view.get_standing(request.standing_id)
+    if row is None:
+        return format_error(
+            "Unknown or already resolved standing payment.", code="UNKNOWN_STANDING"
+        )
+    book = _standing_book_from_row(row)
+    ok, reason = book.can_admit_execute(
+        request.standing_id, tx.get("sender_pubkey"),
+        tip_view.next_block_height, tip_view.next_block_timestamp,
+        fee_limit=parse_fee_limit(tx.get("fee_limit")),
+    )
+    if not ok:
+        return format_error(
+            f"standing_payment_execute rejected: {reason}",
+            code="STANDING_EXECUTE_REJECTED",
+        )
+    return success({"standing_id": request.standing_id.hex()})
+
+
+def validate_standing_update_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for updating a standing payment's terms."""
+    try:
+        request = parse_standing_update(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment_update: {exc}.")
+
+    chain_error = check_chain_binding(tx, tip_view.genesis_hash)
+    if chain_error is not None:
+        return format_error(
+            f"standing_payment_update rejected: {chain_error}.", code=WRONG_CHAIN_ID
+        )
+
+    row = tip_view.get_standing(request.standing_id)
+    if row is None:
+        return format_error(
+            "Unknown or already resolved standing payment.", code="UNKNOWN_STANDING"
+        )
+    book = _standing_book_from_row(row)
+    current = book.get(request.standing_id)
+    # The update is a new version of the same standing payment: same id,
+    # version + 1, never a mutation of the old terms. can_admit_update
+    # validates the new terms shape (the request fields are already
+    # structurally checked by parse_standing_update above).
+    new_entry = build_update_entry(current, request)
+    ok, reason = book.can_admit_update(
+        request.standing_id, tx.get("sender_pubkey"), new_entry,
+        tip_view.next_block_height, tip_view.next_block_timestamp,
+    )
+    if not ok:
+        return format_error(
+            f"standing_payment_update rejected: {reason}",
+            code="STANDING_UPDATE_REJECTED",
+        )
+    return success({"standing_id": request.standing_id.hex(), "version": new_entry.version})
+
+
+def validate_standing_cancel_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for cancelling a standing payment."""
+    try:
+        request = parse_standing_cancel(tx)
+    except StandingShapeError as exc:
+        return format_error(f"Malformed standing_payment_cancel: {exc}.")
+
+    chain_error = check_chain_binding(tx, tip_view.genesis_hash)
+    if chain_error is not None:
+        return format_error(
+            f"standing_payment_cancel rejected: {chain_error}.", code=WRONG_CHAIN_ID
+        )
+
+    row = tip_view.get_standing(request.standing_id)
+    if row is None:
+        return format_error(
+            "Unknown or already resolved standing payment.", code="UNKNOWN_STANDING"
+        )
+    book = _standing_book_from_row(row)
+    ok, reason = book.can_admit_cancel(
+        request.standing_id, tx.get("sender_pubkey"),
+        tip_view.next_block_height, tip_view.next_block_timestamp,
+    )
+    if not ok:
+        return format_error(
+            f"standing_payment_cancel rejected: {reason}",
+            code="STANDING_CANCEL_REJECTED",
+        )
+    return success({"standing_id": request.standing_id.hex()})
 
 
 # Two types carried a height deadline before this was general, each with its own
@@ -1869,6 +2045,18 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_GRANT_CANCEL:
          return validate_grant_cancel_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_PAYMENT:
+         return validate_standing_create_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_EXECUTE:
+         return validate_standing_execute_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_UPDATE:
+         return validate_standing_update_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_STANDING_PAYMENT_CANCEL:
+         return validate_standing_cancel_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

@@ -94,6 +94,15 @@ class SweepContext:
     # The block's credit ledger, when the caller wants sweep-produced
     # credits recorded (the engine passes its ledger); None records nothing.
     credit_records: Optional[Any] = None
+    # The block's resolved fee beneficiary (governance beneficiary or
+    # proposer), for handlers that charge a fee (standing payments). Empty
+    # when the engine did not resolve one; a handler that needs it and
+    # finds it empty must leave the item due, never burn the fee.
+    fee_beneficiary: str = ""
+    # Optional fee measurer for handlers that charge a fee: called as
+    # measure_fee(payer_pubkey, payee_pubkey, amount, timestamp) -> int.
+    # None means the fee model is inactive and the fee is 0.
+    measure_fee: Optional[Any] = None
 
 
 class SweepHandler(Protocol):
@@ -198,6 +207,8 @@ def run_programmable_sweep(
     cap: int = MAX_SWEEP_ACTIONS_PER_BLOCK,
     faucet_grant: int = 0,
     credit_records: Optional[Any] = None,
+    fee_beneficiary: str = "",
+    measure_fee: Optional[Any] = None,
 ) -> SweepReport:
     """Engine hook: run the post-transaction programmable sweep for a block.
 
@@ -214,5 +225,7 @@ def run_programmable_sweep(
         timestamp=int(timestamp),
         faucet_grant=faucet_grant,
         credit_records=credit_records,
+        fee_beneficiary=fee_beneficiary,
+        measure_fee=measure_fee,
     )
     return (registry or DEFAULT_SWEEP_REGISTRY).run(ctx, cap=cap)

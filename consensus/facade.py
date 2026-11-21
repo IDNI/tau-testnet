@@ -487,6 +487,50 @@ class TipAdmissionView:
     def open_grant_count(self) -> int:
         return self._retractable_scalar("SELECT COUNT(*) FROM grants_v1")
 
+    def get_standing(self, standing_id: bytes) -> Optional[dict]:
+        """The open standing payment with this id, or None (unknown or
+        already resolved)."""
+        try:
+            with db._db_lock:
+                row = db._db_conn.execute(
+                    "SELECT payer_pubkey, payee_pubkey, amount, "
+                    "sequence_number, version, period_kind, period_length, "
+                    "period_anchor, max_fee_per_execution, start_at, "
+                    "last_executed_period, executions "
+                    "FROM standing_v1 WHERE standing_id = ?",
+                    (bytes(standing_id).hex(),),
+                ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        return {
+            "standing_id": bytes(standing_id).hex(),
+            "payer_pubkey": row[0],
+            "payee_pubkey": row[1],
+            "amount": int(row[2]),
+            "sequence_number": int(row[3]),
+            "version": int(row[4]),
+            "period_kind": int(row[5]),
+            "period_length": None if row[6] is None else int(row[6]),
+            "period_anchor": int(row[7]),
+            "max_fee_per_execution": int(row[8]),
+            "start_at": int(row[9]),
+            "last_executed_period": (
+                None if row[10] is None else int(row[10])
+            ),
+            "executions": int(row[11]),
+        }
+
+    def open_standing_count_for_payer(self, payer_pubkey: str) -> int:
+        return self._retractable_scalar(
+            "SELECT COUNT(*) FROM standing_v1 WHERE payer_pubkey = ?",
+            (payer_pubkey,),
+        )
+
+    def open_standing_count(self) -> int:
+        return self._retractable_scalar("SELECT COUNT(*) FROM standing_v1")
+
     def get_retractable(self, retractable_id: bytes) -> Optional[dict]:
         """The open entry with this id, or None (unknown or already resolved)."""
         try:
