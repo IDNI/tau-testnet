@@ -38,12 +38,14 @@ from consensus.approvals import (
 # Every transaction type the node will admit. Governance types are fee-exempt
 # so validators never need funds to govern; the rule-sharing types are
 # user-initiated and expensive, so they pay like a user_tx does.
+from consensus.payments import FEE_BEARING_PAYMENT_TYPES, PAYMENT_TX_TYPES
 KNOWN_TX_TYPES = frozenset(
     {"user_tx", "consensus_rule_update", "consensus_rule_vote"}
     | set(RULE_OFFER_TX_TYPES)
     | set(APPROVAL_TX_TYPES)
     | set(RULE_CHANGE_TX_TYPES)
     | set(RETRACTABLE_TX_TYPES)
+    | set(PAYMENT_TX_TYPES)
 )
 # `approval_request` pays: it parks a transfer and is the ONLY charge for it, so
 # execution later is free and there is no second fee to drift. `transfer_vote` is
@@ -54,6 +56,7 @@ FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST}
     | set(RULE_OFFER_TX_TYPES)
+    | set(FEE_BEARING_PAYMENT_TYPES)
 )
 from db import add_mempool_tx
 from network import bus as network_bus

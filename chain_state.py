@@ -540,6 +540,15 @@ def _overrun_tx(block, opened_as) -> str:
     return opened_as or "?"
 
 
+def _payments_state(lm) -> str:
+    """Canonical JSON of the programmable-payment books. Empty is still written."""
+    import json
+    book = getattr(lm, "programmable", None)
+    if book is None:
+        return json.dumps({})
+    return json.dumps(book.snapshot(), sort_keys=True, separators=(",", ":"))
+
+
 def _retractable_state(lm) -> dict:
     book = lm.retractable_transfers
     count, acc = book.resolved_state()
@@ -608,6 +617,7 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         rule_change_requests=lm.approval_requests.snapshot_rule_change_requests(),
         approval_slots_active=lm.approval_slots_active,
         retractable_transfers=_retractable_state(lm),
+        programmable_payments=_payments_state(lm),
         eligibility_mode=lm.eligibility_mode,
         fee_beneficiary=lm.fee_beneficiary,
         last_transfer_ts=merged_ts,
@@ -2228,6 +2238,20 @@ def _restore_rule_change_requests(lm) -> None:
     lm.approval_requests.rule_change_requests = entries
 
 
+def _restore_payments(lm) -> None:
+    """Rehydrate programmable payments. A row whose id does not match is corruption."""
+    import json
+    from consensus.payments import restore_books
+
+    raw = db.get_chain_state_value("programmable_payments_v1", None)
+    if not raw:
+        return
+    try:
+        lm.programmable = restore_books(json.loads(raw))
+    except (TypeError, ValueError) as exc:
+        raise DatabaseError(f"corrupt programmable payment state: {exc}") from exc
+
+
 def _restore_retractables(lm) -> None:
     """Rehydrate the escrow book; a stored row that does not recompute its id is
     corruption and refuses to load rather than silently dropping escrowed funds."""
@@ -2372,6 +2396,7 @@ def load_state_from_db() -> bool:
         _restore_approvals(_lifecycle_manager)
         _restore_rule_change_requests(_lifecycle_manager)
         _restore_retractables(_lifecycle_manager)
+        _restore_payments(_lifecycle_manager)
         # One-way activation flag: rehydrated BEFORE anything reads the reserved
         # stream set, so a restarted node does not briefly un-reserve i18..i25.
         persisted_slots = db.get_chain_state_value("approval_slots_active", _MISSING)
@@ -2458,6 +2483,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_change_requests=rule_change_requests_list,
         approval_slots_active=approval_slots_active_snapshot,
         retractable_transfers=retractable_snapshot,
+        programmable_payments=_payments_state(_lifecycle_manager),
     )
 
 def tick_governance(height: int):
@@ -2955,6 +2981,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 ),
                 approval_slots_active=_lifecycle_manager.approval_slots_active,
                 retractable_transfers=_retractable_state(_lifecycle_manager),
+                programmable_payments=_payments_state(_lifecycle_manager),
             )
     except Exception as exc:
         logger.error(

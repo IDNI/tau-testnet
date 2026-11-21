@@ -43,7 +43,12 @@ class SoleMiner:
             return False
         head = db.get_canonical_head_block()
         next_height = head['header']['block_number'] + 1 if head else 0
-        return db.has_due_retractables(next_height, int(time.time()))
+        if db.has_due_retractables(next_height, int(time.time())):
+            return True
+        import chain_state
+        from consensus.payments import has_due
+        book = getattr(getattr(chain_state, "_lifecycle_manager", None), "programmable", None)
+        return bool(book is not None and has_due(book, next_height, int(time.time())))
 
     def _should_mine(self) -> bool:
         # 1. Cheap local gates first to avoid driving the Tau engine on every tick.
