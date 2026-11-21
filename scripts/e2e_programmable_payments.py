@@ -34,7 +34,11 @@ ASSERTION DISCIPLINE
     getstandingpayments / getreceiveroute / getpayoutrule RPC getters, and
     sequence numbers -- never one createblock response: the node's own
     miner races every explicit mine, so the chain is awaited, not the
-    call. Fees are assumed BASE_FEE per tx, as in e2e_retractable.py.
+    call. Fees are assumed BASE_FEE per fee-bearing tx, as in e2e_retractable.py.
+Exceptions, all by design: `grant_draw` is fee-exempt (only
+`grant_create` bears a fee); a standing-payment sweep charges the
+payer one extra BASE_FEE (`max_fee_per_execution`) per execution;
+a rejected tx (e.g. a cap-skipped second payout execute) pays no fee.
 """
 from __future__ import annotations
 
@@ -66,7 +70,17 @@ ROLES = ("sender", "recipient", "other")
 ACTORS = ("miner",) + tuple(f"{s}_{r}" for s in SCENARIOS for r in ROLES) + ("pad1", "pad2")
 DAY = 86400
 WEEK = 7 * DAY
-CLAUSE = "always (o1[t] = 300, o2[t] = 700)."
+# Valid payout-clause shape (Stage 5): a ternary over an input guard.
+# Bare decimals (`o1[t] = 300`) and comma-separated assignments do not parse,
+# and a constant-only clause cannot be stepped at all (it reads no input
+# stream), so the clause must read an input -- here i1, the payer balance.
+# Caveat: the i1[t]:bv[24] guard caps at 16,777,215; fine for the balances
+# in this e2e (1,000,000), but a payer holding more would need a wider guard.
+CLAUSE = (
+    "always ((i1[t]:bv[24] > { #x000000 }:bv[24])"
+    " ? (o1[t]:bv[24] = { 300 }:bv[24] && o2[t]:bv[24] = { 700 }:bv[24])"
+    " : (o1[t]:bv[24] = { 0 }:bv[24] && o2[t]:bv[24] = { 0 }:bv[24]))."
+)
 
 FAILED: list[str] = []
 STARTED: list["Node"] = []
@@ -612,7 +626,9 @@ def scenario_b(node, sg):
     res = sg.grant_draw(node, r, gid, draw)
     tx_ok(res, "b: grant_draw admitted")
     check("b: grant_draw mined", produce(node, node.height() + 1))
-    orc.add(r, draw - BASE_FEE); orc.add("miner", BASE_FEE)
+    # grant_draw is fee-exempt by design (only grant_create bears a fee),
+    # so the grantee receives the full draw and the miner gains nothing.
+    orc.add(r, draw)
     orc.verify("after draw")
     out, _ = node.acct(sg.pk(g)); _, r_in = node.acct(sg.pk(r))
     check("b: escrow drops to the remainder after the draw",
@@ -639,8 +655,10 @@ def scenario_c(node, sg):
           row["amount"] == amount and row["payee_pubkey"] == sg.pk(r)
           and row["payer_pubkey"] == sg.pk(p), row)
     # The sweep executes the current period at create: the payee is paid
-    # once immediately, and the payer's fee is the only other movement.
-    orc.add(p, -(amount + BASE_FEE)); orc.add(r, amount); orc.add("miner", BASE_FEE)
+    # once immediately. The payer bears two fees: the create fee (BASE_FEE)
+    # plus the sweep execution's fee (max_fee_per_execution = BASE_FEE here),
+    # charged by design; the miner receives both.
+    orc.add(p, -(amount + 2 * BASE_FEE)); orc.add(r, amount); orc.add("miner", 2 * BASE_FEE)
     orc.verify("after create (first-period sweep)")
     check("c: schedule executed exactly once in its first period",
           int(row.get("executions", 0)) == 1, row)
@@ -723,8 +741,9 @@ def scenario_e(node, sg):
     res = sg.payout_execute(node, p, pid)
     tx_ok(res, "e: second payout_execute admitted")
     check("e: second payout_execute mined", produce(node, node.height() + 1))
-    orc.add(p, -BASE_FEE); orc.add("miner", BASE_FEE)
-    orc.verify("after second execute (fee only, no payout)")
+    # The cap-skipped second execute is rejected, and rejected txs pay no
+    # fee -- so neither the payer nor the miner moves on this execute.
+    orc.verify("after second execute (cap-skipped: no payout, no fee)")
     return pid
 
 
