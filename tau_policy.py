@@ -3,7 +3,8 @@
 A clause body reads the current step only, so its verdict is a pure function of
 (body, inputs). The evaluator owns a worker process holding a cache of built
 interpreters and replaces it on loss, on a build failure that a fresh process
-might not share, and when it has served enough builds, steps or memory.
+might not share, on a refused step that a fresh process might not share, and
+when it has served enough builds, steps or memory.
 """
 from __future__ import annotations
 
@@ -316,7 +317,7 @@ class PolicyEvaluator:
                 self.recycles += 1
                 self._replace()
             resp, worker, prior = self._exchange(payload, timeout)
-            if not resp.get("ok") and resp.get("phase") == "build" and prior >= 1:
+            if not resp.get("ok") and resp.get("phase") in ("build", "step") and prior >= 1:
                 self.fresh_fallbacks += 1
                 self._replace()
                 resp, worker, _ = self._exchange(payload, timeout)

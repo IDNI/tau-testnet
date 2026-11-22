@@ -176,6 +176,37 @@ def screen_reserved_rule_outputs(rule_text: str) -> Optional[str]:
     return None
 
 
+_SPECIAL_STREAMS = {
+    "u": "the spec-update stream: writing it revises the running spec itself",
+    "this": "the current-spec input: its value is the executing spec",
+}
+_SPECIAL_NAME_RE = re.compile(r"\b(" + "|".join(_SPECIAL_STREAMS) + r")\b")
+_INDEXED_NAME_RE = re.compile(r"(:\s*)?\b([A-Za-z_]\w*)\s*\[")
+_USER_STREAM_NAME_RE = re.compile(r"[io]\d+")
+
+
+def screen_stream_names(rule_text: str) -> Optional[str]:
+    """Error text when a rule names an engine-special stream or a non-i/o stream."""
+    scrubbed = _strip_tau_comments(rule_text)
+    special = _SPECIAL_NAME_RE.search(scrubbed)
+    if special:
+        name = special.group(1)
+        return (
+            f"rule references reserved engine stream '{name}', "
+            f"{_SPECIAL_STREAMS[name]}."
+        )
+    for match in _INDEXED_NAME_RE.finditer(scrubbed):
+        if match.group(1):
+            continue
+        name = match.group(2)
+        if not _USER_STREAM_NAME_RE.fullmatch(name):
+            return (
+                f"rule references unknown stream '{name}'; only i<N> inputs "
+                f"and o<N> outputs may be indexed."
+            )
+    return None
+
+
 # Lookback is global to the evaluator's spec: one unit reading another step
 # leaves every output at 0 for the steps after each later revision or rebuild.
 TEMPORAL_REFERENCE_CODE = "TEMPORAL_REFERENCE"
@@ -284,6 +315,10 @@ def screen_user_rule_text(
     A proposer can include a tx that never passed admission, so apply must refuse
     exactly what admission refuses.
     """
+    stream_error = screen_stream_names(rule_text)
+    if stream_error:
+        return UserRuleRejection(stream_error, "special_stream", "TX_REJECTED")
+
     # A user rule on a consensus-owned output forges verdicts or fees, or makes the spec unsat.
     # Governance revisions are exempt because writing those streams is their job.
     reserved_error = screen_reserved_rule_outputs(rule_text)
@@ -966,6 +1001,10 @@ def _screen_clause_domains(body: str) -> Optional[str]:
     type a reserved input stream, and may reference [t] only. It may read i2:
     the policy evaluator is fed the parent-block balance at admission and apply.
     """
+    stream_error = screen_stream_names(body)
+    if stream_error:
+        return stream_error
+
     temporal_error = screen_temporal_rule(body)
     if temporal_error:
         return temporal_error
@@ -1041,6 +1080,10 @@ GUARD_READABLE_INPUTS = frozenset({
 def _screen_guard_domains(body: str) -> Optional[str]:
     """Domain screen for a rule-change guard body: reads i1, i5 and the approval
     slots only, and writes o5 only."""
+    stream_error = screen_stream_names(body)
+    if stream_error:
+        return stream_error
+
     temporal_error = screen_temporal_rule(body)
     if temporal_error:
         return temporal_error
