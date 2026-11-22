@@ -105,10 +105,10 @@ def execute(raw_command: str, container):
             # behaviour of a bad activation is unchanged.
             #
             # Run AFTER the locks below are released: for a patch that switches a
-            # stream on (approval_slots_active) the precheck audits the rules in
-            # force, which takes the rules lock again. Run here it never
-            # returned, and the node could not apply another block while the
-            # update was scheduled.
+            # stream on (approval_slots_active, recipient_policy_active) the
+            # precheck audits the rules in force, which takes the rules lock
+            # again. Run here it never returned, and the node could not apply
+            # another block while the update was scheduled.
             deferred_prechecks.append(
                 (entry, payload_obj, list(chain_state._lifecycle_manager.active_validators))
             )
@@ -185,6 +185,21 @@ def execute(raw_command: str, container):
             "votes": sorted(votes, key=lambda entry: (entry["update_id"], entry["voter_pubkey"])),
             "lifecycle": lifecycle,
             "stream_widths": dict(tau_defs.HOST_STREAM_WIDTHS),
+            # Recipient policy (#47/#76). `supported`: this node runs the gate.
+            # `active`: the chain activated it (governance patch
+            # recipient_policy_active), so a recipient's clause that reads the
+            # receive stream judges incoming payments. A wallet offers an
+            # inbound allow-list or a hold cap only when both are true.
+            "recipient_policy": {
+                "supported": True,
+                "active": bool(getattr(
+                    chain_state._lifecycle_manager, "recipient_policy_active", False)),
+                "receive_stream": f"i{tau_defs.RECIPIENT_HOLD_STREAM_INDEX}",
+                "receive_stream_width": tau_defs.RECIPIENT_HOLD_BV_WIDTH,
+                # i17 = 1 + N: held N seconds; i17 = blocks_base + N: held N blocks.
+                "hold_seconds_base": tau_defs.RECIPIENT_HOLD_INSTANT,
+                "hold_blocks_base": str(tau_defs.RECIPIENT_HOLD_BLOCKS_BASE),
+            },
         }
 
     for entry, payload_obj, validators in deferred_prechecks:

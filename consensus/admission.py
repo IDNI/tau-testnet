@@ -29,7 +29,10 @@ from consensus.rule_offers import (
 from consensus.facade import TipAdmissionView
 from consensus.approvals import (
     MAX_APPROVAL_WINDOW_BLOCKS,
+    audit_recipient_stream_collisions,
     audit_stream_collisions,
+    recipient_policy_active,
+    screen_receive_stream,
     MAX_PENDING_REQUESTS_PER_APPROVER,
     approval_slots_active,
     MAX_PENDING_REQUESTS_PER_SENDER,
@@ -69,6 +72,7 @@ from consensus.governance import (
     HOST_CONTRACT_PATCH_KEYS,
     validate_fee_beneficiary,
     validate_approval_slots_active,
+    validate_recipient_policy_active,
 )
 
 logger = logging.getLogger(__name__)
@@ -277,7 +281,8 @@ class UserRuleRejection(NamedTuple):
 
 
 def screen_user_rule_text(
-    rule_text: str, eligibility_mode: str, slots_active: bool
+    rule_text: str, eligibility_mode: str, slots_active: bool,
+    recipient_active: bool = False
 ) -> Optional[UserRuleRejection]:
     """Screens for an accumulated op-0 rule, run by admission and by block apply.
 
@@ -318,6 +323,7 @@ def screen_user_rule_text(
         tau_defs.RULE_TEXT_CONTEXT_USER,
         eligibility_mode,
         approval_slots_active=slots_active,
+        recipient_policy_active=recipient_active,
     )
     typed_reserved_in = _streams_referenced(rule_text, typed_reserved)
     if typed_reserved_in:
@@ -397,9 +403,11 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
     # The slot reservation is what makes a co-signature unforgeable: without it a
     # sender could put "18" in `operations` and write their own approval.
     slots_active = approval_slots_active(tip_view)
+    recipient_active = recipient_policy_active(tip_view)
     reserved_ops = tau_defs.reserved_operation_keys(
         getattr(tip_view, "eligibility_mode", ""),
         approval_slots_active=slots_active,
+        recipient_policy_active=recipient_active,
     )
 
     for key, val in operations.items():
@@ -436,7 +444,8 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
         if routing is not None:
             return routing
 
-        rejection = screen_user_rule_text(rule_text, tip_view.eligibility_mode, slots_active)
+        rejection = screen_user_rule_text(
+            rule_text, tip_view.eligibility_mode, slots_active, recipient_active)
         if rejection:
             return format_error(
                 rejection.error, code=rejection.code, **(rejection.details or {})
@@ -581,6 +590,17 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         if findings:
             return (
                 "approval_slots_active cannot be activated on this chain: "
+                + "; ".join(findings)
+            )
+    if "recipient_policy_active" in patch:
+        err = validate_recipient_policy_active(patch["recipient_policy_active"])
+        if err:
+            return f"recipient_policy_active: {err}"
+        # First phase of the same two-phase activation as approval slots.
+        findings = audit_recipient_stream_collisions(_tip_effective_spec_texts())
+        if findings:
+            return (
+                "recipient_policy_active cannot be activated on this chain: "
                 + "; ".join(findings)
             )
     if "vote_quorum" in patch:
@@ -1007,6 +1027,14 @@ def _screen_clause_domains(body: str) -> Optional[str]:
             + ", ".join(typed)
         )
 
+    # The receive stream i17 (#47/#76) is typed bv[64] wherever a clause reads
+    # it, by every route that registers a clause, whether or not recipient
+    # policy is active yet: stream typing is process-global, and a clause
+    # outlives the moment it was accepted.
+    receive_width = screen_receive_stream(body, True)
+    if receive_width:
+        return receive_width
+
     return _screen_clause_widths_and_structure(body)
 
 
@@ -1233,6 +1261,13 @@ def validate_o5_clause_routing(
     if domain_error:
         return _admission_from_domain_error(
             domain_error, prefix="o5 policy rule rejected: "
+        )
+
+    receive_error = screen_receive_stream(body, recipient_policy_active(tip_view))
+    if receive_error:
+        return format_error(
+            f"o5 policy rule rejected: {receive_error}",
+            code="RECIPIENT_POLICY_INACTIVE",
         )
 
     sender = tx.get("sender_pubkey")

@@ -165,6 +165,8 @@ def restore_genesis_approval_slots(monkeypatch):
     import chain_state
     monkeypatch.setattr(chain_state, "_genesis_approval_slots_active",
                         chain_state._genesis_approval_slots_active)
+    monkeypatch.setattr(chain_state, "_genesis_recipient_policy_active",
+                        chain_state._genesis_recipient_policy_active)
 
 
 @pytest.fixture(autouse=True)

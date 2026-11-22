@@ -18,6 +18,7 @@ from commands import checktx, createblock, getmempool, gettimestamp, sendtx, get
 from commands import getofferid, getruleoffers, getruleoffer, getruleconflict
 from commands import (
     getapprovalpreview,
+    getrecipientpolicy,
     getapprovalrequest,
     getapprovalrequests,
     getapprovalslots,
@@ -90,6 +91,8 @@ class ServiceContainer:
         # in server.py.
         "getapprovalslots": getapprovalslots,
         "getapprovalpreview": getapprovalpreview,
+        # Advisory recipient-policy pre-flight (#47/#76); steps the evaluator.
+        "getrecipientpolicy": getrecipientpolicy,
         }
 
         mempool = override_map.get("mempool") or []

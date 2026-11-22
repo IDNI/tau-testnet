@@ -226,6 +226,29 @@
                         </div>
                         <div id="rule-validation-status" class="form-text mt-1"></div>
                     </div>
+                    <details class="mb-3" id="receive-rule-builder">
+                        <summary class="form-label">Rule for incoming payments</summary>
+                        <div class="form-text mb-2">Accept money only from chosen senders, and/or cap how long an
+                            incoming retractable transfer may be held. Needs recipient policy active on the node.</div>
+                        <label for="rcv-allow" class="form-label">Accept only from (one public key per line)</label>
+                        <textarea class="form-control mb-2" id="rcv-allow" rows="2"></textarea>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label for="rcv-max-seconds" class="form-label">Max hold (seconds)</label>
+                                <input type="number" min="0" class="form-control" id="rcv-max-seconds"
+                                    placeholder="0 = instant only">
+                            </div>
+                            <div class="col-6">
+                                <label for="rcv-max-blocks" class="form-label">Max hold (blocks)</label>
+                                <input type="number" min="0" class="form-control" id="rcv-max-blocks">
+                            </div>
+                        </div>
+                        <label for="rcv-send-only-to" class="form-label">Send only to (optional, one per line)</label>
+                        <textarea class="form-control mb-2" id="rcv-send-only-to" rows="1"></textarea>
+                        <button class="btn btn-sm btn-outline-primary" type="button" id="btn-build-receive-rule">Build
+                            rule</button>
+                        <div id="rcv-status" class="form-text mt-1"></div>
+                    </details>
                 </div>
 
                 <!-- Custom Ops Tab -->

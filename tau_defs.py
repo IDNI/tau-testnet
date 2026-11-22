@@ -258,6 +258,50 @@ COOLDOWN_NEVER_SENT = (1 << 63) - 1
 # feed, so by the time this is switched on the history is already accumulated.
 COOLDOWN_STREAM_ACTIVE = False
 
+# --- Recipient-side policy (issues #47, #76) ---------------------------------
+# i17: the RECEIVE stream, node-fed into every o5 clause evaluation once the
+# network has activated recipient policy (governance patch
+# `recipient_policy_active`, a one-way switch like `approval_slots_active`).
+# It tells a clause which side of a transfer it is judging, and for a payment
+# it receives, how long that payment is held:
+#
+#   0             the clause owner is SENDING (the existing sender pass)
+#   1             the owner is RECEIVING a plain transfer (hold 0)
+#   1 + N         the owner is RECEIVING a time-based park held N seconds
+#   2^63 + N      the owner is RECEIVING a height-based park held N blocks
+#
+# The two hold ranges never meet (a park is held at most
+# MAX_RELEASE_WINDOW_SECONDS), so one comparison states either kind of cap:
+#   instant only            i17 > 1                -> o5 = 0
+#   at most 600 seconds     i17 > 601              -> o5 = 0   (also refuses
+#                                                    every height-based park,
+#                                                    whose hold has no length
+#                                                    in seconds)
+#   at most 100 blocks      i17 > 2^63 + 100       -> o5 = 0
+# and "accept money only from A" is `i17 > 0 && i3 != A -> o5 = 0`. One clause
+# per account carries the outbound rules (i17 = 0), the inbound allow-list and
+# the hold cap.
+#
+# A recipient's clause is evaluated for an incoming payment ONLY if it reads
+# i17. A clause that never mentions i17 was written as an outbound rule; judging
+# money arriving with it would silently turn every existing outbound whitelist
+# into an inbound block. Reading i17 is the opt-in, and it is decided from the
+# clause text alone, so every node decides it identically.
+RECIPIENT_HOLD_STREAM_INDEX = 17
+RECIPIENT_HOLD_BV_WIDTH = 64
+RECIPIENT_HOLD_SENDING = 0
+RECIPIENT_HOLD_INSTANT = 1
+RECIPIENT_HOLD_BLOCKS_BASE = 1 << 63
+_RECIPIENT_HOLD_MAX = (1 << RECIPIENT_HOLD_BV_WIDTH) - 1
+
+
+class HeldBlocks(int):
+    """A hold counted in blocks (a park released at a height), as opposed to a
+    plain int, which is a hold in seconds."""
+
+    def __repr__(self) -> str:
+        return f"HeldBlocks({int(self)})"
+
 # --- Tau Consensus ABI v1.2 additions (Tau-encoded validator membership) ---
 # Proposer BLS pubkey fed so a consensus rule can test set membership itself
 # (o7 = 1 iff i13 equals one of the validator pubkey constants baked into the
@@ -321,8 +365,23 @@ def approval_slot_indices() -> tuple:
     return tuple(range(APPROVAL_SLOT_BASE, APPROVAL_SLOT_BASE + APPROVAL_SLOT_COUNT))
 
 
+def recipient_hold_value(hold) -> int:
+    """The i17 value for a payment the clause owner RECEIVES.
+
+    `hold` is an int of seconds (0 for a plain transfer, N for a time-based park
+    released N seconds after the block it lands in) or a HeldBlocks of blocks (a
+    height-based park). A negative hold cannot occur for an admissible park (it
+    must release in the future) and is treated as 0. The seconds range stops
+    below the blocks range, so the two can never be confused.
+    """
+    if isinstance(hold, HeldBlocks):
+        return min(RECIPIENT_HOLD_BLOCKS_BASE + max(0, int(hold)), _RECIPIENT_HOLD_MAX)
+    return min(RECIPIENT_HOLD_INSTANT + max(0, int(hold)), RECIPIENT_HOLD_BLOCKS_BASE - 1)
+
+
 def reserved_operation_keys(
-    eligibility_mode: str = "", approval_slots_active: bool = False
+    eligibility_mode: str = "", approval_slots_active: bool = False,
+    recipient_policy_active: bool = False,
 ) -> tuple:
     """Operation keys a user_tx may not target, for the given eligibility mode.
 
@@ -345,6 +404,10 @@ def reserved_operation_keys(
         # Reserved exactly when the node starts feeding them, mirroring the i13
         # and i16 precedents.
         keys = keys + approval_slot_indices()
+    if recipient_policy_active:
+        # Same precedent: i17 is reserved exactly when the node starts feeding
+        # it, so a sender can never write their own receive context.
+        keys = keys + (RECIPIENT_HOLD_STREAM_INDEX,)
     return keys
 
 
@@ -352,6 +415,7 @@ def rule_text_forbidden_input_streams(
     context: str = RULE_TEXT_CONTEXT_USER,
     eligibility_mode: str = "",
     approval_slots_active: bool = False,
+    recipient_policy_active: bool = False,
 ) -> tuple:
     """Input stream NAMES that rule text of this kind may not reference.
 
@@ -360,12 +424,15 @@ def rule_text_forbidden_input_streams(
     rule text depends on what the rule is. i12 is the standing example — reading
     the sender pubkey is how a policy rule scopes itself, only writing it as an
     operation is forbidden. Approval slots are the second: write-forbidden
-    everywhere, readable only from a registered o5 clause.
+    everywhere, readable only from a registered o5 clause. The receive stream
+    i17 is the third, for the same reason: only a clause is ever fed it.
     """
     keys = reserved_operation_keys(
-        eligibility_mode, approval_slots_active=approval_slots_active
+        eligibility_mode, approval_slots_active=approval_slots_active,
+        recipient_policy_active=recipient_policy_active,
     )
     readable = {12}
     if context == RULE_TEXT_CONTEXT_O5_CLAUSE:
         readable |= set(approval_slot_indices())
+        readable.add(RECIPIENT_HOLD_STREAM_INDEX)
     return tuple(f"i{idx}" for idx in keys if idx not in readable)

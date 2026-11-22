@@ -11,6 +11,7 @@ from consensus.retractable import RetractableBook
 logger = logging.getLogger(__name__)
 from consensus.approvals import (
     ApprovalRequestLifecycleManager,
+    audit_recipient_stream_collisions,
     audit_stream_collisions,
 )
 
@@ -93,6 +94,7 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "fee_beneficiary",
     "max_rule_txs_per_block",
     "approval_slots_active",
+    "recipient_policy_active",
 })
 
 
@@ -106,6 +108,18 @@ def validate_approval_slots_active(value: Any) -> Optional[str]:
     """
     if value is not True:
         return "must be true; approval slots cannot be deactivated once active"
+    return None
+
+
+def validate_recipient_policy_active(value: Any) -> Optional[str]:
+    """Recipient-policy activation is a ONE-WAY switch to True.
+
+    Turning it back off would un-reserve i17 while clauses depend on it: a
+    sender could then write the receive stream themselves and pass a
+    recipient's allow-list or hold cap. So only `True` is a legal patch value.
+    """
+    if value is not True:
+        return "must be true; recipient policy cannot be deactivated once active"
     return None
 
 
@@ -198,6 +212,7 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     faucet_amount: int = 0,
+    recipient_policy_active: bool = False,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -234,6 +249,10 @@ def build_mechanism_metadata(
     # unaffected.
     if approval_slots_active:
         mech["approval_slots_active"] = True
+    # Recipient policy (#47/#76): same non-default gate, so a chain that never
+    # activates it hashes exactly as before the field existed.
+    if recipient_policy_active:
+        mech["recipient_policy_active"] = True
     if approval_requests_root:
         mech["approval_requests_root"] = approval_requests_root
     if faucet_amount:
@@ -457,6 +476,9 @@ class ConsensusLifecycleManager:
         # rollback, reorg and competing branches. Read from the PARENT snapshot,
         # so an activation recorded in block H governs H+1 onward.
         self.approval_slots_active: bool = False
+        # Recipient policy (#47/#76): one-way, hash-bound, read from the parent
+        # snapshot exactly like approval_slots_active above.
+        self.recipient_policy_active: bool = False
         # Pinned by genesis for the life of the network: no patch sets it.
         # Bound into the meta hash only when non-zero.
         self.faucet_amount: int = 0
@@ -546,6 +568,7 @@ class ConsensusLifecycleManager:
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
             faucet_amount=self.faucet_amount,
+            recipient_policy_active=self.recipient_policy_active,
         )
         return compute_consensus_meta_hash(
             host_contract={},
@@ -657,6 +680,24 @@ class ConsensusLifecycleManager:
                 )
             else:
                 self.activate_approval_slots()
+
+        if "recipient_policy_active" in patch:
+            # Same two-phase shape as approval_slots_active above: the value
+            # is validated here (apply reaches this without admission's check),
+            # and a collision leaves the flag False and the chain running.
+            err = validate_recipient_policy_active(patch["recipient_policy_active"])
+            if err:
+                raise ValueError(f"recipient_policy_active: {err}")
+            corpus = effective_spec_texts() if callable(effective_spec_texts) else effective_spec_texts
+            findings = audit_recipient_stream_collisions(corpus or ())
+            if findings:
+                logger.error(
+                    "recipient_policy_active activation REFUSED at this height; "
+                    "the effective spec already collides: %s",
+                    "; ".join(findings),
+                )
+            else:
+                self.activate_recipient_policy()
         self.recompute_approval_threshold()
 
     def activate_approval_slots(self) -> None:
@@ -667,6 +708,10 @@ class ConsensusLifecycleManager:
         depend on them, letting a sender write their own approval slots.
         """
         self.approval_slots_active = True
+
+    def activate_recipient_policy(self) -> None:
+        """Turn recipient policy on. Idempotent, and there is no way back."""
+        self.recipient_policy_active = True
 
     def knows_update(self, update_id: bytes) -> bool:
         """Check if an update is currently known in any state."""

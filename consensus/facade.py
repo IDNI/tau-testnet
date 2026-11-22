@@ -193,6 +193,14 @@ class TipAdmissionView:
         lm = getattr(chain_state, "_lifecycle_manager", None)
         return getattr(lm, "approval_slots_active", False) is True
 
+    @property
+    def recipient_policy_active(self) -> bool:
+        """Whether recipient policy (#47/#76) is active at the canonical tip:
+        i17 reserved and fed, recipients' clauses judging incoming payments.
+        Read from the same lifecycle manager block apply reads."""
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        return getattr(lm, "recipient_policy_active", False) is True
+
     def get_approval_request(self, request_id: str) -> Optional[dict]:
         """The full request row, or None. Includes the recorded votes."""
         import json as _json
