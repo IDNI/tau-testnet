@@ -82,6 +82,42 @@ _expensive_rpc_sema = threading.BoundedSemaphore(_EXPENSIVE_RPC_CONCURRENCY)
 _TCP_MAX_CONNECTIONS = 64
 _tcp_conn_sema = threading.BoundedSemaphore(_TCP_MAX_CONNECTIONS)
 
+# The 64 slots above were held by whoever opened them, for as long as they
+# liked: one host opening 64 connections, or 64 connections that send half a
+# command and stop (slowloris), left the RPC port unanswered for everyone until
+# the attacker let go. Each host now gets a share, and a slot that is not used
+# is taken back.
+_TCP_MAX_PER_HOST = 16
+# Granularity of the checks below; a recv() returns at least this often.
+_TCP_POLL_SECONDS = 2.0
+# A connection that has sent nothing since its last reply.
+_TCP_IDLE_SECONDS = 60.0
+# A command that has started but is not finished: a real client sends a whole
+# command (MAX_RPC_COMMAND_BYTES at most) in well under this.
+_TCP_PARTIAL_COMMAND_SECONDS = 20.0
+# A reply the client does not read.
+_TCP_SEND_SECONDS = 60.0
+_tcp_per_host: dict = {}
+_tcp_per_host_lock = threading.Lock()
+
+
+def _tcp_host_acquire(host) -> bool:
+    with _tcp_per_host_lock:
+        n = _tcp_per_host.get(host, 0)
+        if n >= _TCP_MAX_PER_HOST:
+            return False
+        _tcp_per_host[host] = n + 1
+        return True
+
+
+def _tcp_host_release(host) -> None:
+    with _tcp_per_host_lock:
+        n = _tcp_per_host.get(host, 0) - 1
+        if n > 0:
+            _tcp_per_host[host] = n
+        else:
+            _tcp_per_host.pop(host, None)
+
 # WebSocket listener is a single Trio thread. Unbounded accept + huge replies
 # are what make a handful of dashboard pollers look like "the node is wedged".
 _WS_MAX_CONNECTIONS = 32
@@ -693,7 +729,7 @@ def handle_client(conn, addr, container: ServiceContainer):
             ) + "\r\n"
             try:
                 conn.sendall(err.encode('utf-8'))
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
                 return False
             return True
 
@@ -705,7 +741,7 @@ def handle_client(conn, addr, container: ServiceContainer):
             logger.warning("Rate limit exceeded for %s (%s)", client_label, command_name)
             try:
                 conn.sendall((_rate_limited_response() + "\r\n").encode("utf-8"))
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
                 return False
             return True
 
@@ -718,7 +754,7 @@ def handle_client(conn, addr, container: ServiceContainer):
 
         try:
             conn.sendall(result_message.encode('utf-8'))
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
             logger.info("Client %s disconnected during send", client_label)
             return False
         return True
@@ -726,9 +762,23 @@ def handle_client(conn, addr, container: ServiceContainer):
     try:
         with conn:
             buffer = bytearray()
+            last_activity = time.monotonic()
+            partial_since = None
             while True:
                 try:
+                    conn.settimeout(_TCP_POLL_SECONDS)
                     data = conn.recv(config.BUFFER_SIZE)
+                except socket.timeout:
+                    now = time.monotonic()
+                    if partial_since is not None and now - partial_since > _TCP_PARTIAL_COMMAND_SECONDS:
+                        logger.warning("Client %s left a command unfinished for %.0fs; closing.",
+                                       client_label, now - partial_since)
+                        break
+                    if partial_since is None and now - last_activity > _TCP_IDLE_SECONDS:
+                        logger.info("Client %s idle for %.0fs; closing.", client_label,
+                                    now - last_activity)
+                        break
+                    continue
                 except (ConnectionResetError, ConnectionAbortedError):
                     # Normal client disconnect patterns (e.g. browser probes, clients closing early).
                     logger.info("Client %s reset/aborted connection", client_label)
@@ -747,9 +797,19 @@ def handle_client(conn, addr, container: ServiceContainer):
                     break
 
                 buffer.extend(data)
+                if partial_since is None:
+                    partial_since = time.monotonic()
+                elif (b"\n" not in data
+                      and time.monotonic() - partial_since > _TCP_PARTIAL_COMMAND_SECONDS):
+                    # Bytes keep arriving but the command never ends: a trickle
+                    # must not reset the deadline.
+                    logger.warning("Client %s trickled an unfinished command for %.0fs; closing.",
+                                   client_label, time.monotonic() - partial_since)
+                    break
 
                 # Dispatch every complete newline-delimited command in the buffer.
                 closed = False
+                conn.settimeout(_TCP_SEND_SECONDS)
                 while True:
                     nl = buffer.find(b"\n")
                     if nl == -1:
@@ -759,8 +819,12 @@ def handle_client(conn, addr, container: ServiceContainer):
                     if not _dispatch(line):
                         closed = True
                         break
+                    last_activity = time.monotonic()
+                    partial_since = time.monotonic() if buffer.strip() else None
                 if closed:
                     break
+                if not buffer.strip():
+                    partial_since = None
 
                 # Anti-DoS: a pending (unterminated) command must not grow without
                 # bound. Once the buffered remainder exceeds the cap it cannot be a
@@ -775,7 +839,7 @@ def handle_client(conn, addr, container: ServiceContainer):
                     ) + "\r\n"
                     try:
                         conn.sendall(err.encode('utf-8'))
-                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
                         pass
                     break
     except Exception:
@@ -989,7 +1053,17 @@ def _run_server(container: ServiceContainer):
         while not tau_module.server_should_stop.is_set():
             try:
                 conn, addr = server_socket.accept()
+                host = addr[0] if isinstance(addr, tuple) else addr
+                if not _tcp_host_acquire(host):
+                    logger.warning("Rejected TCP from %s: %d connections from this host",
+                                   addr, _TCP_MAX_PER_HOST)
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    continue
                 if not _tcp_conn_sema.acquire(blocking=False):
+                    _tcp_host_release(host)
                     logger.warning("Rejected TCP from %s: at capacity", addr)
                     try:
                         conn.close()
@@ -997,11 +1071,12 @@ def _run_server(container: ServiceContainer):
                         pass
                     continue
 
-                def _run_tcp_client(c=conn, a=addr):
+                def _run_tcp_client(c=conn, a=addr, h=host):
                     try:
                         handle_client(c, a, container)
                     finally:
                         _tcp_conn_sema.release()
+                        _tcp_host_release(h)
 
                 client_thread = threading.Thread(target=_run_tcp_client, daemon=True)
                 client_thread.start()
