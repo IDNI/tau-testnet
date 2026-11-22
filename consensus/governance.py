@@ -752,6 +752,16 @@ class ConsensusLifecycleManager:
         Returns True if the vote contributed to the tally, False if duplicate no-op or invalid state.
         """
         uid = vote.update_id
+
+        # v1 has no decline semantics: a signed approve=False is dropped by the
+        # mempool (see can_admit_vote) and by admission/gossip, so it must not
+        # contribute to the tally on the block-apply path either. Counting it
+        # let a proposer turn a validator's signed "no" into a "yes" and promote
+        # a rule update (issue #164). Soft no-op, never a hard reject: block
+        # validity has to stay deterministic across replays.
+        if vote.approve is False:
+            return False
+
         if uid not in self.pending_updates:
             # Non-duplicate vote targeting an update that is already approved-and-scheduled is invalid in context
             # "duplicate vote by the same validator for the same update_id in the same block is always a valid no-op"
