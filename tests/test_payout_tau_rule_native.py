@@ -54,6 +54,18 @@ duplicate tests above never exposed this: every assertion of theirs
 is negative, so a step refusal and a book refusal look identical to
 them. A positive settlement test has no such cover, so its clause
 must be a reading clause, like the grant example's.
+
+A final test pins install-day independence for the grant shape itself
+(the FIX-1A proof): the SAME signed grant — the same clause text, the
+same caps, periods_from set to the schedule's anchor — installed at two
+different block times (its recorded install anchors two weeks and a day,
+resp. four days, after the anchor) counts its weeks from the anchor,
+not from either install: period_index_at agrees on the two entries at
+every probed timestamp and provably differs from what either install
+anchor would give, and the money path is identical for both installs —
+three 500 draws, a refused fourth, and exactly 3,500 back to the funder
+after the deadline, with every settlement recorded under the anchored
+grid's period 0.
 """
 import json
 import os
@@ -84,7 +96,11 @@ import tau_manager
 from errors import TauEngineCrash
 from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, SK_MALLORY, pubkey_hex, sign_payload
 from commands import sendtx, createblock
-from consensus.payout_rules import FORM_TAU_RULE, PayoutRuleEntry
+from consensus.payout_rules import (
+    FORM_TAU_RULE,
+    PayoutRuleEntry,
+    period_index_at,
+)
 
 GENESIS_TAU = os.path.join(project_root, "genesis.tau")
 TRANSFER_RULE_PATH = os.path.join(project_root, "rules", "04_handle_valid_transfer.tau")
@@ -93,8 +109,10 @@ FUNDER = pubkey_hex(SK_ALICE)
 BOB = pubkey_hex(SK_BOB)
 EXECUTOR = pubkey_hex(SK_CAROL)
 OWNER = pubkey_hex(SK_MALLORY)  # the grant account holding the 5,000
+OWNER2 = pubkey_hex(0xDA7E)  # a second grant account, stocked the same
 
 WEEK = 604_800
+DAY = 86_400
 TOTAL = 5000
 WEEKLY = 500
 
@@ -261,7 +279,7 @@ class TestPayoutTauRuleNativeE2E(unittest.TestCase):
 
     def _balances(self):
         return {pk: chain_state._balances.get(pk, 0)
-                for pk in (OWNER, BOB, FUNDER, EXECUTOR)}
+                for pk in (OWNER, OWNER2, BOB, FUNDER, EXECUTOR)}
 
     def test_grant_example_as_a_tau_payout_rule(self):
         start = int(time.time())
@@ -436,6 +454,108 @@ class TestPayoutTauRuleNativeE2E(unittest.TestCase):
         self.assertTrue(book.is_settled(entry.rule_id, bytes.fromhex("88" * 32)))
         self.assertEqual(book.period_total(entry.rule_id, 2), 100)
         self.assertEqual(book.period_total(entry.rule_id, 0), 0)
+
+    def test_grant_weeks_count_from_periods_from_not_from_install(self):
+        # FIX-1A: the grant example installed at two different block
+        # times, with periods_from set to the schedule's own anchor.
+        # The two installs record different install anchors (the anchor
+        # + 2 weeks + 1 day, resp. + 4 days — the moments the two
+        # installs "happened"), but every period answer counts from the
+        # signed periods_from anchor, so the week boundaries and the
+        # whole money path are identical for both.
+        start = int(time.time())
+        anchor = start - 3 * WEEK + 150
+        deadline = anchor + 3 * WEEK
+        recipients = tuple(sorted([BOB, FUNDER]))
+        clause = _grant_clause(
+            anchor, recipients.index(BOB), recipients.index(FUNDER))
+        installs = (
+            (OWNER, anchor + 2 * WEEK + DAY, ("a1", "a2", "a3", "a4", "a5")),
+            (OWNER2, anchor + 2 * WEEK + 4 * DAY, ("b1", "b2", "b3", "b4", "b5")),
+        )
+        chain_state._balances[OWNER2] = TOTAL
+        chain_state._balances[EXECUTOR] = 100_000
+        book = chain_state._lifecycle_manager.payout_rules
+        entries = []
+        for owner, install_ts, _sids in installs:
+            entry = PayoutRuleEntry(
+                owner_pubkey=owner, recipients=recipients, legs=(),
+                max_per_execution=3500, max_per_period=TOTAL,
+                period_seconds=4 * WEEK, period_anchor_ts=install_ts,
+                version=1, form=FORM_TAU_RULE, clause_text=clause,
+                periods_from_ts=anchor,
+            )
+            book.install(entry, install_ts)
+            entries.append(entry)
+
+        # Identical week boundaries: at every probed timestamp the two
+        # entries name the same period — the one the anchor gives — and
+        # at the anchor's own 4-week boundary the anchored index (1)
+        # provably differs from what either install anchor would give
+        # (0): the grid follows periods_from, not the install day.
+        for ts in (anchor - 1, anchor, anchor + WEEK, anchor + 2 * WEEK,
+                   anchor + 3 * WEEK, anchor + 4 * WEEK - 1,
+                   anchor + 4 * WEEK, anchor + 5 * WEEK, anchor + 8 * WEEK):
+            expected = -1 if ts < anchor else (ts - anchor) // (4 * WEEK)
+            for entry in entries:
+                self.assertEqual(period_index_at(entry, ts), expected,
+                                 f"ts={ts} owner={entry.owner_pubkey[:8]}")
+        for entry in entries:
+            twin = PayoutRuleEntry(
+                owner_pubkey=entry.owner_pubkey, recipients=recipients,
+                legs=(), max_per_execution=3500, max_per_period=TOTAL,
+                period_seconds=4 * WEEK,
+                period_anchor_ts=entry.period_anchor_ts, version=1,
+                form=FORM_TAU_RULE, clause_text=clause,
+            )
+            self.assertEqual(
+                period_index_at(twin, anchor + 4 * WEEK), 0,
+                "install-anchored twin should still be in its period 0")
+
+        # Identical money path: three 500 draws per install, submitted
+        # by the third party, each settling exactly 500 to Bob; a
+        # fourth draw per install refused (release exhausted).
+        for entry, (owner, _ts, sids) in zip(entries, installs):
+            for k in range(3):
+                before = self._balances()
+                res = sendtx.queue_transaction(
+                    self._execute_tx(entry.rule_id, sids[k] * 32, WEEKLY),
+                    propagate=False)
+                self.assertTrue(res["ok"], f"draw {k + 1} rejected: {res}")
+                self._mine()
+                after = self._balances()
+                self.assertEqual(after[BOB] - before[BOB], WEEKLY)
+                self.assertEqual(after[owner] - before[owner], -WEEKLY)
+            before = self._balances()
+            res = sendtx.queue_transaction(
+                self._execute_tx(entry.rule_id, sids[3] * 32, WEEKLY),
+                propagate=False)
+            self.assertFalse(res["ok"], f"fourth draw admitted: {res}")
+            self.assertEqual(self._balances(), before)
+
+        # Past the deadline, the refund leg pays the unpaid remainder —
+        # exactly 3,500 — back to the funder, for both installs.
+        while time.time() < deadline + 2:
+            time.sleep(1)
+        for entry, (owner, _ts, sids) in zip(entries, installs):
+            before = self._balances()
+            res = sendtx.queue_transaction(
+                self._execute_tx(entry.rule_id, sids[4] * 32, 1),
+                propagate=False)
+            self.assertTrue(res["ok"], f"refund rejected: {res}")
+            self._mine()
+            after = self._balances()
+            self.assertEqual(after[FUNDER] - before[FUNDER], 3500)
+            self.assertEqual(after[owner], 0)
+
+        # Identical book accounting: every settlement of both grants —
+        # 1,500 of draws plus the 3,500 refund — is recorded under the
+        # anchored grid's period 0, the four-week window from the
+        # anchor, on both installs.
+        book = chain_state._lifecycle_manager.payout_rules
+        for entry in entries:
+            self.assertEqual(book.period_total(entry.rule_id, 0), TOTAL)
+        self.assertEqual(self._balances()[BOB], 2 * 1500)
 
 
 if __name__ == "__main__":
