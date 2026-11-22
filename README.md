@@ -657,11 +657,13 @@ The node evaluates the account's one `o5` unit twice per payment: once with `i12
 
 ```text
 # only approved senders may pay me
-always ( (i3[t]:bv[384] = { #x<APPROVER> }:bv[384]) -> (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
+always ( (i3[t]:bv[384] = { #x<APPROVER> }:bv[384]) ? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24]) ).
 
 # take payments that arrive instantly, and nothing held for more than 600 seconds
-always ( (i17[t]:bv[64] > { #x0259 }:bv[64]) -> (o5[t]:bv[24] = { #x000000 }:bv[24]) ).
+always ( (i17[t]:bv[64] > { #x0259 }:bv[64]) ? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24]) ).
 ```
+
+Both are ternaries on purpose: an `o5` the rule leaves unconstrained materialises as `0`, which blocks (see "How a clause judges a transfer" above).
 
 Semantics:
 
