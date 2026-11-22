@@ -5,6 +5,12 @@ mirroring tests/test_payouts_apply.py. The named test is the bounty
 page's worked example end to end: creation escrows the money, the
 weekly cap binds draws, and the deadline sweep refunds the exact
 remainder to the sender, fee-free.
+
+Draws are decided by the sender's grant clause: the harness seeds
+the canonical clause for ALICE (the grant sender throughout) and
+the scripted evaluator plays the Tau engine's role for it, reading
+the verdict off the draw facts the node feeds (o29) -- a test may
+override `ch.verdict` to script a stricter clause's answer.
 """
 
 import hashlib
@@ -17,7 +23,11 @@ from py_ecc.bls import G2Basic
 from block import Block
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager
-from consensus.grants import parse_grant_create
+from consensus.grants import (
+    CANONICAL_GRANT_CLAUSE,
+    GRANT_STREAM_INDEX,
+    parse_grant_create,
+)
 from consensus.state import TauStateSnapshot
 from consensus.tx_signing import signing_message_bytes
 
@@ -92,12 +102,38 @@ class Chain:
         self.seq = {}
         self.lts = {}
         self.lm = ConsensusLifecycleManager(active_validators=[ALICE])
+        self.lm.rule_offers.accepted_clauses[(ALICE, GRANT_STREAM_INDEX)] = (
+            CANONICAL_GRANT_CLAUSE
+        )
         self.fee = fee
+        self.verdict = None
         self.last = None
+
+    def _grant_verdict(self, vals):
+        """The canonical clause's verdict over the fed draw facts,
+        unless the test scripted one (a stricter clause's answer)."""
+        if self.verdict is not None:
+            return self.verdict
+        ts = int(vals.get(5, 0))
+        req = int(vals.get(24, 0))
+        rem = int(vals.get(25, 0))
+        drawn = int(vals.get(26, 0))
+        cap = int(vals.get(27, 0))
+        opens = int(vals.get(28, 0))
+        deadline = int(vals.get(29, 0))
+        group_drawn = int(vals.get(30, 0))
+        group_cap = int(vals.get(31, 0))
+        ok = (opens <= ts < deadline and req <= rem
+              and drawn + req <= cap
+              and (group_cap == 0 or group_drawn + req <= group_cap))
+        return "1" if ok else "0"
 
     def _multi(self, **kwargs):
         vals = kwargs.get("input_stream_values") or {}
-        return {1: str(vals.get(1, "0")), 8: "0", 9: str(self.fee), 5: "1"}
+        out = {1: str(vals.get(1, "0")), 8: "0", 9: str(self.fee), 5: "1"}
+        if 24 in vals:
+            out[29] = self._grant_verdict(vals)
+        return out
 
     def block(self, txs, height=20, ts=DEC1):
         parent = TauStateSnapshot(

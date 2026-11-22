@@ -64,6 +64,23 @@ other sweep movements, so the remainder is never reduced by a fee
 nobody signed for. Held grant money is part of the chain's supply
 invariant, counted alongside the retractable escrow.
 
+Whether a draw may happen is decided by the sender's Tau clause,
+not by the book: the sender publishes a clause on the grant stream
+(stream 29), and a draw steps it -- on the same evaluation path as
+payout executions -- with the draw's facts: the requested amount,
+the remaining grant, the amount already drawn in the current
+period, the declared per-period cap, the opens/deadline window and,
+for a grouped grant, the group's drawn-in-period and cap. The
+clause's verdict on o29 approves (1) or refuses the draw for its
+full requested amount. `CANONICAL_GRANT_CLAUSE` in
+`consensus/grants.py` states the conditions above as such a clause,
+so publishing it reproduces exactly the semantics first shipped;
+a sender may publish a stricter clause (its own extra conditions),
+never a looser one, because the book re-checks its declared caps
+after the clause approves -- the same defence in depth payout
+executions keep. A sender who has published no grant clause cannot
+be drawn on at all: admission and apply both refuse.
+
 Worked example (the bounty page's demo): 5,000 granted, cap
 500/week, draws open December 1, remainder refunds at the deadline
 -- `test_grant_5000_week_cap_refund_returns_remainder`.

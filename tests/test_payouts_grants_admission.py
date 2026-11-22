@@ -167,10 +167,28 @@ def test_grant_draw_admission():
         "tx_type": "grant_draw", "sender_pubkey": BOB,
         "grant_id": terms.grant_id, "amount": 500,
     }
+    # No grant clause published by the sender yet -> refused at
+    # admission too, mirroring the payout clause gate.
+    refused = validate_grant_draw_payload(tx, view)
+    assert not refused.is_valid
+    assert refused.code == "NO_GRANT_CLAUSE"
+
+    from consensus.governance import ConsensusLifecycleManager
+    from consensus.grants import CANONICAL_GRANT_CLAUSE, GRANT_STREAM_INDEX
+    lm = ConsensusLifecycleManager(active_validators=[ALICE])
+    lm.rule_offers.accepted_clauses[(ALICE, GRANT_STREAM_INDEX)] = (
+        CANONICAL_GRANT_CLAUSE
+    )
+
+    class _ClauseView(_View):
+        def clause_for(self, owner, stream):
+            return lm.rule_offers.clause_for(owner, stream)
+
+    view = _ClauseView(DEC1 + 60)
     assert validate_grant_draw_payload(tx, view).is_valid
     too_much = validate_grant_draw_payload({**tx, "amount": 5001}, view)
     assert not too_much.is_valid
     stranger = validate_grant_draw_payload({**tx, "sender_pubkey": CAROL}, view)
     assert not stranger.is_valid
-    early = validate_grant_draw_payload(tx, _View(DEC1 - 10))
+    early = validate_grant_draw_payload(tx, _ClauseView(DEC1 - 10))
     assert not early.is_valid

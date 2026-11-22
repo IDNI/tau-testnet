@@ -68,6 +68,7 @@ from consensus.payouts import (
     validate_payout_shape,
 )
 from consensus.grants import (
+    GRANT_STREAM_INDEX,
     MAX_GRANTS,
     GrantShapeError,
     TX_TYPE_GRANT_CREATE,
@@ -1677,11 +1678,14 @@ def validate_grant_create_payload(
 def validate_grant_draw_payload(
     tx: Dict, tip_view: TipAdmissionView
 ) -> AdmissionResult:
-    """Tau-free screens for drawing on a grant.
+    """Screens for drawing on a grant.
 
-    The period-cap arithmetic is shared with apply through the book's
-    own check on the tip state; apply re-checks against the candidate
-    book, so admission and apply cannot disagree on the verdict.
+    Admission checks the sender has published a grant clause (the
+    payout admission does the same for its clause) and screens the
+    window and remainder against the tip state; the clause's verdict
+    and the period-cap arithmetic run at apply, which re-checks
+    against the candidate book, so admission never promises a draw
+    apply would refuse for a book reason.
     """
     try:
         grant_id, amount = parse_grant_draw(tx)
@@ -1695,6 +1699,12 @@ def validate_grant_draw_payload(
     sender = tx.get("sender_pubkey")
     if not isinstance(sender, str) or sender != row["recipient_pubkey"]:
         return format_error("Only the grant recipient may draw.")
+
+    if tip_view.clause_for(row["sender_pubkey"], GRANT_STREAM_INDEX) is None:
+        return format_error(
+            "The grant sender has published no grant clause.",
+            code="NO_GRANT_CLAUSE",
+        )
 
     if amount <= 0:
         return format_error("A draw must be positive.")

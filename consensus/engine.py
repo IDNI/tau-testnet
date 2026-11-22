@@ -56,10 +56,13 @@ from .payouts import (
     validate_payout_shape,
 )
 from .grants import (
+    GRANT_STREAM_INDEX,
     GRANT_TX_TYPES,
     TX_TYPE_GRANT_CREATE,
     TX_TYPE_GRANT_DRAW,
     GrantShapeError,
+    draw_approved,
+    grant_values,
     parse_grant_create,
     parse_grant_draw,
     validate_grant_shape,
@@ -2892,13 +2895,41 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             reason = "only the grant recipient may draw"
                         elif target_balances is None:
                             reason = "no balance overlay to draw into"
+                        elif lifecycle_mgr.rule_offers.clause_for(
+                                gstate.terms.sender, GRANT_STREAM_INDEX) is None:
+                            reason = "the sender has published no grant clause"
                         else:
-                            try:
-                                gbook.check_draw(
-                                    grant_id, amount,
-                                    ts=int(block_timestamp or 0))
-                            except GrantShapeError as exc:
-                                reason = f"draw refused ({exc})"
+                            # The sender's clause decides whether this
+                            # draw may happen, stepped with the draw's
+                            # facts on the payout evaluation path; the
+                            # book's own check then re-runs as the
+                            # guardrail, so a clause can narrow the
+                            # grant's conditions but never widen them.
+                            ts_now = int(block_timestamp or 0)
+                            remaining, drawn, group_drawn = gbook.draw_facts(
+                                grant_id, ts=ts_now)
+                            values = grant_values(
+                                {2: str(_read_bal(sender)), 5: str(ts_now)},
+                                gstate.terms,
+                                drawer=sender,
+                                requested=amount,
+                                remaining=remaining,
+                                drawn_in_period=drawn,
+                                group_drawn_in_period=group_drawn,
+                            )
+                            with tau_manager.tau_comm_lock:
+                                outputs = _session.evaluate(
+                                    values, multi=True,
+                                    apply_rules_update=False,
+                                )
+                            if not draw_approved(outputs):
+                                reason = "the grant clause refused the draw"
+                            else:
+                                try:
+                                    gbook.check_draw(
+                                        grant_id, amount, ts=ts_now)
+                                except GrantShapeError as exc:
+                                    reason = f"draw refused ({exc})"
                         if reason:
                             tx_receipt["logs"].append(f"Grant draw ignored: {reason}")
                             tx_receipt["reason"] = "grant_not_drawn"

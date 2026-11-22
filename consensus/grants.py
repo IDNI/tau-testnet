@@ -5,6 +5,24 @@ recipient's account: creating one debits the sender immediately into
 the entry, so the recipient's own balance is never capped and a
 refund never has to pull from a balance that may no longer hold it.
 
+Whether a draw may happen is decided by the sender's own Tau
+clause, not by this module: the sender publishes a clause on the
+grant stream (GRANT_STREAM_INDEX), and a draw steps it with the
+draw's facts -- the requested amount, the remaining grant, the
+amount already drawn in the current period, the declared caps and
+the time window -- on the same evaluation path payout executions
+use. The clause's verdict on o29 is the policy decision: 1 approves
+the draw for its full requested amount, anything else refuses it.
+CANONICAL_GRANT_CLAUSE below states the original grant conditions
+as such a clause, so a sender who publishes it gets exactly the
+semantics this book first shipped with; a sender may publish a
+stricter clause instead (extra conditions of their own), never a
+looser one, because the book re-checks its declared caps as a
+guardrail after the clause approves -- the same defence in depth
+payout executions keep. The book itself retains only accounting:
+the held balance, the period counters, the shared-cap sum and the
+refund sweep.
+
 Conditions attach to the grant and combine by AND:
 
 - a per-period spending cap on draws (the window is one week of
@@ -40,10 +58,68 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from consensus import periods
 from consensus.serialization import canonical_json
+from tau_manager import parse_tau_output as _parse_tau_output
 
 TX_TYPE_GRANT_CREATE = "grant_create"
 TX_TYPE_GRANT_DRAW = "grant_draw"
 GRANT_TX_TYPES = frozenset({TX_TYPE_GRANT_CREATE, TX_TYPE_GRANT_DRAW})
+
+#: Stream the sender's grant clause is registered on, and the
+#: output stream its draw verdict is read from -- the grant
+#: counterpart of the payout stream (24) and its leg outputs.
+GRANT_STREAM_INDEX = 29
+APPROVED_STREAM = 29
+
+#: The original grant conditions, stated as a Tau clause over the
+#: draw facts grant_values feeds: i5 block timestamp, i24 requested
+#: amount, i25 remaining, i26 drawn in the current period, i27 the
+#: grant's per-period cap, i28 opens_at, i29 deadline, i30 the cap
+#: group's drawn in the current period, i31 the group's cap (0 =
+#: no group). The verdict on o29 is 1 exactly when every condition
+#: holds: the window is open, the request fits the remainder, the
+#: per-period cap and -- for a grouped grant -- the shared cap.
+CANONICAL_GRANT_CLAUSE = (
+    "always ( (i5[t]:bv[64] >= i28[t]:bv[64]"
+    " && i5[t]:bv[64] < i29[t]:bv[64]"
+    " && i24[t]:bv[64] <= i25[t]:bv[64]"
+    " && i26[t]:bv[64] + i24[t]:bv[64] <= i27[t]:bv[64]"
+    " && (i31[t]:bv[64] = { #x0000000000000000 }:bv[64]"
+    " || i30[t]:bv[64] + i24[t]:bv[64] <= i31[t]:bv[64]))"
+    " ? (o29[t]:bv[64] = { #x0000000000000001 }:bv[64])"
+    " : (o29[t]:bv[64] = { #x0000000000000000 }:bv[64]) )."
+)
+
+
+def grant_values(base_values: Dict, terms: "GrantTerms", *,
+                 drawer: str, requested: int, remaining: int,
+                 drawn_in_period: int,
+                 group_drawn_in_period: int) -> Dict:
+    """The evaluation input map for a grant draw.
+
+    The sender's clause is stepped with the policy owner set to
+    the sender (i12) and the drawer on i3 -- the same discipline
+    as payout executions -- plus the draw facts on i24..i31.
+    """
+    values = dict(base_values)
+    values[3] = "{ #x" + str(drawer) + " }:bv[384]"
+    values[12] = "{ #x" + str(terms.sender) + " }:bv[384]"
+    values[24] = str(requested)
+    values[25] = str(remaining)
+    values[26] = str(drawn_in_period)
+    values[27] = str(terms.cap_per_period)
+    values[28] = str(terms.opens_at)
+    values[29] = str(terms.deadline)
+    values[30] = str(group_drawn_in_period)
+    values[31] = str(terms.cap_group_cap)
+    return values
+
+
+def draw_approved(outputs: Dict) -> bool:
+    """The clause's verdict: o29 parses to exactly 1."""
+    raw = outputs.get(APPROVED_STREAM)
+    if raw is None:
+        return False
+    return _parse_tau_output(raw) == 1
 
 MAX_GRANTS = 4096
 
@@ -243,6 +319,19 @@ class GrantBook:
                     and st.period_index == idx):
                 total += st.drawn_in_period
         return total
+
+    def draw_facts(self, grant_id: str, *, ts: int) -> Tuple[int, int, int]:
+        """(remaining, drawn in the current period, the cap group's
+        drawn in the current period) at `ts`, window-correct without
+        mutating the stored counters -- the facts a draw clause is
+        stepped with. A grant last rolled in an older window has
+        drawn nothing in this one."""
+        state = self._grants[grant_id]
+        idx = periods.period_index_at(
+            state.terms.opens_at, periods.PERIOD_WEEK, ts)
+        drawn = state.drawn_in_period if state.period_index == idx else 0
+        return (state.remaining, drawn,
+                self.group_drawn_in_period(state, ts=ts))
 
     def check_draw(self, grant_id: str, amount: int, *, ts: int) -> None:
         """The book's draw verdict: the grant's own conditions AND,

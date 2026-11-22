@@ -17,10 +17,16 @@ tau_manager (the seam consensus/engine.py steps through via
 tau_session.InProcessSession), and patches nothing on the Tau path.
 
 Honest scope, stated up front (also for the PR comment):
-  - Case 5's grant book is Python (consensus/grants.py); the native
-    run proves the full apply path — escrow, capped draws, the
-    shared cap, the deadline refund sweep — with the real engine
-    stepping every block's Tau outputs.
+  - Case 5's grant draws are decided by the sender's Tau clause:
+    the canonical grant clause (consensus/grants.py) is seeded into
+    the real interpreter's spec exactly as the payout clause is,
+    and every draw below is approved or refused by its real verdict
+    on o29 over the fed draw facts (window, remainder, period cap,
+    shared cap). The book's Python remains as accounting and as a
+    guardrail re-check. The native run proves the full apply path —
+    escrow, clause-decided capped draws, the shared cap, the
+    deadline refund sweep — with the real engine stepping every
+    block's Tau outputs.
   - Case 2: the owner's payout clause is a real Tau unit seeded into
     the real interpreter's spec, and the engine's payout seam reads
     its real outputs via consensus/payouts.py (legs_from_outputs).
@@ -104,7 +110,11 @@ import tau_manager
 from block import Block
 from consensus.engine import ActiveConsensusView, TauConsensusEngine
 from consensus.governance import ConsensusLifecycleManager
-from consensus.grants import parse_grant_create
+from consensus.grants import (
+    CANONICAL_GRANT_CLAUSE,
+    GRANT_STREAM_INDEX,
+    parse_grant_create,
+)
 from consensus.payouts import PAYOUT_STREAM_INDEX
 from consensus.state import TauStateSnapshot
 from consensus.tx_signing import signing_message_bytes
@@ -363,6 +373,17 @@ def _install_payout_clause(ch: Chain, clause: str):
     )
 
 
+def _install_grant_clause(ch: Chain, clause: str):
+    """Register ALICE's grant clause the same two ways as the
+    payout clause above: the rule_offers registry entry the apply
+    path looks up, and the clause unit in the interpreter's spec."""
+    ch.lm.rule_offers.accepted_clauses[(ALICE, GRANT_STREAM_INDEX)] = clause
+    tau_manager.communicate_with_tau(
+        rule_text=clause, target_output_stream_index=0,
+        apply_rules_update=True, source="native-grant-clause",
+    )
+
+
 # --- the named cases ---------------------------------------------------------
 
 # A real clause paying one leg of 5 to declared recipient index 0
@@ -438,6 +459,7 @@ def test_grant_5000_returns_3800_after_1200_drawn_native():
     is fee-free: the grantor's gain across the sweep block is the
     full 3,800 and the proposer's gain across it is zero."""
     ch = Chain({ALICE: 10_000, BOB: 0, CAROL: 0, PROPOSER: 0})
+    _install_grant_clause(ch, CANONICAL_GRANT_CLAUSE)
     create = create_tx()
     ch.block([create], height=20, ts=DEC1 - 60)
     assert ch.accepted(create), ch.receipt(create)
@@ -486,6 +508,7 @@ def test_grant_shared_cap_binds_across_grants_native():
     is refused (and pays nothing), her 100 draw lands — the full
     apply path with the real engine stepping every block."""
     ch = Chain({ALICE: 20_000, BOB: 0, CAROL: 0, PROPOSER: 0})
+    _install_grant_clause(ch, CANONICAL_GRANT_CLAUSE)
     group = {"cap_group": "team-budget", "cap_group_cap": 600}
     c1 = create_tx(seq=0, total=5000, cap=500, extra=group)
     ch.block([c1], height=20, ts=DEC1 - 60)
