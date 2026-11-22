@@ -17,6 +17,7 @@ through the same code when the native bindings are usable, and skips
 otherwise.
 """
 import json
+import os
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -343,3 +344,101 @@ def test_native_receipt_projects_to_rule_outcome():
     assert second["revision_taken"] == "F"
     assert second["spec_revision_before"] == first["spec_revision_after"]
     assert second["spec_revision_after"] > second["spec_revision_before"]
+
+
+# --- the worker session's receipt (the live block-apply path) -----------------
+#
+# Block application drives rules through a WorkerSession, whose receipt is
+# built by the speculation worker in its own process. That receipt used to
+# carry the outcome and the o0 verdict but NOT the revision counters (it
+# exposed only the post-step `spec_revision` from its state observation),
+# so on live nodes the projection above recorded null before/after while
+# the in-process path -- the one the tests up to here exercise -- populated
+# them. The worker now reports `spec_revision_before` / `spec_revision_after`
+# bracketing the revise call, under the same names as the in-process
+# receipt. The first test below runs the real worker; the second pins the
+# WorkerSession-side contract with a faithful stand-in for its receipt, so
+# the regression is covered even where the native bindings are unavailable.
+
+
+def _router_spec():
+    genesis = (REPO_ROOT / "genesis.tau").read_text(encoding="utf-8")
+    return f"always ( {genesis.strip()} )."
+
+
+@pytest.mark.skipif(
+    not _native_available(), reason="native tau bindings unavailable"
+)
+def test_worker_session_receipt_carries_revision_counters():
+    """Through a real WorkerSession (the live apply path): the displacement
+    probe's two rule steps record populated, chaining revision counters --
+    install 0 -> 1, displacement 1 -> 2 -- with the o0 verdict 'F'."""
+    import tau_session
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    session = tau_session.WorkerSession.spawn(
+        _router_spec(), cwd=str(REPO_ROOT), env=env
+    )
+    try:
+        assert session.apply_rule(RULE_INSTALL) == "ok"
+        first = _rule_outcome_from_receipt(session.last_receipt())
+        assert first["outcome"] == "ACCEPTED_CHANGED"
+        assert first["revision_taken"] == "F"
+        assert first["spec_revision_before"] == 0
+        assert first["spec_revision_after"] == 1
+
+        assert session.apply_rule(RULE_DISPLACE) == "ok"
+        second = _rule_outcome_from_receipt(session.last_receipt())
+        assert second["outcome"] == "ACCEPTED_CHANGED"
+        assert second["revision_taken"] == "F"
+        assert second["spec_revision_before"] == first["spec_revision_after"]
+        assert second["spec_revision_after"] == 2
+    finally:
+        session.dispose()
+
+
+def test_worker_session_passes_the_workers_counters_through():
+    """A faithful stand-in for the speculation worker's receipt, driven
+    through a real WorkerSession: last_receipt() must hand the projection
+    the worker's own before/after pair for the step, not a later read."""
+    import tau_session
+    from tau_speculation import RevisionReceipt
+
+    worker_receipt = RevisionReceipt({
+        "ok": True,
+        "outcome": "ACCEPTED_CHANGED",
+        "candidate_id": "apply",
+        "consumed": True,
+        "asked": ["i0"],
+        "outputs": {"o0": "F"},
+        "filler_steps": [],
+        "diagnostics": "",
+        "report": {"errors": [], "warnings": [], "codes": [],
+                   "has_error": False, "awaiting_input": False},
+        "deferred_diagnostics": "",
+        "capture_complete": True,
+        "binding_id": "fake",
+        "spec_revision_before": 7,
+        "spec_revision_after": 8,
+        "time_point": 0,
+        "spec_revision": 8,
+    })
+
+    class _FakeSpec:
+        def revise(self, candidate, candidate_id="", *, timeout=None):
+            return worker_receipt
+
+        def step(self, inputs, *, timeout=None):
+            return {"ok": True, "outputs": {}}
+
+        def kill(self):
+            pass
+
+    session = tau_session.WorkerSession(_FakeSpec())
+    assert session.apply_rule(RULE_INSTALL) == "ok"
+    outcome = _rule_outcome_from_receipt(session.last_receipt())
+    assert outcome["spec_revision_before"] == 7
+    assert outcome["spec_revision_after"] == 8
+    assert outcome["revision_taken"] == "F"
+    assert outcome["outcome"] == "ACCEPTED_CHANGED"
