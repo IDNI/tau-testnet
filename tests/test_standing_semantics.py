@@ -120,7 +120,7 @@ def test_one_execution_per_period():
     book = _book()
     sid = _terms().standing_id
     period, amount = book.settle(sid, ANCHOR + 3600)
-    assert (period, amount) == (0, 1000)
+    assert (period, amount) == ((0,), 1000)
     # The same period can never be due or settled again.
     assert book.due_period(sid, ANCHOR + 3600) is None
     with pytest.raises(ValueError):
@@ -128,7 +128,10 @@ def test_one_execution_per_period():
 
 
 def test_missed_periods_are_skipped_with_no_catch_up():
-    assert SEMANTICS["missed_periods"] == "skipped_no_catch_up"
+    # The declared default: without a signed catch_up_limit in the
+    # terms, a missed period is skipped (the opt-in itself is pinned
+    # by tests/test_standing_catchup.py).
+    assert SEMANTICS["missed_periods"] == "skipped_unless_signed_catch_up"
     book = _book()
     sid = _terms().standing_id
     # Period 0's window passes unsettled. Inside period 1's window the
@@ -136,7 +139,7 @@ def test_missed_periods_are_skipped_with_no_catch_up():
     p1_start = period_start(ANCHOR, PERIOD_MONTH, 1)
     assert book.due_period(sid, p1_start + 60) == 1
     period, _amount = book.settle(sid, p1_start + 60)
-    assert period == 1
+    assert period == (1,)
     assert book.paid_for_period(sid, 1)
     assert not book.paid_for_period(sid, 0)
 

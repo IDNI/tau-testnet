@@ -482,6 +482,7 @@ def init_db():
                     end_value           INTEGER NOT NULL,
                     sequence_number     INTEGER NOT NULL,
                     supersedes_id       TEXT,
+                    catch_up_limit      INTEGER NOT NULL DEFAULT 0,
                     executed_count      INTEGER NOT NULL,
                     total_executed      INTEGER NOT NULL,
                     settled_periods     TEXT NOT NULL,
@@ -2634,9 +2635,10 @@ def _write_standing_rows(state: Dict) -> None:
             'INSERT INTO standing_payments_v1 '
             '(standing_id, payer_pubkey, recipient_pubkey, amount, period_kind, '
             'anchor_timestamp, window_start_offset, window_end_offset, end_kind, '
-            'end_value, sequence_number, supersedes_id, executed_count, '
-            'total_executed, settled_periods, last_executed_period) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'end_value, sequence_number, supersedes_id, catch_up_limit, '
+            'executed_count, total_executed, settled_periods, '
+            'last_executed_period) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (
                 row['standing_id'],
                 row['payer_pubkey'],
@@ -2650,6 +2652,7 @@ def _write_standing_rows(state: Dict) -> None:
                 int(row['end_value']),
                 int(row['sequence_number']),
                 row.get('supersedes_id'),
+                int(row.get('catch_up_limit', 0)),
                 int(row['executed_count']),
                 int(row['total_executed']),
                 json.dumps([int(x) for x in row['settled_periods']]),
@@ -2674,8 +2677,9 @@ def load_standing_state() -> tuple[List[Dict], int, bytes]:
             'SELECT standing_id, payer_pubkey, recipient_pubkey, amount, '
             'period_kind, anchor_timestamp, window_start_offset, '
             'window_end_offset, end_kind, end_value, sequence_number, '
-            'supersedes_id, executed_count, total_executed, settled_periods, '
-            'last_executed_period FROM standing_payments_v1 ORDER BY standing_id'
+            'supersedes_id, catch_up_limit, executed_count, total_executed, '
+            'settled_periods, last_executed_period '
+            'FROM standing_payments_v1 ORDER BY standing_id'
         ).fetchall()
         raw = _db_conn.execute(
             "SELECT value FROM chain_state WHERE key = 'standing_resolved'"
@@ -2688,8 +2692,8 @@ def load_standing_state() -> tuple[List[Dict], int, bytes]:
         'standing_id', 'payer_pubkey', 'recipient_pubkey', 'amount',
         'period_kind', 'anchor_timestamp', 'window_start_offset',
         'window_end_offset', 'end_kind', 'end_value', 'sequence_number',
-        'supersedes_id', 'executed_count', 'total_executed', 'settled_periods',
-        'last_executed_period',
+        'supersedes_id', 'catch_up_limit', 'executed_count', 'total_executed',
+        'settled_periods', 'last_executed_period',
     )
     out = []
     for r in rows:

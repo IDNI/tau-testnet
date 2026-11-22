@@ -802,6 +802,7 @@ def _encode_standing_terms(
     end_value: int,
     sequence_number: int,
     supersedes: Any,
+    catch_up_limit: int,
 ) -> None:
     out.extend(encode_pubkey48(payer_pubkey))
     out.extend(encode_pubkey48(recipient_pubkey))
@@ -815,6 +816,7 @@ def _encode_standing_terms(
     out.extend(encode_uint64(int(sequence_number)))
     out.extend(bytes([1 if supersedes else 0]))
     out.extend(encode_hash32(supersedes if supersedes else bytes(32)))
+    out.extend(encode_uint64(int(catch_up_limit)))
 
 
 def compute_standing_id(
@@ -829,6 +831,7 @@ def compute_standing_id(
     end_value: int,
     sequence_number: int,
     supersedes: Any,
+    catch_up_limit: int,
 ) -> bytes:
     """BLAKE3 of the canonical signed authorization terms. Returns 32 bytes.
 
@@ -850,6 +853,7 @@ def compute_standing_id(
         end_value,
         sequence_number,
         supersedes,
+        catch_up_limit,
     )
     return blake3(bytes(out)).digest()
 
@@ -877,6 +881,7 @@ def encode_standing_entry(
     end_value: int,
     sequence_number: int,
     supersedes: Any,
+    catch_up_limit: int,
     executed_count: int,
     total_executed: int,
     settled_periods: Any,
@@ -902,6 +907,7 @@ def encode_standing_entry(
         end_value,
         sequence_number,
         supersedes,
+        catch_up_limit,
     )
     out.extend(encode_uint64(int(executed_count)))
     out.extend(encode_uint64(int(total_executed)))

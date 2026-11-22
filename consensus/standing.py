@@ -14,8 +14,12 @@ decides *whether an occurrence is due and unsettled* and records that it
 settled. An execution that fails in the engine (insufficient funds,
 current policy refusal) simply never calls :meth:`StandingBook.settle`,
 so the occurrence marker does not advance and the occurrence stays due
-until its window closes -- after which it lapses, unsettled, forever
-(no catch-up).
+until its window closes -- after which it lapses, unsettled. Lapsed
+occurrences are skipped by default, exactly the safe default issue #34
+recommends. The one extension the issue allows is opt-in and signed:
+``catch_up_limit`` in the terms lets a single execution also settle up
+to that many lapsed occurrences (oldest first, never past the end
+condition); at the default 0 nothing changes.
 
 Design rules that are consensus-visible and therefore live here:
 
@@ -70,6 +74,12 @@ class StandingShapeError(ValueError):
 MAX_OPEN_STANDING_PER_PAYER = 16
 MAX_OPEN_STANDING_TOTAL = 4096
 
+# Protocol cap on the signed catch-up allowance: one execution may
+# collect at most this many lapsed occurrences on top of the due one
+# (a year of monthly periods). The signed value may be lower, never
+# higher; 0 keeps the issue's recommended default (skip lapsed).
+MAX_CATCH_UP_LIMIT = 12
+
 OUTCOME_CANCELLED = 1
 OUTCOME_SUPERSEDED = 2
 OUTCOME_COMPLETED = 3
@@ -106,6 +116,10 @@ class StandingTerms:
     end_value: int  # final period index | occurrence cap | total cap
     sequence_number: int = 0
     supersedes: Optional[bytes] = None
+    # Signed opt-in: how many lapsed occurrences one execution may
+    # additionally settle. Part of the identity preimage -- an executor
+    # can never claim a catch-up the payer did not sign for.
+    catch_up_limit: int = 0
 
     @property
     def standing_id(self) -> bytes:
@@ -121,6 +135,7 @@ class StandingTerms:
             self.end_value,
             self.sequence_number,
             self.supersedes,
+            self.catch_up_limit,
         )
 
 
@@ -144,6 +159,8 @@ def validate_terms(terms: StandingTerms, max_transfer_value: int) -> None:
         raise ValueError("end condition value must be positive")
     if terms.end_kind == END_MAX_TOTAL and terms.end_value < terms.amount:
         raise ValueError("max_total below one occurrence amount")
+    if not (0 <= terms.catch_up_limit <= MAX_CATCH_UP_LIMIT):
+        raise ValueError("catch_up_limit out of range")
     # The window must fit inside the first and the last possible period.
     window_bounds(terms.anchor_ts, terms.kind, 0, terms.window_start_offset, terms.window_end_offset)
     if terms.end_kind == END_FINAL_PERIOD:
@@ -244,6 +261,8 @@ class StandingBook:
                 supersedes=(
                     bytes.fromhex(row["supersedes_id"]) if row.get("supersedes_id") else None
                 ),
+                # Rows written before the field existed mean the default.
+                catch_up_limit=row.get("catch_up_limit", 0),
             )
             sid = terms.standing_id
             if sid.hex() != row["standing_id"]:
@@ -288,6 +307,7 @@ class StandingBook:
                     t.end_value,
                     t.sequence_number,
                     t.supersedes,
+                    t.catch_up_limit,
                     rec.executed_count,
                     rec.total_executed,
                     tuple(sorted(rec.settled_periods)),
@@ -342,7 +362,9 @@ class StandingBook:
         Due means: ``ts`` is inside that period's signed execution
         window, the period has not settled, and no end condition has
         been reached. A period whose window has passed is lapsed and
-        never becomes due again (no catch-up).
+        never becomes due again on its own; it can only be collected
+        as catch-up riding on a later due execution (see
+        :meth:`due_periods`), and only when the signed terms allow it.
         """
         rec = self.open.get(standing_id)
         if rec is None or rec.end_reached():
@@ -358,6 +380,45 @@ class StandingBook:
         ):
             return None
         return index
+
+    def due_periods(self, standing_id: bytes, ts: int) -> list:
+        """Every period one execution at ``ts`` settles, oldest first.
+
+        Empty when nothing is due. Otherwise the candidates are the
+        lapsed (window closed, unsettled) periods -- at most the
+        signed ``catch_up_limit`` oldest of them -- followed by the
+        currently due period (:meth:`due_period`). Each candidate is
+        admitted under the same rule a single execution has always
+        used: it settles only while the end condition is still
+        unreached, so the occurrence cap is a hard bound and the
+        total cap stops at the same place it does today. When
+        catch-up alone exhausts the end condition, the authorization
+        completes on the lapsed periods and the due period is left
+        out. Pure function of the record and ``ts``, so admission,
+        apply and wallets all compute the same list.
+        """
+        current = self.due_period(standing_id, ts)
+        if current is None:
+            return []
+        rec = self.open[standing_id]
+        t = rec.terms
+        lapsed = [
+            index
+            for index in range(current)
+            if index not in rec.settled_periods
+        ][: t.catch_up_limit]
+        chosen: list = []
+        count = rec.executed_count
+        total = rec.total_executed
+        for index in lapsed + [current]:
+            if t.end_kind == END_MAX_OCCURRENCES and count >= t.end_value:
+                break
+            if t.end_kind == END_MAX_TOTAL and total >= t.end_value:
+                break
+            chosen.append(index)
+            count += 1
+            total += t.amount
+        return chosen
 
     # -- admission -------------------------------------------------------
     def can_admit_create(self, terms: StandingTerms, max_transfer_value: int) -> bool:
@@ -406,25 +467,28 @@ class StandingBook:
             raise ValueError("only the payer can cancel")
         self._close(standing_id, OUTCOME_CANCELLED)
 
-    def settle(self, standing_id: bytes, ts: int) -> Tuple[int, int]:
-        """Record one due occurrence as settled. Returns (period, amount).
+    def settle(self, standing_id: bytes, ts: int) -> Tuple[Tuple[int, ...], int]:
+        """Record one execution as settled. Returns (periods, total).
 
-        Call only after the engine has moved the money; the book is the
-        record, not the mover. Raises when nothing is due, which is what
-        makes a second execution in the same period impossible.
+        ``periods`` is :meth:`due_periods` at ``ts``: the due period
+        plus any signed catch-up periods it collected. Call only after
+        the engine has moved ``total``; the book is the record, not
+        the mover. Raises when nothing is due, which is what makes a
+        second execution in the same period impossible.
         """
-        period = self.due_period(standing_id, ts)
-        if period is None:
+        periods = self.due_periods(standing_id, ts)
+        if not periods:
             raise ValueError("no occurrence is due")
         rec = self.open[standing_id]
-        rec.settled_periods.add(period)
-        rec.executed_count += 1
-        rec.total_executed += rec.terms.amount
-        rec.last_executed_period = period
-        amount = rec.terms.amount
+        for period in periods:
+            rec.settled_periods.add(period)
+            rec.executed_count += 1
+            rec.total_executed += rec.terms.amount
+        rec.last_executed_period = periods[-1]
+        total = rec.terms.amount * len(periods)
         if rec.end_reached():
             self._close(standing_id, OUTCOME_COMPLETED)
-        return (period, amount)
+        return (tuple(periods), total)
 
 
 # --- Parsing -----------------------------------------------------------------
@@ -499,6 +563,9 @@ def parse_standing_create(tx: Dict[str, Any]) -> StandingTerms:
     supersedes = None
     if tx.get("supersedes_id") is not None:
         supersedes = _id_field(tx, "supersedes_id")
+    catch_up_limit = 0
+    if tx.get("catch_up_limit") is not None:
+        catch_up_limit = _u64_field(tx, "catch_up_limit")
     return StandingTerms(
         payer=payer,
         recipient=recipient,
@@ -511,6 +578,7 @@ def parse_standing_create(tx: Dict[str, Any]) -> StandingTerms:
         end_value=int(end_raw),
         sequence_number=sequence,
         supersedes=supersedes,
+        catch_up_limit=catch_up_limit,
     )
 
 
@@ -576,6 +644,7 @@ def _standing_row(rec: "StandingRecord") -> Dict[str, Any]:
         "end_value": t.end_value,
         "sequence_number": t.sequence_number,
         "supersedes_id": t.supersedes.hex() if t.supersedes else None,
+        "catch_up_limit": t.catch_up_limit,
         "executed_count": rec.executed_count,
         "total_executed": rec.total_executed,
         "settled_periods": sorted(rec.settled_periods),

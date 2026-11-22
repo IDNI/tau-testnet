@@ -2698,13 +2698,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             reason = f"invalid standing execution ({exc})"
                         else:
                             record = book.get(request.standing_id)
+                            due_now = (
+                                book.due_periods(
+                                    request.standing_id, int(block_timestamp or 0)
+                                )
+                                if record is not None
+                                else []
+                            )
                             if record is None:
                                 reason = "unknown standing authorization"
                             elif target_balances is None:
                                 reason = "no balance overlay to execute from"
-                            elif book.due_period(
-                                request.standing_id, int(block_timestamp or 0)
-                            ) is None:
+                            elif not due_now:
                                 reason = "no occurrence is due"
                             else:
                                 reason = None
@@ -2725,7 +2730,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             moved = _execute_fee_era_transfer(
                                 record.terms.payer,
                                 record.terms.recipient,
-                                record.terms.amount,
+                                record.terms.amount * len(due_now),
                                 slot_values=_approval_slot_values(),
                                 overrides={},
                             )

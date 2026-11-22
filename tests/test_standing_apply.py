@@ -424,3 +424,32 @@ def test_execution_moves_only_the_payers_clock_never_the_executors():
     assert ch.book.paid_for_period(sid_c, 0)
     assert ch.bal[BOB] == 1_050
     assert ch.bal[CAROL] == 100 - 50
+
+
+def test_catch_up_execution_moves_the_lapsed_amounts_in_one_transfer():
+    ch = Chain(_balances())
+    tx = create_tx(extra={"catch_up_limit": 2})
+    ch.block([tx], height=20, ts=BEFORE)
+    assert ch.accepted(tx)
+    sid = parse_standing_create(tx).standing_id
+    assert ch.book.get(sid).terms.catch_up_limit == 2
+    # The January and February windows pass with no execution; the
+    # March execution collects both lapsed periods plus its own.
+    ex = execute_tx(sid.hex())
+    ch.block([ex], height=21, ts=_ts(2026, 3, 31, 12))
+    assert ch.accepted(ex)
+    assert ch.bal[ALICE] == 7_000
+    assert ch.bal[BOB] == 3_000
+    for period in (0, 1, 2):
+        assert ch.book.paid_for_period(sid, period)
+
+
+def test_late_execution_without_catch_up_moves_one_amount_only():
+    ch, sid = _created_chain()
+    ex = execute_tx(sid.hex())
+    ch.block([ex], height=21, ts=_ts(2026, 3, 31, 12))
+    assert ch.accepted(ex)
+    assert ch.bal[BOB] == 1_000
+    assert not ch.book.paid_for_period(sid, 0)
+    assert not ch.book.paid_for_period(sid, 1)
+    assert ch.book.paid_for_period(sid, 2)

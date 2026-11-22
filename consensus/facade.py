@@ -477,8 +477,9 @@ class TipAdmissionView:
                     "SELECT payer_pubkey, recipient_pubkey, amount, period_kind, "
                     "anchor_timestamp, window_start_offset, window_end_offset, "
                     "end_kind, end_value, sequence_number, supersedes_id, "
-                    "executed_count, total_executed, settled_periods, "
-                    "last_executed_period FROM standing_payments_v1 "
+                    "catch_up_limit, executed_count, total_executed, "
+                    "settled_periods, last_executed_period "
+                    "FROM standing_payments_v1 "
                     "WHERE standing_id = ?",
                     (bytes(standing_id).hex(),),
                 ).fetchone()
@@ -499,10 +500,11 @@ class TipAdmissionView:
             "end_value": int(row[8]),
             "sequence_number": int(row[9]),
             "supersedes_id": row[10],
-            "executed_count": int(row[11]),
-            "total_executed": int(row[12]),
-            "settled_periods": json.loads(row[13]),
-            "last_executed_period": int(row[14]),
+            "catch_up_limit": int(row[11]),
+            "executed_count": int(row[12]),
+            "total_executed": int(row[13]),
+            "settled_periods": json.loads(row[14]),
+            "last_executed_period": int(row[15]),
         }
 
     def standings_for(self, pubkey: str) -> list:

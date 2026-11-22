@@ -19,6 +19,7 @@ from consensus.standing import (
     END_FINAL_PERIOD,
     END_MAX_OCCURRENCES,
     END_MAX_TOTAL,
+    MAX_CATCH_UP_LIMIT,
     MAX_HORIZON_SECONDS,
     MAX_OPEN_STANDING_PER_PAYER,
     MAX_OPEN_STANDING_TOTAL,
@@ -41,7 +42,7 @@ SEMANTICS = {
     "period_kinds": ["day", "week", "month"],
     "month_end": "clamped_to_last_day_of_month",
     "executions_per_period": 1,
-    "missed_periods": "skipped_no_catch_up",
+    "missed_periods": "skipped_unless_signed_catch_up",
     "end_condition": "exactly_one_of_three_required",
     "end_conditions": ["final_period", "max_occurrences", "max_total"],
     "executor": "anyone",
@@ -53,6 +54,7 @@ SEMANTICS = {
         "max_open_per_payer": MAX_OPEN_STANDING_PER_PAYER,
         "max_open_total": MAX_OPEN_STANDING_TOTAL,
         "max_horizon_seconds": MAX_HORIZON_SECONDS,
+        "max_catch_up_per_execution": MAX_CATCH_UP_LIMIT,
     },
 }
 
@@ -72,6 +74,7 @@ def _record_from_row(row: dict) -> StandingRecord:
         supersedes=(
             bytes.fromhex(row["supersedes_id"]) if row.get("supersedes_id") else None
         ),
+        catch_up_limit=row.get("catch_up_limit", 0),
     )
     return StandingRecord(
         terms=terms,
@@ -99,6 +102,7 @@ def entry_view(row: dict, tip_ts: int) -> dict:
         "end_condition": {
             _END_NAMES.get(row["end_kind"], row["end_kind"]): row["end_value"]
         },
+        "catch_up_limit": row.get("catch_up_limit", 0),
         "status": "active",
         "executed_count": row["executed_count"],
         "total_executed": row["total_executed"],

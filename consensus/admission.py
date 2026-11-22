@@ -1670,6 +1670,7 @@ def _standing_record_from_row(row: Dict) -> StandingRecord:
         supersedes=(
             bytes.fromhex(row["supersedes_id"]) if row.get("supersedes_id") else None
         ),
+        catch_up_limit=row.get("catch_up_limit", 0),
     )
     return StandingRecord(
         terms=terms,

@@ -59,13 +59,13 @@ def test_monthly_authorization_executes_at_most_once_per_period():
     sid = terms.standing_id
     # January window: Jan 31 12:00 .. Feb 1 12:00.
     assert book.due_period(sid, ts(2026, 1, 31, 13)) == 0
-    assert book.settle(sid, ts(2026, 1, 31, 13)) == (0, 1000)
+    assert book.settle(sid, ts(2026, 1, 31, 13)) == ((0,), 1000)
     # A second execution in the same period finds nothing due.
     with pytest.raises(ValueError):
         book.settle(sid, ts(2026, 1, 31, 14))
     # February's period becomes due in its own window (Feb 28, clamped).
     assert book.due_period(sid, ts(2026, 2, 28, 12)) == 1
-    assert book.settle(sid, ts(2026, 2, 28, 12)) == (1, 1000)
+    assert book.settle(sid, ts(2026, 2, 28, 12)) == ((1,), 1000)
 
 
 def test_monthly_on_31st_runs_on_last_day_of_short_month():
@@ -124,7 +124,7 @@ def test_unsettled_occurrence_stays_due_in_window_then_lapses_no_catchup():
     # ...lapses when the window closes, and never comes back: February's
     # window offers period 1 only, not a double collection.
     assert book.due_period(sid, ts(2026, 2, 28, 12)) == 1
-    assert book.settle(sid, ts(2026, 2, 28, 12)) == (1, 1000)
+    assert book.settle(sid, ts(2026, 2, 28, 12)) == ((1,), 1000)
     rec = book.get(sid)
     assert rec.executed_count == 1
     assert rec.total_executed == 1000
@@ -168,7 +168,7 @@ def test_update_supersedes_and_old_terms_cannot_execute():
     assert book.get(v1.standing_id) is None
     with pytest.raises(ValueError):
         book.settle(v1.standing_id, ts(2026, 1, 31, 12))
-    assert book.settle(v2.standing_id, ts(2026, 1, 31, 12)) == (0, 2000)
+    assert book.settle(v2.standing_id, ts(2026, 1, 31, 12)) == ((0,), 2000)
 
 
 def test_paid_for_period_fact():
