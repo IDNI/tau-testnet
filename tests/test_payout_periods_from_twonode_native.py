@@ -55,6 +55,17 @@ re-anchors. Both nodes checkpoint after every step (height, head hash,
 state hash, balances, sequences, the payout book's period totals and
 settlement list) and the parent asserts the two streams are identical,
 plus the case's numbers on the stream itself.
+
+Installation is the one deliberate shortcut, stated plainly: both
+children install the identical entry with the book's own install call
+at boot — the single-node native suite's idiom for this book — rather
+than through an install transaction (that path is covered by the
+admission and mock suites). The case's numbers require it: an install
+transaction charges the grant account its own install fee (measured
+10 in this suite's first CI run), after which the account holds 4,990
+and the remainder is 3,490, not the case's exact 3,500. With the book
+install the account holds exactly 5,000, and every number below is
+the official one, to the unit.
 """
 import json
 import os
@@ -187,10 +198,11 @@ def main():
     import db
     import tau_manager
     import tau_native
-    from bls_keys import SK_CAROL, SK_MALLORY, sign_payload
+    from bls_keys import SK_CAROL, sign_payload
     from block import Block
     import block as block_mod
     from commands import createblock, sendtx
+    from consensus.payout_rules import FORM_TAU_RULE, PayoutRuleEntry
 
     RECIPIENTS = sorted([BOB, FUNDER])
     CLAUSE = grant_clause(RECIPIENTS.index(BOB), RECIPIENTS.index(FUNDER))
@@ -408,26 +420,6 @@ def main():
         entry = chain_state._lifecycle_manager.payout_rules.get(OWNER)
         return entry.rule_id.hex()
 
-    def install_tx():
-        return sign_payload({
-            "tx_id": "fix1a-install",
-            "tx_type": "install_payout_rule",
-            "sender_pubkey": OWNER,
-            "sequence_number": chain_state.get_sequence_number(OWNER),
-            "expiration_time": TX_EXPIRY,
-            "expire_at_height": 5000,
-            "fee_limit": "1000",
-            "payout_recipients": RECIPIENTS,
-            "payout_form": 2,
-            "payout_clause": CLAUSE,
-            "payout_max_per_execution": 3500,
-            "payout_max_per_period": 3500,
-            "payout_period_seconds": WEEK,
-            "payout_period_anchor_ts": INSTALL_TS,
-            "payout_periods_from_ts": T0,
-            "payout_version": 1,
-        }, SK_MALLORY)
-
     def execute_tx(tx_id, sid_hex, base):
         return sign_payload({
             "tx_id": tx_id,
@@ -442,21 +434,27 @@ def main():
             "payout_base_amount": base,
         }, SK_CAROL)
 
+    # --- Shared: the identical entry, installed with the book's own
+    # install call on BOTH children (see the module docstring for why
+    # not an install transaction: the case's exact numbers). The
+    # install's recorded moment is anchor + 2 weeks + 3 days —
+    # mid-week-2 of the anchored grid, week 0 of the install grid.
+    checkpoint("boot")
+    entry = PayoutRuleEntry(
+        owner_pubkey=OWNER, recipients=tuple(RECIPIENTS), legs=(),
+        max_per_execution=3500, max_per_period=3500,
+        period_seconds=WEEK, period_anchor_ts=INSTALL_TS, version=1,
+        form=FORM_TAU_RULE, clause_text=CLAUSE, periods_from_ts=T0,
+    )
+    chain_state._lifecycle_manager.payout_rules.install(entry, INSTALL_TS)
+    checkpoint("install")
+
     if ROLE == "proposer":
         events = []
 
         def emit(label, candidate):
             events.append({"op": "block", "label": label,
                            "block": candidate.to_dict()})
-
-        checkpoint("boot")
-
-        # The install lands at anchor + 2 weeks + 3 days: mid-week-2 of
-        # the anchored grid, week 0 of the install grid.
-        tx = queue_and_fetch(install_tx(), "install")
-        candidate = produce("install", [tx], INSTALL_TS)
-        emit("install", candidate)
-        checkpoint("install")
 
         # Draw 1 in anchored week 2.
         tx = queue_and_fetch(execute_tx("fix1a-draw-1", "11" * 32, 500), "draw1")
@@ -509,7 +507,6 @@ def main():
     else:
         with open(EVENTS_PATH) as fh:
             events = json.load(fh)["events"]
-        checkpoint("boot")
         for ev in events:
             if ev["op"] != "block":
                 raise RuntimeError("unknown op " + ev["op"])
@@ -592,9 +589,9 @@ def test_case5_tau_form_periods_from_two_node_parity(tmp_path):
         if label != "draw1b":
             assert prop["ingest"][label], f"block {label} not ingested"
 
-    # Admission on the proposer accepted the install, all three draws
-    # and the refund through the real sendtx path.
-    for label in ("install", "draw1", "draw2", "draw3", "refund"):
+    # Admission on the proposer accepted all three draws and the
+    # refund through the real sendtx path.
+    for label in ("draw1", "draw2", "draw3", "refund"):
         assert prop["admissions"][label]["ok"] is True, (
             f"{label} admission: {prop['admissions'][label]}")
 
@@ -605,8 +602,7 @@ def test_case5_tau_form_periods_from_two_node_parity(tmp_path):
         assert prop["verdicts"][label] == foll["verdicts"][label], (
             f"verdict {label} diverges:\nproposer={prop['verdicts'][label]}"
             f"\nfollower={foll['verdicts'][label]}")
-    for label, tx_id in (("install", "fix1a-install"),
-                         ("draw1", "fix1a-draw-1"),
+    for label, tx_id in (("draw1", "fix1a-draw-1"),
                          ("draw2", "fix1a-draw-2"),
                          ("draw3", "fix1a-draw-3"),
                          ("refund", "fix1a-refund")):
