@@ -221,7 +221,15 @@ class _Session:
                     "filler_steps": filler, "diagnostics": _diag(cap.text, *reps),
                     "report": _report_summary(*reps),
                     "deferred_diagnostics": "", "capture_complete": cap.complete,
-                    "binding_id": self.binding_id, **self.observe(),
+                    "binding_id": self.binding_id,
+                    # The revision counters bracketing THIS revise call, under
+                    # the same names the in-process receipt uses
+                    # (tau_native._build_revision_receipt): measured here, in
+                    # the worker that ran the step -- a later read on the node
+                    # side could belong to a different step entirely.
+                    "spec_revision_before": before,
+                    "spec_revision_after": self.itp.spec_revision,
+                    **self.observe(),
                 }
 
         named, asked, cap, reps = self._one_step({"i0": candidate})
@@ -256,6 +264,15 @@ class _Session:
             "deferred_diagnostics": drain.text,
             "capture_complete": bool(cap.complete and drain.complete),
             "binding_id": self.binding_id,
+            # The revision counters bracketing THIS revise call, under the
+            # same names the in-process receipt uses
+            # (tau_native._build_revision_receipt): `before` was read before
+            # any step of this call, the after value is read now that the
+            # delivery step (and its drain) has run -- both here, in the
+            # worker that ran the step, so the pair always names this
+            # revision and no other.
+            "spec_revision_before": before,
+            "spec_revision_after": self.itp.spec_revision,
             **self.observe(),
         }
 
