@@ -1,0 +1,90 @@
+# Bounty CI — fork-level test runs for the two IDNI bounty branches.
+#
+# Why this file exists: upstream IDNI/tau-testnet has its own ci.yml, but
+# GitHub does not run it on pull requests opened from forks without a
+# maintainer approving the run (0 check-runs observed on PR #126 / #135).
+# This workflow lives on OUR fork (etoneretoner-cmd/tau-testnet), so its
+# runs need no one's approval: every push to a bounty branch produces a
+# public, linkable test run for that branch's bounty test files.
+#
+# Scope, deliberately narrow (mirrors upstream's "Unit tests (mock Tau)"
+# job): Python 3.14, mock Tau engine, NO native tau bindings. Tests that
+# need the real engine skip themselves and are reported as skipped --
+# they are covered locally, not here. The full upstream suite is not
+# re-run; only the bounty files, their wiring neighbours, and a small
+# core smoke set. Typical wall time: a few minutes.
+name: bounty-ci
+
+on:
+  push:
+    branches:
+      - bounty/recipient-controls
+      - bounty/active-rules-m1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bounty-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Bounty tests (mock Tau)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Cache coincurve wheel
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/coincurve-wheels
+          key: coincurve-${{ runner.os }}-${{ runner.arch }}-py3.14-${{ hashFiles('scripts/install_coincurve.sh') }}
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config libgmp-dev libffi-dev
+
+      - name: Install coincurve (no cp314 wheel)
+        run: ./scripts/install_coincurve.sh
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Generate genesis artifact (data/ is gitignored)
+        run: |
+          python scripts/generate_miner_keys.py
+          python scripts/gen_genesis.py --validator-privkey "$(cat test_miner.key)" --out data/genesis.json
+          mv test_miner.key test_miner.pub data/
+          mkdir -p data_local && cp data/test_miner.key data/test_miner.pub data_local/
+
+      - name: Run the bounty test files for this branch
+        run: |
+          case "${{ github.ref_name }}" in
+            bounty/recipient-controls)
+              # Bounty 03 (PR #126): the recipient-policy files, the wiring
+              # neighbours the branch touches (checktx, retractable parks,
+              # sendtx preflight), and a core smoke file.
+              FILES="tests/test_recipient_policy.py tests/test_recipient_policy_native.py tests/test_recipient_hold_native.py tests/test_checktx.py tests/test_retractable_admission.py tests/test_retractable_rpc.py tests/test_sendtx_preflight_wiring.py tests/test_block.py"
+              ;;
+            bounty/active-rules-m1)
+              # Bounty 02, milestone 1 (PR #135): the rule-outcome file, the
+              # gettxstatus suite, the sibling apply-outcome suite, smoke.
+              FILES="tests/test_rule_outcome.py tests/test_gettxstatus.py tests/test_apply_block_outcome_key.py tests/test_block.py"
+              ;;
+            *)
+              # workflow_dispatch from the default branch: smoke set only
+              # (every file listed here exists on main).
+              FILES="tests/test_gettxstatus.py tests/test_checktx.py tests/test_retractable_rpc.py tests/test_block.py"
+              ;;
+          esac
+          echo "Branch '${{ github.ref_name }}' — running: $FILES"
+          python -m pytest $FILES -p no:asyncio -q
