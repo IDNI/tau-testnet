@@ -558,12 +558,13 @@ def build_rule_change_request_tx(
     """Construct a ``tx_type='rule_change_request'`` payload (without signature).
 
     Kinds 1 and 4 carry the clause in ``rule_text``; kind 3 carries the exact
-    offered text and the offer id; kinds 2 and 5 carry neither. Zero approvers is
-    valid: the time escape alone can release the request.
+    offered text and the offer id; kinds 2 and 5 carry neither. Kind 6 carries
+    a payout-rule update payload as canonical JSON in ``rule_text``. Zero
+    approvers is valid: the time escape alone can release the request.
     """
-    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5):
-        raise ValueError("kind must be 1..5")
-    has_body = kind in (1, 3, 4)
+    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5, 6):
+        raise ValueError("kind must be 1..6")
+    has_body = kind in (1, 3, 4, 6)
     if has_body and not (isinstance(rule_text, str) and rule_text.strip()):
         raise ValueError("this kind needs a non-empty rule text")
     if not has_body and rule_text:

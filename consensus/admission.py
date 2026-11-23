@@ -55,16 +55,20 @@ from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
 )
+from consensus import periods as _periods
 from consensus.payouts import (
     MAX_PAYOUT_RULES,
+    MAX_RULES_PER_OWNER,
     PAYOUT_STREAM_INDEX,
     PayoutShapeError,
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_INSTALL,
     TX_TYPE_PAYOUT_REMOVE,
+    TX_TYPE_PAYOUT_UPDATE,
     parse_payout_execute,
     parse_payout_install,
     parse_payout_remove,
+    parse_payout_update,
     validate_payout_shape,
 )
 from consensus.grants import (
@@ -371,6 +375,23 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
                 return format_error(
                     f"Transaction invalid. Transfer #{index + 1}: {err}",
                     code="TX_INVALID",
+                )
+    # A sealed payout rule locks its owner's account to the rule's
+    # own settlements until the rule ends (Bounty 01 stage 2): while
+    # any of the sender's rules is sealed and unended, the sender's
+    # signed transfers are refused. Payout settlements are not user
+    # transactions, so they are exactly what remains possible.
+    if isinstance(transfers, list) and transfers:
+        sender = tx.get("sender_pubkey")
+        if isinstance(sender, str) and sender:
+            ts = getattr(tip_view, "next_block_timestamp", 0) or 0
+            if any(_payout_row_sealed(r, ts)
+                   for r in _payout_rows(tip_view, sender)):
+                return format_error(
+                    "The sender's payout rule is sealed and has not "
+                    "ended; the account is locked to the rule's "
+                    "settlements.",
+                    code="PAYOUT_RULE_SEALED",
                 )
     custom_stream_count = sum(1 for k in operations if str(k).isdigit() and int(k) not in (0, 1))
     if custom_stream_count > MAX_CUSTOM_INPUT_STREAMS:
@@ -1406,6 +1427,27 @@ def _rule_change_precondition_error(request, tip_view: TipAdmissionView) -> Opti
     elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD:
         if not tip_view.clause_for(sender, tau_defs.RULE_CHANGE_GUARD_INDEX):
             return "there is no registered rule-change guard to revoke"
+    elif request.kind == tau_defs.RULE_CHANGE_KIND_PAYOUT_UPDATE:
+        # The guarded path to a payout update: the body is the
+        # update payload as canonical JSON. The same screens as the
+        # direct payout_rule_update, over the tip rows; the write
+        # re-checks them against the live book.
+        try:
+            data = json.loads(request.body)
+            if not isinstance(data, dict):
+                raise ValueError("body is not a JSON object")
+            data["sender_pubkey"] = sender
+            _owner, rule_id, terms = parse_payout_update(data)
+            validate_payout_shape(
+                terms, now_ts=tip_view.next_block_timestamp)
+        except (PayoutShapeError, ValueError, TypeError) as exc:
+            return f"the payout update payload is not valid: {exc}"
+        rows = _payout_rows(tip_view, sender)
+        row = next((r for r in rows if r.get("rule_id") == rule_id), None)
+        if row is None:
+            return "no payout rule with that id is installed for the sender"
+        return _payout_update_row_problem(
+            row, terms, tip_view.next_block_timestamp)
     elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
         row = tip_view.get_offer(request.offer_id)
         if not isinstance(row, dict) or row.get("status") != STATUS_OFFERED:
@@ -1538,6 +1580,81 @@ def validate_rule_change_cancel_payload(
 
 # --- Retractable transfers ---------------------------------------------------
 
+def _payout_rows(tip_view, owner) -> list:
+    """Every payout row the tip holds for `owner` (possibly none).
+
+    The facade exposes the whole book; a view that only carries the
+    stage-1 single-row accessor is read through it. Anything that is
+    not a list of row dicts reads as "no rows", so a partial view in
+    a caller that only exercises other screens cannot crash here.
+    """
+    if tip_view is None:
+        return []
+    getter = getattr(tip_view, "get_payout_rules", None)
+    if callable(getter):
+        rows = getter(owner)
+        if isinstance(rows, (list, tuple)) and \
+                all(isinstance(r, dict) for r in rows):
+            return list(rows)
+    getter = getattr(tip_view, "get_payout_rule", None)
+    if callable(getter):
+        row = getter(owner)
+        if isinstance(row, dict):
+            return [row]
+    return []
+
+
+def _payout_row_ended(row, ts) -> bool:
+    """Whether a tip row's end condition has ended it at `ts`:
+    the calendar end reads the period containing `ts`, the counter
+    ends read the firing accounting (consensus.payouts.rule_ended,
+    over a row)."""
+    anchor = int(row.get("anchor_ts", 0))
+    kind = int(row.get("period_kind", 0))
+    epi = row.get("end_period_index")
+    if epi is not None and \
+            _periods.period_index_at(anchor, kind, ts) > int(epi):
+        return True
+    mf = row.get("max_fires")
+    if mf is not None and int(row.get("fires", 0)) >= int(mf):
+        return True
+    mt = row.get("max_total")
+    if mt is not None and int(row.get("total_spent", 0)) >= int(mt):
+        return True
+    return False
+
+
+def _payout_row_sealed(row, ts) -> bool:
+    """A row is sealed against changes while sealed and unended."""
+    return bool(row.get("sealed", False)) and not _payout_row_ended(row, ts)
+
+
+def _payout_update_row_problem(row, new_terms, ts):
+    """The book's update screens over a tip row, or None.
+
+    Mirrors PayoutBook.update_problem; block apply re-checks them
+    against the live book, so admission and apply agree.
+    """
+    if new_terms.anchor_ts != int(row.get("anchor_ts", 0)) \
+            or new_terms.period_kind != int(row.get("period_kind", 0)):
+        return ("an update cannot move the schedule the settled "
+                "history was recorded against")
+    if _payout_row_sealed(row, ts):
+        return "a sealed rule cannot be updated before it ends"
+    idx = _periods.period_index_at(
+        int(row.get("anchor_ts", 0)), int(row.get("period_kind", 0)), ts)
+    spent_now = int(row.get("spent_in_period", 0)) \
+        if idx == int(row.get("period_index", -1)) else 0
+    if new_terms.max_per_period < spent_now:
+        return ("the new period cap is below what the current "
+                "period has already spent")
+    if new_terms.max_total is not None \
+            and int(row.get("total_spent", 0)) >= new_terms.max_total:
+        return ("the new total cap does not exceed what the rule "
+                "has already paid")
+    return None
+
+
 def validate_payout_install_payload(
     tx: Dict, tip_view: TipAdmissionView
 ) -> AdmissionResult:
@@ -1560,7 +1677,19 @@ def validate_payout_install_payload(
         if err:
             return format_error(f"payout_rule_install rejected: {err}")
 
-    if tip_view.get_payout_rule(terms.owner) is None and \
+    rows = _payout_rows(tip_view, terms.owner)
+    existing = next(
+        (r for r in rows if r.get("rule_id") == terms.rule_id), None)
+    if existing is not None and _payout_row_sealed(
+            existing, tip_view.next_block_timestamp):
+        return format_error(
+            "The installed rule is sealed and has not ended.",
+            code="PAYOUT_RULE_SEALED")
+    if existing is None and len(rows) >= MAX_RULES_PER_OWNER:
+        return format_error(
+            "The owner already holds the maximum number of payout rules.",
+            code="PAYOUT_OWNER_BOOK_FULL")
+    if existing is None and \
             tip_view.payout_rule_count() >= MAX_PAYOUT_RULES:
         return format_error("The payout rule book is full.", code="PAYOUT_BOOK_FULL")
 
@@ -1569,6 +1698,57 @@ def validate_payout_install_payload(
         "max_per_execution": terms.max_per_execution,
         "max_per_period": terms.max_per_period,
         "recipients": len(terms.recipients),
+    })
+
+
+def validate_payout_update_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for updating a payout rule in place.
+
+    The update names the installed version it supersedes; the new
+    terms are shape-checked like an install's and screened against
+    the settled history the tip rows record. Block apply re-checks
+    every screen against the live book (PayoutBook.update_problem).
+    """
+    try:
+        owner, rule_id, terms = parse_payout_update(tx)
+        validate_payout_shape(terms, now_ts=tip_view.next_block_timestamp)
+    except (PayoutShapeError, ValueError, TypeError) as exc:
+        return format_error(f"Malformed payout_rule_update: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != owner:
+        return format_error("payout_rule_update sender_pubkey must match the signer.")
+
+    for r in terms.recipients:
+        err = validate_bls_pubkey(r, "recipients")
+        if err:
+            return format_error(f"payout_rule_update rejected: {err}")
+
+    rows = _payout_rows(tip_view, owner)
+    row = next((r for r in rows if r.get("rule_id") == rule_id), None)
+    if row is None:
+        return format_error(
+            "No payout rule with that id is installed for the sender.",
+            code="NO_PAYOUT_RULE",
+        )
+    problem = _payout_update_row_problem(
+        row, terms, tip_view.next_block_timestamp)
+    if problem is not None:
+        return format_error(
+            f"payout_rule_update rejected: {problem}",
+            code="PAYOUT_UPDATE_REFUSED")
+    if terms.rule_id != rule_id and \
+            any(r.get("rule_id") == terms.rule_id for r in rows):
+        return format_error(
+            "Another rule of the owner already carries those terms.",
+            code="PAYOUT_UPDATE_REFUSED")
+
+    return success({
+        "payout_rule_id": terms.rule_id,
+        "supersedes": rule_id,
+        "version": int(row.get("version", 1)) + 1,
     })
 
 
@@ -1582,7 +1762,7 @@ def validate_payout_execute_payload(
     the settlement id's freshness against the tip book.
     """
     try:
-        owner, settlement_id, gross = parse_payout_execute(tx)
+        owner, settlement_id, gross, rule_id = parse_payout_execute(tx)
     except (PayoutShapeError, ValueError, TypeError) as exc:
         return format_error(f"Malformed payout_execute: {exc}.")
 
@@ -1591,11 +1771,26 @@ def validate_payout_execute_payload(
     if gross < 0:
         return format_error("payout_execute gross cannot be negative.")
 
-    row = tip_view.get_payout_rule(owner)
-    if row is None:
+    rows = _payout_rows(tip_view, owner)
+    if rule_id is not None:
+        row = next((r for r in rows if r.get("rule_id") == rule_id), None)
+        if row is None:
+            return format_error(
+                "No payout rule with that id is installed for that owner.",
+                code="NO_PAYOUT_RULE",
+            )
+    elif len(rows) == 1:
+        row = rows[0]
+    elif not rows:
         return format_error(
             "No payout rule is installed for that owner.",
             code="NO_PAYOUT_RULE",
+        )
+    else:
+        return format_error(
+            "The owner holds several payout rules; the execution "
+            "must name its rule_id.",
+            code="PAYOUT_RULE_AMBIGUOUS",
         )
     if settlement_id in (row.get("settlements") or []):
         return format_error(
@@ -1627,17 +1822,22 @@ def validate_payout_remove_payload(
     if not isinstance(sender, str) or sender != owner:
         return format_error("payout_rule_remove sender_pubkey must match the signer.")
 
-    row = tip_view.get_payout_rule(owner)
-    if row is None:
+    rows = _payout_rows(tip_view, owner)
+    if not rows:
         return format_error(
             "No payout rule is installed for the sender.",
             code="NO_PAYOUT_RULE",
         )
-    if row["rule_id"] != rule_id:
+    row = next((r for r in rows if r.get("rule_id") == rule_id), None)
+    if row is None:
         return format_error(
-            "rule_id does not match the installed rule.",
+            "rule_id does not match an installed rule.",
             code="PAYOUT_RULE_MISMATCH",
         )
+    if _payout_row_sealed(row, tip_view.next_block_timestamp):
+        return format_error(
+            "The rule is sealed and has not ended.",
+            code="PAYOUT_RULE_SEALED")
 
     return success({"payout_rule_id": rule_id})
 
@@ -1948,6 +2148,9 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_PAYOUT_REMOVE:
          return validate_payout_remove_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_PAYOUT_UPDATE:
+         return validate_payout_update_payload(payload, tip_view)
 
     elif tx_type == TX_TYPE_GRANT_CREATE:
          return validate_grant_create_payload(payload, tip_view)

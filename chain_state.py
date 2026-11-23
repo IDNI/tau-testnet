@@ -2271,8 +2271,8 @@ def _restore_payouts(lm) -> None:
     its id is corruption and refuses to load."""
     from consensus.payouts import PayoutBook
 
-    rows = db.load_payout_state()
     try:
+        rows = db.load_payout_state()
         lm.payout_rules = PayoutBook.restore(rows)
     except ValueError as exc:
         raise DatabaseError(f"corrupt payout rule state: {exc}") from exc

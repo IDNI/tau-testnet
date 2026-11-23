@@ -495,6 +495,19 @@ def init_db():
                     settlements_json  TEXT NOT NULL
                 );
             ''')
+            # Bounty 01 stage 2: the multi-rule book's complete
+            # rows. v1's owner column is UNIQUE and its column set
+            # predates triggers and stage-2 terms, so v1 keeps the
+            # FIRST rule of each owner in the stage-1 shape (stage-1
+            # readers read exactly that row), and this table carries
+            # every rule's full row as JSON, keyed by rule id.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS payout_rules_v2 (
+                    rule_id           TEXT PRIMARY KEY,
+                    owner_pubkey      TEXT NOT NULL,
+                    row_json          TEXT NOT NULL
+                );
+            ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS grants_v1 (
                     grant_id        TEXT PRIMARY KEY,
@@ -2696,9 +2709,27 @@ def load_retractable_state() -> tuple[List[tuple], int, bytes]:
 
 
 def _write_payout_rows(state: Dict) -> None:
-    """Full replace of the installed payout-rule rows."""
+    """Full replace of the installed payout-rule rows.
+
+    Every rule's complete row goes to payout_rules_v2 as JSON; the
+    first rule of each owner (by rule id) ALSO goes to
+    payout_rules_v1 in the stage-1 column shape, whose owner column
+    is UNIQUE and whose readers predate the multi-rule book.
+    """
+    rows = sorted(
+        state['rows'], key=lambda r: (r['owner'], r['rule_id']))
     _db_conn.execute('DELETE FROM payout_rules_v1')
-    for row in state['rows']:
+    _db_conn.execute('DELETE FROM payout_rules_v2')
+    seen_owners = set()
+    for row in rows:
+        _db_conn.execute(
+            'INSERT INTO payout_rules_v2 '
+            '(rule_id, owner_pubkey, row_json) VALUES (?, ?, ?)',
+            (row['rule_id'], row['owner'], json.dumps(row)),
+        )
+        if row['owner'] in seen_owners:
+            continue
+        seen_owners.add(row['owner'])
         _db_conn.execute(
             'INSERT INTO payout_rules_v1 '
             '(rule_id, owner_pubkey, max_per_execution, max_per_period, '
@@ -2721,8 +2752,26 @@ def _write_payout_rows(state: Dict) -> None:
         )
 
 
+def _load_payout_v2_rows() -> Dict[str, Dict]:
+    """rule_id -> complete row, from payout_rules_v2 ({} if absent)."""
+    try:
+        rows = _db_conn.execute(
+            'SELECT rule_id, row_json FROM payout_rules_v2'
+        ).fetchall()
+    except Exception:
+        return {}
+    return {r[0]: json.loads(r[1]) for r in rows}
+
+
 def load_payout_state() -> List[Dict]:
-    """The installed payout-rule rows as dicts, exactly as stored."""
+    """The installed payout-rule rows as dicts, exactly as stored.
+
+    Merges the two tables _write_payout_rows maintains: a v1 row
+    and its v2 extension must agree on every field v1 carries --
+    a disagreement is corruption and raises ValueError, which the
+    restore path turns into a loud refusal. A v1 row with no v2
+    extension is a stage-1 row and restores as one.
+    """
     if _db_conn is None:
         init_db()
     with _db_lock:
@@ -2732,17 +2781,50 @@ def load_payout_state() -> List[Dict]:
             'period_index, spent_in_period, settlements_json '
             'FROM payout_rules_v1 ORDER BY owner_pubkey'
         ).fetchall()
+        extensions = _load_payout_v2_rows()
     out = []
     for r in rows:
-        out.append({
+        base = {
             'rule_id': r[0], 'owner': r[1],
             'max_per_execution': int(r[2]), 'max_per_period': int(r[3]),
             'recipients': json.loads(r[4]),
             'period_kind': int(r[5]), 'anchor_ts': int(r[6]),
             'sequence_number': int(r[7]), 'period_index': int(r[8]),
             'spent_in_period': int(r[9]), 'settlements': json.loads(r[10]),
-        })
+        }
+        ext = extensions.pop(base['rule_id'], None)
+        if ext is None:
+            out.append(base)
+            continue
+        for key, value in base.items():
+            if key == 'rule_id':
+                continue
+            if ext.get(key) != value:
+                raise ValueError(
+                    "payout row does not agree with its extension row")
+        out.append(ext)
+    out.extend(extensions.values())
+    out.sort(key=lambda row: (row['owner'], row['rule_id']))
     return out
+
+
+def payout_extension_row(rule_id: str):
+    """The complete stored row for one rule (v2), or None."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        return _load_payout_v2_rows().get(rule_id)
+
+
+def payout_rows_for_owner(owner: str) -> List[Dict]:
+    """Every complete stored row of one owner (v2), by rule id."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        extensions = _load_payout_v2_rows()
+    rows = [r for r in extensions.values() if r.get('owner') == owner]
+    rows.sort(key=lambda row: row['rule_id'])
+    return rows
 
 
 def _write_grant_rows(state: Dict) -> None:

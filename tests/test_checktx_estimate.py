@@ -183,6 +183,12 @@ def _payload(kind, fee_limit="0"):
     if kind == "payout_execute":
         return _envelope(kind, SENDER, fee_limit, owner=SENDER,
                          settlement_id="estimate-1", gross=100)
+    if kind == "payout_rule_update":
+        return _envelope(kind, SENDER, fee_limit,
+                         rule_id=_payout_row()["rule_id"],
+                         max_per_execution=1000, max_per_period=1500,
+                         recipients=[RECIPIENT], period_kind=2,
+                         anchor_ts=1_800_000_000, terms_sequence_number=2)
     if kind == "grant_create":
         return _envelope(kind, SENDER, fee_limit, recipient_pubkey=RECIPIENT,
                          total=5000, cap_per_period=500,
@@ -205,7 +211,7 @@ def _check(payload, *, estimate=True):
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
                "rule_change_request", "payout_rule_install", "payout_execute",
-               "grant_create", "grant_draw"]
+               "payout_rule_update", "grant_create", "grant_draw"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():

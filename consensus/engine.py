@@ -42,22 +42,29 @@ from .retractable import (
     parse_retractable_transfer,
 )
 from .payouts import (
+    MAX_CLOCK_SETTLEMENTS_PER_BLOCK,
+    MAX_RULES_PER_OWNER,
     PAYOUT_TX_TYPES,
     PayoutShapeError,
     PayoutTerms,
     TX_TYPE_PAYOUT_EXECUTE,
     TX_TYPE_PAYOUT_INSTALL,
     TX_TYPE_PAYOUT_REMOVE,
+    TX_TYPE_PAYOUT_UPDATE,
     PAYOUT_STREAM_INDEX,
     ZERO_PUBKEY,
     arrival_settlement_id,
     clock_due_period,
     clock_settlement_id,
+    fee_exceeds_cap,
     legs_from_outputs,
+    observe_clock,
     parse_payout_execute,
     parse_payout_install,
     parse_payout_remove,
+    parse_payout_update,
     payout_values,
+    rule_ended,
     validate_payout_shape,
 )
 from .grants import (
@@ -102,7 +109,7 @@ from .rule_offers import (
 FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST, TX_TYPE_PAYOUT_INSTALL,
-     TX_TYPE_PAYOUT_EXECUTE}
+     TX_TYPE_PAYOUT_EXECUTE, TX_TYPE_PAYOUT_UPDATE}
     | set(RULE_OFFER_TX_TYPES)
     | set(GRANT_TX_TYPES)
 )
@@ -284,6 +291,34 @@ def _payout_book(lm):
     return getattr(lm, "payout_rules", None)
 
 
+def _payout_update_from_body(lm, sender, body, timestamp):
+    """Parse a rule-change kind-6 body into an update, or why not.
+
+    Returns ((owner, rule_id, terms), None) or (None, problem). The
+    book screens run separately (PayoutBook.update_problem), so the
+    parking precondition and the release write share this parse.
+    """
+    import json as _json
+
+    from consensus.payouts import (
+        PayoutShapeError,
+        parse_payout_update,
+        validate_payout_shape,
+    )
+
+    if _payout_book(lm) is None:
+        return None, "the payout book is unavailable"
+    try:
+        data = _json.loads(body)
+        if not isinstance(data, dict):
+            raise ValueError("body is not a JSON object")
+        parsed = parse_payout_update({**data, "sender_pubkey": sender})
+        validate_payout_shape(parsed[2], now_ts=int(timestamp or 0))
+    except (PayoutShapeError, ValueError, TypeError) as exc:
+        return None, f"the payout update payload is not valid: {exc}"
+    return parsed, None
+
+
 def _grant_book(lm):
     return getattr(lm, "grants", None)
 
@@ -366,7 +401,9 @@ def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str
         if entry is None or entry.status != STATUS_OPEN:
             continue
         processed += 1
-        problem = _write_rule_change(lm, rid, entry, int(height), timeout)
+        problem = _write_rule_change(
+            lm, rid, entry, int(height), timeout,
+            timestamp=int(timestamp or 0))
         if problem:
             approvals.resolve_rule_change(rid, STATUS_FAILED)
             logger.info("Rule-change request %s failed at release: %s", rid.hex(), problem)
@@ -377,7 +414,8 @@ def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str
     return events
 
 
-def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
+def _write_rule_change(lm, rid, entry, height, timeout,
+                       timestamp: int = 0) -> Optional[str]:
     """Apply one request to the block's lifecycle. None on success, else why not.
 
     Every check runs before the first write, so a failure leaves nothing behind.
@@ -399,7 +437,18 @@ def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
         return None if builds else f"does not build: {build_error}"
 
     decision = None
-    if kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+    payout_update = None
+    if kind == tau_defs.RULE_CHANGE_KIND_PAYOUT_UPDATE:
+        # Bounty 01 stage 2: the guarded payout update. The book's
+        # own screens are the whole precondition -- no clause is
+        # built, nothing is screened as policy text.
+        payout_update, problem = _payout_update_from_body(
+            lm, sender, entry.body, timestamp)
+        if problem is None:
+            problem = _payout_book(lm).update_problem(
+                payout_update[0], payout_update[1], payout_update[2],
+                ts=timestamp)
+    elif kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
         problem = _screen_and_build(entry.body)
     elif kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
         problem = _screen_and_build(entry.body, guard=True)
@@ -433,7 +482,11 @@ def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
     if problem:
         return problem
 
-    if kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+    if kind == tau_defs.RULE_CHANGE_KIND_PAYOUT_UPDATE:
+        _payout_book(lm).update(
+            payout_update[0], payout_update[1], payout_update[2],
+            ts=timestamp)
+    elif kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
         offers.accepted_clauses[policy_key] = entry.body
     elif kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
         offers.accepted_clauses.pop(policy_key, None)
@@ -447,7 +500,9 @@ def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
         except RuleOfferShapeError as exc:
             return str(exc)
 
-    if kind in (tau_defs.RULE_CHANGE_KIND_SET_GUARD, tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD):
+    if kind in (tau_defs.RULE_CHANGE_KIND_SET_GUARD,
+                tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD,
+                tau_defs.RULE_CHANGE_KIND_PAYOUT_UPDATE):
         approvals.resolve_open_rule_changes_for_sender(
             sender, STATUS_FAILED, except_id=rid
         )
@@ -1630,7 +1685,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 )
             return lifecycle_mgr
 
-        def _step_triggered_payout(book, offers, owner, settlement_id, gross,
+        def _step_triggered_payout(book, offers, state, settlement_id, gross,
                                    *, ts, balance):
             """Step a triggered rule's clause and check its legs.
 
@@ -1644,16 +1699,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             legs. A trigger never fails the block or the crediting
             transaction: it settles what it can, or nothing.
             """
-            if book is None:
-                return None
-            state = book.get(owner)
-            if state is None:
+            if book is None or state is None:
                 return None
             if not isinstance(state.terms, PayoutTerms):
                 # Terms this build does not recognise (a book double
                 # in tests carries mocks here): a trigger settles
                 # nothing rather than failing the block.
                 return None
+            owner = state.terms.owner
             if offers is None or offers.clause_for(
                     owner, PAYOUT_STREAM_INDEX) is None:
                 return None
@@ -1678,7 +1731,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             try:
                 legs = legs_from_outputs(outputs, state.terms)
                 total = book.check_execution(
-                    owner, settlement_id, legs, ts=ts)
+                    owner, settlement_id, legs, ts=ts,
+                    rule_id=state.terms.rule_id)
             except PayoutShapeError:
                 return None
             if balance < total:
@@ -1822,7 +1876,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
             pending_payout_install = None
-            pending_payout_remove_owner = None
+            pending_payout_remove = None
+            pending_payout_update = None
             pending_payout_settle = None
             # Ordinary (non-payout-class) credits staged by this tx,
             # per recipient: the arrival trigger's input. Payout legs,
@@ -2468,6 +2523,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             if not offers.clause_for(
                                     request.sender_pubkey, tau_defs.RULE_CHANGE_GUARD_INDEX):
                                 precondition = "there is no registered rule-change guard to revoke"
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_PAYOUT_UPDATE:
+                            parsed, precondition = _payout_update_from_body(
+                                lifecycle_mgr, request.sender_pubkey,
+                                request.body, int(block_timestamp or 0))
+                            if precondition is None:
+                                precondition = _payout_book(
+                                    lifecycle_mgr).update_problem(
+                                    parsed[0], parsed[1], parsed[2],
+                                    ts=int(block_timestamp or 0))
                         elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
                             offer_entry = offers.offered.get(bytes.fromhex(request.offer_id))
                             if offer_entry is None:
@@ -2809,6 +2873,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         except (PayoutShapeError, ValueError, TypeError) as exc:
                             terms = None
                             reason = f"invalid payout rule ({exc})"
+                        if terms is not None and reason is None:
+                            book = _payout_book(lifecycle_mgr)
+                            existing = book.get_rule(
+                                terms.owner, terms.rule_id) if book else None
+                            if existing is not None and existing.terms.sealed \
+                                    and not rule_ended(
+                                        existing, int(block_timestamp or 0)):
+                                reason = "the installed rule is sealed and has not ended"
+                            elif existing is None and book is not None \
+                                    and book.owner_rule_count(terms.owner) \
+                                    >= MAX_RULES_PER_OWNER:
+                                reason = "the owner already holds the maximum number of rules"
                         if terms is None or reason:
                             tx_receipt["logs"].append(f"Payout install ignored: {reason}")
                             tx_receipt["reason"] = "payout_not_installed"
@@ -2825,37 +2901,81 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         except (PayoutShapeError, ValueError, TypeError) as exc:
                             owner, rule_id = "", ""
                             reason = f"invalid payout removal ({exc})"
-                        state = _payout_book(lifecycle_mgr).get(owner) if owner else None
+                        book = _payout_book(lifecycle_mgr)
+                        state = book.get_rule(owner, rule_id) \
+                            if owner and book else None
                         if reason:
                             pass
                         elif state is None:
-                            reason = "no payout rule installed for the sender"
+                            reason = "no payout rule with that id is installed for the sender"
                         elif not isinstance(sender, str) or sender != owner:
                             reason = "sender is not the rule owner"
-                        elif state.terms.rule_id != rule_id:
-                            reason = "rule id does not match the installed rule"
+                        elif state.terms.sealed and not rule_ended(
+                                state, int(block_timestamp or 0)):
+                            reason = "the rule is sealed and has not ended"
                         if reason:
                             tx_receipt["logs"].append(f"Payout removal ignored: {reason}")
                             tx_receipt["reason"] = "payout_not_removed"
                             accepted_in_block = False
                         else:
-                            pending_payout_remove_owner = owner
+                            pending_payout_remove = (owner, rule_id)
                             tx_receipt["logs"].append("Payout rule removed: " + rule_id)
-                    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+                    elif tx_type == TX_TYPE_PAYOUT_UPDATE:
                         try:
-                            owner, settlement_id, gross = parse_payout_execute(tx)
+                            owner, rule_id, new_terms = parse_payout_update(tx)
+                            validate_payout_shape(
+                                new_terms, now_ts=int(block_timestamp or 0))
                             reason = None
                         except (PayoutShapeError, ValueError, TypeError) as exc:
-                            owner, settlement_id, gross = "", "", 0
+                            owner, rule_id, new_terms = "", "", None
+                            reason = f"invalid payout update ({exc})"
+                        book = _payout_book(lifecycle_mgr)
+                        if reason:
+                            pass
+                        elif not isinstance(sender, str) or sender != owner:
+                            reason = "sender is not the rule owner"
+                        elif book is None:
+                            reason = "the payout book is unavailable"
+                        else:
+                            reason = book.update_problem(
+                                owner, rule_id, new_terms,
+                                ts=int(block_timestamp or 0))
+                        if reason:
+                            tx_receipt["logs"].append(f"Payout update ignored: {reason}")
+                            tx_receipt["reason"] = "payout_not_updated"
+                            accepted_in_block = False
+                        else:
+                            pending_payout_update = (
+                                owner, rule_id, new_terms,
+                                int(block_timestamp or 0))
+                            tx_receipt["logs"].append(
+                                "Payout rule updated: " + rule_id
+                                + " -> " + new_terms.rule_id)
+                    elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
+                        try:
+                            owner, settlement_id, gross, want_rule_id = \
+                                parse_payout_execute(tx)
+                            reason = None
+                        except (PayoutShapeError, ValueError, TypeError) as exc:
+                            owner, settlement_id, gross, want_rule_id = \
+                                "", "", 0, None
                             reason = f"invalid payout execution ({exc})"
                         book = _payout_book(lifecycle_mgr)
-                        state = book.get(owner) if owner else None
+                        state = book.get(owner, want_rule_id) \
+                            if owner and book else None
                         legs = []
                         total = 0
                         if reason:
                             pass
                         elif state is None:
-                            reason = "no payout rule installed for the owner"
+                            if want_rule_id is not None:
+                                reason = "no payout rule with that id is installed for the owner"
+                            elif book is not None \
+                                    and book.owner_rule_count(owner) > 1:
+                                reason = ("the owner holds several rules; "
+                                          "the execution must name its rule")
+                            else:
+                                reason = "no payout rule installed for the owner"
                         elif target_balances is None:
                             reason = "no balance overlay to execute from"
                         elif lifecycle_mgr.rule_offers.clause_for(
@@ -2879,6 +2999,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 total = book.check_execution(
                                     owner, settlement_id, legs,
                                     ts=int(block_timestamp or 0),
+                                    rule_id=state.terms.rule_id,
                                 )
                             except PayoutShapeError as exc:
                                 reason = f"execution refused ({exc})"
@@ -2898,6 +3019,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             pending_payout_settle = (
                                 owner, settlement_id, total,
                                 int(block_timestamp or 0),
+                                state.terms.rule_id,
                             )
                             tx_receipt["logs"].append(
                                 "Payout executed: " + settlement_id
@@ -3026,7 +3148,24 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 # user_tx
                 rule_op_data = operations.get("0")
                 transfers_op_data = operations.get("1")
-                
+                # Bounty 01 stage 2: a sealed payout rule locks its
+                # owner's account to the rule's own settlements until
+                # the rule ends, so the owner's signed transfers are
+                # refused here at apply, exactly as at admission.
+                # Payout settlements are not user transactions, so
+                # they are exactly what remains possible.
+                if isinstance(transfers_op_data, list) and transfers_op_data \
+                        and isinstance(sender, str) and sender:
+                    s_book = _payout_book(lifecycle_mgr)
+                    if s_book is not None and any(
+                            st.terms.sealed and not rule_ended(
+                                st, int(block_timestamp or 0))
+                            for st in s_book.rules_of(sender)):
+                        reserved_error = (
+                            "the sender's payout rule is sealed and "
+                            "has not ended")
+                        reserved_reason = "payout_rule_sealed"
+
             for k, v in operations.items():
                 if k.isdigit():
                     idx = int(k)
@@ -3470,6 +3609,29 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     execution_success = False
                     tx_receipt["logs"].append(f"Error (fee query): {e}")
 
+            # Bounty 01 stage 2: a payout rule may cap the fee of a
+            # submitted execution (max_fee_per_execution). The fee
+            # is only final here, after the fee-query step, so the
+            # cap is enforced here: a refused execution settles
+            # nothing and pays no fee. Node-initiated settlements
+            # (clock, arrival) carry no transaction fee at all.
+            if (charge_fee and accepted_in_block and not hard_reject
+                    and pending_payout_settle is not None):
+                f_owner, _f_sid, _f_total, _f_ts, f_rule_id = \
+                    pending_payout_settle
+                f_book = _payout_book(lifecycle_mgr)
+                f_state = f_book.get_rule(f_owner, f_rule_id) \
+                    if f_book else None
+                if f_state is not None and fee_exceeds_cap(
+                        f_state.terms, sum(fee_components)):
+                    accepted_in_block = False
+                    hard_reject = True
+                    execution_success = False
+                    tx_receipt["reason"] = "payout_fee_cap_exceeded"
+                    tx_receipt["logs"].append(
+                        "Payout execution refused: the fee exceeds "
+                        "the rule's max_fee_per_execution")
+
             if charge_fee and accepted_in_block and not hard_reject:
                 total_fee = sum(fee_components)
                 if total_fee == 0:
@@ -3565,14 +3727,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     _lifecycle_for_write().payout_rules.install(pending_payout_install)
                     tx_receipt["payout_event"] = (
                         pending_payout_install.rule_id, "installed")
-                elif pending_payout_remove_owner is not None:
-                    _lifecycle_for_write().payout_rules.remove(pending_payout_remove_owner)
+                elif pending_payout_remove is not None:
+                    r_owner, r_rule_id = pending_payout_remove
+                    _lifecycle_for_write().payout_rules.remove(
+                        r_owner, r_rule_id)
                     tx_receipt["payout_event"] = (
-                        pending_payout_remove_owner, "removed")
+                        r_rule_id, "removed")
+                elif pending_payout_update is not None:
+                    u_owner, u_rule_id, u_terms, u_ts = pending_payout_update
+                    _lifecycle_for_write().payout_rules.update(
+                        u_owner, u_rule_id, u_terms, ts=u_ts)
+                    tx_receipt["payout_event"] = (
+                        u_terms.rule_id, "updated")
                 elif pending_payout_settle is not None:
-                    s_owner, s_id, s_total, s_ts = pending_payout_settle
+                    s_owner, s_id, s_total, s_ts, s_rule_id = \
+                        pending_payout_settle
                     _lifecycle_for_write().payout_rules.settle(
-                        s_owner, s_id, s_total, ts=s_ts)
+                        s_owner, s_id, s_total, ts=s_ts, rule_id=s_rule_id)
                     tx_receipt["payout_event"] = (s_id, "executed")
                 if arrival_credits:
                     # Arrival trigger (receive routes, #35): a credit
@@ -3585,30 +3756,38 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     # tx takes its route settlement with it.
                     for a_owner in sorted(arrival_credits):
                         a_book = _payout_book(lifecycle_mgr)
-                        a_state = a_book.get(a_owner) if a_book else None
-                        if a_state is None or not a_state.terms.on_arrival:
+                        if a_book is None:
                             continue
                         a_sid = arrival_settlement_id(tx_id)
-                        stepped = _step_triggered_payout(
-                            a_book, lifecycle_mgr.rule_offers,
-                            a_owner, a_sid, arrival_credits[a_owner],
-                            ts=int(block_timestamp or 0),
-                            balance=_read_bal(a_owner),
-                        )
-                        if stepped is None:
-                            continue
-                        a_legs, a_total = stepped
-                        staged_writes[a_owner] = _read_bal(a_owner) - a_total
-                        for a_recipient, a_amount in a_legs:
-                            staged_writes[a_recipient] = (
-                                _read_bal(a_recipient) + a_amount
+                        # Stage 2: every on_arrival rule of the owner
+                        # settles on the credit, each under the same
+                        # settlement id in its OWN history -- the id
+                        # names the credit, the state names the rule.
+                        for a_state in a_book.rules_of(a_owner):
+                            if not a_state.terms.on_arrival:
+                                continue
+                            stepped = _step_triggered_payout(
+                                a_book, lifecycle_mgr.rule_offers,
+                                a_state, a_sid, arrival_credits[a_owner],
+                                ts=int(block_timestamp or 0),
+                                balance=_read_bal(a_owner),
                             )
-                        _lifecycle_for_write().payout_rules.settle(
-                            a_owner, a_sid, a_total,
-                            ts=int(block_timestamp or 0))
-                        tx_receipt["payout_event"] = (a_sid, "executed")
-                        tx_receipt["logs"].append(
-                            "Payout arrival settled: " + a_sid)
+                            if stepped is None:
+                                continue
+                            a_legs, a_total = stepped
+                            staged_writes[a_owner] = \
+                                _read_bal(a_owner) - a_total
+                            for a_recipient, a_amount in a_legs:
+                                staged_writes[a_recipient] = (
+                                    _read_bal(a_recipient) + a_amount
+                                )
+                            _lifecycle_for_write().payout_rules.settle(
+                                a_owner, a_sid, a_total,
+                                ts=int(block_timestamp or 0),
+                                rule_id=a_state.terms.rule_id)
+                            tx_receipt["payout_event"] = (a_sid, "executed")
+                            tx_receipt["logs"].append(
+                                "Payout arrival settled: " + a_sid)
                 if pending_grant_create is not None:
                     _lifecycle_for_write().grants.create(pending_grant_create)
                     tx_receipt["grant_event"] = (
@@ -3741,17 +3920,38 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             _clock_book = _payout_book(_block_lifecycle)
             if _clock_book is not None:
                 _clock_ts = int(block_timestamp or 0)
-                for c_owner in _clock_book.owners():
-                    c_state = _clock_book.get(c_owner)
+                # Stage 2: the book holds several rules per owner.
+                # Every clock rule is observed first (periods that
+                # closed unsettled are counted as missed), then the
+                # due ones are stepped earliest-due-first, at most
+                # MAX_CLOCK_SETTLEMENTS_PER_BLOCK per block; a due
+                # rule past the cap stays due for the next block.
+                _due = []
+                for c_state in _clock_book.all_states():
+                    if not c_state.terms.due:
+                        continue
+                    observe_clock(c_state, _clock_ts)
                     c_period = clock_due_period(c_state, _clock_ts)
                     if c_period is None:
                         continue
+                    _due.append((
+                        periods.period_start(
+                            c_state.terms.anchor_ts,
+                            c_state.terms.period_kind, c_period),
+                        c_state.terms.owner, c_state.terms.rule_id,
+                        c_state, c_period,
+                    ))
+                _due.sort(key=lambda item: (item[0], item[1], item[2]))
+                _settled = 0
+                for _start, c_owner, _rid, c_state, c_period in _due:
+                    if _settled >= MAX_CLOCK_SETTLEMENTS_PER_BLOCK:
+                        break
                     c_sid = clock_settlement_id(
                         c_state.terms.rule_id, c_period)
                     stepped = _step_triggered_payout(
                         _clock_book,
                         getattr(_block_lifecycle, "rule_offers", None),
-                        c_owner, c_sid, 0,
+                        c_state, c_sid, 0,
                         ts=_clock_ts, balance=_balance_of(c_owner),
                     )
                     if stepped is None:
@@ -3769,7 +3969,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             _balance_of(c_recipient) + c_amount
                         )
                     _clock_book.settle_clock(
-                        c_owner, c_sid, c_total, ts=_clock_ts)
+                        c_owner, c_sid, c_total, ts=_clock_ts,
+                        rule_id=c_state.terms.rule_id)
+                    _settled += 1
 
         # Create new snapshot
         new_snapshot = TauStateSnapshot(
