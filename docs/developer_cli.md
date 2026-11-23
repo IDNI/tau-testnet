@@ -179,8 +179,8 @@ The full registry (31 names, `app/container.py`):
 | `getretractable` | `getretractable <retractable_id>` — 64 hex chars |
 | `getretractables` | `getretractables <address> [in\|out\|all]` (default `all`) |
 | `getretractableid` | `getretractableid <json_payload>` |
-| `getstandingpayments` | `getstandingpayments <address> [out\|in\|all]` (default `all`) |
-| `getstandingpayment` | `getstandingpayment <standing_id>` — 64 hex chars |
+| `getstandingpayments` | `getstandingpayments <address> [out\|in\|all]` (default `all`) — standing payments, i.e. payout rules with a repeating due schedule and one fixed slot |
+| `getstandingpayment` | `getstandingpayment <standing_id>` — 64 hex chars (a payout rule id) |
 | `getpayoutrule` | `getpayoutrule <address>` |
 
 `gettimestamp` and `getcurrenttimestamp` share one handler, and it hardcodes
@@ -450,7 +450,7 @@ connection/timeout errors.
 
 `--fee <n>` sets `fee_limit`. Without `--fee`, a fee-bearing command (`tx send`,
 `rule offer|accept|reject`, `approval request`, `retractable send`,
-`standing create`, `payout set`, `payout execute`) signs a
+`payout set`, `payout update`, `payout execute`) signs a
 draft with `fee_limit` 0, asks the node with `checktx estimate`, and signs the
 transaction again with the estimate as `fee_limit`. The estimate does not
 depend on the draft's `fee_limit`. On `ESTIMATE_BUSY`, the CLI asks again up to
@@ -462,7 +462,7 @@ A sender that cannot pay the estimated fee gets `INSUFFICIENT_FUNDS` and no
 estimate, even with `--fee`. Fund the sender first.
 
 The fee-exempt commands have no `--fee`: `approval approve`, `approval decline`,
-`retractable retract`, `standing cancel`, `payout revoke`, `gov propose` and
+`retractable retract`, `payout revoke`, `gov propose` and
 `gov vote`. They sign `fee_limit` 0.
 
 ## Rule sharing
@@ -580,60 +580,45 @@ RPC replies:
 
 ## Standing payments
 
-Sign once to pay a fixed amount to a fixed recipient every period, until the
-last period or a cancel. Semantics are in the
-[README](../README.md#standing-payments).
-Long-form guide: [standing_payments.md](standing_payments.md).
+A standing payment is a payout rule with a repeating due schedule and one
+fixed slot: the node pays the fixed amount every period, without the payer
+signing again. Semantics are in the [README](../README.md#payout-rules).
 
 ```bash
-tau-testnet standing create --key alice --to <pk> --amount 25 --periods 12 --every-months 1 --first-due-time 1798761600
-tau-testnet standing create --key alice --to <pk> --amount 10 --periods 52 --every-seconds 604800 --first-due-after 3600
-tau-testnet standing create --key alice --to <pk> --amount 5 --periods 10 --every-blocks 1000 --first-due-in 50
-tau-testnet standing list --key alice --role out
-tau-testnet standing show <standing_id>
-tau-testnet standing cancel --key alice <standing_id>
+tau-testnet payout set --key alice --file standing.tau --slot <pk> --cap-per-execution 25 --cap-per-period 25 \
+    --period-seconds 2592000 --due-at 1798761600 --due-months 1 --ends-in 31104000
+tau-testnet rpc "getstandingpayments <address> out"
+tau-testnet rpc "getstandingpayment <rule_id>"
 ```
 
-Exactly one of `--every-blocks`, `--every-seconds`, `--every-months`, and one
-first-due flag: `--first-due-height` or `--first-due-in` for a block schedule,
-`--first-due-time` or `--first-due-after` for a time or month schedule.
-`--first-due-in N` counts from the next block, like `--expire-in`. The CLI clamps
-`expire_at_height` to the first due height, or `expiration_time` below the first
-due time, because admission refuses a create that could be mined at or after its
-own first payment. `create` prints the standing payment id.
-
-Raw transactions (root fields only; a nested `payload` is ignored):
-
-| `tx_type` | Signed fields beyond the envelope |
-|---|---|
-| `standing_payment_create` | `genesis_hash`, `recipient_pubkey`, `amount`, exactly one of `interval_blocks` / `interval_seconds` / `interval_months`, `first_due`, `periods` |
-| `standing_payment_cancel` | `genesis_hash`, `standing_id` (feeless) |
-
-RPC replies:
-
-- `getstandingpayments` returns `payments` (open authorizations the address pays
-  or receives, each with its terms, current period window, `status`
-  `waiting`/`due`/`retrying` and counts), `block_hash`, and `semantics` (the
-  node's rules and limits for the feature).
-- `getstandingpayment` returns the open entry with its `history`, or
-  `{standing_id, status: "ended"|"cancelled", resolved_at_height, history}` once
-  resolved on the canonical chain, or `STANDING_PAYMENT_UNKNOWN`.
-- `gettxstatus` adds `standing: {id, status}` to a confirmed create and
-  `cancels` to a confirmed cancel.
+`--due-at` is the first due point, `--due-every N` repeats every N on the
+period's clock (at least 256 blocks, or 3600 seconds), `--due-months N`
+repeats every N calendar months (UTC, needs `--period-seconds`). A due point
+that could not pay is retried while its window is open, then counted missed,
+never caught up. `getstandingpayments` returns `payments` (open standing
+payments the address pays or receives, each with its terms, current period
+window, `status` `waiting`/`due`/`ended` and counts), `block_hash`, and
+`semantics`. `getstandingpayment` returns the open entry with its `history`,
+resolving a superseded id to the rule's current version, or
+`{standing_id, status: "ended"|"cancelled", resolved_at_height, history}`
+once resolved on the canonical chain, or `STANDING_PAYMENT_UNKNOWN`.
 
 ## Payout rules
 
-Let a Tau rule pay out an account's money: the account installs one rule, and
-anyone may execute it; each execution pays every slot the rule writes, or
-nothing, inside the caps the account signed. Semantics are in the
-[README](../README.md#payout-rules). Long-form guide: [payout_rules.md](payout_rules.md).
+Let a Tau rule pay out an account's money: the account installs rules — it may
+hold several independent ones — and anyone may execute one; each execution pays
+every slot the rule writes, or nothing, inside the caps the account signed.
+Semantics are in the [README](../README.md#payout-rules). Long-form guide:
+[payout_rules.md](payout_rules.md).
 
 ```bash
 tau-testnet payout set --key treasury --file payout.tau --slot <bob_pk> --slot open \
     --cap-per-execution 500 --cap-per-period 2000 --period-blocks 1000 --ends-in 100000
+tau-testnet payout update --key treasury --rule-id <rule_id> --file payout-v2.tau --slot <bob_pk> \
+    --cap-per-execution 500 --cap-per-period 2000 --period-blocks 1000 --ends-in 100000
 tau-testnet payout execute --key carol --account <treasury_pk> --recipient 1=<dave_pk> --data 0=300
 tau-testnet payout show <address>
-tau-testnet payout revoke --key treasury
+tau-testnet payout revoke --key treasury --rule-id <rule_id>
 # an account with a rule-change guard: the same, as a rule-change request (kinds 6 and 7)
 tau-testnet payout set ... --request --approver 18=<cosigner_pk>
 tau-testnet payout revoke --key treasury --request --approver 18=<cosigner_pk>
@@ -643,29 +628,36 @@ tau-testnet payout revoke --key treasury --request --approver 18=<cosigner_pk>
 executor names it with `--recipient K=<pk>`). Exactly one of `--period-blocks`
 and `--period-seconds`, and one of `--ends-at` (on the period's clock) and
 `--ends-in`. `--data K=V` fills input `i40+K`. `execute` reads the installed
-`rule_id` from the node unless `--rule-id` pins it, so a rule replaced in the
+`rule_id` from the node unless `--rule-id` pins it, so a rule updated in the
 meantime is refused instead of run. `set` prints the payout rule id.
 `set --per-sale` installs a rule that pays once per recorded sale (a signed
 transfer into the account); `execute --sale <tx_hash>` names the sale to pay
-(`payout show` lists the open ones).
+(`payout show` lists the open ones). `set` and `update` also take `--sealed`,
+`--periods-from`, `--due-at`, `--due-every`, `--due-months`, `--on-arrival`
+(with `--per-sale`) and `--max-fee-per-execution`. `update` has no `--request`:
+a guarded account updates by revoking and setting again.
 
 Raw transactions (root fields only; a nested `payload` is ignored):
 
 | `tx_type` | Signed fields beyond the envelope |
 |---|---|
-| `payout_rule_set` | `genesis_hash`, `rule_text`, `slots`, `cap_per_execution`, `cap_per_period`, exactly one of `period_blocks` / `period_seconds`, `expires_at`, `per_sale` when present |
+| `payout_rule_set` | `genesis_hash`, `rule_text`, `slots`, `cap_per_execution`, `cap_per_period`, exactly one of `period_blocks` / `period_seconds`, `expires_at`, `per_sale` / `sealed` / `on_arrival` / `periods_from` / `due_at` / `due_every` / `due_months` / `max_fee_per_execution` when present |
+| `payout_rule_update` | `genesis_hash`, `rule_id`, and the set fields above |
 | `payout_execute` | `genesis_hash`, `account_pubkey`, `rule_id`, `recipients` (slot -> key), `data` (k -> value), `sale_id` when present |
-| `payout_rule_revoke` | `genesis_hash` (feeless) |
+| `payout_rule_revoke` | `genesis_hash`, `rule_id` (feeless) |
 
 RPC replies:
 
-- `getpayoutrule` returns `installed`, the `rule` (terms, `spent_this_period`,
-  `left_this_period`, `executions`, `paid_total`, `last_height`), `history`
-  (installed, executed with legs, revoked, expired; canonical blocks only,
-  newest first), `block_hash`, and `semantics` (the ABI, limits and rules).
+- `getpayoutrule` returns `installed`, `rules` (every rule: terms,
+  `spent_this_period`, `left_this_period`, `executions`, `paid_total`,
+  `last_height`, `version`, `lineage`, due / missed / open-arrival fields where
+  they apply; `rule` repeats the single entry when the account holds exactly
+  one), `history` (installed, updated, executed with legs, revoked, expired;
+  canonical blocks only, newest first), `block_hash`, and `semantics` (the ABI,
+  limits and rules).
 - `gettxstatus` adds `payout` to a confirmed payout transaction: its outcome and
   legs, and for an install whether the rule is still `installed` or was
-  `replaced`, `revoked` or `expired`.
+  `revoked` or `expired`; for an update, `updated`.
 
 ## Governance
 

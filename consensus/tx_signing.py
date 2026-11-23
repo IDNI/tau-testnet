@@ -40,6 +40,7 @@ from consensus.retractable import (
 )
 from consensus.payout import (
     TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_RULE_REVOKE,
     TX_TYPE_PAYOUT_RULE_SET,
     TX_TYPE_PAYOUT_RULE_UPDATE,
 )
@@ -183,7 +184,10 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         # execution to another sale nor add or drop the field.
         if "sale_id" in payload:
             signing_dict["sale_id"] = payload.get("sale_id")
-    # payout_rule_revoke signs the envelope only: it names the sender's own rule.
+    elif tx_type == TX_TYPE_PAYOUT_RULE_REVOKE:
+        # The id selects which of the sender's rules dies, so it is signed:
+        # a proposer must not be able to retarget a revoke at another rule.
+        signing_dict["rule_id"] = payload.get("rule_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 
