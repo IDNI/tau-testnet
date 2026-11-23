@@ -426,6 +426,35 @@ def compute_rule_offer_book_root(
     return blake3(encode_rule_offer_book(offered, resolved)).digest()
 
 
+DOMAIN_POLICY_VERSIONS_V1 = b"tau.policy.versions.v1"
+
+
+def compute_policy_versions_root(
+    versions: List[tuple],
+) -> bytes:
+    """BLAKE3 of the per-policy version record. Returns 32 bytes.
+
+    `versions` holds (sender_pubkey, target_stream, version) triples,
+    sorted here by (sender, stream): the count of policy writes the
+    rule-offers book has recorded for each account's policy. A policy
+    that was never written has no entry (version 0 is the absence of a
+    record, not a stored zero), so a chain that never touches policies
+    hashes exactly as it did before this root existed.
+    """
+    entries = sorted(
+        (str(sender), int(stream), int(version))
+        for sender, stream, version in versions
+    )
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_POLICY_VERSIONS_V1.decode()))
+    out.extend(encode_uint32(len(entries)))
+    for sender, stream, version in entries:
+        out.extend(encode_pubkey48(sender))
+        out.extend(encode_uint32(stream))
+        out.extend(encode_uint64(version))
+    return blake3(bytes(out)).digest()
+
+
 DOMAIN_CLAUSE_ENTRY_V1 = b"tau.clause.entry.v1"
 DOMAIN_CLAUSE_ROOT_V1 = b"tau.clause.root.v1"
 

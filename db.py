@@ -388,6 +388,19 @@ def init_db():
                     PRIMARY KEY (acceptor_pubkey, target_stream)
                 );
             ''')
+            # The per-policy version record (Bounty 01, FIX 5): one count
+            # per (acceptor, target stream), bumped on every policy write
+            # the rule-offers book records. Its root is bound into the
+            # state hash beside the clause root, so it is written in the
+            # same transaction as the registry, for the same reason.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_policy_versions_v1 (
+                    acceptor_pubkey TEXT NOT NULL,
+                    target_stream   INTEGER NOT NULL,
+                    version         INTEGER NOT NULL,
+                    PRIMARY KEY (acceptor_pubkey, target_stream)
+                );
+            ''')
             # Co-signature approval requests: parked transfers awaiting votes.
             # The book root (including which approvers have voted) is bound into
             # consensus_meta_hash, so this must be written in the same
@@ -2243,7 +2256,7 @@ def set_chain_state_value(key: str, value: str) -> None:
             )
 
 
-def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, rule_policy_versions: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
     """
     Saves the chain state to the database atomically with Full Replace semantics for accounts, and new v2 update tracking.
 
@@ -2277,6 +2290,7 @@ def save_canonical_state_atomically(head_hash: str, head_num: int, balances: Dic
                 last_transfer_ts=last_transfer_ts,
                 rule_offers=rule_offers,
                 rule_clauses=rule_clauses,
+                rule_policy_versions=rule_policy_versions,
                 max_rule_txs_per_block=max_rule_txs_per_block,
                 approval_requests=approval_requests,
                 approval_slots_active=approval_slots_active,
@@ -2346,7 +2360,7 @@ def _confirm_rule_clauses(canonical) -> None:
         plan.confirm()
 
 
-def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
+def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[str, int], sequences: Dict[str, int], application_rules: str, consensus_rules: str, active_consensus_id: str, pending_updates: List[Dict], votes: List[Dict], scheduled: List[tuple[int, str]], archival: List[str], active_validators: List[str] | None = None, quorum_policy: str | None = None, eligibility_mode: str | None = None, fee_beneficiary: str | None = None, last_transfer_ts: Dict[str, int] | None = None, rule_offers: List[Dict] | None = None, rule_clauses: List[Dict] | None = None, rule_policy_versions: List[Dict] | None = None, max_rule_txs_per_block: int | None = None, approval_requests: List[Dict] | None = None, approval_slots_active: bool | None = None, retractable_transfers: Dict | None = None, rule_change_requests: List[Dict] | None = None):
     """The row writes, WITHOUT a transaction of its own.
 
     Callers own the transaction. `save_canonical_state_atomically` gives it
@@ -2489,6 +2503,24 @@ def _write_canonical_state_rows(head_hash: str, head_num: int, balances: Dict[st
 
     if rule_clauses is not None:
         _write_rule_clauses(rule_clauses)
+
+    # The per-policy version record, same full-replace semantics and
+    # same transaction as the clause registry: the versions root is
+    # bound into consensus_meta_hash, so disk must agree with memory.
+    if rule_policy_versions is not None:
+        _db_conn.execute('DELETE FROM rule_policy_versions_v1')
+        _db_conn.executemany(
+            'INSERT OR REPLACE INTO rule_policy_versions_v1 '
+            '(acceptor_pubkey, target_stream, version) VALUES (?, ?, ?)',
+            [
+                (
+                    r['acceptor_pubkey'],
+                    int(r['target_stream']),
+                    int(r['version']),
+                )
+                for r in rule_policy_versions
+            ],
+        )
 
     # Approval requests, same full-replace semantics and same
     # transaction as accounts, for the same reason: the request book root
@@ -2821,6 +2853,26 @@ def load_rule_clauses_token() -> str | None:
         init_db()
     with _db_lock:
         return _read_rule_clauses_token()
+
+
+def load_rule_policy_versions() -> List[Dict]:
+    """Rows of the persisted per-policy version record."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT acceptor_pubkey, target_stream, version '
+            'FROM rule_policy_versions_v1'
+        )
+        return [
+            {
+                'acceptor_pubkey': row[0],
+                'target_stream': int(row[1]),
+                'version': int(row[2]),
+            }
+            for row in cur.fetchall()
+        ]
 
 
 def get_candidate_heads() -> List[tuple[str, int]]:

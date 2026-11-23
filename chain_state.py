@@ -603,6 +603,7 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         quorum_policy=lm.quorum_policy,
         rule_offers=lm.rule_offers.snapshot_offers(),
         rule_clauses=lm.rule_offers.clause_plan(),
+        rule_policy_versions=lm.rule_offers.snapshot_policy_versions(),
         max_rule_txs_per_block=lm.max_rule_txs_per_block,
         approval_requests=lm.approval_requests.snapshot_requests(),
         rule_change_requests=lm.approval_requests.snapshot_rule_change_requests(),
@@ -2100,6 +2101,10 @@ def _restore_rule_offers(lm) -> None:
     lm.rule_offers.accepted_clauses = clauses
     lm.rule_offers.terminal_status = statuses
     lm.rule_offers.offer_payloads = payloads
+    lm.rule_offers.policy_versions = {
+        (row["acceptor_pubkey"], int(row["target_stream"])): int(row["version"])
+        for row in db.load_rule_policy_versions()
+    }
 
 
 def _restore_approvals(lm) -> None:
@@ -2433,6 +2438,9 @@ def commit_state_to_db(block_hash: str, block_number: int):
         # computes a different state hash than a peer replaying from genesis.
         rule_offers_list = _lifecycle_manager.rule_offers.snapshot_offers()
         rule_clauses_list = _lifecycle_manager.rule_offers.clause_plan()
+        rule_policy_versions_list = (
+            _lifecycle_manager.rule_offers.snapshot_policy_versions()
+        )
         max_rule_txs_snapshot = _lifecycle_manager.max_rule_txs_per_block
         approval_requests_list = _lifecycle_manager.approval_requests.snapshot_requests()
         rule_change_requests_list = (
@@ -2453,6 +2461,7 @@ def commit_state_to_db(block_hash: str, block_number: int):
         last_transfer_ts=last_transfer_ts_snapshot,
         rule_offers=rule_offers_list,
         rule_clauses=rule_clauses_list,
+        rule_policy_versions=rule_policy_versions_list,
         max_rule_txs_per_block=max_rule_txs_snapshot,
         approval_requests=approval_requests_list,
         rule_change_requests=rule_change_requests_list,
@@ -2928,6 +2937,9 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
             active_validators_list = sorted(normalize_validator_set(_lifecycle_manager.active_validators))
             rule_offers_list = _lifecycle_manager.rule_offers.snapshot_offers()
             rule_clauses_list = _lifecycle_manager.rule_offers.clause_plan()
+            rule_policy_versions_list = (
+                _lifecycle_manager.rule_offers.snapshot_policy_versions()
+            )
             head_num = db.get_block_by_hash(new_head_hash)['header']['block_number']
             db.save_canonical_state_atomically(
                 new_head_hash,
@@ -2948,6 +2960,7 @@ def reorg_to(new_head_hash: str) -> Optional[bool]:
                 last_transfer_ts=dict(_last_transfer_ts),
                 rule_offers=rule_offers_list,
                 rule_clauses=rule_clauses_list,
+                rule_policy_versions=rule_policy_versions_list,
                 max_rule_txs_per_block=_lifecycle_manager.max_rule_txs_per_block,
                 approval_requests=_lifecycle_manager.approval_requests.snapshot_requests(),
                 rule_change_requests=(

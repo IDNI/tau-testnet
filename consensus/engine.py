@@ -465,6 +465,14 @@ def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
     decision = None
     if kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
         problem = _screen_and_build(entry.body)
+    elif kind == tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY:
+        # A guarded update: the policy must exist (the release-time
+        # mirror of admission's precondition), then the new body must
+        # screen and build exactly as a set's does.
+        if not offers.clause_for(*policy_key):
+            problem = "no policy to update"
+        else:
+            problem = _screen_and_build(entry.body)
     elif kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
         problem = _screen_and_build(entry.body, guard=True)
     elif kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
@@ -499,6 +507,13 @@ def _write_rule_change(lm, rid, entry, height, timeout) -> Optional[str]:
 
     if kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
         offers.accepted_clauses[policy_key] = entry.body
+        offers.record_policy_write(sender, tau_defs.USER_POLICY_STREAM_INDEX)
+    elif kind == tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY:
+        # The update replaces the body in place: the account is never
+        # without a policy, and the version counts the write — the
+        # lineage is SET, then UPDATE, then UPDATE...
+        offers.accepted_clauses[policy_key] = entry.body
+        offers.record_policy_write(sender, tau_defs.USER_POLICY_STREAM_INDEX)
     elif kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
         offers.accepted_clauses.pop(policy_key, None)
     elif kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
@@ -2033,6 +2048,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     offers.accepted_clauses.pop(key, None)
                 else:
                     offers.accepted_clauses[key] = body
+                    # A direct declaration IS a policy write: the version
+                    # counts it, so the lineage a later UPDATE continues
+                    # includes policies declared outside the request flow.
+                    offers.record_policy_write(
+                        sender_n, tau_defs.USER_POLICY_STREAM_INDEX
+                    )
 
                 tx_receipt["logs"].append(
                     "o5 clause %s for %s"
@@ -2625,7 +2646,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         ok, reason = approvals.can_admit_rule_change(request, height_now)
                         if not ok:
                             problem = (reason, "rule_change_request_invalid")
-                        elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+                        elif request.kind in (
+                            tau_defs.RULE_CHANGE_KIND_SET_POLICY,
+                            tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY,
+                        ):
                             rejection = _clause_domain_rejection(request.body)
                             if rejection:
                                 problem = rejection
@@ -2644,6 +2668,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                             if not offers.clause_for(
                                     request.sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX):
                                 precondition = "there is no registered o5 policy to revoke"
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY:
+                            if not offers.clause_for(
+                                    request.sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX):
+                                precondition = "there is no registered o5 policy to update"
                         elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD:
                             if not offers.clause_for(
                                     request.sender_pubkey, tau_defs.RULE_CHANGE_GUARD_INDEX):

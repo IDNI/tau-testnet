@@ -1471,6 +1471,14 @@ def _rule_change_precondition_error(request, tip_view: TipAdmissionView) -> Opti
     if request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
         if not tip_view.clause_for(sender, tau_defs.USER_POLICY_STREAM_INDEX):
             return "there is no registered o5 policy to revoke"
+    elif request.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY:
+        # An update is a guarded change to a policy that exists: without
+        # one there is nothing to update, and a set (kind 1) is the way
+        # to write the first policy. The lineage stays unbroken — the
+        # account is never without a policy between the set and its
+        # updates — which is exactly what revoke+set cannot promise.
+        if not tip_view.clause_for(sender, tau_defs.USER_POLICY_STREAM_INDEX):
+            return "there is no registered o5 policy to update"
     elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD:
         if not tip_view.clause_for(sender, tau_defs.RULE_CHANGE_GUARD_INDEX):
             return "there is no registered rule-change guard to revoke"
@@ -1522,7 +1530,10 @@ def validate_rule_change_request_payload(
     if shape_error:
         return _invalid_rule_change(shape_error)
 
-    if request.kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+    if request.kind in (
+        tau_defs.RULE_CHANGE_KIND_SET_POLICY,
+        tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY,
+    ):
         domain_error = _screen_clause_domains(request.body)
     elif request.kind == tau_defs.RULE_CHANGE_KIND_SET_GUARD:
         domain_error = _screen_guard_domains(request.body)

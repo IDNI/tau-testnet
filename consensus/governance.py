@@ -197,6 +197,7 @@ def build_mechanism_metadata(
     fee_beneficiary: str = DEFAULT_FEE_BENEFICIARY,
     rule_offers_root: str = "",
     rule_clauses_root: str = "",
+    rule_policy_versions_root: str = "",
     max_rule_txs_per_block: int = DEFAULT_MAX_RULE_TXS_PER_BLOCK,
     approval_requests_root: str = "",
     approval_slots_active: bool = False,
@@ -233,6 +234,11 @@ def build_mechanism_metadata(
     if rule_offers_root:
         mech["rule_offers_root"] = rule_offers_root
         mech["rule_clauses_root"] = rule_clauses_root
+        # The per-policy version record: emitted only once a policy has
+        # ever been written, so a chain that predates it keeps a
+        # byte-identical meta hash.
+        if rule_policy_versions_root:
+            mech["rule_policy_versions_root"] = rule_policy_versions_root
     if max_rule_txs_per_block != DEFAULT_MAX_RULE_TXS_PER_BLOCK:
         mech["max_rule_txs_per_block"] = max_rule_txs_per_block
     # Co-signature approvals: same non-default gate, same reasoning. The flag is
@@ -585,6 +591,10 @@ class ConsensusLifecycleManager:
             self.effective_fee_beneficiary(),
             rule_offers_root=("" if empty_book else self.rule_offers.offers_root().hex()),
             rule_clauses_root=("" if empty_book else self.rule_offers.clauses_root().hex()),
+            rule_policy_versions_root=(
+                "" if empty_book
+                else self.rule_offers.policy_versions_root().hex()
+            ),
             max_rule_txs_per_block=self.max_rule_txs_per_block,
             approval_requests_root=(
                 "" if self.approval_requests.is_empty()

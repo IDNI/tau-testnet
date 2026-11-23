@@ -581,9 +581,11 @@ _RULE_CHANGE_BODY_KINDS = frozenset({
     tau_defs.RULE_CHANGE_KIND_SET_POLICY,
     tau_defs.RULE_CHANGE_KIND_SET_GUARD,
     tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER,
+    # An update carries a new policy body, exactly as a set does.
+    tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY,
 })
 _RULE_CHANGE_KINDS = frozenset(range(
-    tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_REVOKE_GUARD + 1
+    tau_defs.RULE_CHANGE_KIND_SET_POLICY, tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY + 1
 ))
 
 
@@ -609,7 +611,7 @@ def parse_rule_change_request_checked(
         if isinstance(val, bool) or not isinstance(val, int):
             return None, "kind, sequence_number and expire_at_height must be integers"
     if kind not in _RULE_CHANGE_KINDS:
-        return None, "kind must be 1..5"
+        return None, "kind must be 1..6"
 
     rule_text = tx.get("rule_text", "")
     if rule_text is None:
@@ -652,7 +654,10 @@ def parse_rule_change_request_checked(
             body = clause_body_v1(rule_text)
         except RuleOfferShapeError as exc:
             return None, f"rule_text is not a single clause: {exc}"
-        if kind == tau_defs.RULE_CHANGE_KIND_SET_POLICY:
+        if kind in (
+            tau_defs.RULE_CHANGE_KIND_SET_POLICY,
+            tau_defs.RULE_CHANGE_KIND_UPDATE_POLICY,
+        ):
             if clause_output_streams(rule_text) != [tau_defs.USER_POLICY_STREAM_INDEX]:
                 return None, "a policy rule must write o5 and nothing else"
             if is_neutral_clause_body(body, tau_defs.USER_POLICY_STREAM_INDEX):

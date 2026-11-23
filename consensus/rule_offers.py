@@ -18,6 +18,7 @@ import tau_defs
 from consensus.clause_registry import ClausePlan, ClauseRegistry
 from consensus.serialization import (
     compute_offer_id,
+    compute_policy_versions_root,
     compute_rule_offer_book_root,
 )
 
@@ -419,11 +420,23 @@ class RuleOfferLifecycleManager:
         offered: Optional[Dict[bytes, OfferEntry]] = None,
         resolved: Optional[Iterable[bytes]] = None,
         accepted_clauses: Optional[Mapping[Tuple[str, int], str]] = None,
+        policy_versions: Optional[Mapping[Tuple[str, int], int]] = None,
     ) -> None:
         self.offered: Dict[bytes, OfferEntry] = dict(offered or {})
         self.resolved: Set[bytes] = set(resolved or ())
         # (acceptor pubkey, target stream) -> canonical clause body.
         self._accepted_clauses = ClauseRegistry(accepted_clauses)
+        # (acceptor pubkey, target stream) -> count of policy writes the
+        # book has recorded for that policy (Bounty 01, FIX 5): SET,
+        # UPDATE and ACCEPT each count one; a revoke counts none, so the
+        # number is the length of the policy's write lineage — the
+        # executed-request chain in one integer. A policy that was never
+        # written has no entry. Persisted with the rest of the book (see
+        # snapshot_policy_versions) and bound into the state hash, so a
+        # restart cannot reset it.
+        self.policy_versions: Dict[Tuple[str, int], int] = dict(
+            policy_versions or {}
+        )
         # Node-local only: never hashed, re-derivable by replay. Kept for the
         # RPC surface so a wallet can show what an offer actually said.
         self.terminal_status: Dict[bytes, str] = {}
@@ -448,9 +461,17 @@ class RuleOfferLifecycleManager:
         contributes no key to mechanism_specific_metadata, so every chain that
         predates rule sharing keeps a byte-identical state hash. `resolved` is
         therefore never pruned -- a prune could flip this back to True and fork
-        the chain.
+        the chain. The policy-version record counts here too: a version
+        exists only after a policy write, which also registers a clause,
+        so in practice the two empties agree — but the gate must not be
+        able to hide a recorded version.
         """
-        return not self.offered and not self.resolved and not self.accepted_clauses
+        return (
+            not self.offered
+            and not self.resolved
+            and not self.accepted_clauses
+            and not self.policy_versions
+        )
 
     def offers_root(self) -> bytes:
         return compute_rule_offer_book_root(
@@ -468,6 +489,45 @@ class RuleOfferLifecycleManager:
 
     def clauses_root(self) -> bytes:
         return self._accepted_clauses.root()
+
+    def policy_version(
+        self, sender_pubkey: str, stream: int = tau_defs.USER_POLICY_STREAM_INDEX
+    ) -> int:
+        """How many policy writes the book has recorded for one policy.
+
+        0 when the policy was never written — the absence of a record,
+        not a stored zero. The stream defaults to the o5 policy stream;
+        the guard stream (RULE_CHANGE_GUARD_INDEX) is versioned the same
+        way when a guard is written.
+        """
+        return int(self.policy_versions.get((sender_pubkey, stream), 0))
+
+    def record_policy_write(
+        self, sender_pubkey: str, stream: int = tau_defs.USER_POLICY_STREAM_INDEX
+    ) -> int:
+        """Count one policy write for one policy; returns the new version.
+
+        Called by every site that lands a policy body in the registry —
+        SET, UPDATE and ACCEPT, and the direct o5-clause path — so the
+        number is the length of the policy's write lineage however the
+        write arrived. A revoke counts none: it removes the body, not
+        the history, so a later SET continues the count.
+        """
+        key = (sender_pubkey, stream)
+        version = int(self.policy_versions.get(key, 0)) + 1
+        self.policy_versions[key] = version
+        return version
+
+    def policy_versions_root(self) -> bytes:
+        """BLAKE3 of the per-policy version record (empty when none)."""
+        if not self.policy_versions:
+            return b""
+        return compute_policy_versions_root(
+            [
+                (sender, stream, version)
+                for (sender, stream), version in self.policy_versions.items()
+            ]
+        )
 
     # -- queries ------------------------------------------------------------
 
@@ -582,6 +642,9 @@ class RuleOfferLifecycleManager:
         # An acceptor holds at most one clause per stream; accepting a new one
         # replaces it.
         self.accepted_clauses[(decision.actor_pubkey, target)] = body
+        # An acceptance IS a policy write: the version counts it, so the
+        # lineage a later UPDATE continues includes offers accepted.
+        self.record_policy_write(decision.actor_pubkey, target)
         self.terminal_status[decision.offer_id] = STATUS_ACCEPTED
         return target
 
@@ -622,6 +685,25 @@ class RuleOfferLifecycleManager:
                 "status": self.terminal_status.get(offer_id, STATUS_REJECTED),
             })
         return rows
+
+    def snapshot_policy_versions(self) -> List[Dict[str, Any]]:
+        """Rows for the node-local policy-version table.
+
+        One row per policy the book has ever recorded a write for, in
+        canonical (sender, stream) order. Saved in the same atomic write
+        as the clause registry, for the same reason: the versions root is
+        bound into the state hash, so disk must agree with memory.
+        """
+        return [
+            {
+                "acceptor_pubkey": sender,
+                "target_stream": stream,
+                "version": version,
+            }
+            for (sender, stream), version in sorted(
+                self.policy_versions.items()
+            )
+        ]
 
     def clause_plan(self) -> ClausePlan:
         """The registry writes for one state save; confirm it after the commit."""
