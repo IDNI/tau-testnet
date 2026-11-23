@@ -301,8 +301,11 @@ def test_catch_up_only_when_signed_terms_permit():
 
 def test_update_is_new_version_superseding():
     """Update = a new signed version, never an invisible mutation: the old
-    version stops executing, the new one starts with fresh progress, and
-    the old version's facts remain readable."""
+    version stops executing, and the old version's facts remain readable.
+    FIX 5C: the new version starts with the settled current period carried
+    over — an update never lets one period be paid twice — so its first
+    period is already settled and the next period pays under the new terms.
+    """
     v1 = sp(max_occ=10)
     book = book_with(v1)
     book.execute(v1.auth_id, ANCHOR, 10_000)
@@ -314,8 +317,12 @@ def test_update_is_new_version_superseding():
     assert book.get(v1.auth_id) is None
     with pytest.raises(ValueError):
         book.execute(v1.auth_id, ANCHOR + WEEK, 10_000)
-    assert book.total_executed(v2.auth_id) == (0, 0)  # fresh progress
-    settled = book.execute(v2.auth_id, ANCHOR, 10_000)
+    # FIX 5C: period 0 arrives settled with v1's 500 already paid.
+    assert book.total_executed(v2.auth_id) == (1, 500)
+    assert book.paid_for_period(v2.auth_id, 0).amount == 500
+    again = book.execute(v2.auth_id, ANCHOR, 10_000)
+    assert not again.executed and "already settled" in again.reason
+    settled = book.execute(v2.auth_id, ANCHOR + WEEK, 10_000)
     assert settled.executed and settled.amount == 700
     old_fact = book.paid_for_period(v1.auth_id, 0)
     assert old_fact is not None and old_fact.amount == 500  # history not rewritten
