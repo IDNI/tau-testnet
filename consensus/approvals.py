@@ -533,7 +533,10 @@ class RuleChangeRequest:
     @property
     def body(self) -> str:
         """The normalized clause body (the exact offered text for an accept);
-        "" for kinds that carry none."""
+        for a payout revoke the place it names ("" for the first rule); "" for
+        kinds that carry none."""
+        if self.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
+            return self.rule_text
         if self.kind not in _RULE_CHANGE_BODY_KINDS:
             return ""
         if self.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
@@ -634,7 +637,15 @@ def parse_rule_change_request_checked(
     has_body = kind in _RULE_CHANGE_BODY_KINDS
     if has_body and not rule_text.strip():
         return None, "this kind needs a non-empty rule_text"
-    if not has_body and rule_text != "":
+    if kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT and rule_text != "":
+        # A revoke of the rule in another place than the first names it.
+        from consensus.payout import PayoutShapeError, payout_revoke_place
+
+        try:
+            payout_revoke_place(rule_text)
+        except PayoutShapeError as exc:
+            return None, str(exc)
+    elif not has_body and rule_text != "":
         return None, "this kind carries no rule_text"
 
     offer_id = tx.get("offer_id", "")

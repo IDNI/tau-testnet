@@ -25,7 +25,12 @@ def semantics() -> dict:
     return {
         "version": 1,
         "tx_types": sorted(payout.PAYOUT_TX_TYPES),
-        "rules_per_account": 1,
+        "rules_per_account": payout.MAX_RULES_PER_ACCOUNT,
+        "rule_index": "the rule's place on the account: left out for the first, "
+                      f"1..{payout.MAX_RULES_PER_ACCOUNT - 1} for the others; a set "
+                      "installs or replaces the rule in its place only, a revoke "
+                      "names the place (rule_index, or the rule_text of a kind 7 "
+                      "request); an execution names the rule by its id",
         "slots": [1, payout.MAX_SLOTS],
         "executor_data": payout.MAX_DATA,
         "abi": {
@@ -61,6 +66,13 @@ def semantics() -> dict:
                       f"{payout.MAX_DUE_MONTHS} calendar months, UTC, time clock): the "
                       "node runs the rule at every such point from due_at on, each "
                       "once; a point the chain passed is not caught up",
+            "retry": "due_retry (on the rule's clock, at most one period's range): "
+                     "a run that found the account short is run again in each "
+                     "later block, after the block's due points, at most "
+                     f"{payout.MAX_PAYOUT_RETRY_RUNS_PER_BLOCK} a block, longest "
+                     "waiting first, until it pays or the clock reaches the due "
+                     "point plus due_retry, the next due point or the rule's end; "
+                     "a refusal for another reason ends it",
         },
         "on_arrival": {
             "term": "on_arrival: true, with per_sale and a fixed slot",
@@ -129,11 +141,15 @@ def execute(raw_command: str, container):
     except Exception:
         history = []
     head, next_height, book = _tip()
+    keys = book.keys_of(address)
+    now = int(time.time())
     terms = book.get(address)
-    data = {"address": address, "block_hash": head, "installed": terms is not None}
+    data = {"address": address, "block_hash": head, "installed": bool(keys)}
     if terms is not None:
-        data["rule"] = describe(terms, book.state_of(address),
-                                height=next_height, ts=int(time.time()))
+        # the first place, as before several rules per account
+        data["rule"] = describe(terms, book.state_of(address), height=next_height, ts=now)
+    data["rules"] = [describe(book.get(k), book.state_of(k), height=next_height, ts=now)
+                     for k in keys]
     data["history"] = history
     data["semantics"] = semantics()
     return api_response.success_response(_CMD, data)

@@ -831,23 +831,27 @@ def _encode_payout_terms(
 
 def _encode_payout_options(periods_from: Any, due_at: Any, due_every: Any = None,
                            due_months: Any = None, on_arrival: bool = False,
-                           sealed: bool = False) -> bytes:
+                           sealed: bool = False, rule_index: Any = None,
+                           due_retry: Any = None) -> bytes:
     """The optional terms of a payout rule: one byte saying which are there
     (bit 0 `periods_from`, bit 1 `due_at`, bit 2 `due_every`, bit 3 `due_months`,
-    bit 4 `on_arrival`, bit 5 `sealed`), then each number present as a uint64,
-    in that order. The two switches carry no number."""
+    bit 4 `on_arrival`, bit 5 `sealed`, bit 6 `rule_index`, bit 7 `due_retry`),
+    then each number present as a uint64, in that order. The two switches carry
+    no number. A rule without the two later numbers encodes as it always did."""
     numbers = (periods_from, due_at, due_every, due_months)
     flags = sum(1 << k for k, value in enumerate(numbers) if value is not None)
     flags |= (16 if on_arrival else 0) | (32 if sealed else 0)
+    flags |= (64 if rule_index is not None else 0) | (128 if due_retry is not None else 0)
     out = bytearray([flags])
-    for value in numbers:
+    for value in numbers + (rule_index, due_retry):
         if value is not None:
             out.extend(encode_uint64(int(value)))
     return bytes(out)
 
 
 def payout_options_present(options: Any) -> bool:
-    """`options` = (periods_from, due_at, due_every, due_months, on_arrival, sealed)."""
+    """`options` = (periods_from, due_at, due_every, due_months, on_arrival, sealed,
+    rule_index, due_retry); the last two may be left off."""
     return any(v is not None and v is not False for v in options)
 
 
@@ -868,6 +872,8 @@ def compute_payout_rule_id(
     due_months: Any = None,
     on_arrival: bool = False,
     sealed: bool = False,
+    rule_index: Any = None,
+    due_retry: Any = None,
 ) -> bytes:
     """BLAKE3 of the signed terms of a payout rule. Returns 32 bytes.
 
@@ -885,7 +891,8 @@ def compute_payout_rule_id(
         account_pubkey, sequence_number, body_hash, slots, cap_per_execution,
         cap_per_period, kind, period, expires_at,
     ))
-    options = (periods_from, due_at, due_every, due_months, on_arrival, sealed)
+    options = (periods_from, due_at, due_every, due_months, on_arrival, sealed,
+               rule_index, due_retry)
     if payout_options_present(options):
         out.extend(_encode_payout_options(*options))
     return blake3(bytes(out)).digest()
@@ -930,8 +937,10 @@ def encode_payout_entry(
     `more`, only for a rule that carries an optional term or reads the clocks the
     node keeps for it: (periods_from, due_at, last_clock, due_done), then, when
     one of the later terms is there, (due_every, due_months, on_arrival, sealed,
-    due_index). A rule with none of it keeps the entry it always had, and a rule
-    with only the first two terms keeps the entry those gave it.
+    due_index), then, when the rule has a place other than the first or retries
+    its due points, (rule_index, due_retry, retry_at, retry_until). A rule with none of it
+    keeps the entry it always had, and a rule with only the earlier terms keeps
+    the entry those gave it.
     """
     out = bytearray()
     out.extend(encode_hash32(rule_id))
@@ -959,14 +968,22 @@ def encode_payout_entry(
         periods_from, due_at, last_clock, due_done = more[:4]
         due_every, due_months, on_arrival, sealed, due_index = (
             tuple(more[4:9]) if len(more) > 4 else (None, None, False, False, 0))
+        rule_index, due_retry, retry_at, retry_until = (
+            tuple(more[9:13]) if len(more) > 9 else (None, None, 0, 0))
         out.extend(b"\x02")
         out.extend(_encode_payout_options(
-            periods_from, due_at, due_every, due_months, on_arrival, sealed))
+            periods_from, due_at, due_every, due_months, on_arrival, sealed,
+            rule_index, due_retry))
         out.extend(encode_uint64(int(last_clock)))
         out.extend(b"\x01" if due_done else b"\x00")
         if due_every is not None or due_months is not None:
             # which due point of a repeating rule comes next
             out.extend(encode_uint64(int(due_index)))
+        if due_retry is not None:
+            # when the node tries an unpaid due point again and until when,
+            # both 0 while it owes no retry
+            out.extend(encode_uint64(int(retry_at)))
+            out.extend(encode_uint64(int(retry_until)))
     return bytes(out)
 
 

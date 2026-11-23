@@ -2464,6 +2464,10 @@ def _payout_fields(args, tip: int, now: int) -> dict:
            if getattr(args, "due_months", None) is not None else {}),
         **({"on_arrival": True} if getattr(args, "on_arrival", False) else {}),
         **({"sealed": True} if getattr(args, "sealed", False) else {}),
+        **({"rule_index": int(args.rule_index)}
+           if getattr(args, "rule_index", None) is not None else {}),
+        **({"due_retry": int(args.due_retry)}
+           if getattr(args, "due_retry", None) is not None else {}),
     }
 
 
@@ -2507,8 +2511,11 @@ def cmd_payout_set(args: argparse.Namespace) -> int:
 
 
 def cmd_payout_revoke(args: argparse.Namespace) -> int:
+    place = getattr(args, "rule_index", None)
     if args.request:
-        return _submit_rule_change(args, _KIND_PAYOUT_REVOKE, "", "")
+        # A kind 7 request names a place other than the first in its rule_text.
+        return _submit_rule_change(args, _KIND_PAYOUT_REVOKE,
+                                   "" if place is None else str(int(place)), "")
 
     def _build(sender_pubkey, sequence_number, expire_at_height):
         return tx_mod.build_payout_rule_revoke_tx(
@@ -2516,6 +2523,7 @@ def cmd_payout_revoke(args: argparse.Namespace) -> int:
             sequence_number=sequence_number,
             expiration_time=int(_now()) + args.expiry,
             expire_at_height=expire_at_height,
+            rule_index=place,
         )
 
     if args.expire_in is None:
@@ -2525,14 +2533,20 @@ def cmd_payout_revoke(args: argparse.Namespace) -> int:
     return _submit_rule_tx(args, _build)
 
 
-def _installed_rule_id(args, account: str) -> str:
+def _installed_rule_id(args, account: str, place: int = 0) -> str:
     raw = _send(args, f"getpayoutrule {account}")
     if rpc_mod.is_error_response(raw):
         raise _PayloadError(f"cannot read the payout rule of {account}: {raw}")
     data = (parse_json_response(raw) or {}).get("data") or {}
-    if not data.get("installed"):
-        raise _PayloadError(f"{account} has no payout rule installed")
-    return data["rule"]["rule_id"]
+    rules = data.get("rules")
+    if rules is None:   # a node from before several rules per account
+        rules = [data["rule"]] if data.get("installed") else []
+    for rule in rules:
+        if int(rule.get("rule_index") or 0) == int(place):
+            return rule["rule_id"]
+    if place:
+        raise _PayloadError(f"{account} has no payout rule in place {place}")
+    raise _PayloadError(f"{account} has no payout rule installed")
 
 
 def cmd_payout_execute(args: argparse.Namespace) -> int:
@@ -2546,7 +2560,8 @@ def cmd_payout_execute(args: argparse.Namespace) -> int:
             except ValueError:
                 raise _PayloadError(f"--data {k}: {v!r} is not an integer")
         account = args.account.strip().lower()
-        rule_id = (args.rule_id or _installed_rule_id(args, account)).strip().lower()
+        rule_id = (args.rule_id or _installed_rule_id(
+            args, account, getattr(args, "rule_index", None) or 0)).strip().lower()
         sale_id = args.sale.strip().lower() if args.sale else None
         if sale_id is not None and (len(sale_id) != 64
                                     or any(c not in "0123456789abcdef" for c in sale_id)):
@@ -2669,11 +2684,19 @@ def _add_payout_subparsers(sub) -> None:
     p_set.add_argument("--sealed", action="store_true",
                        help="Until the rule ends the account signs nothing and the rule "
                             "cannot be changed: money leaves by the rule only")
+    p_set.add_argument("--rule-index", type=int, metavar="K",
+                       help="The rule's place on the account, 1..7 (default: the first); "
+                            "a set replaces only the rule in its own place")
+    p_set.add_argument("--due-retry", type=int, metavar="N",
+                       help="With --due-at: a due point that found the account short is "
+                            "run again in later blocks for up to N blocks or seconds")
     _tx_flags(p_set, request=True)
     p_set.set_defaults(func=cmd_payout_set)
 
     p_rev = psub.add_parser("revoke", parents=common, help="Remove your payout rule")
     _key_group(p_rev)
+    p_rev.add_argument("--rule-index", type=int, metavar="K",
+                       help="Remove the rule in place K, 1..7 (default: the first)")
     _tx_flags(p_rev, fee=False, request=True)
     p_rev.set_defaults(func=cmd_payout_revoke)
 
@@ -2682,6 +2705,9 @@ def _add_payout_subparsers(sub) -> None:
     _key_group(p_exe)
     p_exe.add_argument("--account", required=True, help="The paying account (96 hex)")
     p_exe.add_argument("--rule-id", help="Pin the rule (default: the installed one)")
+    p_exe.add_argument("--rule-index", type=int, metavar="K",
+                       help="Without --rule-id: run the account's rule in place K "
+                            "(default: the first)")
     p_exe.add_argument("--recipient", action="append", metavar="SLOT=PUBKEY",
                        help="Name the recipient of an open slot. Repeatable.")
     p_exe.add_argument("--data", action="append", metavar="K=VALUE",

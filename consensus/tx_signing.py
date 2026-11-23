@@ -40,6 +40,7 @@ from consensus.retractable import (
 )
 from consensus.payout import (
     TX_TYPE_PAYOUT_EXECUTE,
+    TX_TYPE_PAYOUT_RULE_REVOKE,
     TX_TYPE_PAYOUT_RULE_SET,
 )
 from consensus.rule_offers import (
@@ -149,9 +150,11 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
             signing_dict["per_sale"] = payload.get("per_sale")
         # The optional terms, signed when present: where the periods count from,
         # the points at which the node runs the rule itself, whether it runs it
-        # for each payment that arrives, and whether the account is sealed.
+        # for each payment that arrives, whether the account is sealed, the
+        # rule's place on the account and how long an unpaid due point is
+        # tried again.
         for field in ("periods_from", "due_at", "due_every", "due_months",
-                      "on_arrival", "sealed"):
+                      "on_arrival", "sealed", "rule_index", "due_retry"):
             if field in payload:
                 signing_dict[field] = payload.get(field)
     elif tx_type == TX_TYPE_PAYOUT_EXECUTE:
@@ -164,7 +167,11 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         # execution to another sale nor add or drop the field.
         if "sale_id" in payload:
             signing_dict["sale_id"] = payload.get("sale_id")
-    # payout_rule_revoke signs the envelope only: it names the sender's own rule.
+    elif tx_type == TX_TYPE_PAYOUT_RULE_REVOKE:
+        # The envelope names the sender's own rule; the place, when it is not
+        # the first, is signed so a proposer cannot move the revoke to another.
+        if "rule_index" in payload:
+            signing_dict["rule_index"] = payload.get("rule_index")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

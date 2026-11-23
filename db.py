@@ -2787,12 +2787,20 @@ def _write_payout_rows(state: Dict) -> None:
                 'due_at': None if due_at is None else int(due_at),
                 'last_clock': int(last_clock), 'due_done': bool(due_done)}
             if len(row[17]) > 4:
-                due_every, due_months, on_arrival, sealed, due_index = row[17][4:]
+                due_every, due_months, on_arrival, sealed, due_index = row[17][4:9]
                 more[account].update({
                     'due_every': None if due_every is None else int(due_every),
                     'due_months': None if due_months is None else int(due_months),
                     'on_arrival': bool(on_arrival), 'sealed': bool(sealed),
                     'due_index': int(due_index)})
+            if len(row[17]) > 9:
+                # A rule in another place than the first, or one that retries
+                # an unpaid due point. Its `account` is the rule's key.
+                rule_index, due_retry, retry_at, retry_until = row[17][9:]
+                more[account].update({
+                    'rule_index': None if rule_index is None else int(rule_index),
+                    'due_retry': None if due_retry is None else int(due_retry),
+                    'retry_at': int(retry_at), 'retry_until': int(retry_until)})
         _db_conn.execute(
             f'INSERT INTO payout_rules_v1 ({_PAYOUT_COLUMNS}) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
@@ -2854,6 +2862,9 @@ def load_payout_state() -> tuple[List[tuple], int, bytes]:
             if 'due_index' in entry:
                 head += (entry['due_every'], entry['due_months'], entry['on_arrival'],
                          entry['sealed'], entry['due_index'])
+            if 'retry_until' in entry:
+                head += (entry['rule_index'], entry['due_retry'], entry['retry_at'],
+                         entry['retry_until'])
             row += (kept, head)
         elif kept is not None:
             row += (kept,)

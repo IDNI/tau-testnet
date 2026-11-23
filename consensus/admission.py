@@ -62,9 +62,11 @@ from consensus.payout import (
     PayoutState,
     execution_inputs as payout_execution_inputs,
     parse_payout_execute,
-    parse_payout_rule_revoke,
+    parse_payout_rule_revoke_place,
     parse_payout_rule_set,
     parse_payout_spec,
+    payout_key,
+    payout_revoke_place,
     settle as settle_payout,
 )
 from consensus.retractable import (
@@ -1454,7 +1456,11 @@ def _rule_change_precondition_error(request, tip_view: TipAdmissionView) -> Opti
         if reason:
             return reason
     elif request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT:
-        if tip_view.payout_book().get(sender) is None:
+        try:
+            place = payout_revoke_place(request.body)
+        except PayoutShapeError as exc:
+            return str(exc)
+        if tip_view.payout_book().get(payout_key(sender, place)) is None:
             return "there is no payout rule to revoke"
     elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
         row = tip_view.get_offer(request.offer_id)
@@ -1794,6 +1800,8 @@ def validate_payout_rule_set_payload(
         **({"due_months": terms.due_months} if terms.due_months is not None else {}),
         **({"on_arrival": True} if terms.on_arrival else {}),
         **({"sealed": True} if terms.sealed else {}),
+        **({"rule_index": terms.rule_index} if terms.rule_index is not None else {}),
+        **({"due_retry": terms.due_retry} if terms.due_retry is not None else {}),
     })
 
 
@@ -1801,14 +1809,17 @@ def validate_payout_rule_revoke_payload(
     tx: Dict, tip_view: TipAdmissionView
 ) -> AdmissionResult:
     try:
-        account = parse_payout_rule_revoke(tx)
+        account, place = parse_payout_rule_revoke_place(tx)
     except PayoutShapeError as exc:
         return format_error(f"Malformed payout_rule_revoke: {exc}.")
     sender = tx.get("sender_pubkey")
     if not isinstance(sender, str) or sender != account:
         return format_error("payout_rule_revoke sender_pubkey must match the signer.")
-    terms = tip_view.payout_book().get(account)
+    terms = tip_view.payout_book().get(payout_key(account, place))
     if terms is None:
+        if place:
+            return format_error(f"The account has no payout rule in place {place}.",
+                                code="NO_PAYOUT_RULE")
         return format_error("The account has no payout rule.", code="NO_PAYOUT_RULE")
     refusal = _rule_change_refusal(tip_view, sender, tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT)
     if refusal is not None:

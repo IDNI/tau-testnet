@@ -60,22 +60,24 @@ tau-testnet payout set --key treasury --file payout.tau \
 | `due_months` | Optional, 1 to 12, with `due_at` and `period_seconds`. The node runs the rule again every so many calendar months, UTC. |
 | `on_arrival` | Optional, `true` or left out, with `per_sale`. The node runs the rule itself for each payment that arrives. |
 | `sealed` | Optional, `true` or left out. Until the rule ends the account signs nothing and the rule cannot be changed. |
+| `rule_index` | Optional, 1 to 7 or left out. The rule's place on the account; left out, the first ([Several rules per account](#several-rules-per-account)). |
+| `due_retry` | Optional, a number or left out, with `due_at`. A due point that found the account short is run again until this much later ([A due point tried again](#a-due-point-tried-again)). |
 
 Admission and apply refuse a rule that pays the account itself in a fixed slot,
 names one fixed recipient in two slots, or does not fit the ABI. The rule is
 built (compiled) in the payout pool at admission and again at apply; a rule that
 does not build is not installed.
 
-Installing costs one fee, paid by the account. Installing again replaces the
-current rule: the old one is removed (outcome `replaced`) and the new one starts
-its own period count where it is installed. There is no edit.
+Installing costs one fee, paid by the account. Installing again in the same
+place replaces the rule there: the old one is removed (outcome `replaced`) and
+the new one starts its own period count where it is installed. There is no edit.
 
 ### The id
 
 `rule_id` is a BLAKE3 hash over the account, the install's sequence number, the
 hash of the normalized rule body, the slots, both caps, the period clock and
-length, and `expires_at` (`compute_payout_rule_id`), followed by `periods_from`
-and `due_at` when the rule carries one. Every execution names the id, so an
+length, and `expires_at` (`compute_payout_rule_id`), followed by the optional
+terms when the rule carries one (the place included). Every execution names the id, so an
 execution signed against a rule the account has since replaced is refused
 instead of running the new rule.
 
@@ -250,10 +252,12 @@ executions either; it governs installing and revoking (below).
 
 ```bash
 tau-testnet payout revoke --key treasury
+tau-testnet payout revoke --key treasury --rule-index 2     # the rule in place 2
 ```
 
 Account only, fee-free, effective in its own block: an execution later in that
-block finds no rule. A rule also ends on its own when its block (or block time)
+block finds no rule. A revoke names the place (`rule_index`, signed; left out,
+the first) and removes only the rule there. A rule also ends on its own when its block (or block time)
 reaches `expires_at`; the money stays where it is.
 
 ## The rule-change guard
@@ -505,8 +509,10 @@ always ( (i13[t]:bv[384] = { 0 }:bv[384])
   stood still does not pay several at once.
 - A run that pays nothing (the account does not hold the amount, a cap is
   reached, the rule answers 0) is recorded as `due_not_paid` with the reason.
-  Nothing is owed for it later. A rule that wants to make up for it can say so
-  itself: it reads the clock of its last paid execution on `i49`.
+  Nothing is owed for it later, unless the rule carries `due_retry` and the
+  account was short ([A due point tried again](#a-due-point-tried-again)). A
+  rule can also make up for it itself: it reads the clock of its last paid
+  execution on `i49`.
 - The last due point is the last one before `expires_at`. The rule is kept
   until that one has run, then it ends like any rule.
 - Revoking the rule stops every later run. A revoke in the block of a due point
@@ -516,6 +522,40 @@ always ( (i13[t]:bv[384] = { 0 }:bv[384])
 
 `getpayoutrule` shows `due_every` or `due_months`, `next_due` and the number of
 the next due point; the history shows `due_index` with each run.
+
+### A due point tried again
+
+A due point can find the account short: the rule pays 100 and the account holds
+60. Without more, that point is lost. `due_retry` (signed, with `due_at`) makes
+the node run it again:
+
+```bash
+# the rent again; if the 31st finds the account short, try until a week later
+tau-testnet payout set --key alice --file rent.tau --slot <bob_pubkey> \
+    --cap-per-execution 100 --cap-per-period 100 \
+    --period-seconds 86400 --ends-at 1830297600 \
+    --due-at 1801353600 --due-months 1 --due-retry 604800
+```
+
+- Only a run refused because the account holds less than the rule pays is
+  tried again. A run the rule answers with 0, or one a cap refuses, is not.
+- The retry is a run like the one at the due point: no executor, fixed slots
+  only, the balance the block has reached, all slots or none, the rule's caps.
+- It runs in each later block, after the block's due points, at most 4 a block,
+  longest waiting first, so a retry never takes a run from another rule's due
+  point. Found short again, it waits for the next block.
+- It is owed until the rule's clock reaches the due point plus `due_retry`, the
+  rule's next due point or its end, whichever comes first. Then it ends unpaid
+  (`due_retry_ended` in the history, when no block tried it in time) and
+  nothing more is owed.
+- A retry does not make the miner produce a block. The money that lets it pay
+  reaches the account in a block, and the retry runs at the end of that block.
+- `due_retry` is on the rule's clock: 1 to 1,000,000 blocks with
+  `period_blocks`, 1 second to 366 days with `period_seconds`.
+
+`getpayoutrule` shows `due_retry`, and `retry_at` and `retry_until` while a
+retry is owed; the history marks each retry with `retry: true`, and a run that
+leaves one owed with `retry_at`.
 
 ### A payment that arrives
 
@@ -603,11 +643,41 @@ tau-testnet payout set --key grant --file conditions.tau \
 Use an account made for the purpose: a sealed account cannot do anything else
 with its key, votes and approvals included.
 
+## Several rules per account
+
+An account holds up to eight payout rules, one per place: the first place, and
+places 1 to 7 named by `rule_index`. A payer with a rent, a salary and a
+royalty split keeps three rules, each with its own text, slots, caps, clock and
+end.
+
+```bash
+tau-testnet payout set --key alice --file rent.tau --slot <bob_pubkey> ... --due-at ...
+tau-testnet payout set --key alice --file salary.tau --slot <carol_pubkey> ... --rule-index 1
+tau-testnet payout execute --key dave --account <alice_pubkey> --rule-index 1 --data 0=300
+tau-testnet payout revoke --key alice --rule-index 1
+```
+
+- A set installs or replaces the rule in its own place only. The place is part
+  of the signed terms and of the id.
+- A revoke names the place; a guarded account's revoke request (kind 7) names
+  it in its `rule_text` ("" for the first rule, as before, or "1" to "7").
+- An execution names the rule by its id, as always; the CLI looks the id up by
+  `--rule-index`.
+- Each rule has its own period count, due points, open sales and runs. A
+  payment that arrives is a sale of every per-sale rule of the account, and each
+  pays its own share of it under its own caps.
+- A sealed rule in any place seals the account: until it ends, the account
+  signs nothing, so no rule of it can be set or revoked.
+- The 4,096 rules of the book count rules, not accounts.
+
 `tests/test_payout_triggers.py` pins all of this without an engine, including
 that every rule from before is byte for byte the rule it was;
 `tests/test_payout_triggers_native.py` runs the rules above on the real engine;
 `scripts/e2e_payout_triggers.py` runs a recurring payment, a route and a sealed
-account on two live nodes.
+account on two live nodes. `tests/test_payout_places.py` and
+`tests/test_payout_places_guard.py` pin the places and the retry without an
+engine, `tests/test_payout_places_native.py` runs them on the real engine, and
+`scripts/e2e_payout_places.py` on two live nodes.
 
 ## Inspecting
 
@@ -616,7 +686,8 @@ tau-testnet payout show <address>
 tau-testnet getpayoutrule <address>       # raw RPC
 ```
 
-`getpayoutrule` answers `installed`, the rule with its terms and where it
+`getpayoutrule` answers `installed`, `rules` (every place, first place first),
+the rule in the first place (`rule`) with its terms and where it
 stands (`spent_this_period`, `left_this_period`, `executions`, `paid_total`,
 `last_height`), its history on this node (newest first, canonical blocks only),
 and `semantics`: the node's own constants, so a wallet can explain the feature
@@ -628,13 +699,14 @@ account's).
 
 | Limit | Value |
 |---|---|
-| Rules per account | 1 |
+| Rules per account | 8 (the first place and places 1 to 7) |
 | Rules in total | 4,096 |
 | Slots per rule | 8 |
 | Executor data inputs | 8 |
 | Executions per block | 16 |
 | Due points run per block | 16 |
 | Runs on arrival per block | 16 |
+| Retries of a short due point per block | 4 |
 | Shortest repeat (`due_every`) | 256 blocks, or 3,600 seconds |
 | Rule text | 4,096 bytes |
 | Open sales per rule (`per_sale`) | 64 |
@@ -645,9 +717,9 @@ account's).
 |---|---|
 | `INVALID_PAYOUT_RULE` | The rule is malformed, does not fit the ABI, or breaks a limit. |
 | `DUPLICATE_PAYOUT_RULE` | This exact rule is already installed. |
-| `PAYOUT_BOOK_FULL` | 4,096 accounts already have a rule (replacing your own is still possible). |
+| `PAYOUT_BOOK_FULL` | 4,096 rules are installed (replacing one of your own is still possible). |
 | `PAYOUT_RULE_DOES_NOT_BUILD` | The rule does not compile. |
-| `NO_PAYOUT_RULE` | Revoke without an installed rule. |
+| `NO_PAYOUT_RULE` | Revoke without an installed rule in the place named. |
 | `INVALID_PAYOUT_EXECUTION` | The execution is malformed. |
 | `PAYOUT_REFUSED` | The execution would be refused (reason in the message). |
 | `RULE_CHANGE_NEEDS_APPROVAL` | The account's guard blocks the change; use `--request`. |
@@ -690,7 +762,7 @@ execution signed for another network is refused here.
 
 ## Consensus notes
 
-- The book (one row per account: the id, the terms, and where it stands) plus a
+- The book (one row per rule: the id, the terms, and where it stands) plus a
   running commitment of every removal (`replaced`, `revoked`, `expired`) is
   folded into the consensus metadata as `payout_rules_root` **only once the book
   has held a rule**. Until then the metadata is unchanged, so **no regenesis** is
@@ -713,6 +785,11 @@ execution signed for another network is refused here.
   recorded the sale, account). A rule with `due_every`, `due_months`, `on_arrival` or
   `sealed` adds those terms and the number of its next due point to the second
   part of its entry; a rule without them hashes exactly as before.
+- A rule in another place than the first, or one with `due_retry`, adds its
+  place, `due_retry`, and where a retry stands (`retry_at`, `retry_until`) to
+  the second part of its entry. Retries run after the due points, in the order
+  (retry point, key), at most 4 a block. A rule without these terms hashes
+  exactly as before.
 - The seal is checked in the block against the book as the block has built it,
   so a transaction of the account later in the block that installed the sealed
   rule is refused too.
@@ -727,7 +804,7 @@ refuses it. Upgrade every node before anyone sends the first one.
 
 | Table | Written | Read by |
 |---|---|---|
-| `payout_rules_v1 (account_pubkey, rule_id, …)` | with the accounts, in the block's state commit | restore at start, `getpayoutrule` |
+| `payout_rules_v1 (account_pubkey, rule_id, …)`; `account_pubkey` is the rule's key: the account for the first place, `account/k` for place k | with the accounts, in the block's state commit | restore at start, `getpayoutrule` |
 | `payout_events (account_pubkey, block_hash, …)`, indexed by account | per block, every node, apply and replay | `getpayoutrule`, `gettxstatus` |
 
 Tables and columns are created on start; there is no manual migration.
@@ -771,14 +848,13 @@ replay could not run the rule; nothing moves, and the state hash says so.
 - Executions are bounded per block (16), and refused ones cost the executor
   nothing but are not included either, so they cannot fill blocks.
 - Runs the node makes are bounded per block too (16 at due points, 16 on
-  arrival), and each run on arrival was paid for by the fee of the payment that
-  caused it.
+  arrival, 4 retries), and each run on arrival was paid for by the fee of the
+  payment that caused it.
 - A seal binds the key holder for the life of the rule and nobody can lift it,
   the key holder included. Check the rule text and `expires_at` before signing.
 
 ## Not in this release
 
-- More than one rule per account.
 - A run on arrival for money the node itself moved (a payout leg, a released
   transfer): only a signed payment is a sale.
 - Executor data wider than `bv[24]`.

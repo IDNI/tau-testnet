@@ -595,16 +595,20 @@ def build_rule_change_request_tx(
 
     Kinds 1 and 4 carry the clause in ``rule_text``; kind 3 carries the exact
     offered text and the offer id; kind 6 carries a payout rule's canonical spec
-    text (``payout_spec_text`` without a sequence number); kinds 2, 5 and 7
-    carry neither. Zero approvers is
-    valid: the time escape alone can release the request.
+    text (``payout_spec_text`` without a sequence number); kinds 2 and 5 carry
+    neither, and kind 7 carries nothing for the first payout rule or the place
+    "1".."7" of another. Zero approvers is valid: the time escape alone can
+    release the request.
     """
     if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5, 6, 7):
         raise ValueError("kind must be 1..7")
     has_body = kind in (1, 3, 4, 6)
     if has_body and not (isinstance(rule_text, str) and rule_text.strip()):
         raise ValueError("this kind needs a non-empty rule text")
-    if not has_body and rule_text:
+    if kind == 7 and rule_text:
+        if not (isinstance(rule_text, str) and rule_text in ("1", "2", "3", "4", "5", "6", "7")):
+            raise ValueError("kind 7 carries no rule text, or the place 1..7 of the rule")
+    elif not has_body and rule_text:
         raise ValueError("this kind carries no rule text")
     if kind == 3:
         if not isinstance(offer_id, str) or len(offer_id) != 64:
@@ -804,6 +808,8 @@ def build_payout_rule_set_tx(
     due_months: int | None = None,
     on_arrival: bool = False,
     sealed: bool = False,
+    rule_index: int | None = None,
+    due_retry: int | None = None,
 ) -> dict:
     """Construct a ``tx_type='payout_rule_set'`` payload (without signature).
 
@@ -818,6 +824,10 @@ def build_payout_rule_set_tx(
     time clock only) repeat that run from ``due_at`` on. ``on_arrival`` (with
     ``per_sale``): the node runs the rule itself for each sale. ``sealed``: the
     account signs nothing until the rule ends.
+
+    ``rule_index`` (1..7): the rule's place on the account; left out, the
+    first. ``due_retry`` (with ``due_at``, on the period's clock): a due point
+    that found the account short is run again until this much later.
 
     ``slots`` lists one entry per slot: a recipient's 96-hex key, or "" for an
     open slot the executor names. ``expires_at`` is on the period's clock: a
@@ -864,6 +874,10 @@ def build_payout_rule_set_tx(
         tx["on_arrival"] = True
     if sealed:
         tx["sealed"] = True
+    if rule_index is not None:
+        tx["rule_index"] = int(rule_index)
+    if due_retry is not None:
+        tx["due_retry"] = int(due_retry)
     return tx
 
 
@@ -874,9 +888,11 @@ def build_payout_rule_revoke_tx(
     expiration_time: int,
     expire_at_height: int,
     fee_limit: str | int = "0",
+    rule_index: int | None = None,
 ) -> dict:
-    """Construct a ``tx_type='payout_rule_revoke'`` payload (without signature). Feeless."""
-    return {
+    """Construct a ``tx_type='payout_rule_revoke'`` payload (without signature).
+    Feeless. ``rule_index`` (1..7) names a rule in another place than the first."""
+    tx = {
         "tx_type": "payout_rule_revoke",
         "sender_pubkey": sender_pubkey,
         "sequence_number": sequence_number,
@@ -884,6 +900,9 @@ def build_payout_rule_revoke_tx(
         "expire_at_height": _check_expire_at_height(expire_at_height),
         "fee_limit": str(fee_limit),
     }
+    if rule_index is not None:
+        tx["rule_index"] = int(rule_index)
+    return tx
 
 
 def build_payout_execute_tx(

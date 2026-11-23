@@ -578,8 +578,8 @@ RPC replies:
 
 ## Payout rules
 
-Let a Tau rule pay out an account's money: the account installs one rule, and
-anyone may execute it; each execution pays every slot the rule writes, or
+Let a Tau rule pay out an account's money: the account installs a rule (up to
+eight, one per place), and anyone may execute it; each execution pays every slot the rule writes, or
 nothing, inside the caps the account signed. Semantics are in the
 [README](../README.md#payout-rules). Long-form guide: [payout_rules.md](payout_rules.md).
 
@@ -602,19 +602,23 @@ and `--period-seconds`, and one of `--ends-at` (on the period's clock) and
 meantime is refused instead of run. `set` prints the payout rule id.
 `set --per-sale` installs a rule that pays once per recorded sale (a signed
 transfer into the account); `execute --sale <tx_hash>` names the sale to pay
-(`payout show` lists the open ones).
+(`payout show` lists the open ones). `--rule-index K` (1..7) on `set`,
+`revoke` and `execute` names a rule in another place than the first; `set
+--due-retry N` (with `--due-at`) has the node run a due point that found the
+account short again, for up to N blocks or seconds.
 
 Raw transactions (root fields only; a nested `payload` is ignored):
 
 | `tx_type` | Signed fields beyond the envelope |
 |---|---|
-| `payout_rule_set` | `genesis_hash`, `rule_text`, `slots`, `cap_per_execution`, `cap_per_period`, exactly one of `period_blocks` / `period_seconds`, `expires_at`, `per_sale` when present |
+| `payout_rule_set` | `genesis_hash`, `rule_text`, `slots`, `cap_per_execution`, `cap_per_period`, exactly one of `period_blocks` / `period_seconds`, `expires_at`; each optional term when present (`per_sale`, `periods_from`, `due_at`, `due_every`, `due_months`, `on_arrival`, `sealed`, `rule_index`, `due_retry`) |
 | `payout_execute` | `genesis_hash`, `account_pubkey`, `rule_id`, `recipients` (slot -> key), `data` (k -> value), `sale_id` when present |
-| `payout_rule_revoke` | `genesis_hash` (feeless) |
+| `payout_rule_revoke` | `genesis_hash`, `rule_index` when present (feeless) |
 
 RPC replies:
 
-- `getpayoutrule` returns `installed`, the `rule` (terms, `spent_this_period`,
+- `getpayoutrule` returns `installed`, `rules` (every place), the `rule` in the
+  first place (terms, `spent_this_period`,
   `left_this_period`, `executions`, `paid_total`, `last_height`), `history`
   (installed, executed with legs, revoked, expired; canonical blocks only,
   newest first), `block_hash`, and `semantics` (the ABI, limits and rules).
