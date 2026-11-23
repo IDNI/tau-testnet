@@ -39,6 +39,23 @@ _CAP_RE = re.compile(
 )
 
 
+_RECEIVE_MENTION_RE = re.compile(r"\bi%d\b" % tau_defs.RECEIVE_STREAM_INDEX)
+
+
+def mentions_receive_stream(body: str) -> bool:
+    """True when the clause reads `i17` and therefore opts into inbound judging.
+
+    A clause written before this feature exists says nothing about how its owner
+    wants to be PAID, and must not acquire that meaning silently: a policy that
+    merely reads `i3` (or `i1`) for outbound rules would otherwise start refusing
+    inbound payments the moment the node upgrades. Reading `i17` is the opt-in,
+    and it is the only thing a clause can read to tell the two passes apart.
+    """
+    from consensus.rule_offers import strip_clause_comments
+
+    return bool(_RECEIVE_MENTION_RE.search(strip_clause_comments(body or "")))
+
+
 def hold_seconds_value(hold_seconds: int) -> int:
     """`i17` for an incoming payment released `hold_seconds` after the block."""
     return tau_defs.RECEIVE_FINAL + int(hold_seconds)
@@ -107,8 +124,11 @@ def judge(clause_for, recipient: str, inputs: dict, value: int, *,
           pool: str, timeout=None) -> tuple[bool, str, str]:
     """(blocked, reason, message) for one payment judged by the RECIPIENT.
 
-    An account with no clause on o5 never reaches the evaluator: the common case
-    of a payment to an account without a policy costs nothing.
+    Two things keep this from changing what already-deployed policy means:
+
+    * an account with no clause on o5 never reaches the evaluator, and
+    * a clause that does not read `i17` never does either (`mentions_receive_stream`),
+      so only a policy written for the receiving side is judged on it.
     """
     # The registry is keyed by the lowercase hex form, and the literal below must
     # be the same bytes, so normalise once here rather than at every call site: a
@@ -117,8 +137,15 @@ def judge(clause_for, recipient: str, inputs: dict, value: int, *,
     body = clause_for(recipient, tau_defs.USER_POLICY_STREAM_INDEX)
     if not isinstance(body, str) or not body:
         return False, "", ""
+    if not mentions_receive_stream(body):
+        return False, "", ""
     values = dict(inputs or {})
     values[tau_defs.RECEIVE_STREAM_INDEX] = str(int(value))
+    # The payer's approval slots belong to the payer's axis: a co-signature the
+    # SENDER collected must never satisfy the recipient's rule. Zeroed rather
+    # than removed so every clause sees the same shape of input map.
+    for slot in tau_defs.approval_slot_indices():
+        values[slot] = "0"
     # The recipient's own key, in the same literal shape every other pubkey
     # stream is fed, so one guarded unit per account serves both directions.
     values[tau_defs.SENDER_KEY_STREAM_INDEX] = (

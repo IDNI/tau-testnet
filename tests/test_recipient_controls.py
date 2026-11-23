@@ -36,6 +36,14 @@ INBOUND_BODY = (
 )
 
 
+# Mentions i17 (so the clause opts into inbound judging) but blocks exactly the
+# plain, final payment — used to prove the reason is not a hold refusal.
+BLOCK_FINAL = (
+    "(i17[t]:bv[64] = { #x0001 }:bv[64]) ? (o5[t]:bv[24] = { #x000000 }:bv[24])"
+    " : (o5[t]:bv[24] = { #x000001 }:bv[24])"
+)
+
+
 @pytest.fixture(autouse=True)
 def _reset_overrides():
     for pool in POOLS:
@@ -141,6 +149,33 @@ def test_a_mixed_case_recipient_cannot_slip_past_its_own_clause():
     assert seen["who"] == ap.BOB
 
 
+def test_a_clause_that_never_reads_i17_is_never_judged_inbound():
+    """Existing policy must not acquire an inbound meaning on upgrade."""
+    legacy = ("always ( !(i3[t]:bv[384] = { #x" + ap.ALICE + " }:bv[384]) -> "
+              "(o5[t]:bv[24] = { #x000000 }:bv[24]) ).")
+    sender_policy.set_evaluator("apply", _Exploding())
+    assert recipient_policy.judge(
+        lambda _who, _stream: legacy, ap.BOB, {}, 1, pool="apply"
+    ) == (False, "", "")
+    assert recipient_policy.mentions_receive_stream(INBOUND_BODY) is True
+    assert recipient_policy.mentions_receive_stream(legacy) is False
+
+
+def test_the_payers_approval_slots_are_zeroed_for_the_recipient():
+    """A co-signature the sender collected must not satisfy the recipient."""
+    ev = _judgeable(decide="1")
+    sender_policy.set_evaluator("apply", ev)
+    slot = tau_defs.approval_slot_indices()[0]
+    recipient_policy.judge(
+        lambda _who, _stream: INBOUND_BODY, ap.BOB,
+        {slot: "{ #x" + ap.ALICE + " }:bv[384]", 1: "500"},
+        recipient_policy.plain_transfer_value(), pool="apply",
+    )
+    _body, inputs = ev.verdict_calls[-1]
+    assert inputs[f"i{slot}"] == "0"
+    assert inputs["i1"] == "500"
+
+
 def test_a_refusal_names_the_hold_and_the_cap():
     sender_policy.set_evaluator("apply", _judgeable(decide="0"))
     blocked, reason, message = recipient_policy.judge(
@@ -152,7 +187,7 @@ def test_a_refusal_names_the_hold_and_the_cap():
 
 
 def test_a_plain_payment_refusal_is_not_a_hold_refusal():
-    body = "always (o5[t]:bv[24] = { #x000000 }:bv[24])."
+    body = BLOCK_FINAL
     sender_policy.set_evaluator("apply", _judgeable(body=body, decide="0"))
     blocked, reason, _message = recipient_policy.judge(
         lambda _who, _stream: body,
@@ -216,7 +251,7 @@ def test_one_unit_serves_both_directions_at_apply():
 
 def test_a_recipient_refusal_invalidates_the_whole_batch():
     ev = MockPolicyEvaluator(pool="apply")
-    ev.set_verdict("always (o5[t]:bv[24] = { #x000000 }:bv[24]).", "0")
+    ev.set_verdict(BLOCK_FINAL, "0")
     sender_policy.set_evaluator("apply", ev)
     third = pubkey_hex(SK_CAROL)   # a third account, no clause
     tx = ap._sign({
@@ -229,7 +264,7 @@ def test_a_recipient_refusal_invalidates_the_whole_batch():
         "fee_limit": "100",
         "operations": {"1": [[ap.ALICE, ap.BOB, "10"], [ap.ALICE, third, "10"]]},
     }, ap.SK_ALICE)
-    lm = _registered("always (o5[t]:bv[24] = { #x000000 }:bv[24]).")
+    lm = _registered(BLOCK_FINAL)
     result, _lm, _calls = ap._apply([tx], lm=lm)
     assert tx["tx_id"] in result.invalid_tx_ids
     assert ap._balances(result)[ap.BOB] == 0

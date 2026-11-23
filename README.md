@@ -644,7 +644,7 @@ Timing caveats:
 
 Long-form guide: [docs/recipient_controls.md](docs/recipient_controls.md).
 
-An account's own `o5` clause judges the payments made **to** it, not just the payments it makes: it can refuse senders it has not approved ([#47](https://github.com/IDNI/tau-testnet/issues/47)) and cap how long a payment to it may be held ([#76](https://github.com/IDNI/tau-testnet/issues/76)). The network refuses the transaction at mempool admission and again at block apply; a refusal at apply is a hard reject, so the sender pays the fee for it, exactly as for the sender's own clause.
+An account's own `o5` clause judges the payments made **to** it, not just the payments it makes: it can refuse senders it has not approved ([#47](https://github.com/IDNI/tau-testnet/issues/47)) and cap how long a payment to it may be held ([#76](https://github.com/IDNI/tau-testnet/issues/76)). The network refuses the transaction at mempool admission and again at block apply; a refusal at apply is a hard reject, no staged write commits and no fee is settled, exactly as for the sender's own clause. Reading `i17` is the opt-in: a clause that never mentions it is never judged on the receiving side, so existing policy does not change meaning on upgrade.
 
 The node evaluates the account's one `o5` unit twice per payment: once with `i12 = the sender` (outbound) and once with `i12 = the recipient` (inbound). A clause body may not read `i12`, so the node also feeds `i17` (`bv[64]`), which is what an inbound rule reads:
 
