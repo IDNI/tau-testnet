@@ -619,8 +619,9 @@ tau-testnet payout update --key treasury --rule-id <rule_id> --file payout-v2.ta
 tau-testnet payout execute --key carol --account <treasury_pk> --recipient 1=<dave_pk> --data 0=300
 tau-testnet payout show <address>
 tau-testnet payout revoke --key treasury --rule-id <rule_id>
-# an account with a rule-change guard: the same, as a rule-change request (kinds 6 and 7)
+# an account with a rule-change guard: the same, as a rule-change request (kinds 6, 7 and 8)
 tau-testnet payout set ... --request --approver 18=<cosigner_pk>
+tau-testnet payout update ... --request --approver 18=<cosigner_pk>
 tau-testnet payout revoke --key treasury --request --approver 18=<cosigner_pk>
 ```
 

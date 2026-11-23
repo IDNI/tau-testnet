@@ -594,19 +594,20 @@ def build_rule_change_request_tx(
     """Construct a ``tx_type='rule_change_request'`` payload (without signature).
 
     Kinds 1 and 4 carry the clause in ``rule_text``; kind 3 carries the exact
-    offered text and the offer id; kind 6 carries a payout rule's canonical spec
-    text (``payout_spec_text`` without a sequence number); kinds 2, 5 and 7
-    carry neither. Zero approvers is
+    offered text and the offer id; kinds 6 and 8 carry a payout rule's
+    canonical spec text (``payout_spec_text`` without a sequence number) —
+    kind 8 also carries the id of the rule version it replaces in
+    ``offer_id``; kinds 2, 5 and 7 carry neither. Zero approvers is
     valid: the time escape alone can release the request.
     """
-    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5, 6, 7):
-        raise ValueError("kind must be 1..7")
-    has_body = kind in (1, 3, 4, 6)
+    if isinstance(kind, bool) or kind not in (1, 2, 3, 4, 5, 6, 7, 8):
+        raise ValueError("kind must be 1..8")
+    has_body = kind in (1, 3, 4, 6, 8)
     if has_body and not (isinstance(rule_text, str) and rule_text.strip()):
         raise ValueError("this kind needs a non-empty rule text")
     if not has_body and rule_text:
         raise ValueError("this kind carries no rule text")
-    if kind == 3:
+    if kind in (3, 8):
         if not isinstance(offer_id, str) or len(offer_id) != 64:
             raise ValueError("offer_id must be a 64-character hex string")
     elif offer_id:

@@ -73,7 +73,7 @@ def semantics() -> dict:
         "o5": "not consulted; the payout rule is the account's own second "
               "authorization for its money",
         "rule_change_guard": "install, update and revoke are rule changes "
-                             "(kinds 6 and 7): a guarded account uses a "
+                             "(kinds 6, 7 and 8): a guarded account uses a "
                              "rule_change_request",
         "fee": "the installing or updating account pays one fee; an execution's "
                "fee is paid by its executor; revoke is fee-free",

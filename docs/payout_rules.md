@@ -293,9 +293,19 @@ under the same lineage, version + 1, with a fresh execution schedule. The
 period spend, paid total, execution count, history and open arrivals do **not**
 carry over — the new version starts clean, as a fresh install does. An update
 that changes nothing is refused. It costs one fee, like an install, and is a
-rule change (kind 6) for the guard. There is no rule-change request kind for
-an update: a guarded account updates by revoking the rule and setting a new
-one instead.
+rule change (kind 8) for the guard. A guarded account files an update request
+instead of sending the update directly:
+
+```bash
+tau-testnet payout update --key treasury --rule-id <rule_id> --file payout-v2.tau \
+    --slot <bob_pubkey> --cap-per-execution 500 --cap-per-period 2000 \
+    --period-blocks 1000 --ends-in 100000 \
+    --request --approver 18=<cosigner_pubkey>
+```
+
+The request names the version it replaces and installs version + 1 under the
+same lineage when it releases, so the update keeps its history where a
+revoke + set would lose it.
 
 ## Due points (standing payments)
 
@@ -344,20 +354,23 @@ rule out and spend, and cannot fee-spend its way around it either.
 
 Installing, updating and revoking a payout rule are rule changes. An account
 with a rule-change guard (see [approvals.md](approvals.md)) has them judged with
-`i1` = 6 (set or update payout rule) or 7 (revoke payout rule). If the guard
-blocks, the direct transaction is refused, and the account files a rule-change
-request instead (set and revoke only — there is no update request kind):
+`i1` = 6 (set payout rule), 8 (update payout rule) or 7 (revoke payout rule).
+If the guard blocks, the direct transaction is refused, and the account files
+a rule-change request instead:
 
 ```bash
 tau-testnet payout set --key treasury --file payout.tau --slot <bob> \
     --cap-per-execution 500 --cap-per-period 2000 --period-blocks 1000 --ends-in 100000 \
     --request --approver 18=<cosigner_pubkey>
+tau-testnet payout update --key treasury --rule-id <rule_id> --file payout-v2.tau \
+    --slot <bob> --cap-per-execution 500 --cap-per-period 2000 --period-blocks 1000 \
+    --ends-in 100000 --request --approver 18=<cosigner_pubkey>
 tau-testnet payout revoke --key treasury --request --approver 18=<cosigner_pubkey>
 ```
 
-A guard that blocks every change without its co-signers covers kinds 6 and 7
+A guard that blocks every change without its co-signers covers kinds 6, 7 and 8
 with no edit. A guard that names the kinds it blocks (like the weaker wallet
-template, which names 2 and 5) does not block 6 and 7.
+template, which names 2 and 5) does not block 6, 7 or 8.
 
 The request carries the rule's canonical spec text (`payout_spec_text`: sorted
 keys, no spaces) and releases on co-signatures or after the time escape, like

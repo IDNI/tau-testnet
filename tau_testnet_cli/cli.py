@@ -2427,6 +2427,7 @@ def cmd_retractable_id(args: argparse.Namespace) -> int:
 
 _KIND_PAYOUT_SET = 6
 _KIND_PAYOUT_REVOKE = 7
+_KIND_PAYOUT_UPDATE = 8
 
 
 def _payout_fields(args, tip: int, now: int) -> dict:
@@ -2578,10 +2579,24 @@ def _installed_rule_id(args, account: str) -> str:
 def cmd_payout_update(args: argparse.Namespace) -> int:
     """Replace one installed rule with new terms (same lineage, version + 1).
 
-    No rule-change request kind exists for an update: a guarded account
-    updates by revoking the rule and setting a new one instead.
+    With --request, a guarded account files an update request (kind 8) instead:
+    the request names the version it replaces and installs version + 1 under
+    the same lineage when it releases.
     """
-    from consensus.payout import PayoutShapeError, parse_payout_rule_update
+    from consensus.payout import PayoutShapeError, parse_payout_rule_update, payout_spec_text
+
+    if args.request:
+        try:
+            _sk, sender = _resolve_signing_key(args)
+            rule_id = (args.rule_id or _installed_rule_id(args, sender)).strip().lower()
+            fields = _payout_fields(args, 0, int(_now()))
+            payload = tx_mod.build_payout_rule_update_tx(
+                sender_pubkey="00" * 48, sequence_number=0, expiration_time=0,
+                expire_at_height=1, rule_id=rule_id, **fields)
+        except (_PayloadError, ValueError) as exc:
+            print_error(str(exc))
+            return EXIT_LOCAL
+        return _submit_rule_change(args, _KIND_PAYOUT_UPDATE, payout_spec_text(payload), rule_id)
 
     if args.expire_in is None:
         args.expire_in = 1000
@@ -2751,7 +2766,7 @@ def _add_payout_subparsers(sub) -> None:
                           help="Pay only against sales the chain recorded (transfers into "
                                "the account), once per sale; the rule reads i27 and i28")
     _payout_optional_terms(p_update)
-    _tx_flags(p_update)
+    _tx_flags(p_update, request=True)
     p_update.set_defaults(func=cmd_payout_update)
 
     p_rev = psub.add_parser("revoke", parents=common, help="Remove one of your payout rules")

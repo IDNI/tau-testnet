@@ -1466,6 +1466,26 @@ def _rule_change_precondition_error(request, tip_view: TipAdmissionView) -> Opti
                 return "there is no payout rule to revoke"
         elif not tip_view.payout_book().get_rules(sender):
             return "there is no payout rule to revoke"
+    elif request.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT:
+        # The offer_id names the version to replace; the body is the new
+        # spec, and the update must be one the book would take.
+        _oid = (request.offer_id or "").strip().lower()
+        try:
+            _rid = bytes.fromhex(_oid)
+            if (len(_rid) != 32
+                    or tip_view.payout_book().get(sender, _rid) is None):
+                return "there is no payout rule to update"
+        except ValueError:
+            return "there is no payout rule to update"
+        try:
+            terms = parse_payout_spec(request.body, sender)
+        except PayoutShapeError as exc:
+            return str(exc)
+        _, reason = tip_view.payout_book().can_admit_update(
+            sender, _rid, terms,
+            tip_view.next_block_height, tip_view.next_block_timestamp)
+        if reason:
+            return reason
     elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
         row = tip_view.get_offer(request.offer_id)
         if not isinstance(row, dict) or row.get("status") != STATUS_OFFERED:
@@ -1775,7 +1795,7 @@ def validate_payout_rule_update_payload(
 
     Shape, ABI screen and book checks are apply's own (`can_admit_update`);
     the rule is built in the payout admission pool, and the sender's
-    rule-change guard is consulted (kind 6), as apply does.
+    rule-change guard is consulted (kind 8), as apply does.
     """
     from consensus import sender_policy
 
@@ -1807,7 +1827,7 @@ def validate_payout_rule_update_payload(
             f"payout_rule_update rejected: the rule does not build: {built.error[:300]}",
             code="PAYOUT_RULE_DOES_NOT_BUILD",
         )
-    refusal = _rule_change_refusal(tip_view, sender, tau_defs.RULE_CHANGE_KIND_SET_PAYOUT)
+    refusal = _rule_change_refusal(tip_view, sender, tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT)
     if refusal is not None:
         return refusal
     # The node installs version + 1, so the rule id the book will hold is the

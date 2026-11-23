@@ -506,13 +506,16 @@ def test_a_guard_that_blocks_changes_blocks_install_and_revoke(evs):
     ch, oracle, tx = _installed()
     ch.lm.rule_offers.accepted_clauses[(ALICE, tau_defs.RULE_CHANGE_GUARD_INDEX)] = GUARD
     evs["apply"].set_verdict(GUARD, lambda inputs: 0)
-    result = ch.block([set_tx(seq=1, cap_exec=50), revoke_tx(seq=1, rule_id=rid(tx))], height=HEIGHT + 1)
+    result = ch.block([set_tx(seq=1, cap_exec=50), revoke_tx(seq=1, rule_id=rid(tx)),
+                       update_tx(rid(tx), seq=1, cap_exec=50)], height=HEIGHT + 1)
     assert [o.reason for o in result.outcomes] == ["payout_rule_not_set",
-                                                   "payout_rule_not_revoked"]
+                                                   "payout_rule_not_revoked",
+                                                   "payout_rule_not_updated"]
     assert "use a rule-change request" in _logs(result)
     kinds = [c[1]["i1"] for c in evs["apply"].verdict_calls]
     assert kinds == [str(tau_defs.RULE_CHANGE_KIND_SET_PAYOUT),
-                     str(tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT)]
+                     str(tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT),
+                     str(tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT)]
     assert ch.lm.payout_rules.get(ALICE).rule_id.hex() == rid(tx)
     # Executions are not rule changes: the guard does not stop them.
     ch.block([exec_tx(rule_id=rid(tx), data={"0": 5})], height=HEIGHT + 2, ts=TS + 2)

@@ -137,8 +137,11 @@ RULE_CHANGE_KIND_ACCEPT_OFFER = 3
 RULE_CHANGE_KIND_SET_GUARD = 4
 RULE_CHANGE_KIND_REVOKE_GUARD = 5
 # Payout rules (#63): installing or replacing one, and revoking it.
+# An update (kind 8) replaces one version with the next under the same
+# lineage; the request names the version it replaces in `offer_id`.
 RULE_CHANGE_KIND_SET_PAYOUT = 6
 RULE_CHANGE_KIND_REVOKE_PAYOUT = 7
+RULE_CHANGE_KIND_UPDATE_PAYOUT = 8
 
 # Blocks after which a parked rule-change request may release without approvals.
 RULE_CHANGE_DELAY_BLOCKS = 1000

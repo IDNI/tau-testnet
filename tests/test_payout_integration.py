@@ -23,6 +23,7 @@ from consensus.admission import (
     validate_payout_execute_payload,
     validate_payout_rule_revoke_payload,
     validate_payout_rule_set_payload,
+    validate_payout_rule_update_payload,
 )
 from consensus.governance import ConsensusLifecycleManager, build_mechanism_metadata
 from consensus.lanes import LANE_FAST, LANE_SLOW, TAU_EVALUATING_TX_TYPES, classify_lane
@@ -300,6 +301,23 @@ def test_a_guard_refuses_a_direct_install(tip_view):
         result = validate_payout_rule_set_payload(rule_set(), tip_view)
         assert result.code == "RULE_CHANGE_NEEDS_APPROVAL"
         assert mock.verdict_calls[0][1]["i1"] == str(tau_defs.RULE_CHANGE_KIND_SET_PAYOUT)
+    finally:
+        sender_policy.set_evaluator("admission", None)
+
+
+def test_a_guard_refuses_a_direct_update(tip_view, book):
+    terms = _installed(book)
+    guard = "(o5[t]:bv[24] = { #x000000 }:bv[24])"
+    tip_view.clause_for.side_effect = lambda who, idx: (
+        guard if idx == tau_defs.RULE_CHANGE_GUARD_INDEX else None)
+    mock = MockPolicyEvaluator(pool="admission")
+    mock.set_verdict(guard, 0)
+    sender_policy.set_evaluator("admission", mock)
+    try:
+        result = validate_payout_rule_update_payload(
+            update(terms.rule_id.hex()), tip_view)
+        assert result.code == "RULE_CHANGE_NEEDS_APPROVAL"
+        assert mock.verdict_calls[0][1]["i1"] == str(tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT)
     finally:
         sender_policy.set_evaluator("admission", None)
 

@@ -484,6 +484,28 @@ def _payout_request_problem(lm, sender, body, height, timestamp) -> Optional[str
     return reason or None
 
 
+def _payout_update_request_problem(lm, sender, body, offer_id, height,
+                                   timestamp) -> Optional[str]:
+    """Why a payout rule update (a kind-8 body + the id it replaces) may not
+    be installed now, or None."""
+    from consensus.payout import PayoutShapeError, parse_payout_spec
+
+    try:
+        rule_id = bytes.fromhex((offer_id or "").strip().lower())
+    except ValueError:
+        return "the update names no rule id"
+    if len(rule_id) != 32:
+        return "the update names no rule id"
+    try:
+        terms = parse_payout_spec(body, sender)
+    except PayoutShapeError as exc:
+        return str(exc)
+    book = _payout_book(lm) or PayoutBook()
+    _, reason = book.can_admit_update(sender, rule_id, terms,
+                                      int(height), int(timestamp))
+    return reason or None
+
+
 def _release_rule_changes(lm, height, timestamp, timeout,
                           payout_events: Optional[List[Dict[str, Any]]] = None
                           ) -> List[Tuple[str, str]]:
@@ -525,7 +547,8 @@ def _write_rule_change(lm, rid, entry, height, timeout, *, timestamp=0,
     Every check runs before the first write, so a failure leaves nothing behind.
     """
     if entry.kind in (tau_defs.RULE_CHANGE_KIND_SET_PAYOUT,
-                      tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT):
+                      tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT,
+                      tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT):
         return _write_payout_change(lm, entry, height, timestamp, timeout, payout_events)
     offers = lm.rule_offers
     approvals = lm.approval_requests
@@ -602,7 +625,7 @@ def _write_rule_change(lm, rid, entry, height, timeout, *, timestamp=0,
 
 
 def _write_payout_change(lm, entry, height, timestamp, timeout, events) -> Optional[str]:
-    """Install or revoke a payout rule from a released rule-change request.
+    """Install, update or revoke a payout rule from a released rule-change request.
 
     A payout change touches nothing else the account has, so unlike a policy
     change it fails no other open request.
@@ -635,6 +658,26 @@ def _write_payout_change(lm, entry, height, timestamp, timeout, events) -> Optio
         if events is not None:
             events.append({"account_pubkey": sender, "rule_id": gone.rule_id.hex(),
                            "outcome": "revoked"})
+        return None
+    if entry.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT:
+        # The offer_id names the version to replace; the body is the new
+        # spec (canonical text plus this request's sequence number).
+        problem = _payout_update_request_problem(
+            lm, sender, entry.body, entry.offer_id, height, timestamp)
+        if problem:
+            return problem
+        terms = parse_payout_spec(entry.body, sender)
+        built = sender_policy.evaluator(PAYOUT_POOL_APPLY).validate(
+            terms.body, timeout=timeout)
+        if not built.ok:
+            return f"the payout rule does not build: {built.error[:200]}"
+        rule_id = bytes.fromhex((entry.offer_id or "").strip().lower())
+        _old, new_terms = book.update(
+            sender, rule_id, terms, terms.clock(int(height), int(timestamp)))
+        if events is not None:
+            events.append({"account_pubkey": sender,
+                           "rule_id": new_terms.rule_id.hex(),
+                           "replaces": rule_id.hex(), "outcome": "updated"})
         return None
     problem = _payout_request_problem(lm, sender, entry.body, height, timestamp)
     if problem:
@@ -2649,6 +2692,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 height_now, int(block_timestamp or 0))
                             if why:
                                 problem = (why, "rule_change_request_invalid")
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT:
+                            why = _payout_update_request_problem(
+                                lifecycle_mgr, request.sender_pubkey, request.body,
+                                request.offer_id,
+                                height_now, int(block_timestamp or 0))
+                            if why:
+                                problem = (why, "rule_change_request_invalid")
                     if request is not None and problem is None:
                         precondition = None
                         if request.kind == tau_defs.RULE_CHANGE_KIND_REVOKE_POLICY:
@@ -2674,6 +2724,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     precondition = "there is no payout rule to revoke"
                             elif not lifecycle_mgr.payout_rules.get_rules(request.sender_pubkey):
                                 precondition = "there is no payout rule to revoke"
+                        elif request.kind == tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT:
+                            # The offer_id names the version to replace.
+                            _oid = (request.offer_id or "").strip().lower()
+                            try:
+                                _rid = bytes.fromhex(_oid)
+                                if (len(_rid) != 32
+                                        or lifecycle_mgr.payout_rules.get(
+                                            request.sender_pubkey, _rid) is None):
+                                    precondition = "there is no payout rule to update"
+                            except ValueError:
+                                precondition = "there is no payout rule to update"
                         elif request.kind == tau_defs.RULE_CHANGE_KIND_ACCEPT_OFFER:
                             offer_entry = offers.offered.get(bytes.fromhex(request.offer_id))
                             if offer_entry is None:
@@ -3133,7 +3194,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         if terms is not None and not reason:
                             blocked, detail = sender_policy.rule_change_blocked(
                                 lambda who, idx: lifecycle_mgr.rule_offers.accepted_clauses.get((who, idx)),
-                                sender, tau_defs.RULE_CHANGE_KIND_SET_PAYOUT, ts_now,
+                                sender, tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT, ts_now,
                                 pool="apply", timeout=budget,
                             )
                             if blocked:

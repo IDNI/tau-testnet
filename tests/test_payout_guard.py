@@ -1,4 +1,4 @@
-"""Payout rules behind a rule-change guard (#63): kinds 6 and 7.
+"""Payout rules behind a rule-change guard (#63): kinds 6, 7 and 8.
 
 An account with a guard cannot install, replace or revoke its payout rule
 directly; it files a rule-change request that releases on co-signatures or after
@@ -26,6 +26,7 @@ from test_rule_change_release import D, LATE, Chain, _guarded, _vote
 
 KIND_SET_PAYOUT = tau_defs.RULE_CHANGE_KIND_SET_PAYOUT
 KIND_REVOKE_PAYOUT = tau_defs.RULE_CHANGE_KIND_REVOKE_PAYOUT
+KIND_UPDATE_PAYOUT = tau_defs.RULE_CHANGE_KIND_UPDATE_PAYOUT
 RULE = "always ( o30[t]:bv[24] = i40[t]:bv[24] )."
 BODY = payout_rule_body(RULE)
 CAROL_KEY = "ab" * 48
@@ -52,8 +53,8 @@ def evaluators():
         sender_policy.set_evaluator(pool, None)
 
 
-def _parked(kind, text="", seq=0):
-    req = _request(kind, text=text, seq=seq, expire=LATE)
+def _parked(kind, text="", seq=0, offer_id=""):
+    req = _request(kind, text=text, seq=seq, offer_id=offer_id, expire=LATE)
     chain = Chain(_guarded())
     chain.block(_tx(req))
     return chain, req
@@ -127,6 +128,63 @@ def test_a_revoke_request_needs_a_rule():
     result = chain.block(_tx(req))
     assert req.request_id.hex() not in str(chain.book.rule_change_requests.keys())
     assert "payout" in " | ".join(str(x) for o in result.outcomes for x in (o.receipt_logs or []))
+
+
+def test_an_update_request_body_carries_the_spec_and_the_version_it_replaces():
+    chain, install = _parked(KIND_SET_PAYOUT, spec())
+    chain.block(_vote(install.request_id))
+    old = chain.lm.payout_rules.get(ALICE)
+    req = parse_rule_change_request(_tx(_request(
+        KIND_UPDATE_PAYOUT, text=spec(cap_per_execution=500), seq=1,
+        offer_id=old.rule_id.hex(), expire=LATE)))
+    assert req is not None
+    assert json.loads(req.body)["sequence_number"] == 1
+    assert req.offer_id == old.rule_id.hex()
+    assert parse_rule_change_request(_tx(_request(
+        KIND_UPDATE_PAYOUT, text=spec(), seq=1, offer_id="zz" * 32, expire=LATE))) is None
+
+
+def test_an_update_parks_then_releases_on_the_co_signature():
+    chain, install = _parked(KIND_SET_PAYOUT, spec())
+    chain.block(_vote(install.request_id))
+    old = chain.lm.payout_rules.get(ALICE)
+    assert old is not None
+    update = _request(KIND_UPDATE_PAYOUT, text=spec(cap_per_execution=500), seq=1,
+                      offer_id=old.rule_id.hex(), expire=LATE)
+    chain.block(_tx(update))
+    assert chain.entry(update).status == STATUS_OPEN
+    assert chain.lm.payout_rules.get(ALICE).rule_id == old.rule_id
+    result = chain.block(_vote(update.request_id, seq=1))
+    assert chain.entry(update).status == STATUS_EXECUTED
+    new = chain.lm.payout_rules.get(ALICE)
+    assert new is not None and new.cap_per_execution == 500
+    assert new.sequence_number == 1 and new.version == old.version + 1
+    assert chain.lm.payout_rules.get(ALICE, old.rule_id) is None
+    assert chain.lm.payout_rules.current_id(old.rule_id) == new.rule_id
+    events = _payout_events(result)
+    assert [e["outcome"] for e in events] == ["updated"]
+    assert events[0]["replaces"] == old.rule_id.hex()
+
+
+def test_an_update_request_for_a_missing_rule_is_refused():
+    chain = Chain(_guarded())
+    req = _request(KIND_UPDATE_PAYOUT, text=spec(), seq=0, offer_id="00" * 32,
+                   expire=LATE)
+    result = chain.block(_tx(req))
+    assert req.request_id.hex() not in str(chain.book.rule_change_requests.keys())
+    assert "payout" in " | ".join(str(x) for o in result.outcomes for x in (o.receipt_logs or []))
+
+
+def test_an_update_request_from_a_sealed_account_is_refused():
+    chain, install = _parked(KIND_SET_PAYOUT, spec(sealed=True))
+    chain.block(_vote(install.request_id))
+    old = chain.lm.payout_rules.get(ALICE)
+    assert old is not None and chain.lm.payout_rules.sealed(ALICE)
+    update = _request(KIND_UPDATE_PAYOUT, text=spec(cap_per_execution=500), seq=1,
+                      offer_id=old.rule_id.hex(), expire=LATE)
+    result = chain.block(_tx(update))
+    assert update.request_id.hex() not in str(chain.book.rule_change_requests.keys())
+    assert "sealed" in " | ".join(str(x) for o in result.outcomes for x in (o.receipt_logs or []))
 
 
 def test_a_request_outside_the_abi_is_refused_up_front():

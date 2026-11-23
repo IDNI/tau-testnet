@@ -19,7 +19,7 @@ the recipient, and the rule sees it as an input and decides what it may get).
 The rule is a second, separate authorization for the account's money, chosen
 by the account: the o5 clause governs transfers the account signs, the payout
 rule governs executions. Installing, updating and revoking a payout rule are
-rule changes, so an account's rule-change guard judges them (kinds 6 and 7) and
+rule changes, so an account's rule-change guard judges them (kinds 6, 7 and 8) and
 a guarded account installs one through a rule-change request. An escrow account
 therefore locks its money to its payout rule with three things: a payout rule,
 an o5 clause that blocks signed transfers, and a guard that needs co-signers
@@ -631,7 +631,7 @@ def parse_payout_rule_update(tx: Dict[str, Any]) -> Tuple[str, bytes, PayoutTerm
 
 def payout_spec_text(fields: Dict[str, Any], sequence_number: Optional[int] = None) -> str:
     """CONSENSUS-FROZEN. The canonical text of a payout rule's terms: sorted keys,
-    no spaces. A rule-change request (kind 6) carries it as `rule_text` without
+    no spaces. A rule-change request (kinds 6 and 8) carries it as `rule_text` without
     a sequence number; the request's stored body adds the request's own
     sequence number, which then enters the installed rule's id."""
     spec = {k: fields[k] for k in SPEC_FIELDS if fields.get(k) is not None}
